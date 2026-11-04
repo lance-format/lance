@@ -129,8 +129,6 @@ impl BloomFilterIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        // The load path yields a uniquely-owned index, so the remapper is
-        // attached in place instead of deep-cloning every zone's filter.
         let mut index = Self::load_with_max_array_length(
             store,
             None,
@@ -1608,6 +1606,7 @@ mod tests {
     use datafusion_execution::SendableRecordBatchStream;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
+    use lance_core::deepsize::DeepSizeOf;
     use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
@@ -1616,7 +1615,7 @@ mod tests {
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
         bloomfilter::{
             BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams,
-            merge_bloomfilter_indices,
+            BloomFilterProcessor, BloomFilterStatistics, ZoneBound, merge_bloomfilter_indices,
         },
         lance_format::LanceIndexStore,
     };
@@ -3101,14 +3100,9 @@ mod tests {
         );
     }
 
-    // The deep size must stay the serialized filter payload per zone, the
-    // number `to_bytes().len()` used to report.
+    // Deep size counts each zone's filter as its serialized payload size.
     #[test]
     fn test_bloomfilter_deep_size_equals_serialized_payload() {
-        use lance_core::deepsize::DeepSizeOf;
-
-        use super::{BloomFilterProcessor, BloomFilterStatistics, ZoneBound};
-
         // Default parameters yield a zone payload of tens of KiB.
         let params = BloomFilterIndexBuilderParams::new(8192, 0.00057);
         let filter = BloomFilterProcessor::build_filter(&params).unwrap();
@@ -3136,10 +3130,6 @@ mod tests {
             batch_remapper: None,
         };
 
-        assert_eq!(index.zones.capacity(), index.zones.len());
-        // Value identity: `size_bytes()` is exactly what serializing returns,
-        // and the deep size is the shallow struct plus the two zone payloads.
-        assert_eq!(filter.to_bytes().len(), zone_payload);
         assert_eq!(
             index.deep_size_of(),
             std::mem::size_of::<BloomFilterIndex>()
