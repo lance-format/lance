@@ -19,7 +19,7 @@
 use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -376,8 +376,46 @@ impl IndexClaim {
 }
 
 impl Footprint {
-    /// Relate this set's index dependencies to the nesting in `schema`.
-    pub fn with_field_ancestry(self, _schema: &Schema) -> Self {
+    /// Extend each dependency an index segment has on a field's data, keyed or
+    /// carried, to the fields that field is nested in or contains in `schema`.
+    ///
+    /// A footprint names fields by id alone, but one field's values can be
+    /// rewritten under another's id: a packed struct is stored and rewritten
+    /// under the parent's id while an index on a child records the child's,
+    /// and an index on a struct describes its children's values. The rewrite's
+    /// claims cannot be widened instead, or two writes of sibling children
+    /// would collide through their shared parent.
+    ///
+    /// Only the dependency widens, in the same [`Mode::RequiresUnlessRemoved`],
+    /// so a re-encode of a related field or a removal of the fragment still
+    /// leaves the segment alone. Call it once per schema the ids may be
+    /// resolved in; a field missing from `schema` keeps only its own id.
+    pub fn with_field_ancestry(mut self, schema: &Schema) -> Self {
+        let dependencies: Vec<(u64, i32)> = self
+            .claims
+            .iter()
+            .filter_map(|(coordinate, mode)| match (coordinate, mode) {
+                (Coordinate::FieldData { fragment, field }, Mode::RequiresUnlessRemoved) => {
+                    Some((*fragment, *field))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut related: HashMap<i32, Vec<i32>> = HashMap::new();
+        for (fragment, field) in dependencies {
+            let related = related
+                .entry(field)
+                .or_insert_with(|| containing_and_nested_fields(schema, field));
+            for related in related.iter().copied() {
+                self.claim(
+                    Coordinate::FieldData {
+                        fragment,
+                        field: related,
+                    },
+                    Mode::RequiresUnlessRemoved,
+                );
+            }
+        }
         self
     }
 
@@ -746,6 +784,28 @@ fn committed_field(reference: FieldRef) -> Option<i32> {
     reference.committed().filter(|id| *id >= 0)
 }
 
+/// The ids of the fields `id` is nested in or contains in `schema`, itself
+/// excluded: the relation [`field_affects_index`] tests, enumerated.
+///
+/// [`field_affects_index`]: crate::format::overlay::staleness::field_affects_index
+fn containing_and_nested_fields(schema: &Schema, id: i32) -> Vec<i32> {
+    fn collect_descendants(field: &Field, ids: &mut Vec<i32>) {
+        for child in &field.children {
+            ids.push(child.id);
+            collect_descendants(child, ids);
+        }
+    }
+    let Some(ancestry) = schema.field_ancestry_by_id(id) else {
+        return Vec::new();
+    };
+    let Some((field, ancestors)) = ancestry.split_last() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<i32> = ancestors.iter().map(|ancestor| ancestor.id).collect();
+    collect_descendants(field, &mut ids);
+    ids
+}
+
 fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {
     fragments
         .into_iter()
@@ -753,6 +813,8 @@ fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64>
         .collect()
 }
 
+/// Fields are compared by id alone; see [`Footprint::with_field_ancestry`] for
+/// relating an index's fields to the fields they are nested in or contain.
 impl From<&CompositeOperation> for Footprint {
     fn from(composite_operation: &CompositeOperation) -> Self {
         let mut footprint = Self::default();

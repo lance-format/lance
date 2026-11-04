@@ -66,11 +66,13 @@ pub struct TransactionRebase<'a> {
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
-    /// child's id).
+    /// child's id). Also loaded for an action set, whose footprints relate
+    /// fields through it.
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// so a concurrent `Merge` can be told which columns it rewrote in place
-    /// and which fields it removed or retyped.
+    /// and which fields it removed or retyped. The schema is also kept for an
+    /// action set, whose footprints relate fields through it.
     read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
@@ -266,8 +268,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
+                let is_composite =
+                    matches!(transaction.operation, Operation::CompositeOperation(_));
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());
-                let read_schema = is_create_index.then(|| dataset.schema().clone());
+                let read_schema =
+                    (is_create_index || is_composite).then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
                         if new_indices
@@ -548,6 +553,10 @@ impl<'a> TransactionRebase<'a> {
     }
 
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
+        if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
+            self.current_schema = Some(dataset.schema().clone());
+            return Ok(());
+        }
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
@@ -776,7 +785,19 @@ impl<'a> TransactionRebase<'a> {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         };
 
-        if Footprint::from(ours).conflicts_with(&Footprint::from(theirs)) {
+        // Field ids only nest one way for good, so resolving them in both the
+        // read and the latest schema finds every relation either side named:
+        // a child added since the read, or a field dropped since.
+        let schemas = [self.read_schema.as_ref(), self.current_schema.as_ref()];
+        let footprint = |operation| {
+            schemas
+                .iter()
+                .flatten()
+                .fold(Footprint::from(operation), |footprint, schema| {
+                    footprint.with_field_ancestry(schema)
+                })
+        };
+        if footprint(ours).conflicts_with(&footprint(theirs)) {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
         Ok(())
