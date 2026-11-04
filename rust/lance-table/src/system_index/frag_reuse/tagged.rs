@@ -163,8 +163,8 @@ impl FriImpl for TaggedHistory {
 
     fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
         Err(Error::not_supported(
-            "a tagged fragment reuse history cannot describe a table with stable row IDs, which \
-             supports only index_version 0",
+            "the table requires a tagged fragment reuse history, which cannot describe a table \
+             with stable row IDs: such a table supports only index_version 0",
         ))
     }
 
