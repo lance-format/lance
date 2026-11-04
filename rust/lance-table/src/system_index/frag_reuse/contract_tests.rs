@@ -29,7 +29,7 @@ use super::history::{
 };
 use super::mapping::{MappingRef, MappingSource, translate_stable_partition};
 use super::plan::{
-    Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary,
+    Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary, TranslationPlan,
     TranslationSupport,
 };
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
@@ -1136,6 +1136,50 @@ async fn bound_plan_translates_through_mixed_mappings(
         remapper.translate_fragments(&RoaringBitmap::from_iter([0])),
         RoaringBitmap::from_iter([2, 3])
     );
+}
+
+/// Following a tagged history to the live fragments stops at the first
+/// live fragment on an address's path, even one a later transition
+/// consumes. A version 0 history binds the frozen remap released readers
+/// applied, which follows every recorded move whatever is live (the NGram
+/// merge of a version 0 table relies on that).
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy, 2)]
+#[case::tagged(HistoryFormat::Tagged, 1)]
+#[tokio::test]
+async fn following_stops_at_a_live_source_only_under_tagged(
+    #[case] format: HistoryFormat,
+    #[case] reached: u64,
+) {
+    let history = record_natively(
+        FragReuseHistory::empty(format),
+        REWRITE_VERSION,
+        &[whole(0, 1)],
+        &[(1, 1)],
+    );
+    let history = record_natively(history, REWRITE_VERSION + 1, &[whole(1, 1)], &[(2, 1)]);
+    let follow = |live: &[u32]| {
+        TranslationPlan::following(&history, &live.iter().copied().collect())
+            .bind(Arc::new(InMemoryMappings::default()))
+    };
+
+    let mut addrs = vec![Some(address(0, 0)), Some(address(1, 0))];
+    follow(&[1, 2])
+        .translate_in_place(&mut addrs)
+        .await
+        .unwrap();
+    assert_eq!(addrs, [Some(address(reached, 0)); 2]);
+
+    let mut addrs = vec![Some(address(0, 0)), Some(address(1, 0))];
+    follow(&[2]).translate_in_place(&mut addrs).await.unwrap();
+    assert_eq!(addrs, [Some(address(2, 0)); 2]);
+
+    if let Some(remap) = history.legacy_compact_index() {
+        assert_eq!(
+            remap.unwrap().remap_row_id(address(0, 0)),
+            Some(address(2, 0))
+        );
+    }
 }
 
 /// How a reader translates `addrs`, stored by `segment`, under `history`:
