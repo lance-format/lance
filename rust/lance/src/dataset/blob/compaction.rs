@@ -9,13 +9,11 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::Field;
-use lance_core::datatypes::BlobKind;
-use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 
-use super::locate::{BlobV2DescriptorColumns, BlobV2ReadContext, resolve_managed_base_id};
+use super::locate::{BlobLocator, StoredBlob};
 use crate::Dataset;
 use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange};
 
@@ -68,66 +66,61 @@ impl SidecarRewrite {
                 "Blob descriptor and source row counts differ",
             ));
         }
-        let columns = BlobV2DescriptorColumns::new(values);
-        let mut context = BlobV2ReadContext::new(dataset, field_id);
+        let mut locator = BlobLocator::new(dataset, field_id);
         let mut builder = BlobDescriptorArrayBuilder::new_with_metadata(
             field.name(),
             field.is_nullable(),
             field.metadata().clone(),
         );
-        for (row, row_addr) in rows.iter().enumerate() {
-            if columns.is_null_blob(row) {
+        for (row, row_addr) in rows.iter().copied().enumerate() {
+            let Some(blob) = StoredBlob::parse(values, row)? else {
                 builder.push_null()?;
                 continue;
-            }
-            match BlobKind::try_from(columns.kinds.value(row))? {
-                kind @ (BlobKind::Packed | BlobKind::Dedicated) => {
-                    let location = context.blob_read_location(*row_addr).await?;
-                    let path = blob_path(
-                        &location.data_file_dir,
-                        &location.data_file_key,
-                        columns.blob_ids.value(row),
-                    );
+            };
+            match blob {
+                StoredBlob::Packed { blob_id, .. } | StoredBlob::Dedicated { blob_id, .. } => {
+                    let base_id = locator.sidecar(row_addr, blob_id)?.0;
+                    let file = locator.locate(&blob, row_addr).await?;
                     let id = self.register(
-                        location.base_id,
+                        base_id,
                         Source {
-                            store: location.object_store,
-                            path,
+                            store: file.source.object_store.clone(),
+                            path: file.source.path.clone(),
                         },
                     )?;
-                    if kind == BlobKind::Packed {
+                    if matches!(blob, StoredBlob::Dedicated { .. }) {
+                        builder.push_dedicated(id, file.size)?;
+                    } else {
                         builder.push_packed(
                             id,
                             BlobRange {
-                                offset: columns.positions.value(row),
-                                size: columns.sizes.value(row),
+                                offset: file.position,
+                                size: file.size,
                             },
                         )?;
-                    } else {
-                        builder.push_dedicated(id, columns.sizes.value(row))?;
                     }
                 }
-                BlobKind::Inline => {
-                    let file = context.collect_inline(&columns, row, *row_addr).await?;
+                StoredBlob::Empty | StoredBlob::Inline { .. } => {
+                    let file = locator.locate(&blob, row_addr).await?;
                     builder.push_inline(file.read().await?)?;
                 }
-                BlobKind::External => builder.push(BlobDescriptor::External {
-                    base_id: columns.blob_ids.value(row),
-                    uri: columns.blob_uris.value(row).to_string(),
-                    offset: columns.positions.value(row),
-                    size: columns.sizes.value(row),
+                StoredBlob::External {
+                    base_id,
+                    uri,
+                    position,
+                    size,
+                } => builder.push(BlobDescriptor::External {
+                    base_id,
+                    uri: uri.to_string(),
+                    offset: position,
+                    size,
                 })?,
-                BlobKind::Managed | BlobKind::ManagedWithBase => {
+                StoredBlob::Managed { base_id, .. } => {
                     // A clone can retain Managed descriptors after the schema's
-                    // write opt-in is removed. Copy those ranges into ordinary
-                    // packed objects rather than changing the write capability.
-                    let file = context.collect_managed(&columns, row, *row_addr).await?;
-                    let base = resolve_managed_base_id(
-                        dataset,
-                        field_id,
-                        *row_addr,
-                        columns.managed_base_id(row),
-                    )?;
+                    // write opt-in is removed. Stream those ranges into ordinary
+                    // packs rather than changing the write capability.
+                    let base = locator.managed_base(base_id, row_addr)?;
+                    let file = locator.locate(&blob, row_addr).await?;
                     let id = self.register(
                         base,
                         Source {
