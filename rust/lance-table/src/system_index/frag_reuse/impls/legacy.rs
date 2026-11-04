@@ -237,6 +237,63 @@ pub(super) fn is_caught_up_with_version(
     Ok(true)
 }
 
+/// Where the live segments stand with one compaction version under the
+/// version 0 cleanup rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VersionNeed {
+    /// Every segment is caught up with the version.
+    CaughtUp,
+    /// Some segment still translates through the version.
+    Needed,
+    /// Some segment covers part of one of its rewrite groups, which only a
+    /// corrupted version records. Outranks [`Self::Needed`].
+    Corrupt,
+}
+
+/// Every fragment `versions` touch, sources and destinations: the chain
+/// [`is_caught_up_with_version`]'s disjointness rule is scoped to.
+pub(super) fn version_chain<'a>(
+    versions: impl IntoIterator<Item = &'a pb::Version>,
+) -> RoaringBitmap {
+    let mut chain = RoaringBitmap::new();
+    for version in versions {
+        for group in &version.groups {
+            chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
+            chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
+        }
+    }
+    chain
+}
+
+/// How the segments of `live` stand with `version`, warning about every
+/// segment whose state cannot be determined, as the v0 cleanup always has.
+pub(super) fn version_need(
+    version: &pb::Version,
+    live: &[Vec<SegmentSummary>],
+    chain: &RoaringBitmap,
+) -> VersionNeed {
+    let mut need = VersionNeed::CaughtUp;
+    for segment in live.iter().flatten() {
+        warn_missing_bitmap(segment, version.dataset_version);
+        match is_caught_up_with_version(
+            version.dataset_version,
+            version
+                .groups
+                .iter()
+                .map(|group| group.old_fragments.iter().map(|digest| digest.id).collect()),
+            segment.fragment_bitmap.as_ref(),
+            segment.dataset_version,
+            chain,
+        ) {
+            Ok(true) => {}
+            Ok(false) if need == VersionNeed::CaughtUp => need = VersionNeed::Needed,
+            Ok(false) => {}
+            Err(_) => need = VersionNeed::Corrupt,
+        }
+    }
+    need
+}
+
 impl LegacyHistory {
     fn translation(&self) -> &Arc<LegacyRemapper> {
         self.1
@@ -360,13 +417,7 @@ impl FriImpl for LegacyHistory {
     /// applies; a version the segment covers part of a group of is never
     /// caught up with.
     fn is_caught_up(&self, _entry_version: u64, segment: &SegmentSummary) -> bool {
-        let mut chain = RoaringBitmap::new();
-        for version in self.versions() {
-            for group in &version.groups {
-                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
-                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
-            }
-        }
+        let chain = version_chain(self.versions());
         self.versions().all(|version| {
             matches!(
                 is_caught_up_with_version(
@@ -403,40 +454,20 @@ impl FriImpl for LegacyHistory {
     /// caught up with it, and dropped when some segment covers part of one
     /// of its groups (only a corrupted version records that). The kept
     /// versions are repaired as a committed history is.
+    ///
+    /// When a version goes, only the kept compaction versions are written,
+    /// so a record this build cannot interpret is dropped: the released
+    /// cleanup decoded the versions with prost and re-encoded them. This is
+    /// cleanup, not a caller-proposed rewrite, so the rule that a proposal
+    /// carries such records byte for byte does not apply.
     fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
         let versions: Vec<&pb::Version> = self.versions().collect();
-        let mut chain = RoaringBitmap::new();
-        for version in &versions {
-            for group in &version.groups {
-                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
-                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
-            }
-        }
-        let mut retained = Vec::with_capacity(versions.len());
-        for &version in &versions {
-            let mut caught_up = true;
-            let mut corrupt = false;
-            for segment in live.iter().flatten() {
-                warn_missing_bitmap(segment, version.dataset_version);
-                match is_caught_up_with_version(
-                    version.dataset_version,
-                    version
-                        .groups
-                        .iter()
-                        .map(|group| group.old_fragments.iter().map(|digest| digest.id).collect()),
-                    segment.fragment_bitmap.as_ref(),
-                    segment.dataset_version,
-                    &chain,
-                ) {
-                    Ok(true) => {}
-                    Ok(false) => caught_up = false,
-                    Err(_) => corrupt = true,
-                }
-            }
-            if !corrupt && !caught_up {
-                retained.push(version.clone());
-            }
-        }
+        let chain = version_chain(versions.iter().copied());
+        let retained: Vec<pb::Version> = versions
+            .iter()
+            .filter(|version| version_need(version, live, &chain) == VersionNeed::Needed)
+            .map(|&version| version.clone())
+            .collect();
         if retained.len() == versions.len() {
             return Ok(self);
         }

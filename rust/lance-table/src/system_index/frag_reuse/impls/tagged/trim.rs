@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use roaring::RoaringBitmap;
 
 use super::super::StoredRecord;
-use super::super::legacy::{is_caught_up_with_version, warn_missing_bitmap};
+use super::super::legacy::{VersionNeed, version_chain, version_need};
 use crate::format::pb::fragment_reuse_index_details as pb;
 use crate::system_index::frag_reuse::history::Record;
 use crate::system_index::frag_reuse::plan::{SegmentSummary, TranslationSupport};
@@ -52,21 +52,18 @@ fn is_transition_needed(transition: &pb::Transition, groups: &[GroupCoverage]) -
 /// closes the set forward: a retained record's translation path walks
 /// through every downstream consumer of its destinations, so those records
 /// survive too. Legacy versions retain at whole-version granularity (their
-/// groups stand or fall together, as in v0). Every record must be
-/// interpretable; the caller refuses a history that is not.
+/// groups stand or fall together, as in v0). The caller refuses a history
+/// holding a record it cannot interpret, so such a record is only kept
+/// defensively here: it is never dropped, but neither does it pin anything
+/// downstream, since its lineage is unknown.
 pub(super) fn retention(records: &[StoredRecord], live: &[Vec<SegmentSummary>]) -> Vec<bool> {
     // The v0 predicate's disjointness rule is scoped to the legacy chain, as
     // in v0: an index touching only tagged-transition fragments holds nothing
     // a legacy version remaps.
-    let mut legacy_chain = RoaringBitmap::new();
-    for stored in records {
-        if let Record::LegacyVersion(version) = &stored.record {
-            for group in &version.groups {
-                legacy_chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
-                legacy_chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
-            }
-        }
-    }
+    let legacy_chain = version_chain(records.iter().filter_map(|stored| match &stored.record {
+        Record::LegacyVersion(version) => Some(version),
+        _ => None,
+    }));
     let groups: Vec<GroupCoverage> = live
         .iter()
         .map(|segments| {
@@ -86,28 +83,9 @@ pub(super) fn retention(records: &[StoredRecord], live: &[Vec<SegmentSummary>]) 
     let mut retained = vec![false; records.len()];
     for (position, stored) in records.iter().enumerate() {
         retained[position] = match &stored.record {
+            // A corrupt version is not retained (v0 behavior).
             Record::LegacyVersion(version) => {
-                let mut caught_up = true;
-                let mut corrupt = false;
-                for segment in live.iter().flatten() {
-                    warn_missing_bitmap(segment, version.dataset_version);
-                    match is_caught_up_with_version(
-                        version.dataset_version,
-                        version.groups.iter().map(|group| {
-                            group.old_fragments.iter().map(|digest| digest.id).collect()
-                        }),
-                        segment.fragment_bitmap.as_ref(),
-                        segment.dataset_version,
-                        &legacy_chain,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => caught_up = false,
-                        Err(_) => corrupt = true,
-                    }
-                }
-                // A version some segment covers part of a group of is
-                // likely corrupt: it is not retained (v0 behavior).
-                !corrupt && !caught_up
+                version_need(version, live, &legacy_chain) == VersionNeed::Needed
             }
             Record::Transition(transition) => is_transition_needed(transition, &groups),
             Record::Uninterpretable { .. } => true,

@@ -18,7 +18,7 @@ use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
 use super::legacy::{
-    is_caught_up_with_version, repair_versions, warn_dropped_versions, warn_missing_bitmap,
+    VersionNeed, repair_versions, version_chain, version_need, warn_dropped_versions,
 };
 use super::{FriImpl, Records};
 use crate::format::pb::fragment_reuse_index_details as pb;
@@ -93,7 +93,9 @@ impl FriImpl for LegacySridHistory {
     /// Only the oldest versions are removed, up to the first one a segment
     /// is not caught up with, and every later version is kept as it is: an
     /// address a kept version maps still translates through every later
-    /// recorded move.
+    /// recorded move. As in the address cleanup, a trim that removes a
+    /// version writes only the kept compaction versions, dropping records
+    /// this build cannot interpret.
     fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
         let versions: Vec<pb::Version> = self
             .0
@@ -105,32 +107,13 @@ impl FriImpl for LegacySridHistory {
                 _ => None,
             })
             .collect();
-        let mut chain = RoaringBitmap::new();
-        for version in &versions {
-            for group in &version.groups {
-                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
-                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
-            }
-        }
+        let chain = version_chain(&versions);
+        // Unlike the address cleanup, a corrupt version is not dropped: no
+        // segment's state with it can be proven, so it ends the removable
+        // prefix like a needed one.
         let trimmed = versions
             .iter()
-            .position(|version| {
-                live.iter().flatten().any(|segment| {
-                    warn_missing_bitmap(segment, version.dataset_version);
-                    !matches!(
-                        is_caught_up_with_version(
-                            version.dataset_version,
-                            version.groups.iter().map(|group| {
-                                group.old_fragments.iter().map(|digest| digest.id).collect()
-                            }),
-                            segment.fragment_bitmap.as_ref(),
-                            segment.dataset_version,
-                            &chain,
-                        ),
-                        Ok(true)
-                    )
-                })
-            })
+            .position(|version| version_need(version, live, &chain) != VersionNeed::CaughtUp)
             .unwrap_or(versions.len());
         if trimmed == 0 {
             return Ok(self);
