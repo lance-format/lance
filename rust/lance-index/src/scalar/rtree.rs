@@ -1775,7 +1775,7 @@ mod tests {
         // The row holding the infinite coordinate must be found too.
         let query = BoundingBox::new_with_rect(&Rect::new(
             coord! { x: -5.0, y: 1.0 },
-            coord! { x: 0.0, y: 2.0 },
+            coord! { x: -1.0, y: 2.0 },
         ));
         let mut expected = RowAddrTreeMap::new();
         expected.insert(0);
