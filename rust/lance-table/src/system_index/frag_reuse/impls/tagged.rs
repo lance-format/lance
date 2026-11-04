@@ -522,6 +522,7 @@ mod tests {
     use crate::system_index::frag_reuse::history::{FragReuseHistory, RawHistory};
     use crate::system_index::frag_reuse::ledger::Mapping;
     use crate::system_index::frag_reuse::plan::RowDomain;
+    use lance_core::utils::stable_partition::CountsMatrix;
 
     #[test]
     fn appended_transitions_are_validated_against_the_whole_lineage() {
@@ -538,6 +539,74 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("duplicate consumer"), "{error}");
+    }
+
+    /// Ordered compactions read no row map.
+    #[derive(Debug)]
+    struct NoRowMaps;
+
+    #[async_trait::async_trait]
+    impl MappingSource for NoRowMaps {
+        async fn counts(&self, mapping: &MappingRef) -> Result<Arc<CountsMatrix>> {
+            Err(Error::internal(format!("unexpected row map {mapping:?}")))
+        }
+
+        async fn read(
+            &self,
+            mapping: &MappingRef,
+            _rows: std::ops::Range<u64>,
+        ) -> Result<arrow_array::UInt16Array> {
+            Err(Error::internal(format!("unexpected row map {mapping:?}")))
+        }
+    }
+
+    /// A path that enters a fragment a sibling segment covers belongs to the
+    /// sibling: the address is dropped there, even when the path continues
+    /// into this segment's coverage. An address already in an excluded
+    /// fragment is still translated, since a projected bitmap may name it.
+    #[tokio::test]
+    async fn paths_into_a_sibling_fragment_are_dropped() {
+        // 0 -> 1 -> 2 -> 3, with fragment 9 never rewritten.
+        let mut history = FragReuseHistory::empty(HistoryFormat::Tagged);
+        for (version, (source, destination)) in [(0, 1), (1, 2), (2, 3)].into_iter().enumerate() {
+            history = history
+                .append(RewriteRecord::new(
+                    version as u64 + 1,
+                    vec![ordered(&[whole(source, 2)], &[(destination, 2)])],
+                ))
+                .unwrap();
+        }
+        let remapper = Remapper::from_backing(Arc::new(TaggedRemapper {
+            ledger: history.ledger().clone(),
+            coverage: RoaringBitmap::from_iter([3, 9]),
+            excluded: RoaringBitmap::from_iter([2]),
+            stops: RoaringBitmap::new(),
+            mappings: Arc::new(NoRowMaps),
+        }));
+        let address = |fragment| u64::from(RowAddress::new_from_parts(fragment, 1));
+
+        let mut addrs = [0, 1, 2, 3, 9].map(|fragment| Some(address(fragment)));
+        remapper.translate_in_place(&mut addrs).await.unwrap();
+        assert_eq!(
+            addrs,
+            [
+                None,
+                None,
+                Some(address(3)),
+                Some(address(3)),
+                Some(address(9))
+            ]
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([0, 1])),
+            RoaringBitmap::new()
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([2, 9])),
+            RoaringBitmap::from_iter([3, 9])
+        );
+        assert!(remapper.fragment_needs_translation(2));
+        assert!(!remapper.fragment_needs_translation(3));
     }
 
     #[test]
