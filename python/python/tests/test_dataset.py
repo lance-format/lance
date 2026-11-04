@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import copy
 import importlib
 import json
 import os
@@ -18,6 +19,7 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional
 from unittest import mock
 
@@ -39,6 +41,7 @@ from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
+from lance.indices import IndexConfig
 from lance.schema import LanceSchema
 from lance.util import sanitize_ts, validate_vector_index
 
@@ -3884,6 +3887,201 @@ def test_merge_insert_defaults_to_pk_when_on_omitted(tmp_path):
     assert result.to_pydict() == {"id": [1, 2, 3, 4], "value": [10, 200, 300, 400]}
 
 
+def test_merge_insert_inserted_rows_filter(tmp_path):
+    base_dir = tmp_path / "merge_insert_inserted_rows_filter"
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
+    )
+    dataset.merge_insert("id").when_not_matched_insert_all().execute(
+        pa.table({"id": [2, 4], "value": [21, 40]}, schema=schema)
+    )
+
+    txn = dataset.read_transaction(dataset.version)
+    inserted = txn.operation.inserted_rows_filter
+    assert inserted is not None
+    assert inserted.kind == "bloom"
+    assert len(inserted.field_ids) == 1
+    assert len(inserted.payload) % 32 == 0
+    assert inserted.number_of_items is not None
+    assert inserted.probability is not None
+    assert inserted.might_contain(pa.array([4, None], type=pa.int32())) == [
+        True,
+        False,
+    ]
+    assert inserted.might_contain(pa.record_batch({"id": [4, None]})) == [True, False]
+    assert inserted.might_contain(pa.table({"id": [4, None]})) == [True, False]
+
+    recommitted = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.Update(inserted_rows_filter=inserted),
+        read_version=dataset.version,
+    )
+    round_trip = recommitted.read_transaction(recommitted.version)
+    restored = round_trip.operation.inserted_rows_filter
+    assert restored is not None
+    assert restored.kind == "bloom"
+    assert restored.field_ids == inserted.field_ids
+    assert restored.payload == inserted.payload
+    assert restored.number_of_items == inserted.number_of_items
+    assert restored.probability == inserted.probability
+    assert restored.might_contain(pa.array([4, None], type=pa.int32())) == [
+        True,
+        False,
+    ]
+
+
+@pytest.mark.parametrize("transport", ["pickle", "deepcopy"])
+def test_inserted_rows_filter_transport(tmp_path, transport):
+    base_dir = tmp_path / f"inserted_rows_filter_{transport}"
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
+    )
+    txn, _ = (
+        dataset.merge_insert("id")
+        .when_not_matched_insert_all()
+        .execute_uncommitted(pa.table({"id": [4], "value": [40]}, schema=schema))
+    )
+
+    if transport == "pickle":
+        restored_txn = pickle.loads(pickle.dumps(txn))
+    else:
+        restored_txn = copy.deepcopy(txn)
+
+    original = txn.operation.inserted_rows_filter
+    restored = restored_txn.operation.inserted_rows_filter
+    assert original is not None
+    assert restored is not None
+    assert restored is not original
+    assert restored.field_ids == original.field_ids
+    assert restored.kind == original.kind
+    assert restored.payload == original.payload
+    assert restored.number_of_items == original.number_of_items
+    assert restored.probability == original.probability
+    assert restored.might_contain(pa.table({"id": [4, None]})) == [True, False]
+
+
+def test_inserted_rows_filter_preserves_bloom_config(tmp_path):
+    base_dir = tmp_path / "inserted_rows_filter_bloom_config"
+    dataset = lance.write_dataset(pa.table({"value": [1, 2]}), base_dir)
+    payload = b"\x00" * 32
+    state = SimpleNamespace(
+        field_ids=[0],
+        kind="bloom",
+        payload=payload,
+        num_bits=len(payload) * 8,
+        number_of_items=123,
+        probability=0.01,
+    )
+
+    committed = lance.LanceDataset.commit(
+        dataset,
+        lance.LanceOperation.Update(inserted_rows_filter=state),
+        read_version=dataset.version,
+    )
+    restored = committed.read_transaction(
+        committed.version
+    ).operation.inserted_rows_filter
+    assert restored is not None
+    assert restored.payload == payload
+
+    transported = pickle.loads(pickle.dumps(restored))
+    assert transported.payload == payload
+    assert transported.number_of_items == 123
+    assert transported.probability == 0.01
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "error"),
+    [
+        ("bloom", b"", "must not be empty"),
+        ("bloom", b"\x00" * 31, "multiple of 32"),
+        ("exact", b"\x00" * 9, "multiple of 8"),
+    ],
+)
+def test_inserted_rows_filter_rejects_invalid_payload(tmp_path, kind, payload, error):
+    dataset = lance.write_dataset(
+        pa.table({"value": [1]}), tmp_path / f"invalid_{kind}_{len(payload)}"
+    )
+    state = SimpleNamespace(field_ids=[0], kind=kind, payload=payload)
+
+    with pytest.raises(ValueError, match=error):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.Update(inserted_rows_filter=state),
+            read_version=dataset.version,
+            max_retries=0,
+        )
+
+
+def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
+    from lance.commit import CommitConflictError
+
+    base_dir = tmp_path / "inserted_rows_filter_conflict"
+    schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
+    )
+    dataset.merge_insert("id").when_not_matched_insert_all().execute(
+        pa.table({"id": [100], "value": [1]}, schema=schema)
+    )
+    assert dataset.version == 2
+
+    txn = dataset.read_transaction(dataset.version)
+    filter_state = pickle.loads(pickle.dumps(txn.operation.inserted_rows_filter))
+    fragment = lance.fragment.LanceFragment.create(
+        dataset.uri, pa.table({"id": [100], "value": [2]}, schema=schema)
+    )
+    operation = lance.LanceOperation.Update(
+        new_fragments=[fragment], inserted_rows_filter=filter_state
+    )
+
+    with pytest.raises(CommitConflictError) as exc_info:
+        lance.LanceDataset.commit(dataset.uri, operation, read_version=1, max_retries=0)
+    assert exc_info.value.retryable is True
+
+    # The same stale update succeeds without the filter, proving the failure
+    # above came from the reconstructed inserted-key conflict check.
+    committed = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.Update(new_fragments=[fragment]),
+        read_version=1,
+        max_retries=0,
+    )
+    assert committed.version == 3
+
+
 def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
     base_dir = tmp_path / "merge_insert_no_pk"
 
@@ -7314,6 +7512,89 @@ def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):
 EXPECTED_DEFAULT_STORAGE_VERSION = stable_version()
 EXPECTED_MAJOR_VERSION = int(stable_version().split(".")[0])
 EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
+
+
+def test_zone_statistics(tmp_path: Path):
+    values = [
+        1.0,
+        2.0,
+        np.nan,
+        -np.nan,
+        None,
+        None,
+        None,
+        None,
+        -5.0,
+        None,
+        5.0,
+        np.nan,
+    ]
+    table = pa.table({"x": pa.array(values, type=pa.float64()), "y": ["a"] * 12})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index(
+        "x",
+        index_type=IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 4}),
+        name="x_zonemap",
+    )
+    dataset.create_scalar_index("y", index_type="BTREE", name="y_btree")
+
+    zones = dataset.stats.zone_statistics("x_zonemap")
+    assert zones.column_names == [
+        "min",
+        "max",
+        "null_count",
+        "nan_count",
+        "negative_nan_count",
+        "fragment_id",
+        "zone_start",
+        "zone_length",
+    ]
+    assert zones.schema.metadata[b"rows_per_zone"] == b"4"
+    assert zones.schema.field("negative_nan_count").nullable
+    assert zones["min"].to_pylist() == [1.0, None, -5.0]
+    assert zones["max"].to_pylist() == [2.0, None, 5.0]
+    assert zones["null_count"].to_pylist() == [0, 4, 1]
+    assert zones["nan_count"].to_pylist() == [2, 0, 1]
+    assert zones["negative_nan_count"].to_pylist() == [1, 0, 0]
+    assert zones["fragment_id"].to_pylist() == [0, 0, 0]
+    assert zones["zone_start"].to_pylist() == [0, 4, 8]
+    assert zones["zone_length"].to_pylist() == [4, 4, 4]
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.zone_statistics("missing")
+    with pytest.raises(ValueError, match="not a ZoneMap"):
+        dataset.stats.zone_statistics("y_btree")
+
+
+def test_zone_statistics_multi_segment(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"x": pa.array(range(8), type=pa.float64())}),
+        tmp_path,
+        max_rows_per_file=4,
+    )
+    fragments = dataset.get_fragments()
+    segments = [
+        dataset.create_index_uncommitted(
+            "x",
+            IndexConfig(
+                index_type="zonemap", parameters={"rows_per_zone": rows_per_zone}
+            ),
+            name="x_zonemap",
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment, rows_per_zone in zip(fragments, [2, 4])
+    ]
+    dataset = dataset.commit_existing_index_segments("x_zonemap", "x", segments)
+
+    zones = dataset.stats.zone_statistics("x_zonemap")
+
+    assert zones["fragment_id"].to_pylist() == [0, 0, 1]
+    assert zones["zone_start"].to_pylist() == [0, 2, 0]
+    assert zones["zone_length"].to_pylist() == [2, 2, 4]
+    assert zones["negative_nan_count"].to_pylist() == [0, 0, 0]
+    assert (
+        zones.schema.metadata is None or b"rows_per_zone" not in zones.schema.metadata
+    )
 
 
 def test_stats(tmp_path: Path):

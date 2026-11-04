@@ -52,20 +52,13 @@ rand_xoshiro = { workspace = true }
 proptest.workspace = true
 serial_test.workspace = true
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [features]
 default = ["lz4", "zstd", "bitpacking"]
-protoc = ["dep:protobuf-src"]
+# Retained for compatibility; protobuf sources are now checked in.
+protoc = []
 bitpacking = ["dep:lance-bitpacking"]
 lz4 = ["dep:lz4"]
 zstd = ["dep:zstd"]
-
-[package.metadata.docs.rs]
-# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
-features = ["protoc"]
 
 [package.metadata.cargo-machete]
 ignored = ["prost"]
