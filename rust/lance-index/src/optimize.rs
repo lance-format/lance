@@ -93,12 +93,9 @@ pub struct OptimizeOptions {
     /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
     /// re-encoding tasks, but fragments are indivisible and must fit that bound.
     pub max_rows_to_consolidate: Option<u64>,
-    /// Consolidate these segments of one vector index instead of the newest
-    /// ones. They are re-encoded into one segment with the model of the
-    /// newest live segment, dropping deleted rows; a source trained on a
-    /// different distribution can lose recall under that model. Reading more
-    /// than `max_rows_to_consolidate` rows is an error. Default: unset.
-    pub consolidate_segments: Option<Vec<Uuid>>,
+    /// Consolidate these segments of one vector index instead of a bounded
+    /// suffix; set with [`Self::consolidate_selected`]. Default: unset.
+    pub segments_to_consolidate: Option<Vec<Uuid>>,
 }
 
 impl Default for OptimizeOptions {
@@ -113,7 +110,7 @@ impl Default for OptimizeOptions {
             max_rows_per_task: None,
             max_rows_per_segment: None,
             max_rows_to_consolidate: None,
-            consolidate_segments: None,
+            segments_to_consolidate: None,
         }
     }
 }
@@ -146,6 +143,22 @@ impl OptimizeOptions {
     pub fn consolidate(max_rows: u64) -> Self {
         Self {
             max_rows_to_consolidate: Some(max_rows),
+            ..Default::default()
+        }
+    }
+
+    /// Consolidate the named segments of one vector index, wherever they sit,
+    /// without training.
+    ///
+    /// They are re-encoded into one segment with the model of the newest live
+    /// segment, dropping deleted rows; a source trained on a different
+    /// distribution can lose recall under that model. The selection is not
+    /// bounded by a row budget, and segments the index no longer has are
+    /// skipped.
+    pub fn consolidate_selected(index_name: impl Into<String>, segments: Vec<Uuid>) -> Self {
+        Self {
+            index_names: Some(vec![index_name.into()]),
+            segments_to_consolidate: Some(segments),
             ..Default::default()
         }
     }
@@ -200,12 +213,6 @@ impl OptimizeOptions {
     /// Bound the rows one committed segment holds.
     pub fn max_rows_per_segment(mut self, rows: Option<u64>) -> Self {
         self.max_rows_per_segment = rows;
-        self
-    }
-
-    /// See [`Self::consolidate_segments`].
-    pub fn consolidate_segments(mut self, segments: Vec<Uuid>) -> Self {
-        self.consolidate_segments = Some(segments);
         self
     }
 }

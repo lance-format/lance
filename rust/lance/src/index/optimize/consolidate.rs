@@ -6,24 +6,28 @@
 use super::*;
 use crate::dataset::fragment::FileFragment;
 
+pub(super) fn requested(options: &OptimizeOptions) -> bool {
+    options.max_rows_to_consolidate.is_some() || options.segments_to_consolidate.is_some()
+}
+
 pub(super) fn validate_options(options: &OptimizeOptions) -> Result<()> {
-    if let Some(selected) = &options.consolidate_segments
+    if let Some(selected) = &options.segments_to_consolidate
         && (selected.is_empty()
             || selected.iter().collect::<HashSet<_>>().len() != selected.len()
             || options
                 .index_names
                 .as_ref()
                 .is_none_or(|names| names.len() != 1)
-            || options.max_rows_to_consolidate.is_none())
+            || options.max_rows_to_consolidate.is_some())
     {
         return Err(Error::invalid_input(
-            "consolidate_segments requires distinct segments, exactly one index name, and a row budget",
+            "a segment selection needs distinct segments and exactly one index name, and takes no row budget",
         ));
     }
-    let Some(budget) = options.max_rows_to_consolidate else {
+    if !requested(options) {
         return Ok(());
-    };
-    if budget == 0
+    }
+    if options.max_rows_to_consolidate == Some(0)
         || options.max_rows_per_task == Some(0)
         || options.retrain
         || options.enable_partition_rebalancing
@@ -44,9 +48,8 @@ pub(super) async fn plan_index(
     options: &OptimizeOptions,
     tagged: bool,
 ) -> Result<()> {
-    let budget = options
-        .max_rows_to_consolidate
-        .expect("consolidation requested");
+    // A selection is not bounded: the caller chose the work.
+    let budget = options.max_rows_to_consolidate.unwrap_or(u64::MAX);
     let named = options.index_names.is_some();
     let reference = segments.last().expect("nonempty index");
     if !segment_has_vector_details(reference) || tagged {
@@ -58,7 +61,7 @@ pub(super) async fn plan_index(
         return Ok(());
     }
     let (field_path, _) = index_field_path(dataset, reference).await?;
-    let explicit = options.consolidate_segments.as_ref();
+    let explicit = options.segments_to_consolidate.as_ref();
     let candidates = match explicit {
         Some(uuids) => {
             let found = segments
@@ -76,12 +79,6 @@ pub(super) async fn plan_index(
             found
         }
         None => segments.to_vec(),
-    };
-    // A selection over the budget is an error, not a shorter selection.
-    let over_budget = || {
-        Error::invalid_input(format!(
-            "the selected segments hold more than the consolidation budget of {budget} rows"
-        ))
     };
     let mut selected = Vec::new();
     let mut pairs = Vec::new();
@@ -109,9 +106,6 @@ pub(super) async fn plan_index(
             }
         }
         if segment_rows > budget - rows {
-            if explicit.is_some() {
-                return Err(over_budget());
-            }
             break;
         }
         let index = dataset
@@ -127,9 +121,6 @@ pub(super) async fn plan_index(
         // the raw fragments (including rows with null/unindexable vectors).
         let segment_rows = segment_rows.max(index.num_rows());
         if segment_rows > budget - rows {
-            if explicit.is_some() {
-                return Err(over_budget());
-            }
             break;
         }
         if index.as_any().is::<LegacyIvfIndex>() {

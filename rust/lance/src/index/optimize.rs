@@ -588,7 +588,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
-        if options.max_rows_to_consolidate.is_some() {
+        if consolidate::requested(options) {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
             continue;
         }
@@ -1394,7 +1394,7 @@ pub async fn commit_optimize_indices(
     }
     let planned = dataset_at_version(dataset, read_version).await?;
     let mut results = results;
-    let read_version = if options.max_rows_to_consolidate.is_some() {
+    let read_version = if consolidate::requested(options) {
         consolidate::validate_commit(dataset, &planned, &mut results).await?;
         if results.is_empty() {
             return Ok(());
@@ -1403,7 +1403,7 @@ pub async fn commit_optimize_indices(
     } else {
         read_version
     };
-    let committed_segments = if options.max_rows_to_consolidate.is_some() {
+    let committed_segments = if consolidate::requested(options) {
         load_all_indices(dataset).await?
     } else {
         load_all_indices(&planned).await?
