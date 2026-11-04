@@ -282,6 +282,10 @@ pub enum RowAddrTranslator {
 impl From<Remapper> for RowAddrTranslator {
     fn from(remapper: Remapper) -> Self {
         match remapper.row_addr_remap() {
+            // One copy per rewrite. A version 0 remap is compact (sized by
+            // rewrite groups and their changed-row bitmaps, not one entry per
+            // row), so sharing it behind an Arc in CompactFragReuseIndex is
+            // not worth widening that public type's internals.
             Some(remap) => Self::sync(remap.clone()),
             None => Self::Remapper(remapper),
         }

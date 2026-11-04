@@ -265,8 +265,8 @@ impl FragReuseHistory {
     /// loses the translation it records: rows an index reaches only through it
     /// are scanned instead.
     ///
-    /// Used by the version 0 cleanup in `lance`, which still edits
-    /// compaction versions directly; not part of the stable interface.
+    /// Used by `lance`'s conflict resolver, which still rebases version 0
+    /// rewrites as compaction versions; not part of the stable interface.
     #[doc(hidden)]
     pub fn repair_legacy_versions(versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
         legacy::repair_versions(versions)
@@ -401,8 +401,9 @@ impl FragReuseHistory {
 
     /// The lineage view used for translation.
     ///
-    /// Used by `lance`'s reader, cleanup and remapping until address
-    /// translation moves behind this type; not part of the stable interface.
+    /// Used by `lance`'s reader (segment coverage and translation
+    /// fingerprints), its row-map source (to resolve the bases row maps
+    /// live under) and tests; not part of the stable interface.
     #[doc(hidden)]
     pub fn ledger(&self) -> &Arc<FragReuseLedger> {
         &self.0.records().ledger
@@ -410,8 +411,8 @@ impl FragReuseHistory {
 
     /// Records in serialized order.
     ///
-    /// Used by `lance`'s version 0 cleanup and commit checks; not part of
-    /// the stable interface.
+    /// Used by `lance`'s conflict resolver to read back repaired version 0
+    /// versions; not part of the stable interface.
     #[doc(hidden)]
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.0.records().stored.iter().map(|stored| &stored.record)
@@ -420,8 +421,9 @@ impl FragReuseHistory {
     /// Whether every record is one this implementation interprets. Edits
     /// that reason about the whole history require it.
     ///
-    /// Used by `lance`'s cleanup and trim to refuse early; not part of the
-    /// stable interface.
+    /// Used by `lance`'s superseded-segment pruning, which reads coverage
+    /// through the lenient reader path and so must refuse before it
+    /// derives anything; not part of the stable interface.
     #[doc(hidden)]
     pub fn is_fully_interpretable(&self) -> bool {
         self.0.records().is_fully_interpretable()
@@ -528,6 +530,27 @@ impl FragReuseHistory {
     /// The row maps the history's records reference, which must outlive
     /// it. Refused with `NotSupported` while the history holds records this
     /// writer cannot interpret, since they may reference files too.
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// /// The row maps on disk that no retained record still reads.
+    /// fn unreferenced(
+    ///     history: &FragReuseHistory,
+    ///     row_maps_on_disk: &[String],
+    /// ) -> lance_core::Result<Vec<String>> {
+    ///     let referenced: HashSet<String> = history
+    ///         .referenced_files()?
+    ///         .iter()
+    ///         .map(|mapping| mapping.map_id().to_string())
+    ///         .collect();
+    ///     Ok(row_maps_on_disk
+    ///         .iter()
+    ///         .filter(|map_id| !referenced.contains(*map_id))
+    ///         .cloned()
+    ///         .collect())
+    /// }
+    /// ```
     pub fn referenced_files(&self) -> Result<Vec<MappingRef>> {
         self.0
             .records()
@@ -648,6 +671,44 @@ impl FragReuseHistory {
     /// [`Composition::LineageUnknown`] for a segment without a bitmap, and
     /// refuses with `NotSupported` while it holds transitions this build
     /// cannot interpret.
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use std::sync::Arc;
+    /// # use roaring::RoaringBitmap;
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// # use lance_table::system_index::frag_reuse::mapping::MappingSource;
+    /// # use lance_table::system_index::frag_reuse::plan::{
+    /// #     Composition, RewriteContext, SegmentSummary,
+    /// # };
+    /// # async fn example(
+    /// #     history: &FragReuseHistory,
+    /// #     segment: &SegmentSummary,
+    /// #     live_fragments: &RoaringBitmap,
+    /// #     entry_bitmap: &RoaringBitmap,
+    /// #     fragment_rows: &HashMap<u32, u64>,
+    /// #     mappings: Arc<dyn MappingSource>,
+    /// #     stored_addresses: &mut [Option<u64>],
+    /// # ) -> lance_core::Result<()> {
+    /// let context = RewriteContext {
+    ///     live_fragments,
+    ///     lineage: entry_bitmap,
+    ///     fragment_rows,
+    ///     served: None,
+    /// };
+    /// if let Composition::Rewrite(plan) = history.compose(&context, segment)? {
+    ///     let published = plan.published_bitmap().cloned();
+    ///     plan.bind(mappings)
+    ///         .translate_in_place(stored_addresses)
+    ///         .await?;
+    ///     // Write the translated segment, publishing `published` as its
+    ///     // fragment bitmap.
+    /// }
+    /// // Otherwise the segment is left as it is: it is caught up, or keeps
+    /// // translating through the history when read.
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn compose(
         &self,
         context: &RewriteContext,

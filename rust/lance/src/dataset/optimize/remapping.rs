@@ -287,6 +287,9 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             .find(|idx| idx.uuid == *index_id)
             .and_then(|idx| idx.fragment_bitmap.as_ref()),
     };
+    // `compose` reads only the segment's bitmap and version; whether the
+    // index kind can be rewritten is decided by the eligibility check below
+    // and by `remap_index` itself.
     let summary = SegmentSummary {
         uuid: curr_index_meta.uuid,
         fragment_bitmap: curr_index_meta.fragment_bitmap.clone(),

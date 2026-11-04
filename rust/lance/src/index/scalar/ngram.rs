@@ -204,7 +204,10 @@ pub(in crate::index) async fn open_and_merge_segments(
     let segments = segments.iter().map(|&s| s.clone()).collect::<Vec<_>>();
     let segment_stores = collect_ngram_segment_stores(dataset, &segments).await?;
     // Under a version 0 history every segment translates through the same
-    // frozen remap, whatever its coverage.
+    // frozen remap, whatever its coverage. Under a tagged history the check
+    // above refused every segment whose rows need translation, so the rest
+    // are merged as stored, as the legacy reader (which had no tagged
+    // remapper) merged them.
     let remapper = match dataset.frag_reuse_history().await? {
         Some(history) if history.format() == HistoryFormat::Legacy => {
             let mappings =

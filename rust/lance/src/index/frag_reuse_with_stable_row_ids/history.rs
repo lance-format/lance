@@ -302,6 +302,12 @@ fn trimmed_versions(
 /// one cleanup's rule ([`is_index_remap_caught_up`]) finds behind it, or that
 /// the rule cannot decide for (a rewrite group split across its coverage).
 /// `chain` is every fragment the history holding `version` touches.
+///
+/// This applies the same per-version rule as `FragReuseHistory::trim`
+/// rather than calling it: refusing a proposed trim needs to name the index
+/// that blocks each version and judge it against the history and metadata
+/// the writer read as well as the ones it publishes, to tell a caller error
+/// from a retryable race. `trim` only answers what survives.
 fn index_needing<'a>(
     version: &FragReuseVersion,
     indices: &'a [IndexMetadata],

@@ -147,6 +147,13 @@ pub struct RewriteContext<'a> {
     pub live_fragments: &'a RoaringBitmap,
     /// The FRI entry's `fragment_bitmap`, the lineage it recorded. A
     /// fragment it names that the history no longer maps lost its mapping.
+    ///
+    /// It is taken from the entry rather than derived from the history
+    /// because the two can differ: an entry this build writes names exactly
+    /// the fragments of its records, but a committed version 0 entry
+    /// [`FragReuseHistory::decode`](super::history::FragReuseHistory::decode)
+    /// repaired still names the destinations of the versions it dropped,
+    /// and entries other writers committed follow their own rule.
     pub lineage: &'a RoaringBitmap,
     /// The physical row counts of the snapshot's fragments.
     pub fragment_rows: &'a HashMap<u32, u64>,
@@ -294,7 +301,9 @@ impl TranslationPlan {
 
     /// Whether binding the plan moves any stored address. A rewrite plan
     /// that only drops coverage (a partially covered compaction leaves its
-    /// rows to the scan) changes the segment's bitmap, not its files.
+    /// rows to the scan) changes the segment's bitmap, not its files. A
+    /// version 0 rewrite always reports true: like the released remap, it
+    /// rewrites the files through the whole history.
     pub fn moves_addresses(&self) -> bool {
         self.rewrite
             .as_ref()

@@ -12,8 +12,10 @@
 //!
 //! Translation is always asynchronous, because some history formats read
 //! their mappings lazily. A format whose mappings are already in memory
-//! returns futures that are complete on first poll. Indices never learn
-//! which format produced their remapper.
+//! returns futures that are complete on first poll. Indices do not branch
+//! on the format that produced their remapper; the one thing a format may
+//! expose is its translation as a single in-memory map
+//! ([`Remapper::row_addr_remap`]), which an index rewrite applies directly.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -50,7 +52,8 @@ pub trait RemapperBacking: Send + Sync + Debug {
     }
 
     /// The memory [`Remapper::materialize`] may spend, temporary buffers and
-    /// the map together.
+    /// the map together. Kept as a seam: only test remappers override it,
+    /// to exercise the decline without a map of the default size.
     fn materialization_budget_bytes(&self) -> u64 {
         DEFAULT_MATERIALIZATION_BUDGET_BYTES
     }
@@ -118,6 +121,13 @@ impl Remapper {
 
     /// The whole translation as one in-memory map, when the backing already
     /// holds it: see [`RemapperBacking::row_addr_remap`].
+    ///
+    /// It exists so that a version 0 fragment reuse history, which decodes
+    /// into one map, is applied by an index rewrite exactly as the released
+    /// remap applied it (as a synchronous map) rather than batch by batch.
+    /// As in [`Self::materialize`]'s map, an address the map does not hold
+    /// is unchanged; unlike it, the map is not limited to any fragments and
+    /// needs no budget, since it is already in memory.
     pub fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
         self.0.row_addr_remap()
     }
@@ -173,6 +183,27 @@ impl Remapper {
     /// fragments are unknown, one that needs translation cannot be sized, or
     /// the map would exceed the budget. Translation errors propagate as they
     /// are.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_core::utils::row_addr_remap::RowAddrRemap;
+    /// # use lance_select::Remapper;
+    /// # use lance_select::remapper::RemapUnavailable;
+    /// # use roaring::RoaringBitmap;
+    /// /// The complete map for an index whose rewrite takes one, or `None`
+    /// /// when the remapper declines to build it and the index is left as
+    /// /// it is.
+    /// async fn complete_map(
+    ///     remapper: &Remapper,
+    ///     stored_fragments: &RoaringBitmap,
+    /// ) -> Result<Option<RowAddrRemap>> {
+    ///     match remapper.materialize(Some(stored_fragments)).await {
+    ///         Ok(map) => Ok(Some(map)),
+    ///         Err(error) if RemapUnavailable::from_error(&error).is_some() => Ok(None),
+    ///         Err(error) => Err(error),
+    ///     }
+    /// }
+    /// ```
     pub async fn materialize(
         &self,
         stored_fragments: Option<&RoaringBitmap>,
