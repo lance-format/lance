@@ -533,6 +533,7 @@ fn compose_chain(history: &FragReuseHistory, provenance: &[u32]) -> TranslationP
         live_fragments: &live,
         lineage: &lineage,
         fragment_rows: &rows,
+        served: None,
     };
     let segment = SegmentSummary {
         uuid: Uuid::new_v4(),
@@ -630,6 +631,7 @@ fn straddle_only_rewrite_moves_no_address() {
         live_fragments: &live,
         lineage: &lineage,
         fragment_rows: &rows,
+        served: None,
     };
     let segment = SegmentSummary {
         uuid: Uuid::new_v4(),
@@ -643,4 +645,62 @@ fn straddle_only_rewrite_moves_no_address() {
     };
     assert!(!plan.moves_addresses());
     assert!(plan.coverage().is_empty());
+}
+
+fn compose_one(
+    history: &FragReuseHistory,
+    fragment_bitmap: Option<RoaringBitmap>,
+    served: Option<&RoaringBitmap>,
+) -> Composition {
+    let live = bitmap(&[5, 6]);
+    let lineage = history.fragment_bitmap();
+    let rows = HashMap::new();
+    let context = RewriteContext {
+        live_fragments: &live,
+        lineage: &lineage,
+        fragment_rows: &rows,
+        served,
+    };
+    let segment = SegmentSummary {
+        uuid: Uuid::new_v4(),
+        fragment_bitmap,
+        dataset_version: 1,
+        domain: RowDomain::Address,
+        translation: TranslationSupport::Supported,
+    };
+    history.compose(&context, &segment).unwrap()
+}
+
+/// A rewrite that moves addresses publishes only what the reader serves the
+/// segment for; one that only drops coverage moves nothing the reader could
+/// cede, so the reader's coverage does not narrow it.
+#[test]
+fn a_moving_rewrite_publishes_only_what_the_reader_serves() {
+    let history = history(vec![ordered(&[3, 4], &[5, 6])]);
+    let served = bitmap(&[5]);
+    let Composition::Rewrite(plan) = compose_one(&history, Some(bitmap(&[3, 4])), Some(&served))
+    else {
+        panic!("a covered compaction is rewritten");
+    };
+    assert!(plan.moves_addresses());
+    assert_eq!(plan.published_bitmap(), Some(&bitmap(&[5])));
+
+    let history = history_with_legacy(vec![], vec![ordered(&[3, 4], &[5])]);
+    let served = bitmap(&[]);
+    let Composition::Rewrite(plan) = compose_one(&history, Some(bitmap(&[3, 7])), Some(&served))
+    else {
+        panic!("a straddled compaction is rewritten");
+    };
+    assert!(!plan.moves_addresses());
+    assert_eq!(plan.published_bitmap(), Some(&bitmap(&[7])));
+}
+
+/// Without a bitmap the history cannot tell which addresses moved.
+#[test]
+fn a_segment_without_a_bitmap_has_no_known_lineage() {
+    let history = history(vec![ordered(&[3, 4], &[5, 6])]);
+    assert_eq!(
+        compose_one(&history, None, None),
+        Composition::LineageUnknown
+    );
 }

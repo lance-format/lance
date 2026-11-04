@@ -609,9 +609,10 @@ impl FragReuseHistory {
     /// publishes none), and one covering part of a rewrite group is refused
     /// with `InvalidInput`. Its rewrite translates through the whole history
     /// as one in-memory map. A tagged history plans from the segment's
-    /// provenance per transition, refuses a segment without a fragment
-    /// bitmap with `InvalidInput`, and refuses with `NotSupported` while it
-    /// holds transitions this build cannot interpret.
+    /// provenance per transition, answers
+    /// [`Composition::LineageUnknown`] for a segment without a bitmap, and
+    /// refuses with `NotSupported` while it holds transitions this build
+    /// cannot interpret.
     pub fn compose(
         &self,
         context: &RewriteContext,

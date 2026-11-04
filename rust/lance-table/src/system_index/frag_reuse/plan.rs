@@ -150,6 +150,11 @@ pub struct RewriteContext<'a> {
     pub lineage: &'a RoaringBitmap,
     /// The physical row counts of the snapshot's fragments.
     pub fragment_rows: &'a HashMap<u32, u64>,
+    /// The coverage the snapshot's reader serves the segment with, when it
+    /// lists the segment. An index that materializes its state when loaded
+    /// cedes the rows a sibling covers directly, so a rewrite through its
+    /// loader publishes no fragment the reader does not serve it for.
+    pub served: Option<&'a RoaringBitmap>,
 }
 
 /// How [`FragReuseHistory::compose`] answers for one segment.
@@ -157,6 +162,11 @@ pub struct RewriteContext<'a> {
 pub enum Composition {
     /// No recorded transition moves the segment's stored addresses.
     CaughtUp,
+    /// The segment records no fragment bitmap, so the history cannot tell
+    /// which of its stored addresses moved. It keeps translating through the
+    /// history until it is rebuilt. Only a tagged history answers this; a
+    /// version 0 history rewrites such a segment, as released writers did.
+    LineageUnknown,
     /// The segment cannot be rewritten through the history: at `fragment`
     /// its coverage reaches a transition it only partially covers (a stable
     /// partition, or any hop after a stable-partition restamp), or a

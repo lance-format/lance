@@ -1290,6 +1290,7 @@ async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
         live_fragments: &live,
         lineage: &lineage,
         fragment_rows: &rows,
+        served: None,
     };
     let stale = segment(&[0, 2, 3], 1, TranslationSupport::Supported);
     let Composition::Rewrite(plan) = history.compose(&context, &stale).unwrap() else {

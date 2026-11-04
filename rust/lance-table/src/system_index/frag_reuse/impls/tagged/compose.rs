@@ -34,13 +34,9 @@ pub(super) fn compose(
              upgrade to a newer version of Lance before remapping",
         ));
     }
-    let stored = segment.fragment_bitmap.as_ref().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "segment {} records no fragment bitmap, so its lineage through the history \
-             cannot be determined",
-            segment.uuid
-        ))
-    })?;
+    let Some(stored) = segment.fragment_bitmap.as_ref() else {
+        return Ok(Composition::LineageUnknown);
+    };
     // A segment that predates a lifted v0 deferred compaction still holds
     // the group's source addresses behind a bitmap v0 swapped to the
     // destinations; plan from the fragments the file really addresses.
@@ -56,17 +52,31 @@ pub(super) fn compose(
             Walk::Blocked { fragment } => Composition::Blocked { fragment },
             Walk::Remap {
                 hops,
-                coverage,
+                mut coverage,
                 admitted,
-            } => Composition::Rewrite(TranslationPlan::rewrite(
-                history,
-                coverage,
-                RewritePath {
-                    hops,
-                    admitted,
-                    fragment_rows: known_fragment_rows(&ledger, context.fragment_rows),
-                },
-            )),
+            } => {
+                // A rewrite streams the segment through the reader's loading
+                // path, and an index that materializes its state at load
+                // (bitmap) cedes rows whose destination a sibling covers
+                // directly. Claiming them would let segment pruning later
+                // remove the sibling that holds them; an index that streams
+                // its pages (btree) has them dropped by the claim filter, so
+                // its files and bitmap agree either way.
+                if !hops.is_empty()
+                    && let Some(served) = context.served
+                {
+                    coverage &= served;
+                }
+                Composition::Rewrite(TranslationPlan::rewrite(
+                    history,
+                    coverage,
+                    RewritePath {
+                        hops,
+                        admitted,
+                        fragment_rows: known_fragment_rows(&ledger, context.fragment_rows),
+                    },
+                ))
+            }
         },
     )
 }

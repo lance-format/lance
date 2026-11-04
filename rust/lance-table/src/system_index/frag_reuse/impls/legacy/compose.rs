@@ -123,6 +123,7 @@ mod tests {
                     live_fragments: &live,
                     lineage: &lineage,
                     fragment_rows: &rows,
+                    served: None,
                 },
                 segment,
             )
@@ -207,6 +208,7 @@ mod tests {
                     live_fragments: &live,
                     lineage: &lineage,
                     fragment_rows: &rows,
+                    served: None,
                 },
                 &segment(Some(&[0]), dataset_version),
             )

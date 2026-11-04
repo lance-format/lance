@@ -500,10 +500,15 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         })
         .collect();
     let lineage = entry.fragment_bitmap.clone().unwrap_or_default();
+    let listed = dataset.load_indices().await?;
     let context = RewriteContext {
         live_fragments: dataset.fragment_bitmap.as_ref(),
         lineage: &lineage,
         fragment_rows: &fragment_rows,
+        served: listed
+            .iter()
+            .find(|idx| idx.uuid == *index_id)
+            .and_then(|idx| idx.fragment_bitmap.as_ref()),
     };
     let summary = SegmentSummary {
         uuid: curr_index_meta.uuid,
@@ -513,7 +518,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         translation: TranslationSupport::Supported,
     };
     let plan = match history.compose(&context, &summary)? {
-        Composition::CaughtUp => return Ok(()),
+        Composition::CaughtUp | Composition::LineageUnknown => return Ok(()),
         Composition::Blocked { fragment } => {
             log::info!(
                 "Skipping remap of index {} ({}): at fragment {} its coverage reaches a \
@@ -530,30 +535,6 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         Composition::Rewrite(plan) => plan,
     };
     let mut coverage = plan.coverage().clone();
-
-    if plan.moves_addresses() {
-        // The rewrite streams the segment through the reader's loading path,
-        // and for index types that materialize their state at load (e.g.
-        // bitmap) that path applies direct-coverage-wins: rows whose
-        // translated destination is directly covered by a sibling segment
-        // are ceded to it and absent from the loaded state. Publish only the
-        // coverage the reader attributes to this segment, so the swapped
-        // bitmap never claims rows the remapped file may not contain -- an
-        // over-claim would later let segment pruning remove the sibling that
-        // actually holds those rows. (For types that stream raw pages, e.g.
-        // BTree, the rows the reader cedes are dropped by the translator's
-        // claim filter below, so file and bitmap agree.)
-        use crate::index::DatasetIndexExt;
-        if let Some(listed) = dataset
-            .load_indices()
-            .await?
-            .iter()
-            .find(|idx| idx.uuid == *index_id)
-            && let Some(servable) = &listed.fragment_bitmap
-        {
-            coverage &= servable;
-        }
-    }
 
     // Overlays committed after the source index was built are not
     // incorporated by the remap; exclude those fragments so queries scan
