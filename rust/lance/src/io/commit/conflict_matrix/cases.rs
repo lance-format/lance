@@ -49,8 +49,8 @@ update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L
 update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L
 data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L  L  L  L
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  R* R* R*
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  R  R* R
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  R* R  R
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  R  R  R
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
 create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L
@@ -58,9 +58,9 @@ rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L
 restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R
 update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X  L  R  R
-action_append             | L  L  L  L  L  L  L  R* R  R* R  L  L  R  R  L  L  L  L
-action_update_config      | L  L  L  L  L  L  L  R* R* R  R  L  L  R  R  R  L  R  R
-action_append_and_config  | L  L  L  L  L  L  L  R* R  R  R  L  L  R  R  R  L  R  R
+action_append             | L  L  L  L  L  L  L  R* R  R  R  L  L  R  R  L  L  L  L
+action_update_config      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  R  L  R  R
+action_append_and_config  | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  R  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -188,11 +188,7 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
 /// Keyed by scenario rather than by cell because a gap comes from how the
 /// resolver treats a kind of operation, not from one particular pairing. When
 /// the last `*` cell involving a scenario is closed, its entry goes too.
-const PARITY_GAPS: &[(Scenario, &str)] = &[
-    (Scenario::Project, SCHEMA_RESTATED),
-    (Scenario::ProjectAlterNullability, SCHEMA_RESTATED),
-    (Scenario::Merge, SCHEMA_RESTATED),
-];
+const PARITY_GAPS: &[(Scenario, &str)] = &[(Scenario::Project, SCHEMA_RESTATED)];
 
 const SCHEMA_RESTATED: &str = "a legacy Project or Merge restates the whole schema, which no \
      footprint coordinate describes, so it fails closed against an action set; conflict \
