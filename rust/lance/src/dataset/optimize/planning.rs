@@ -1047,6 +1047,30 @@ impl DefaultCompactionPlanner {
             );
         }
 
+        // Only the selected sources change identity, so `max_source_fragments`
+        // bounds them directly: tasks are kept in group order until the next
+        // would exceed it, as the row and byte budgets are applied below.
+        let all_tasks = if let Some(max_frags) = self.options.max_source_fragments {
+            let num_candidate_tasks = all_tasks.len();
+            let mut total = 0_usize;
+            let mut kept = Vec::with_capacity(all_tasks.len());
+            for (task, live_rows) in all_tasks {
+                total += task.fragments.len();
+                if total > max_frags {
+                    break;
+                }
+                kept.push((task, live_rows));
+            }
+            if kept.is_empty() && num_candidate_tasks > 0 {
+                warn!(
+                    "Grouped compaction plan is empty: the first of {num_candidate_tasks} tasks \
+                     already exceeds max_source_fragments={max_frags}"
+                );
+            }
+            kept
+        } else {
+            all_tasks
+        };
         let (tasks, _source_budget) =
             limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
