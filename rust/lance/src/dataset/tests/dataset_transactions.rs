@@ -2830,7 +2830,7 @@ mod composite {
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
-    use futures::stream;
+    use futures::{TryStreamExt, stream};
     use lance_core::datatypes::Field as LanceField;
     use lance_index::IndexType;
     use lance_index::pb::vector_index_details::{
@@ -2839,15 +2839,16 @@ mod composite {
     use lance_index::pb::{HnswParameters, VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef,
+        Ref, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -2877,7 +2878,12 @@ mod composite {
     /// A data file of `fragment`, as an `AddDataFile` carries it: with no
     /// field list of its own, since the action's `field_ids` is that list.
     fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
-        without_fields(dataset.fragments()[fragment].files[0].clone())
+        without_fields(existing_overlay_file(dataset, fragment))
+    }
+
+    /// A data file of `fragment` as an overlay carries it, field list and all.
+    fn existing_overlay_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        dataset.fragments()[fragment].files[0].clone()
     }
 
     fn without_fields(file: DataFile) -> DataFile {
@@ -4781,5 +4787,279 @@ mod composite {
             .expect_err("a Dot segment cannot join an L2 index");
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("metric"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_overlays_what_was_already_there() {
+        let dataset = test_dataset(false).await;
+        let overlaid = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+        let overlay_file = existing_overlay_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddOverlays(AddOverlays {
+                    fragment: Ref::Committed(overlaid),
+                    overlays: vec![DataOverlayFile {
+                        data_file: overlay_file,
+                        coverage: OverlayCoverage::dense([0u32, 2].into_iter().collect()),
+                        // Left for the commit to stamp.
+                        committed_version: 0,
+                    }],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 3);
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == overlaid)
+            .unwrap();
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
+        Action::AddOverlays(AddOverlays {
+            fragment: Ref::Committed(fragment),
+            overlays: vec![DataOverlayFile {
+                data_file: existing_overlay_file(dataset, 1),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                committed_version: 0,
+            }],
+            data_change: true,
+        })
+    }
+
+    /// Incremental consumers find changed rows through the last-updated
+    /// versions, so an overlay has to restamp the rows it covers -- including
+    /// on a fragment migrated to stable row ids, which has no sequence yet.
+    #[rstest::rstest]
+    #[case::stable_from_creation(false)]
+    #[case::migrated(true)]
+    #[tokio::test]
+    async fn test_overlaid_rows_are_reported_as_updated(#[case] migrated: bool) {
+        let mut dataset = test_dataset(!migrated).await;
+        if migrated {
+            dataset.migrate_to_stable_row_ids().await.unwrap();
+            assert!(
+                dataset.fragments()[0]
+                    .last_updated_at_version_meta
+                    .is_none()
+            );
+        }
+        let fragment = dataset.fragments()[0].id;
+        let before = dataset.version().version;
+        let actions = vec![overlay_action(&dataset, fragment)];
+
+        let dataset = commit(dataset, actions).await;
+
+        let delta = dataset
+            .delta()
+            .with_begin_version(before)
+            .with_end_version(before + 1)
+            .build()
+            .unwrap();
+        let updated: Vec<RecordBatch> = delta
+            .get_updated_rows()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(updated.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+    }
+
+    /// A row-moving update deletes rows from the fragment and re-creates them
+    /// elsewhere from the base the overlay never modified.
+    #[tokio::test]
+    async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
+        let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
+            vec![
+                Action::SetDeletionFile(SetDeletionFile {
+                    fragment,
+                    deletion_file: Some(DeletionFile {
+                        read_version,
+                        id: 1,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                        inline: None,
+                    }),
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: existing_data_file(dataset, 0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ]
+        };
+
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlaid = commit(original.clone(), vec![overlay_action(&original, fragment)]).await;
+        commit_expecting_conflict(
+            &overlaid,
+            read_version,
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+
+        let original = test_dataset(false).await;
+        let updated = commit(
+            original.clone(),
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+        commit_expecting_conflict(
+            &updated,
+            read_version,
+            vec![overlay_action(&original, fragment)],
+        )
+        .await;
+    }
+
+    /// A re-encode keeps every row where it was and leaves the overlays alone,
+    /// so whichever lands first, the overlay still wins its cells.
+    #[rstest::rstest]
+    #[case::overlay_first(true)]
+    #[case::reencode_first(false)]
+    #[tokio::test]
+    async fn test_an_overlay_and_a_reencode_of_its_column_both_land(#[case] overlay_first: bool) {
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlay = vec![overlay_action(&original, fragment)];
+        let reencode = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: existing_data_file(&original, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+                base: None,
+            }),
+        ];
+        let (first, second) = if overlay_first {
+            (overlay, reencode)
+        } else {
+            (reencode, overlay)
+        };
+
+        let committed = commit(original, first).await;
+        let landed = CommitBuilder::new(Arc::new(committed))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, second))
+            .await
+            .unwrap();
+
+        assert_eq!(landed.fragments()[0].overlays.len(), 1);
+        let values = landed.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values((5..10).chain(5..10)) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A stale append that carries an overlay for a column a concurrent set
+    /// dropped would leave values for a field the schema no longer has.
+    #[tokio::test]
+    async fn test_an_overlay_on_a_minted_fragment_conflicts_with_a_dropped_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let read_version = dataset.version().version;
+        // The base file is declared for `b` alone, so the conflict with dropping
+        // `a` comes from the overlay, whose file carries `a`.
+        let stale_append = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&dataset, 0),
+                field_ids: vec![FieldRef::Committed(1)],
+                data_change: true,
+                base: None,
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Local(0),
+                overlays: vec![DataOverlayFile {
+                    data_file: existing_overlay_file(&dataset, 1),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                    committed_version: 0,
+                }],
+                data_change: true,
+            }),
+        ];
+
+        let dropped = commit(
+            dataset.clone(),
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(0),
+            })],
+        )
+        .await;
+
+        commit_expecting_conflict(&dropped, read_version, stale_append).await;
     }
 }

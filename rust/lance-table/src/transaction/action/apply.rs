@@ -31,7 +31,7 @@ use crate::format::{
     BasePath, DataFile, Fragment, IndexMetadata, Manifest, ManifestBuildConfig, RowIdMeta,
 };
 use crate::rowids::read_row_ids;
-use crate::rowids::version::build_version_meta;
+use crate::rowids::version::{SpilledRowLineage, build_version_meta};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
@@ -383,6 +383,14 @@ impl<'a> ApplyState<'a> {
         self.read_version
     }
 
+    /// The version this delta produces, for the actions that stamp it into what
+    /// they write. Distinct from [`Self::read_version`]: a retry against a newer
+    /// manifest re-runs the apply, so anything stamped with this is re-stamped
+    /// rather than carried over.
+    pub(super) fn new_version(&self) -> u64 {
+        self.current_manifest.version + 1
+    }
+
     /// Add an index segment. A segment's uuid identifies it, so re-adding one
     /// that is already there is a mistake rather than a replacement -- swapping
     /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
@@ -453,6 +461,12 @@ impl<'a> ApplyState<'a> {
         };
         self.touched_index_names.insert(name.to_string());
         Ok(&mut self.indices[position])
+    }
+
+    /// Row lineage the caller read ahead of time for fragments whose lineage
+    /// lives in a data file, which applying cannot read itself.
+    pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
+        &self.build_config.spilled_row_lineage
     }
 
     pub(super) fn schema(&self) -> &Schema {

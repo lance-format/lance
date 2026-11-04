@@ -146,10 +146,25 @@ enum Mode {
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
+    /// Writes some of the coordinate and leaves the rest as it was. An overlay
+    /// is the case: new values for a subset of one field's cells in one
+    /// fragment. Two of these commute -- both land, the newer wins where they
+    /// overlap -- which is what sets it apart from a full write. So does a
+    /// move: it keeps every physical row where it was and leaves the overlays
+    /// alone, so the overlay's offsets still address its cells and the newer
+    /// overlay still wins them.
+    ///
+    /// It also serves as a conflict marker on a coordinate the set does not
+    /// change at all, where it needs exactly this row and column of the table:
+    /// collide with a full write, commute with other markers. An overlay's
+    /// claim on its fragment's deletions is the case; see
+    /// [`Footprint::write_part_of_deletions`].
+    WritesPart,
     /// Replaces how the coordinate is stored without changing its values: a
-    /// re-encode with `data_change` false. It collides with any write, as a
-    /// write does, but not with a requirement -- an index segment built over
-    /// the values still describes them after they move.
+    /// re-encode with `data_change` false. It collides with a full write and
+    /// with another move, but not with a partial write or a requirement -- an
+    /// overlay still shadows the moved values, and an index segment built over
+    /// them still describes them.
     Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
@@ -189,18 +204,23 @@ impl Region {
 /// `committed` on the same coordinate, where the `committed` set landed after
 /// the `committing` set read.
 ///
-/// | committing \ committed | Writes   | Moves    | Requires | RequiresUnlessRemoved |
-/// |------------------------|----------|----------|----------|-----------------------|
-/// | Writes                 | conflict | conflict | ok       | ok                    |
-/// | Moves                  | conflict | conflict | ok       | ok                    |
-/// | Requires               | conflict | ok       | ok       | ok                    |
-/// | RequiresUnlessRemoved  | conflict | ok       | ok       | ok                    |
+/// | committing \ committed | Writes   | Moves    | WritesPart | Requires | RequiresUnlessRemoved |
+/// |------------------------|----------|----------|------------|----------|-----------------------|
+/// | Writes                 | conflict | conflict | conflict   | ok       | ok                    |
+/// | Moves                  | conflict | conflict | ok         | ok       | ok                    |
+/// | WritesPart             | conflict | ok       | ok         | ok       | ok                    |
+/// | Requires               | conflict | ok       | ok         | ok       | ok                    |
+/// | RequiresUnlessRemoved  | conflict | ok       | ok         | ok       | ok                    |
 ///
 /// The requirement columns are all "ok": what the committed set required held
 /// when it committed, and it serialized first, so nothing arriving later can
 /// retroactively break it. The requirement rows are the open question, because
-/// the committing set read before the other landed. They collide with a write
-/// and not a move, since a move leaves every value where a reader finds it.
+/// the committing set read before the other landed. They collide with a full
+/// write and not a move or a partial one. A move leaves every value where a
+/// reader finds it. A segment built over a column an overlay then landed on is
+/// stamped with the version it read, the overlay carries the later version it
+/// committed at, and the read path masks the overlaid cells out of any segment
+/// older than the overlay.
 ///
 /// The two requirement rows differ only where the write is a removal of the
 /// whole fragment, which reaches the coordinate through a [`Region`] rather
@@ -213,8 +233,11 @@ impl Region {
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
         (_, Mode::Writes) => true,
-        (Mode::Writes | Mode::Moves, Mode::Moves) => true,
-        (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves) => false,
+        (Mode::Writes, Mode::Moves | Mode::WritesPart) => true,
+        (Mode::Moves, Mode::Moves) => true,
+        (Mode::Moves, Mode::WritesPart) => false,
+        (Mode::WritesPart, Mode::Moves | Mode::WritesPart) => false,
+        (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves | Mode::WritesPart) => false,
         (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
     }
 }
@@ -282,8 +305,9 @@ pub struct Footprint {
     ///
     /// Not a `Requires` claim on the region, because the check is symmetric: a
     /// removal that lands second destroys the cells just as surely as one that
-    /// lands first. And not a write, because it must not collide with a
-    /// concurrent write to some other coordinate in the same fragment.
+    /// lands first. And not a write of either strength (`Writes` or
+    /// `WritesPart`), because it must not collide with a concurrent write to
+    /// some other coordinate in the same fragment.
     required_fragments: HashSet<u64>,
     /// Facts about the table this set is valid only against. See
     /// [`Precondition`].
@@ -532,6 +556,12 @@ impl Footprint {
         self.claim(coordinate, Mode::Writes);
     }
 
+    /// Record that this set writes some of `coordinate`, leaving the rest as
+    /// it was. See [`Mode::WritesPart`].
+    fn write_part(&mut self, coordinate: Coordinate) {
+        self.claim(coordinate, Mode::WritesPart);
+    }
+
     /// Record that this set reads `coordinate` and needs it to still hold what
     /// it read. See [`Mode::Requires`].
     pub(super) fn require(&mut self, coordinate: Coordinate) {
@@ -617,6 +647,42 @@ impl Footprint {
         for field in fields {
             self.claim(Coordinate::FieldData { fragment, field }, mode);
         }
+    }
+
+    /// Record that this set writes some of the cells of each of `fields` in
+    /// `fragment`, leaving the rest as they were.
+    ///
+    /// As [`Self::write_field_data`], the definition of every committed field
+    /// and the new-row schema are required and the values count as written
+    /// whichever fragment they go in, so a minted fragment still depends on
+    /// the schema it was prepared against. Only a committed fragment has cells
+    /// a concurrent writer can name.
+    pub(super) fn write_partial_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        let committed_fragment = fragment.committed();
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.require(Coordinate::FieldDefinition(field));
+            self.require(Coordinate::NewRowSchema);
+            self.values_written = true;
+            if let Some(fragment) = committed_fragment {
+                self.write_part(Coordinate::FieldData { fragment, field });
+            }
+        }
+    }
+
+    /// Mark `fragment`'s deletions as a conflict point without changing them.
+    ///
+    /// Not a write: the set leaves the deletions as they were. The claim is a
+    /// [`Mode::WritesPart`] marker because that mode has exactly the pairing
+    /// needed -- it collides with any set that replaces the fragment's
+    /// deletions, in either order, and commutes with other markers. See
+    /// [`AddOverlays`](super::AddOverlays)'s footprint for why an overlay
+    /// needs it.
+    pub(super) fn write_part_of_deletions(&mut self, fragment: u64) {
+        self.write_part(Coordinate::FragmentDeletions(fragment));
     }
 
     /// Record that this set adds a fragment, whose rows were prepared against
@@ -864,6 +930,7 @@ mod tests {
         let modes = [
             Mode::RequiresUnlessRemoved,
             Mode::Requires,
+            Mode::WritesPart,
             Mode::Moves,
             Mode::Writes,
         ];
