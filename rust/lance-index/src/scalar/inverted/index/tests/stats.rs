@@ -276,7 +276,7 @@ async fn load_counted_v2_index_with_counter(
         posting_file: posting_file_path(0),
         counter: counter.clone(),
     });
-    let index = InvertedIndex::load(counting_store, None, &cache)
+    let index = InvertedIndex::load_remapped(counting_store, None, &cache)
         .await
         .unwrap();
     (index, counter, tmpdir)
@@ -377,7 +377,9 @@ async fn load_counted_v3_index(
         posting_file: posting_file_path(partitions[0]),
         counter: counter.clone(),
     });
-    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    let index = InvertedIndex::load_remapped(store, None, &cache)
+        .await
+        .unwrap();
     assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
     (index, counter, tmpdir)
 }
@@ -1409,7 +1411,7 @@ async fn load_v2_index_with_grouped_postings(
     // The inverted list keeps only a `WeakLanceCache`, so the caller must
     // hold this `Arc<LanceCache>` alive for the cache to stay usable.
     let cache = Arc::new(LanceCache::with_capacity(1 << 30));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
     (index, cache)

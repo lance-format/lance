@@ -858,10 +858,32 @@ impl InvertedPartition {
         Ok((total_tokens, stale.len() as usize, row_freqs))
     }
 
+    #[deprecated(
+        since = "15.0.0",
+        note = "a fragment reuse history translates through a Remapper; use \
+                InvertedPartition::load_remapped"
+    )]
     pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        Self::load_remapped(
+            store,
+            id,
+            DeprecatedRemapper::sync(frag_reuse_index),
+            index_cache,
+            token_set_format,
+        )
+        .await
+    }
+
+    pub async fn load_remapped(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
@@ -871,7 +893,7 @@ impl InvertedPartition {
             &token_file_path(id),
             &posting_file_path(id),
             &doc_file_path(id),
-            frag_reuse_index,
+            remapper,
             index_cache,
             token_set_format,
         )
@@ -887,7 +909,7 @@ impl InvertedPartition {
         token_path: &str,
         posting_path: &str,
         docs_path: &str,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
@@ -903,7 +925,7 @@ impl InvertedPartition {
             id,
             WeakLanceCache::from(index_cache),
             docs_reader.as_ref(),
-            frag_reuse_index,
+            remapper,
             // 256-document blocks score with quantized document lengths.
             inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
         )?;
@@ -913,44 +935,6 @@ impl InvertedPartition {
             id,
             store,
             tokens: Arc::new(tokens),
-            inverted_list: Arc::new(inverted_list),
-            docs: PartitionDocumentStore::Modern(Arc::new(docs)),
-            token_set_format,
-        })
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    pub(crate) async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        id: u64,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-        token_set_format: TokenSetFormat,
-    ) -> Result<Self> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let token_file = store.open_index_file(&token_file_path(id)).await?;
-        let tokens = TokenSet::load(token_file, token_set_format).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
-        let docs_path = doc_file_path(id);
-        let docs_reader = store.open_index_file(&docs_path).await?;
-        let docs = PartitionDocuments::try_new_with_remapping(
-            store.clone(),
-            docs_path,
-            id,
-            WeakLanceCache::from(index_cache),
-            docs_reader.as_ref(),
-            remapping,
-            // 256-document blocks score with quantized document lengths.
-            inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
-        )?;
-        inverted_list.modern_num_docs = Some(docs.len());
-
-        Ok(Self {
-            id,
-            store,
-            tokens: tokens.into(),
             inverted_list: Arc::new(inverted_list),
             docs: PartitionDocumentStore::Modern(Arc::new(docs)),
             token_set_format,

@@ -887,10 +887,10 @@ mod tests {
             .await
             .unwrap();
         let index_cache = LanceCache::no_cache();
-        let index_a = InvertedIndex::load(store_a.clone(), None, &index_cache)
+        let index_a = InvertedIndex::load_remapped(store_a.clone(), None, &index_cache)
             .await
             .unwrap();
-        let index_b = InvertedIndex::load(store_b.clone(), None, &index_cache)
+        let index_b = InvertedIndex::load_remapped(store_b.clone(), None, &index_cache)
             .await
             .unwrap();
         [(store_a, index_a), (store_b, index_b)]

@@ -91,6 +91,43 @@ pub async fn translate_treemap(
     }
 }
 
+/// Translate the row-address column at `addr_idx` of `batch` through
+/// `remapper` without changing the batch's layout: a deleted row keeps its
+/// slot, with the tombstone address. The returned synchronous remapper drops
+/// tombstones, for consumers whose layout-aware decoding takes one.
+#[doc(hidden)]
+pub async fn translate_preserving_layout(
+    remapper: &Remapper,
+    batch: RecordBatch,
+    addr_idx: usize,
+) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
+    let addrs = batch
+        .columns()
+        .get(addr_idx)
+        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "row address column {addr_idx} must have type UInt64"
+            ))
+        })?;
+    let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+    let mut translated = Vec::with_capacity(addrs.len());
+    let mut slice: Vec<Option<u64>> = Vec::with_capacity(addrs.len().min(BATCH_SIZE));
+    for start in (0..addrs.len()).step_by(BATCH_SIZE) {
+        let end = (start + BATCH_SIZE).min(addrs.len());
+        slice.clear();
+        slice.extend(
+            (start..end).map(|position| addrs.is_valid(position).then(|| addrs.value(position))),
+        );
+        remapper.translate_in_place(&mut slice).await?;
+        translated.extend(slice.iter().map(|addr| addr.unwrap_or(tombstone)));
+    }
+    let mut columns = batch.columns().to_vec();
+    columns[addr_idx] = Arc::new(UInt64Array::from(translated));
+    let batch = RecordBatch::try_new(batch.schema(), columns)?;
+    Ok((batch, Arc::new(TombstoneRowIdRemapper)))
+}
+
 /// Translate the row addresses in column `addr_idx` of `batch` through
 /// `remapper`, as one batch, and drop the rows whose address translates to
 /// `None`. A null address is dropped too: it names no row.

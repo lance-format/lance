@@ -647,7 +647,7 @@ impl InvertedIndexBuilder {
     ) -> Result<Vec<IndexFile>> {
         let mut files = Vec::new();
         for part in self.partitions.iter() {
-            let part = InvertedPartition::load(
+            let part = InvertedPartition::load_remapped(
                 src_store.clone(),
                 *part,
                 None,
@@ -4379,7 +4379,7 @@ mod tests {
         )
         .await?;
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.partition_count(), 1);
 
         Ok(())
@@ -4561,7 +4561,7 @@ mod tests {
             .write_metadata(src_store.as_ref(), &[0])
             .await?;
 
-        let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(src_store, None, &LanceCache::no_cache()).await?;
         let derived_params = index.derive_index_params()?;
         let derived_params: InvertedIndexParams =
             serde_json::from_str(derived_params.params.as_deref().unwrap())?;
@@ -4583,7 +4583,7 @@ mod tests {
             .await?;
 
         let updated =
-            InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache()).await?;
+            InvertedIndex::load_remapped(dest_store.clone(), None, &LanceCache::no_cache()).await?;
         assert_eq!(updated.partitions.len(), 2);
         for partition in &updated.partitions {
             assert_eq!(
@@ -4683,7 +4683,7 @@ mod tests {
         let mut builder = InvertedIndexBuilder::new(params);
         builder.update(stream, store.as_ref(), None).await?;
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         assert_eq!(index.partitions.len(), 1);
         let partition = &index.partitions[0];
         let token_id = partition.tokens.get("hello").unwrap();
@@ -4744,7 +4744,7 @@ mod tests {
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         let (total_tokens, num_docs, token_docs) = index
             .bm25_stats_for_terms(&["hello".to_string()], None)
             .await?;
@@ -4794,7 +4794,7 @@ mod tests {
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         assert!(index.partitions.is_empty());
         let statistics = index.statistics()?;
         assert_eq!(statistics["num_tokens"], 0);
@@ -4844,7 +4844,7 @@ mod tests {
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         let statistics = index.statistics()?;
         assert_eq!(statistics["num_tokens"], 0);
         assert_eq!(statistics["num_docs"], 5);
@@ -5463,7 +5463,7 @@ mod tests {
         builder
             .update(Box::pin(stream), store.as_ref(), None)
             .await?;
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache()).await?;
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
         // The caller keeps the TempDir alive for as long as it queries the
         // loaded index.
         Ok((index_dir, index))
@@ -5849,7 +5849,7 @@ mod tests {
         let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
         builder.update(stream, store.as_ref(), None).await.unwrap();
 
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert!(
@@ -5894,7 +5894,7 @@ mod tests {
             .unwrap();
 
         // Load it back and confirm the invalidated fragments are set
-        let index = InvertedIndex::load(src_store.clone(), None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(src_store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(index.deleted_fragments(), &initial_deleted);
@@ -5908,9 +5908,10 @@ mod tests {
             .unwrap();
 
         // Reload from dest and verify deleted fragments are preserved
-        let remapped_index = InvertedIndex::load(dest_store.clone(), None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let remapped_index =
+            InvertedIndex::load_remapped(dest_store.clone(), None, &LanceCache::no_cache())
+                .await
+                .unwrap();
         assert_eq!(
             remapped_index.deleted_fragments(),
             &initial_deleted,
@@ -5936,7 +5937,7 @@ mod tests {
         builder.update(stream, store.as_ref(), None).await.unwrap();
 
         // Load the index and update it with an old_data_filter that invalidates fragments
-        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert!(index.deleted_fragments().is_empty());
@@ -5966,7 +5967,7 @@ mod tests {
             .unwrap();
 
         let updated_index =
-            InvertedIndex::load(update_store.clone(), None, &LanceCache::no_cache())
+            InvertedIndex::load_remapped(update_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .unwrap();
         assert_eq!(
@@ -5994,7 +5995,7 @@ mod tests {
         builder.update(stream, store1.as_ref(), None).await.unwrap();
 
         // First update: delete fragments 3 and 7
-        let index = InvertedIndex::load(store1.clone(), None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(store1.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -6024,7 +6025,7 @@ mod tests {
             .unwrap();
 
         // Second update: invalidate additional fragments 12 and 15
-        let index2 = InvertedIndex::load(store2.clone(), None, &LanceCache::no_cache())
+        let index2 = InvertedIndex::load_remapped(store2.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(
@@ -6056,7 +6057,7 @@ mod tests {
             .await
             .unwrap();
 
-        let index3 = InvertedIndex::load(store3.clone(), None, &LanceCache::no_cache())
+        let index3 = InvertedIndex::load_remapped(store3.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(
@@ -6082,7 +6083,7 @@ mod tests {
         let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default());
         builder.update(stream, store.as_ref(), None).await.unwrap();
 
-        let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(store.clone(), None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -6110,7 +6111,7 @@ mod tests {
             .unwrap();
 
         let updated_index =
-            InvertedIndex::load(update_store.clone(), None, &LanceCache::no_cache())
+            InvertedIndex::load_remapped(update_store.clone(), None, &LanceCache::no_cache())
                 .await
                 .unwrap();
         assert!(
@@ -6493,7 +6494,8 @@ mod tests {
         .await?;
 
         let index =
-            InvertedIndex::load(staged_store.clone(), None, &LanceCache::no_cache()).await?;
+            InvertedIndex::load_remapped(staged_store.clone(), None, &LanceCache::no_cache())
+                .await?;
         assert_eq!(
             index.partition_count(),
             1,
@@ -6564,7 +6566,8 @@ mod tests {
         reference_builder
             .update(Box::pin(stream), reference_store.as_ref(), None)
             .await?;
-        let reference = InvertedIndex::load(reference_store, None, &LanceCache::no_cache()).await?;
+        let reference =
+            InvertedIndex::load_remapped(reference_store, None, &LanceCache::no_cache()).await?;
 
         for (tokens, operator, phrase) in [
             (vec!["common"], Operator::Or, false),

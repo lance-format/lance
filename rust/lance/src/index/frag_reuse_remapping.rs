@@ -24,7 +24,6 @@ use std::sync::Arc;
 /// A kind leaves this list when it implements one.
 const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
     "FmIndexDetails",
-    "InvertedIndexDetails",
     "JsonIndexDetails",
     "LabelListIndexDetails",
     "MinHashLshIndexDetails",

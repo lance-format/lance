@@ -281,8 +281,10 @@ async fn cached_fts_versions_release_posting_readers(
                 None,
                 &version_cache,
                 Box::pin(async move {
-                    Ok(InvertedIndex::load(load_store, None, &load_cache).await?
-                        as Arc<dyn ScalarIndex>)
+                    Ok(
+                        InvertedIndex::load_remapped(load_store, None, &load_cache).await?
+                            as Arc<dyn ScalarIndex>,
+                    )
                 }),
             )
             .await
@@ -468,7 +470,7 @@ async fn test_posting_cache_conflict_across_partitions() {
 
     // Load the inverted index
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
 
@@ -589,7 +591,7 @@ async fn test_modern_prewarm_packs_group_with_shared_posting_buffer() {
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     let inverted_list = &index.partitions[0].inverted_list;
@@ -890,7 +892,7 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(1 << 20));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     let inverted_list = &index.partitions[0].inverted_list;
@@ -1039,7 +1041,7 @@ async fn test_prewarm_streams_in_chunks_with_positions(
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         CacheWithoutResidentProbe(QuickCacheBackend::with_capacity(1 << 20)),
     )));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     let inverted_list = &index.partitions[0].inverted_list;
@@ -1136,7 +1138,7 @@ async fn test_prewarm_streams_in_chunks_with_positions(
     let probe_cache = Arc::new(LanceCache::with_backend(Arc::new(
         QuickCacheBackend::with_capacity(1 << 20),
     )));
-    let probe_index = InvertedIndex::load(store, None, probe_cache.as_ref())
+    let probe_index = InvertedIndex::load_remapped(store, None, probe_cache.as_ref())
         .await
         .unwrap();
     let probe_inverted_list = &probe_index.partitions[0].inverted_list;
@@ -1211,7 +1213,7 @@ async fn test_strict_modern_prewarm_fails_when_index_cache_cannot_hold_all_parti
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         QuickCacheBackend::with_capacity(8 * 1024),
     )));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
 

@@ -94,7 +94,7 @@ async fn write_single_partition_index(
         .await?;
     writer.finish_with_metadata(metadata).await?;
 
-    InvertedIndex::load(store, None, &LanceCache::no_cache()).await
+    InvertedIndex::load_remapped(store, None, &LanceCache::no_cache()).await
 }
 
 fn empty_doc_stream() -> SendableRecordBatchStream {

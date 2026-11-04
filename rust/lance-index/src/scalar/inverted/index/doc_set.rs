@@ -476,46 +476,39 @@ impl DocSet {
         Ok(batch)
     }
 
+    #[deprecated(
+        since = "15.0.0",
+        note = "a fragment reuse history translates through a Remapper; use \
+                DocSet::load_remapped"
+    )]
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
-        let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-        let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
-        let mut doc_indices = Vec::new();
-        for rank in 0.. {
-            let column_name = doc_index_storage_column(rank);
-            let Some(column) = batch.column_by_name(&column_name) else {
-                break;
-            };
-            doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
-        }
-        Self::from_columns_with_doc_indices(
-            row_id_col,
-            num_tokens_col,
-            &doc_indices,
+        Self::load_remapped(
+            reader,
             is_legacy,
-            frag_reuse_index,
+            DeprecatedRemapper::sync(frag_reuse_index).as_ref(),
         )
+        .await
     }
 
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    pub(crate) async fn load_with_remapping(
+    /// Load the documents, translating their row addresses through
+    /// `remapper` as a batch. A deleted row keeps its slot as a tombstone
+    /// until the layout-aware decoding below, so documents stay aligned with
+    /// the posting lists that reference them by position.
+    pub async fn load_remapped(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        remapper: Option<&Remapper>,
     ) -> Result<Self> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let (batch, frag_reuse_index) = match remapping {
-            Some(remapping) => {
+        let (batch, frag_reuse_index) = match remapper {
+            Some(remapper) => {
                 let row_id_idx = batch.schema().index_of(ROW_ID)?;
                 let (batch, remapper) =
-                    remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
-                        .await?;
+                    translate_preserving_layout(remapper, batch, row_id_idx).await?;
                 (batch, Some(remapper))
             }
             None => (batch, None),

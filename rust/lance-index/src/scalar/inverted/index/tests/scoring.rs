@@ -56,7 +56,7 @@ async fn test_bm25_search_uses_global_idf() {
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
 
@@ -183,7 +183,7 @@ async fn load_test_index(
     }
     write_test_metadata(&store, partition_ids, InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
     (tmpdir, cache, index)
@@ -246,7 +246,7 @@ async fn load_global_scoring_test_index(
     let cache = Arc::new(LanceCache::with_backend(Arc::new(
         QuickCacheBackend::with_capacity(64 * 1024),
     )));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
     (tmpdir, cache, index)
@@ -543,7 +543,7 @@ async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     )
     .await;
     let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
     let tokens = Arc::new(Tokens::new(vec!["pipeline".to_owned()], DocType::Text));
@@ -880,7 +880,7 @@ async fn load_no_impact_bulk_conjunction_test_index(
     let params = InvertedIndexParams::default().with_position(with_positions);
     write_test_metadata(&store, vec![0, 1], params).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store, None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
         .await
         .unwrap();
     (tmpdir, cache, index)
@@ -1194,7 +1194,7 @@ async fn test_and_query_returns_empty_when_exact_term_missing() {
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
 
@@ -1263,7 +1263,7 @@ async fn test_and_query_accepts_same_position_alternatives() {
     builder.write(store.as_ref()).await.unwrap();
 
     write_test_metadata(&store, vec![0], InvertedIndexParams::code()).await;
-    let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+    let index = InvertedIndex::load_remapped(store.clone(), None, &LanceCache::no_cache())
         .await
         .unwrap();
 
@@ -1334,7 +1334,7 @@ async fn test_phrase_query_accepts_same_position_alternatives() {
         InvertedIndexParams::code().with_position(true),
     )
     .await;
-    let index = InvertedIndex::load(store.clone(), None, &LanceCache::no_cache())
+    let index = InvertedIndex::load_remapped(store.clone(), None, &LanceCache::no_cache())
         .await
         .unwrap();
 

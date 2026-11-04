@@ -42,7 +42,7 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
         )
         .await
         .unwrap();
-    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
         .await
         .unwrap();
     let tokens = try_collect_query_tokens("abcd", &mut params.build().unwrap()).unwrap();
@@ -176,7 +176,7 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
         )
         .await
         .unwrap();
-    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
         .await
         .unwrap();
     for (operator, expected) in [(Operator::And, expected_and), (Operator::Or, expected_or)] {
@@ -371,7 +371,7 @@ async fn test_document_lengths_indexed_and_flat(
             )
             .await
             .unwrap();
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let (tokens, num_docs, _) = index.bm25_stats_for_terms(&[], None).await.unwrap();
