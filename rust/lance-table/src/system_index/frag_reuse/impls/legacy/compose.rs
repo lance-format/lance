@@ -241,13 +241,16 @@ mod tests {
         }
     }
 
-    /// The rewrite translates through every version, whatever the published
-    /// bitmap claims: an address outside the history stays as it is.
+    /// The rewrite translates through every version, as one in-memory map,
+    /// whatever the published bitmap claims: an address outside the history
+    /// stays as it is.
     #[tokio::test]
     async fn the_rewrite_translates_through_the_whole_history() {
         let history = two_rounds();
         let plan = rewritten(compose(&history, &segment(Some(&[2, 3]), 15)));
         let remapper = plan.bind(Arc::new(NoMappings));
+        // An index rewrite applies it as that one map.
+        assert!(remapper.row_addr_remap().is_some());
         let mut addrs = vec![
             Some(address(0, 1)),
             Some(address(3, 0)),

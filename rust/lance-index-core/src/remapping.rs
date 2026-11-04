@@ -275,9 +275,16 @@ pub enum RowAddrTranslator {
     Remapper(Remapper),
 }
 
+/// A remapper whose translation is already one in-memory map (a version 0
+/// fragment reuse history's) becomes [`RowAddrTranslator::Sync`] over that
+/// map, so the rewrite applies it exactly as the released version 0 remap
+/// did, never through batch translation.
 impl From<Remapper> for RowAddrTranslator {
     fn from(remapper: Remapper) -> Self {
-        Self::Remapper(remapper)
+        match remapper.row_addr_remap() {
+            Some(remap) => Self::sync(remap.clone()),
+            None => Self::Remapper(remapper),
+        }
     }
 }
 
@@ -944,5 +951,46 @@ mod tests {
             assert_eq!(translated, expected);
             assert_eq!(sizing.calls.load(Ordering::Relaxed), 2);
         });
+    }
+
+    /// A backing that may or may not hold its translation as one map.
+    #[derive(Debug)]
+    struct MapBacking(Option<RowAddrRemap>);
+
+    impl lance_select::remapper::RemapperBacking for MapBacking {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            _addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+            self.0.as_ref()
+        }
+    }
+
+    #[test]
+    fn an_in_memory_translation_rewrites_synchronously() {
+        let remap = RowAddrRemap::direct(HashMap::from([(1, Some(5)), (3, None)]));
+        let remapper = Remapper::from_backing(Arc::new(MapBacking(Some(remap.clone()))));
+        let RowAddrTranslator::Sync(translated) = RowAddrTranslator::from(remapper) else {
+            panic!("an in-memory translation is applied as its map");
+        };
+        assert_eq!(translated.as_ref(), &remap);
+
+        let remapper = Remapper::from_backing(Arc::new(MapBacking(None)));
+        assert!(matches!(
+            RowAddrTranslator::from(remapper),
+            RowAddrTranslator::Remapper(_)
+        ));
     }
 }

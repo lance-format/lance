@@ -54,6 +54,13 @@ pub trait RemapperBacking: Send + Sync + Debug {
     fn materialization_budget_bytes(&self) -> u64 {
         DEFAULT_MATERIALIZATION_BUDGET_BYTES
     }
+
+    /// The whole translation as one in-memory map, when the backing already
+    /// holds it (a version 0 history decodes into one). An index rewrite
+    /// applies such a map directly rather than translating batch by batch.
+    fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+        None
+    }
 }
 
 /// Translates the row addresses one index segment stores into the addresses
@@ -107,6 +114,12 @@ impl Remapper {
     /// one at a time, since a lazily read mapping is read once per batch.
     pub async fn translate_in_place(&self, addrs: &mut [Option<u64>]) -> Result<()> {
         self.0.translate_in_place(addrs).await
+    }
+
+    /// The whole translation as one in-memory map, when the backing already
+    /// holds it: see [`RemapperBacking::row_addr_remap`].
+    pub fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+        self.0.row_addr_remap()
     }
 
     /// The translation of every address in `addrs`, without the ones that

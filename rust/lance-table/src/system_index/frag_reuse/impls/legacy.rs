@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use bytes::{Bytes, BytesMut};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_select::Remapper;
 use lance_select::remapper::{RemapperBacking, TranslateFuture};
@@ -528,6 +529,10 @@ impl RemapperBacking for LegacyRemapper {
             .compact_index()
             .map(|index| index.remap_row_ids_in_place(addrs));
         Box::pin(std::future::ready(result))
+    }
+
+    fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+        self.index.as_ref().ok().map(|index| index.row_addr_remap())
     }
 }
 
