@@ -197,6 +197,32 @@ fn records_added_since_is_append_only() {
     assert!(error.to_string().contains("changes"), "{error}");
 }
 
+/// A record this build cannot interpret has no identity to match, so a
+/// proposal must carry it byte for byte.
+#[rstest::rstest]
+#[case::unknown_envelope_record(unknown_record())]
+#[case::transition_with_unknown_field(transition_with_unknown_field())]
+fn records_added_since_keeps_records_it_cannot_interpret(#[case] unknown: Vec<u8>) {
+    let known = length_delimited(
+        TRANSITION_FIELD,
+        &ordered(&[whole(0, 1)], &[(1, 1)]).encode_to_vec(),
+    );
+    let history = |parts: &[&[u8]]| {
+        RawHistory::new(HistoryFormat::Tagged, Bytes::from(parts.concat()))
+            .validate()
+            .unwrap()
+    };
+    let base = history(&[&known, &unknown]);
+
+    assert_eq!(base.records_added_since(&base).unwrap(), vec![]);
+    let error = history(&[&known]).records_added_since(&base).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains("cannot interpret"), "{error}");
+    let changed = history(&[&known, &length_delimited(10, b"future")]);
+    let error = changed.records_added_since(&base).unwrap_err();
+    assert!(error.to_string().contains("cannot interpret"), "{error}");
+}
+
 /// One rewrite the model applies: which live fragments it consumes, which of
 /// their rows are deleted first, and how the survivors split into
 /// destinations.

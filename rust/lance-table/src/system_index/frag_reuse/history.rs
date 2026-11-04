@@ -574,6 +574,9 @@ impl FragReuseHistory {
     /// appends history, so every record `base` holds must still be present
     /// with the same content. Transitions are identified by their source and
     /// destination fragments, compaction versions by their dataset version.
+    /// A record this build cannot interpret has no identity, so it must be
+    /// carried byte for byte: only a newer writer could tell whether dropping
+    /// it is an edit.
     ///
     /// Used by `lance`'s commit path to find what a rewrite adds; not part
     /// of the stable interface.
@@ -589,9 +592,25 @@ impl FragReuseHistory {
                 )));
             }
         }
+        let mut uninterpretable: HashMap<&Bytes, usize> = HashMap::new();
+        for stored in &self.0.records().stored {
+            if matches!(stored.record, Record::Uninterpretable { .. }) {
+                *uninterpretable.entry(&stored.raw).or_default() += 1;
+            }
+        }
         let mut recorded = HashSet::new();
-        for record in base.records() {
+        for stored in &base.0.records().stored {
+            let record = &stored.record;
             let Some(identity) = RecordIdentity::of(record) else {
+                match uninterpretable.get_mut(&stored.raw) {
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => {
+                        return Err(Error::invalid_input(
+                            "the fragment reuse entry drops or changes a record this version of \
+                             Lance cannot interpret; a rewrite only appends history",
+                        ));
+                    }
+                }
                 continue;
             };
             match proposed.get(&identity) {
