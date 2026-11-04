@@ -933,7 +933,7 @@ impl Dataset {
         // the translated namespace of `query_cache`.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
-        let remapping = resolved.map(|(_, remapping)| remapping);
+        let remapping = frag_reuse::segment_remapper(self, index_meta, &resolved).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());

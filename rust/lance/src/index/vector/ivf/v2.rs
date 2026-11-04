@@ -4,6 +4,7 @@
 //! IVF - Inverted File index.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::Remapper;
 use lance_index::scalar::RowAddrTranslator;
 use std::marker::PhantomData;
 use std::{
@@ -17,7 +18,6 @@ use std::{
     },
 };
 
-use crate::index::frag_reuse::ResolvedRemapping;
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
@@ -661,7 +661,7 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
-        frag_reuse_index: Option<ResolvedRemapping>,
+        remapper: Option<Remapper>,
         context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
 }
@@ -838,7 +838,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
         object_store: Arc<ObjectStore>,
         file_metadata_cache: &'a LanceCache,
         index_cache: LanceCache,
-        frag_reuse_index: Option<ResolvedRemapping>,
+        remapper: Option<Remapper>,
         context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>> {
         Box::pin(async move {
@@ -849,7 +849,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         object_store,
                         file_metadata_cache,
                         index_cache,
-                        frag_reuse_index,
+                        remapper,
                         context,
                     )
                     .await
@@ -860,7 +860,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                         object_store,
                         file_metadata_cache,
                         index_cache,
-                        frag_reuse_index,
+                        remapper,
                         context,
                     )
                     .await
@@ -1697,7 +1697,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         uuid: Uuid,
-        frag_reuse_index: Option<ResolvedRemapping>,
+        remapper: Option<Remapper>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
@@ -1783,22 +1783,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             FileReaderOptions::default(),
         )
         .await?;
-        let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::V0(remapper)) => {
-                IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
-                    .await?
-            }
-            Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
-                IvfQuantizationStorage::try_new_with_remapper(storage_reader, None)
-                    .await?
-                    .with_row_id_remapping(remapper)
-            }
-            // An untouched segment on a tagged dataset decodes the original
-            // way, with no remapper.
-            Some(ResolvedRemapping::V1Identity) | None => {
-                IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
-            }
-        };
+        let storage = IvfQuantizationStorage::open(storage_reader)
+            .await?
+            .with_remapper(remapper);
         let resident_columns = Self::resident_columns_at_open(
             &storage,
             context.file_cache.as_ref(),
@@ -3869,7 +3856,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     object_store: Arc<ObjectStore>,
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
-    frag_reuse_index: Option<ResolvedRemapping>,
+    remapper: Option<Remapper>,
     context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
@@ -3920,22 +3907,13 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
-    let make_storage = |legacy| {
-        IvfQuantizationStorage::from_cached_with_remapper(
-            aux_reader,
-            state.aux_ivf.clone(),
-            state.metadata.clone(),
-            state.distance_type,
-            legacy,
-        )
-    };
-    let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
-        Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
-            make_storage(None).with_row_id_remapping(remapper)
-        }
-        Some(ResolvedRemapping::V1Identity) | None => make_storage(None),
-    };
+    let storage = IvfQuantizationStorage::from_cached_parts(
+        aux_reader,
+        state.aux_ivf.clone(),
+        state.metadata.clone(),
+        state.distance_type,
+    )
+    .with_remapper(remapper);
     // Bind the store as an open does: the state holds none, so a state read
     // back from a persistent tier binds to the one the index cache holds or
     // the file's live indexes share, and any state pins nothing.

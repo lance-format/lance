@@ -31,7 +31,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, ReaderProjection};
 use lance_index_core::remapping::{
-    BatchRowIdRemapper, remap_row_ids_async, remap_row_ids_preserving_layout_async,
+    BatchRowIdRemapper, DeprecatedRemapper, Remapper, translate_preserving_layout,
 };
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
@@ -1340,11 +1340,9 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     metadata: Q::Metadata,
 
     ivf: IvfModel,
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates each partition's row addresses; `None` when they are
+    /// current.
+    remapper: Option<Remapper>,
     /// Address-only views under the current file and translation identity.
     row_address_cache: Option<WeakLanceCache>,
     /// See [`Self::origin_latency`].
@@ -1374,22 +1372,38 @@ impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
 
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Open a Loader.
-    ///
-    ///
+    #[deprecated(
+        since = "15.0.0",
+        note = "use IvfQuantizationStorage::open and IvfQuantizationStorage::with_remapper"
+    )]
     pub async fn try_new(
         reader: FileReader,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::try_new_with_remapper(reader, frag_reuse_index).await
+        Ok(Self::open(reader)
+            .await?
+            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index)))
     }
 
     #[doc(hidden)]
+    #[deprecated(
+        since = "15.0.0",
+        note = "use IvfQuantizationStorage::open and IvfQuantizationStorage::with_remapper"
+    )]
     pub async fn try_new_with_remapper(
         reader: FileReader,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
+        Ok(Self::open(reader)
+            .await?
+            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index)))
+    }
+
+    /// Open the partitioned storage in `reader`'s file, with row addresses
+    /// as stored; see [`Self::with_remapper`] to translate them.
+    pub async fn open(reader: FileReader) -> Result<Self> {
         let schema = reader.schema();
 
         let distance_type = DistanceType::try_from(
@@ -1453,8 +1467,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             quantizer,
             metadata,
             ivf,
-            frag_reuse_index,
-            batch_remapper: None,
+            remapper: None,
             row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
@@ -1467,6 +1480,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// Construct from pre-parsed metadata, skipping global buffer reads.
     /// Used when reconstructing from a disk cache.
+    #[deprecated(
+        since = "15.0.0",
+        note = "use IvfQuantizationStorage::from_cached_parts and IvfQuantizationStorage::with_remapper"
+    )]
     pub fn from_cached(
         reader: FileReader,
         ivf: IvfModel,
@@ -1476,16 +1493,34 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Self {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
+        Self::from_cached_parts(reader, ivf, metadata, distance_type)
+            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index))
     }
 
     #[doc(hidden)]
+    #[deprecated(
+        since = "15.0.0",
+        note = "use IvfQuantizationStorage::from_cached_parts and IvfQuantizationStorage::with_remapper"
+    )]
     pub fn from_cached_with_remapper(
         reader: FileReader,
         ivf: IvfModel,
         metadata: Q::Metadata,
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Self {
+        Self::from_cached_parts(reader, ivf, metadata, distance_type)
+            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index))
+    }
+
+    /// Construct from pre-parsed metadata, skipping global buffer reads, with
+    /// row addresses as stored; see [`Self::with_remapper`] to translate
+    /// them. Used when reconstructing from a disk cache.
+    pub fn from_cached_parts(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
     ) -> Self {
         let quantizer = if Q::retain_quantizer_for_partition_storage() {
             Q::from_metadata(&metadata, distance_type).ok()
@@ -1498,8 +1533,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             quantizer,
             metadata,
             ivf,
-            frag_reuse_index,
-            batch_remapper: None,
+            remapper: None,
             row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
@@ -1511,13 +1545,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Set the batch row-ID remapper used when decoding each partition.
-    ///
-    /// Only tagged fragment-reuse histories use this; the legacy remapper is
-    /// supplied through the constructors instead.
-    pub fn with_row_id_remapping(mut self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
-        self.frag_reuse_index = None;
-        self.batch_remapper = Some(remapping);
-        debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
+    #[deprecated(since = "15.0.0", note = "use IvfQuantizationStorage::with_remapper")]
+    pub fn with_row_id_remapping(self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
+        self.with_remapper(DeprecatedRemapper::batch(Some(remapping)))
+    }
+
+    /// Translate each partition's row addresses through `remapper` as the
+    /// partition is decoded, one batch per partition; `None` keeps them as
+    /// stored. Deleted rows are dropped from decoded partitions.
+    pub fn with_remapper(mut self, remapper: Option<Remapper>) -> Self {
+        self.remapper = remapper;
         self
     }
 
@@ -1715,21 +1752,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
-    /// Translate assembled rows without changing cached encoded columns.
+    /// Translate assembled rows without changing cached encoded columns. A
+    /// deleted row keeps its slot with a tombstone address; the returned
+    /// remapper, which the storage decodes the batch with, drops it.
     async fn remap_partition_batch(
         &self,
         batch: RecordBatch,
     ) -> Result<(RecordBatch, Option<Arc<dyn RowIdRemapper>>)> {
-        if let Some(remapping) = &self.batch_remapper {
-            lance_index_core::remapping::check_batch_remapping_entry()?;
-            let row_id_idx = batch.schema().index_of(ROW_ID)?;
-            let (batch, remapper) =
-                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
-                    .await?;
-            Ok((batch, Some(remapper)))
-        } else {
-            Ok((batch, self.frag_reuse_index.clone()))
-        }
+        let Some(remapper) = &self.remapper else {
+            return Ok((batch, None));
+        };
+        let row_id_idx = batch.schema().index_of(ROW_ID)?;
+        let (batch, tombstones) = translate_preserving_layout(remapper, batch, row_id_idx).await?;
+        Ok((batch, Some(tombstones)))
     }
 
     /// Load a partition's quantization storage, optionally measuring the exact
@@ -2345,7 +2380,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ));
         }
         let sign = self.load_plane(part_id, 0, cache, io_stats).await?;
-        let sign = if self.batch_remapper.is_some() || self.frag_reuse_index.is_some() {
+        let sign = if let Some(remapper) = &self.remapper {
             let row_id_idx = sign.schema().index_of(ROW_ID)?;
             let row_ids = sign
                 .column(row_id_idx)
@@ -2358,34 +2393,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 })?;
             let translate = || async {
                 let started = Instant::now();
-                let ids = if let Some(remapper) = &self.batch_remapper {
-                    remap_row_ids_async(remapper.as_ref(), row_ids.values())
-                        .await?
-                        .into_iter()
-                        .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
-                        .collect::<Vec<_>>()
-                } else if let Some(remapper) = &self.frag_reuse_index {
-                    let remapper = remapper.clone();
-                    let row_ids = row_ids.clone();
-                    spawn_cpu(move || {
-                        Ok::<_, Error>(
-                            row_ids
-                                .values()
-                                .iter()
-                                .map(|&id| {
-                                    remapper
-                                        .remap_row_id(id)
-                                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .await?
-                } else {
-                    return Err(Error::internal(
-                        "candidate address translation has no remapper",
-                    ));
-                };
+                let mut ids: Vec<Option<u64>> =
+                    row_ids.values().iter().copied().map(Some).collect();
+                remapper.translate_in_place(&mut ids).await?;
+                let ids: Vec<u64> = ids
+                    .into_iter()
+                    .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                    .collect();
                 // Own precisely this partition's addresses. An identity map
                 // must not pin a slice of the whole resident file store.
                 let stats = scan_stats::counters();
@@ -3126,52 +3140,19 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
         let quantizer = self.quantizer.clone();
-        if let Some(remapping) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            lance_index_core::remapping::check_batch_remapping_entry()?;
-            let batch =
-                spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
-            let row_id_idx = batch.schema().index_of(ROW_ID)?;
-            // Row-map IO must finish outside the CPU-only materialization pool.
-            let (batch, remapper) =
-                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
-                    .await?;
-            let quantizer = quantizer.clone();
-            return spawn_prewarm_materialization(move || match &quantizer {
-                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
-                    batch,
-                    quantizer,
-                    &metadata,
-                    distance_type,
-                    Some(remapper),
-                ),
-                None => Q::Storage::try_from_batch_with_remapper(
-                    batch,
-                    &metadata,
-                    distance_type,
-                    Some(remapper),
-                ),
-            })
-            .await;
-        }
-        // Legacy synchronous remapping path.
-        let frag_reuse_index = self.frag_reuse_index.clone();
-        spawn_prewarm_materialization(move || {
-            let batch = compact_prewarm_batches(batches)?;
-            match &quantizer {
-                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
-                    batch,
-                    quantizer,
-                    &metadata,
-                    distance_type,
-                    frag_reuse_index,
-                ),
-                None => Q::Storage::try_from_batch_with_remapper(
-                    batch,
-                    &metadata,
-                    distance_type,
-                    frag_reuse_index,
-                ),
+        let batch = spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
+        // Row-map IO must finish outside the CPU-only materialization pool.
+        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        spawn_prewarm_materialization(move || match &quantizer {
+            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                batch,
+                quantizer,
+                &metadata,
+                distance_type,
+                remapper,
+            ),
+            None => {
+                Q::Storage::try_from_batch_with_remapper(batch, &metadata, distance_type, remapper)
             }
         })
         .await
