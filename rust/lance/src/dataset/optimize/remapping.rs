@@ -3961,16 +3961,20 @@ mod tests {
         assert!(cloned_index.base_id.is_some());
 
         // Dropping every indexed row makes `index::remap::remap_index` return `Keep`.
+        // The source digest records every row deleted, as a compaction of a
+        // fragment without survivors does.
         let mut no_survivors = Vec::new();
         RoaringTreemap::new()
             .serialize_into(&mut no_survivors)
             .unwrap();
+        let mut source = FragDigest::from(&clone.manifest.fragments[0]);
+        source.num_deleted_rows = source.physical_rows;
         let details = FragReuseIndexDetails {
             versions: vec![FragReuseVersion {
                 dataset_version: clone.manifest.version,
                 groups: vec![FragReuseGroup {
                     changed_row_addrs: no_survivors,
-                    old_frags: vec![FragDigest::from(&clone.manifest.fragments[0])],
+                    old_frags: vec![source],
                     new_frags: vec![],
                 }],
             }],
