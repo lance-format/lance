@@ -120,8 +120,9 @@ pub fn repair_versions(mut versions: Vec<pb::Version>) -> Result<(FragReuseHisto
     Ok((from_versions(kept)?, dropped))
 }
 
-/// The warning every trim that drops invalid versions logs.
-pub(super) fn warn_dropped_versions(dropped: &[u64]) {
+/// The warning logged whenever invalid recorded versions are dropped (by a
+/// trim, or by the conflict resolver repairing the versions it rebases onto).
+pub fn warn_dropped_versions(dropped: &[u64]) {
     if !dropped.is_empty() {
         log::warn!(
             "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \

@@ -60,10 +60,11 @@ pub mod metadata;
 pub mod plan;
 pub mod policy;
 
-// Version 0 cleanup in `lance` until trim owns it; not part of the stable
-// interface.
+// Used by `lance`'s commit-time checks of version 0 cleanups on tables
+// with stable row IDs and by the conflict resolver's repair of recorded
+// versions; not part of the stable interface.
 #[doc(hidden)]
-pub use impls::legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
+pub use impls::legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap, warn_dropped_versions};
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 

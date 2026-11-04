@@ -64,6 +64,22 @@ pub(super) fn retention(records: &[StoredRecord], live: &[Vec<SegmentSummary>]) 
         Record::LegacyVersion(version) => Some(version),
         _ => None,
     }));
+    // Lifted legacy versions warn through the v0 rule; a transition is
+    // simply not pinned by such a segment.
+    if records
+        .iter()
+        .any(|stored| matches!(stored.record, Record::Transition(_)))
+    {
+        for segment in live.iter().flatten() {
+            if segment.fragment_bitmap.is_none() {
+                log::warn!(
+                    "Index segment {} missing fragment bitmap, it cannot pin tagged fragment \
+                     reuse records, consider retraining the index",
+                    segment.uuid
+                );
+            }
+        }
+    }
     let groups: Vec<GroupCoverage> = live
         .iter()
         .map(|segments| {

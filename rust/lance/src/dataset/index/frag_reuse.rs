@@ -17,7 +17,6 @@ use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::history::HistoryFormat;
 use lance_table::system_index::frag_reuse::plan::{RowDomain, SegmentSummary, TranslationSupport};
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
-use log::warn;
 use roaring::RoaringBitmap;
 
 impl Dataset {
@@ -200,15 +199,6 @@ async fn cleanup_stable_row_id_history(
         .apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
     Ok(())
-}
-
-pub(crate) fn warn_dropped_versions(dropped: &[u64]) {
-    if !dropped.is_empty() {
-        warn!(
-            "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
-             scanned until their indices are rebuilt"
-        );
-    }
 }
 
 /// Conflict-source marker for a trim whose rebase derived nothing left to
@@ -566,22 +556,8 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     }
 
     // A v0 entry under the sticky flag is trimmed as the tagged history it
-    // is lifted to.
+    // is lifted to. Trimming refuses a history it cannot interpret.
     let history = load_frag_reuse_history(dataset, &entry).await?.lift()?;
-    if !history.is_fully_interpretable() {
-        return Err(Error::not_supported(
-            "the tagged FRI history carries transitions this client cannot interpret; \
-             upgrade to a newer version of Lance before trimming",
-        ));
-    }
-    for index in &indices {
-        if !is_system_index(index) && index.fragment_bitmap.is_none() {
-            warn!(
-                "Index {} ({}) missing fragment bitmap, it cannot pin tagged fragment reuse records, consider retraining the index",
-                index.name, index.uuid
-            );
-        }
-    }
     let trimmed = history.trim(&trim_segments(&indices))?;
     if trimmed == history {
         return Ok(TaggedTrimOutcome::NothingToTrim);
