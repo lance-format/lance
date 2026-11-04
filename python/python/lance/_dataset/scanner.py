@@ -548,8 +548,9 @@ def _build_vector_search_query(
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently affects
         RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
-        that exclude rows through a prefilter or deletions, where ``fast``
-        enables the ACORN traversal. Other index types ignore this setting.
+        that exclude rows (for example through a prefilter or deletions),
+        where ``fast`` enables the ACORN traversal. Other index types ignore
+        this setting.
         ``fast`` favors lower latency and may reduce recall, ``normal`` uses
         the default balance, and ``accurate`` favors higher recall and may
         increase latency.
@@ -1064,8 +1065,9 @@ class ScannerBuilder:
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently affects
             RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
-            that exclude rows through a prefilter or deletions, where ``fast``
-            enables the ACORN traversal. Other index types ignore this setting.
+            that exclude rows (for example through a prefilter or deletions),
+            where ``fast`` enables the ACORN traversal. Other index types ignore
+            this setting.
             ``fast`` favors lower latency and may reduce recall, ``normal`` uses
             the default balance, and ``accurate`` favors higher recall and may
             increase latency.

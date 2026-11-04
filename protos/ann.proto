@@ -12,9 +12,9 @@ import "index.proto";
 /* Query-time approximation mode for vector search.
  *
  * This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
- * HNSW sub-index searches that exclude rows through a prefilter or deletions,
- * where FAST enables the ACORN traversal. Other index types ignore this
- * setting.
+ * HNSW sub-index searches that exclude rows (for example through a prefilter
+ * or deletions), where Fast enables the ACORN traversal. Other index types
+ * ignore this setting.
  */
 enum VectorApproxMode {
   // Use all RQ bits for query-time scoring with u8-quantized lookup tables.
@@ -64,8 +64,8 @@ message VectorQueryProto {
   optional int32 query_parallelism = 13;
   /* Query-time approximation mode. Currently affects RQ-quantized vector
    * indexes (such as IVF_RQ) and HNSW sub-index searches that exclude rows
-   * through a prefilter or deletions, where FAST enables the ACORN traversal.
-   * Other index types ignore this setting.
+   * (for example through a prefilter or deletions), where Fast enables the
+   * ACORN traversal. Other index types ignore this setting.
    */
   VectorApproxMode approx_mode = 14;
   /* Which covering columns the index must materialize for this query. Absent means

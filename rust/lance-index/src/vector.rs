@@ -92,9 +92,9 @@ pub const DEFAULT_QUERY_PARALLELISM: i32 = 0;
 /// Controls the speed / accuracy tradeoff for approximate vector search.
 ///
 /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-/// HNSW sub-index searches that exclude rows through a prefilter or deletions,
-/// where `Fast` enables the ACORN traversal. Other index types ignore this
-/// setting.
+/// HNSW sub-index searches that exclude rows (for example through a prefilter
+/// or deletions), where `Fast` enables the ACORN traversal. Other index types
+/// ignore this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApproxMode {
     /// Prefer lower query latency, which can reduce recall.
@@ -223,9 +223,9 @@ pub struct Query {
     /// Controls the speed / accuracy tradeoff for approximate vector search.
     ///
     /// This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-    /// HNSW sub-index searches that exclude rows through a prefilter or
-    /// deletions, where `Fast` enables the ACORN traversal. Other index types
-    /// ignore this setting.
+    /// HNSW sub-index searches that exclude rows (for example through a
+    /// prefilter or deletions), where `Fast` enables the ACORN traversal. Other
+    /// index types ignore this setting.
     pub approx_mode: ApproxMode,
 }
 
