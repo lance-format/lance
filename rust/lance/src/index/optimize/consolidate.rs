@@ -77,8 +77,12 @@ pub(super) async fn plan_index(
         }
         None => segments.to_vec(),
     };
-    // A selection is read whole, then held to the budget.
-    let limit = if explicit.is_some() { u64::MAX } else { budget };
+    // A selection over the budget is an error, not a shorter selection.
+    let over_budget = || {
+        Error::invalid_input(format!(
+            "the selected segments hold more than the consolidation budget of {budget} rows"
+        ))
+    };
     let mut selected = Vec::new();
     let mut pairs = Vec::new();
     let mut coverage = RoaringBitmap::new();
@@ -100,11 +104,14 @@ pub(super) async fn plan_index(
                 .checked_add(count)
                 .ok_or_else(|| Error::invalid_input("consolidation physical row count overflow"))?;
             fragment_rows.insert(fragment.id() as u32, count);
-            if segment_rows > limit - rows {
+            if segment_rows > budget - rows {
                 break;
             }
         }
-        if segment_rows > limit - rows {
+        if segment_rows > budget - rows {
+            if explicit.is_some() {
+                return Err(over_budget());
+            }
             break;
         }
         let index = dataset
@@ -119,7 +126,10 @@ pub(super) async fn plan_index(
         // Direct merges also read retired postings, whereas re-encoding reads
         // the raw fragments (including rows with null/unindexable vectors).
         let segment_rows = segment_rows.max(index.num_rows());
-        if segment_rows > limit - rows {
+        if segment_rows > budget - rows {
+            if explicit.is_some() {
+                return Err(over_budget());
+            }
             break;
         }
         if index.as_any().is::<LegacyIvfIndex>() {
@@ -136,11 +146,6 @@ pub(super) async fn plan_index(
         coverage |= effective;
         pairs.push(((*segment).clone(), index));
         selected.push((*segment).clone());
-    }
-    if explicit.is_some() && rows > budget {
-        return Err(Error::invalid_input(format!(
-            "the selected segments hold {rows} rows, more than the consolidation budget of {budget}"
-        )));
     }
     if selected.len() < if explicit.is_some() { 1 } else { 2 } {
         return Ok(());

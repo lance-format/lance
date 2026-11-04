@@ -95,8 +95,9 @@ pub struct OptimizeOptions {
     pub max_rows_to_consolidate: Option<u64>,
     /// Consolidate these segments of one vector index instead of the newest
     /// ones. They are re-encoded into one segment with the model of the
-    /// newest live segment, dropping deleted rows. Reading more than
-    /// `max_rows_to_consolidate` rows is an error. Default: unset.
+    /// newest live segment, dropping deleted rows; a source trained on a
+    /// different distribution can lose recall under that model. Reading more
+    /// than `max_rows_to_consolidate` rows is an error. Default: unset.
     pub consolidate_segments: Option<Vec<Uuid>>,
 }
 
