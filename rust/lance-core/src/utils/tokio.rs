@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, LazyLock, Mutex, atomic};
+use std::sync::{Arc, LazyLock, atomic};
 use std::time::Duration;
 
 use futures::{Future, FutureExt};
@@ -189,15 +190,14 @@ pub fn spawn_cpu<
     // cell, harness, vtable, drop glue) is instantiated once rather than once
     // per closure type in every calling crate.
     let task = Arc::new(CpuTask {
-        func: Mutex::new(Some(func)),
-        output: Mutex::new(None),
+        func: UnsafeCell::new(Some(func)),
+        output: UnsafeCell::new(None),
     });
     spawn_erased(task.clone()).map(move |res| match res {
-        Ok(()) => task
-            .output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+        // SAFETY: the join handle resolved, so `run` has returned on the CPU
+        // thread and tokio's task-completion handoff orders its write to
+        // `output` before this read. Nothing else touches `output`.
+        Ok(()) => unsafe { (*task.output.get()).take() }
             .expect("spawn_cpu task completed without storing its output"),
         // Awaited through the join handle, not a result channel: a panic in
         // `func` arrives as a `JoinError` still carrying its payload, so
@@ -211,28 +211,33 @@ pub fn spawn_cpu<
     })
 }
 
+/// A closure and the slot for its output, shared between the caller and the
+/// CPU thread without locks. Access is sequenced by the task lifecycle rather
+/// than synchronized per field: `func` is only touched by `run`, and `output`
+/// is written by `run` and read by the caller only after the task completes.
 struct CpuTask<F, T> {
-    func: Mutex<Option<F>>,
-    output: Mutex<Option<T>>,
+    func: UnsafeCell<Option<F>>,
+    output: UnsafeCell<Option<T>>,
 }
 
+// SAFETY: the fields are never accessed concurrently (see `CpuTask`), so
+// sharing across threads only requires the contents to be `Send`.
+unsafe impl<F: Send, T: Send> Sync for CpuTask<F, T> {}
+
 trait RunOnce: Send + Sync {
-    fn run(&self);
+    /// # Safety
+    ///
+    /// Must be called at most once, and `output` must not be read until it
+    /// returns.
+    unsafe fn run(&self);
 }
 
 impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
-    fn run(&self) {
-        let func = self
-            .func
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-            .expect("spawn_cpu task runs once");
+    unsafe fn run(&self) {
+        // SAFETY: upheld by the caller of `run`; see `RunOnce::run`.
+        let func = unsafe { (*self.func.get()).take() }.expect("spawn_cpu task runs once");
         let output = func();
-        *self
-            .output
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(output);
+        unsafe { *self.output.get() = Some(output) };
     }
 }
 
@@ -241,7 +246,9 @@ fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
     let span = Span::current();
     global_cpu_runtime().spawn_blocking(move || {
         let _span_guard = span.enter();
-        task.run();
+        // SAFETY: tokio runs a blocking task exactly once, and the caller in
+        // `spawn_cpu` reads `output` only after this task's join handle resolves.
+        unsafe { task.run() };
     })
 }
 
