@@ -997,3 +997,47 @@ fn translate_legacy_posting(
         doc_positions.map(|list| list.as_list::<i32>().clone()),
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::ListArray;
+    use arrow_array::types::Int32Type;
+
+    use super::*;
+
+    /// A legacy posting's addresses follow the translation; the entry of a
+    /// deleted row is dropped, and the rest are re-sorted together with
+    /// their frequencies and positions.
+    #[test]
+    fn translate_legacy_posting_follows_the_translation() {
+        let positions = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(0)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+        ]);
+        let posting = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![10_u64, 20, 30]),
+            ScalarBuffer::from(vec![1.0_f32, 2.0, 3.0]),
+            Some(3.0),
+            Some(positions),
+        ));
+        // Row 10 moved past row 30, and row 20 was deleted.
+        let translation = [(10, 300), (30, 100)];
+
+        let PostingList::Plain(translated) =
+            translate_legacy_posting(posting, &translation).unwrap()
+        else {
+            panic!("a legacy posting stays plain");
+        };
+        assert_eq!(translated.row_ids.as_ref(), &[100, 300]);
+        assert_eq!(translated.frequencies.as_ref(), &[3.0, 1.0]);
+        assert_eq!(translated.max_score, Some(3.0));
+        assert_eq!(
+            translated.positions,
+            Some(ListArray::from_iter_primitive::<Int32Type, _, _>([
+                Some(vec![Some(3)]),
+                Some(vec![Some(0)]),
+            ]))
+        );
+    }
+}

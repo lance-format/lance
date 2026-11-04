@@ -1027,3 +1027,76 @@ async fn test_oversized_merge_groups_stream_and_match_gather() {
         .unwrap();
     assert_eq!(bands(streamed, &rows).await, sorted_in_memory);
 }
+
+/// Loaded with a remapper, the index answers with current addresses: moved
+/// rows at their destination, a deleted row not at all, a row of an
+/// untouched fragment as stored. Addresses are translated in batches.
+#[tokio::test]
+async fn test_remapper_translates_stored_addresses() {
+    let (_tmpdir, store) = test_store();
+    let (bases, _) = near_duplicate_corpus(5, 40);
+    let address = |fragment: u64, offset: u64| (fragment << 32) | offset;
+    // Bases 0..4 in fragment 0, which a rewrite moved into fragment 1 and
+    // where it deleted base 1; base 4 in fragment 2, which it left alone.
+    let mut rows: Vec<(Option<&str>, u64)> = bases[..4]
+        .iter()
+        .enumerate()
+        .map(|(offset, text)| (Some(text.as_str()), address(0, offset as u64)))
+        .collect();
+    rows.push((Some(bases[4].as_str()), address(2, 0)));
+    let params = default_builder().params().clone();
+    default_builder()
+        .train(text_stream(&rows, 2), store.as_ref())
+        .await
+        .unwrap();
+    let (remapper, script) = lance_select::remapper::ScriptedRemapper::new()
+        .moved(address(0, 0), address(1, 2))
+        .deleted(address(0, 1))
+        .moved(address(0, 2), address(1, 0))
+        .moved(address(0, 3), address(1, 1))
+        .into_remapper();
+    let index = MinHashLshIndex::load_remapped(
+        store.clone(),
+        &params.details_any().unwrap(),
+        Some(remapper),
+        &LanceCache::no_cache(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(row_ids(&index, &bases[0], 1).await, vec![address(1, 2)]);
+    assert!(search(&index, &bases[1], 5).await.is_empty());
+    assert_eq!(row_ids(&index, &bases[2], 1).await, vec![address(1, 0)]);
+    assert_eq!(row_ids(&index, &bases[3], 1).await, vec![address(1, 1)]);
+    assert_eq!(row_ids(&index, &bases[4], 1).await, vec![address(2, 0)]);
+
+    let live = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+        address(1, 0),
+        address(1, 1),
+        address(1, 2),
+        address(2, 0),
+    ]));
+    let mut scanned = Vec::new();
+    let mut signatures = index.scan_signatures(Arc::new(live));
+    while let Some(batch) = signatures.try_next().await.unwrap() {
+        scanned.extend(
+            batch[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    scanned.sort_unstable();
+    assert_eq!(
+        scanned,
+        vec![address(1, 0), address(1, 1), address(1, 2), address(2, 0)]
+    );
+    assert!(script.batches() > 0, "the index never translated");
+    assert!(
+        script.batches() < script.addresses(),
+        "{} batches for {} addresses: the index translates row by row",
+        script.batches(),
+        script.addresses()
+    );
+}
