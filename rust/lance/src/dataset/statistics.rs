@@ -5,6 +5,8 @@
 
 use std::{collections::HashMap, future::Future, sync::Arc};
 
+use arrow_array::RecordBatch;
+use arrow_select::concat::concat_batches;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
@@ -15,7 +17,7 @@ use roaring::RoaringBitmap;
 
 use super::overlay::{collect_overlay_stale_frags, overlaid_fragments};
 use super::{Dataset, fragment::FileFragment, versions};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {
@@ -208,6 +210,95 @@ impl<'a> DatasetStatistics<'a> {
             return Ok(None);
         };
         Ok(ZoneMapIndex::value_range_over(zonemaps))
+    }
+
+    /// Returns per-zone statistics for the ZoneMap index named `index_name`.
+    ///
+    /// The result concatenates same-named physical segments and exposes their
+    /// persisted zone entries without reading data files. It is not a snapshot
+    /// of the current dataset: `fragment_id` and `zone_start` remain in each
+    /// segment's original index address domain, `zone_length` is the recorded
+    /// offset span rather than a post-deletion row count, and data overlays or
+    /// fragments appended after a segment was built are not represented.
+    ///
+    /// The columns are `min`, `max`, `null_count`, `nan_count`,
+    /// `negative_nan_count`, `fragment_id`, `zone_start`, and `zone_length`.
+    /// `negative_nan_count` is null when a legacy zone contains NaNs but did
+    /// not persist their sign split.
+    ///
+    /// The `rows_per_zone` schema metadata is present only when every returned
+    /// segment reports the same value. It is omitted when segments use
+    /// different values.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let zones = dataset.statistics().zone_statistics("x_zonemap").await?;
+    /// assert_eq!(zones.num_columns(), 8);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn zone_statistics(&self, index_name: &str) -> Result<RecordBatch> {
+        let dataset = self.dataset;
+        let indices = dataset.load_indices().await?;
+        let segments: Vec<_> = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .filter(|idx| {
+                idx.index_details
+                    .as_ref()
+                    .is_some_and(|details| details.type_url.ends_with("ZoneMapIndexDetails"))
+            })
+            .collect();
+        if segments.is_empty() {
+            if indices.iter().any(|idx| idx.name == index_name) {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' is not a ZoneMap index"
+                )));
+            }
+            return Err(Error::invalid_input(format!(
+                "zone_statistics: index '{index_name}' not found"
+            )));
+        }
+
+        let mut batches = Vec::with_capacity(segments.len());
+        let mut rows_per_zone = Vec::with_capacity(segments.len());
+        for idx in &segments {
+            let Some(field_id) = idx.keyed_field() else {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' segment {} has no keyed field",
+                    idx.uuid
+                )));
+            };
+            let field_path = dataset.schema().field_path(field_id)?;
+            let opened = dataset
+                .open_generic_index(&field_path, &idx.uuid, &NoOpMetricsCollector)
+                .await?;
+            let Some(zonemap) = opened.as_any().downcast_ref::<ZoneMapIndex>() else {
+                return Err(Error::invalid_input(format!(
+                    "zone_statistics: index '{index_name}' segment {} is not a ZoneMapIndex",
+                    idx.uuid
+                )));
+            };
+            rows_per_zone.push(zonemap.rows_per_zone());
+            batches.push(zonemap.zones_as_batch()?);
+        }
+
+        if batches.len() == 1 {
+            return Ok(batches.remove(0));
+        }
+        let mut schema = batches[0].schema().as_ref().clone();
+        if rows_per_zone.windows(2).any(|pair| pair[0] != pair[1]) {
+            schema.metadata.remove("rows_per_zone");
+        }
+        let schema = Arc::new(schema);
+        concat_batches(&schema, &batches).map_err(|err| {
+            Error::invalid_input(format!(
+                "zone_statistics: failed to combine segments of '{index_name}': {err}"
+            ))
+        })
     }
 }
 

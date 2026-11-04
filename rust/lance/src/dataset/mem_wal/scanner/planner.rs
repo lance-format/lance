@@ -625,11 +625,12 @@ mod integration_tests {
     use futures::TryStreamExt;
     use uuid::Uuid;
 
+    use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
     use lance_core::datatypes::Schema as LanceSchema;

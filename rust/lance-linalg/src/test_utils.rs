@@ -125,3 +125,59 @@ where
     });
     runner.run(&strategy, property).unwrap();
 }
+
+/// Input pairs shared by the u8 distance kernel tests.
+pub mod u8_inputs {
+    /// Covers empty input and both sides of the 32- and 64-element SIMD strides.
+    pub const LENGTHS: &[usize] = &[
+        0, 1, 7, 15, 16, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 1024, 4096, 4097,
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum Pattern {
+        Random,
+        Extremes,
+        OneSidedZeros,
+    }
+
+    impl Pattern {
+        /// Labeled input pairs of length `len`.
+        pub fn pairs(self, len: usize) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+            let filled = |value| vec![value; len];
+            match self {
+                Self::Random => (0..4)
+                    .map(|seed| ("random", random(len, 2 * seed), random(len, 2 * seed + 1)))
+                    .collect(),
+                Self::Extremes => {
+                    let alternating = |first| {
+                        (0..len)
+                            .map(|i| if i % 2 == 0 { first } else { u8::MAX - first })
+                            .collect::<Vec<_>>()
+                    };
+                    vec![
+                        ("max-0", filled(u8::MAX), filled(0)),
+                        ("0-max", filled(0), filled(u8::MAX)),
+                        ("max-max", filled(u8::MAX), filled(u8::MAX)),
+                        ("0-0", filled(0), filled(0)),
+                        ("1-1", filled(1), filled(1)),
+                        ("alternating", alternating(0), alternating(u8::MAX)),
+                    ]
+                }
+                Self::OneSidedZeros => vec![
+                    ("b=0", random(len, 0), filled(0)),
+                    ("a=0", filled(0), random(len, 1)),
+                ],
+            }
+        }
+    }
+
+    pub fn random(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = 0xC0FFEE_u32.wrapping_add(seed.wrapping_mul(7919));
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 16) as u8
+            })
+            .collect()
+    }
+}

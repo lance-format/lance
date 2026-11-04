@@ -57,19 +57,19 @@ pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+    include!("pb/lance.index.pb.rs");
 }
 
 pub mod pbold {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+    include!("pb/lance.table.rs");
 }
 
 /// Protobuf headers for serialized index cache entries (FTS posting lists,
 /// scalar indices, and IVF vector partitions).
 pub mod cache_pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+    include!("pb/lance.index.cache.rs");
 }
 
 #[derive(Serialize, Deserialize, Debug)]

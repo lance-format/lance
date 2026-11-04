@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
@@ -311,7 +311,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::Float32Type;
     use arrow_array::{Array, FixedSizeListArray, Float32Array};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
     use lance_arrow::FixedSizeListArrayExt;
     use rstest::rstest;

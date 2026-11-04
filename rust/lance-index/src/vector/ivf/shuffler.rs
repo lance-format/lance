@@ -417,6 +417,25 @@ struct ShuffleInput {
     end: usize,
 }
 
+/// Count one batch's partition ids into `partition_sizes`. The ids can come
+/// from a precomputed partitions file or shuffle buffer, so an id past
+/// `num_partitions` is an input error, not an index panic in the counting task.
+fn count_partition_ids(
+    part_ids: &UInt32Array,
+    num_partitions: u32,
+    partition_sizes: &mut [u64],
+) -> Result<()> {
+    for &part_id in part_ids.values() {
+        let Some(size) = partition_sizes.get_mut(part_id as usize) else {
+            return Err(Error::invalid_input(format!(
+                "precomputed partition id {part_id} is out of range [0, {num_partitions})"
+            )));
+        };
+        *size += 1;
+    }
+    Ok(())
+}
+
 /// Translate a batch range into the row range to read from a v2 unsorted buffer.
 ///
 /// The last batch of a file is partial whenever the row count is not a multiple of
@@ -595,9 +614,7 @@ impl IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
-                    part_ids.values().iter().for_each(|part_id| {
-                        partition_sizes[*part_id as usize] += 1;
-                    });
+                    count_partition_ids(part_ids, self.num_partitions, &mut partition_sizes)?;
                 }
             } else {
                 let file = scheduler
@@ -627,9 +644,7 @@ impl IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
-                    part_ids.values().iter().for_each(|part_id| {
-                        partition_sizes[*part_id as usize] += 1;
-                    });
+                    count_partition_ids(part_ids, self.num_partitions, &mut partition_sizes)?;
                 }
             }
         }
@@ -1012,6 +1027,46 @@ mod test {
         for v in pq_codes.values() {
             assert_eq!(*v, idx as u8);
         }
+    }
+
+    /// Partition ids come from the caller's buffers, so one past the shuffler's
+    /// partition count is an input error in both buffer formats.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_shuffler_rejects_out_of_range_partition_ids(#[values(false, true)] legacy: bool) {
+        // Four rows with partition ids 0..4, shuffled into two partitions.
+        let (dir_path, _temp_dir) = get_temp_dir().unwrap();
+        let mut shuffler = IvfShuffler::try_new(2, Some(dir_path.clone()), legacy, None).unwrap();
+        if legacy {
+            let schema = make_schema(32);
+            let codes = FixedSizeListArray::try_new_from_values(
+                Arc::new(UInt8Array::from_iter_values(0..128)) as Arc<dyn Array>,
+                32,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values(0..4)),
+                    Arc::new(UInt32Array::from_iter_values(0..4)),
+                    Arc::new(codes),
+                ],
+            )
+            .unwrap();
+            let stream =
+                RecordBatchStreamAdapter::new(schema, stream::once(async move { Ok(batch) }));
+            shuffler.write_unsorted_stream(stream).await.unwrap();
+        } else {
+            write_v2_unsorted_buffer(&dir_path, "unsorted.lance", 4, 4, 32).await;
+            shuffler.set_unsorted_buffers(&["unsorted.lance"]);
+        }
+        let err = shuffler.write_partitioned_shuffles(2, 1).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("precomputed partition id 2 is out of range [0, 2)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

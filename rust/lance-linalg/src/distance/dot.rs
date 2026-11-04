@@ -7,14 +7,13 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
-use crate::Error;
-use arrow_array::types::{Float16Type, Float64Type, Int8Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, cast::AsArray, types::Float32Type};
-use arrow_schema::DataType;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 #[allow(unused_imports)]
-use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
+use lance_core::{
+    deepsize::DeepSizeOf,
+    utils::cpu::{SIMD_SUPPORT, SimdSupport},
+};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
@@ -22,7 +21,7 @@ use crate::Result;
 use crate::distance::HalfBackend;
 use crate::distance::{
     BatchKernel, HALF_KERNELS_COMPILED, HalfType, PairKernel, assert_batch_output_layout,
-    assert_equal_lengths, half_backend, int8_query_to_f32, x86_half_features,
+    assert_equal_lengths, half_backend, x86_half_features,
 };
 
 /// Default implementation of dot product.
@@ -61,6 +60,11 @@ fn dot_scalar<
 }
 
 /// Dot product.
+///
+/// # Panics
+///
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`Dot`] implementation may define different behavior.
 #[inline]
 pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
@@ -69,20 +73,124 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// Dot product between two f32 slices, dispatched to the widest SIMD backend
 /// available at runtime. See [`crate::distance::l2::l2_f32`] for why this is
 /// needed on top of the generic [`dot`].
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different lengths.
 #[inline]
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::dot(x, y)
 }
 
 /// Negative [Dot] distance.
+///
+/// # Panics
+///
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`Dot`] implementation may define different behavior.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
     1.0 - T::dot(from, to)
 }
 
+/// Accumulate one query dimension into the Dot distances for all targets.
+///
+/// Keeping this in a separate function tells LLVM that `row` and `distances`
+/// do not alias, allowing it to vectorize across targets on every architecture.
+#[inline(never)]
+fn accumulate_dot_dimension(q: f32, row: &[f32], distances: &mut [f32]) {
+    for (distance, &target) in distances.iter_mut().zip(row) {
+        *distance -= q * target;
+    }
+}
+
+/// Pre-transposed target vectors for batched Dot distance computation.
+///
+/// Stores targets in SoA layout `[dimension][num_targets]`, allowing one query
+/// dimension to be multiplied with many contiguous target values. Construction
+/// performs the AoS-to-SoA transpose once, so callers should reuse this across
+/// queries. This is intended for small target sets whose transposed values fit
+/// in cache, such as PQ sub-vector codebooks.
+///
+/// # Example
+///
+/// ```
+/// use lance_linalg::distance::dot::DotPrepared;
+///
+/// let targets = [1.0, 0.0, 0.0, 1.0];
+/// let prepared = DotPrepared::new(&targets, 2);
+/// assert_eq!(prepared.distances(&[1.0, 0.0]), [0.0, 1.0]);
+/// ```
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct DotPrepared {
+    transposed: Vec<f32>,
+    dimension: usize,
+    num_targets: usize,
+}
+
+impl DotPrepared {
+    /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    pub fn new(targets: &[f32], dimension: usize) -> Self {
+        let num_targets = targets.len() / dimension;
+        debug_assert_eq!(targets.len(), num_targets * dimension);
+
+        let mut transposed = vec![0.0; targets.len()];
+        for target in 0..num_targets {
+            for dim in 0..dimension {
+                transposed[dim * num_targets + target] = targets[target * dimension + dim];
+            }
+        }
+
+        Self {
+            transposed,
+            dimension,
+            num_targets,
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target, writing into `out`.
+    pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(query.len(), self.dimension);
+        debug_assert_eq!(out.len(), self.num_targets);
+
+        out.fill(1.0);
+        for (dim, &q) in query.iter().enumerate() {
+            let row = &self.transposed[dim * self.num_targets..][..self.num_targets];
+            accumulate_dot_dimension(q, row, out);
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target.
+    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0; self.num_targets];
+        self.distances_into(query, &mut result);
+        result
+    }
+
+    /// Number of targets in this set.
+    pub fn num_targets(&self) -> usize {
+        self.num_targets
+    }
+
+    /// Dimension of each target vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Size of the transposed values in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.transposed.len() * std::mem::size_of::<f32>()
+    }
+}
+
 /// Dot product
 pub trait Dot: Num {
     /// Dot product.
+    ///
+    /// # Panics
+    ///
+    /// The implementations in this crate panic if `x` and `y` have different
+    /// lengths. A downstream implementation may define different behavior.
     fn dot(x: &[Self], y: &[Self]) -> f32;
 
     /// Writes the dot product of `x` with each `dimension`-sized vector in
@@ -95,7 +203,8 @@ pub trait Dot: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// The default implementation panics if `dimension == 0`, if
+    /// `x.len() != dimension`, if `batch.len()` is not a multiple of
     /// `dimension`, or if `output.len() != batch.len() / dimension`.
     fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
@@ -671,8 +780,9 @@ impl Dot for u8 {
 ///
 /// # Panics
 ///
-/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
-/// `dimension`, or if `output.len() != to.len() / dimension`.
+/// The implementations in this crate panic if `dimension == 0`, if
+/// `from.len() != dimension`, if `to.len()` is not a multiple of `dimension`,
+/// or if `output.len() != to.len() / dimension`.
 ///
 /// ```
 /// # use lance_linalg::distance::dot_distance_batch_into;
@@ -688,76 +798,15 @@ pub fn dot_distance_batch_into<T: Dot>(from: &[T], to: &[T], dimension: usize, o
     }
 }
 
-fn do_dot_distance_arrow_batch<T: ArrowFloatType>(
-    from: &T::ArrayType,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>>
-where
-    T::Native: Dot,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::InvalidArgumentError(format!(
-                "Invalid type: expect {:?} got {:?}",
-                from.data_type(),
-                to.value_type()
-            )))?;
-
-    let mut distances = vec![0.0; to.len()];
-    dot_distance_batch_into(
-        from.as_slice(),
-        to_values.as_slice(),
-        dimension,
-        &mut distances,
-    );
-
-    Ok(Arc::new(Float32Array::new(
-        distances.into(),
-        to.nulls().cloned(),
-    )))
-}
-
-/// Compute negative dot product distance between a vector and a batch of vectors.
+/// Compute dot distances, propagating the null buffer of `to`.
 ///
-/// Null buffer of `to` is propagated to the returned array.
-///
-/// Parameters
-///
-/// - `from`: the vector to compute distance from.
-/// - `to`: a list of vectors to compute distance to.
-///
-/// # Errors
-///
-/// Returns an error if `from` is an `Int8` array containing nulls, since a null
-/// query element has no distance to compute. The unsupported-type and downcast
-/// paths return errors of their own; this list is not exhaustive.
-///
-/// # Panics
-///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// See [`super::DistanceType::batch`] for supported types and input validation.
+#[deprecated(note = "Use DistanceType::Dot.batch")]
 pub fn dot_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    match *from.data_type() {
-        DataType::Float16 => do_dot_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_dot_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
-        DataType::Float64 => do_dot_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_dot_distance_arrow_batch::<Float32Type>(
-            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
-            &to.convert_to_floating_point()?,
-        ),
-        _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type: {:?}",
-            from.data_type()
-        ))),
-    }
+    super::DistanceType::Dot.batch(from, to).map(Arc::new)
 }
 
 #[cfg(test)]
@@ -836,6 +885,51 @@ mod tests {
             let y: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 1.5).collect();
             assert_relative_eq!(dot_f32(&x, &y), dot(&x, &y), max_relative = 1e-5);
         }
+    }
+
+    #[test]
+    fn test_dot_prepared_matches_per_target_distance() {
+        for (dimension, num_targets) in
+            [(1_usize, 32_usize), (3, 20), (8, 256), (16, 17), (128, 64)]
+        {
+            let query = (0..dimension)
+                .map(|idx| idx as f32 * 0.125 - 1.5)
+                .collect::<Vec<_>>();
+            let targets = (0..dimension * num_targets)
+                .map(|idx| ((idx * 7) % 101) as f32 * 0.02 - 1.0)
+                .collect::<Vec<_>>();
+            let expected = targets
+                .chunks_exact(dimension)
+                .map(|target| dot_distance(&query, target))
+                .collect::<Vec<_>>();
+
+            let prepared = DotPrepared::new(&targets, dimension);
+            let actual = prepared.distances(&query);
+
+            assert_eq!(prepared.dimension(), dimension);
+            assert_eq!(prepared.num_targets(), num_targets);
+            assert_eq!(
+                prepared.size_bytes(),
+                targets.len() * std::mem::size_of::<f32>()
+            );
+            for (target, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    approx::relative_eq!(actual, expected, epsilon = 1e-4, max_relative = 1e-5),
+                    "target {target}, dimension {dimension}: prepared={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dot_prepared_reuses_output() {
+        let prepared = DotPrepared::new(&[1.0, 0.0, 0.0, 1.0], 2);
+        let mut distances = vec![f32::NAN; 2];
+
+        prepared.distances_into(&[1.0, 0.0], &mut distances);
+        assert_eq!(distances, [0.0, 1.0]);
+        prepared.distances_into(&[0.0, 1.0], &mut distances);
+        assert_eq!(distances, [1.0, 0.0]);
     }
 
     #[test]
