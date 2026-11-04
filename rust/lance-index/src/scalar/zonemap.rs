@@ -285,11 +285,21 @@ impl ZoneMapIndex {
         self.rows_per_zone
     }
 
-    /// Per-zone statistics as a record batch.
+    /// Returns this segment's persisted ZoneMap entries as a stable record batch.
     ///
-    /// Columns match the on-disk zone map: `min`, `max`, `null_count`,
-    /// `nan_count`, `fragment_id`, `zone_start`, and `zone_length`. Schema
-    /// metadata carries `rows_per_zone`.
+    /// This is a raw view of the persisted index, not a snapshot of the current
+    /// dataset rows. `fragment_id` and `zone_start` are in the index's original
+    /// address domain: fragment-reuse remapping is not applied, and appended
+    /// fragments or data overlays are not represented. `zone_length` is the
+    /// offset span recorded for the zone, not its physical row count after
+    /// deletions. The counts are the statistics recorded when the zone was
+    /// built.
+    ///
+    /// The columns are `min`, `max`, `null_count`, `nan_count`,
+    /// `negative_nan_count`, `fragment_id`, `zone_start`, and `zone_length`.
+    /// `negative_nan_count` is null when a legacy zone contains NaNs but did
+    /// not persist their sign split; callers must not interpret that null as
+    /// zero. Schema metadata carries this segment's `rows_per_zone`.
     pub fn zones_as_batch(&self) -> lance_core::Result<RecordBatch> {
         let min_array = zone_scalar_column(
             &self.data_type,
@@ -302,6 +312,8 @@ impl ZoneMapIndex {
         let null_count =
             UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.null_count));
         let nan_count = UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.nan_count));
+        let negative_nan_count =
+            UInt32Array::from_iter(self.zones.iter().map(|zone| zone.negative_nan_count));
         let fragment_id =
             UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.fragment_id));
         let zone_start =
@@ -317,6 +329,7 @@ impl ZoneMapIndex {
                 Field::new("max", max_array.data_type().clone(), true),
                 Field::new("null_count", DataType::UInt32, false),
                 Field::new("nan_count", DataType::UInt32, false),
+                Field::new("negative_nan_count", DataType::UInt32, true),
                 Field::new("fragment_id", DataType::UInt64, false),
                 Field::new("zone_start", DataType::UInt64, false),
                 Field::new("zone_length", DataType::UInt64, false),
@@ -330,6 +343,7 @@ impl ZoneMapIndex {
                 max_array,
                 Arc::new(null_count),
                 Arc::new(nan_count),
+                Arc::new(negative_nan_count),
                 Arc::new(fragment_id),
                 Arc::new(zone_start),
                 Arc::new(zone_length),

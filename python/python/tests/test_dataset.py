@@ -41,6 +41,7 @@ from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
+from lance.indices import IndexConfig
 from lance.schema import LanceSchema
 from lance.util import sanitize_ts, validate_vector_index
 
@@ -7514,9 +7515,27 @@ EXPECTED_MINOR_VERSION = int(stable_version().split(".")[1])
 
 
 def test_zone_statistics(tmp_path: Path):
-    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    values = [
+        1.0,
+        2.0,
+        np.nan,
+        -np.nan,
+        None,
+        None,
+        None,
+        None,
+        -5.0,
+        None,
+        5.0,
+        np.nan,
+    ]
+    table = pa.table({"x": pa.array(values, type=pa.float64()), "y": ["a"] * 12})
     dataset = lance.write_dataset(table, tmp_path)
-    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+    dataset.create_scalar_index(
+        "x",
+        index_type=IndexConfig(index_type="zonemap", parameters={"rows_per_zone": 4}),
+        name="x_zonemap",
+    )
     dataset.create_scalar_index("y", index_type="BTREE", name="y_btree")
 
     zones = dataset.stats.zone_statistics("x_zonemap")
@@ -7525,19 +7544,57 @@ def test_zone_statistics(tmp_path: Path):
         "max",
         "null_count",
         "nan_count",
+        "negative_nan_count",
         "fragment_id",
         "zone_start",
         "zone_length",
     ]
-    assert zones.schema.metadata[b"rows_per_zone"]
-    assert pc.min(zones["min"]).as_py() == 0
-    assert pc.max(zones["max"]).as_py() == 99
-    assert pc.sum(zones["zone_length"]).as_py() == 100
+    assert zones.schema.metadata[b"rows_per_zone"] == b"4"
+    assert zones.schema.field("negative_nan_count").nullable
+    assert zones["min"].to_pylist() == [1.0, None, -5.0]
+    assert zones["max"].to_pylist() == [2.0, None, 5.0]
+    assert zones["null_count"].to_pylist() == [0, 4, 1]
+    assert zones["nan_count"].to_pylist() == [2, 0, 1]
+    assert zones["negative_nan_count"].to_pylist() == [1, 0, 0]
+    assert zones["fragment_id"].to_pylist() == [0, 0, 0]
+    assert zones["zone_start"].to_pylist() == [0, 4, 8]
+    assert zones["zone_length"].to_pylist() == [4, 4, 4]
 
     with pytest.raises(ValueError, match="not found"):
         dataset.stats.zone_statistics("missing")
     with pytest.raises(ValueError, match="not a ZoneMap"):
         dataset.stats.zone_statistics("y_btree")
+
+
+def test_zone_statistics_multi_segment(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"x": pa.array(range(8), type=pa.float64())}),
+        tmp_path,
+        max_rows_per_file=4,
+    )
+    fragments = dataset.get_fragments()
+    segments = [
+        dataset.create_index_uncommitted(
+            "x",
+            IndexConfig(
+                index_type="zonemap", parameters={"rows_per_zone": rows_per_zone}
+            ),
+            name="x_zonemap",
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment, rows_per_zone in zip(fragments, [2, 4])
+    ]
+    dataset = dataset.commit_existing_index_segments("x_zonemap", "x", segments)
+
+    zones = dataset.stats.zone_statistics("x_zonemap")
+
+    assert zones["fragment_id"].to_pylist() == [0, 0, 1]
+    assert zones["zone_start"].to_pylist() == [0, 2, 0]
+    assert zones["zone_length"].to_pylist() == [2, 2, 4]
+    assert zones["negative_nan_count"].to_pylist() == [0, 0, 0]
+    assert (
+        zones.schema.metadata is None or b"rows_per_zone" not in zones.schema.metadata
+    )
 
 
 def test_stats(tmp_path: Path):
