@@ -126,7 +126,7 @@ impl AddFragment {
     ///
     /// Row ids the fragment arrives carrying are claimed as an exact set, so
     /// two operations spending one reservation collide. A sequence that does
-    /// not decode takes the table exclusively: apply rejects it anyway, and a
+    /// not decode makes the footprint opaque: apply rejects it anyway, and a
     /// footprint must not under-report. A spilled sequence lives in a file
     /// this cannot read, and goes unclaimed.
     ///
@@ -143,7 +143,7 @@ impl AddFragment {
         if let Some(RowIdMeta::Inline(data)) = &self.row_id_meta {
             match read_row_ids(data) {
                 Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
-                Err(_) => footprint.take_exclusive(),
+                Err(_) => footprint.mark_opaque(),
             }
         }
         if self.data_change {
