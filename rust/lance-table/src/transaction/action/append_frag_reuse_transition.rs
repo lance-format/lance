@@ -326,6 +326,14 @@ mod tests {
         },
         "carries a deletion file"
     )]
+    #[case::destination_added_as_a_data_change(
+        |_: &mut Manifest, actions: &mut Vec<Action>| {
+            if let Action::AddFragment(add) = &mut actions[2] {
+                add.data_change = true;
+            }
+        },
+        "adds with data_change true"
+    )]
     #[case::bitmap_missing_a_surviving_row(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
             if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
