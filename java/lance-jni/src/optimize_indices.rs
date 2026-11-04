@@ -119,11 +119,14 @@ fn inner_execute_task<'local>(
     json: JString,
 ) -> Result<JObject<'local>> {
     let task: OptimizeIndexTask = serde_json::from_str(&json.extract(env)?)?;
-    let result = {
+    // The task reads only the plan's snapshot, so release the native field guard
+    // before building; holding it would serialize every call on this Dataset.
+    let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(task.execute(&dataset.inner))?
+        dataset.inner.clone()
     };
+    let result = block_on(task.execute(&dataset))?;
     result_into_java(env, result)
 }
 
@@ -149,11 +152,13 @@ fn inner_execute_merge<'local>(
 ) -> Result<JObject<'local>> {
     let merge: OptimizeIndexMerge = serde_json::from_str(&json.extract(env)?)?;
     let task_results = results_from_java(env, &java_results)?;
-    let result = {
+    // Like a task, the merge reads only the plan's snapshot.
+    let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(merge.execute(&dataset.inner, &task_results))?
+        dataset.inner.clone()
     };
+    let result = block_on(merge.execute(&dataset, &task_results))?;
     result_into_java(env, result)
 }
 
