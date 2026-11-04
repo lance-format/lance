@@ -3106,14 +3106,11 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
 // ---- cache identity: translated entries follow the translation state ----
 
 /// Open `i_idx` through the real scalar path, returning how many index loads
-/// it took (0 = served from the cache) and the cached container.
-async fn open_i_idx(dataset: &Dataset) -> (usize, Arc<dyn lance_index::scalar::ScalarIndex>) {
+/// it took (0 = served from the cache). The btree caches its reader-free
+/// state, not a container, so the load count is the cache signal.
+async fn open_i_idx(dataset: &Dataset) -> usize {
     let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
-    let (loads, container) = open_segment(dataset, &index).await;
-    (
-        loads,
-        container.expect("a translating open leaves its container in the cache"),
-    )
+    open_segment(dataset, &index).await.0
 }
 
 /// `(index loads, cached container)`: the container is absent on a plugin's
@@ -3334,14 +3331,13 @@ async fn install_history(
 #[tokio::test]
 async fn tagged_append_keeps_translated_entries_warm() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, before) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "cold open loads the index");
     assert_eq!(count(&dataset, 2).await, 1);
 
     append_rows(&mut dataset, &[100]).await;
-    let (loads, after) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 0, "an append must not evict translated entries");
-    assert!(same_container(&before, &after));
     assert_eq!(count(&dataset, 2).await, 1);
     assert_eq!(count(&dataset, 100).await, 1, "the appended row is scanned");
 }
@@ -3351,7 +3347,7 @@ async fn tagged_append_keeps_translated_entries_warm() {
 #[tokio::test]
 async fn coverage_change_misses_without_new_fri() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let fri_before = fri_entry(
         &crate::index::loading::load_all_indices(&dataset)
@@ -3383,7 +3379,7 @@ async fn coverage_change_misses_without_new_fri() {
     .uuid;
     assert_eq!(fri_before, fri_after);
 
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "a coverage change must miss");
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, usize::from(value % 2 == 1));
@@ -3395,7 +3391,7 @@ async fn coverage_change_misses_without_new_fri() {
 #[tokio::test]
 async fn relevant_transition_misses_translated_entries() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let first = decode_transitions(&dataset).await;
     assert_eq!(first.len(), 1);
@@ -3414,7 +3410,7 @@ async fn relevant_transition_misses_translated_entries() {
     transitions.push(second);
     install_history(&mut dataset, transitions, live).await;
 
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "a transition on the path must miss");
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, 1, "value {value}");
@@ -3428,7 +3424,7 @@ async fn relevant_transition_misses_translated_entries() {
 #[tokio::test]
 async fn unrelated_transition_keeps_translated_entries_warm() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, before) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let fri_before = fri_entry(
         &crate::index::loading::load_all_indices(&dataset)
@@ -3452,12 +3448,11 @@ async fn unrelated_transition_keeps_translated_entries_warm() {
     let fri_after = install_history(&mut dataset, transitions, live).await.uuid;
     assert_ne!(fri_before, fri_after);
 
-    let (loads, after) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(
         loads, 0,
         "a transition off the segment's path must not evict its entries"
     );
-    assert!(same_container(&before, &after));
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, 1, "value {value}");
     }

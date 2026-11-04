@@ -4154,18 +4154,11 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        single_flight_open(
+        self.get_or_insert_remapped_in_cache(
+            index_store,
+            DeprecatedRemapper::sync(frag_reuse_index),
             cache,
-            BTreeIndexStateKey,
             load,
-            BTreeIndexState::from_index,
-            move |state| {
-                state.reconstruct(
-                    index_store,
-                    cache,
-                    DeprecatedRemapper::sync(frag_reuse_index),
-                )
-            },
         )
         .await
     }
@@ -4186,6 +4179,23 @@ impl RemappingIndexLoader for BTreeIndexPlugin {
             BTreeIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    async fn get_or_insert_remapped_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BTreeIndexStateKey,
+            load,
+            BTreeIndexState::from_index,
+            move |state| state.reconstruct(index_store, cache, remapper),
+        )
+        .await
     }
 }
 

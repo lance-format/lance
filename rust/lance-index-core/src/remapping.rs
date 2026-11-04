@@ -51,23 +51,6 @@ pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 pub use lance_select::Remapper;
 
-/// A [`Remapper`] served to index code that still takes a
-/// [`BatchRowIdRemapper`]. Transitional: it goes away once every index
-/// translates through the [`Remapper`] it is loaded with.
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct RemapperAsBatch(pub Remapper);
-
-#[async_trait]
-impl BatchRowIdRemapper for RemapperAsBatch {
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        check_batch_remapping_entry()?;
-        let mut translated: Vec<Option<u64>> = row_ids.iter().copied().map(Some).collect();
-        self.0.translate_in_place(&mut translated).await?;
-        Ok(translated)
-    }
-}
-
 /// The translation of every row address in `addrs` through `remapper`,
 /// without the ones that translate to `None`.
 ///

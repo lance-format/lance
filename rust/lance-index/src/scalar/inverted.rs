@@ -639,6 +639,53 @@ impl RemappingIndexLoader for InvertedIndexPlugin {
         }
         Ok(index as Arc<dyn ScalarIndex>)
     }
+
+    /// Caches a reader-free snapshot and only a weak reference to the live
+    /// index, so cached FTS state does not keep a request's readers (and
+    /// their credentials) alive; each request rebinds the snapshot to its own
+    /// store and remapper.
+    async fn get_or_insert_remapped_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let rebind_store = index_store.clone();
+        single_flight_store_bound_open_with_snapshot(
+            index_store,
+            cache,
+            load,
+            move |index| async move { Self::rebind(index.as_ref(), rebind_store, remapper) },
+            Self::reader_free_snapshot,
+        )
+        .await
+    }
+}
+
+impl InvertedIndexPlugin {
+    fn reader_free_snapshot(index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Self::downcast(index)?
+            .cache_snapshot()
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn rebind(
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapper: Option<Remapper>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Self::downcast(index)?
+            .with_store(index_store, remapper)
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn downcast(index: &dyn ScalarIndex) -> Result<&InvertedIndex> {
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))
+    }
 }
 
 #[async_trait]
@@ -734,21 +781,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let rebind_store = index_store.clone();
-        single_flight_store_bound_open_with_snapshot(
+        self.get_or_insert_remapped_in_cache(
             index_store,
+            DeprecatedRemapper::sync(frag_reuse_index),
             cache,
             load,
-            move |index| async move {
-                let index = index
-                    .as_any()
-                    .downcast_ref::<InvertedIndex>()
-                    .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
-                index
-                    .with_store(rebind_store, DeprecatedRemapper::sync(frag_reuse_index))
-                    .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-            },
-            |index| self.cache_snapshot(index),
         )
         .await
     }
@@ -759,7 +796,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
         index: Arc<dyn ScalarIndex>,
     ) -> Result<()> {
-        let snapshot = self.cache_snapshot(index.as_ref())?;
+        let snapshot = Self::reader_free_snapshot(index.as_ref())?;
         cache
             .insert_unsized_with_key(
                 &ScalarIndexCacheKey,
@@ -771,30 +808,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             )
             .await;
         Ok(())
-    }
-
-    fn cache_snapshot(&self, index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .cache_snapshot()
-            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-    }
-
-    fn rebind_with_remapping(
-        &self,
-        index: &dyn ScalarIndex,
-        index_store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .with_store(index_store, DeprecatedRemapper::batch(remapping))
-            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 
     async fn get_from_cache(

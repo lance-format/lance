@@ -900,31 +900,29 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
     let remapping_loader = plugin.remapping_loader();
-    let remapper = match remapping_loader {
-        Some(_) => super::frag_reuse::segment_remapper(dataset, index, &resolved).await?,
-        None => None,
-    };
-    // The cache hooks still take the deprecated remappers: a plugin with a
-    // remapping loader gets the ones its remapper stands for, so a warm
-    // reconstruct translates exactly as its load did.
-    let (frag_reuse_index, batch_remapping) = if remapping_loader.is_some() {
-        lance_index::frag_reuse::deprecated_remappers(remapper.as_ref())?
-    } else {
-        match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
-            // An untouched segment on a tagged dataset loads the original way,
-            // with no remapper; every plugin (including legacy-API-only ones)
-            // supports this.
-            Some(ResolvedRemapping::V1Identity) => (None, None),
-            Some(ResolvedRemapping::V1Translate {
-                translation,
-                mappings,
-                ..
-            }) => lance_index::frag_reuse::deprecated_remappers(Some(
-                &translation.clone().bind(mappings.clone()),
-            ))?,
-            None => (None, None),
-        }
+    let (remapper, frag_reuse_index) = match remapping_loader {
+        Some(_) => (
+            super::frag_reuse::segment_remapper(dataset, index, &resolved).await?,
+            None,
+        ),
+        // A plugin without a remapping loader cannot translate, so its
+        // segments that need translation are left out of query listings
+        // under every history format. Opened anyway under a version 0 index,
+        // its deprecated loader is handed the legacy remapper, as before; a
+        // tagged history has no remapper such a plugin can apply.
+        None => match resolved.as_ref().map(|(_, remapping)| remapping) {
+            Some(ResolvedRemapping::V0(remapper)) => (None, Some(remapper.clone())),
+            Some(ResolvedRemapping::V1Identity) | None => (None, None),
+            Some(ResolvedRemapping::V1Translate { .. }) => {
+                return Err(Error::not_supported(format!(
+                    "segment {index_uuid} of index `{}` needs its row addresses translated \
+                     through the fragment reuse history, and its {} plugin does not \
+                     implement a remapping loader",
+                    index.name,
+                    plugin.name()
+                )));
+            }
+        },
     };
 
     // Runs only on a cold miss, and at most once even under concurrent opens
@@ -932,7 +930,7 @@ pub(crate) async fn open_scalar_index_with_plan(
     // already validated this session, saving the extra `open_index_file` IOP.
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
-        let batch_remapping = batch_remapping.clone();
+        let remapper = remapper.clone();
         let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
         async move {
@@ -948,8 +946,8 @@ pub(crate) async fn open_scalar_index_with_plan(
 
             let index_version = u32::try_from(index.index_version).unwrap_or(0);
 
-            let index = match (remapping_loader, batch_remapping) {
-                (Some(loader), _) => {
+            let index = match remapping_loader {
+                Some(loader) => {
                     loader
                         .load_remapped(
                             index_store,
@@ -960,18 +958,7 @@ pub(crate) async fn open_scalar_index_with_plan(
                         )
                         .await?
                 }
-                (None, Some(remapping)) => {
-                    plugin
-                        .load_index_with_remapping(
-                            index_store,
-                            &index_details,
-                            index_version,
-                            Some(remapping),
-                            &index_cache,
-                        )
-                        .await?
-                }
-                (None, None) => {
+                None => {
                     plugin
                         .load_index(
                             index_store,
@@ -990,22 +977,17 @@ pub(crate) async fn open_scalar_index_with_plan(
         }
     });
 
-    if batch_remapping.is_some() {
-        let rebind_store = index_store.clone();
-        lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
-            index_store,
-            &index_cache,
-            load,
-            move |index| async move {
-                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
-            },
-            |index| plugin.cache_snapshot(index),
-        )
-        .await
-    } else {
-        plugin
-            .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-            .await
+    match remapping_loader {
+        Some(loader) => {
+            loader
+                .get_or_insert_remapped_in_cache(index_store, remapper, &index_cache, load)
+                .await
+        }
+        None => {
+            plugin
+                .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
+                .await
+        }
     }
 }
 

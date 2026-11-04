@@ -221,6 +221,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// plugin that returns `None` (the default) cannot, so a segment of it
     /// that needs translation is left out of query listings under every
     /// fragment reuse history format, and its rows are scanned instead.
+    ///
+    /// Lance opens every segment of a plugin with a remapping loader through
+    /// it, caching with
+    /// [`RemappingIndexLoader::get_or_insert_remapped_in_cache`]; this
+    /// trait's cache hooks then serve only direct callers. See
+    /// [`RemappingIndexLoader`] for an example.
     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
         None
     }
@@ -303,36 +309,6 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
             )
             .await;
         Ok(())
-    }
-
-    /// Provide cached state that owns no open readers or row-ID remappers.
-    ///
-    /// The cache keeps only a weak reference to the live index when this returns
-    /// `Some`. The plugin must reconstruct a request's live index from the state
-    /// in its open path. `None` preserves the default live-index cache.
-    ///
-    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
-    fn cache_snapshot(&self, _index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        Ok(None)
-    }
-
-    /// Reconstruct cached state with the current store and batch row-ID remapper.
-    ///
-    /// The caller scopes the state to an immutable index and fragment-reuse
-    /// namespace. Implementations may share decoded and prewarmed data, but must
-    /// replace request-owned readers and remappers. Returning `None` falls back
-    /// to [`load_index_with_remapping`](Self::load_index_with_remapping).
-    /// Plugins providing a [`cache_snapshot`](Self::cache_snapshot) for batch
-    /// remapping should override this to preserve that state across requests.
-    ///
-    /// See [`single_flight_store_bound_open_with_snapshot`] for an example.
-    fn rebind_with_remapping(
-        &self,
-        _index: &dyn ScalarIndex,
-        _index_store: Arc<dyn IndexStore>,
-        _remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        Ok(None)
     }
 
     /// Open an index through the cache, awaiting `load` only on a miss.
@@ -449,6 +425,97 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
 /// Loads a scalar index segment whose stored row addresses are translated
 /// through a [`Remapper`]. See [`ScalarIndexPlugin::remapping_loader`].
+///
+/// A rewrite (compaction) that records a fragment reuse history moves rows
+/// without rebuilding the indices over them. A segment built before it still
+/// stores the old row addresses; Lance opens it through this loader with a
+/// [`Remapper`] that translates them into the addresses the rows have now.
+///
+/// A plugin implements this trait and returns itself from
+/// [`ScalarIndexPlugin::remapping_loader`]:
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use async_trait::async_trait;
+/// # use lance_core::{Result, cache::LanceCache};
+/// # use lance_index::scalar::{IndexStore, Remapper, RowIdRemapper, ScalarIndex};
+/// # use lance_index::scalar::expression::ScalarQueryParser;
+/// # use lance_index::scalar::registry::{RemappingIndexLoader, ScalarIndexPlugin};
+/// #[derive(Debug)]
+/// struct AddressListPlugin;
+///
+/// impl AddressListPlugin {
+///     /// Reads the row addresses the segment stores.
+///     async fn read_addresses(&self, store: &dyn IndexStore) -> Result<Vec<u64>> {
+///         // ...
+/// #       unimplemented!()
+///     }
+///
+///     /// Builds the in-memory index over row addresses that are current.
+///     fn open(
+///         &self,
+///         store: Arc<dyn IndexStore>,
+///         addresses: Vec<u64>,
+///     ) -> Result<Arc<dyn ScalarIndex>> {
+///         // ...
+/// #       unimplemented!()
+///     }
+/// }
+///
+/// #[async_trait]
+/// impl RemappingIndexLoader for AddressListPlugin {
+///     async fn load_remapped(
+///         &self,
+///         index_store: Arc<dyn IndexStore>,
+///         _index_details: &prost_types::Any,
+///         _index_version: u32,
+///         remapper: Option<Remapper>,
+///         _cache: &LanceCache,
+///     ) -> Result<Arc<dyn ScalarIndex>> {
+///         let stored = self.read_addresses(index_store.as_ref()).await?;
+///         let addresses = match remapper {
+///             None => stored,
+///             Some(remapper) => {
+///                 let mut addresses: Vec<Option<u64>> =
+///                     stored.into_iter().map(Some).collect();
+///                 // One batch for every address at hand; a row the rewrite
+///                 // deleted translates to `None`.
+///                 remapper.translate_in_place(&mut addresses).await?;
+///                 addresses.into_iter().flatten().collect()
+///             }
+///         };
+///         self.open(index_store, addresses)
+///     }
+/// }
+///
+/// #[async_trait]
+/// impl ScalarIndexPlugin for AddressListPlugin {
+///     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+///         Some(self)
+///     }
+///
+///     async fn load_index(
+///         &self,
+///         index_store: Arc<dyn IndexStore>,
+///         index_details: &prost_types::Any,
+///         index_version: u32,
+///         _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+///         cache: &LanceCache,
+///     ) -> Result<Arc<dyn ScalarIndex>> {
+///         // Lance opens segments through the remapping loader; this serves
+///         // callers that load one directly, with current addresses.
+///         self.load_remapped(index_store, index_details, index_version, None, cache)
+///             .await
+///     }
+///
+///     // ...
+/// #   fn name(&self) -> &str { "AddressList" }
+/// #   fn provides_exact_answer(&self) -> bool { true }
+/// #   fn version(&self) -> u32 { 0 }
+/// #   fn new_query_parser(&self, _: String, _: &prost_types::Any)
+/// #       -> Option<Box<dyn ScalarQueryParser>> { None }
+/// }
+/// ```
 #[async_trait]
 pub trait RemappingIndexLoader: Send + Sync {
     /// Load a segment, as [`ScalarIndexPlugin::load_index`] does, translating
@@ -468,13 +535,37 @@ pub trait RemappingIndexLoader: Send + Sync {
         remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// Open a segment through the cache, awaiting `load` (a
+    /// [`load_remapped`](Self::load_remapped) with the same `remapper`) only
+    /// on a miss.
+    ///
+    /// The caller namespaces `cache` per segment and per translation state,
+    /// so everything cached under it was loaded with an equivalent remapper.
+    /// An index rebuilt from cached state must still be given `remapper`:
+    /// only this one belongs to the current request.
+    ///
+    /// The default caches the live index bound to `index_store`, reloading
+    /// when a request arrives with a different storage binding, and coalesces
+    /// concurrent cold opens. Plugins with a serializable form override it,
+    /// for example with [`single_flight_open`].
+    async fn get_or_insert_remapped_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _remapper: Option<Remapper>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_store_bound_open(index_store, cache, load, |_| async { Ok(None) }).await
+    }
 }
 
 /// A boxed, `Send` future performing the storage-level load of a scalar index
 /// (compat checks, `load_index`, metrics).
 ///
-/// Passed to [`ScalarIndexPlugin::get_or_insert_in_cache`], which awaits it at
-/// most once on a cache miss and drops it un-awaited on a warm hit.
+/// Passed to [`RemappingIndexLoader::get_or_insert_remapped_in_cache`] or
+/// [`ScalarIndexPlugin::get_or_insert_in_cache`], which await it at most once
+/// on a cache miss and drop it un-awaited on a warm hit.
 pub type ScalarIndexLoad<'a> = BoxFuture<'a, Result<Arc<dyn ScalarIndex>>>;
 
 /// Single-flight open helper for plugins with a serializable form.
@@ -536,19 +627,22 @@ where
 /// # use std::sync::Arc;
 /// # use lance_core::{cache::LanceCache, Result};
 /// # use lance_index::scalar::{IndexStore, ScalarIndex};
-/// # use lance_index::scalar::registry::{ScalarIndexLoad, ScalarIndexPlugin,
+/// # use lance_index::scalar::registry::{ScalarIndexLoad,
 /// #     single_flight_store_bound_open_with_snapshot};
-/// # use lance_index_core::remapping::BatchRowIdRemapper;
-/// # async fn open(plugin: &dyn ScalarIndexPlugin, store: Arc<dyn IndexStore>,
-/// #     cache: &LanceCache, load: ScalarIndexLoad<'_>,
-/// #     remapping: Arc<dyn BatchRowIdRemapper>) -> Result<Arc<dyn ScalarIndex>> {
+/// # async fn open(
+/// #     store: Arc<dyn IndexStore>,
+/// #     cache: &LanceCache,
+/// #     load: ScalarIndexLoad<'_>,
+/// #     rebind: impl Fn(&dyn ScalarIndex, Arc<dyn IndexStore>)
+/// #         -> Result<Option<Arc<dyn ScalarIndex>>> + Send,
+/// #     reader_free_snapshot: impl Fn(&dyn ScalarIndex)
+/// #         -> Result<Option<Arc<dyn ScalarIndex>>> + Send + Sync,
+/// # ) -> Result<Arc<dyn ScalarIndex>> {
 /// let rebind_store = store.clone();
 /// single_flight_store_bound_open_with_snapshot(
 ///     store, cache, load,
-///     |index| async move {
-///         plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(remapping))
-///     },
-///     |index| plugin.cache_snapshot(index),
+///     |index| async move { rebind(index.as_ref(), rebind_store) },
+///     |index| reader_free_snapshot(index),
 /// ).await
 /// # }
 /// ```

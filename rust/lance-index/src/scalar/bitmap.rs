@@ -2591,6 +2591,25 @@ impl RemappingIndexLoader for BitmapIndexPlugin {
                 as Arc<dyn ScalarIndex>,
         )
     }
+
+    async fn get_or_insert_remapped_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        single_flight_open(
+            cache,
+            BitmapIndexStateKey,
+            load,
+            BitmapIndexState::from_scalar_index,
+            move |state| {
+                Ok(state.to_bitmap_index(index_store, cache, remapper)? as Arc<dyn ScalarIndex>)
+            },
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -2709,18 +2728,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        single_flight_open(
+        self.get_or_insert_remapped_in_cache(
+            index_store,
+            DeprecatedRemapper::sync(frag_reuse_index),
             cache,
-            BitmapIndexStateKey,
             load,
-            BitmapIndexState::from_scalar_index,
-            move |state| {
-                Ok(state.to_bitmap_index(
-                    index_store,
-                    cache,
-                    DeprecatedRemapper::sync(frag_reuse_index),
-                )? as Arc<dyn ScalarIndex>)
-            },
         )
         .await
     }

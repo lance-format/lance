@@ -63,7 +63,6 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     )
     .await
     .unwrap();
-    let plugin = InvertedIndexPlugin;
     let remapper = Arc::new(OffsetBatchRemapper::default());
     let remapper_weak = Arc::downgrade(&remapper);
     let cache = LanceCache::with_capacity(1 << 20);
@@ -75,7 +74,9 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     .await
     .unwrap();
     index.prewarm().await.unwrap();
-    let snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    let snapshot = InvertedIndexPlugin::reader_free_snapshot(index.as_ref())
+        .unwrap()
+        .unwrap();
     let reader = Arc::downgrade(
         index.partitions[0]
             .inverted_list
@@ -111,10 +112,13 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     ));
     let remapper = Arc::new(OffsetBatchRemapper::default());
     let remapper_weak = Arc::downgrade(&remapper);
-    let index = plugin
-        .rebind_with_remapping(snapshot.as_ref(), store, Some(remapper.clone()))
-        .unwrap()
-        .unwrap();
+    let index = InvertedIndexPlugin::rebind(
+        snapshot.as_ref(),
+        store,
+        DeprecatedRemapper::batch(Some(remapper.clone())),
+    )
+    .unwrap()
+    .unwrap();
     let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
     assert!(
         inverted.shares_prewarm_state(snapshot.as_any().downcast_ref::<InvertedIndex>().unwrap())
@@ -131,7 +135,9 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     assert_eq!(documents.row_id(0), 1100);
     assert_eq!(remapper.calls.load(Ordering::Relaxed), 1);
     let reader = Arc::downgrade(partition.inverted_list.reader.get().await.unwrap());
-    let rebound_snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    let rebound_snapshot = InvertedIndexPlugin::reader_free_snapshot(index.as_ref())
+        .unwrap()
+        .unwrap();
     drop(index);
     drop(remapper);
     assert!(reader.upgrade().is_none());
