@@ -497,9 +497,6 @@ async fn read_partition_window_batches(
     split_window_batches(schema, &partition_lengths, batches)
 }
 
-/// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
-/// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
-/// the window size is the lever.
 fn global_heap_to_batch(
     heap: BinaryHeap<OrderedNode<u64>>,
     metrics: &dyn MetricsCollector,
@@ -727,6 +724,9 @@ async fn prewarm_partitions<'a>(
     Ok(())
 }
 
+/// Number of prewarm windows kept in flight. Raising this beyond the CPU pool
+/// size measured no throughput gain (see `DEFAULT_IVF_PREWARM_WINDOW_SIZE_BYTES`);
+/// the window size is the lever.
 fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
     io_parallelism.max(1).min(cpu_parallelism.max(1))
 }
