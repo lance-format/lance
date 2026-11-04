@@ -3106,6 +3106,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         Ok(Box::pin(stream))
     }
 
+    async fn partition_storage_batches(&self, partition_id: usize) -> Result<Vec<RecordBatch>> {
+        let storage = self.load_partition_storage(partition_id, None).await?;
+        Ok(storage.to_batches()?.collect())
+    }
+
     fn supports_pairwise_vectors(&self) -> bool {
         true
     }

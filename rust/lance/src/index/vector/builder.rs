@@ -20,7 +20,6 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
-use futures::future::BoxFuture;
 use futures::{FutureExt, SinkExt, stream, stream::BoxStream};
 use futures::{
     Stream,
@@ -412,11 +411,6 @@ type FreshWindowBuildStream =
 /// partition building, so the scheduling around it is compiled once.
 type BuildPartitionFn =
     Arc<dyn Fn(usize, Vec<RecordBatch>, f64) -> Result<Option<BuiltPartition>> + Send + Sync>;
-
-/// Reads a partition's stored rows out of an existing segment of this builder's
-/// `S × Q` type, or errors when the segment is of another type.
-type LoadExistingPartitionFn =
-    for<'a> fn(&'a dyn VectorIndex, usize) -> BoxFuture<'a, Result<Vec<RecordBatch>>>;
 type PartitionInputAdmissionStream<T> =
     Pin<Box<dyn Stream<Item = Result<(T, OwnedSemaphorePermit)>> + Send>>;
 
@@ -1298,7 +1292,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             num_partitions,
             merge_indices,
             partition_adjustment,
-            Self::existing_partition_loader(),
             build_partition,
         ))
     }
@@ -1355,28 +1348,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         Ok((storage, sub_index))
-    }
-
-    fn existing_partition_loader() -> ExistingPartitionLoader {
-        ExistingPartitionLoader {
-            quantization_type: Q::quantization_type(),
-            load: Self::load_existing_partition,
-        }
-    }
-
-    fn load_existing_partition(
-        index: &dyn VectorIndex,
-        part_id: usize,
-    ) -> BoxFuture<'_, Result<Vec<RecordBatch>>> {
-        async move {
-            let existing_index = index
-                .as_any()
-                .downcast_ref::<IVFIndex<S, Q>>()
-                .ok_or(Error::invalid_input("existing index is not IVF index"))?;
-            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
-            Ok(part_storage.to_batches()?.collect())
-        }
-        .boxed()
     }
 
     async fn merge_partitions(&mut self, build_stream: BuildStream) -> Result<Vec<IndexFile>> {
@@ -1469,13 +1440,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 }
 
-/// How `take_partition_batches` reads rows out of existing segments.
-#[derive(Clone, Copy)]
-struct ExistingPartitionLoader {
-    quantization_type: QuantizationType,
-    load: LoadExistingPartitionFn,
-}
-
 /// Builds every partition of an optimize pass: rows come from the merged
 /// segments and the shuffle, adjusted for a split or join.
 fn build_merged_partitions(
@@ -1483,7 +1447,6 @@ fn build_merged_partitions(
     num_partitions: usize,
     merge_indices: Arc<Vec<ExistingIndex>>,
     partition_adjustment: Option<PartitionAdjustment>,
-    loader: ExistingPartitionLoader,
     build_partition: BuildPartitionFn,
 ) -> BuildStream {
     let partition_adjustment = Arc::new(partition_adjustment);
@@ -1520,19 +1483,17 @@ fn build_merged_partitions(
                     partition,
                     &[],
                     Some(split_reader.as_ref().unwrap().as_ref()),
-                    loader,
                 )
                 .await?
             } else {
-                take_partition_batches(partition, indices.as_ref(), Some(reader.as_ref()), loader)
-                    .await?
+                take_partition_batches(partition, indices.as_ref(), Some(reader.as_ref())).await?
             };
 
             // For unaffected partitions during a split, vectors from
             // affected partitions may have been reassigned here.
             if !is_affected && let Some(sr) = split_reader.as_ref() {
                 let (extra, extra_loss) =
-                    take_partition_batches(partition, &[], Some(sr.as_ref()), loader).await?;
+                    take_partition_batches(partition, &[], Some(sr.as_ref())).await?;
                 batches.extend(extra);
                 loss += extra_loss;
             }
@@ -1554,13 +1515,9 @@ fn build_merged_partitions(
                         *batch = arrow::compute::filter_record_batch(batch, &mask)?;
                     }
                 }
-                let (extra, extra_loss) = take_partition_batches(
-                    partition,
-                    &[],
-                    Some(join_shuffle_reader.as_ref()),
-                    loader,
-                )
-                .await?;
+                let (extra, extra_loss) =
+                    take_partition_batches(partition, &[], Some(join_shuffle_reader.as_ref()))
+                        .await?;
                 batches.extend(extra);
                 loss += extra_loss;
             }
@@ -1762,7 +1719,6 @@ async fn take_partition_batches(
     part_id: usize,
     existing_indices: &[ExistingIndex],
     reader: Option<&dyn ShuffleReader>,
-    loader: ExistingPartitionLoader,
 ) -> Result<(Vec<RecordBatch>, f64)> {
     let mut batches = Vec::new();
     for source in existing_indices.iter() {
@@ -1777,9 +1733,9 @@ async fn take_partition_batches(
         // decoded partition per in-flight task while the rest wait on it.
         let old_data_filter = source.old_data_filter().await?;
 
-        let mut part_batches = (loader.load)(source.index.as_ref(), part_id).await?;
+        let mut part_batches = source.index.partition_storage_batches(part_id).await?;
         // for PQ, the PQ codes are transposed, so we need to transpose them back
-        match loader.quantization_type {
+        match source.index.sub_index_type().1 {
             QuantizationType::Product => {
                 for batch in part_batches.iter_mut() {
                     if batch.num_rows() == 0 {
@@ -4844,14 +4800,7 @@ mod tests {
             partition_id: 0,
         };
 
-        let (batches, loss) = take_partition_batches(
-            0,
-            &[],
-            Some(&reader),
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::existing_partition_loader(),
-        )
-        .await
-        .unwrap();
+        let (batches, loss) = take_partition_batches(0, &[], Some(&reader)).await.unwrap();
 
         assert_eq!(loss, 0.0);
         assert_eq!(batches.len(), 1);
