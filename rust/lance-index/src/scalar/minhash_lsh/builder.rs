@@ -515,12 +515,13 @@ impl RunSorter {
                 .clone(),
         };
         let run = self.spilled.len() + self.spills.len();
-        self.spills.push_back(tokio::spawn(spill_run(
-            dir,
-            run,
-            records,
-            self.partitions_per_band,
-        )));
+        self.spills
+            .push_back(lance_core::utils::tokio::spawn(spill_run(
+                dir,
+                run,
+                records,
+                self.partitions_per_band,
+            )));
         Ok(())
     }
 
@@ -895,7 +896,7 @@ impl MinHashLshIndexBuilder {
             {}
         };
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
-        let writer = tokio::spawn(async move {
+        let writer = lance_core::utils::tokio::spawn(async move {
             while let Some(batch) = batch_rx.recv().await {
                 signatures_writer.write_record_batch(batch).await?;
             }
@@ -1016,7 +1017,7 @@ impl MinHashLshIndexBuilder {
                         .map(|group| {
                             let runs = runs.clone();
                             let (output, batches) = mpsc::channel(1);
-                            let task = tokio::spawn(async move {
+                            let task = lance_core::utils::tokio::spawn(async move {
                                 if group_records(&runs, &group) <= budget {
                                     let batch = merge_group(&runs, group).await;
                                     output.send(batch).await.map_err(|_| {

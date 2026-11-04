@@ -132,6 +132,20 @@ fn install_atfork() {
 #[cfg(windows)]
 fn install_atfork() {}
 
+/// Spawn a future onto the current tokio runtime, like [`tokio::spawn`].
+///
+/// Prefer this over [`tokio::spawn`] in library code. `tokio::spawn` instantiates
+/// tokio's task machinery (task cell, harness, vtable, `catch_unwind`, drop glue,
+/// about 1.7K LLVM IR lines) once per future type, and every `async` block is its
+/// own type. Boxing the future first means that machinery is instantiated once
+/// per output type instead. The cost is one allocation per spawn.
+#[track_caller]
+pub fn spawn<T: Send + 'static>(
+    future: impl Future<Output = T> + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::spawn(future.boxed())
+}
+
 /// Spawn a CPU intensive task
 ///
 /// This task will be put onto a thread pool dedicated for CPU-intensive work

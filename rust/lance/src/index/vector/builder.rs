@@ -2037,7 +2037,7 @@ async fn shuffle_transformed(
         data.map(move |batch| {
             let partition_map = partition_map.clone();
             let ivf_transformer = transformer.clone();
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let mut batch = batch?;
                 if !partition_map.is_empty() {
                     let row_ids = &batch[ROW_ID];

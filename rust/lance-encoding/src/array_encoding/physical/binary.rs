@@ -187,7 +187,7 @@ impl PageScheduler for BinaryPageScheduler {
         let null_adjustment = self.null_adjustment;
         let offsets_type = self.offsets_type.clone();
 
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             // For the following data:
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27

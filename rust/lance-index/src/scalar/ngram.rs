@@ -1338,7 +1338,7 @@ impl NGramIndexBuilder {
             senders.push(send);
 
             let mut builder = self.clone_worker(worker_idx + 1);
-            let future = tokio::spawn(async move {
+            let future = lance_core::utils::tokio::spawn(async move {
                 while let Some(partition) = recv.recv().await {
                     builder.process_batch(partition).await?;
                 }
@@ -1350,7 +1350,7 @@ impl NGramIndexBuilder {
         let mut partitions_stream = data
             .and_then(|batch| {
                 let tokenizer = self.tokenizer.clone();
-                std::future::ready(Ok(tokio::task::spawn(async move {
+                std::future::ready(Ok(lance_core::utils::tokio::spawn(async move {
                     Ok(Self::tokenize_and_partition(
                         &tokenizer,
                         batch,
@@ -1672,7 +1672,7 @@ impl NGramIndexBuilder {
             while spill_files.len() >= 2 {
                 let left = spill_files.pop().expect_ok()?;
                 let right = spill_files.pop().expect_ok()?;
-                new_spills.push(tokio::spawn(Self::merge_spill_files(
+                new_spills.push(lance_core::utils::tokio::spawn(Self::merge_spill_files(
                     self.spill_store.clone(),
                     left,
                     right,
@@ -1835,7 +1835,7 @@ impl NGramIndexBuilder {
             let s0 = stores[0].clone();
             let f0 = filters[0].clone();
             let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
-            tasks.push(tokio::spawn(async move {
+            tasks.push(lance_core::utils::tokio::spawn(async move {
                 let mut writer = spill_store
                     .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
                     .await?;

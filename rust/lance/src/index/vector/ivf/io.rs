@@ -401,7 +401,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             .await?;
 
             if row_id_array.is_empty() {
-                tasks.push(Some(tokio::spawn(async { Ok(0) })));
+                tasks.push(Some(lance_core::utils::tokio::spawn(async { Ok(0) })));
                 continue;
             }
 
@@ -433,7 +433,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             let quantizer = quantizer.clone();
             let sem = sem.clone();
             let tmp_part_dir_guard = tmp_part_dir_guard.clone();
-            tasks.push(Some(tokio::spawn(async move {
+            tasks.push(Some(lance_core::utils::tokio::spawn(async move {
                 // Hold a guard clone so the scratch dir stays alive while this task writes.
                 let _tmp_part_dir_guard = tmp_part_dir_guard;
                 let _permit = sem.acquire().await.map_err(|err| {
