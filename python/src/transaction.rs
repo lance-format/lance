@@ -2,23 +2,32 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::bitmap::{PyBitmap, bitmap_from_iterable, is_int, value_from_py};
-use crate::dataset::DatasetBasePath;
+use crate::dataset::base_path::DatasetBasePath;
+use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
-use arrow::pyarrow::PyArrowType;
+use arrow::pyarrow::{FromPyArrow, PyArrowType};
+use arrow_array::{ArrayRef, make_array};
+use arrow_data::ArrayData;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::datatypes::{Field, Schema};
+use lance_table::format::key_existence::{
+    BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS, BLOOM_FILTER_DEFAULT_PROBABILITY, FilterType,
+    KeyExistenceFilter,
+};
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::system_index::mem_wal::CompactedSsTable;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -98,6 +107,17 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             Err(_) => Vec::new(),
         };
 
+        // Tolerate objects predating these attributes; absent means no
+        // clustering reference and no generic metadata.
+        let clustering_id: Option<u32> = match ob.getattr("clustering_id") {
+            Ok(value) => value.extract::<Option<u32>>()?,
+            Err(_) => None,
+        };
+        let metadata: HashMap<String, String> = match ob.getattr("metadata") {
+            Ok(value) => value.extract()?,
+            Err(_) => HashMap::new(),
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
@@ -110,6 +130,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            clustering_id,
+            metadata,
         }))
     }
 }
@@ -148,19 +170,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let cls = namespace
             .getattr("Index")
             .expect("Failed to get Index class");
-        cls.call1((
-            uuid,
-            name.clone(),
-            fields.clone(),
-            dataset_version,
-            fragment_ids,
-            index_version,
-            created_at,
-            base_id,
-            files,
-            index_details,
-            covering_fields.clone(),
-        ))
+        // PyO3 accepts at most twelve positional arguments in one tuple; the
+        // two trailing dataclass fields go by keyword.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "clustering_id"), self.0.clustering_id)?;
+        kwargs.set_item(intern!(py, "metadata"), self.0.metadata.clone())?;
+        cls.call(
+            (
+                uuid,
+                name.clone(),
+                fields.clone(),
+                dataset_version,
+                fragment_ids,
+                index_version,
+                created_at,
+                base_id,
+                files,
+                index_details,
+                covering_fields.clone(),
+            ),
+            Some(&kwargs),
+        )
     }
 }
 
@@ -397,7 +427,257 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayGroup> {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Read-only view of the keys a merge-insert recorded as inserted.
+///
+/// Exact sets compare hashed keys, so a different key with the same hash also
+/// matches. Bloom filters never report a recorded key as absent, but they can
+/// report an absent key as present.
+#[pyclass(
+    name = "InsertedRowsFilter",
+    module = "lance",
+    frozen,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+pub struct PyInsertedRowsFilter {
+    inner: KeyExistenceFilter,
+}
+
+#[pymethods]
+impl PyInsertedRowsFilter {
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        let (num_bits, number_of_items, probability) = match &self.inner.filter {
+            FilterType::ExactSet(_) => (None, None, None),
+            FilterType::Bloom {
+                num_bits,
+                number_of_items,
+                probability,
+                ..
+            } => (Some(*num_bits), Some(*number_of_items), Some(*probability)),
+        };
+        let ctor = py
+            .import("lance")?
+            .getattr("InsertedRowsFilter")?
+            .getattr("_from_state")?
+            .unbind();
+        let args = (
+            self.inner.field_ids.clone(),
+            self.kind(),
+            self.payload(),
+            num_bits,
+            number_of_items,
+            probability,
+        )
+            .into_pyobject(py)?
+            .into_any()
+            .unbind();
+        Ok((ctor, args))
+    }
+
+    /// Reconstruct a filter from its complete transport state.
+    #[staticmethod]
+    fn _from_state(
+        field_ids: Vec<i32>,
+        kind: &str,
+        payload: Vec<u8>,
+        num_bits: Option<u32>,
+        number_of_items: Option<u64>,
+        probability: Option<f64>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: build_inserted_rows_filter(
+                field_ids,
+                kind,
+                payload,
+                num_bits,
+                number_of_items,
+                probability,
+            )?,
+        })
+    }
+
+    /// Field ids of the join key, in key order.
+    #[getter]
+    fn field_ids(&self) -> Vec<i32> {
+        self.inner.field_ids.clone()
+    }
+
+    /// ``exact`` or ``bloom``.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match &self.inner.filter {
+            FilterType::ExactSet(_) => "exact",
+            FilterType::Bloom { .. } => "bloom",
+        }
+    }
+
+    /// Exact sets store sorted little-endian key hashes. Bloom filters store
+    /// the serialized bitset.
+    #[getter]
+    fn payload(&self) -> Vec<u8> {
+        match &self.inner.filter {
+            FilterType::ExactSet(hashes) => {
+                let mut hashes: Vec<u64> = hashes.iter().copied().collect();
+                hashes.sort_unstable();
+                let mut bytes = Vec::with_capacity(hashes.len() * 8);
+                for hash in hashes {
+                    bytes.extend_from_slice(&hash.to_le_bytes());
+                }
+                bytes
+            }
+            FilterType::Bloom { bitmap, .. } => bitmap.clone(),
+        }
+    }
+
+    /// Number of items the Bloom filter was sized for. ``None`` for exact sets.
+    #[getter]
+    fn number_of_items(&self) -> Option<u64> {
+        match &self.inner.filter {
+            FilterType::ExactSet(_) => None,
+            FilterType::Bloom {
+                number_of_items, ..
+            } => Some(*number_of_items),
+        }
+    }
+
+    /// Target false-positive probability of the Bloom filter. ``None`` for
+    /// exact sets.
+    #[getter]
+    fn probability(&self) -> Option<f64> {
+        match &self.inner.filter {
+            FilterType::ExactSet(_) => None,
+            FilterType::Bloom { probability, .. } => Some(*probability),
+        }
+    }
+
+    /// Whether each row might have been inserted.
+    ///
+    /// `values` is a pyarrow Array (one key column), RecordBatch, or Table
+    /// whose columns are in `field_ids` order. A null in any key column is
+    /// reported as absent.
+    fn might_contain(&self, values: &Bound<'_, PyAny>) -> PyResult<Vec<bool>> {
+        let columns = key_columns_from_pyarrow(values)?;
+        self.inner.might_contain_columns(&columns).infer_error()
+    }
+}
+
+fn key_columns_from_pyarrow(values: &Bound<'_, PyAny>) -> PyResult<Vec<ArrayRef>> {
+    if values.hasattr("num_columns")? && values.hasattr("column")? {
+        let num_columns: usize = values.getattr("num_columns")?.extract()?;
+        let mut columns = Vec::with_capacity(num_columns);
+        for index in 0..num_columns {
+            let column = values.call_method1("column", (index,))?;
+            let array = if column.hasattr("combine_chunks")? {
+                column.call_method0("combine_chunks")?
+            } else {
+                column
+            };
+            columns.push(array_from_pyarrow(&array)?);
+        }
+        return Ok(columns);
+    }
+    Ok(vec![array_from_pyarrow(values)?])
+}
+
+fn array_from_pyarrow(values: &Bound<'_, PyAny>) -> PyResult<ArrayRef> {
+    let data = ArrayData::from_pyarrow_bound(values)?;
+    Ok(make_array(data))
+}
+
+fn build_inserted_rows_filter(
+    field_ids: Vec<i32>,
+    kind: &str,
+    payload: Vec<u8>,
+    num_bits: Option<u32>,
+    number_of_items: Option<u64>,
+    probability: Option<f64>,
+) -> PyResult<KeyExistenceFilter> {
+    let filter = match kind {
+        "exact" => {
+            if !payload.len().is_multiple_of(8) {
+                return Err(PyValueError::new_err(format!(
+                    "exact inserted_rows_filter payload length must be a multiple of 8, got {}",
+                    payload.len()
+                )));
+            }
+            let mut hashes = HashSet::with_capacity(payload.len() / 8);
+            for chunk in payload.as_chunks::<8>().0 {
+                hashes.insert(u64::from_le_bytes(*chunk));
+            }
+            FilterType::ExactSet(hashes)
+        }
+        "bloom" => {
+            if payload.is_empty() {
+                return Err(PyValueError::new_err(
+                    "bloom inserted_rows_filter payload must not be empty",
+                ));
+            }
+            if !payload.len().is_multiple_of(32) {
+                return Err(PyValueError::new_err(format!(
+                    "bloom inserted_rows_filter payload length must be a multiple of 32 bytes, \
+                     got {}",
+                    payload.len()
+                )));
+            }
+            let derived_num_bits = u32::try_from(payload.len())
+                .ok()
+                .and_then(|len| len.checked_mul(8))
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "bloom inserted_rows_filter payload is too large: {} bytes",
+                        payload.len()
+                    ))
+                })?;
+            FilterType::Bloom {
+                num_bits: num_bits.unwrap_or(derived_num_bits),
+                bitmap: payload,
+                number_of_items: number_of_items.unwrap_or(BLOOM_FILTER_DEFAULT_NUMBER_OF_ITEMS),
+                probability: probability.unwrap_or(BLOOM_FILTER_DEFAULT_PROBABILITY),
+            }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "inserted_rows_filter kind must be 'exact' or 'bloom', got {other}"
+            )));
+        }
+    };
+    let filter = KeyExistenceFilter { field_ids, filter };
+    filter.validate().infer_error()?;
+    Ok(filter)
+}
+
+fn extract_inserted_rows_filter(ob: &Bound<'_, PyAny>) -> PyResult<KeyExistenceFilter> {
+    if let Ok(filter) = ob.cast::<PyInsertedRowsFilter>() {
+        let filter = filter.borrow().inner.clone();
+        filter.validate().infer_error()?;
+        return Ok(filter);
+    }
+
+    let field_ids: Vec<i32> = ob.getattr("field_ids")?.extract()?;
+    let kind: String = ob.getattr("kind")?.extract()?;
+    let payload: Vec<u8> = ob.getattr("payload")?.extract()?;
+    let num_bits = match ob.getattr("num_bits") {
+        Ok(value) if !value.is_none() => Some(value.extract::<u32>()?),
+        _ => None,
+    };
+    let number_of_items = match ob.getattr("number_of_items") {
+        Ok(value) if !value.is_none() => Some(value.extract::<u64>()?),
+        _ => None,
+    };
+    let probability = match ob.getattr("probability") {
+        Ok(value) if !value.is_none() => Some(value.extract::<f64>()?),
+        _ => None,
+    };
+    build_inserted_rows_filter(
+        field_ids,
+        &kind,
+        payload,
+        num_bits,
+        number_of_items,
+        probability,
+    )
+}
+
 pub struct PyUpdateMode(pub UpdateMode);
 
 impl FromPyObject<'_, '_> for PyUpdateMode {
@@ -413,6 +693,37 @@ impl FromPyObject<'_, '_> for PyUpdateMode {
             ))),
         }
     }
+}
+
+fn import_compacted_sstables(values: &Bound<'_, PyAny>) -> PyResult<Vec<CompactedSsTable>> {
+    if values.is_none() {
+        return Ok(Vec::new());
+    }
+    let mut tables = Vec::new();
+    for item in values.try_iter()? {
+        let item = item?;
+        let shard_id: String = item.getattr("shard_id")?.extract()?;
+        let generation: u64 = item.getattr("generation")?.extract()?;
+        let shard_id = uuid::Uuid::parse_str(&shard_id).map_err(|err| {
+            PyValueError::new_err(format!(
+                "compacted_sstables shard_id must be a UUID, got {shard_id}: {err}"
+            ))
+        })?;
+        tables.push(CompactedSsTable::new(shard_id, generation));
+    }
+    Ok(tables)
+}
+
+fn export_compacted_sstables<'py>(
+    py: Python<'py>,
+    tables: &[CompactedSsTable],
+) -> PyResult<Bound<'py, PyAny>> {
+    let cls = py.import("lance.mem_wal")?.getattr("CompactedSsTable")?;
+    let mut items = Vec::with_capacity(tables.len());
+    for table in tables {
+        items.push(cls.call1((table.shard_id.to_string(), table.generation))?);
+    }
+    Ok(PyList::new(py, items)?.into_any())
 }
 
 impl FromPyObject<'_, '_> for PyLance<Operation> {
@@ -506,15 +817,30 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     .transpose()?
                     .map(UpdatedFragmentOffsets);
 
+                let inserted_rows_filter = ob
+                    .getattr("inserted_rows_filter")
+                    .ok()
+                    .filter(|value| !value.is_none())
+                    .map(|value| extract_inserted_rows_filter(&value))
+                    .transpose()?;
+
+                let compacted_sstables = match ob.getattr("compacted_sstables") {
+                    Ok(value) => import_compacted_sstables(&value)?,
+                    Err(_) => Vec::new(),
+                };
+
+                let mem_wal_dir_id: Option<String> = ob.getattr("mem_wal_dir_id")?.extract()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
-                    compacted_sstables: vec![],
+                    compacted_sstables,
+                    mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
-                    inserted_rows_filter: None,
+                    inserted_rows_filter,
                     updated_fragment_offsets,
                 };
                 Ok(Self(op))
@@ -564,11 +890,16 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             "Rewrite" => {
                 let groups = extract_vec(&ob.getattr("groups")?)?;
                 let rewritten_indices = extract_vec(&ob.getattr("rewritten_indices")?)?;
+                let frag_reuse_index = match ob.getattr("frag_reuse_index") {
+                    Ok(value) if !value.is_none() => {
+                        Some(value.extract::<PyLance<IndexMetadata>>()?.0)
+                    }
+                    _ => None,
+                };
                 let op = Operation::Rewrite {
                     groups,
                     rewritten_indices,
-                    // TODO: pass frag_reuse_index when available
-                    frag_reuse_index: None,
+                    frag_reuse_index,
                 };
                 Ok(Self(op))
             }
@@ -648,6 +979,17 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
+            "UpdateMemWalState" => {
+                let compacted_sstables = match ob.getattr("compacted_sstables") {
+                    Ok(value) => import_compacted_sstables(&value)?,
+                    Err(_) => Vec::new(),
+                };
+                let dir_id: String = ob.getattr("dir_id")?.extract()?;
+                Ok(Self(Operation::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                }))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),
@@ -689,7 +1031,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Overwrite class");
 
                 let initial_bases_py = if let Some(bases) = initial_bases {
-                    use crate::dataset::DatasetBasePath;
+                    use crate::dataset::base_path::DatasetBasePath;
                     // Convert each Rust BasePath to a Python DatasetBasePath object
                     let bases_py: Vec<DatasetBasePath> = bases
                         .iter()
@@ -710,6 +1052,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
+                compacted_sstables,
+                mem_wal_dir_id,
+                inserted_rows_filter,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -742,6 +1087,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                                 })
                                 .collect::<HashMap<u64, Vec<u8>>>()
                         });
+                let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
+                let inserted_rows_filter = match inserted_rows_filter {
+                    Some(filter) => Py::new(
+                        py,
+                        PyInsertedRowsFilter {
+                            inner: filter.clone(),
+                        },
+                    )?
+                    .into_bound(py)
+                    .into_any(),
+                    None => py.None().into_bound(py),
+                };
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
@@ -753,6 +1110,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     updated_fragment_offsets,
+                    compacted_sstables,
+                    mem_wal_dir_id,
+                    inserted_rows_filter,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -814,14 +1174,18 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
-                ..
+                frag_reuse_index,
             } => {
                 let groups_py = export_vec(py, groups.as_slice())?;
                 let rewritten_indices_py = export_vec(py, rewritten_indices.as_slice())?;
+                let frag_reuse_index = match frag_reuse_index {
+                    Some(index) => PyLance(index).into_pyobject(py)?.into_any(),
+                    None => py.None().into_bound(py),
+                };
                 let cls = namespace
                     .getattr("Rewrite")
                     .expect("Failed to get Rewrite class");
-                cls.call1((groups_py, rewritten_indices_py))
+                cls.call1((groups_py, rewritten_indices_py, frag_reuse_index))
             }
             Operation::CreateIndex {
                 new_indices,
@@ -885,7 +1249,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             }
             Operation::UpdateBases { new_bases } => {
                 if let Ok(cls) = namespace.getattr("UpdateBases") {
-                    use crate::dataset::DatasetBasePath;
+                    use crate::dataset::base_path::DatasetBasePath;
                     let new_bases_py: Vec<DatasetBasePath> = new_bases
                         .iter()
                         .map(|bp| DatasetBasePath::from(bp.clone()))
@@ -896,6 +1260,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     let base_op = namespace.getattr("BaseOperation")?;
                     base_op.call0()
                 }
+            }
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
+                let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
+                let cls = namespace
+                    .getattr("UpdateMemWalState")
+                    .expect("Failed to get UpdateMemWalState class");
+                cls.call1((compacted_sstables, dir_id))
             }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {}",
@@ -916,11 +1290,15 @@ impl FromPyObject<'_, '_> for PyLance<Transaction> {
             .extract::<Option<HashMap<String, String>>>()?
             .filter(|map| !map.is_empty())
             .map(Arc::new);
+        let tag = match ob.getattr("tag") {
+            Ok(value) if !value.is_none() => Some(value.extract()?),
+            _ => None,
+        };
         Ok(Self(Transaction {
             read_version,
             uuid,
             operation,
-            tag: None,
+            tag,
             transaction_properties,
         }))
     }
@@ -949,6 +1327,9 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         if let Some(transaction_properties_arc) = &self.0.transaction_properties {
             let py_dict = transaction_properties_arc.as_ref().into_pyobject(py)?;
             py_transaction.setattr("transaction_properties", py_dict)?;
+        }
+        if let Some(tag) = &self.0.tag {
+            py_transaction.setattr("tag", tag)?;
         }
         // Unwrap due to infallible
         Ok(py_transaction.into_pyobject(py).unwrap())

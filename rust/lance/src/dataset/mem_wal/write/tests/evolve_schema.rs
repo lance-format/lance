@@ -4,9 +4,26 @@
 //! Moving a live writer onto a schema change, and the replay that has to
 //! rebuild the same generation boundaries afterwards.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use lance_arrow::FixedSizeListArrayExt;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
+use uuid::Uuid;
+
+use super::super::test_support::*;
+use super::super::{ShardWriter, ShardWriterConfig};
+use crate::dataset::Dataset;
+use crate::dataset::mem_wal::manifest::ShardManifestStore;
+
 /// Replay starts each memtable where the WAL entry it reads says to.
 mod replay {
-    use super::super::*;
+    use super::*;
 
     /// Replay starts a new memtable where the recorded generation changes, even
     /// when no size limit or Blob v2 target would.
@@ -82,7 +99,7 @@ mod replay {
         base_path: &Path,
         shard_id: Uuid,
     ) -> Vec<u64> {
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 10)
+        ShardManifestStore::new(store.clone(), base_path, "", shard_id, 10)
             .latest()
             .await
             .unwrap()
@@ -223,10 +240,10 @@ mod replay {
 
 /// A live writer moved onto a new schema keeps writing and reading.
 mod evolve {
-    use super::super::*;
+    use super::*;
     use crate::dataset::WriteParams;
     use crate::dataset::mem_wal::DatasetMemWalExt;
-    use crate::dataset::mem_wal::write::shard_writer_tests::{
+    use crate::dataset::mem_wal::write::tests::integration::{
         create_test_batch, create_test_schema,
     };
     use crate::index::DatasetIndexExt;
@@ -407,10 +424,11 @@ mod evolve {
             .iter()
             .find(|s| s.generation == frozen_generation)
             .expect("the frozen generation is in the manifest");
-        let generation = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+        let generation = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -458,10 +476,11 @@ mod evolve {
             .iter()
             .find(|s| s.generation == generation)
             .expect("the frozen generation is flushed");
-        let flushed = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+        let flushed = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -516,6 +535,7 @@ mod evolve {
                 vec!["id".to_string()],
             )
             .with_identity_schema(writer_schema_of(&dataset))
+            .with_mem_wal_dir_id(writer.config().dir_id.clone())
         };
         let rows = |batch: RecordBatch| -> Vec<(i64, String)> {
             let ids = batch["id"].as_primitive::<Int64Type>();

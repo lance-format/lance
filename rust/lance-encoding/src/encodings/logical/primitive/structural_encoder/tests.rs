@@ -1579,9 +1579,12 @@ async fn test_constant_layout_out_of_line_utf8_v2_2() {
     assert!(layout.inline_value.is_none());
     assert_eq!(page.data.len(), 1);
 
+    // No definition levels here, so the row count of a mid-page read comes from `drain`
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(100..300)
+        .with_indices(vec![1, 150, 400]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -1661,7 +1664,9 @@ async fn test_constant_layout_nullable_item_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..4)
+        .with_indices(vec![1, 4]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -1706,7 +1711,9 @@ async fn test_constant_layout_list_repdef_v2_2() {
 
     let test_cases = TestCases::default()
         .with_encoding(TestEncoding::StructuralU32)
-        .with_page_sizes(vec![4096]);
+        .with_page_sizes(vec![4096])
+        .with_range(1..3)
+        .with_indices(vec![1, 3]);
     check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
 }
 
@@ -2291,13 +2298,24 @@ fn int8_dictionary_with_all_values() -> ArrayRef {
     )
 }
 
+#[rstest::rstest]
+// Both chunks land in one page, which the writer merges.
+#[case::one_page(4096, vec![TestEncoding::StructuralU32])]
+// Each chunk is its own page, so the reader merges the two decoded dictionaries
+// for a batch that spans both pages.
+#[case::page_per_chunk(
+    64,
+    vec![TestEncoding::Array, TestEncoding::StructuralU16, TestEncoding::StructuralU32]
+)]
 #[tokio::test]
-async fn test_dictionary_merge_keeps_declared_key_type_round_trip() {
-    // Regression for a write that succeeded but produced a file the reader
-    // rejected: two Dictionary(Int8, UInt16) chunks, each holding all 127
-    // values an Int8 key can address.  Arrow's lossy concat merge
-    // over-counted the union (hash collisions in its interner) and widened
-    // the indices to 32 bits, contradicting the declared key type.
+async fn test_dictionary_merge_keeps_declared_key_type_round_trip(
+    #[case] page_size: u64,
+    #[case] encodings: Vec<TestEncoding>,
+) {
+    // Two Dictionary(Int8, UInt16) chunks, each holding all 127 values an Int8
+    // key can address.  Arrow's lossy concat merge over-counts the union (hash
+    // collisions in its interner) and overflows Int8, although the exact union
+    // fits.  The column must round-trip with its declared key type.
     let a = int8_dictionary_with_all_values();
     let b = int8_dictionary_with_all_values();
     // Build the expected array directly: `concat` hits the same Arrow
@@ -2316,8 +2334,9 @@ async fn test_dictionary_merge_keeps_declared_key_type_round_trip() {
         .unwrap(),
     );
     let test_cases = TestCases::default()
-        .with_encodings([TestEncoding::StructuralU32])
-        .with_page_sizes(vec![4096]);
+        .with_encodings(encodings)
+        .with_page_sizes(vec![page_size])
+        .with_batch_size(1000);
     check_round_trip_encoding_of_data_with_expected(
         vec![a, b],
         Some(expected),

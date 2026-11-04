@@ -678,7 +678,9 @@ mod tests {
 
     use crate::Dataset;
     use crate::index::vector::ivf::v2;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::index::{
+        DatasetIndexExt, loading::DatasetIndexInternalExt, vector::VectorIndexParams,
+    };
     use arrow_array::{RecordBatchIterator, UInt8Array};
     use arrow_schema::{Field, Schema};
     use lance_core::utils::tempfile::{TempObjFile, TempStrDir};

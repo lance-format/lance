@@ -26,6 +26,9 @@ lance-jsonb = { workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true
 
+[dev-dependencies]
+rstest = { workspace = true }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 

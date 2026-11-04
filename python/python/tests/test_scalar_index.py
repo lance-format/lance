@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance.dataset import ScannerBuilder
+from lance._dataset.scanner import ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -277,7 +277,7 @@ def test_list_indices_index_without_details(tmp_path):
     """An index whose manifest entry has no index details (e.g. committed by an
     older writer) is still reported on a best-effort basis: describe_indices()
     does not error, and the type is reported as "Unknown"."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -313,7 +313,7 @@ def test_list_indices_legacy_vector_index_without_details(tmp_path):
     """A legacy vector index predates VectorIndexDetails: it has no index
     details but stores a monolithic index file. Its type is recognized as
     "Vector" from the index file rather than reported as "Unknown"."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -823,6 +823,17 @@ def test_index_take_batch_size(tmp_path):
     ).to_batches()
     batches = list(batches)
     assert len(batches) == 21
+
+
+def test_btree_rejects_zero_zone_size(tmp_path):
+    """A zero-sized BTree zone must be rejected."""
+    dataset = lance.write_dataset(pa.table({"value": [1, 2, 3]}), tmp_path)
+
+    with pytest.raises(ValueError, match="zone_size"):
+        dataset.create_scalar_index(
+            "value",
+            index_type=IndexConfig("btree", {"zone_size": 0}),
+        )
 
 
 def test_all_null_chunk(tmp_path):
@@ -3730,14 +3741,13 @@ def test_nan_handling(tmp_path: Path):
     )
     dataset = lance.write_dataset(tbl, tmp_path / "dataset")
 
-    # There is no way, in DF, to query for NAN / INF, that I'm aware of.
-    # So the best we can do here is make sure that the presence of NAN / INF
-    # doesn't interfere with normal operation of the btree.
+    # NaNs sort above finite values regardless of their sign bit, both with and
+    # without an index. Infinities retain their usual ordering.
     def check(has_index: bool):
         assert dataset.to_table(filter="x IS NULL").num_rows == 0
         assert dataset.to_table(filter="x IS NOT NULL").num_rows == 7
-        assert dataset.to_table(filter="x > 0").num_rows == 5
-        assert dataset.to_table(filter="x < 5").num_rows == 5
+        assert dataset.to_table(filter="x > 0").num_rows == 6
+        assert dataset.to_table(filter="x < 5").num_rows == 4
         assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
 
     check(False)
@@ -4475,7 +4485,7 @@ def build_distributed_fts_index(
     """
     import uuid
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Generate unique index ID for distributed indexing
     index_id = str(uuid.uuid4())
@@ -5444,7 +5454,7 @@ def test_distribute_fts_index_build(tmp_path):
     ds.merge_index_metadata(index_id, index_type="INVERTED")
 
     # Create an Index object using the new dataclass format
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Get the schema field for the indexed column
     # Only use for non nested struct schema
@@ -6006,6 +6016,45 @@ def test_minhashlsh_segment_merge_and_commit_from_python():
     assert stats["indices"][0]["num_bands"] == 16
     assert stats["indices"][0]["shingle_size"] == 3
     assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()[2] == 2
+
+
+def test_fm_index():
+    texts = ["hello world", "say hello", None, "goodbye", "hello again", "nothing"]
+    tbl = pa.table({"id": list(range(len(texts))), "text": texts})
+    ds = lance.write_dataset(tbl, "memory://fm_index", max_rows_per_file=2)
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    assert len(fragment_ids) == 3
+    index_name = "text_idx"
+
+    def contains(ds, pattern):
+        predicate = f"contains(text, '{pattern}')"
+        plan = ds.scanner(filter=predicate).explain_plan()
+        assert f"@{index_name}" in plan
+        return sorted(ds.to_table(filter=predicate, columns=["id"])["id"].to_pylist())
+
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index("text", "FM", fragment_ids=fragment_ids[:1])
+
+    segments = [
+        ds.create_index_uncommitted(
+            "text", "FM", name=index_name, fragment_ids=[fragment_id]
+        )
+        for fragment_id in fragment_ids
+    ]
+    merged = ds.merge_existing_index_segments(segments[1:])
+    assert merged.fragment_ids == set(fragment_ids[1:])
+    ds = ds.commit_existing_index_segments(index_name, "text", [segments[0], merged])
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert descriptions[index_name].index_type == "Fm"
+    assert len(descriptions[index_name].segments) == 2
+    assert contains(ds, "hello") == [0, 1, 4]
+
+    ds.create_scalar_index("text", "FM", name=index_name, num_segments=3)
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert len(descriptions[index_name].segments) == 3
+    assert contains(ds, "hello") == [0, 1, 4]
+    # Unlike NGRAM, a single-character pattern is still answered by the index.
+    assert contains(ds, "y") == [1, 3]
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):
@@ -6838,14 +6887,17 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        # `$.x` is absent from every document, so the target type was inferred
+        # as utf8, the fallback for an all-null path.
+        '{"path":"x","target_data_type":"utf8","target_details":{}}',
         "{}",
         "{}",
     ]
     # BTree only stores row addresses (bumping its on-disk format version to
     # 1) on a dataset with stable row ids; this dataset doesn't enable them,
-    # so BTree stays at version 0 along with every other index type here.
-    index_versions = [0, 0, 0, 0, 0, 0]
+    # so BTree stays at version 0. New ZoneMap segments are written as
+    # version 1 (ordinary bounds plus the NaN sign split).
+    index_versions = [0, 0, 0, 0, 0, 1]
 
     for i in range(len(indices)):
         assert indices[i].name == names[i]
@@ -7117,3 +7169,64 @@ def test_large_string_scalar_index(tmp_path, index_type):
     result = ds.scanner(filter="category = 'alpha'").to_table()
     assert result.num_rows == 2
     assert set(result.column("id").to_pylist()) == {1, 3}
+
+
+def _assert_row_address_query(dataset, value, filter_expression):
+    table = dataset.to_table(filter=filter_expression)
+    assert table.num_rows == 1
+    assert table.column("idx").to_pylist() == [value]
+
+    plan = dataset.scanner(filter=filter_expression).explain_plan()
+    assert "ScalarIndexQuery" in plan or "MaterializeIndex" in plan
+
+
+def _assert_row_address_case(index_type, dataset, value):
+    if index_type == "LABEL_LIST":
+        filter_expression = f"array_has_any(label_list, ['label{value}'])"
+    else:
+        filter_expression = f"{index_type.lower()} == {value}"
+    _assert_row_address_query(dataset, value, filter_expression)
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "LABEL_LIST"])
+def test_row_address_index_maintenance(tmp_path, index_type):
+    column = "label_list" if index_type == "LABEL_LIST" else index_type.lower()
+    data = pa.table(
+        {
+            "idx": range(16),
+            column: (
+                [[f"label{i}"] for i in range(16)]
+                if index_type == "LABEL_LIST"
+                else range(16)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(
+        data,
+        tmp_path,
+        max_rows_per_file=8,
+        data_storage_version="2.1",
+        enable_stable_row_ids=True,
+    )
+    dataset.create_scalar_index(column, index_type)
+    _assert_row_address_case(index_type, dataset, 7)
+
+    dataset.insert(
+        pa.table(
+            {
+                "idx": [16],
+                column: [["label16"]] if index_type == "LABEL_LIST" else [16],
+            }
+        )
+    )
+    dataset.optimize.optimize_indices()
+    dataset.optimize.compact_files()
+
+    dataset = lance.dataset(tmp_path)
+    _assert_row_address_case(index_type, dataset, 7)
+    _assert_row_address_case(index_type, dataset, 16)
+
+    # Compaction can leave coverage addressed by stable row ids. Rebuild it so
+    # both rows remain available through physical-address coverage as well.
+    dataset.optimize.optimize_indices()
+    _assert_row_address_case(index_type, dataset, 16)

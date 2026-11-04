@@ -9,6 +9,13 @@ import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
+from ._dataset.cleanup import CleanupPolicy, CleanupRule, KeepOne, RemoveAll
+from ._dataset.index import Index, IndexFile
+from ._dataset.merge_insert import MergeInsertBuilder
+from ._dataset.optimize import AutoCleanupConfig
+from ._dataset.scanner import LanceScanner
+from ._dataset.stats import DataStatistics, FieldStatistics
+from ._dataset.transaction import LanceOperation, Transaction
 from .blob import (
     Blob,
     BlobArray,
@@ -23,16 +30,8 @@ from .blob import (
     blob_field,
 )
 from .dataset import (
-    DataStatistics,
-    FieldStatistics,
-    Index,
-    IndexFile,
     LanceDataset,
-    LanceOperation,
-    LanceScanner,
-    MergeInsertBuilder,
     Session,
-    Transaction,
     __version__,
     batch_udf,
     write_dataset,
@@ -47,6 +46,7 @@ from .lance import (
     FFILanceTableProvider,
     FragmentAddColumnsCleanup,
     FtsToken,
+    InsertedRowsFilter,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
@@ -70,14 +70,11 @@ from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
 if TYPE_CHECKING:
-    from datetime import datetime
     from pathlib import Path
 
     from lance.commit import CommitLock
-    from lance.dependencies import pandas as pd
     from lance.namespace import LanceNamespace
-
-    ts_types = Union[datetime, pd.Timestamp, str]
+    from lance.util import ts_types
 
 
 __all__ = [
@@ -96,6 +93,11 @@ __all__ = [
     "CleanupExplanation",
     "CleanupReferencedBranch",
     "CleanupStats",
+    "CleanupPolicy",
+    "CleanupRule",
+    "AutoCleanupConfig",
+    "KeepOne",
+    "RemoveAll",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -104,6 +106,7 @@ __all__ = [
     "FtsToken",
     "Index",
     "IndexFile",
+    "InsertedRowsFilter",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",
@@ -170,6 +173,9 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given
         argument value. If a version is already specified, this arg is ignored.
+        Pandas timestamps are accepted, but ``pandas.NaT`` raises ``ValueError``.
+        Strings use pandas parsing when installed; otherwise they must match
+        ``YYYY-MM-DD HH:MM:SS``. Use ``version`` for version numbers or tags.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     commit_lock : optional, lance.commit.CommitLock
@@ -188,6 +194,9 @@ def dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+        Set ``scheduler_error_mode`` to ``"fail_fast"`` to cancel the remaining
+        physical reads in a logical scheduler request after one read fails. The
+        default is ``"best_effort"``.
 
         For datasets with additional registered base paths, a key of the form
         ``base_<id>.<key>`` applies ``<key>`` only to the base path with that

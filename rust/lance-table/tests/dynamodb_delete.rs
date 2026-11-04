@@ -5,9 +5,8 @@
 //!
 //! The store's paging and batching are only observable in the sequence of
 //! requests it issues, so this serves canned JSON responses to the real SDK and
-//! asserts on what it asked for. It covers the two shapes that cannot be
-//! reached from a unit test: a second page, and a terminal `LastEvaluatedKey`
-//! that arrives as an empty map rather than being absent.
+//! asserts on what it asked for. It covers multi-page deletes, the 25-request
+//! batch limit, unprocessed-row retries, and empty partitions.
 
 #![cfg(feature = "dynamodb")]
 
@@ -18,7 +17,9 @@ use std::time::Duration;
 
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::{Credentials, Region, retry::RetryConfig};
+use lance_core::Error;
 use lance_table::io::commit::dynamodb::DynamoDBExternalManifestStore;
+use rstest::rstest;
 use serde_json::{Value, json};
 
 /// One recorded request: the operation name from `X-Amz-Target` and its body.
@@ -134,17 +135,32 @@ fn row(base_uri: &str, version: &str) -> Value {
     })
 }
 
-/// The versions carried by a recorded `BatchWriteItem` body, in order.
-fn deleted_versions(body: &Value, table: &str) -> Vec<String> {
-    body["RequestItems"][table]
+/// The complete keys carried by a recorded `BatchWriteItem` body, in order.
+fn deleted_keys(body: &Value, table: &str) -> Vec<(String, String)> {
+    let request_items = body["RequestItems"]
+        .as_object()
+        .expect("batch carries request items");
+    assert_eq!(
+        request_items.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![table],
+        "batch must target only the configured table"
+    );
+
+    request_items[table]
         .as_array()
         .expect("batch carries requests for the table")
         .iter()
         .map(|request| {
-            request["DeleteRequest"]["Key"]["version"]["N"]
+            let key = &request["DeleteRequest"]["Key"];
+            let base_uri = key["base_uri"]["S"]
+                .as_str()
+                .expect("delete request keys a string base URI")
+                .to_string();
+            let version = key["version"]["N"]
                 .as_str()
                 .expect("delete request keys a numeric version")
-                .to_string()
+                .to_string();
+            (base_uri, version)
         })
         .collect()
 }
@@ -189,8 +205,17 @@ async fn delete_drains_every_page_and_stops_on_an_empty_terminal_key() {
         ],
         "the empty terminal key must end the paging"
     );
-    assert_eq!(deleted_versions(&recorded[2].1, table), vec!["1", "2"]);
-    assert_eq!(deleted_versions(&recorded[4].1, table), vec!["3"]);
+    assert_eq!(
+        deleted_keys(&recorded[2].1, table),
+        vec![
+            (base_uri.to_string(), "1".to_string()),
+            (base_uri.to_string(), "2".to_string())
+        ]
+    );
+    assert_eq!(
+        deleted_keys(&recorded[4].1, table),
+        vec![(base_uri.to_string(), "3".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -226,6 +251,146 @@ async fn delete_resends_unprocessed_rows() {
         vec!["DescribeTable", "Query", "BatchWriteItem", "BatchWriteItem"],
         "the unprocessed row must be sent again"
     );
-    assert_eq!(deleted_versions(&recorded[2].1, table), vec!["1", "2"]);
-    assert_eq!(deleted_versions(&recorded[3].1, table), vec!["2"]);
+    assert_eq!(
+        deleted_keys(&recorded[2].1, table),
+        vec![
+            (base_uri.to_string(), "1".to_string()),
+            (base_uri.to_string(), "2".to_string())
+        ]
+    );
+    assert_eq!(
+        deleted_keys(&recorded[3].1, table),
+        vec![(base_uri.to_string(), "2".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn delete_splits_each_query_page_into_batches_of_25() {
+    let table = "lance_delete_batch_limit";
+    let base_uri = "s3://bucket/table";
+    let items = (1..=26)
+        .map(|version| row(base_uri, &version.to_string()))
+        .collect::<Vec<_>>();
+    let (endpoint, recorded) = scripted_endpoint(vec![
+        describe_table(table),
+        json!({"Items": items}),
+        json!({"UnprocessedItems": {}}),
+        json!({"UnprocessedItems": {}}),
+    ]);
+
+    let store = DynamoDBExternalManifestStore::new_external_store(
+        client(&endpoint),
+        table,
+        "test-committer",
+    )
+    .await
+    .unwrap();
+    store.delete(base_uri).await.unwrap();
+
+    let recorded = recorded.lock().unwrap();
+    let targets = recorded
+        .iter()
+        .map(|(target, _)| target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets,
+        vec!["DescribeTable", "Query", "BatchWriteItem", "BatchWriteItem"]
+    );
+
+    let first_batch = (1..=25)
+        .map(|version| (base_uri.to_string(), version.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(deleted_keys(&recorded[2].1, table), first_batch);
+    assert_eq!(
+        deleted_keys(&recorded[3].1, table),
+        vec![(base_uri.to_string(), "26".to_string())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn delete_errors_when_unprocessed_rows_exhaust_retries() {
+    let table = "lance_delete_unprocessed_exhausted";
+    let base_uri = "s3://bucket/table";
+    let leftover = json!({table: [{"DeleteRequest": {"Key": {
+        "base_uri": {"S": base_uri},
+        "version": {"N": "2"},
+    }}}]});
+    let mut responses = vec![
+        describe_table(table),
+        json!({"Items": [row(base_uri, "1"), row(base_uri, "2")]}),
+    ];
+    // The production limit is the initial send plus eight re-sends.
+    let batch_attempts = 9;
+    responses.extend((0..batch_attempts).map(|_| json!({"UnprocessedItems": leftover.clone()})));
+    let (endpoint, recorded) = scripted_endpoint(responses);
+
+    let store = DynamoDBExternalManifestStore::new_external_store(
+        client(&endpoint),
+        table,
+        "test-committer",
+    )
+    .await
+    .unwrap();
+    let error = store
+        .delete(base_uri)
+        .await
+        .expect_err("unprocessed rows must eventually fail");
+    assert!(
+        matches!(&error, Error::IO { .. }),
+        "unexpected error: {error}"
+    );
+    assert!(
+        error.to_string().contains(&format!(
+            "dynamodb table: {table} left 1 manifest rows unprocessed after re-sending them 8 times"
+        )),
+        "unexpected error: {error}"
+    );
+
+    let recorded = recorded.lock().unwrap();
+    let targets = recorded
+        .iter()
+        .map(|(target, _)| target.as_str())
+        .collect::<Vec<_>>();
+    let mut expected_targets = vec!["DescribeTable", "Query"];
+    expected_targets.extend(std::iter::repeat_n("BatchWriteItem", batch_attempts));
+    assert_eq!(targets, expected_targets);
+    assert_eq!(
+        deleted_keys(&recorded[2].1, table),
+        vec![
+            (base_uri.to_string(), "1".to_string()),
+            (base_uri.to_string(), "2".to_string())
+        ]
+    );
+    for record in &recorded[3..] {
+        assert_eq!(
+            deleted_keys(&record.1, table),
+            vec![(base_uri.to_string(), "2".to_string())],
+            "only the unprocessed key must be re-sent"
+        );
+    }
+}
+
+#[rstest]
+#[case::missing_items("lance_delete_missing_items", json!({}))]
+#[case::empty_items("lance_delete_empty_items", json!({"Items": []}))]
+#[tokio::test]
+async fn delete_empty_partition_skips_batch(#[case] table: &str, #[case] query_response: Value) {
+    let base_uri = "s3://bucket/table";
+    let (endpoint, recorded) = scripted_endpoint(vec![describe_table(table), query_response]);
+
+    let store = DynamoDBExternalManifestStore::new_external_store(
+        client(&endpoint),
+        table,
+        "test-committer",
+    )
+    .await
+    .unwrap();
+    store.delete(base_uri).await.unwrap();
+
+    let recorded = recorded.lock().unwrap();
+    let targets = recorded
+        .iter()
+        .map(|(target, _)| target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(targets, vec!["DescribeTable", "Query"]);
 }

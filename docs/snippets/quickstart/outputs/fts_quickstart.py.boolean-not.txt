@@ -1,0 +1,3 @@
+Empty DataFrame
+Columns: [id, text, _score]
+Index: []
