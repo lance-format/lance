@@ -959,6 +959,97 @@ async fn test_optimize_empty_code_fts_index_preserves_params(#[case] block_size:
     assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
 }
 
+#[rstest]
+#[case::btree(IndexType::BTree, "id", "page_lookup.lance")]
+#[case::fts(IndexType::Inverted, "text", "tokens.lance")]
+#[tokio::test]
+async fn test_optimize_reports_segment_open_errors(
+    #[case] index_type: IndexType,
+    #[case] column: &str,
+    #[case] file_suffix: &str,
+    #[values(false, true)] is_missing_file: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_dataset(&test_dir, FragmentCount(1), FragmentRowCount(4))
+        .await
+        .unwrap();
+    let params: Box<dyn IndexParams> = match index_type {
+        IndexType::BTree => Box::new(ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)),
+        IndexType::Inverted => Box::new(InvertedIndexParams::default()),
+        _ => unreachable!(),
+    };
+    dataset
+        .create_index(
+            &[column],
+            index_type,
+            Some("test_idx".into()),
+            params.as_ref(),
+            false,
+        )
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+
+    // Reopen with a fresh session so a cached index cannot hide the missing file.
+    let mut dataset = Dataset::open(&test_dir).await.unwrap();
+    let original = dataset.load_indices_by_name("test_idx").await.unwrap();
+    let version = dataset.version().version;
+
+    if is_missing_file {
+        let segment = &original[0];
+        let file = segment
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|file| file.path.ends_with(file_suffix))
+            .unwrap();
+        let path = dataset
+            .indices_dir()
+            .join(segment.uuid.to_string())
+            .join(file.path.as_str());
+        dataset.object_store.delete(&path).await.unwrap();
+    }
+
+    let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
+    let dataset = Dataset::open(&test_dir).await.unwrap();
+    let indices = dataset.load_indices_by_name("test_idx").await.unwrap();
+    if is_missing_file {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("index 'test_idx'"), "{message}");
+        assert!(message.contains(&format!("column '{column}'")), "{message}");
+        assert!(message.contains(file_suffix), "{message}");
+        assert!(
+            message.to_ascii_lowercase().contains("not found"),
+            "{message}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(indices, original);
+    } else {
+        result.unwrap();
+        let covered: RoaringBitmap = indices
+            .iter()
+            .flat_map(|index| index.fragment_bitmap.as_ref().unwrap().iter())
+            .collect();
+        assert_eq!(covered, RoaringBitmap::from_iter([0, 1]));
+    }
+}
+
 /// Optimizing a name whose segments this build cannot all read would commit
 /// a merged segment overlapping the one it left behind - a state
 /// `Dataset::validate` reports as corruption and no later commit can heal.
