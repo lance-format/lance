@@ -21,7 +21,7 @@ package org.lance.ipc;
  * ignore this setting.
  */
 public enum ApproxMode {
-  /** Prefer faster approximate scoring when supported by the RQ index. */
+  /** Prefer lower query latency, which can reduce recall. */
   FAST("fast"),
 
   /** Use the index's default approximation behavior. */

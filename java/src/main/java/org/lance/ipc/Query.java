@@ -479,7 +479,7 @@ public class Query {
      * Sets the speed / accuracy tradeoff for approximate vector search.
      *
      * <p>This setting currently affects RQ-quantized vector indexes (such as IVF_RQ) and
-     * prefiltered search on HNSW sub-indexes, where {@code Fast} enables the ACORN traversal.
+     * prefiltered search on HNSW sub-indexes, where {@code FAST} enables the ACORN traversal.
      * Other index types ignore this setting.
      *
      * @param approxMode The approximate search mode to use for the query.
