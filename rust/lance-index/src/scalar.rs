@@ -55,6 +55,8 @@ pub mod ngram;
 pub mod registry;
 #[cfg(test)]
 mod remap_compat_tests;
+#[cfg(test)]
+mod remap_contract;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;
