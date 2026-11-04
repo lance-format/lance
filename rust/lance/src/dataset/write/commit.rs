@@ -62,6 +62,8 @@ pub struct CommitBuilder<'a> {
     /// The complete desired clustering definitions list for an `UpdateConfig`
     /// commit; see [`ManifestBuildConfig::clustering_definitions`].
     clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    /// Whether the caller has opted in to committing a [`CompositeOperation`].
+    allow_composite_operations: bool,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -90,6 +92,7 @@ impl<'a> CommitBuilder<'a> {
             deep_clone_files_copied: false,
             inherited_field_ids: false,
             clustering_definitions: None,
+            allow_composite_operations: false,
         }
     }
 
@@ -349,7 +352,56 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Opt in to committing an action-based transaction.
+    ///
+    /// Transaction V2 -- a [`Transaction`] whose operation is a
+    /// [`CompositeOperation`](lance_table::transaction::action::CompositeOperation)
+    /// -- is experimental for now: this API may change, and not every
+    /// operation can be expressed as actions yet.
+    /// The format it writes is not experimental.
+    ///
+    /// Without this opt-in, [`Self::execute`] rejects such a transaction with
+    /// [`Error::NotSupported`]. The opt-in has no effect on any other operation.
+    ///
+    /// # Compatibility
+    ///
+    /// Any reader can open and scan a dataset version committed this way: the
+    /// inline transaction lives in a manifest field older readers ignore
+    /// ([#9482]). Lance before v14.0.0 fails only when it decodes the
+    /// transaction itself, to read the transaction history or to check a
+    /// concurrent commit for conflicts. For conflict checking, that failure
+    /// aborts the older writer's commit, which is the safe outcome.
+    ///
+    /// [#9482]: https://github.com/lance-format/lance/pull/9482
+    ///
+    /// ```
+    /// # use lance::dataset::CommitBuilder;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_table::transaction::Transaction;
+    /// # use std::sync::Arc;
+    /// # async fn commit(dataset: Arc<Dataset>, transaction: Transaction) -> Result<Dataset> {
+    /// CommitBuilder::new(dataset)
+    ///     .with_experimental_composite_operations(true)
+    ///     .execute(transaction)
+    ///     .await
+    /// # }
+    /// ```
+    pub fn with_experimental_composite_operations(mut self, allow: bool) -> Self {
+        self.allow_composite_operations = allow;
+        self
+    }
+
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
+        if matches!(transaction.operation, Operation::CompositeOperation(_))
+            && !self.allow_composite_operations
+        {
+            return Err(Error::not_supported_source(
+                "Transaction V2 is experimental; a CompositeOperation can only be \
+                 committed after opting in with \
+                 CommitBuilder::with_experimental_composite_operations"
+                    .into(),
+            ));
+        }
         let timeout = self.timeout;
         if let Some(t) = timeout
             && t.is_zero()
