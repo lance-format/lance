@@ -185,7 +185,7 @@ pub use write::update::{UpdateBuilder, UpdateJob};
 pub use write::{
     AutoCleanupParams, CommitBuilder, DEFAULT_COMMIT_TIMEOUT, DeleteBuilder, DeleteResult,
     ExternalBlobMode, InsertBuilder, UncommittedDelete, WriteDestination, WriteMode, WriteParams,
-    WriteProgressFn, WriteStats, write_fragments,
+    WriteProgressFn, WriteStats, ZoneWriteSeedOptions, write_fragments,
 };
 
 pub(crate) const INDICES_DIR: &str = "_indices";

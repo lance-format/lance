@@ -42,7 +42,7 @@ use crate::dataset::transaction::{DataReplacementGroup, Operation, Transaction};
 use crate::dataset::write::merge_insert::{WhenMatched, WhenNotMatched};
 use crate::dataset::{
     CommitBuilder, DATA_DIR, InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode,
-    UpdateBuilder, WriteDestination, WriteMode, WriteParams,
+    UpdateBuilder, WriteDestination, WriteMode, WriteParams, ZoneWriteSeedOptions,
 };
 use crate::index::DatasetIndexExt;
 
@@ -498,6 +498,431 @@ fn rows(ids: std::ops::Range<i32>, value: impl Fn(i32) -> Option<i32>) -> Record
 
 fn base_value(i: i32) -> Option<i32> {
     (i % 7 != 3).then_some(i)
+}
+
+async fn dataset_without_seed_index(uri: &str) -> Dataset {
+    Dataset::write(
+        RecordBatchIterator::new([Ok(rows(0..3, base_value))], schema()),
+        uri,
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+async fn assert_configured_seed(dataset: &Dataset, path: &str, column: &str, rows_per_zone: u64) {
+    let reader = open_data_file(dataset, path).await;
+    let key = format!("{SEED_META_KEY_PREFIX}{column}");
+    let locator = &reader.metadata().file_schema.metadata[&key];
+    assert_eq!(
+        locator.split_once(':').unwrap().1,
+        rows_per_zone.to_string()
+    );
+    let physical = physical_column(dataset, path, column).await;
+    let mut expected =
+        ZoneMapSeedWriter::new(column, rows_per_zone, physical.data_type().clone()).unwrap();
+    expected.observe_batch(&physical).unwrap();
+    assert_eq!(
+        seed_in_file(dataset, path, column).await.unwrap(),
+        expected.finish().unwrap().unwrap()
+    );
+}
+
+#[rstest::rstest]
+#[case::small(4, false)]
+#[case::million(1_000_000, false)]
+#[case::all_null(4, true)]
+#[tokio::test]
+async fn test_zone_write_seed_columns_without_index(
+    #[case] rows_per_zone: u64,
+    #[case] all_null: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    let original = data_file_paths(&dataset);
+    dataset
+        .update_field_metadata()
+        .update("val", [("application.note", "preserve")])
+        .unwrap()
+        .await
+        .unwrap();
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", rows_per_zone)])
+        .await
+        .unwrap();
+    assert_seed_flags_set(&dataset);
+    assert_eq!(data_file_paths(&dataset), original);
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(
+                [Ok(rows(
+                    3..26,
+                    |i| if all_null { None } else { base_value(i) },
+                ))],
+                schema(),
+            ),
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 4);
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    assert_eq!(
+        dataset.schema().field("val").unwrap().metadata["application.note"],
+        "preserve"
+    );
+    for fragment in dataset.fragments().iter() {
+        let file = &fragment.files[0];
+        if original.contains(&file.path) {
+            assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+        } else {
+            assert_configured_seed(&dataset, &file.path, "val", rows_per_zone).await;
+        }
+        assert!(seed_in_file(&dataset, &file.path, "id").await.is_none());
+        assert!(
+            seed_in_file(&dataset, &file.path, "untouched")
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_replace_clear_and_rename() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", 4)])
+        .await
+        .unwrap();
+    dataset
+        .alter_columns(&[ColumnAlteration::new("val".into()).rename("renamed".into())])
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let renamed_schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        renamed_schema.clone(),
+        rows(3..8, base_value).columns().to_vec(),
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], renamed_schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed(&dataset, &file.path, "renamed", 4).await;
+    assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("id", 2)])
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], renamed_schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed(&dataset, &file.path, "id", 2).await;
+    assert!(
+        seed_in_file(&dataset, &file.path, "renamed")
+            .await
+            .is_none()
+    );
+    dataset.set_zone_write_seed_columns(&[]).await.unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(batch)], renamed_schema), None)
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    for column in ["id", "renamed"] {
+        assert!(seed_in_file(&dataset, &file.path, column).await.is_none());
+    }
+    assert_seed_flags_set(&dataset);
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+}
+
+#[rstest::rstest]
+#[case::missing(vec![ZoneWriteSeedOptions::new("missing", 4)], "missing")]
+#[case::zero(vec![ZoneWriteSeedOptions::new("val", 0)], "positive")]
+#[case::duplicate(vec![ZoneWriteSeedOptions::new("val", 4), ZoneWriteSeedOptions::new("val", 4)], "more than once")]
+#[case::conflicting(vec![ZoneWriteSeedOptions::new("val", 4), ZoneWriteSeedOptions::new("val", 8)], "more than once")]
+#[tokio::test]
+async fn test_zone_write_seed_columns_invalid_selection(
+    #[case] options: Vec<ZoneWriteSeedOptions>,
+    #[case] message: &str,
+) {
+    let mut dataset = dataset_without_seed_index("memory://").await;
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("id", 2)])
+        .await
+        .unwrap();
+    let version = dataset.version_id();
+    let before = dataset.schema().clone();
+    let error = dataset
+        .set_zone_write_seed_columns(&options)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains(message), "{error}");
+    assert_eq!(dataset.version_id(), version);
+    assert_eq!(dataset.schema(), &before);
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_snapshot_policy() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    let mut stale = dataset.clone();
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", 4)])
+        .await
+        .unwrap();
+    let error = stale.set_zone_write_seed_columns(&[]).await.unwrap_err();
+    assert!(matches!(
+        error,
+        lance_core::Error::RetryableCommitConflict { .. }
+    ));
+    assert!(error.to_string().contains("latest version advanced"));
+    let error = stale
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("id", 2)])
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        lance_core::Error::RetryableCommitConflict { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("latest version advanced from the expected"),
+        "{error}"
+    );
+    stale
+        .append(
+            RecordBatchIterator::new([Ok(rows(3..8, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &stale.fragments().last().unwrap().files[0];
+    assert!(seed_in_file(&stale, &file.path, "val").await.is_none());
+    let mut reopened = Dataset::open(dir.as_str()).await.unwrap();
+    reopened
+        .append(
+            RecordBatchIterator::new([Ok(rows(8..13, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &reopened.fragments().last().unwrap().files[0];
+    assert_configured_seed(&reopened, &file.path, "val", 4).await;
+    assert!(reopened.load_indices().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_reject_nested_fields() {
+    let values = StructArray::from(vec![(
+        Arc::new(ArrowField::new("child", DataType::Int32, false)),
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+    )]);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "parent",
+        values.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let version = dataset.version_id();
+    for column in ["parent", "parent.child"] {
+        let error = dataset
+            .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new(column, 4)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(column), "{error}");
+        assert_eq!(dataset.version_id(), version);
+    }
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_reencoding_compaction() {
+    let dir = TempStrDir::default();
+    let mut dataset = dataset_without_seed_index(dir.as_str()).await;
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", 4)])
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(3..8, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100,
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_configured_seed(&dataset, &dataset.fragments()[0].files[0].path, "val", 4).await;
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_zone_write_seed_columns_create_and_binary_copy() {
+    let dir = TempStrDir::default();
+    let mut configured = LanceSchema::try_from(schema().as_ref()).unwrap();
+    configured.fields[1].metadata.insert(
+        lance_table::feature_flags::ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY.to_string(),
+        "4".to_string(),
+    );
+    let arrow_schema = Arc::new(ArrowSchema::from(&configured));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        rows(0..3, base_value).columns().to_vec(),
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], arrow_schema),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_seed_flags_set(&dataset);
+    assert_configured_seed(&dataset, &dataset.fragments()[0].files[0].path, "val", 4).await;
+    for start in [3, 13] {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(rows(start..start + 10, base_value))], schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+    force_binary_copy(&mut dataset, 100).await;
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    let fragment = &dataset.fragments()[0];
+    let reader = open_data_file(&dataset, &fragment.files[0].path).await;
+    let locator = &reader.metadata().file_schema.metadata[&format!("{SEED_META_KEY_PREFIX}val")];
+    assert_eq!(locator.split_once(':').unwrap().1, "4");
+    let seed = seed_in_file(&dataset, &fragment.files[0].path, "val")
+        .await
+        .unwrap();
+    let lance_index::scalar::zonemap::CarriedSeed::Supported(seed) =
+        lance_index::scalar::zonemap::parse_seed_for_binary_copy(&seed, 4).unwrap()
+    else {
+        panic!("newly written seed must use a supported version");
+    };
+    assert_eq!(seed.total_rows(), 23);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 23);
+    assert!(dataset.load_indices().await.unwrap().is_empty());
+}
+
+#[rstest::rstest]
+#[case::policy_finer(true, 2, 2)]
+#[case::index_finer(true, 8, 4)]
+#[case::identical(true, 4, 4)]
+#[case::index_declines(false, 2, 2)]
+#[tokio::test]
+async fn test_zone_write_seed_columns_merge_index_demands(
+    #[case] index_seeds: bool,
+    #[case] configured: u64,
+    #[case] collected: u64,
+) {
+    let mut dataset = dataset_without_seed_index("memory://").await;
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": ROWS_PER_ZONE,
+            "use_seeds": index_seeds,
+            "store_null_bitmap": false,
+        }));
+    dataset
+        .create_index(&["val"], IndexType::ZoneMap, None, &params, false)
+        .await
+        .unwrap();
+    dataset
+        .set_zone_write_seed_columns(&[ZoneWriteSeedOptions::new("val", configured)])
+        .await
+        .unwrap();
+    let collector = crate::dataset::write::seeds::SeedCollector::for_write(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        Some(&dataset),
+        dataset.schema(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(collector.len(), 1);
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(30..40, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    assert_configured_seed(&dataset, &file.path, "val", collected).await;
+    assert_eq!(
+        open_data_file(&dataset, &file.path)
+            .await
+            .metadata()
+            .file_buffers
+            .len(),
+        2
+    );
+    dataset.set_zone_write_seed_columns(&[]).await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(40..50, base_value))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let file = &dataset.fragments().last().unwrap().files[0];
+    if index_seeds {
+        let physical = physical_column(&dataset, &file.path, "val").await;
+        let mut expected = ZoneMapSeedWriter::new("val", 4, DataType::Int32)
+            .unwrap()
+            .with_null_positions(false);
+        expected.observe_batch(&physical).unwrap();
+        assert_eq!(
+            seed_in_file(&dataset, &file.path, "val").await.unwrap(),
+            expected.finish().unwrap().unwrap()
+        );
+    } else {
+        assert!(seed_in_file(&dataset, &file.path, "val").await.is_none());
+    }
 }
 
 fn zone_map_params(use_seeds: bool) -> ScalarIndexParams {

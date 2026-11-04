@@ -40,20 +40,25 @@ pub enum SourceColumnSeed {
 }
 
 /// The `rows_per_zone` an output column's locator declares: the current
-/// index specification for the column when one exists, else the writer
+/// policy or index specification for the column when one exists, else the writer
 /// default. It is write-time configuration; zones are located by length.
-pub fn output_rows_per_zone(index_rows_per_zone: Option<u64>) -> u64 {
-    index_rows_per_zone.unwrap_or(lance_index::scalar::zonemap::ROWS_PER_ZONE_DEFAULT)
+pub fn output_rows_per_zone(configured_rows_per_zone: Option<u64>) -> u64 {
+    configured_rows_per_zone.unwrap_or(lance_index::scalar::zonemap::ROWS_PER_ZONE_DEFAULT)
 }
 
-/// The configured `rows_per_zone` of each column's current usable ZoneMap
-/// index, by field id.
-pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>> {
+/// The finest configured row count from each column's policy and usable
+/// ZoneMap indices, by field id.
+pub async fn seed_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>> {
     use crate::index::scalar::fetch_index_details;
     use crate::index::{loading::load_all_indices, segment::index_is_usable};
     use lance_index::pbold::ZoneMapIndexDetails;
 
     let mut rows_per_zone = HashMap::new();
+    for field in &dataset.schema().fields {
+        if let Some(rows) = crate::dataset::write::seeds::configured_zone_rows(field)? {
+            rows_per_zone.insert(field.id, rows);
+        }
+    }
     for index in load_all_indices(dataset)
         .await?
         .iter()
@@ -76,7 +81,10 @@ pub async fn index_rows_per_zone(dataset: &Dataset) -> Result<HashMap<i32, u64>>
         if let Ok(zone_map) = details.to_msg::<ZoneMapIndexDetails>()
             && let Some(configured) = zone_map.rows_per_zone
         {
-            rows_per_zone.insert(field_id, configured);
+            rows_per_zone
+                .entry(field_id)
+                .and_modify(|rows| *rows = (*rows).min(configured))
+                .or_insert(configured);
         }
     }
     Ok(rows_per_zone)
@@ -246,7 +254,7 @@ impl OutputSeedAccumulator {
     /// A column is kept only when every input carries a version 1 seed of one
     /// value type; zones are located by length, so differing collection
     /// granularities concatenate freely and the output locator declares the
-    /// column's current `rows_per_zone` from `index_rows_per_zone` (or the
+    /// column's current `rows_per_zone` from `seed_rows_per_zone` (or the
     /// writer default). Each column is decided on its own: an input without
     /// a seed, with a version this build cannot interpret, or with a version
     /// 0 seed drops that column (no conversion or relabeling), and the data
@@ -254,7 +262,7 @@ impl OutputSeedAccumulator {
     pub fn finish(
         &mut self,
         current_schema: &Schema,
-        index_rows_per_zone: &HashMap<i32, u64>,
+        seed_rows_per_zone: &HashMap<i32, u64>,
     ) -> Result<Vec<OutputSeed>> {
         let sources = std::mem::take(&mut self.sources);
         let Some(first) = sources.first() else {
@@ -329,7 +337,7 @@ impl OutputSeedAccumulator {
             };
             output.push(OutputSeed {
                 column_name: current_field.name.clone(),
-                rows_per_zone: output_rows_per_zone(index_rows_per_zone.get(field_id).copied()),
+                rows_per_zone: output_rows_per_zone(seed_rows_per_zone.get(field_id).copied()),
                 bytes,
             });
         }
