@@ -116,24 +116,19 @@ impl RefreshRowVersionMetadata {
         false
     }
 
-    /// Each selected fragment's version sequence, whole, whatever rows the
-    /// selection names. The sequence is one value per fragment, rewritten at
-    /// once, so two sets refreshing the same fragment collide even when they
-    /// select disjoint rows, or the column rewrites that prompted them touched
-    /// different fields. Over-strict, and cheap: the alternative is a
-    /// sequence that records which columns each row's version speaks for.
+    /// Part of each selected fragment's version sequence. The refresh restamps
+    /// the rows it selects with the version its commit produces, at apply, so
+    /// two refreshes of one fragment compose in either order, whatever rows
+    /// each selects: every row ends up stamped with the later commit that
+    /// selected it, which is when it last changed. A set that installs the
+    /// sequences whole still collides with it.
     ///
     /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
-    /// without claiming it, so the two do not collide: the overlay sets only
-    /// the rows it covers and keeps whatever the rest hold when it applies,
-    /// which composes with a refresh in either order. Two refreshes would
-    /// compose too -- each stamps only its own rows, and the later version
-    /// wins where they overlap -- so their conflict is part of the same
-    /// over-strictness, tracked in
-    /// <https://github.com/lance-format/lance/issues/10189>.
+    /// without claiming it, setting only the rows it covers, so it composes
+    /// with a refresh too.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for selection in &self.rows {
-            footprint.write(Coordinate::FragmentRowVersions(u64::from(
+            footprint.write_part(Coordinate::FragmentRowVersions(u64::from(
                 selection.fragment_id,
             )));
         }
@@ -472,28 +467,40 @@ mod tests {
         );
     }
 
-    /// The whole sequence is claimed whatever the selection, so even disjoint
-    /// rows of one fragment collide.
+    /// Two refreshes of one fragment land in either order with every row
+    /// stamped by the later commit, which is what landing them one after the
+    /// other gives, so they do not conflict, whatever rows each selects.
     #[rstest]
-    #[case::full_and_full(refresh(&[0]), refresh(&[0, 1]), true)]
-    #[case::full_and_rows(refresh(&[0]), refresh_rows(0, &[1]), true)]
-    #[case::disjoint_rows(refresh_rows(0, &[0]), refresh_rows(0, &[1]), true)]
-    #[case::other_fragment_full(refresh(&[0]), refresh(&[1]), false)]
-    #[case::other_fragment_rows(refresh_rows(0, &[0]), refresh_rows(1, &[0]), false)]
-    fn test_two_writers_refreshing_the_same_fragment_conflict(
+    #[case::full_and_full(refresh(&[0]), refresh(&[0, 1]))]
+    #[case::full_and_rows(refresh(&[0]), refresh_rows(0, &[1]))]
+    #[case::disjoint_rows(refresh_rows(0, &[0]), refresh_rows(0, &[1]))]
+    #[case::other_fragment_full(refresh(&[0]), refresh(&[1]))]
+    #[case::other_fragment_rows(refresh_rows(0, &[0]), refresh_rows(1, &[0]))]
+    fn test_two_writers_refreshing_the_same_fragment_compose(
         #[case] ours: Action,
         #[case] theirs: Action,
-        #[case] is_conflict: bool,
     ) {
         let ours = footprint(vec![ours]);
         let theirs = footprint(vec![theirs]);
 
-        assert_eq!(ours.conflicts_with(&theirs), is_conflict);
-        assert_eq!(theirs.conflicts_with(&ours), is_conflict);
+        assert!(!ours.conflicts_with(&theirs));
+        assert!(!theirs.conflicts_with(&ours));
     }
 
-    /// The version sequence lives in the fragment, so a concurrent removal of
-    /// it leaves nothing to restamp, in either order.
+    #[test]
+    fn test_a_second_refresh_restamps_with_the_later_version() {
+        let manifest = manifest_with_rows(3);
+        let once = apply(&manifest, vec![refresh(&[0])]).unwrap();
+        let twice = apply(&once, vec![refresh(&[0])]).unwrap();
+        assert_eq!(
+            last_updated_versions(&twice.fragments[0]),
+            vec![manifest.version + 2; 3]
+        );
+    }
+
+    /// The version sequence lives in the fragment, so a removal landing first
+    /// leaves nothing to restamp. Landing second, the removal discards the
+    /// restamp along with the fragment.
     #[test]
     fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
         let ours = footprint(vec![refresh_rows(0, &[1])]);
@@ -505,7 +512,7 @@ mod tests {
         };
 
         assert!(ours.conflicts_with(&removal(0)));
-        assert!(removal(0).conflicts_with(&ours));
+        assert!(!removal(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&removal(1)));
         assert!(!removal(1).conflicts_with(&ours));
     }
