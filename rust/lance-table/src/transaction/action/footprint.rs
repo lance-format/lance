@@ -18,6 +18,7 @@
 
 use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
+use crate::format::key_existence::KeyExistenceFilter;
 use crate::transaction::UpdateMap;
 use lance_core::datatypes::{Field, Schema};
 use roaring::RoaringTreemap;
@@ -333,10 +334,71 @@ pub struct Footprint {
     /// append's rows would vanish or survive the reset depending on which
     /// commit landed first -- so it is a flag rather than a region.
     exclusive: bool,
+    /// Whether this set brings rows into the dataset that were not there
+    /// before. Coordinates cannot answer what the key assertions ask: two
+    /// writers inserting the same key write it into fragments of their own, so
+    /// their coordinates stay disjoint however badly the keys collide. Key
+    /// uniqueness is a claim about values, not about structure, so it is
+    /// checked by comparing this flag against the filters below.
+    ///
+    /// Set by any [`AddFragment`](super::AddFragment) that is a data change,
+    /// which over-approximates: the rows a merge insert updates arrive in a new
+    /// fragment too, and those carry no new key. The cost is a conflict between
+    /// two writers who only ever touched keys that were already there.
+    inserts_rows: bool,
+    /// The unique-key preconditions this set carries, one per
+    /// [`AssertUniqueKeys`](super::AssertUniqueKeys).
+    key_assertions: Vec<KeyAssertion>,
+    /// The cells this set read and needs unchanged, one per
+    /// [`AssertCellsUnchanged`](super::AssertCellsUnchanged).
+    cell_assertions: Vec<CellAssertion>,
     /// What this set writes into logical indices. A segment's uuid is a
     /// coordinate, but the thing two writers can collide over is the index the
     /// segment joins, which is not a set of ids -- see [`IndexClaim`].
     index_claims: Vec<IndexClaim>,
+}
+
+/// A claim about which keys an action set inserts, and over which columns.
+#[derive(Debug, Clone, PartialEq)]
+struct KeyAssertion {
+    key_fields: Vec<FieldRef>,
+    filter: KeyExistenceFilter,
+}
+
+/// Cells an action set read and needs unchanged: the declared fields in the
+/// selected fragments. Fragment granularity, which over-rejects a selection of
+/// some of a fragment's rows; refining it against overlay coverage is
+/// follow-up work.
+#[derive(Debug, Clone, PartialEq)]
+struct CellAssertion {
+    fields: HashSet<i32>,
+    fragments: HashSet<u64>,
+}
+
+impl CellAssertion {
+    /// Whether `committed` may have changed one of these cells: written the
+    /// data of a declared field in a selected fragment, wholly or by overlay;
+    /// redefined or dropped a declared field; or removed a selected fragment.
+    /// A deletion does not count, since a deleted row's value is invisible.
+    fn changed_by(&self, committed: &Footprint) -> bool {
+        let wrote_a_cell = committed
+            .claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { fragment, field } => {
+                    self.fragments.contains(fragment) && self.fields.contains(field)
+                }
+                Coordinate::FieldDefinition(field) => self.fields.contains(field),
+                Coordinate::FragmentExistence(fragment) => self.fragments.contains(fragment),
+                _ => false,
+            });
+        let removed_a_fragment = committed.regions.keys().any(|region| match region {
+            Region::Fragment(fragment) => self.fragments.contains(fragment),
+            Region::Map(_) => false,
+        });
+        wrote_a_cell || removed_a_fragment
+    }
 }
 
 /// What an action set writes into one logical index.
@@ -456,8 +518,8 @@ impl Footprint {
     /// `Precondition`s, which are tested against the facts `committed`
     /// recorded, and are likewise one-way.
     ///
-    /// Index claims are not coordinates and are compared on their own terms,
-    /// symmetrically.
+    /// The value predicates -- key assertions, index claims -- are not
+    /// coordinates and are compared on their own terms, symmetrically.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -466,6 +528,15 @@ impl Footprint {
             return true;
         }
         if self.claims_conflict_with(committed) || self.preconditions_violated_by(committed) {
+            return true;
+        }
+        // One-way, like the preconditions: a set that landed first was valid
+        // when it landed, whatever it read.
+        if self
+            .cell_assertions
+            .iter()
+            .any(|assertion| assertion.changed_by(committed))
+        {
             return true;
         }
         if !self
@@ -477,6 +548,18 @@ impl Footprint {
         if self.required_fragment_removed_by(committed)
             || committed.required_fragment_removed_by(self)
         {
+            return true;
+        }
+        // Symmetric, unlike the coordinate requirements above. Dropping the
+        // second direction would let a plain append land a duplicate of a key
+        // a committed merge-insert asserted was absent -- correct if the
+        // assertion is a precondition on that commit, wrong if it is an
+        // invariant on the table.
+        //
+        // TODO(https://github.com/lance-format/lance/issues/10189): decide which
+        // reading holds as part of conflict parity with the legacy resolver;
+        // until then, keep the stricter one.
+        if self.key_assertion_violated_by(committed) || committed.key_assertion_violated_by(self) {
             return true;
         }
         self.index_claims.iter().any(|ours| {
@@ -539,6 +622,71 @@ impl Footprint {
         self.required_fragments
             .iter()
             .any(|fragment| other.regions.contains_key(&Region::Fragment(*fragment)))
+    }
+
+    /// Whether `other` may have introduced a key this set asserts is not there.
+    ///
+    /// A set that asserts nothing has nothing to violate. A key can arrive two
+    /// ways. Writing into a key column of rows that are already there -- a
+    /// column rewrite, an overlay -- can put any value in it and says nothing
+    /// about which, so that is a violation outright. Inserting rows is the
+    /// other, and is only compatible if `other` says which keys it inserted
+    /// over the same columns, and the two filters provably do not intersect.
+    /// Anything less -- an unqualified insert, no assertion over these columns,
+    /// filters built with incomparable parameters -- leaves the assertion
+    /// unverifiable, which counts as a conflict.
+    fn key_assertion_violated_by(&self, other: &Self) -> bool {
+        if self.key_assertions.is_empty() {
+            return false;
+        }
+        if self
+            .key_assertions
+            .iter()
+            .any(|ours| other.writes_into_any_of(&ours.key_fields))
+        {
+            return true;
+        }
+        if !other.inserts_rows {
+            return false;
+        }
+        for ours in &self.key_assertions {
+            // Each assertion speaks for every row its set inserts, over its own
+            // key columns (see `AssertUniqueKeys`). An assertion of theirs
+            // over other columns hashes other values, so it says nothing about
+            // ours either way; one over the same columns says everything.
+            let mut over_same_columns = other
+                .key_assertions
+                .iter()
+                .filter(|theirs| theirs.key_fields == ours.key_fields)
+                .peekable();
+            if over_same_columns.peek().is_none() {
+                return true;
+            }
+            for theirs in over_same_columns {
+                match ours.filter.intersects(&theirs.filter) {
+                    Ok((false, _)) => {}
+                    // Either the keys really do overlap, or the two filters were
+                    // built with parameters that cannot be compared. Neither
+                    // clears the assertion.
+                    Ok((true, _)) | Err(_) => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether this set writes, wholly or in part, the data of any of `fields`
+    /// in some committed fragment.
+    fn writes_into_any_of(&self, fields: &[FieldRef]) -> bool {
+        self.claims
+            .iter()
+            .filter(|(_, mode)| **mode >= Mode::WritesPart)
+            .any(|(coordinate, _)| match coordinate {
+                Coordinate::FieldData { field, .. } => {
+                    fields.contains(&FieldRef::Committed(*field))
+                }
+                _ => false,
+            })
     }
 
     /// Record a claim on `coordinate`, keeping the strongest mode if the set
@@ -810,6 +958,40 @@ impl Footprint {
             identity: None,
             coverage: Some(committed_fragments(fragments)),
         });
+    }
+
+    /// Note that this set brings in rows that were not in the dataset before.
+    pub(super) fn insert_rows(&mut self) {
+        self.inserts_rows = true;
+    }
+
+    /// Record a precondition that no concurrent commit inserted a colliding key.
+    ///
+    /// Only an assertion whose key columns are all committed is recorded. A
+    /// local key field names a column this operation mints, which no
+    /// concurrent writer can insert into, so the assertion has nothing to
+    /// guard against. Nor could it be matched: assertions are matched by key
+    /// columns, and a local token means a different column in each operation.
+    pub(super) fn assert_unique_keys(
+        &mut self,
+        key_fields: Vec<FieldRef>,
+        filter: KeyExistenceFilter,
+    ) {
+        if key_fields.iter().any(|field| field.committed().is_none()) {
+            return;
+        }
+        self.key_assertions
+            .push(KeyAssertion { key_fields, filter });
+    }
+
+    /// Record that this set read `fields` in `fragments` and needs those cells
+    /// unchanged by any set that lands after it read.
+    pub(super) fn assert_cells_unchanged(&mut self, fields: HashSet<i32>, fragments: HashSet<u64>) {
+        if fields.is_empty() || fragments.is_empty() {
+            return;
+        }
+        self.cell_assertions
+            .push(CellAssertion { fields, fragments });
     }
 
     /// Record that this set removes `fragment` outright: its existence, and

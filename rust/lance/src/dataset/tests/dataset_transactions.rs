@@ -2839,6 +2839,7 @@ mod composite {
     use lance_index::pb::{HnswParameters, VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+    use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
     use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
     use lance_table::format::{
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
@@ -2850,9 +2851,10 @@ mod composite {
     };
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef,
-        Ref, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserStep,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
+        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -3663,6 +3665,124 @@ mod composite {
         assert!(
             error.to_string().contains("preempted"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// One fragment of five rows with `a` = 0..5 and `b` = 10..15.
+    async fn two_column_dataset() -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..5)),
+                Arc::new(Int32Array::from_iter_values(10..15)),
+            ],
+        )
+        .unwrap();
+        InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap()
+    }
+
+    /// `UPDATE t SET {target} = {source}` over the only fragment, as an action
+    /// set: rewrite `target` with `source`'s values, and declare the read of
+    /// `source` when `declare_read` is set.
+    async fn set_column_from(
+        dataset: &Dataset,
+        target: &str,
+        source: &str,
+        declare_read: bool,
+    ) -> Vec<Action> {
+        let fragment = dataset.get_fragments().remove(0);
+        let source_values = dataset
+            .scan()
+            .project(&[source])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .clone();
+        let target_schema = dataset.schema().project(&[target]).unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::from(&target_schema)), vec![source_values])
+                .unwrap();
+        let (fragment_id, file) = fragment
+            .write_columns(stream::iter(vec![Ok(batch)]), &target_schema)
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let target_id = dataset.schema().field(target).unwrap().id;
+        let source_id = dataset.schema().field(source).unwrap().id;
+
+        let mut actions = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment_id),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file: without_fields(file),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if declare_read {
+            actions.push(Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(source_id)],
+                rows: vec![RowSelection {
+                    fragment_id: u32::try_from(fragment_id).unwrap(),
+                    rows: SelectedRows::Full,
+                }],
+            }));
+        }
+        actions
+    }
+
+    /// `a = b` and `b = a` from one snapshot write disjoint columns. Without
+    /// declared reads both commit and the columns end up swapped, which neither
+    /// serial order produces (either leaves them equal) -- snapshot isolation.
+    /// With each declaring the column it read, the second commit conflicts.
+    #[rstest::rstest]
+    #[case::reads_declared(true)]
+    #[case::reads_undeclared(false)]
+    #[tokio::test]
+    async fn test_swapping_two_columns_concurrently(#[case] declare_reads: bool) {
+        let dataset = two_column_dataset().await;
+        let read_version = dataset.version().version;
+        let a_from_b = set_column_from(&dataset, "a", "b", declare_reads).await;
+        let b_from_a = set_column_from(&dataset, "b", "a", declare_reads).await;
+
+        let updated = commit(dataset, a_from_b).await;
+        let result = CommitBuilder::new(Arc::new(updated))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, b_from_a))
+            .await;
+
+        if declare_reads {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            );
+            return;
+        }
+        let swapped = result.unwrap();
+        let batch = swapped.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from_iter_values(10..15) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            batch["b"].as_ref(),
+            &Int32Array::from_iter_values(0..5) as &dyn arrow_array::Array
         );
     }
 
@@ -4887,6 +5007,77 @@ mod composite {
         // The data is untouched: recording where rows live is not a change to
         // them.
         assert_eq!(dataset.fragments().len(), 2);
+    }
+
+    /// An append of five rows, asserting the hashes of their keys over `a`
+    /// when `key_hashes` is given.
+    fn keyed_append(dataset: &Dataset, key_hashes: Option<&[u64]>) -> Vec<Action> {
+        let mut actions = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if let Some(key_hashes) = key_hashes {
+            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
+                },
+            }));
+        }
+        actions
+    }
+
+    #[tokio::test]
+    async fn test_a_key_assertion_commits_alongside_the_insert_it_guards() {
+        let dataset = test_dataset(false).await;
+        let before = dataset.fragments().len();
+        let actions = keyed_append(&dataset, Some(&[11, 12]));
+
+        let dataset = commit(dataset, actions).await;
+
+        assert_eq!(dataset.fragments().len(), before + 1);
+    }
+
+    /// The assertion travels through the transaction file and is compared by
+    /// the commit path's conflict check, not just by footprints in memory.
+    #[rstest::rstest]
+    #[case::overlapping_keys(Some(&[2, 3][..]), true)]
+    #[case::disjoint_keys(Some(&[3, 4][..]), false)]
+    #[case::unqualified_append(None, true)]
+    #[tokio::test]
+    async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
+        #[case] stale_key_hashes: Option<&'static [u64]>,
+        #[case] is_conflict: bool,
+    ) {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let committed = commit(dataset.clone(), keyed_append(&dataset, Some(&[1, 2]))).await;
+        let stale = keyed_append(&dataset, stale_key_hashes);
+
+        if is_conflict {
+            commit_expecting_conflict(&committed, read_version, stale).await;
+        } else {
+            let landed = CommitBuilder::new(Arc::new(committed.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(read_version, stale))
+                .await
+                .unwrap();
+            assert_eq!(landed.fragments().len(), committed.fragments().len() + 1);
+        }
     }
 
     fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {

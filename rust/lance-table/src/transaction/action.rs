@@ -74,6 +74,8 @@ macro_rules! for_each_action {
             ReserveRowIds,
             ResetTable,
             ConfigUpdate,
+            AssertUniqueKeys,
+            AssertCellsUnchanged,
         }
     };
 }
@@ -87,6 +89,8 @@ mod add_overlays;
 mod adjust_index_coverage;
 mod alter_field;
 mod apply;
+mod assert_cells_unchanged;
+mod assert_unique_keys;
 mod config_update;
 mod drop_field;
 mod drop_index;
@@ -98,6 +102,7 @@ mod remove_index_segment;
 mod reserve_fragment_ids;
 mod reserve_row_ids;
 mod reset_table;
+mod row_selection;
 mod set_deletion_file;
 mod tombstone_field_data;
 mod update_compacted_sstables;
@@ -113,6 +118,8 @@ pub use add_index_segment::AddIndexSegment;
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
+pub use assert_cells_unchanged::AssertCellsUnchanged;
+pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
@@ -122,6 +129,7 @@ pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
+pub use row_selection::{RowSelection, SelectedRows};
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
 pub use update_compacted_sstables::UpdateCompactedSsTables;
@@ -358,7 +366,8 @@ impl UserStep {
 
 macro_rules! define_action {
     ($($variant:ident,)*) => {
-        /// A single granular change to the manifest.
+        /// A single granular change to the manifest, or an assertion about the
+        /// version it lands on.
         ///
         /// The specified vocabulary is larger than this; the variants here are the
         /// ones this build implements end to end. Each one is defined, applied,

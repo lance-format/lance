@@ -183,6 +183,7 @@ for_each_action!(define_action_proto);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::key_existence::{FilterType, KeyExistenceFilter};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType, IndexFile, RowIdMeta};
     use crate::rowids::version::RowDatasetVersionMeta;
@@ -190,9 +191,10 @@ mod tests {
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
-        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
+        DropField, DropIndex, FieldMetadataUpdate, RemoveFragment, RemoveIndexSegment,
+        ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile,
+        TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -317,6 +319,26 @@ mod tests {
                 compacted_sstables: vec![
                     CompactedSsTable::new(Uuid::from_u128(10), 2),
                     CompactedSsTable::new(Uuid::from_u128(11), 5),
+                ],
+            }),
+            Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
+                },
+            }),
+            Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(1)],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 5,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                    },
                 ],
             }),
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
