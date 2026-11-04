@@ -598,7 +598,7 @@ impl<'a> TransactionRebase<'a> {
                     .iter_actions()
                     .any(|action| matches!(action, Action::AddIndexSegment(_))) =>
             {
-                let indices = crate::index::load_all_indices(dataset).await?;
+                let indices = crate::index::loading::load_all_indices(dataset).await?;
                 return self.load_untagged_reuse(dataset, &indices).await;
             }
             _ => return Ok(()),
