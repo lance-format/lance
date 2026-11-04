@@ -338,7 +338,7 @@ impl ConstantPageDecoder {
         ranges
     }
 
-    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+    fn take_row(&mut self) -> Result<()> {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
@@ -360,21 +360,22 @@ impl ConstantPageDecoder {
             start + 1
         };
 
-        let visible = if let Some(def) = &self.def {
-            def[start..end]
-                .iter()
-                .filter(|d| **d <= self.max_visible_def)
-                .count() as u64
-        } else {
-            (end - start) as u64
-        };
-
         self.cursor_level = end;
         self.cursor_row += 1;
-        Ok((start..end, visible))
+        Ok(())
     }
 
     fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        debug_assert!(
+            target_row >= self.cursor_row,
+            "rows must be requested in order"
+        );
+        if self.rep.is_none() {
+            // Without repetition every row is exactly one level, so jump straight there
+            self.cursor_row = self.cursor_row.max(target_row);
+            self.cursor_level = self.cursor_row as usize;
+            return Ok(());
+        }
         while self.cursor_row < target_row {
             self.take_row()?;
         }
@@ -389,19 +390,24 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
         let mut level_slices: Vec<Range<usize>> = Vec::new();
         let mut visible_items_total: u64 = 0;
 
+        // Each row range is one contiguous level slice, so locate both ends rather than
+        // stepping through it row by row
         for range in drained_ranges {
             self.skip_to_row(range.start)?;
-            for _ in range.start..range.end {
-                let (level_range, visible) = self.take_row()?;
-                visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut()
-                    && last.end == level_range.start
-                {
-                    last.end = level_range.end;
-                    continue;
-                }
-                level_slices.push(level_range);
+            let level_start = self.cursor_level;
+            self.skip_to_row(range.end)?;
+            let level_range = level_start..self.cursor_level;
+            // With definition levels `decode` counts the visible items from the sliced levels
+            if self.def.is_none() {
+                visible_items_total += level_range.len() as u64;
             }
+            if let Some(last) = level_slices.last_mut()
+                && last.end == level_range.start
+            {
+                last.end = level_range.end;
+                continue;
+            }
+            level_slices.push(level_range);
         }
 
         Ok(Box::new(DecodeConstantTask {
@@ -501,7 +507,7 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
         };
 
         let values = self.materialize_values(def.as_deref(), visible_items_total)?;
-        let data = crate::data::DataBlock::from_array(values);
+        let data = crate::data::DataBlock::from_decoded_array(values);
         let unraveler =
             RepDefUnraveler::new(rep, def, self.def_meaning.clone(), visible_items_total);
 

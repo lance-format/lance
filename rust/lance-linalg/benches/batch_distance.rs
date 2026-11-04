@@ -46,14 +46,13 @@ fn bench_batch_distance(c: &mut Criterion) {
     });
     c.bench_function("Batch distance cosine f32 dim 8", |b| {
         b.iter(|| {
-            black_box(
-                <f32 as Cosine>::cosine_batch(
-                    black_box(&key),
-                    black_box(&batch),
-                    black_box(DIMENSION),
-                )
-                .sum::<f32>(),
-            )
+            <f32 as Cosine>::cosine_batch_into(
+                black_box(&key),
+                black_box(&batch),
+                black_box(DIMENSION),
+                &mut output,
+            );
+            black_box(&mut output);
         })
     });
 }

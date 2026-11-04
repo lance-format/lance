@@ -887,7 +887,11 @@ impl LogicalPageDecoder for ListPageDecoder {
 
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         if num_rows == 0 {
-            return Ok(DrainLimit { rows: 0, bytes: 0 });
+            return Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows: None,
+            });
         }
         let start_index = self.rows_drained as usize;
         let end_index = start_index + num_rows as usize;
@@ -905,6 +909,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         // The item array has its own offset buffers with their own budget; shrink to
         // the largest whole number of lists whose items also fit.
         let mut item_bytes = 0u64;
+        let mut dictionary_rows = None;
         let mut safe_end_index = start_index + safe_rows as usize;
         let requested_items = self.offsets[safe_end_index] - start_offset;
         if requested_items > 0
@@ -912,6 +917,11 @@ impl LogicalPageDecoder for ListPageDecoder {
         {
             let item_limit = item_decoder.max_rows_to_drain(requested_items, byte_budget)?;
             item_bytes = item_limit.bytes;
+            dictionary_rows = item_limit.dictionary_rows.map(|item_rows| {
+                let max_item_offset = start_offset + item_rows;
+                self.offsets[start_index + 1..=end_index]
+                    .partition_point(|offset| *offset <= max_item_offset) as u64
+            });
             if item_limit.rows < requested_items {
                 let max_item_offset = start_offset + item_limit.rows;
                 safe_rows = self.offsets[start_index + 1..=safe_end_index]
@@ -931,6 +941,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         Ok(DrainLimit {
             rows: safe_rows,
             bytes,
+            dictionary_rows,
         })
     }
 
@@ -1404,7 +1415,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use super::*;
-    use crate::decoder::LogicalPageDecoder;
+    use crate::decoder::{DecoderReady, DrainLimit, LogicalPageDecoder, NextDecodeTask};
 
     #[test]
     fn oversized_binary_batch_error_is_actionable() {
@@ -1484,6 +1495,52 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RowLimitItemDecoder {
+        num_rows: u64,
+        row_limit: u64,
+        data_type: DataType,
+    }
+
+    impl LogicalPageDecoder for RowLimitItemDecoder {
+        fn wait_for_loaded(
+            &mut self,
+            _loaded_need: u64,
+        ) -> futures::future::BoxFuture<'_, Result<()>> {
+            std::future::ready(Ok(())).boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn rows_drained(&self) -> u64 {
+            0
+        }
+
+        fn drain(&mut self, _num_rows: u64) -> Result<NextDecodeTask> {
+            Err(lance_core::Error::internal(
+                "row-limit item decoder is used only for planning".to_string(),
+            ))
+        }
+
+        fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+            Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: Some(self.row_limit),
+            })
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.data_type
+        }
+    }
+
     const FULL_BUDGET: u64 = i32::MAX as u64;
 
     #[test]
@@ -1520,5 +1577,30 @@ mod tests {
         let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
         let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
         assert_eq!(limit.rows, 0);
+    }
+
+    #[test]
+    fn test_list_page_translates_item_row_limit_to_parent_rows() {
+        let mut decoder = list_page_decoder(vec![0, 2, 5, 6]);
+        let item_fields =
+            arrow_schema::Fields::from(vec![Field::new("item", DataType::Int32, true)]);
+        let mut item_decoder = SimpleStructDecoder::new(item_fields, 6);
+        item_decoder
+            .accept_child(DecoderReady {
+                decoder: Box::new(RowLimitItemDecoder {
+                    num_rows: 6,
+                    row_limit: 5,
+                    data_type: DataType::Int32,
+                }),
+                path: std::collections::VecDeque::from([0]),
+            })
+            .unwrap();
+        decoder.item_decoder = Some(item_decoder);
+
+        let limit = decoder.max_rows_to_drain(3, FULL_BUDGET).unwrap();
+
+        assert_eq!(limit.rows, 3);
+        assert_eq!(limit.bytes, 6);
+        assert_eq!(limit.dictionary_rows, Some(2));
     }
 }

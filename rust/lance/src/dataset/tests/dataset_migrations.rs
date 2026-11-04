@@ -807,27 +807,16 @@ async fn test_v10_0_0_dictionary_merged_past_key_type() {
     let test_dir = copy_test_data_to_tmp("v10.0.0/disjoint_v2_1.lance").unwrap();
     let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
-    // One batch of the whole page references 192 distinct values, more than Int8
-    // keys can address.
-    let error = dataset.scan().try_into_batch().await.unwrap_err();
-    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-    assert!(
-        error
-            .to_string()
-            .contains("more than the 128 distinct values that Int8 keys can address"),
-        "unexpected error: {error}"
-    );
-
-    let mut scanner = dataset.scan();
-    scanner.batch_size(128);
-    // Each batch carries its own Int8 dictionary, and together they do not fit one.
-    let batches = scanner
+    let batches = dataset
+        .scan()
         .try_into_stream()
         .await
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
+    // Each batch carries its own Int8 dictionary, and together they do not fit one.
+    assert!(batches.iter().all(|batch| batch.num_rows() <= 128));
     let actual = batches
         .iter()
         .flat_map(|batch| int8_dictionary_strings(&batch["d"]))

@@ -256,7 +256,7 @@ impl Updater {
         self.allow_external_blob_outside_bases = true;
     }
 
-    async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    async fn write_batches(&mut self, batches: &[RecordBatch]) -> Result<()> {
         if self.writer.is_none() {
             let write_schema = self
                 .write_schema
@@ -277,13 +277,18 @@ impl Updater {
         // representation: a Utf8View or BinaryView input is stored as its
         // classic offset type, and the writer's own conversion never reaches
         // the caller's batch, so normalize once here for both.
-        let batch = SchemaAdapter::new(batch.schema()).to_physical_batch(batch)?;
+        let batches = batches
+            .iter()
+            .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch.clone()))
+            .collect::<Result<Vec<_>>>()?;
         self.writer
             .as_mut()
             .ok_or_else(|| Error::internal("Fragment Updater: missing writer"))?
-            .write(std::slice::from_ref(&batch))
+            .write(&batches)
             .await?;
-        self.seeds.observe(&batch)
+        batches
+            .iter()
+            .try_for_each(|batch| self.seeds.observe(batch))
     }
 
     /// Update one batch.
@@ -293,24 +298,75 @@ impl Updater {
     /// would count them twice. After an error, drop the updater and start over rather
     /// than calling `update` or `finish` again.
     pub async fn update(&mut self, batch: RecordBatch) -> Result<()> {
+        self.update_batches(vec![batch]).await
+    }
+
+    /// Update one input batch with output split across several batches.
+    ///
+    /// The batches together must have as many rows as the batch returned by
+    /// [`Self::next`], and must share column types. They reach the writer without
+    /// being concatenated, so the output for one input batch may hold more
+    /// variable-width data than one array with 32-bit offsets can address. Legacy
+    /// files are the exception: each restored batch has to reproduce a row group, so
+    /// their batches are concatenated first.
+    ///
+    /// Errors leave the updater in the same unspecified state as [`Self::update`].
+    pub async fn update_batches(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::invalid_input(
                 "Fragment Updater: no input data is available before update".to_string(),
             ));
         };
+        let Some(first) = batches.first() else {
+            return Err(Error::invalid_input(
+                "Fragment Updater: cannot update with an empty batch list",
+            ));
+        };
 
-        if last.num_rows() != batch.num_rows() {
+        let num_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        if last.num_rows() != num_rows {
             return Err(Error::invalid_input(format!(
                 "Fragment Updater: new batch has different size with the source batch: {} != {}",
                 last.num_rows(),
-                batch.num_rows()
+                num_rows
             )));
+        };
+
+        let output_schema = first.schema();
+        if let Some(mismatch) = batches.iter().find(|batch| {
+            batch.num_columns() != first.num_columns()
+                || batch
+                    .columns()
+                    .iter()
+                    .zip(first.columns())
+                    .any(|(a, b)| a.data_type() != b.data_type())
+        }) {
+            return Err(Error::invalid_input(format!(
+                "Fragment Updater: new batches have different column types: {:?} != {:?}",
+                mismatch.schema().fields(),
+                output_schema.fields()
+            )));
+        }
+
+        let batches = if !self.deletion_restorer.can_defer() && batches.len() > 1 {
+            vec![arrow_select::concat::concat_batches(
+                &output_schema,
+                &batches,
+            )?]
+        } else if num_rows == 0 {
+            batches.into_iter().take(1).collect()
+        } else {
+            // Restoring an empty batch defers the deleted run at its position, and
+            // deferred blanks are written ahead of everything restored in this call.
+            batches
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .collect::<Vec<_>>()
         };
 
         if self.write_schema.is_none() {
             // Infer from the caller's batch even when it has no rows. A leading
             // deleted run may not produce anything writable until a later batch.
-            let output_schema = batch.schema();
             let mut final_schema = self.fragment.schema().merge(output_schema.as_ref())?;
             final_schema.try_set_field_id(Some(self.fragment.dataset().manifest.max_field_id()))?;
             final_schema.validate()?;
@@ -323,7 +379,10 @@ impl Updater {
             self.write_schema = Some(write_schema);
         }
 
-        let current_blank_source = (batch.num_rows() > 0).then(|| batch.slice(0, 1));
+        let current_blank_source = batches
+            .first()
+            .filter(|batch| batch.num_rows() > 0)
+            .map(|batch| batch.slice(0, 1));
         let write_schema = self
             .write_schema
             .as_ref()
@@ -333,7 +392,12 @@ impl Updater {
         // Add back deletions that belong to this input batch. Blanks deferred by
         // earlier empty batches are emitted separately below so each write stays
         // bounded by the updater's chosen batch size.
-        let restored = self.deletion_restorer.restore(batch, Some(&write_schema))?;
+        let mut restored = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if let Some(batch) = self.deletion_restorer.restore(batch, Some(&write_schema))? {
+                restored.push(batch);
+            }
+        }
 
         // A slice would keep all of the source batch's buffers alive until this
         // fragment finishes. Materialize the single row only when a later batch can
@@ -374,12 +438,12 @@ impl Updater {
                 .deletion_restorer
                 .take_pending_blanks_with_plans(blank_source, &plans)?
             {
-                self.write_batch(blanks).await?;
+                self.write_batches(&[blanks]).await?;
             }
         }
 
-        if let Some(restored) = restored {
-            self.write_batch(restored).await?;
+        if !restored.is_empty() {
+            self.write_batches(&restored).await?;
         }
         if self.deletion_restorer.is_exhausted() {
             self.blank_source = None;
@@ -809,7 +873,8 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, BinaryArray, BinaryViewArray, DictionaryArray, FixedSizeListArray,
         GenericListArray, Int32Array, LargeBinaryArray, LargeStringArray, MapArray,
-        OffsetSizeTrait, RecordBatch, StringArray, StringViewArray, StructArray, UInt64Array,
+        OffsetSizeTrait, RecordBatch, RecordBatchIterator, StringArray, StringViewArray,
+        StructArray, UInt64Array,
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema};
@@ -819,12 +884,13 @@ mod tests {
     use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_datagen::RowCount;
-    use lance_file::version::ConcreteFileVersion;
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use rstest::rstest;
 
     use super::{
         BlankPlan, DeletionRestorer, Error, add_blanks, blank_plans, compact_blank_source,
     };
+    use crate::dataset::{Dataset, WriteParams};
 
     /// For tests that do not care which version they run against: the blank a
     /// nullable column gets is the same for every version that can store nulls.
@@ -2364,5 +2430,111 @@ mod tests {
         let json = converted.column(0).as_struct().column(0).as_binary::<i64>();
         assert_eq!(decode_json(json.value(0)), r#"{"name":"Alice"}"#);
         assert_eq!(decode_json(json.value(1)), "null");
+    }
+
+    async fn int_dataset(
+        uri: &str,
+        rows: i32,
+        version: LanceFileVersion,
+        max_rows_per_group: usize,
+    ) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                max_rows_per_group,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn int_output(name: &str, values: impl IntoIterator<Item = i32>) -> RecordBatch {
+        batch_of(
+            Field::new(name, DataType::Int32, false),
+            Arc::new(Int32Array::from_iter_values(values)),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_update_batches_rejects_mismatched_batches() {
+        let dataset = int_dataset(
+            "memory://update-batches-mismatch",
+            4,
+            LanceFileVersion::V2_2,
+            1024,
+        )
+        .await;
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment
+            .updater::<String>(None, None, None, None)
+            .await
+            .unwrap();
+        updater.next().await.unwrap().unwrap();
+
+        let error = updater.update_batches(vec![]).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("empty batch list"), "{error}");
+
+        let output = int_output("o", 0..4);
+        let error = updater
+            .update_batches(vec![output.slice(0, 1), output.slice(1, 1)])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("4 != 2"), "{error}");
+
+        let strings = batch_of(
+            Field::new("o", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec!["a", "b"])),
+        );
+        let error = updater
+            .update_batches(vec![output.slice(0, 2), strings])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("column types"), "{error}");
+    }
+
+    /// Each restored legacy batch must match the file's row group size. Restoring the
+    /// two halves of the first row group separately would fail that check, since the
+    /// deleted row 7 keeps the restorer from treating either half as the last batch.
+    #[tokio::test]
+    async fn test_update_batches_concatenates_legacy_row_groups() {
+        let mut dataset = int_dataset(
+            "memory://update-batches-legacy",
+            8,
+            LanceFileVersion::Legacy,
+            4,
+        )
+        .await;
+        dataset.delete("i = 7").await.unwrap();
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment
+            .updater::<String>(None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(updater.next().await.unwrap().unwrap().num_rows(), 4);
+        let output = int_output("o", 0..4);
+        updater
+            .update_batches(vec![output.slice(0, 2), output.slice(2, 2)])
+            .await
+            .unwrap();
+
+        assert_eq!(updater.next().await.unwrap().unwrap().num_rows(), 3);
+        updater.update(int_output("o", 4..7)).await.unwrap();
+        assert!(updater.next().await.unwrap().is_none());
+
+        let updated = updater.finish().await.unwrap();
+        assert_eq!(updated.files.len(), 2);
     }
 }

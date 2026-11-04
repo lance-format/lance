@@ -1,0 +1,2 @@
+   id                                               text  _score
+0   1  I left my umbrella on the evening train to Boston  2.0614

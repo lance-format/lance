@@ -13,7 +13,7 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings.rs"));
+    include!("pb/lance.encodings.rs");
 }
 
 /// Protobuf definitions for encodings21
@@ -29,13 +29,13 @@ pub mod pb21 {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings21.rs"));
+    include!("pb/lance.encodings21.rs");
 }
 
 /// Metadata for the unstable 2.3 planar page format.
 pub mod pb23 {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/lance.encodings23.rs"));
+    include!("pb/lance.encodings23.rs");
 }
 
 pub mod metadata;
@@ -54,7 +54,7 @@ use pb::{
 use crate::{encodings::physical::block::CompressionConfig, repdef::DefinitionInterpretation};
 
 use self::pb::Constant;
-use lance_core::Result;
+use lance_core::{Error, Result};
 
 // Utility functions for creating complex protobuf objects
 pub struct ProtobufUtils {}
@@ -490,9 +490,25 @@ impl EncodingUtils {
         }
     }
 
+    /// Converts a stored repdef layer to its definition interpretation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layer` is unspecified or not a known repdef layer.
+    #[deprecated(note = "use try_repdef_layer_to_def_interp to handle corrupt layer values")]
     pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
-        let layer = metadata::RepDefLayer::try_from(layer).unwrap();
-        match layer {
+        Self::try_repdef_layer_to_def_interp(layer).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Converts a stored repdef layer to its definition interpretation.
+    ///
+    /// Returns [`Error::CorruptFile`] if `layer` is unspecified or not a known
+    /// repdef layer.
+    pub fn try_repdef_layer_to_def_interp(layer: i32) -> Result<DefinitionInterpretation> {
+        let layer = metadata::RepDefLayer::try_from(layer).map_err(|_| {
+            Error::corrupt_file_named("repdef", format!("Unknown repdef layer value: {layer}"))
+        })?;
+        Ok(match layer {
             metadata::RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
             metadata::RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
             metadata::RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
@@ -502,9 +518,12 @@ impl EncodingUtils {
                 DefinitionInterpretation::NullableAndEmptyableList
             }
             metadata::RepDefLayer::RepdefUnspecified => {
-                panic!("Unspecified repdef layer")
+                return Err(Error::corrupt_file_named(
+                    "repdef",
+                    "Repdef layer is unspecified",
+                ));
             }
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -781,5 +800,24 @@ impl EncodingUtils {
                 ),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EncodingUtils, metadata};
+
+    #[test]
+    fn test_repdef_layer_to_def_interp_rejects_invalid_layers() {
+        // `RepdefUnspecified` is the proto default and is not a valid layer.
+        assert!(EncodingUtils::try_repdef_layer_to_def_interp(0).is_err());
+        // Values outside the enum must not panic either.
+        assert!(EncodingUtils::try_repdef_layer_to_def_interp(9999).is_err());
+        assert!(
+            EncodingUtils::try_repdef_layer_to_def_interp(
+                metadata::RepDefLayer::RepdefAllValidItem as i32
+            )
+            .is_ok()
+        );
     }
 }

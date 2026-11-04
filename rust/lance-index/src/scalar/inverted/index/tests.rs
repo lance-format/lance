@@ -40,6 +40,8 @@ use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
 use super::*;
 
+const TEST_GROUP_TOKENS: usize = 128;
+
 async fn write_single_partition_index(
     store: Arc<LanceIndexStore>,
     params: InvertedIndexParams,

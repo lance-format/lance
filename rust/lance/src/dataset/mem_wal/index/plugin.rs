@@ -284,6 +284,8 @@ impl GenerationWrite<'_> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }

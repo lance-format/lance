@@ -303,6 +303,10 @@ message Transaction {
      * manifests written before this change.
      */
     map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
+    /* The `dir_id` of the MemWAL `compacted_sstables` belongs to; required
+     * when `compacted_sstables` is non-empty. See UpdateMemWalState.dir_id.
+     */
+    optional string mem_wal_dir_id = 11;
   }
 
   // The mode of update operation
@@ -408,6 +412,10 @@ message Transaction {
   message UpdateMemWalState {
     // SSTables being marked as compacted.
     repeated CompactedSsTable compacted_sstables = 1;
+    /* The `dir_id` of the MemWAL this update was built for. The commit is
+     * rejected unless the manifest it builds on carries that MemWAL.
+     */
+    string dir_id = 2;
   }
 
   // An operation that updates base paths in the dataset.
