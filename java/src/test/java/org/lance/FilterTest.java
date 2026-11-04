@@ -18,14 +18,29 @@ import org.lance.ipc.ScanOptions;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.ByteArrayReadableSeekableByteChannel;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -99,6 +114,58 @@ public class FilterTest {
     // Not supported
     // testFilter("\"id\" == 10", 1);
     // testFilter("'id' == 10", 1);
+  }
+
+  /** Java hands strings to JNI as modified UTF-8, which encodes these characters differently. */
+  @Test
+  void testFilterAndColumnsWithCharactersOutsideTheBmp(@TempDir Path tempDir) throws Exception {
+    String column = "tag👍";
+    String[] tags = {"plain", "👍", "𠀀"};
+    String datasetPath = tempDir.resolve("supplementary_characters").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.nullable(column, new ArrowType.Utf8())));
+      ByteArrayOutputStream out = new ByteArrayOutputStream();
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        IntVector ids = (IntVector) root.getVector("id");
+        VarCharVector values = (VarCharVector) root.getVector(column);
+        for (int i = 0; i < tags.length; i++) {
+          ids.setSafe(i, i);
+          values.setSafe(i, tags[i].getBytes(StandardCharsets.UTF_8));
+        }
+        root.setRowCount(tags.length);
+        try (ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+          writer.writeBatch();
+        }
+      }
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(
+                  new ByteArrayReadableSeekableByteChannel(out.toByteArray()), allocator);
+          Dataset written =
+              Dataset.write().allocator(allocator).reader(reader).uri(datasetPath).execute()) {
+        assertEquals(1, written.countRows("`" + column + "` = '" + tags[1] + "'"));
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .columns(Collections.singletonList(column))
+                .filter("`" + column + "` = '" + tags[2] + "'")
+                .build();
+        List<String> matched = new ArrayList<>();
+        try (LanceScanner scanner = written.newScan(options);
+            ArrowReader batches = scanner.scanBatches()) {
+          while (batches.loadNextBatch()) {
+            VarCharVector vector = (VarCharVector) batches.getVectorSchemaRoot().getVector(column);
+            for (int i = 0; i < vector.getValueCount(); i++) {
+              matched.add(new String(vector.get(i), StandardCharsets.UTF_8));
+            }
+          }
+        }
+        assertEquals(Collections.singletonList(tags[2]), matched);
+      }
+    }
   }
 
   private void testFilter(String filter, int expectedCount) throws Exception {

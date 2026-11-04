@@ -36,6 +36,13 @@ jobs:
       UV_PYTHON_DOWNLOADS: never
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          toolchain: stable
       - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
@@ -57,5 +64,14 @@ jobs:
         with:
           path: ${{ env.SPARK_IVY_DIR }}
           key: docs-snippets-ivy-${{ hashFiles('docs/snippets/quickstart/spark-sql.sh') }}
+      - name: Restore Cargo registry and Maven dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.m2/repository
+          key: docs-snippets-sdk-${{ hashFiles('docs/snippets/quickstart/rust-cargo.toml', 'docs/snippets/quickstart/java-maven-deps.xml') }}
       - name: Run snippets
         run: uv run --locked pytest tests -v

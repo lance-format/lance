@@ -371,6 +371,68 @@ pub async fn maybe_sample_training_data(
     }
 }
 
+/// Sample `sample_size` non-null vectors from a FixedSizeList column, drawing
+/// only rows that no earlier call sharing `drawn_offsets` drew.
+///
+/// The set holds row offsets within the selected fragments, so every call
+/// sharing it must select the same fragments. Drawing stops once the set holds
+/// `max_drawn` offsets, nulls included, so the sample can hold fewer vectors.
+pub(crate) async fn sample_unseen_training_data(
+    dataset: &Dataset,
+    column: &str,
+    sample_size: usize,
+    fragment_ids: Option<&[u32]>,
+    drawn_offsets: Arc<Mutex<RoaringTreemap>>,
+    max_drawn: usize,
+) -> Result<FixedSizeListArray> {
+    let vector_field = dataset.schema().field(column).ok_or(Error::index(format!(
+        "Sample training data: column {} does not exist in schema",
+        column
+    )))?;
+    if !matches!(vector_field.data_type(), DataType::FixedSizeList(_, _)) {
+        return Err(Error::index(format!(
+            "Sample training data: column {} is not a FixedSizeList vector column",
+            column
+        )));
+    }
+    let byte_width = vector_field
+        .data_type()
+        .byte_width_opt()
+        .unwrap_or(4 * 1024);
+    let num_rows = count_rows(dataset, fragment_ids).await?;
+    // Reserve no more than the rows the cap still lets this call draw
+    let sample_size = sample_size.min(
+        max_drawn
+            .min(num_rows)
+            .saturating_sub(drawn_offsets.lock().await.len() as usize),
+    );
+    let still_needed = Arc::new(AtomicUsize::new(sample_size));
+    let scan = sample_training_data_scan_by_indices(
+        dataset,
+        column,
+        num_rows,
+        training_sample_batch_rows(byte_width)?,
+        training_sample_readahead(
+            sample_size,
+            byte_width,
+            dataset.object_store.io_parallelism(),
+        )?,
+        fragment_ids,
+        still_needed.clone(),
+        Some(drawn_offsets),
+        Some(max_drawn),
+    )?;
+    sample_nullable_fsl(
+        column,
+        sample_size,
+        byte_width,
+        vector_field,
+        scan,
+        Some(still_needed),
+    )
+    .await
+}
+
 /// Filter out non-finite vectors from sampled training data.
 ///
 /// This is a no-op when all rows are finite, avoiding an unnecessary copy.
@@ -503,6 +565,8 @@ async fn sample_training_data(
             batch_readahead,
             Some(fragment_ids),
             still_needed.clone(),
+            None,
+            None,
         )?;
         return match vector_field.data_type() {
             DataType::FixedSizeList(_, _) => {
@@ -551,6 +615,8 @@ async fn sample_training_data(
                 batch_readahead,
                 None,
                 still_needed.clone(),
+                None,
+                None,
             )?;
             sample_nullable_fsl(
                 column,
@@ -597,7 +663,10 @@ fn sample_training_data_scan(
 /// are tracked in a [`RoaringTreemap`] because sparse or all-null columns
 /// force the stream to visit most selected rows before it can terminate, and
 /// a compressed bitmap keeps that persistent state near `num_rows / 8` bytes
-/// even when fully populated.
+/// even when fully populated. Streams over the same selection can share that
+/// set through `drawn_offsets` so their samples never repeat a row; the stream
+/// stops drawing once the set holds `max_drawn` offsets, nulls included.
+#[allow(clippy::too_many_arguments)]
 fn sample_training_data_scan_by_indices(
     dataset: &Dataset,
     column: &str,
@@ -606,6 +675,8 @@ fn sample_training_data_scan_by_indices(
     batch_readahead: usize,
     fragment_ids: Option<&[u32]>,
     still_needed: Arc<AtomicUsize>,
+    drawn_offsets: Option<Arc<Mutex<RoaringTreemap>>>,
+    max_drawn: Option<usize>,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>> {
     if fragment_ids.is_some_and(|ids| ids.is_empty()) {
         return Err(Error::invalid_input(
@@ -622,31 +693,26 @@ fn sample_training_data_scan_by_indices(
         ProjectionRequest::from(dataset.schema().project(&[column])?)
             .into_projection_plan(dataset.clone())?,
     );
+    let max_drawn = max_drawn.map_or(num_rows, |max_drawn| max_drawn.min(num_rows));
 
     let stream = stream::try_unfold(
         (
             dataset,
             projection,
             selected_fragments,
-            RoaringTreemap::new(),
+            drawn_offsets.unwrap_or_default(),
             SmallRng::from_os_rng(),
             still_needed,
         ),
-        move |(
-            dataset,
-            projection,
-            selected_fragments,
-            mut seen_offsets,
-            mut rng,
-            still_needed,
-        )| async move {
+        move |(dataset, projection, selected_fragments, drawn_offsets, mut rng, still_needed)| async move {
             let still = still_needed.load(Ordering::Relaxed);
-            if still == 0 || seen_offsets.len() as usize >= num_rows {
+            let mut seen_offsets = drawn_offsets.lock().await;
+            if still == 0 || seen_offsets.len() as usize >= max_drawn {
                 return Ok(None);
             }
 
             let remaining = num_rows.saturating_sub(seen_offsets.len() as usize);
-            let target = still.min(remaining);
+            let target = still.min(max_drawn - seen_offsets.len() as usize);
             let mut sampled_offsets = if remaining <= target.saturating_mul(4) {
                 // Few offsets remain unseen, so shuffling the unseen set is
                 // cheaper than repeatedly rejecting already-sampled offsets.
@@ -667,6 +733,7 @@ fn sample_training_data_scan_by_indices(
                 }
                 sampled_offsets
             };
+            drop(seen_offsets);
             sampled_offsets.sort_unstable();
 
             let chunks =
@@ -699,7 +766,7 @@ fn sample_training_data_scan_by_indices(
                     dataset,
                     projection,
                     selected_fragments,
-                    seen_offsets,
+                    drawn_offsets,
                     rng,
                     still_needed,
                 ),
@@ -1330,6 +1397,8 @@ mod tests {
             1,
             None,
             still_needed.clone(),
+            None,
+            None,
         )
         .unwrap();
         let batch = scan.next().await.unwrap().unwrap();
@@ -1368,18 +1437,14 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::small(256, 8, true)]
-    #[case::exhausted(256, 64, true)]
-    #[case::multiple_batches(256, 63, false)]
-    #[tokio::test]
-    async fn test_nullable_vector_sampling_refills_without_duplicates(
-        #[case] rows: usize,
-        #[case] sample_size: usize,
-        #[case] with_nulls_and_deletions: bool,
-        #[values(None, Some(vec![1, 3]))] fragments: Option<Vec<u32>>,
-        #[values(1, 4)] batch_readahead: usize,
-    ) {
+    /// Four equal fragments whose vectors hold their row id. With
+    /// `with_nulls_and_deletions`, only every fourth row has a vector and every
+    /// seventh row is deleted. Also returns the ids a sample of `fragments` may hold.
+    async fn write_id_vectors(
+        rows: usize,
+        with_nulls_and_deletions: bool,
+        fragments: Option<&[u32]>,
+    ) -> (Dataset, roaring::RoaringBitmap) {
         let rows_per_fragment = rows / 4;
         let vectors = FixedSizeListArray::new(
             Arc::new(Field::new("item", DataType::Float32, false)),
@@ -1418,14 +1483,27 @@ mod tests {
         if with_nulls_and_deletions {
             dataset.delete("id % 7 = 0").await.unwrap();
         }
-        let expected: roaring::RoaringBitmap = (0..rows as u32)
+        let expected = (0..rows as u32)
             .filter(|id| !with_nulls_and_deletions || (id % 4 == 0 && id % 7 != 0))
-            .filter(|id| {
-                fragments
-                    .as_ref()
-                    .is_none_or(|f| f.contains(&(id / rows_per_fragment as u32)))
-            })
+            .filter(|id| fragments.is_none_or(|f| f.contains(&(id / rows_per_fragment as u32))))
             .collect();
+        (dataset, expected)
+    }
+
+    #[rstest::rstest]
+    #[case::small(256, 8, true)]
+    #[case::exhausted(256, 64, true)]
+    #[case::multiple_batches(256, 63, false)]
+    #[tokio::test]
+    async fn test_nullable_vector_sampling_refills_without_duplicates(
+        #[case] rows: usize,
+        #[case] sample_size: usize,
+        #[case] with_nulls_and_deletions: bool,
+        #[values(None, Some(vec![1, 3]))] fragments: Option<Vec<u32>>,
+        #[values(1, 4)] batch_readahead: usize,
+    ) {
+        let (dataset, expected) =
+            write_id_vectors(rows, with_nulls_and_deletions, fragments.as_deref()).await;
 
         // Exercise chunk boundaries with a small budget so the fixture stays
         // lightweight independently of the production 64 MiB batch target.
@@ -1438,6 +1516,8 @@ mod tests {
             batch_readahead,
             fragments.as_deref(),
             still_needed.clone(),
+            None,
+            None,
         )
         .unwrap();
         let sample = sample_nullable_fsl(
@@ -1461,6 +1541,48 @@ mod tests {
             ids.is_subset(&expected),
             "sample contains null, deleted, or unselected rows"
         );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_sample_unseen_training_data_never_repeats_rows(
+        #[values(None, Some(vec![1, 3]))] fragments: Option<Vec<u32>>,
+    ) {
+        let (dataset, expected) = write_id_vectors(256, true, fragments.as_deref()).await;
+        let num_rows = count_rows(&dataset, fragments.as_deref()).await.unwrap();
+        let drawn_offsets = Arc::new(Mutex::new(RoaringTreemap::new()));
+        let mut sampled = roaring::RoaringBitmap::new();
+        let mut sample = async |sample_size: usize, max_drawn: usize| {
+            let sample = sample_unseen_training_data(
+                &dataset,
+                "vec",
+                sample_size,
+                fragments.as_deref(),
+                drawn_offsets.clone(),
+                max_drawn,
+            )
+            .await
+            .unwrap();
+            let values = sample.values().as_primitive::<Float32Type>();
+            for id in (0..sample.len()).map(|i| values.value(i * 2) as u32) {
+                assert!(
+                    expected.contains(id),
+                    "row {id} is null, deleted or unselected"
+                );
+                assert!(sampled.insert(id), "row {id} was sampled twice");
+            }
+            (sample.len(), drawn_offsets.lock().await.len() as usize)
+        };
+
+        // The first call reads past nulls until it holds its four vectors
+        let (len, drawn) = sample(4, num_rows).await;
+        assert_eq!(len, 4);
+        // The next one stops at its cap, then the last takes all remaining rows
+        let cap = drawn + (num_rows - drawn) / 2;
+        assert_eq!(sample(num_rows, cap).await.1, cap);
+        assert_eq!(sample(num_rows, num_rows).await.1, num_rows);
+        assert_eq!(sample(1, num_rows).await.0, 0);
+        assert_eq!(sampled, expected);
     }
 
     #[rstest::rstest]
@@ -1838,6 +1960,8 @@ mod tests {
             batch_readahead,
             Some(&fragment_ids),
             still_needed.clone(),
+            None,
+            None,
         )
         .unwrap();
 

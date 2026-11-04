@@ -346,7 +346,8 @@ pub use sharding::{
     evaluate_sharding_spec_with_source_columns,
 };
 pub use wal::{
-    BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer, fence_shard,
+    BatchDurableWatcher, WalAppendResult, WalAppender, WalEntry, WalEntryData, WalFlushFailure,
+    WalFlushResult, WalFlusher, WalReadEntry, WalTailer, fence_shard,
 };
 pub use write::FreezeFence;
 pub use write::ShardWriter;

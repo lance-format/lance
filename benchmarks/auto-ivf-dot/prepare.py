@@ -16,7 +16,7 @@ from pathlib import Path
 
 import lance
 import numpy as np
-from lance.dataset import VectorIndexReader
+from lance._dataset.index import VectorIndexReader
 
 
 def save(path, value):
