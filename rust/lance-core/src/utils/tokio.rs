@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::Ordering;
-use std::sync::{LazyLock, atomic};
+use std::sync::{Arc, LazyLock, Mutex, atomic};
 use std::time::Duration;
 
 use futures::{Future, FutureExt};
@@ -184,26 +184,64 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    // Propagate the current span into the task
-    let span = Span::current();
-    let handle = global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        func()
+    // The closure and its output share one allocation, and only the non-generic
+    // `spawn_erased` touches tokio, so tokio's blocking-task machinery (task
+    // cell, harness, vtable, drop glue) is instantiated once rather than once
+    // per closure type in every calling crate.
+    let task = Arc::new(CpuTask {
+        func: Mutex::new(Some(func)),
+        output: Mutex::new(None),
     });
-    // Awaited through the join handle, not a result channel: a panic in `func`
-    // arrives as a `JoinError` still carrying its payload, so resuming it
-    // re-raises the original panic in the caller. Reporting the closure's
-    // outcome over a channel instead loses that -- the sender drops unsent and
-    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
-    // `RecvError`, pointing here rather than at the fault.
-    handle.map(|res| match res {
-        Ok(result) => result,
+    spawn_erased(task.clone()).map(move |res| match res {
+        Ok(()) => task
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("spawn_cpu task completed without storing its output"),
+        // Awaited through the join handle, not a result channel: a panic in
+        // `func` arrives as a `JoinError` still carrying its payload, so
+        // resuming it re-raises the original panic in the caller.
         Err(join_error) => match join_error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             // The CPU runtime outlives every caller, so its tasks are not
             // cancelled out from under one.
             Err(join_error) => panic!("spawn_cpu task failed: {join_error}"),
         },
+    })
+}
+
+struct CpuTask<F, T> {
+    func: Mutex<Option<F>>,
+    output: Mutex<Option<T>>,
+}
+
+trait RunOnce: Send + Sync {
+    fn run(&self);
+}
+
+impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
+    fn run(&self) {
+        let func = self
+            .func
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("spawn_cpu task runs once");
+        let output = func();
+        *self
+            .output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(output);
+    }
+}
+
+fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
+    // Propagate the current span into the task
+    let span = Span::current();
+    global_cpu_runtime().spawn_blocking(move || {
+        let _span_guard = span.enter();
+        task.run();
     })
 }
 
