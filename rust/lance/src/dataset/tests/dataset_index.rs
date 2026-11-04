@@ -7839,6 +7839,7 @@ async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVer
         &test_uri,
         Some(WriteParams {
             data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
             ..Default::default()
         }),
     )

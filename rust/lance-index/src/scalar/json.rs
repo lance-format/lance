@@ -542,7 +542,16 @@ impl JsonQuery {
             // rejects values whose JSON type does not match the target type
             // (`validate_json_types`), so on the rows the index returns the
             // string accessor is null exactly where the typed one is.
-            _ => json_get_string_udf(),
+            value_type => {
+                debug_assert!(
+                    matches!(
+                        value_type,
+                        None | Some(DataType::Utf8 | DataType::LargeUtf8)
+                    ),
+                    "JSON query literals are coerced to an accessor type, got {value_type:?}"
+                );
+                json_get_string_udf()
+            }
         };
         Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(accessor),
@@ -1541,94 +1550,41 @@ mod tests {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
     }
 
-    /// Assert `expr` is the typed accessor `func_name(col, path)`.
-    fn expect_json_accessor(expr: &Expr, func_name: &str, col: &str, path: &str) {
-        let Expr::ScalarFunction(accessor) = expr else {
-            panic!("expected {func_name}('{col}', '{path}'), got {expr}");
-        };
-        assert_eq!(accessor.func.name(), func_name);
-        assert_eq!(
-            accessor.args,
-            vec![
-                Expr::Column(DFColumn::new_unqualified(col.to_string())),
-                Expr::Literal(ScalarValue::Utf8(Some(path.to_string())), None),
-            ],
-            "arguments of {func_name} accessor"
-        );
-    }
-
     /// The recheck filter of a JSON-wrapped query must evaluate the value at the
-    /// indexed path: it substitutes the typed accessor the original predicate
-    /// used for the raw-column reference in the wrapped target query.
-    #[test]
-    fn test_json_query_to_expr_substitutes_typed_accessor() {
-        // JSON-wrapped ngram target rechecks `contains(json_get_string(json,'tag'),'bravo')`.
-        let ngram_wrapped = JsonQuery::new(
-            Arc::new(TextQuery::StringContains("bravo".to_string())),
-            "tag".to_string(),
-        );
-        let Expr::ScalarFunction(contains) = ngram_wrapped.to_expr("json".to_string()) else {
-            panic!("expected a contains(...) recheck");
-        };
-        assert_eq!(contains.func.name(), "contains");
-        assert_eq!(
-            contains.args[1],
-            Expr::Literal(ScalarValue::Utf8(Some("bravo".to_string())), None)
-        );
-        expect_json_accessor(&contains.args[0], "json_get_string", "json", "tag");
-
-        // JSON-wrapped bloom filter target rechecks `json_get_int(json,'count') = 7`.
-        let bloom_wrapped = JsonQuery::new(
-            Arc::new(BloomFilterQuery::Equals(ScalarValue::Int64(Some(7)))),
-            "count".to_string(),
-        );
-        let Expr::BinaryExpr(equality) = bloom_wrapped.to_expr("json".to_string()) else {
-            panic!("expected an equality recheck");
-        };
-        assert_eq!(equality.op, Operator::Eq);
-        assert_eq!(
-            *equality.right,
-            Expr::Literal(ScalarValue::Int64(Some(7)), None)
-        );
-        expect_json_accessor(&equality.left, "json_get_int", "json", "count");
-
-        // IS NULL carries no value type; it rechecks through the default string
-        // accessor, which is null exactly on the rows the index treats as null
-        // (path missing or JSON null).
-        let is_null_wrapped = JsonQuery::new(Arc::new(BloomFilterQuery::IsNull()), "tag".into());
-        let Expr::IsNull(inner) = is_null_wrapped.to_expr("json".to_string()) else {
-            panic!("expected an IS NULL recheck");
-        };
-        expect_json_accessor(&inner, "json_get_string", "json", "tag");
-
-        // A range query references the column twice; every reference must be
-        // rewritten: `json_get_int(json,'count') > 3 AND json_get_int(json,'count') <= 5`.
-        let range_wrapped = JsonQuery::new(
-            Arc::new(SargableQuery::Range(
-                Bound::Excluded(ScalarValue::Int64(Some(3))),
-                Bound::Included(ScalarValue::Int64(Some(5))),
-            )),
-            "count".to_string(),
-        );
-        let Expr::BinaryExpr(range) = range_wrapped.to_expr("json".to_string()) else {
-            panic!("expected a range recheck");
-        };
-        assert_eq!(range.op, Operator::And);
-        let Expr::BinaryExpr(gt) = &*range.left else {
-            panic!("expected the range lower bound");
-        };
-        assert_eq!(gt.op, Operator::Gt);
-        assert_eq!(*gt.right, Expr::Literal(ScalarValue::Int64(Some(3)), None));
-        expect_json_accessor(&gt.left, "json_get_int", "json", "count");
-        let Expr::BinaryExpr(lt_eq) = &*range.right else {
-            panic!("expected the range upper bound");
-        };
-        assert_eq!(lt_eq.op, Operator::LtEq);
-        assert_eq!(
-            *lt_eq.right,
-            Expr::Literal(ScalarValue::Int64(Some(5)), None)
-        );
-        expect_json_accessor(&lt_eq.left, "json_get_int", "json", "count");
+    /// indexed path: every reference to the raw column in the target query's
+    /// expression becomes the typed accessor the original predicate used.
+    #[rstest]
+    #[case::ngram_contains(
+        Arc::new(TextQuery::StringContains("bravo".to_string())),
+        "tag",
+        "contains(json_get_string(json, Utf8(\"tag\")), Utf8(\"bravo\"))"
+    )]
+    #[case::bloom_equals(
+        Arc::new(BloomFilterQuery::Equals(ScalarValue::Int64(Some(7)))),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) = Int64(7)"
+    )]
+    #[case::is_null(
+        Arc::new(BloomFilterQuery::IsNull()),
+        "tag",
+        "json_get_string(json, Utf8(\"tag\")) IS NULL"
+    )]
+    #[case::range(
+        Arc::new(SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Int64(Some(3))),
+            Bound::Included(ScalarValue::Int64(Some(5))),
+        )),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) > Int64(3) \
+         AND json_get_int(json, Utf8(\"count\")) <= Int64(5)"
+    )]
+    fn test_json_query_to_expr_substitutes_typed_accessor(
+        #[case] target: Arc<dyn AnyQuery>,
+        #[case] path: &str,
+        #[case] expected: &str,
+    ) {
+        let query = JsonQuery::new(target, path.to_string());
+        assert_eq!(query.to_expr("json".to_string()).to_string(), expected);
     }
 
     /// Lookup keys are values of the indexed path, in the target index's
