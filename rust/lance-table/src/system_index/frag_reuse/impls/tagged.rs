@@ -698,7 +698,6 @@ mod tests {
     /// coverage from its sources, so the history still drains.
     #[test]
     fn the_entry_version_bounds_reads_but_not_the_drain() {
-        use crate::system_index::frag_reuse::plan::{RowDomain, TranslationSupport};
         let first = FragReuseHistory::empty(HistoryFormat::Tagged)
             .append(RewriteRecord::new(
                 5,

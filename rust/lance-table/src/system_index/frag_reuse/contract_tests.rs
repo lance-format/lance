@@ -27,7 +27,10 @@ use super::history::{
     length_delimited,
 };
 use super::mapping::{MappingRef, MappingSource, translate_stable_partition};
-use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
+use super::plan::{
+    Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary,
+    TranslationSupport,
+};
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
 use crate::format::pb::fragment_reuse_index_details as pb;
 use crate::format::{DataFile, Fragment};
@@ -1279,7 +1282,6 @@ fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: History
 #[case::tagged(Reading::Tagged)]
 #[tokio::test]
 async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
-    use super::plan::{Composition, RewriteContext};
     let (history, _) = rewritten(reading);
     // A second hop, so composition spans more than one transition.
     let history = record_natively(history, REWRITE_VERSION + 1, &[whole(1, 2)], &[(4, 2)]);
