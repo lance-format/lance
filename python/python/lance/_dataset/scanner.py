@@ -547,11 +547,12 @@ def _build_vector_search_query(
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently affects
-        RQ-quantized indexes (such as IVF_RQ) and prefiltered search on
-        HNSW sub-indexes, where ``fast`` enables the ACORN traversal.
-        Other index types ignore this setting. ``fast`` favors lower
-        latency and may reduce recall, ``normal`` uses the default balance,
-        and ``accurate`` favors higher recall and may increase latency.
+        RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+        that exclude rows through a prefilter or deletions, where ``fast``
+        enables the ACORN traversal. Other index types ignore this setting.
+        ``fast`` favors lower latency and may reduce recall, ``normal`` uses
+        the default balance, and ``accurate`` favors higher recall and may
+        increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
         A tuple of (lower_bound, upper_bound) to filter results by distance.
         Both bounds are optional. The lower bound is inclusive and the upper
@@ -1062,11 +1063,12 @@ class ScannerBuilder:
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently affects
-            RQ-quantized indexes (such as IVF_RQ) and prefiltered search on
-            HNSW sub-indexes, where ``fast`` enables the ACORN traversal.
-            Other index types ignore this setting. ``fast`` favors lower
-            latency and may reduce recall, ``normal`` uses the default balance,
-            and ``accurate`` favors higher recall and may increase latency.
+            RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+            that exclude rows through a prefilter or deletions, where ``fast``
+            enables the ACORN traversal. Other index types ignore this setting.
+            ``fast`` favors lower latency and may reduce recall, ``normal`` uses
+            the default balance, and ``accurate`` favors higher recall and may
+            increase latency.
         quantized_refine_factor: int, optional
             For an IVF_RQ flat index, overfetch this many one-bit candidates per
             requested result and rerank them with the index's most accurate stored
