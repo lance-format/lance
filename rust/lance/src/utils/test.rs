@@ -257,6 +257,8 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }
@@ -1048,6 +1050,12 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         CompactionOptions, CompactionTask, TaskData, commit_compaction,
     };
 
+    let ids_before = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
     let fragments = dataset
         .manifest
         .fragments
@@ -1065,17 +1073,16 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         ..Default::default()
     };
     let task = CompactionTask {
-        task: TaskData { fragments },
+        task: TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
+        },
         read_version: dataset.manifest.version,
         options: options.clone(),
     };
     let rewrite = task.execute(dataset).await.unwrap();
     assert_eq!(rewrite.new_fragments.len(), 2);
-    let written_files = rewrite
-        .new_fragments
-        .iter()
-        .map(|fragment| fragment.files.clone())
-        .collect::<Vec<_>>();
     commit_compaction(
         dataset,
         vec![rewrite],
@@ -1088,9 +1095,8 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         .manifest
         .fragments
         .iter()
-        // Untouched suffix fragments also receive new IDs, but keep their files.
-        .filter(|fragment| written_files.contains(&fragment.files))
         .map(|fragment| fragment.id)
+        .filter(|id| !ids_before.contains(id))
         .collect()
 }
 
@@ -1214,4 +1220,27 @@ pub mod geo {
             ..Default::default()
         }
     }
+}
+
+/// The schema a data file stores in its footer, as its writer saw it.
+pub async fn data_file_schema(dataset: &Dataset, path: &str) -> Schema {
+    let file_path = dataset.data_dir().join(path);
+    let scheduler = lance_io::scheduler::ScanScheduler::new(
+        dataset.object_store.clone(),
+        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    let file = scheduler
+        .open_file(&file_path, &lance_io::utils::CachedFileSize::unknown())
+        .await
+        .unwrap();
+    let reader = lance_file::reader::FileReader::try_open(
+        file,
+        None,
+        Arc::<lance_encoding::decoder::DecoderPlugins>::default(),
+        &lance_core::cache::LanceCache::no_cache(),
+        lance_file::reader::FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
+    reader.schema().as_ref().clone()
 }

@@ -60,15 +60,36 @@ pub fn relative_deletion_file_path(fragment_id: u64, deletion_file: &DeletionFil
 
 /// Write a deletion file for a fragment for a given deletion vector.
 ///
-/// Returns the deletion file if one was written. If no deletions were present,
-/// returns `Ok(None)`.
+/// Returns the deletion metadata when the vector was written or stored inline.
+/// Returns `Ok(None)` when no deletions were present.
+///
+/// A deletion vector whose bitmap encoding is at most `inline_max_bytes` is
+/// returned inline (see [`DeletionFile::inline`]) and no file is written; `0`
+/// always writes a file.
 pub async fn write_deletion_file(
     base: &Path,
     fragment_id: u64,
     read_version: u64,
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
+    inline_max_bytes: usize,
 ) -> Result<Option<DeletionFile>> {
+    if inline_max_bytes > 0 && !removed_rows.is_empty() {
+        let bitmap = RoaringBitmap::from(removed_rows);
+        let encoded_size = bitmap.serialized_size();
+        if encoded_size <= inline_max_bytes {
+            let mut encoded = Vec::with_capacity(encoded_size);
+            bitmap.serialize_into(&mut encoded)?;
+            return Ok(Some(DeletionFile {
+                read_version,
+                id: rand::rng().random::<u64>(),
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(bitmap.len() as usize),
+                base_id: None,
+                inline: Some(encoded.into()),
+            }));
+        }
+    }
     let deletion_file = match removed_rows {
         DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
@@ -79,6 +100,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Array,
                 num_deleted_rows: Some(set.len()),
                 base_id: None,
+                inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -116,6 +138,7 @@ pub async fn write_deletion_file(
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(bitmap.len() as usize),
                 base_id: None,
+                inline: None,
             };
             let path = deletion_file_path(base, fragment_id, &deletion_file);
 
@@ -147,6 +170,17 @@ pub async fn read_deletion_file(
     object_store: &ObjectStore,
 ) -> Result<DeletionVector> {
     let span = tracing::Span::current();
+    if let Some(encoded) = &deletion_file.inline {
+        let bitmap = RoaringBitmap::deserialize_from(&encoded[..]).map_err(|error| {
+            Error::corrupt_file(
+                Path::from("manifest"),
+                format!(
+                    "failed to deserialize the inline deletion vector for fragment {fragment_id}: {error}"
+                ),
+            )
+        })?;
+        return Ok(DeletionVector::Bitmap(bitmap));
+    }
     match deletion_file.file_type {
         DeletionFileType::Array => {
             let path = deletion_file_path(base, fragment_id, deletion_file);
@@ -228,10 +262,58 @@ mod test {
         let (object_store, path) = ObjectStore::from_uri("memory:///no_deletion")
             .await
             .unwrap();
-        let file = write_deletion_file(&path, 0, 0, &dv, &object_store)
+        let file = write_deletion_file(&path, 0, 0, &dv, &object_store, 0)
             .await
             .unwrap();
         assert!(file.is_none());
+    }
+
+    /// Under the inline budget the deletion vector lives in the returned
+    /// metadata and nothing is written; over it a file is written as before.
+    #[tokio::test]
+    async fn test_write_inline_within_budget() {
+        let dv = DeletionVector::Set(HashSet::from_iter([3, 7, 1000]));
+        let object_store = ObjectStore::memory();
+        let path = Path::from("/inline");
+
+        let file = write_deletion_file(&path, 21, 12, &dv, &object_store, 1024)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(file.is_inline());
+        assert_eq!(file.file_type, DeletionFileType::Bitmap);
+        assert_eq!(file.num_deleted_rows, Some(3));
+        let would_be_path = deletion_file_path(&path, 21, &file);
+        assert!(!object_store.exists(&would_be_path).await.unwrap());
+        let read_back = read_deletion_file(21, &file, &path, &object_store)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back.into_sorted_iter().collect::<Vec<_>>(),
+            vec![3, 7, 1000]
+        );
+
+        let corrupt = DeletionFile {
+            inline: Some(bytes::Bytes::from_static(b"not a roaring bitmap")),
+            ..file.clone()
+        };
+        let error = read_deletion_file(21, &corrupt, &path, &object_store)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inline deletion vector for fragment 21"),
+            "{error}"
+        );
+
+        let file = write_deletion_file(&path, 21, 12, &dv, &object_store, 8)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!file.is_inline());
+        let written_path = deletion_file_path(&path, 21, &file);
+        assert!(object_store.exists(&written_path).await.unwrap());
     }
 
     #[tokio::test]
@@ -243,7 +325,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/write");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store, 0)
             .await
             .unwrap();
 
@@ -297,7 +379,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/bitmap");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store, 0)
             .await
             .unwrap();
 
@@ -339,7 +421,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/roundtrip");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store, 0)
             .await
             .unwrap();
 
@@ -358,7 +440,7 @@ mod test {
 
         let object_store = ObjectStore::memory();
         let path = Path::from("/bitmap");
-        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store)
+        let file = write_deletion_file(&path, fragment_id, read_version, &dv, &object_store, 0)
             .await
             .unwrap();
 

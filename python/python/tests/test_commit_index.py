@@ -50,7 +50,7 @@ def _get_field_id_by_name(lance_schema, field_name):
 
 
 def test_commit_index(dataset_with_index, test_table, tmp_path):
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
 
@@ -107,9 +107,64 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         assert "ScalarIndexQuery: query=[meta = hello]@meta_idx" in plan
 
 
+def test_commit_index_round_trips_object_metadata(
+    dataset_with_index, test_table, tmp_path
+):
+    """clustering_id and the generic metadata map survive Python -> Rust -> Python."""
+    from lance._dataset.index import Index
+
+    index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
+    dataset = lance.write_dataset(test_table, tmp_path / "dataset_metadata")
+    shutil.copytree(
+        Path(dataset_with_index.uri) / "_indices" / index_id,
+        Path(dataset.uri) / "_indices" / index_id,
+    )
+    field_id = _get_field_id_by_name(dataset.lance_schema, "meta")
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: \u6771\u4eac  ",
+        "org.example.empty": "",
+    }
+    index = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+        metadata=metadata,
+    )
+    # No clustering definition exists in this manifest, so the reference stays
+    # unset; the map alone must round-trip.
+    assert index.clustering_id is None
+
+    dataset = lance.LanceDataset.commit(
+        dataset.uri,
+        lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+        read_version=dataset.version,
+    )
+
+    committed = dataset.read_transaction(dataset.version).operation.new_indices[0]
+    assert committed.uuid == index_id
+    assert committed.clustering_id is None
+    assert committed.metadata == metadata
+
+    # An Index built without the new attributes still commits (defaults).
+    plain = Index(
+        uuid=index_id,
+        name="meta_idx",
+        fields=[field_id],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+    )
+    assert plain.metadata == {}
+    assert plain.clustering_id is None
+
+
 def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     """Test that the files field on Index round-trips through commit."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     # Get info about the existing index created by the fixture
     original_desc = dataset_with_index.describe_indices()[0]
@@ -183,7 +238,7 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
 
 def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_path):
     """Test that index_details round-trip through Python transaction bindings."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     original_txn = dataset_with_index.get_transactions(1)[0]
     original_index = original_txn.operation.new_indices[0]
@@ -230,7 +285,7 @@ def test_index_covering_fields_roundtrip(dataset_with_index, test_table, tmp_pat
     """A non-empty covering declaration must survive both the transaction
     round trip (transaction.rs) and the describe_indices round trip
     (indices.rs)."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
 
@@ -289,7 +344,7 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
     LanceOperation.CreateIndex is a plain dataclass; it only reaches Rust at
     commit(), so a construction-time gate would miss this path entirely.
     """
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
     field_id = _get_field_id_by_name(dataset_with_index.lance_schema, "meta")

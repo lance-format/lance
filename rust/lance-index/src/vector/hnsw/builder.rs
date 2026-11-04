@@ -1498,12 +1498,18 @@ pub struct HnswQueryParams {
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
+        Self::from_query(query, query.dist_q_c)
+    }
+}
+
+impl HnswQueryParams {
+    pub(crate) fn from_query(query: &Query, dist_q_c: f32) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-            dist_q_c: query.dist_q_c,
+            dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
         }
     }
@@ -1512,6 +1518,10 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
         let params = build_params.cloned().unwrap_or_default();
@@ -2473,9 +2483,12 @@ mod tests {
         #[case] total: usize,
     ) {
         const DIM: usize = 32;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(total * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(total * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
         let builder = HNSW::index_vectors(
             store.as_ref(),
@@ -2677,9 +2690,12 @@ mod tests {
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),

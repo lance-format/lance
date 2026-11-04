@@ -27,6 +27,7 @@ use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
@@ -1429,6 +1430,7 @@ async fn test_write_manifest(
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1602,6 +1604,8 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         physical_rows: Some(second.num_rows()),
         last_updated_at_version_meta: None,
         created_at_version_meta: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -2143,6 +2147,7 @@ async fn append_dataset(
 async fn test_deep_clone(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
+    #[values(false, true)] local_fsync: bool,
 ) {
     // Setup source and target dirs
     let test_dir = TempStdDir::default();
@@ -2162,7 +2167,7 @@ async fn test_deep_clone(
         data_reader,
         test_uri,
         Some(WriteParams {
-            max_rows_per_file: 64,
+            max_rows_per_file: 32,
             max_rows_per_group: 16,
             data_storage_version: Some(data_storage_version),
             ..Default::default()
@@ -2198,8 +2203,17 @@ async fn test_deep_clone(
         .await
         .unwrap();
 
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+        ))),
+        ..Default::default()
+    };
     // Perform deep clone
-    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_uri, "tag", Some(store_params.clone()))
+        .await
+        .unwrap();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2265,7 +2279,11 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .deep_clone(
+            cloned_ds,
+            ("branch", original_version - 1),
+            Some(store_params),
+        )
         .await
         .unwrap();
     let store = branch.object_store.as_ref();
@@ -2285,6 +2303,13 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+
+    std::fs::remove_dir_all(base_dir).unwrap();
+    for (uri, expected_rows) in [(cloned_uri, 54), (cloned_ds, 64)] {
+        let reopened = Dataset::open(uri).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+    }
 }
 
 #[tokio::test]
@@ -3309,6 +3334,140 @@ async fn scan_dictionary_batches_spanning_pages(
     );
 }
 
+/// Int8 dictionary batches of 100 values starting at 0, 28 and 128: the first two hold
+/// exactly the 128 values Int8 keys address, so the writer starts a new file for the third.
+#[rstest]
+#[tokio::test]
+async fn write_splits_files_before_dictionary_outgrows_key_type(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    #[values(false, true)] is_compaction: bool,
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batches = [0, 28, 128]
+        .into_iter()
+        .map(|start| {
+            let values =
+                StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(1000));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let params = || {
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            enable_stable_row_ids,
+            ..Default::default()
+        })
+    };
+    let reader = |batches: Vec<RecordBatch>| {
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone())
+    };
+
+    let dataset = if is_compaction {
+        let mut dataset = Dataset::write(reader(vec![batches[0].clone()]), "memory://", params())
+            .await
+            .unwrap();
+        for batch in &batches[1..] {
+            dataset
+                .append(reader(vec![batch.clone()]), None)
+                .await
+                .unwrap();
+        }
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (3, 2));
+        dataset
+    } else {
+        Dataset::write(reader(batches.clone()), "memory://", params())
+            .await
+            .unwrap()
+    };
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(2000), Some(1000)]);
+    // The files' dictionaries cannot share one Int8 array, so compare the values as strings.
+    let as_utf8 = |batch: &RecordBatch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        actual
+            .iter()
+            .all(|batch| batch["d"].data_type() == schema.field(0).data_type())
+    );
+    let concat_utf8 = |batches: &[RecordBatch]| {
+        let arrays = batches.iter().map(as_utf8).collect::<Vec<_>>();
+        let arrays = arrays
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>();
+        arrow_select::concat::concat(&arrays).unwrap()
+    };
+    assert_eq!(
+        concat_utf8(&actual).as_ref(),
+        concat_utf8(&batches).as_ref()
+    );
+    dataset.validate().await.unwrap();
+}
+
+/// A file finished early for its dictionary leaves the input's row-limit cuts out of line
+/// with the files. The next file must still stop at `max_rows_per_file` rows.
+#[rstest]
+#[tokio::test]
+async fn write_keeps_max_rows_per_file_after_dictionary_close(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    // 150-row batches over 100 values each; the second and third share theirs, so the
+    // first file closes at 150 rows and the second holds no more than 128 values.
+    let batches = ["a", "b", "b"]
+        .into_iter()
+        .map(|prefix| {
+            let values = StringArray::from_iter_values((0..100).map(|i| format!("{prefix}{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(150));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        max_rows_per_file: 200,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, "memory://", Some(params))
+        .await
+        .unwrap();
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(150), Some(200), Some(100)]);
+    dataset.validate().await.unwrap();
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.
@@ -4082,6 +4241,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[tokio::test]
+async fn test_open_empty_latest_manifest_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    let mut dataset = write_tiny_dataset(uri).await;
+    dataset.truncate_table().await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    let manifest_path = dataset.manifest_location.path.clone();
+    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+
+    let error = Dataset::open(uri).await.unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains(manifest_path.as_ref()),
+        "{error}"
+    );
+    assert!(error.to_string().contains("0 bytes"), "{error}");
+}
+
+#[tokio::test]
+async fn test_read_empty_data_file_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    write_tiny_dataset(uri).await;
+
+    let data_path = std::fs::read_dir(test_dir.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&data_path, b"").unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    let object_path = Path::from_absolute_path(&data_path).unwrap();
+    assert!(error.to_string().contains(object_path.as_ref()), "{error}");
+    assert!(error.to_string().contains("size 0 bytes"), "{error}");
+}
+
 /// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
 /// even when the user keeps unmanaged files beside it.
 #[rstest]
@@ -4310,6 +4511,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

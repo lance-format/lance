@@ -34,7 +34,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
-use crate::index::open_index_proto;
+use crate::index::loading::open_index_proto;
 use crate::{Error, Result};
 
 // Private structs for JSON serialization of VectorIndexDetails.
@@ -948,6 +948,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -971,6 +973,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -992,6 +996,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1030,6 +1036,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1117,6 +1125,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
 
             let metric = metric_type_from_index_metadata(&index);
