@@ -23,7 +23,6 @@ use std::sync::Arc;
 /// [`RemappingIndexLoader`](lance_index::scalar::registry::RemappingIndexLoader).
 /// A kind leaves this list when it implements one.
 const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
-    "BloomFilterIndexDetails",
     "FmIndexDetails",
     "InvertedIndexDetails",
     "JsonIndexDetails",

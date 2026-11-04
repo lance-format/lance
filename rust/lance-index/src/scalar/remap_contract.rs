@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -28,11 +28,12 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use rstest::rstest;
 
 use super::bitmap::BitmapIndexPlugin;
+use super::bloomfilter::BloomFilterIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
 use super::zonemap::ZoneMapIndexPlugin;
-use super::{Remapper, SargableQuery, ScalarIndex};
+use super::{AnyQuery, BloomFilterQuery, Remapper, SargableQuery, ScalarIndex};
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
 
@@ -100,6 +101,29 @@ struct Case {
     params: &'static str,
     /// The fragment IDs handed to training, for kinds that record them.
     fragment_ids: Option<Vec<u32>>,
+    /// The type of the indexed column; see [`value_array`].
+    data_type: DataType,
+    /// The query this kind answers for the rows holding a value.
+    query: fn(i32) -> Box<dyn AnyQuery>,
+}
+
+fn equals(value: i32) -> Box<dyn AnyQuery> {
+    Box::new(SargableQuery::Equals(ScalarValue::Int32(Some(value))))
+}
+
+/// The text a string column holds for `value`: no value's text contains
+/// another's.
+fn text(value: i32) -> String {
+    format!("<{value:03}>")
+}
+
+/// The indexed column for `values`, of type `data_type`.
+fn value_array(data_type: &DataType, values: Vec<i32>) -> ArrayRef {
+    match data_type {
+        DataType::Int32 => Arc::new(Int32Array::from(values)),
+        DataType::Utf8 => Arc::new(StringArray::from_iter_values(values.into_iter().map(text))),
+        other => panic!("no rows of type {other}"),
+    }
 }
 
 fn btree() -> Case {
@@ -107,6 +131,8 @@ fn btree() -> Case {
         plugin: Arc::new(BTreeIndexPlugin),
         params: "{}",
         fragment_ids: Some(vec![0, 2]),
+        data_type: DataType::Int32,
+        query: equals,
     }
 }
 
@@ -116,6 +142,8 @@ fn bitmap() -> Case {
         params: "{}",
         // A bitmap build given several fragments expects a shard ID.
         fragment_ids: None,
+        data_type: DataType::Int32,
+        query: equals,
     }
 }
 
@@ -124,6 +152,18 @@ fn zonemap() -> Case {
         plugin: Arc::new(ZoneMapIndexPlugin),
         params: r#"{"rows_per_zone": 4}"#,
         fragment_ids: Some(vec![0, 2]),
+        data_type: DataType::Int32,
+        query: equals,
+    }
+}
+
+fn bloomfilter() -> Case {
+    Case {
+        plugin: Arc::new(BloomFilterIndexPlugin),
+        params: r#"{"number_of_items": 4, "probability": 0.01}"#,
+        fragment_ids: Some(vec![0, 2]),
+        data_type: DataType::Int32,
+        query: |value| Box::new(BloomFilterQuery::Equals(ScalarValue::Int32(Some(value)))),
     }
 }
 
@@ -143,7 +183,7 @@ async fn load(
     let request = trainer
         .new_training_request(
             case.params,
-            &Field::new(VALUE_COLUMN_NAME, DataType::Int32, true),
+            &Field::new(VALUE_COLUMN_NAME, case.data_type.clone(), true),
         )
         .unwrap();
     let criteria = request.criteria().clone();
@@ -154,8 +194,8 @@ async fn load(
         TrainingOrdering::None => {}
     }
     let (values, addrs): (Vec<i32>, Vec<u64>) = rows.into_iter().unzip();
-    let mut fields = vec![Field::new(VALUE_COLUMN_NAME, DataType::Int32, true)];
-    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(values))];
+    let mut fields = vec![Field::new(VALUE_COLUMN_NAME, case.data_type.clone(), true)];
+    let mut columns: Vec<ArrayRef> = vec![value_array(&case.data_type, values)];
     // The rows have no stable IDs: their addresses stand in for them.
     for (needed, name) in [
         (criteria.needs_row_ids, ROW_ID),
@@ -196,12 +236,9 @@ async fn load(
         .unwrap()
 }
 
-async fn search(index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
+async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
     let result = index
-        .search(
-            &SargableQuery::Equals(ScalarValue::Int32(Some(value))),
-            &NoOpMetricsCollector,
-        )
+        .search((case.query)(value).as_ref(), &NoOpMetricsCollector)
         .await
         .unwrap();
     (result.row_addrs().true_rows(), result.is_exact())
@@ -214,6 +251,7 @@ async fn search(index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
 #[case::btree(btree())]
 #[case::bitmap(bitmap())]
 #[case::zonemap(zonemap())]
+#[case::bloomfilter(bloomfilter())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -221,7 +259,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
     let index = load(&case, &store_dir, Some(remapper)).await;
     let queries = (0..8).chain(100..104);
     for value in queries.clone() {
-        let (rows, is_exact) = search(index.as_ref(), value).await;
+        let (rows, is_exact) = search(&case, index.as_ref(), value).await;
         assert!(
             rows.get(&0).is_none(),
             "value {value} answered with a stale address: {rows:?}"
@@ -254,12 +292,13 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[case::btree(btree())]
 #[case::bitmap(bitmap())]
 #[case::zonemap(zonemap())]
+#[case::bloomfilter(bloomfilter())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();
     let index = load(&case, &store_dir, None).await;
     for value in (0..8).chain(100..104) {
-        let (rows, is_exact) = search(index.as_ref(), value).await;
+        let (rows, is_exact) = search(&case, index.as_ref(), value).await;
         let expected = built_addresses(value);
         if is_exact {
             assert_eq!(rows, expected, "value {value}");
