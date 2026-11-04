@@ -4500,6 +4500,7 @@ mod tests {
     #[rstest::rstest]
     #[case::v21(TestEncoding::StructuralU16)]
     #[case::v22(TestEncoding::StructuralU32)]
+    #[case::sparse(TestEncoding::StructuralSparse)]
     #[tokio::test]
     async fn test_byte_sized_batches_nested_binary_roundtrip(#[case] version: TestEncoding) {
         let mut frames = ListBuilder::new(BinaryBuilder::new());
@@ -4542,6 +4543,7 @@ mod tests {
     #[rstest::rstest]
     #[case::v21(TestEncoding::StructuralU16)]
     #[case::v22(TestEncoding::StructuralU32)]
+    #[case::sparse(TestEncoding::StructuralSparse)]
     #[tokio::test]
     async fn test_small_constant_binary_preserves_row_batches(#[case] version: TestEncoding) {
         let values = BinaryArray::from_iter_values(std::iter::repeat_n(b"payload".as_slice(), 256));

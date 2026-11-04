@@ -970,6 +970,65 @@ impl std::fmt::Debug for PlanarSparseDecoder {
     }
 }
 impl StructuralPageDecoder for PlanarSparseDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if !num_rows.is_multiple_of(self.row_scale) {
+            return Err(Error::invalid_input(
+                "Planar byte planning is not aligned to fixed-size-list scale",
+            ));
+        }
+        if self.decoders.is_empty() && self.scalar.is_none() {
+            return Ok(0);
+        }
+        let mut remaining = num_rows / self.row_scale;
+        let mut ranges = Vec::new();
+        for (index, range) in self.ranges.iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let start = range.start + if index == 0 { self.range_offset } else { 0 };
+            let take = remaining.min(range.end - start);
+            ranges.push(start..start + take);
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(Error::invalid_input(
+                "Planar byte planning exceeds scheduled rows",
+            ));
+        }
+        let selection = slice_sparse_plan(&self.state.plan, &ranges, self.rows)?;
+        if let Some(scalar) = &self.scalar {
+            return selection
+                .plan
+                .num_visible_items
+                .checked_mul(scalar.get_buffer_memory_size() as u64)
+                .ok_or_else(|| Error::not_supported("planar scalar byte count overflowed u64"));
+        }
+        let selected = select_position_set(
+            &self.state.positions,
+            &selection.leaf_ranges,
+            self.state.plan.num_visible_items,
+            "planar byte planning",
+        )?;
+        let mut remaining = selected.positions.len();
+        let mut bytes = 0_u64;
+        for (decoder, available) in &self.decoders {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(*available);
+            bytes = bytes
+                .checked_add(decoder.decoded_expanded_bytes(take)?)
+                .ok_or_else(|| Error::not_supported("planar decoded byte count overflowed u64"))?;
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(Error::invalid_input(
+                "Planar byte planning exceeds loaded values",
+            ));
+        }
+        Ok(bytes)
+    }
+
     fn num_rows(&self) -> u64 {
         self.num_rows
     }
