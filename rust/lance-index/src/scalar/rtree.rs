@@ -423,8 +423,8 @@ impl RTreeIndex {
         // root-to-leaf chain stays serial because a page is only enqueued
         // once its parent batch has been scanned. Results accumulate into a
         // set, so completion order does not matter. Popping the most recently
-        // found page keeps the queue bounded by the tree depth, as the old
-        // depth-first walk was, instead of growing with the leaf count.
+        // found page keeps the queue to a few pages per tree level instead of
+        // the whole intersecting frontier.
         let io_parallelism = self.store.io_parallelism().max(1);
         let mut deferred_pages: Vec<u64> = Vec::new();
         let mut pending_pages = stream::FuturesUnordered::new();
@@ -765,9 +765,9 @@ impl Index for RTreeIndex {
     async fn prewarm(&self) -> Result<()> {
         // One awaited read per page serializes prewarm into num_pages round
         // trips on remote storage. Buffer the per-page reads at the store's
-        // IO parallelism (the same pattern `into_data_stream` uses) so the
-        // round trips overlap. Each future reads exactly its page's range,
-        // because uniform page_size batches would straddle level boundaries.
+        // IO parallelism so the round trips overlap. Each future reads exactly
+        // its page's range, because uniform page_size batches would straddle
+        // level boundaries.
         let mut page_reads = stream::iter(0..self.metadata.num_pages)
             .map(|page_id| async move {
                 let range = self.page_range(page_id).await?;
@@ -781,7 +781,7 @@ impl Index for RTreeIndex {
                     .await;
                 Ok::<(), Error>(())
             })
-            .buffered(self.store.io_parallelism().max(1));
+            .buffer_unordered(self.store.io_parallelism().max(1));
         while let Some(result) = page_reads.next().await {
             result?;
         }
@@ -2437,7 +2437,7 @@ mod tests {
             "search_bbox fetched sibling pages one at a time"
         );
 
-        // A failed leaf read while its siblings are in flight fails the search.
+        // A failed leaf read surfaces as the search error instead of being dropped.
         let (index, _) = load(Some(0)).await;
         let err = index
             .search_bbox(query, &NoOpMetricsCollector)
