@@ -3379,6 +3379,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PreparedPartitionSearc
         )
         .map(Some)
     }
+
+    /// Unboxed [`PreparedPartition::accumulate_topk`], for callers that
+    /// score many partitions per query and would otherwise box each one.
+    fn accumulate_into(
+        self,
+        heap: &mut BinaryHeap<OrderedNode<u64>>,
+        scratch: &mut QueryScratch,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<()> {
+        self.score(metrics, |entry, key, k, param, pre_filter, residual| {
+            entry.index.accumulate_topk_with_scratch(
+                key,
+                k,
+                param,
+                &entry.storage,
+                pre_filter,
+                heap,
+                residual,
+                scratch,
+                metrics,
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PreparedPartition
@@ -3414,20 +3438,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PreparedPartition
         scratch: &mut QueryScratch,
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
-        self.score(metrics, |entry, key, k, param, pre_filter, residual| {
-            entry.index.accumulate_topk_with_scratch(
-                key,
-                k,
-                param,
-                &entry.storage,
-                pre_filter,
-                heap,
-                residual,
-                scratch,
-                metrics,
-            )
-        })?;
-        Ok(())
+        (*self).accumulate_into(heap, scratch, metrics)
     }
 }
 
@@ -3459,7 +3470,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> BatchPartition
             raw_query_context.cloned(),
             self.part_entry.clone(),
         );
-        Box::new(prepared).accumulate_topk(heap, scratch, metrics)
+        prepared.accumulate_into(heap, scratch, metrics)
     }
 }
 

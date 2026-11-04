@@ -38,7 +38,6 @@ use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
 
-use super::partition_search::PreparedPartition;
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
     global_heap_to_batch, rotated_partition_centroid_slice,
@@ -549,7 +548,7 @@ impl RabitScanContext {
         match prepared.0 {
             PreparedRabitPartition::Ordinary(prepared) => {
                 self.index.scratch_pool.with_scratch(|scratch| {
-                    Box::new(prepared).accumulate_topk(heap, scratch, self.metrics.as_ref())
+                    prepared.accumulate_into(heap, scratch, self.metrics.as_ref())
                 })
             }
             PreparedRabitPartition::Planes { sign, ex } => {
