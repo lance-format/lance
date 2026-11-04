@@ -1045,11 +1045,15 @@ mod test {
         let dataset = datasets.deletions_no_missing_frags.clone();
         assert!(dataset.manifest_location().e_tag.is_some());
 
+        // Fragment 0 is outside this set. An unrestricted mask may select its
+        // rows; a restricted mask must not.
+        let covered = RoaringBitmap::from_iter(1..3);
+        let mut cached = Vec::new();
         for restrict_to_fragments in [false, true] {
             let load_mask = || {
                 DatasetPreFilter::create_deletion_mask_impl(
                     dataset.clone(),
-                    RoaringBitmap::from_iter(0..3),
+                    covered.clone(),
                     restrict_to_fragments,
                 )
                 .expect("deletion mask")
@@ -1057,19 +1061,49 @@ mod test {
             let first = load_mask().await.unwrap();
             let second = load_mask().await.unwrap();
             assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(
+                first.selected(0),
+                !restrict_to_fragments,
+                "restricted={restrict_to_fragments} shared the other mode's mask"
+            );
             assert!(!first.selected((2 << 32) + 2));
-            assert!(first.selected((2 << 32) + 1));
+            cached.push(first);
         }
+        assert!(!Arc::ptr_eq(&cached[0], &cached[1]));
 
-        // A mask restricted to fewer fragments is a separate entry.
-        let narrower = DatasetPreFilter::create_restricted_deletion_mask(
-            dataset,
-            RoaringBitmap::from_iter(0..2),
-        )
-        .expect("deletion mask")
-        .await
-        .unwrap();
-        assert!(!narrower.selected((2 << 32) + 1));
+        // The same restriction over every fragment is another entry, and both
+        // modes still block the one deleted row.
+        let all_fragments = RoaringBitmap::from_iter(0..3);
+        let full_unrestricted =
+            DatasetPreFilter::create_deletion_mask(dataset.clone(), all_fragments.clone())
+                .expect("deletion mask")
+                .await
+                .unwrap();
+        let full_restricted =
+            DatasetPreFilter::create_restricted_deletion_mask(dataset.clone(), all_fragments)
+                .expect("deletion mask")
+                .await
+                .unwrap();
+        assert!(!Arc::ptr_eq(&full_unrestricted, &cached[0]));
+        assert!(!Arc::ptr_eq(&full_restricted, &cached[1]));
+        assert!(full_unrestricted.selected(0));
+        assert!(full_restricted.selected(0));
+        assert!(full_unrestricted.selected((2 << 32) + 1));
+        assert!(full_restricted.selected((2 << 32) + 1));
+        assert!(!full_unrestricted.selected((2 << 32) + 2));
+        assert!(!full_restricted.selected((2 << 32) + 2));
+
+        // A recreated dataset restarts its version history, so an entry from
+        // the same version under a different e-tag must not be reused.
+        let mut other_generation = (*dataset).clone();
+        other_generation.manifest_location.e_tag = Some("second-generation".to_string());
+        let other_generation_mask =
+            DatasetPreFilter::create_deletion_mask_impl(Arc::new(other_generation), covered, false)
+                .expect("deletion mask")
+                .await
+                .unwrap();
+        assert!(!Arc::ptr_eq(&other_generation_mask, &cached[0]));
+        assert!(other_generation_mask.selected(0));
 
         // A newer version, which removed fragment 1, does not reuse the old entry.
         let newer = DatasetPreFilter::create_deletion_mask(
