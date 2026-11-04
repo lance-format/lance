@@ -70,6 +70,22 @@ enum Rewrite {
 /// the schema the plan was built for, which catches a mismatched batch but not a
 /// same-shaped batch from elsewhere.
 ///
+/// # A preserved reference does not own its payload
+///
+/// When the managed payload is preserved rather than materialized, the output
+/// holds a reference to an object under the *source* dataset's blob storage. The
+/// plan does not retain that object. Until the destination's references are no
+/// longer needed, the caller must keep the source versions they name alive, which
+/// means not advancing [`cleanup_old_versions`] past them. A destination in
+/// another dataset must additionally register the source as a base, because with
+/// primary base-less storage the preserved reference is a plain `Managed` one that
+/// resolves only within the dataset that holds it. This is the lifetime contract
+/// [`preserve_managed_descriptors`] documents for same-dataset rewrites, stated
+/// here for callers outside this crate.
+///
+/// [`cleanup_old_versions`]: crate::dataset::cleanup::cleanup_old_versions
+/// [`preserve_managed_descriptors`]: crate::dataset::preserve_managed_descriptors
+///
 /// # Example
 ///
 /// ```no_run
@@ -277,10 +293,13 @@ impl BlobRewritePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::BlobArrayBuilder;
+    use crate::blob::{BlobArrayBuilder, BlobFieldOptions, blob_field_with_options};
     use crate::blob_field;
-    use crate::dataset::WriteParams;
+    use crate::dataset::blob::test_util::managed_blob_schema;
+    use crate::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
+    use crate::dataset::{WriteMode, WriteParams};
     use arrow_array::Array;
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, LargeBinaryArray, LargeListArray, ListArray, RecordBatchIterator, StringArray,
         StructArray, UInt32Array, UInt64Array,
@@ -288,9 +307,11 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema};
     use futures::TryStreamExt;
-    use lance_core::datatypes::{BLOB_V2_LOGICAL_TYPE, BlobV2Layout};
+    use lance_core::datatypes::{BLOB_V2_LOGICAL_TYPE, BlobKind, BlobV2Layout};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
+    use lance_table::format::BasePath;
+    use std::num::NonZeroUsize;
 
     /// A dataset with no Blob v2 column anywhere in its schema.
     async fn plain_dataset(dir: &TempStrDir) -> Arc<Dataset> {
@@ -774,5 +795,301 @@ mod tests {
             payloads.extend(list_blob_payloads::<i32>(&rewritten, "items", Some("blob")));
         }
         assert_eq!(payloads, vec![vec![0u8; 16], vec![1u8; 16]]);
+    }
+
+    /// The managed blob column used by the acceptance tests below. The small
+    /// thresholds force the payload out of the data file, so with managed blobs
+    /// enabled it becomes a Lance-owned object reached through a descriptor.
+    fn managed_blob_column() -> Field {
+        blob_field_with_options(
+            "blob",
+            true,
+            BlobFieldOptions {
+                inline_size_threshold: Some(4),
+                dedicated_size_threshold: Some(NonZeroUsize::new(8).unwrap()),
+            },
+        )
+    }
+
+    /// A one-row managed Blob v2 dataset holding `payload`.
+    ///
+    /// `base` registers a table base and writes the data file into it, which is
+    /// what makes a preserved descriptor name that base explicitly instead of
+    /// being relative to whichever dataset later holds it.
+    async fn managed_blob_dataset(
+        dir: &TempStrDir,
+        payload: &[u8],
+        base: Option<BasePath>,
+    ) -> Arc<Dataset> {
+        let schema = Arc::new(managed_blob_schema(vec![
+            Field::new("id", DataType::UInt32, false),
+            managed_blob_column(),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(payload).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..1)),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let base_id = base.as_ref().map(|base| base.id);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    initial_bases: base.map(|base| vec![base]),
+                    target_bases: base_id.map(|id| vec![id]),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(managed_blobs_enabled(dataset.schema()).unwrap());
+        assert!(BlobRewritePlan::can_preserve_managed(&dataset).unwrap());
+        let stored = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            stored[0].as_ref().unwrap().kind(),
+            BlobKind::Managed,
+            "the source payload must already be a managed object, otherwise this \
+             test would be about materialization rather than preservation"
+        );
+        dataset
+    }
+
+    /// The preserved descriptor of the single blob row in `batch`.
+    ///
+    /// Returns `(kind, blob_id, uri, blob_size, inline_len)`. `inline_len` is the
+    /// length of the prepared `data` child, which is how the payload would travel
+    /// if it had been copied into the output instead of referenced.
+    fn preserved_descriptor(batch: &RecordBatch) -> (BlobKind, Option<u32>, String, u64, usize) {
+        let blob = batch.column_by_name("blob").unwrap().as_struct();
+        assert_eq!(
+            BlobV2Layout::classify(blob.fields()),
+            Some(BlobV2Layout::Prepared),
+            "a preserved managed reference must arrive in prepared layout"
+        );
+        assert_eq!(blob.len(), 1);
+        let kind = BlobKind::try_from(
+            blob.column_by_name("kind")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .value(0),
+        )
+        .unwrap();
+        let blob_ids = blob
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt32Type>();
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        (
+            kind,
+            blob_ids.is_valid(0).then(|| blob_ids.value(0)),
+            blob.column_by_name("uri")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0)
+                .to_string(),
+            blob.column_by_name("blob_size")
+                .unwrap()
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            if data.is_null(0) {
+                0
+            } else {
+                data.value(0).len()
+            },
+        )
+    }
+
+    /// Transform every row of `source` and write the result to a fresh dataset at
+    /// `dir`, registering `bases` there. Returns the transformed batch so the
+    /// caller can assert on the descriptor it committed.
+    async fn write_preserved_to_destination(
+        source: &Arc<Dataset>,
+        dir: &TempStrDir,
+        bases: Option<Vec<BasePath>>,
+    ) -> (RecordBatch, Arc<Dataset>) {
+        let batches = scan_with_row_addresses(source).await;
+        assert_eq!(batches.len(), 1);
+        let plan =
+            BlobRewritePlan::try_new(source.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let output_schema = plan.output_schema().clone();
+        let transformed = plan.transform(batches[0].clone()).await.unwrap();
+        assert_eq!(transformed.schema(), output_schema);
+
+        Dataset::write(
+            RecordBatchIterator::new([Ok(transformed.clone())], output_schema),
+            dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: bases,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        (transformed, Arc::new(Dataset::open(dir).await.unwrap()))
+    }
+
+    /// Replace every row of the dataset at `dir`, then run its retention with no
+    /// retained history, which is what makes the replaced objects removable.
+    async fn replace_rows_and_clean(dir: &TempStrDir) {
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            dir,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = Dataset::open(dir).await.unwrap();
+        let removed = cleanup_old_versions(
+            &dataset,
+            CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                // The replacement commit is seconds old, so only an unfiltered
+                // listing reaches the files it superseded.
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            removed.data_files_removed > 0,
+            "the replacement did not make any source file removable, so this test \
+             would not exercise cleanup at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_managed_payload_is_referenced_not_copied_and_reads_back_from_its_base() {
+        let source_dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let base = BasePath::new(
+            1,
+            source_dir.to_string(),
+            Some("payloads".to_string()),
+            true,
+        );
+        let source = managed_blob_dataset(&source_dir, &payload, Some(base.clone())).await;
+
+        let dest_dir = TempStrDir::default();
+        let (transformed, dest) =
+            write_preserved_to_destination(&source, &dest_dir, Some(vec![base])).await;
+
+        // The output names the source's base and carries no payload bytes: the
+        // only thing that crossed into the destination is a reference.
+        let (kind, blob_id, uri, size, inline_len) = preserved_descriptor(&transformed);
+        assert_eq!(kind, BlobKind::ManagedWithBase);
+        assert_eq!(blob_id, Some(1));
+        assert_eq!(size, payload.len() as u64);
+        assert_eq!(
+            inline_len, 0,
+            "the payload was copied into the output instead of being referenced"
+        );
+        assert!(uri.starts_with("_blobs/"), "{uri}");
+
+        // Reading the destination back resolves that reference to the source's
+        // object and yields the original bytes.
+        let read = dest.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(read[0].as_ref().unwrap().kind(), BlobKind::Managed);
+        assert_eq!(
+            read[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            payload
+        );
+    }
+
+    /// A preserved reference is only a reference: the destination is not part of
+    /// the source's lineage, so the source's own retention does not know that
+    /// anything still needs its objects.
+    ///
+    /// This pins the current behaviour rather than a desired one. Cleanup of the
+    /// source after its rows are replaced removes the referenced object, and the
+    /// destination then fails to read the payload it committed.
+    #[tokio::test]
+    async fn source_cleanup_after_replacement_breaks_the_preserved_reference() {
+        let source_dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let base = BasePath::new(
+            1,
+            source_dir.to_string(),
+            Some("payloads".to_string()),
+            true,
+        );
+        let source = managed_blob_dataset(&source_dir, &payload, Some(base.clone())).await;
+
+        let dest_dir = TempStrDir::default();
+        let (transformed, dest) =
+            write_preserved_to_destination(&source, &dest_dir, Some(vec![base])).await;
+        let (_, _, uri, _, _) = preserved_descriptor(&transformed);
+        assert_eq!(
+            dest.take_blobs_by_indices(&[0], "blob").await.unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            payload
+        );
+
+        // Drop the open source snapshot before replacing it: keeping it alive
+        // would only hide the question this test is asking.
+        drop(source);
+        replace_rows_and_clean(&source_dir).await;
+
+        let dest = Arc::new(Dataset::open(&dest_dir).await.unwrap());
+        let read = dest.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let error = read[0].as_ref().unwrap().read().await.unwrap_err();
+        assert!(
+            matches!(error, Error::NotFound { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains(&uri), "{error}");
+    }
+
+    /// Without a registered base the preserved reference is relative to whichever
+    /// dataset holds the descriptor, so a destination elsewhere resolves it
+    /// against its own root and finds nothing.
+    ///
+    /// This pins the current behaviour. The write succeeds, which is why the
+    /// registered-base form above is the one that actually survives a readback.
+    #[tokio::test]
+    async fn a_primary_storage_reference_does_not_resolve_at_another_dataset() {
+        let source_dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let source = managed_blob_dataset(&source_dir, &payload, None).await;
+
+        let dest_dir = TempStrDir::default();
+        let (transformed, dest) = write_preserved_to_destination(&source, &dest_dir, None).await;
+
+        let (kind, blob_id, uri, _, inline_len) = preserved_descriptor(&transformed);
+        assert_eq!(kind, BlobKind::Managed);
+        assert_eq!(blob_id, None, "a plain managed reference names no base");
+        assert_eq!(inline_len, 0);
+
+        let read = dest.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let error = read[0].as_ref().unwrap().read().await.unwrap_err();
+        assert!(
+            matches!(error, Error::NotFound { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains(&uri), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(dest_dir.as_str().trim_start_matches('/')),
+            "the reference resolved somewhere other than the destination root: {error}"
+        );
     }
 }
