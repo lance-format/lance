@@ -23,7 +23,7 @@ use roaring::RoaringBitmap;
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddOverlays {
     /// The fragment to overlay: committed, or one minted earlier in the same
-    /// operation.
+    /// operation with `data_change = true`.
     pub fragment: Ref,
     /// The overlays to append, in precedence order: where two cover the same
     /// cell, the later one wins. Each one's `committed_version` is ignored and
@@ -54,6 +54,7 @@ impl AddOverlays {
             ));
         }
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        state.reject_data_change_to_rearranged(fragment_id, "AddOverlays")?;
         let committed_version = state.new_version();
         let refreshes_lineage = state.uses_stable_row_ids() && self.fragment.committed().is_some();
         let spilled = state.spilled_row_lineage();

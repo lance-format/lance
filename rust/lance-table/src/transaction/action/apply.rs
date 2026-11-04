@@ -209,6 +209,10 @@ pub(super) struct ApplyState<'a> {
     /// Ids of the fragments this operation added, whether minted from the
     /// counter or claimed out of a reservation.
     new_fragments: HashSet<u64>,
+    /// The new fragments an [`AddFragment`](super::AddFragment) added with
+    /// `data_change = false`: rows moved from elsewhere in the table, whose
+    /// values no action in the operation may change.
+    rearranged_fragments: HashSet<u64>,
 
     /// Fragments the version applied onto already held that this operation
     /// wrote changed data into, and the ones it refreshed, wholly or in part.
@@ -291,6 +295,7 @@ impl<'a> ApplyState<'a> {
             field_tokens: HashMap::new(),
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
+            rearranged_fragments: HashSet::new(),
             data_changed_fragments: HashSet::new(),
             refreshed_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
@@ -612,6 +617,7 @@ impl<'a> ApplyState<'a> {
         }
         self.removed_fragments.insert(fragment_id, data_change);
         self.new_fragments.remove(&fragment_id);
+        self.rearranged_fragments.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
         self.data_changed_fragments.remove(&fragment_id);
@@ -628,6 +634,7 @@ impl<'a> ApplyState<'a> {
         self.fragments.clear();
         self.indices.clear();
         self.new_fragments.clear();
+        self.rearranged_fragments.clear();
         self.tombstoned_fields.clear();
         self.data_changed_fragments.clear();
         self.refreshed_fragments.clear();
@@ -852,6 +859,41 @@ impl<'a> ApplyState<'a> {
     /// the version being committed on top of.
     pub(super) fn is_new_fragment(&self, fragment_id: u64) -> bool {
         self.new_fragments.contains(&fragment_id)
+    }
+
+    pub(super) fn note_rearranged(&mut self, fragment_id: u64) {
+        self.rearranged_fragments.insert(fragment_id);
+    }
+
+    /// Whether `fragment_id` is one this operation added with
+    /// `data_change = false`.
+    pub(super) fn is_rearranged(&self, fragment_id: u64) -> bool {
+        self.rearranged_fragments.contains(&fragment_id)
+    }
+
+    /// Refuse a write that changes the values of a fragment this operation
+    /// added with `data_change = false`.
+    ///
+    /// Such a fragment's rows were already in the table: they keep their row
+    /// versions, and the footprint records no inserted rows and no write to a
+    /// committed fragment. A value change in the same operation would hide
+    /// behind all three -- an incremental reader would miss the changed rows,
+    /// a concurrent key assertion would not see a changed key, and an index
+    /// carried onto the fragment through the fragment reuse history would
+    /// answer from the old values.
+    pub(super) fn reject_data_change_to_rearranged(
+        &self,
+        fragment_id: u64,
+        action: &str,
+    ) -> Result<()> {
+        if !self.is_rearranged(fragment_id) {
+            return Ok(());
+        }
+        Err(Error::invalid_input(format!(
+            "{action} changes the values of fragment {fragment_id}, which this operation adds \
+             with data_change = false; a fragment that only moves rows cannot also change \
+             them, so add it with data_change = true, or change the rows in a later operation"
+        )))
     }
 
     /// Record that data written into `fragment_id` changes what its rows hold.

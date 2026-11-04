@@ -56,7 +56,8 @@ pub struct AddFragment {
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
     /// `false` marks a pure rearrangement, e.g. a compaction rewrite. On a
     /// dataset with stable row ids such a fragment must carry all three
-    /// lineage sequences, since its rows keep their identity.
+    /// lineage sequences, since its rows keep their identity. No action in the
+    /// same operation may change such a fragment's values.
     pub data_change: bool,
 }
 
@@ -66,6 +67,9 @@ impl AddFragment {
             self.check_carries_lineage()?;
         }
         let id = state.add_fragment_id(self.id)?;
+        if !self.data_change {
+            state.note_rearranged(id);
+        }
         state.push_fragment(Fragment {
             id,
             files: Vec::new(),
