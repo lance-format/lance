@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
+use crate::io::exec::fts::FlatMatchFilterExec;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::ExecutionPlan;
 use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
@@ -22,6 +25,7 @@ use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
+use lance_datafusion::exec::execute_plan;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
@@ -665,7 +669,35 @@ async fn test_fts_list_postfilter_vector_search(#[case] is_large_list: bool) {
             post_filter_position < vector_search_position,
             "expected FTS to wrap the vector search as a post-filter, got:\n{plan}"
         );
-        let result = scanner.try_into_batch().await.unwrap();
+        let original = scanner.create_plan().await.unwrap();
+        let original_schema = original.schema();
+        let mut rebuilt_filters = 0;
+        let rebuilt = original
+            .transform_up(|plan| {
+                if let Some(filter) = plan.downcast_ref::<FlatMatchFilterExec>() {
+                    rebuilt_filters += 1;
+                    let filter = FlatMatchFilterExec::try_new(
+                        filter.children()[0].clone(),
+                        filter.dataset().clone(),
+                        filter.query().clone(),
+                        filter.params().clone(),
+                        filter.document_binding(),
+                        filter.preset_segments().map(|segments| segments.to_vec()),
+                    )?;
+                    return Ok(Transformed::yes(Arc::new(filter) as Arc<dyn ExecutionPlan>));
+                }
+                Ok(Transformed::no(plan))
+            })
+            .unwrap()
+            .data;
+        assert_eq!(rebuilt_filters, 1);
+        assert_eq!(rebuilt.schema(), original_schema);
+        let batches: Vec<RecordBatch> = execute_plan(rebuilt, Default::default())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let result = concat_batches(&original_schema, &batches).unwrap();
         let mut ids = result["id"]
             .as_any()
             .downcast_ref::<Int32Array>()

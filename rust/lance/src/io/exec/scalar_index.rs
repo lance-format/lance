@@ -116,6 +116,30 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
+        let result = if self.dataset.manifest.uses_stable_row_ids()
+            && let Some(fragments) = self.fragments
+            && fragments != self.dataset.fragment_bitmap.as_ref()
+        {
+            let mut scope = RowAddrTreeMap::new();
+            for fragment in fragments {
+                scope.insert_fragment(fragment);
+            }
+            // A shared segment can match rows outside this scan. Restrict physical
+            // addresses before translation to avoid opening their row-id and
+            // deletion files. Scope TRUE and NULL rows together for boolean filters.
+            let restrict = |mask| match mask {
+                NullableRowAddrMask::AllowList(set) => {
+                    let (mut selected, mut nulls) = set.into_parts();
+                    selected &= &scope;
+                    nulls &= &scope;
+                    NullableRowAddrMask::AllowList(NullableRowAddrSet::new(selected, nulls))
+                }
+                mask => mask,
+            };
+            NullableIndexExprResult::new(restrict(result.lower), restrict(result.upper))
+        } else {
+            result
+        };
         self.dataset.row_addr_result_to_row_ids(result).await
     }
 }
@@ -204,8 +228,9 @@ impl ScalarIndexExec {
 
     /// Restrict which physical scalar index segments are loaded.
     ///
-    /// This does not restrict the result mask. The consumer remains responsible for applying
-    /// the exact fragment scope, deletion mask, and any required data-level recheck.
+    /// Address-domain results are restricted before translation to stable row ids. Native
+    /// row-id results can still cover other fragments, so the consumer remains responsible
+    /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
     pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self

@@ -34,7 +34,9 @@ pub(crate) mod segment_coverage;
 mod statistics;
 pub mod vector;
 
-pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+pub use crate::index::api::{
+    DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment,
+};
 pub use crate::index::loading::DatasetIndexInternalExt;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};

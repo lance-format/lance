@@ -9,6 +9,7 @@ mod commit;
 mod concurrent_reindex;
 mod execution;
 mod frag_reuse;
+mod frag_reuse_contract;
 mod index_remap;
 mod lineage;
 mod overlays;

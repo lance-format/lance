@@ -61,7 +61,6 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
-    optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
@@ -101,6 +100,7 @@ use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use self::base_path::DatasetBasePath;
 use self::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    ExpireVersionsPlan, ExpireVersionsStats,
 };
 use self::commit::PyCommitLock;
 use self::delta::DatasetDeltaBuilder;
@@ -116,6 +116,8 @@ pub(crate) mod delta;
 pub mod io_stats;
 pub(crate) mod merge_insert;
 pub mod optimize;
+pub mod optimize_indices;
+mod replayable;
 pub(crate) mod sql;
 pub mod stats;
 pub(crate) mod write;
@@ -376,6 +378,58 @@ fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
         index_files_removed: stats.index_files_removed,
         deletion_files_removed: stats.deletion_files_removed,
         failed_deletes: stats.failed_deletes,
+    }
+}
+
+/// Build an `ExpireVersionsPolicy` from the Python-facing arguments.
+///
+/// `keep_one_per_micros` is microseconds rather than seconds: `timedelta` resolves to
+/// microseconds, so this is lossless, whereas truncating to seconds would silently widen a
+/// sub-second width and delete more history than asked for.
+fn expire_versions_policy(
+    before_micros: Option<i64>,
+    before_version: Option<u64>,
+    keep_one_per_micros: Option<u64>,
+    error_if_tagged_old_versions: Option<bool>,
+    delete_rate_limit: Option<u64>,
+) -> PyResult<lance::dataset::expire::ExpireVersionsPolicy> {
+    let mut builder = lance::dataset::expire::ExpireVersionsPolicyBuilder::default();
+    if let Some(micros) = before_micros {
+        // A duration, not an absolute time, matching `cleanup_policy`: the caller says
+        // "older than this" and the cutoff is computed here against one clock.
+        builder = builder.before_timestamp(Utc::now() - Duration::microseconds(micros));
+    }
+    if let Some(version) = before_version {
+        builder = builder.before_version(version);
+    }
+    if let Some(micros) = keep_one_per_micros {
+        builder = builder.keep_one_per(std::time::Duration::from_micros(micros));
+    }
+    if let Some(error) = error_if_tagged_old_versions {
+        builder = builder.error_if_tagged_old_versions(error);
+    }
+    if let Some(rate) = delete_rate_limit {
+        builder = builder.delete_rate_limit(rate);
+    }
+    Ok(builder.build())
+}
+
+fn expire_versions_stats(
+    stats: lance::dataset::expire::ExpireVersionsStats,
+) -> ExpireVersionsStats {
+    ExpireVersionsStats {
+        versions_removed: stats.versions_removed,
+        versions_retained: stats.versions_retained,
+        bytes_removed: stats.bytes_removed,
+        failed_deletes: stats.failed_deletes,
+    }
+}
+
+fn expire_versions_plan(plan: lance::dataset::expire::ExpireVersionsPlan) -> ExpireVersionsPlan {
+    ExpireVersionsPlan {
+        versions: plan.versions,
+        stats: expire_versions_stats(plan.stats),
+        tagged_but_kept: plan.tagged_but_kept,
     }
 }
 
@@ -1641,6 +1695,24 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    /// Per-fragment column-layout stats, in manifest fragment order.
+    fn column_layout_stats(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.ds
+            .column_layout_stats()
+            .into_iter()
+            .map(|stats| {
+                let dict = PyDict::new(py);
+                dict.set_item("fragment_id", stats.fragment_id)?;
+                dict.set_item("live_file_count", stats.live_file_count)?;
+                dict.set_item("file_sizes", stats.file_sizes)?;
+                dict.set_item("fields_per_file", stats.fields_per_file)?;
+                dict.set_item("dead_slot_ratio", stats.dead_slot_ratio)?;
+                dict.set_item("overlay_count", stats.overlay_count)?;
+                Ok(dict.unbind())
+            })
+            .collect()
+    }
+
     #[pyo3(signature=(new_bases, transaction_properties=None))]
     fn add_bases(
         &mut self,
@@ -1859,6 +1931,59 @@ impl Dataset {
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         Ok(cleanup_stats(stats))
+    }
+
+    /// Remove version history without deleting any data files.
+    ///
+    /// Data files that only an expired version referenced are left behind for
+    /// `cleanup_old_versions` to reclaim.
+    #[pyo3(signature = (before_micros = None, before_version = None, keep_one_per_micros = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    fn expire_versions(
+        &self,
+        before_micros: Option<i64>,
+        before_version: Option<u64>,
+        keep_one_per_micros: Option<u64>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> PyResult<ExpireVersionsStats> {
+        let policy = expire_versions_policy(
+            before_micros,
+            before_version,
+            keep_one_per_micros,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )?;
+        let stats = rt()
+            .block_on(None, async {
+                lance::dataset::expire::expire_versions(self.ds.as_ref(), policy).await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        Ok(expire_versions_stats(stats))
+    }
+
+    /// Report what `expire_versions` would remove, without removing it.
+    #[pyo3(signature = (before_micros = None, before_version = None, keep_one_per_micros = None, error_if_tagged_old_versions = None, delete_rate_limit = None))]
+    fn explain_expire_versions(
+        &self,
+        before_micros: Option<i64>,
+        before_version: Option<u64>,
+        keep_one_per_micros: Option<u64>,
+        error_if_tagged_old_versions: Option<bool>,
+        delete_rate_limit: Option<u64>,
+    ) -> PyResult<ExpireVersionsPlan> {
+        let policy = expire_versions_policy(
+            before_micros,
+            before_version,
+            keep_one_per_micros,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )?;
+        let plan = rt()
+            .block_on(None, async {
+                lance::dataset::expire::explain_expire_versions(self.ds.as_ref(), &policy).await
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        Ok(expire_versions_plan(plan))
     }
 
     /// Explain cleanup old versions from the dataset without deleting files
@@ -2130,22 +2255,7 @@ impl Dataset {
     #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let mut options: OptimizeOptions = Default::default();
-        if let Some(kwargs) = kwargs {
-            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-                options.num_indices_to_merge = num_indices_to_merge.extract()?;
-            }
-            if let Some(retrain) = kwargs.get_item("retrain")? {
-                options.retrain = retrain.extract()?;
-            }
-            if let Some(index_names) = kwargs.get_item("index_names")? {
-                options.index_names = Some(
-                    index_names
-                        .extract::<Vec<String>>()
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                );
-            }
-        }
+        let options = optimize_indices::optimize_options(kwargs)?;
         rt().block_on(
             None,
             new_self
@@ -2554,6 +2664,19 @@ impl Dataset {
         rt().block_on(None, self.ds.calculate_data_stats())?
             .infer_error()
             .map(PyLance)
+    }
+
+    /// Per-zone statistics for a ZoneMap index, as one Arrow record batch.
+    #[pyo3(signature = (index_name))]
+    fn zone_statistics<'py>(
+        &self,
+        py: Python<'py>,
+        index_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batch = rt()
+            .block_on(None, self.ds.statistics().zone_statistics(&index_name))?
+            .infer_error()?;
+        batch.to_pyarrow(py)
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
