@@ -12,6 +12,7 @@
 //! contract in lance-table.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
@@ -39,11 +40,11 @@ use super::json::{JsonIndexPlugin, JsonQuery};
 use super::label_list::LabelListIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::ngram::NGramIndexPlugin;
-use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
+use super::registry::{ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
 use super::zonemap::ZoneMapIndexPlugin;
 use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, Remapper, SargableQuery, ScalarIndex, TextQuery,
-    TokenQuery,
+    AnyQuery, BloomFilterQuery, CreatedIndex, LabelListQuery, Remapper, SargableQuery, ScalarIndex,
+    TextQuery, TokenQuery,
 };
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
@@ -262,6 +263,23 @@ async fn load(
     store_dir: &TempObjDir,
     remapper: Option<Remapper>,
 ) -> Arc<dyn ScalarIndex> {
+    let (store, created) = train(case, store_dir).await;
+    case.plugin
+        .remapping_loader()
+        .expect("translates row addresses")
+        .load_remapped(
+            store,
+            &created.index_details,
+            created.index_version,
+            remapper,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap()
+}
+
+/// An index of `case`'s kind over [`rows`], trained into `store_dir`.
+async fn train(case: &Case, store_dir: &TempObjDir) -> (Arc<LanceIndexStore>, CreatedIndex) {
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(ObjectStore::local()),
         (**store_dir).clone(),
@@ -310,18 +328,7 @@ async fn load(
         )
         .await
         .unwrap();
-    case.plugin
-        .remapping_loader()
-        .expect("translates row addresses")
-        .load_remapped(
-            store,
-            &created.index_details,
-            created.index_version,
-            remapper,
-            &LanceCache::no_cache(),
-        )
-        .await
-        .unwrap()
+    (store, created)
 }
 
 async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
@@ -398,6 +405,84 @@ async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     for value in (0..8).chain(100..104) {
         let (rows, is_exact) = search(&case, index.as_ref(), value).await;
         let expected = built_addresses(value);
+        if is_exact {
+            assert_eq!(rows, expected, "value {value}");
+        } else {
+            assert!(
+                expected
+                    .row_addrs()
+                    .unwrap()
+                    .all(|addr| rows.contains(addr.into())),
+                "value {value}: {rows:?} misses {expected:?}"
+            );
+        }
+    }
+}
+
+/// A second open of the same translation is served from the cache without
+/// loading again, and still answers with current addresses.
+#[rstest]
+#[case::btree(btree())]
+#[case::bitmap(bitmap())]
+#[case::zonemap(zonemap())]
+#[case::bloomfilter(bloomfilter())]
+#[case::ngram(ngram())]
+#[case::inverted(inverted())]
+#[case::label_list(label_list())]
+#[case::json(json())]
+#[case::fm(fm())]
+#[tokio::test]
+async fn warm_open_answers_with_current_addresses(#[case] case: Case) {
+    let store_dir = TempObjDir::default();
+    let (store, created) = train(&case, &store_dir).await;
+    let loader = case
+        .plugin
+        .remapping_loader()
+        .expect("translates row addresses");
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let loads = AtomicUsize::new(0);
+    let open = |remapper: Remapper| {
+        let store = store.clone();
+        let created = &created;
+        let cache = &cache;
+        let loads = &loads;
+        let load: ScalarIndexLoad<'_> = Box::pin({
+            let store = store.clone();
+            let remapper = remapper.clone();
+            async move {
+                loads.fetch_add(1, Ordering::SeqCst);
+                loader
+                    .load_remapped(
+                        store,
+                        &created.index_details,
+                        created.index_version,
+                        Some(remapper),
+                        cache,
+                    )
+                    .await
+            }
+        });
+        loader.get_or_insert_remapped_in_cache(store, Some(remapper), cache, load)
+    };
+
+    let (remapper, _) = script().into_remapper();
+    open(remapper).await.unwrap();
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    let (remapper, _) = script().into_remapper();
+    let index = open(remapper).await.unwrap();
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        1,
+        "the warm open loaded again"
+    );
+
+    for value in (0..8).chain(100..104) {
+        let (rows, is_exact) = search(&case, index.as_ref(), value).await;
+        assert!(
+            rows.get(&0).is_none(),
+            "value {value} answered with a stale address: {rows:?}"
+        );
+        let expected = current_addresses(value);
         if is_exact {
             assert_eq!(rows, expected, "value {value}");
         } else {

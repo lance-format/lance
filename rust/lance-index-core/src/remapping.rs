@@ -915,4 +915,112 @@ mod tests {
             );
         });
     }
+
+    /// A [`Remapper`] following [`Sizing`]'s moves, and the calls it makes.
+    fn sizing_remapper() -> (Remapper, Arc<Sizing>) {
+        let sizing = Arc::new(Sizing::new(&[], u64::MAX));
+        let remapper =
+            DeprecatedRemapper::batch(Some(sizing.clone() as Arc<dyn BatchRowIdRemapper>)).unwrap();
+        (remapper, sizing)
+    }
+
+    #[test]
+    fn translate_preserving_layout_keeps_every_slot() {
+        block_on(async {
+            let (remapper, sizing) = sizing_remapper();
+            let batch = record_batch!(
+                (
+                    "addr",
+                    UInt64,
+                    [Some(addr(1, 0)), None, Some(addr(1, 1)), Some(addr(2, 0))]
+                ),
+                ("value", Int32, [1, 2, 3, 4])
+            )
+            .unwrap();
+            let (translated, tombstones) = translate_preserving_layout(&remapper, batch, 0)
+                .await
+                .unwrap();
+            let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+            assert_eq!(
+                translated,
+                record_batch!(
+                    (
+                        "addr",
+                        UInt64,
+                        [
+                            Some(addr(5, 0)),
+                            Some(tombstone),
+                            Some(tombstone),
+                            Some(addr(2, 0))
+                        ]
+                    ),
+                    ("value", Int32, [1, 2, 3, 4])
+                )
+                .unwrap()
+            );
+            assert_eq!(tombstones.remap_row_id(tombstone), None);
+
+            let rows = BATCH_SIZE + 1;
+            let batch = RecordBatch::try_from_iter([(
+                "addr",
+                Arc::new(UInt64Array::from(vec![addr(1, 0); rows])) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            let before = sizing.calls.load(Ordering::Relaxed);
+            let (translated, _) = translate_preserving_layout(&remapper, batch, 0)
+                .await
+                .unwrap();
+            assert_eq!(translated.num_rows(), rows);
+            assert_eq!(sizing.calls.load(Ordering::Relaxed) - before, 2);
+        });
+    }
+
+    #[test]
+    fn translate_record_batch_drops_deleted_and_null_rows() {
+        block_on(async {
+            let (remapper, _) = sizing_remapper();
+            let batch = record_batch!(
+                (
+                    "addr",
+                    UInt64,
+                    [Some(addr(1, 0)), None, Some(addr(1, 1)), Some(addr(2, 0))]
+                ),
+                ("value", Int32, [1, 2, 3, 4])
+            )
+            .unwrap();
+            let translated = translate_record_batch(&remapper, batch.clone(), 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                translated,
+                record_batch!(
+                    ("addr", UInt64, [addr(5, 0), addr(2, 0)]),
+                    ("value", Int32, [1, 4])
+                )
+                .unwrap()
+            );
+
+            let error = translate_record_batch(&remapper, batch, 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        });
+    }
+
+    #[test]
+    fn translate_treemap_translates_in_bounded_batches() {
+        block_on(async {
+            let (remapper, sizing) = sizing_remapper();
+            let addrs: RoaringTreemap = (0..=BATCH_SIZE as u64)
+                .map(|offset| addr(1, offset))
+                .collect();
+            let translated = translate_treemap(&remapper, &addrs).await.unwrap();
+            let expected: RoaringTreemap = (0..=BATCH_SIZE as u64)
+                .filter(|&offset| offset != 1)
+                .map(|offset| addr(5, offset))
+                .collect();
+            assert_eq!(translated, expected);
+            assert_eq!(sizing.calls.load(Ordering::Relaxed), 2);
+        });
+    }
 }

@@ -293,6 +293,32 @@ mod tests {
         assert!(error.to_string().contains("fragment 1"), "{error}");
     }
 
+    #[tokio::test]
+    async fn translate_set_of_nothing_translates_nothing() {
+        let (remapper, script) = script();
+        let translated = remapper
+            .translate_set(&RowAddrTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(translated, RowAddrTreeMap::new());
+        assert_eq!(script.batches(), 0);
+    }
+
+    /// Two stored addresses that now name the same row (a sibling's rewrite
+    /// merged them) come back as that one address.
+    #[tokio::test]
+    async fn translate_set_merges_addresses_that_collapse() {
+        let (remapper, _) = ScriptedRemapper::new()
+            .moved(address(1, 0), address(3, 4))
+            .moved(address(2, 0), address(3, 4))
+            .into_remapper();
+        let addrs = RowAddrTreeMap::from_iter([address(1, 0), address(2, 0)]);
+        assert_eq!(
+            remapper.translate_set(&addrs).await.unwrap(),
+            RowAddrTreeMap::from_iter([address(3, 4)])
+        );
+    }
+
     #[test]
     fn lineage_questions_need_no_translation() {
         let (remapper, script) = script();
