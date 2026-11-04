@@ -294,6 +294,8 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional[LanceNamespace] = None,
         table_id: Optional[List[str]] = None,
+        *,
+        session: Optional[_Session] = None,
     ): ...
     def open_reader(
         self, path: str, columns: Optional[List[str]] = None
@@ -332,6 +334,7 @@ class LanceFileReader:
         namespace_client: Optional[LanceNamespace],
         table_id: Optional[List[str]],
         columns: Optional[List[str]] = None,
+        session: Optional[_Session] = None,
     ): ...
     def read_all(
         self, batch_size: int, batch_readahead: int
