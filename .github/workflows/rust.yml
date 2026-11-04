@@ -429,7 +429,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run --cargo-profile ci -p lance-io
   windows-arm-build:
+    # Same scope as windows-build: lance-io on PRs, full suite nightly.
     runs-on: windows-11-arm
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: rust
@@ -445,9 +447,9 @@ jobs:
         with:
           tool: nextest
       - name: Build tests
-        run: cargo nextest run --cargo-profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
       - name: Run tests
-        run: cargo nextest run --cargo-profile ci
+        run: cargo nextest run --cargo-profile ci -p lance-io
 
   qemu-pre-haswell:
     # Builds lance-linalg's lib tests once in release mode and runs them twice: on
