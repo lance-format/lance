@@ -229,7 +229,8 @@ impl FriImpl for TaggedHistory {
             .stored
             .iter()
             .zip(retained)
-            .filter_map(|(stored, kept)| kept.then(|| stored.clone()))
+            .filter(|(_, kept)| *kept)
+            .map(|(stored, _)| stored.clone())
             .collect();
         self.rebuilt(concat(&kept))
     }
@@ -685,6 +686,57 @@ mod tests {
             remapper.translate_fragments(&RoaringBitmap::from_iter([2])),
             RoaringBitmap::from_iter([3])
         );
+    }
+
+    /// A tagged transition records no version on the wire, so the caught-up
+    /// rule bounds it by the entry's `dataset_version`, which every later
+    /// rewrite of the entry raises. Under continuous compaction a segment
+    /// built after a transition onto its destinations therefore stops being
+    /// read directly once another rewrite lands, and is translated instead
+    /// (correct, at the cost of translating). Trimming does not depend on
+    /// that bound: it releases the transition once no logical index derives
+    /// coverage from its sources, so the history still drains.
+    #[test]
+    fn the_entry_version_bounds_reads_but_not_the_drain() {
+        use crate::system_index::frag_reuse::plan::{RowDomain, TranslationSupport};
+        let first = FragReuseHistory::empty(HistoryFormat::Tagged)
+            .append(RewriteRecord::new(
+                5,
+                vec![ordered(&[whole(0, 2)], &[(1, 2)])],
+            ))
+            .unwrap();
+        // Rebuilt over the destination at version 6, after the rewrite.
+        let segment = SegmentSummary {
+            uuid: uuid::Uuid::new_v4(),
+            fragment_bitmap: Some(RoaringBitmap::from_iter([1])),
+            dataset_version: 6,
+            domain: RowDomain::Address,
+            translation: TranslationSupport::Supported,
+        };
+        assert!(first.is_caught_up(5, &segment));
+        // An unrelated rewrite re-stamps the entry at version 9.
+        let second = first
+            .append(RewriteRecord::new(
+                9,
+                vec![ordered(&[whole(7, 2)], &[(8, 2)])],
+            ))
+            .unwrap();
+        assert!(!second.is_caught_up(9, &segment));
+        let live = RoaringBitmap::from_iter([1, 8]);
+        let context = ReadContext {
+            entry_version: 9,
+            live_fragments: &live,
+        };
+        let plan = second
+            .plan(&context, std::slice::from_ref(&segment))
+            .remove(0);
+        let ReadPlan::Translate(plan) = plan else {
+            panic!("the upper bound translates the segment, got {plan:?}");
+        };
+        assert_eq!(plan.coverage(), &RoaringBitmap::from_iter([1]));
+        // Nothing derives coverage from either transition's sources.
+        let trimmed = second.trim(&[vec![segment]]).unwrap();
+        assert_eq!(trimmed.records().count(), 0);
     }
 
     #[test]

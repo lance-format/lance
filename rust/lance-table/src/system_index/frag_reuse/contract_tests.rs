@@ -1112,3 +1112,216 @@ async fn bound_plan_translates_through_mixed_mappings(
         RoaringBitmap::from_iter([2, 3])
     );
 }
+
+/// How a reader translates `addrs`, stored by `segment`, under `history`:
+/// unchanged when the segment is direct, nothing when it is excluded.
+async fn read_translation(
+    history: &FragReuseHistory,
+    live: &RoaringBitmap,
+    segment: &SegmentSummary,
+    addrs: &[u64],
+) -> Vec<Option<u64>> {
+    let context = ReadContext {
+        entry_version: REWRITE_VERSION,
+        live_fragments: live,
+    };
+    let mut translated: Vec<Option<u64>> = addrs.iter().copied().map(Some).collect();
+    match history
+        .plan(&context, std::slice::from_ref(segment))
+        .remove(0)
+    {
+        ReadPlan::Direct => {}
+        ReadPlan::Translate(plan) => plan
+            .bind(Arc::new(InMemoryMappings::default()))
+            .translate_in_place(&mut translated)
+            .await
+            .unwrap(),
+        ReadPlan::Excluded => translated.fill(None),
+    }
+    translated
+}
+
+/// Trimming for a set of live segments never changes how any of them is
+/// read: every record a segment's addresses still pass through is kept,
+/// and a history no segment needs trims to nothing.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+#[case::tagged(Reading::Tagged)]
+#[tokio::test]
+async fn trim_never_drops_a_transition_a_live_segment_still_needs(#[case] reading: Reading) {
+    let (history, live) = rewritten(reading);
+    let supported = TranslationSupport::Supported;
+    let stale = segment(&[0, 3], 1, supported);
+    let caught_up = segment(&[1, 2], REWRITE_VERSION + 1, supported);
+    let disjoint = segment(&[2], 1, supported);
+    for live_segments in [
+        vec![vec![stale.clone()]],
+        vec![vec![caught_up.clone()], vec![stale.clone()]],
+        vec![vec![caught_up.clone(), disjoint.clone()]],
+        vec![],
+    ] {
+        let trimmed = history.trim(&live_segments).unwrap();
+        for segment in live_segments.iter().flatten() {
+            let addrs: Vec<u64> = segment
+                .fragment_bitmap
+                .iter()
+                .flatten()
+                .map(|fragment| address(u64::from(fragment), 0))
+                .collect();
+            assert_eq!(
+                read_translation(&trimmed, &live, segment, &addrs).await,
+                read_translation(&history, &live, segment, &addrs).await,
+                "{segment:?}"
+            );
+        }
+        let needed = live_segments
+            .iter()
+            .flatten()
+            .any(|segment| segment.uuid == stale.uuid);
+        assert_eq!(
+            trimmed.records().count(),
+            usize::from(needed),
+            "{live_segments:?}"
+        );
+    }
+}
+
+/// A tagged history holding records this writer cannot interpret is
+/// neither trimmed nor asked for its files: the unknown records may need
+/// lineage or reference files it cannot see.
+#[test]
+fn trim_refuses_a_tagged_history_it_cannot_interpret() {
+    let mut content = unknown_record();
+    content.extend(length_delimited(
+        super::history::TRANSITION_FIELD,
+        &ordered(&[whole(0, 1)], &[(1, 1)]).encode_to_vec(),
+    ));
+    let history = RawHistory::new(HistoryFormat::Tagged, content.into())
+        .validate()
+        .unwrap();
+    let error = history.trim(&[]).unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    let error = history.referenced_files().unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+}
+
+/// The files a history references cover every row map its trimmed form can
+/// still read, and a format without external mappings references none.
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy)]
+#[case::tagged(HistoryFormat::Tagged)]
+fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: HistoryFormat) {
+    let mut history = record_natively(
+        FragReuseHistory::empty(format),
+        REWRITE_VERSION,
+        &[whole(0, 4)],
+        &[(1, 4)],
+    );
+    if format == HistoryFormat::Tagged {
+        history = history
+            .append(RewriteRecord::new(
+                REWRITE_VERSION,
+                vec![partition(5, 6, MAP_A)],
+            ))
+            .unwrap();
+    }
+    let reachable = |history: &FragReuseHistory| -> Vec<String> {
+        history
+            .ledger()
+            .transitions()
+            .iter()
+            .filter_map(|transition| match transition.mapping() {
+                super::ledger::Mapping::StablePartition(partition) => {
+                    Some(partition.map_id.clone())
+                }
+                super::ledger::Mapping::OrderedCompaction(_) => None,
+            })
+            .collect()
+    };
+    let listed = |history: &FragReuseHistory| -> Vec<String> {
+        history
+            .referenced_files()
+            .unwrap()
+            .iter()
+            .map(|mapping| mapping.map_id().to_string())
+            .collect()
+    };
+    let over_partition = segment(&[5], 1, TranslationSupport::Supported);
+    let over_compaction = segment(&[0], 1, TranslationSupport::Supported);
+    for live in [
+        vec![vec![over_partition.clone()]],
+        vec![vec![over_compaction.clone()]],
+        vec![vec![over_partition, over_compaction]],
+        vec![],
+    ] {
+        let trimmed = history.trim(&live).unwrap();
+        let listed = listed(&trimmed);
+        let reachable = reachable(&trimmed);
+        for map_id in &reachable {
+            assert!(listed.contains(map_id), "{map_id} is not listed");
+        }
+        assert_eq!(listed.len(), reachable.len());
+    }
+    let expected: Vec<String> = match format {
+        HistoryFormat::Legacy => vec![],
+        HistoryFormat::Tagged => vec![MAP_A.to_string()],
+    };
+    assert_eq!(listed(&history), expected);
+}
+
+/// A composed rewrite moves every stored address exactly as following the
+/// history one transition at a time does, and publishes the fragments the
+/// addresses land in. Version 0 histories are not composed: their segments
+/// are rewritten by the frozen version 0 remap.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+#[case::tagged(Reading::Tagged)]
+#[tokio::test]
+async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
+    use super::plan::{Composition, RewriteContext};
+    let (history, live) = rewritten(reading);
+    let (history, live) = match reading {
+        // A second hop, so composition spans more than one transition.
+        Reading::Tagged => (
+            record_natively(history, REWRITE_VERSION, &[whole(1, 2)], &[(4, 2)]),
+            RoaringBitmap::from_iter([2, 4]),
+        ),
+        _ => (history, live),
+    };
+    let lineage = history.fragment_bitmap();
+    let rows = std::collections::HashMap::from([(2, 1)]);
+    let context = RewriteContext {
+        live_fragments: &live,
+        lineage: &lineage,
+        fragment_rows: &rows,
+    };
+    let stale = segment(&[0, 2, 3], 1, TranslationSupport::Supported);
+    let composed = history.compose(&context, &stale);
+    if reading != Reading::Tagged {
+        let error = composed.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        return;
+    }
+    let Composition::Rewrite(plan) = composed.unwrap() else {
+        panic!("a stale segment is rewritten");
+    };
+    assert_eq!(plan.coverage(), &RoaringBitmap::from_iter([2, 4]));
+    let remapper = plan.bind(Arc::new(InMemoryMappings::default()));
+    let stored = [address(0, 0), address(3, 0), address(2, 0)];
+    let mut addrs: Vec<Option<u64>> = stored.iter().copied().map(Some).collect();
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    let expected: Vec<Option<u64>> = stored
+        .iter()
+        .map(|&addr| translate(history.ledger(), addr))
+        .collect();
+    assert_eq!(addrs, expected);
+    assert_eq!(addrs[0], Some(address(4, 0)));
+
+    let caught_up = segment(&[2, 4], REWRITE_VERSION + 1, TranslationSupport::Supported);
+    assert_eq!(
+        history.compose(&context, &caught_up).unwrap(),
+        Composition::CaughtUp
+    );
+}
