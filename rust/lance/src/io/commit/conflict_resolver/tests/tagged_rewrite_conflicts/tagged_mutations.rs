@@ -2207,10 +2207,28 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
             Some(roaring::RoaringBitmap::new()),
             "listed with no coverage"
         );
-        dataset
+        use lance_index::scalar::{SargableQuery, SearchResult};
+        let withdrawn = dataset
             .open_scalar_index("v", &v_idx.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
+        for value in [0, 1, 2, 222] {
+            let SearchResult::Exact(rows) = withdrawn
+                .search(
+                    &SargableQuery::Equals(datafusion::scalar::ScalarValue::Int32(Some(value))),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("expected an exact result");
+            };
+            assert_eq!(
+                rows.true_rows().row_addrs().unwrap().count(),
+                0,
+                "the withdrawn segment answers for no rows (v = {value})"
+            );
+        }
         dataset
             .open_scalar_index_for_maintenance("v", &v_idx.uuid, &NoOpMetricsCollector)
             .await

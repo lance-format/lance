@@ -1901,29 +1901,6 @@ pub mod tests {
             assert_eq!(bytes.as_ref(), content);
         }
     }
-    #[tokio::test]
-    async fn v0_writer_metadata_is_never_tagged() {
-        use lance_table::system_index::frag_reuse::FragReuseIndexDetails;
-        use lance_table::system_index::frag_reuse::metadata::is_tagged;
-
-        let dataset = fixture().await;
-        let details = FragReuseIndexDetails { versions: vec![] };
-        let meta =
-            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, RoaringBitmap::new())
-                .await
-                .unwrap();
-        assert_eq!(meta.index_version, 0);
-        assert!(!is_tagged(&meta));
-
-        // Carrying an existing v0 entry forward preserves version 0.
-        let details = FragReuseIndexDetails { versions: vec![] };
-        let carried =
-            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, RoaringBitmap::new())
-                .await
-                .unwrap();
-        assert_eq!(carried.index_version, 0);
-        assert!(!is_tagged(&carried));
-    }
 }
 
 #[cfg(test)]

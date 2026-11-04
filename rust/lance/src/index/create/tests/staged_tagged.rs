@@ -448,6 +448,46 @@ async fn staged_ngram_segments_needing_translation_are_refused() {
     assert!(error.to_string().contains("Rebuild"), "{error}");
 }
 
+/// Without a rewrite to translate through, staged NGram segments merge and
+/// commit, and the committed segment serves its fragments.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_ngram_segments_merge_without_a_rewrite() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "text", IndexType::NGram, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "text", IndexType::NGram, vec![1]).await;
+    let merged = dataset
+        .merge_existing_index_segments(vec![s1, s2])
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![merged.clone()])
+        .await
+        .unwrap();
+
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let stored = stored_segment(&dataset, "staged").await;
+    assert_eq!(stored.uuid, merged.uuid);
+    assert_eq!(
+        stored.fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([0u32, 1])
+    );
+    let predicate = "contains(text, 'docu')";
+    let plan = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some(predicate), true).await,
+        (0..8).collect::<Vec<_>>()
+    );
+}
+
 /// A segment that is neither staged nor listed in the manifest is an error
 /// for the coverage builder, never empty coverage; with its plan, the same
 /// segment gets the coverage the plan derives.

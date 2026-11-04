@@ -282,11 +282,18 @@ fn plan_one(reading: Reading, segment: SegmentSummary) -> ReadPlan {
 /// A segment built after the rewrite, or covering none of its fragments,
 /// is caught up and read directly. The comparison is strict: a segment built
 /// at the rewrite's version read its sources.
+///
+/// A segment without a recorded bitmap is never read directly. Legacy keeps
+/// the rule released writers relied on and takes it as caught up once built
+/// after the rewrite; tagged never does.
 #[rstest]
-#[case::legacy(Reading::Legacy)]
-#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
-#[case::tagged(Reading::Tagged)]
-fn caught_up_segment_is_direct(#[case] reading: Reading) {
+#[case::legacy(Reading::Legacy, true)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, true)]
+#[case::tagged(Reading::Tagged, false)]
+fn caught_up_segment_is_direct(
+    #[case] reading: Reading,
+    #[case] trusts_unknown_coverage_built_after: bool,
+) {
     let (history, _) = rewritten(reading);
     let supported = TranslationSupport::Supported;
     for (covered, dataset_version, is_caught_up) in [
@@ -310,6 +317,33 @@ fn caught_up_segment_is_direct(#[case] reading: Reading) {
             "{covered:?} at version {dataset_version}: {plan:?}"
         );
     }
+
+    for (dataset_version, is_caught_up) in [
+        (REWRITE_VERSION + 1, trusts_unknown_coverage_built_after),
+        (REWRITE_VERSION, false),
+    ] {
+        let mut summary = segment(&[], dataset_version, supported);
+        summary.fragment_bitmap = None;
+        assert_eq!(
+            history.is_caught_up(REWRITE_VERSION, &summary),
+            is_caught_up,
+            "no bitmap at version {dataset_version}"
+        );
+        assert_ne!(plan_one(reading, summary), ReadPlan::Direct);
+    }
+}
+
+/// A version 0 group is translated as a whole: a segment covering only part
+/// of it holds addresses the group moved, however late it was built.
+#[test]
+fn legacy_segment_covering_part_of_a_group_is_translated() {
+    let partial = segment(&[0], REWRITE_VERSION + 1, TranslationSupport::Supported);
+    let (history, _) = rewritten(Reading::Legacy);
+    assert!(!history.is_caught_up(REWRITE_VERSION, &partial));
+    assert!(matches!(
+        plan_one(Reading::Legacy, partial),
+        ReadPlan::Translate(_)
+    ));
 }
 
 /// Every fragment a segment answers for is live, and either one it covers
@@ -370,14 +404,17 @@ fn effective_coverage_never_claims_an_untranslatable_fragment(#[case] reading: R
 /// provide. Legacy trusts every kind (fail-closed plugins come with the
 /// `Remapper`); on a table with stable row IDs the legacy reader applies the
 /// history to every segment it opens, so a kind that cannot apply it, or one
-/// storing stable row IDs, is excluded even when caught up.
+/// storing stable row IDs, is excluded even when caught up. Tagged cannot
+/// translate a segment whose coverage was never recorded; legacy translates
+/// it as covering nothing.
 #[rstest]
-#[case::legacy(Reading::Legacy, [false, false, false])]
-#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true])]
-#[case::tagged(Reading::Tagged, [true, false, false])]
+#[case::legacy(Reading::Legacy, [false, false, false], false)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true], false)]
+#[case::tagged(Reading::Tagged, [true, false, false], true)]
 fn excluded_only_when_translation_is_needed_and_unsupported(
     #[case] reading: Reading,
     #[case] is_excluded: [bool; 3],
+    #[case] excludes_unknown_coverage: bool,
 ) {
     let unsupported = TranslationSupport::Unsupported;
     let stale = segment(&[0, 3], 1, unsupported);
@@ -396,6 +433,44 @@ fn excluded_only_when_translation_is_needed_and_unsupported(
         let plan = plan_one(reading, segment(covered, 1, TranslationSupport::Supported));
         assert_ne!(plan, ReadPlan::Excluded, "{covered:?}");
     }
+    let mut unknown_coverage = segment(&[], 1, TranslationSupport::Supported);
+    unknown_coverage.fragment_bitmap = None;
+    let plan = plan_one(reading, unknown_coverage);
+    assert_eq!(
+        plan == ReadPlan::Excluded,
+        excludes_unknown_coverage,
+        "{plan:?}"
+    );
+    if let ReadPlan::Translate(plan) = plan {
+        assert!(plan.coverage().is_empty(), "{plan:?}");
+    }
+}
+
+/// Recording onto the stable-row-ID reading keeps it: segments it cannot
+/// apply the history to stay excluded, and it still cannot be lifted.
+#[test]
+fn stable_row_id_reading_survives_append() {
+    let (history, _) = rewritten(Reading::LegacyStableRowIds);
+    let appended = history
+        .append(RewriteRecord::new(
+            REWRITE_VERSION + 1,
+            vec![ordered(&[whole(2, 1)], &[(4, 1)])],
+        ))
+        .unwrap();
+    assert_eq!(appended.format(), HistoryFormat::Legacy);
+    let live = RoaringBitmap::from_iter([1, 4]);
+    let context = ReadContext {
+        entry_version: REWRITE_VERSION + 1,
+        live_fragments: &live,
+    };
+    let mut row_ids = segment(&[1], REWRITE_VERSION + 2, TranslationSupport::Supported);
+    row_ids.domain = RowDomain::StableRowId;
+    assert_eq!(
+        appended.plan(&context, std::slice::from_ref(&row_ids)),
+        vec![ReadPlan::Excluded]
+    );
+    let error = appended.lift().unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
 /// A segment with no remaining coverage is still translated, not excluded,
@@ -533,12 +608,13 @@ fn overlaid_fragment(id: u64) -> Fragment {
 /// rewrite already recorded would consume its sources twice. A stable
 /// partition needs the tagged format.
 #[rstest]
-#[case::legacy(HistoryFormat::Legacy, false, true)]
-#[case::tagged(HistoryFormat::Tagged, true, false)]
+#[case::legacy(HistoryFormat::Legacy, false, true, "duplicate producer")]
+#[case::tagged(HistoryFormat::Tagged, true, false, "already records a transition")]
 fn append_refuses_what_the_format_cannot_record(
     #[case] format: HistoryFormat,
     #[case] refuses_overlays: bool,
     #[case] refuses_stable_partitions: bool,
+    #[case] recorded_twice: &str,
 ) {
     let history = record_natively(
         FragReuseHistory::empty(format),
@@ -565,6 +641,7 @@ fn append_refuses_what_the_format_cannot_record(
         ))
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains(recorded_twice), "{error}");
 
     match history.append(RewriteRecord::new(2, vec![partition(7, 8, MAP_A)])) {
         Err(error) if refuses_stable_partitions => {

@@ -120,7 +120,9 @@ impl<'a> FriPolicy<'a> {
 mod tests {
     use super::*;
     use crate::feature_flags::{FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS};
-    use crate::system_index::frag_reuse::history::tests::{MAP_A, partition};
+    use crate::system_index::frag_reuse::history::tests::{
+        MAP_A, ordered as ordered_transition, partition, whole,
+    };
 
     fn entry(index_version: i32) -> IndexMetadata {
         IndexMetadata {
@@ -209,6 +211,22 @@ mod tests {
 
         let untagged = manifest(false);
         assert_eq!(format(&untagged, &ordered).unwrap(), HistoryFormat::Legacy);
+        // Carrying a version 0 entry forward on an untagged table writes
+        // version 0 again.
+        let legacy = [entry(0)];
+        let rewrite = RewriteRecord::new(2, vec![ordered_transition(&[whole(0, 1)], &[(1, 1)])]);
+        let carried = FriPolicy::new(&untagged, &legacy)
+            .recording_history(
+                Some(FragReuseHistory::empty(HistoryFormat::Legacy)),
+                &rewrite,
+            )
+            .unwrap()
+            .append(rewrite)
+            .unwrap()
+            .encode(2)
+            .entry;
+        assert_eq!(carried.index_version, 0);
+        assert!(!is_tagged(&carried));
         assert_eq!(
             format(&untagged, &stable_partition).unwrap(),
             HistoryFormat::Tagged

@@ -340,6 +340,7 @@ mod tests {
     };
     use crate::system_index::frag_reuse::history::{FragReuseHistory, RawHistory};
     use crate::system_index::frag_reuse::ledger::Mapping;
+    use crate::system_index::frag_reuse::plan::RowDomain;
 
     #[test]
     fn appended_transitions_are_validated_against_the_whole_lineage() {
@@ -373,6 +374,69 @@ mod tests {
         history
             .append(RewriteRecord::new(1, vec![partition(2, 3, MAP_B)]))
             .unwrap();
+
+        let content: Vec<u8> = [partition(0, 1, MAP_A), partition(2, 3, MAP_A)]
+            .iter()
+            .flat_map(|transition| length_delimited(TRANSITION_FIELD, &transition.encode_to_vec()))
+            .collect();
+        let error = RawHistory::new(HistoryFormat::Tagged, content.into())
+            .validate()
+            .unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains("more than one transition"),
+            "{error}"
+        );
+    }
+
+    /// A lifted legacy transition is caught up by its own stamp; a native one
+    /// has none, so it is held to the entry's version.
+    #[test]
+    fn caught_up_compares_against_each_transitions_version() {
+        const ENTRY_VERSION: u64 = 10;
+        let history = FragReuseHistory::empty(HistoryFormat::Legacy)
+            .append(RewriteRecord::new(
+                5,
+                vec![ordered(&[whole(0, 1)], &[(1, 1)])],
+            ))
+            .unwrap()
+            .lift()
+            .unwrap()
+            .append(RewriteRecord::new(
+                8,
+                vec![ordered(&[whole(2, 1)], &[(3, 1)])],
+            ))
+            .unwrap();
+        let live = RoaringBitmap::from_iter([1, 3]);
+        let context = ReadContext {
+            entry_version: ENTRY_VERSION,
+            live_fragments: &live,
+        };
+        for (covered, dataset_version, is_caught_up) in [
+            (1, 7, true),
+            (3, 9, false),
+            (3, ENTRY_VERSION, false),
+            (3, ENTRY_VERSION + 1, true),
+        ] {
+            let segment = SegmentSummary {
+                uuid: uuid::Uuid::new_v4(),
+                fragment_bitmap: Some(RoaringBitmap::from_iter([covered])),
+                dataset_version,
+                domain: RowDomain::Address,
+                translation: TranslationSupport::Supported,
+            };
+            assert_eq!(
+                history.is_caught_up(ENTRY_VERSION, &segment),
+                is_caught_up,
+                "fragment {covered} at version {dataset_version}"
+            );
+            let plan = history.plan(&context, std::slice::from_ref(&segment));
+            assert_eq!(
+                plan[0] == ReadPlan::Direct,
+                is_caught_up,
+                "fragment {covered} at version {dataset_version}: {plan:?}"
+            );
+        }
     }
 
     #[test]

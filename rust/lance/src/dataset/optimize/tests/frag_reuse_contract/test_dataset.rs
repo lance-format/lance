@@ -344,6 +344,7 @@ impl TestDataset {
         // `self` plays the concurrent writer, so the model follows its
         // changes; the handle that staged the merge falls behind.
         let mut stale = self.dataset.clone();
+        let deleted = self.dataset.fragments()[0].id as u32;
         self.delete_whole_fragment(0).await;
         self.append(ROWS_PER_FRAGMENT).await;
         self.dataset
@@ -363,6 +364,10 @@ impl TestDataset {
             matches!(conflict, Error::RetryableCommitConflict { .. }),
             "{conflict}"
         );
+        let covers_deleted = staged
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.contains(deleted));
         match self
             .dataset
             .commit_existing_index_segments(INDEX_NAME, kind.column(), vec![staged])
@@ -372,7 +377,16 @@ impl TestDataset {
             // NGram refuses to commit a segment covering a fragment deleted
             // since it was built; the table keeps the concurrent writer's
             // segments.
-            Err(Error::InvalidInput { .. }) if matches!(kind, IndexKind::NGram) => {}
+            Err(error @ Error::InvalidInput { .. })
+                if matches!(kind, IndexKind::NGram) && covers_deleted =>
+            {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("NGram segments built before compaction must be rebuilt"),
+                    "{error}"
+                );
+            }
             Err(error) => panic!("{kind:?}: committing the staged merge failed: {error}"),
         }
     }
