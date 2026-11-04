@@ -1730,7 +1730,9 @@ mod tests {
     async fn test_has_all_labels_stops_searching_once_intersection_is_empty() {
         // 'a' covers rows 0-1 and 'b' covers rows 2-3 -- disjoint, so the
         // accumulator empties after the second label and none of 'c'..='j',
-        // each present in the index, can change the answer.
+        // each present in the index, can change the answer. Rows 12 (a null
+        // element) and 13 (a null list) check that stopping early keeps the
+        // same null rows as intersecting every label.
         let mut rows: Vec<SampleRow> = vec![
             (0, Some(vec![Some("a".to_string())])),
             (1, Some(vec![Some("a".to_string())])),
@@ -1740,6 +1742,8 @@ mod tests {
         for (offset, label) in ('c'..='j').enumerate() {
             rows.push((4 + offset as u64, Some(vec![Some(label.to_string())])));
         }
+        rows.push((12, Some(vec![Some("a".to_string()), None])));
+        rows.push((13, None));
         let (_dir, index) = build_label_list_segment(&rows).await;
 
         let labels: Vec<ScalarValue> = ('a'..='j')
@@ -1751,13 +1755,14 @@ mod tests {
         let metrics = LocalMetricsCollector::default();
         let result = index.search(&query, &metrics).await.unwrap();
 
-        let SearchResult::Exact(row_addrs) = result else {
+        let SearchResult::Exact(found) = result else {
             panic!("label list search must be exact");
         };
         assert!(
-            row_addrs.true_rows().is_empty(),
+            found.true_rows().is_empty(),
             "disjoint 'a' and 'b' must select no rows"
         );
+        assert_eq!(row_addrs(found.null_rows()), vec![13]);
         assert_eq!(
             metrics.parts_loaded.load(Ordering::Relaxed),
             2,
