@@ -3787,6 +3787,64 @@ mod composite {
         );
     }
 
+    /// Footprints are compared only against transactions that survive. With
+    /// the commit that wrote `a` cleaned up, the declared read of `a` has
+    /// nothing to conflict with, so the commit must refuse the gap rather than
+    /// swap the columns.
+    #[rstest::rstest]
+    #[case::history_present(false)]
+    #[case::history_cleaned(true)]
+    #[tokio::test]
+    async fn test_a_declared_read_conflicts_across_cleaned_up_history(#[case] clean_history: bool) {
+        let original = two_column_dataset().await;
+        let read_version = original.version().version;
+        let a_from_b = set_column_from(&original, "a", "b", true).await;
+        let b_from_a = set_column_from(&original, "b", "a", true).await;
+        let updated = commit(original.clone(), a_from_b).await;
+        let latest = commit(updated, append_with_both_fields(&original)).await;
+        assert_eq!(latest.version().version, read_version + 2);
+        if clean_history {
+            let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                .versions(vec![read_version + 1])
+                .unwrap()
+                .build();
+            let stats = latest.cleanup(policy).execute().await.unwrap();
+            assert_eq!(stats.old_versions, 1);
+        }
+
+        let error = CommitBuilder::new(Arc::new(original))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, b_from_a))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn append_with_both_fields(dataset: &Dataset) -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0), FieldRef::Committed(1)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
     fn append_with_field_zero(dataset: &Dataset) -> Vec<Action> {
         vec![
             Action::AddFragment(AddFragment {
