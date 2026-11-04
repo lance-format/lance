@@ -659,6 +659,37 @@ async fn a_selected_segment_already_removed_is_skipped() {
 }
 
 #[tokio::test]
+async fn a_selection_commits_over_concurrent_deletes_and_appends() {
+    let dir = TempStrDir::default();
+    let dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let options = select(&[&old[0], &old[1]]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    let results = execute(&dataset, &plan).await;
+    let output = results[0].segment.uuid;
+
+    let mut concurrent = dataset.clone();
+    concurrent.delete("id < 16").await.unwrap();
+    append(&mut concurrent, BASE + 2 * SMALL, 64).await;
+    concurrent
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    let appended = segments(&dataset).await.last().unwrap().clone();
+    commit_optimize_indices(&mut dataset, results, &options)
+        .await
+        .unwrap();
+
+    let committed = segments(&dataset).await;
+    assert_eq!(committed.len(), 3);
+    assert!(committed.contains(&old[2]) && committed.contains(&appended));
+    assert!(committed.iter().any(|segment| segment.uuid == output
+        && segment.fragment_bitmap == Some(RoaringBitmap::from_iter([0, 1]))));
+    assert_query(&dataset, BASE + 2 * SMALL - 16 + 64).await;
+}
+
+#[tokio::test]
 async fn invalid_selections_are_rejected() {
     let dir = TempStrDir::default();
     let dataset = fixture(&dir, false).await;
@@ -669,6 +700,10 @@ async fn invalid_selections_are_rejected() {
         unnamed,
         select(&[&old[0], &old[0]]),
         select(&[]),
+        select(&[&old[0]]).index_names(vec![NAME.to_string(), "other".to_string()]),
+        OptimizeOptions::default()
+            .index_names(vec![NAME.to_string()])
+            .consolidate_segments(vec![old[0].uuid]),
         OptimizeOptions::consolidate(BASE as u64)
             .index_names(vec![NAME.to_string()])
             .consolidate_segments(vec![old[0].uuid, old[1].uuid]),
