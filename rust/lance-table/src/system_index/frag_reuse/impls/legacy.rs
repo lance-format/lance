@@ -390,7 +390,7 @@ impl FriImpl for LegacyHistory {
 /// released readers apply, wrapped unchanged. Every future it returns is
 /// complete.
 #[derive(Debug)]
-pub(crate) struct LegacyRemapper {
+pub struct LegacyRemapper {
     index: std::result::Result<Arc<CompactFragReuseIndex>, String>,
     sources: RoaringBitmap,
 }

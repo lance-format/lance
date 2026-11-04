@@ -55,9 +55,8 @@ pub(crate) enum ResolvedRemapping {
     /// A version 0 history, as decoded: invalid versions an older writer
     /// left are dropped. Its synchronous remap (see
     /// [`Self::legacy_row_id_remapper`]) reaches only plugins without a
-    /// remapping loader, which a query listing leaves out whenever the
-    /// history still moves their rows, so in practice segments opened by
-    /// uuid.
+    /// remapping loader: a segment of one that a query listing keeps,
+    /// because the history moves none of its rows, or one opened by uuid.
     V0 {
         history: FragReuseHistory,
         /// The `dataset_version` of the FRI entry holding `history`.
