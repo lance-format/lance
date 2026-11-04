@@ -46,8 +46,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
-    scan_training_data,
+    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, load_fts_training_data,
+    load_training_data, scan_training_data,
 };
 use crate::index::vector::details::vector_index_details_default;
 
@@ -752,9 +752,7 @@ async fn load_unindexed_training_data(
         field_path,
         &update_criteria.data_criteria,
         selection,
-        None,
-        None,
-        None,
+        TrainingScanOptions::default(),
     )
     .await
 }
@@ -797,8 +795,7 @@ async fn rebuild_scalar_segment(
         None,
         true,
         Some(fragment_ids),
-        None,
-        None,
+        TrainingScanOptions::default(),
     )
     .await?;
     super::scalar::build_scalar_index(

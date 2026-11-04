@@ -23,7 +23,9 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::frag_reuse;
 use crate::index::loading::DatasetIndexInternalExt;
-use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
+use crate::index::scalar::{
+    IndexDetails, TrainingScanOptions, fetch_index_details, load_training_data,
+};
 use crate::index::vector::details::vector_index_details_default;
 use crate::index::vector::remap_vector_index;
 use crate::{Dataset, Error, Result};
@@ -199,8 +201,7 @@ pub(crate) async fn remap_index(
                             None,
                             true, // Legacy reindexing should always train
                             None,
-                            None,
-                            None,
+                            TrainingScanOptions::default(),
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(

@@ -155,6 +155,17 @@ pub(crate) enum TrainingRows {
     Rows(RowAddrTreeMap),
 }
 
+/// Optional row selection, progress, and decode concurrency for a training scan.
+#[derive(Default)]
+pub(crate) struct TrainingScanOptions {
+    /// Restricts the scan to these physical rows.
+    physical_rows: Option<RowAddrTreeMap>,
+    /// Progress total when the caller already knows the selected row count.
+    expected_rows: Option<u64>,
+    /// Decoded batches that may be in flight ahead of the consumer.
+    batch_readahead: Option<usize>,
+}
+
 /// Reads the rows a scalar index is built from: `column` projected as the
 /// index's value column, with row ids or addresses as `criteria` asks, sorted
 /// by value when the index type needs it. The scan goes through the regular
@@ -167,17 +178,15 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
-    physical_rows: Option<RowAddrTreeMap>,
-    expected_rows: Option<u64>,
-    batch_readahead: Option<usize>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let num_rows = match expected_rows {
+    let num_rows = match options.expected_rows {
         Some(rows) => rows as usize,
         None => dataset.count_all_rows().await?,
     };
 
     let mut scan = dataset.scan();
-    if let Some(batch_readahead) = batch_readahead {
+    if let Some(batch_readahead) = options.batch_readahead {
         scan.batch_readahead(batch_readahead);
     }
     #[cfg(test)]
@@ -216,7 +225,7 @@ pub(crate) async fn scan_training_data(
     }
     // A physical selection restricts the scan to these rows of the selected
     // fragments (the two intersect); the caller includes every row it wants.
-    if let Some(physical_rows) = physical_rows {
+    if let Some(physical_rows) = options.physical_rows {
         scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
@@ -258,8 +267,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
-    physical_rows: Option<RowAddrTreeMap>,
-    batch_readahead: Option<usize>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -294,28 +302,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(
-                dataset,
-                column,
-                criteria,
-                selection,
-                physical_rows,
-                None,
-                batch_readahead,
-            )
-            .await
+            scan_training_data(dataset, column, criteria, selection, options).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(
-                dataset,
-                column,
-                criteria,
-                selection,
-                physical_rows,
-                None,
-                batch_readahead,
-            )
-            .await
+            scan_training_data(dataset, column, criteria, selection, options).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -352,14 +342,16 @@ pub(crate) async fn load_fts_training_data(
         fragments,
         train,
         fragment_ids,
-        None,
-        // Allow decoding to overlap consumption without scaling speculative
-        // input buffers to every CPU in a build with only a few workers.
-        Some(
-            resolve_num_workers(params)
-                .saturating_mul(2)
-                .min(get_num_compute_intensive_cpus().max(1)),
-        ),
+        TrainingScanOptions {
+            // Allow decoding to overlap consumption without scaling speculative
+            // input buffers to every CPU in a build with only a few workers.
+            batch_readahead: Some(
+                resolve_num_workers(params)
+                    .saturating_mul(2)
+                    .min(get_num_compute_intensive_cpus().max(1)),
+            ),
+            ..Default::default()
+        },
     )
     .await?;
     if resolved.has_lists() {
@@ -598,8 +590,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
-                None,
-                None,
+                TrainingScanOptions::default(),
             )
             .await?
         }
@@ -692,8 +683,7 @@ pub(super) async fn build_bitmap_index_segment(
         None,
         true,
         Some(fragment_ids),
-        None,
-        None,
+        TrainingScanOptions::default(),
     )
     .await?;
     progress.stage_complete("load_data").await?;
@@ -1769,8 +1759,7 @@ mod tests {
             None,
             true,
             None,
-            None,
-            None,
+            TrainingScanOptions::default(),
         )
         .await
         .unwrap();
