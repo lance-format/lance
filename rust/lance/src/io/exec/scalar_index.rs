@@ -19,6 +19,8 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     execution::memory_pool::{MemoryConsumer, MemoryReservation},
     physical_plan::{
@@ -34,6 +36,7 @@ use futures::{StreamExt, TryFutureExt, TryStreamExt, stream::BoxStream};
 use lance_core::{Error, ROW_ID_FIELD, Result, deepsize::DeepSizeOf, utils::address::RowAddress};
 use lance_datafusion::{
     chunker::break_stream,
+    signed_zero::zero_encodings,
     utils::{
         ExecutionPlanMetricsSetExt, SCALAR_INDEX_MAX_ALLOWED_METRIC,
         SCALAR_INDEX_MAX_BLOCKED_METRIC, SCALAR_INDEX_MIN_ALLOWED_METRIC,
@@ -113,6 +116,30 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
+        let result = if self.dataset.manifest.uses_stable_row_ids()
+            && let Some(fragments) = self.fragments
+            && fragments != self.dataset.fragment_bitmap.as_ref()
+        {
+            let mut scope = RowAddrTreeMap::new();
+            for fragment in fragments {
+                scope.insert_fragment(fragment);
+            }
+            // A shared segment can match rows outside this scan. Restrict physical
+            // addresses before translation to avoid opening their row-id and
+            // deletion files. Scope TRUE and NULL rows together for boolean filters.
+            let restrict = |mask| match mask {
+                NullableRowAddrMask::AllowList(set) => {
+                    let (mut selected, mut nulls) = set.into_parts();
+                    selected &= &scope;
+                    nulls &= &scope;
+                    NullableRowAddrMask::AllowList(NullableRowAddrSet::new(selected, nulls))
+                }
+                mask => mask,
+            };
+            NullableIndexExprResult::new(restrict(result.lower), restrict(result.upper))
+        } else {
+            result
+        };
         self.dataset.row_addr_result_to_row_ids(result).await
     }
 }
@@ -201,8 +228,9 @@ impl ScalarIndexExec {
 
     /// Restrict which physical scalar index segments are loaded.
     ///
-    /// This does not restrict the result mask. The consumer remains responsible for applying
-    /// the exact fragment scope, deletion mask, and any required data-level recheck.
+    /// Address-domain results are restricted before translation to stable row ids. Native
+    /// row-id results can still cover other fragments, so the consumer remains responsible
+    /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
     pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
@@ -353,6 +381,13 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -720,18 +755,28 @@ impl MapIndexExec {
     ///
     /// One NULL survives dedupe on purpose: an index reads a NULL in the list
     /// as "also match null rows", which is a flag rather than a count.
+    ///
+    /// A float zero is looked up under both encodings. The index compares keys
+    /// by encoding, but the hash join downstream matches `-0.0` and `+0.0` per
+    /// IEEE 754, so probing one encoding would miss rows the join would match.
     fn key_values(column: &ArrayRef, dedupe: bool) -> datafusion::error::Result<Vec<ScalarValue>> {
         let mut values = Vec::with_capacity(column.len());
         let mut seen = HashSet::with_capacity(if dedupe { column.len() } else { 0 });
         for row in 0..column.len() {
             let value = ScalarValue::try_from_array(column, row)?;
-            if dedupe {
-                if seen.contains(&value) {
-                    continue;
+            let encodings = match zero_encodings(&value) {
+                Some((negative, positive)) => vec![negative, positive],
+                None => vec![value],
+            };
+            for value in encodings {
+                if dedupe {
+                    if seen.contains(&value) {
+                        continue;
+                    }
+                    seen.insert(value.clone());
                 }
-                seen.insert(value.clone());
+                values.push(value);
             }
-            values.push(value);
         }
         Ok(values)
     }
@@ -868,6 +913,13 @@ impl ExecutionPlan for MapIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -1048,6 +1100,7 @@ impl MaterializeIndexExec {
             fragments: None,
             segment_uuids: segment_uuids.as_deref(),
         };
+        let needs_recheck = expr.needs_recheck();
         let expr_result = expr.evaluate(&loader, metrics.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
@@ -1066,9 +1119,10 @@ impl MaterializeIndexExec {
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
         // reach the user). `AtLeast` carries an unbounded upper, so the
-        // candidate set is the whole row space — not actionable here.
+        // candidate set is the whole row space, which is only usable when
+        // every row is rechecked.
         let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
-            if result.is_at_least() && !result.is_exact() {
+            if result.is_at_least() && !result.is_exact() && !needs_recheck {
                 todo!("Support AtLeast in MaterializeIndexExec")
             }
             Ok(result.upper)
@@ -1190,6 +1244,13 @@ impl ExecutionPlan for MaterializeIndexExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1249,6 +1310,8 @@ impl ExecutionPlan for MaterializeIndexExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::{ops::Bound, sync::Arc};
 
     use crate::index::DatasetIndexExt;
@@ -1331,6 +1394,45 @@ mod tests {
             dataset: Arc::new(dataset),
             _tmp_dir_guard: test_dir,
         }
+    }
+
+    #[test]
+    fn key_values_probes_both_zero_encodings() {
+        fn float_bits(values: &[ScalarValue]) -> Vec<u64> {
+            values
+                .iter()
+                .map(|value| match value {
+                    ScalarValue::Float64(Some(v)) => v.to_bits(),
+                    other => panic!("unexpected key value {other:?}"),
+                })
+                .collect()
+        }
+        fn bits(values: &[f64]) -> Vec<u64> {
+            values.iter().map(|v| v.to_bits()).collect()
+        }
+
+        let floats: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![
+            1.0,
+            0.0,
+            1.0,
+            f64::NAN,
+        ]));
+
+        // A zero row yields both encodings, so without dedupe there are more
+        // values than rows. The values only build an `IsIn` set, so nothing
+        // depends on them lining up with input rows.
+        let values = MapIndexExec::key_values(&floats, false).unwrap();
+        assert_eq!(float_bits(&values), bits(&[1.0, -0.0, 0.0, 1.0, f64::NAN]));
+
+        let deduped = MapIndexExec::key_values(&floats, true).unwrap();
+        assert_eq!(float_bits(&deduped), bits(&[1.0, -0.0, 0.0, f64::NAN]));
+
+        // Integer zero has a single encoding and is not expanded.
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        assert_eq!(
+            MapIndexExec::key_values(&ints, false).unwrap(),
+            vec![ScalarValue::Int32(Some(0)), ScalarValue::Int32(Some(1))]
+        );
     }
 
     #[test]
@@ -1504,7 +1606,8 @@ mod tests {
         let verify = async |plan: ScalarIndexExec, schema: Arc<Schema>| {
             assert_eq!(plan.schema(), schema);
             assert_eq!(
-                plan.partition_statistics(None)
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
                     .unwrap()
                     .column_statistics
                     .len(),

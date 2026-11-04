@@ -153,7 +153,8 @@ Alongside `generation` and `path`, a shard manifest entry may record what the
 SSTable holds, as the writer's MemTable accounted for it at flush:
 
 - `in_memory_bytes`: payload size of the rows, summed over the MemTable's
-  buffers as the window each one holds.
+  buffers as the window each one holds, plus the payload of the blob values
+  the generation keeps in packed and dedicated sidecar files.
 - `physical_rows`: rows held, counting the older duplicates of a primary key
   that the generation's deletion vector masks. A scan applying the deletion
   vector yields fewer.

@@ -107,7 +107,9 @@ impl DataFilePart {
         let dir = target.parts_dir(&dataset.data_file_dir_for_base(target.base_id)?);
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
         let concurrency = store.io_parallelism().min(MAX_CONCURRENT_PART_OPENS);
-        let opens = parts.iter().map(|part| {
+        // Owned inputs avoid a higher-ranked borrowed iterator closure in the
+        // buffered future, so callers can spawn concatenation on a worker.
+        let opens = parts.iter().cloned().map(|part| {
             let store = &store;
             let scheduler = &scheduler;
             let dir = &dir;

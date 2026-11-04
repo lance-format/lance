@@ -203,10 +203,14 @@ fn register_bounds() {
     for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
+    for (name, values) in lance_core::cache::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
 }
 
 fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
+    lance_core::cache::describe_metrics();
 }
 
 enum MetricValue {
@@ -428,6 +432,7 @@ fn lance_metrics_catalog_native<'local>(env: &mut JNIEnv<'local>) -> Result<JObj
 fn snapshot_lance_metrics_native<'local>(env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
     let list = object_list(env)?;
     if let Some(registry) = REGISTRY.get() {
+        lance_core::cache::refresh_metrics();
         for point in collect_points(registry) {
             env.with_local_frame(64, |env| {
                 let item = metric_point_to_java(env, point)?;

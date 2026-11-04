@@ -7,6 +7,9 @@ For experienced developers, the issues you can work on run the gamut from warm-u
 
 If you have any questions, please join our [Discord](https://discord.gg/zMM32dvNtd) for real-time support. Your feedback is always welcome!
 
+For a map of the repository's domains, dependency direction, and test
+locations, start with [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Getting Started
 
 1. Join our Discord and say hi
@@ -20,10 +23,24 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
 
 1. Install Rust: https://www.rust-lang.org/tools/install
 2. Install Python 3.10+: https://www.python.org/downloads/
-3. Install protocol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
+3. Install protocol buffers if you are building the Python or Java bindings. They currently enable Substrait,
+   whose upstream crate generates protobuf bindings during the build. See https://grpc.io/docs/protoc-installation/
+   and make sure you have version 3.20 or higher.
 4. Install commit hooks:
     a. Install pre-commit: https://pre-commit.com/#install
     b. Run `pre-commit install` in the root of the repo
+
+### Regenerating Rust protobuf sources
+
+Rust protobuf sources are checked into the repository, so normal Rust builds do not require `protoc`.
+After changing a schema in `protos/` or `rust/lance-index/protos-cache/`, regenerate them with:
+
+```sh
+cargo run --locked --manifest-path protos/codegen/Cargo.toml
+```
+
+The generator uses a vendored platform-specific `protoc` binary and updates the generated modules under each
+crate's `src/pb/` directory.
 
 ## Building for legacy x86_64 hosts (pre-Haswell)
 

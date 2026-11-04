@@ -14,8 +14,10 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::SortOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -46,7 +48,7 @@ use super::PreFilterSource;
 use super::knn::KNN_INDEX_SCHEMA;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::Dataset;
-use crate::index::{DatasetIndexInternalExt, validate_segment_params_compatible};
+use crate::index::{loading::DatasetIndexInternalExt, segment::validate_segment_params_compatible};
 
 async fn open_minhash_segment(
     dataset: &Dataset,
@@ -161,6 +163,13 @@ impl ExecutionPlan for MinHashSearchExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -443,6 +452,13 @@ impl ExecutionPlan for FlatMinHashExec {
         // `execute` reads a single input partition; without this the input
         // could be split across partitions of which only one is consumed.
         vec![Distribution::SinglePartition]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
