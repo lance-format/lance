@@ -359,6 +359,17 @@ impl ApplyState<'_> {
                          operation does not add; add each destination with AddFragment"
                     )));
                 }
+                // The source segments' values are translated onto the
+                // destination as they are, so it must hold the same values.
+                // A rearranged fragment refuses every data change at apply.
+                if !self.is_rearranged(destination) {
+                    return Err(Error::invalid_input(format!(
+                        "AppendFragReuseTransition produces fragment {destination}, which this \
+                         operation adds with data_change true; a transition carries index \
+                         values onto its destinations unchanged, so each destination is added \
+                         with data_change false"
+                    )));
+                }
                 if !produced.insert(destination) {
                     return Err(Error::invalid_input(format!(
                         "AppendFragReuseTransition produces fragment {destination} more than once"
