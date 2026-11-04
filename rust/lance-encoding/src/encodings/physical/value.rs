@@ -17,9 +17,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockChunk, MiniBlockCompressed,
     MiniBlockCompressionContext, MiniBlockCompressor,
 };
-use crate::format::ProtobufUtils21;
-use crate::format::pb21::compressive_encoding::Compression;
-use crate::format::pb21::{self, CompressiveEncoding};
+use crate::format::EncodingUtils;
+use crate::format::metadata::compressive_encoding::Compression;
+use crate::format::metadata::{self, CompressiveEncoding};
 
 use lance_core::{Error, Result};
 
@@ -139,11 +139,11 @@ struct MiniblockFslLayer {
 /// the copies is better than paying the price at read time to do the bit slicing.
 impl ValueEncoder {
     fn make_fsl_encoding(layers: &[MiniblockFslLayer], bits_per_value: u64) -> CompressiveEncoding {
-        let mut encoding = ProtobufUtils21::flat(bits_per_value, None);
+        let mut encoding = EncodingUtils::flat(bits_per_value, None);
         for layer in layers.iter().rev() {
             let has_validity = layer.validity.is_some();
             let dimension = layer.dimension;
-            encoding = ProtobufUtils21::fsl(dimension, has_validity, encoding);
+            encoding = EncodingUtils::fsl(dimension, has_validity, encoding);
         }
         encoding
     }
@@ -333,10 +333,10 @@ impl ValueEncoder {
             // constant(None) signals that every stored item decodes to null.
             DataBlock::AllNull(_) => {
                 has_validity = true;
-                ProtobufUtils21::constant(None)
+                EncodingUtils::constant(None)
             }
             DataBlock::FixedWidth(fixed_width) => {
-                ProtobufUtils21::flat(fixed_width.bits_per_value, None)
+                EncodingUtils::flat(fixed_width.bits_per_value, None)
             }
             DataBlock::FixedSizeList(inner) => Self::fsl_to_encoding(inner),
             _ => unreachable!(
@@ -344,7 +344,7 @@ impl ValueEncoder {
                 inner.name()
             ),
         };
-        ProtobufUtils21::fsl(fsl.dimension, has_validity, inner_encoding)
+        EncodingUtils::fsl(fsl.dimension, has_validity, inner_encoding)
     }
 
     fn simple_per_value_fsl(fsl: FixedSizeListBlock) -> (PerValueDataBlock, CompressiveEncoding) {
@@ -457,6 +457,16 @@ impl ValueEncoder {
 
 impl BlockCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        if matches!(data, DataBlock::FixedSizeList(_)) {
+            let (PerValueDataBlock::Fixed(values), encoding) =
+                PerValueCompressor::compress(self, data)?
+            else {
+                return Err(Error::internal(
+                    "Fixed-size-list block has variable row width",
+                ));
+            };
+            return Ok((Some(values.data), encoding));
+        }
         let DataBlock::FixedWidth(fixed_width) = data else {
             return Err(Error::invalid_input(format!(
                 "ValueEncoder cannot compress a {} block",
@@ -465,7 +475,7 @@ impl BlockCompressor for ValueEncoder {
         };
         Ok((
             Some(fixed_width.data),
-            ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+            EncodingUtils::flat(fixed_width.bits_per_value, None),
         ))
     }
 }
@@ -478,7 +488,7 @@ impl MiniBlockCompressor for ValueEncoder {
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
-                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
+                let encoding = EncodingUtils::flat(fixed_width.bits_per_value, None);
                 Ok((Self::chunk_data(fixed_width)?, encoding))
             }
             DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk),
@@ -514,7 +524,7 @@ pub struct ValueDecompressor {
 }
 
 impl ValueDecompressor {
-    pub fn from_flat(description: &pb21::Flat) -> Self {
+    pub fn from_flat(description: &metadata::Flat) -> Self {
         Self {
             bits_per_item: description.bits_per_value,
             bits_per_value: description.bits_per_value,
@@ -522,7 +532,7 @@ impl ValueDecompressor {
         }
     }
 
-    pub fn from_fsl(mut description: &pb21::FixedSizeList) -> Result<Self> {
+    pub fn from_fsl(mut description: &metadata::FixedSizeList) -> Result<Self> {
         let mut layers = Vec::new();
         let mut cum_dim = 1_u64;
         let mut bytes_per_value = 0_u64;
@@ -606,6 +616,28 @@ impl ValueDecompressor {
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Flat block")?;
+        if !self.layers.is_empty() {
+            let expected = num_values
+                .checked_mul(self.bits_per_value)
+                .and_then(|bits| usize::try_from(bits.div_ceil(8)).ok())
+                .ok_or_else(|| Error::invalid_input("Fixed-size-list block length overflows"))?;
+            if data.len() != expected {
+                return Err(Error::invalid_input(format!(
+                    "Fixed-size-list block has {} bytes, expected {expected}",
+                    data.len()
+                )));
+            }
+            return FixedPerValueDecompressor::decompress(
+                self,
+                FixedWidthDataBlock {
+                    data,
+                    bits_per_value: self.bits_per_value,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                },
+                num_values,
+            );
+        }
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
@@ -855,7 +887,7 @@ impl PerValueCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         let (data, encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => {
-                let encoding = ProtobufUtils21::flat(fixed_width.bits_per_value, None);
+                let encoding = EncodingUtils::flat(fixed_width.bits_per_value, None);
                 (PerValueDataBlock::Fixed(fixed_width), encoding)
             }
             DataBlock::FixedSizeList(fixed_size_list) => Self::per_value_fsl(fixed_size_list),
@@ -882,7 +914,11 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
-        compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
+        compression::{
+            DecompressionStrategy, DefaultDecompressionStrategy, FixedPerValueDecompressor,
+            MiniBlockDecompressor, try_fixed_size_list_block,
+        },
+        compression_config::CompressionFieldParams,
         data::DataBlock,
         encodings::{
             logical::primitive::{
@@ -891,13 +927,56 @@ mod tests {
             },
             physical::value::ValueDecompressor,
         },
-        format::pb21::compressive_encoding::Compression,
+        format::metadata::compressive_encoding::Compression,
         testing::{
             TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
         },
     };
 
     use super::ValueEncoder;
+
+    #[rstest::rstest]
+    #[case::raw("none", false)]
+    #[case::lz4("lz4", false)]
+    #[case::zstd("zstd", false)]
+    #[case::all_null_children("lz4", true)]
+    #[test]
+    fn test_vector_dictionary_block_lengths(#[case] compression: &str, #[case] all_null: bool) {
+        let array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(if all_null {
+                Int32Array::new_null(6)
+            } else {
+                Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), None])
+            }),
+            None,
+        );
+        let data_type = array.data_type().clone();
+        let data = DataBlock::from_array(array.clone());
+        let params = CompressionFieldParams {
+            compression: Some(compression.to_string()),
+            ..Default::default()
+        };
+        let encoder = try_fixed_size_list_block(&data, &params).unwrap().unwrap();
+        let (payload, encoding) = encoder.compress(data).unwrap();
+        let decoder = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&encoding)
+            .unwrap();
+        let decoded = decoder.decompress(payload.clone(), 2).unwrap();
+        assert_eq!(
+            decoded.into_arrow(data_type, true).unwrap(),
+            array.to_data()
+        );
+        assert!(decoder.decompress(payload.clone(), 1).is_err());
+        assert!(decoder.decompress(payload.clone(), 3).is_err());
+        let payload = payload.unwrap();
+        assert!(
+            decoder
+                .decompress(Some(payload.slice_with_length(0, payload.len() - 1)), 2)
+                .is_err()
+        );
+    }
 
     fn miniblock_context() -> MiniBlockCompressionContext {
         MiniBlockCompressionContext::new(0, true, true)

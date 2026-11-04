@@ -8,7 +8,7 @@ use arrow_array::{RecordBatch, UInt64Array};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ID;

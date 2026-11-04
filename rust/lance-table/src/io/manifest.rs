@@ -14,8 +14,10 @@ use lance_file::{
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use lance_core::{Error, Result, datatypes::Schema};
@@ -25,24 +27,63 @@ use lance_io::{
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
-use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
+use crate::format::{
+    DataStorageFormat, Fragment, IndexMetadata, MAGIC, Manifest, Transaction, pb,
+    pb_manifest_without_fragments,
+};
 
 use super::commit::ManifestLocation;
 
-/// Read Manifest on URI.
+/// Read the raw Manifest protobuf from a URI.
 ///
-/// This only reads manifest files. It does not read data files.
+/// This only reads manifest files. It does not read data files or translate the
+/// protobuf into the semantic [`Manifest`] type.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> lance_core::Result<()> {
+/// use lance_io::object_store::ObjectStore;
+/// use lance_table::format::pb;
+/// use lance_table::io::manifest::read_manifest_proto;
+/// use object_store::path::Path;
+///
+/// let object_store = ObjectStore::local();
+/// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
+/// let manifest: pb::Manifest = read_manifest_proto(&object_store, &path, None).await?;
+/// println!("manifest version: {}", manifest.version);
+/// # Ok(())
+/// # }
+/// ```
 #[instrument(level = "debug", skip(object_store))]
-pub async fn read_manifest(
+pub async fn read_manifest_proto(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
-) -> Result<Manifest> {
+) -> Result<pb::Manifest> {
+    let (proto, _) = read_manifest_proto_with_length(object_store, path, known_size).await?;
+    Ok(proto)
+}
+
+async fn read_manifest_proto_with_length(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<(pb::Manifest, usize)> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
         object_store.inner.head(path).await?.size
     };
+    if file_size < 16 {
+        if known_size.is_some() {
+            return Box::pin(read_manifest_proto_with_length(object_store, path, None)).await;
+        }
+        return Err(Error::corrupt_file(
+            path.clone(),
+            format!("Invalid format: manifest is only {file_size} bytes (minimum 16)"),
+        ));
+    }
     const PREFETCH_SIZE: u64 = 64 * 1024;
     let initial_start = file_size.saturating_sub(PREFETCH_SIZE);
     let range = Range {
@@ -54,7 +95,7 @@ pub async fn read_manifest(
     // In case of corruption, the known_size might be wrong. We can retry without
     // the size to be more robust.
     if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
-        return Box::pin(read_manifest(object_store, path, None)).await;
+        return Box::pin(read_manifest_proto_with_length(object_store, path, None)).await;
     }
 
     if buf.len() < 16 {
@@ -113,7 +154,7 @@ pub async fn read_manifest(
     decode_manifest(buf, recorded_length)
 }
 
-fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
+fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifest, usize)> {
     if buf.remaining() != recorded_length {
         return Err(Error::invalid_input(format!(
             "Invalid format: manifest length does not match. Expected {}, got {}",
@@ -122,6 +163,39 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
         )));
     }
     let proto = pb::Manifest::decode(buf)?;
+    Ok((proto, recorded_length))
+}
+
+/// Read the semantic [`Manifest`] from a URI.
+///
+/// This only reads manifest files. It does not read data files. Use
+/// [`Manifest::summary`] to inspect aggregate fragment and row counts after
+/// loading.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> lance_core::Result<()> {
+/// use lance_io::object_store::ObjectStore;
+/// use lance_table::format::Manifest;
+/// use lance_table::io::manifest::read_manifest;
+/// use object_store::path::Path;
+///
+/// let object_store = ObjectStore::local();
+/// let path = Path::from_absolute_path("/data/table/_versions/1.manifest")?;
+/// let manifest: Manifest = read_manifest(&object_store, &path, None).await?;
+/// println!("fragments: {}", manifest.summary().total_fragments);
+/// # Ok(())
+/// # }
+/// ```
+#[instrument(level = "debug", skip(object_store))]
+pub async fn read_manifest(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<Manifest> {
+    let (proto, recorded_length) =
+        read_manifest_proto_with_length(object_store, path, known_size).await?;
     let mut manifest = Manifest::try_from(proto)?;
     manifest.detach_sparse_inline_row_ids(recorded_length);
     Ok(manifest)
@@ -206,7 +280,196 @@ async fn do_write_manifest(
         manifest.transaction_section = None;
     }
 
-    writer.write_struct(manifest).await
+    write_manifest_message(writer, manifest).await
+}
+
+/// Field key of `Manifest.fragments` in table.proto: field 2, wire type 2
+/// (length-delimited).
+const MANIFEST_FRAGMENTS_KEY: u8 = (2 << 3) | 2;
+
+/// When the fragments of a manifest are encoded in parallel.
+#[derive(Clone, Copy, Debug)]
+struct ParallelEncode {
+    /// Fewest fragments without cached bytes for which encoding runs in
+    /// parallel.
+    min_uncached: usize,
+    /// Fragments per chunk when encoding in parallel.
+    chunk_fragments: usize,
+}
+
+const PARALLEL_ENCODE: ParallelEncode = ParallelEncode {
+    min_uncached: 64 * 1024,
+    chunk_fragments: 16 * 1024,
+};
+
+/// The u32 length prefix of a manifest message of `len` bytes.
+///
+/// Readers take the prefix as the message length, so a message that does not
+/// fit in a u32 cannot be written.
+fn manifest_message_len_prefix(len: usize) -> Result<u32> {
+    u32::try_from(len).map_err(|_| {
+        Error::invalid_input(format!(
+            "Manifest message is {len} bytes, which exceeds the {} byte limit of its \
+             u32 length prefix",
+            u32::MAX
+        ))
+    })
+}
+
+/// Whether any data file of `fragment` has an unknown size.
+///
+/// File sizes are cached in place once learned, so the encoding of such a
+/// fragment can change without the fragment list changing. It is encoded on
+/// every write instead of cached.
+fn has_unknown_file_size(fragment: &Fragment) -> bool {
+    fragment
+        .referenced_lance_files()
+        .any(|file| file.file_size_bytes.get().is_none())
+}
+
+/// Append `manifest`'s protobuf message to `buf`, preceded by its u32
+/// little-endian length, the layout [`WriteExt::write_protobuf`] produces.
+///
+/// Fragments are appended one `fragments` field at a time: bytes cached in
+/// [`Manifest::encoded_fragments`] are copied as they are, and only the other
+/// fragments are encoded. prost encodes fields in tag order (`fields` = 1,
+/// `fragments` = 2, then the rest), so the message decodes to the same
+/// `pb::Manifest` as `pb::Manifest::from(manifest)` and its bytes differ at
+/// most in the order of map entries.
+///
+/// Returns, for each fragment, the range of `buf` holding its encoded bytes,
+/// or `None` when those bytes must not be reused.
+///
+/// When many fragments have no cached bytes (the first write after a manifest
+/// is loaded), they are encoded in parallel in chunks that are then appended
+/// in order.
+fn encode_manifest_message(
+    manifest: &Manifest,
+    buf: &mut Vec<u8>,
+    parallel: ParallelEncode,
+) -> Result<Vec<Option<Range<usize>>>> {
+    let fragments = manifest.fragments.as_slice();
+    let cached = manifest.encoded_fragments();
+    // Each cached entry also needs a key byte and a length delimiter of at
+    // most 5 bytes.
+    let cached_len: usize = cached.map_or(0, |cached| {
+        cached.iter().flatten().map(|bytes| bytes.len() + 6).sum()
+    });
+    buf.reserve(cached_len + 64 * 1024);
+
+    let len_pos = buf.len();
+    buf.extend_from_slice(&[0; 4]);
+    let msg_start = buf.len();
+
+    let mut rest = pb_manifest_without_fragments(manifest);
+    let head = pb::Manifest {
+        fields: std::mem::take(&mut rest.fields),
+        ..Default::default()
+    };
+    head.encode(buf)?;
+
+    let num_uncached = cached.map_or(fragments.len(), |cached| {
+        cached.iter().filter(|bytes| bytes.is_none()).count()
+    });
+    let mut ranges = Vec::with_capacity(fragments.len());
+    if num_uncached < parallel.min_uncached {
+        append_fragments(fragments, cached, buf, &mut ranges)?;
+    } else {
+        let chunks = fragments
+            .par_chunks(parallel.chunk_fragments)
+            .enumerate()
+            .map(|(chunk_index, chunk)| {
+                let start = chunk_index * parallel.chunk_fragments;
+                let cached = cached.map(|cached| &cached[start..start + chunk.len()]);
+                let mut chunk_buf = Vec::new();
+                let mut chunk_ranges = Vec::with_capacity(chunk.len());
+                append_fragments(chunk, cached, &mut chunk_buf, &mut chunk_ranges)?;
+                Ok((chunk_buf, chunk_ranges))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        buf.reserve(chunks.iter().map(|(chunk_buf, _)| chunk_buf.len()).sum());
+        for (chunk_buf, chunk_ranges) in chunks {
+            let offset = buf.len();
+            buf.extend_from_slice(&chunk_buf);
+            ranges.extend(
+                chunk_ranges
+                    .into_iter()
+                    .map(|range| range.map(|range| range.start + offset..range.end + offset)),
+            );
+        }
+    }
+
+    rest.encode(buf)?;
+
+    let msg_len = manifest_message_len_prefix(buf.len() - msg_start)?;
+    buf[len_pos..msg_start].copy_from_slice(&msg_len.to_le_bytes());
+    Ok(ranges)
+}
+
+/// Append each fragment to `buf` as a `Manifest.fragments` field, copying
+/// `cached[i]` when present and encoding `fragments[i]` otherwise, and push the
+/// range of its encoded bytes in `buf` (or `None` if they must not be reused)
+/// to `ranges`.
+fn append_fragments(
+    fragments: &[Fragment],
+    cached: Option<&[Option<Bytes>]>,
+    buf: &mut Vec<u8>,
+    ranges: &mut Vec<Option<Range<usize>>>,
+) -> Result<()> {
+    for (i, fragment) in fragments.iter().enumerate() {
+        // Checked before encoding: sizes only ever go from unknown to known,
+        // so a fragment whose sizes are all known here is encoded with them.
+        // Checking afterwards could cache bytes that missed a size filled in
+        // by a concurrent reader.
+        let reusable = !has_unknown_file_size(fragment);
+        buf.push(MANIFEST_FRAGMENTS_KEY);
+        let range = match cached.and_then(|cached| cached[i].as_ref()) {
+            Some(bytes) => {
+                prost::encode_length_delimiter(bytes.len(), buf)?;
+                let start = buf.len();
+                buf.extend_from_slice(bytes);
+                start..buf.len()
+            }
+            None => {
+                let delimiter_pos = buf.len();
+                pb::DataFragment::from(fragment).encode_length_delimited(buf)?;
+                let len = prost::decode_length_delimiter(&buf[delimiter_pos..])?;
+                buf.len() - len..buf.len()
+            }
+        };
+        ranges.push(reusable.then_some(range));
+    }
+    Ok(())
+}
+
+/// Keep the encoded fragments written in `buf` on `manifest` for the next write.
+///
+/// The cached slices keep all of `buf` alive, so `buf` should hold the
+/// manifest message and nothing else.
+fn cache_encoded_fragments(
+    manifest: &mut Manifest,
+    buf: Vec<u8>,
+    ranges: Vec<Option<Range<usize>>>,
+) {
+    // `Bytes::from(Vec)` keeps the Vec allocation when capacity exceeds len,
+    // so cache the capacity before conversion rather than the logical length.
+    let retained_bytes = buf.capacity();
+    let buf = Bytes::from(buf);
+    let encoded = ranges
+        .into_iter()
+        .map(|range| range.map(|range| buf.slice(range)))
+        .collect();
+    manifest.set_encoded_fragments(encoded, retained_bytes);
+}
+
+/// Write the length-prefixed manifest message and return its position.
+async fn write_manifest_message(writer: &mut dyn Writer, manifest: &mut Manifest) -> Result<usize> {
+    let pos = writer.tell().await?;
+    let mut buf = Vec::new();
+    let ranges = encode_manifest_message(manifest, &mut buf, PARALLEL_ENCODE)?;
+    writer.write_all(&buf).await?;
+    cache_encoded_fragments(manifest, buf, ranges);
+    Ok(pos)
 }
 
 /// Write manifest to an open file.
@@ -255,18 +518,40 @@ mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
 
+    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS};
+    use crate::format::ClusteringDefinition;
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
     };
     use rand::{Rng, distr::Alphanumeric};
+    use rstest::rstest;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
 
-    async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
+    #[rstest]
+    #[case::listed_size(Some(0))]
+    #[case::head_size(None)]
+    #[tokio::test]
+    async fn test_read_empty_manifest_reports_path(#[case] known_size: Option<u64>) {
+        let store = ObjectStore::memory();
+        let path = Path::from("dataset/_versions/1.manifest");
+        store.inner.put(&path, Bytes::new().into()).await.unwrap();
+
+        let error = read_manifest(&store, &path, known_size).await.unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains(path.as_ref()), "{error}");
+        assert!(error.to_string().contains("0 bytes"), "{error}");
+    }
+
+    async fn write_test_manifest(
+        prefix_size: usize,
+        manifest_min_size: usize,
+    ) -> (ObjectStore, Path, Manifest) {
         let store = ObjectStore::memory();
         let path = Path::from("/read_large_manifest");
 
@@ -304,6 +589,11 @@ mod test {
             .unwrap();
         Writer::shutdown(writer.as_mut()).await.unwrap();
 
+        (store, path, manifest)
+    }
+
+    async fn test_roundtrip_manifest(prefix_size: usize, manifest_min_size: usize) {
+        let (store, path, manifest) = write_test_manifest(prefix_size, manifest_min_size).await;
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
 
         assert_eq!(manifest, roundtripped_manifest);
@@ -316,6 +606,32 @@ mod test {
         test_roundtrip_manifest(0, 100_000).await;
         test_roundtrip_manifest(1000, 100_000).await;
         test_roundtrip_manifest(1000, 1000).await;
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_proto_roundtrip() {
+        let (store, path, manifest) = write_test_manifest(1000, 1000).await;
+        let expected = pb::Manifest::from(&manifest);
+
+        let roundtripped_manifest = read_manifest_proto(&store, &path, None).await.unwrap();
+
+        assert_eq!(expected, roundtripped_manifest);
+        store.inner.delete(&path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_manifest_proto_retries_stale_known_size() {
+        let (store, path, manifest) = write_test_manifest(1000, 1000).await;
+        let expected = pb::Manifest::from(&manifest);
+        let actual_size = store.inner.head(&path).await.unwrap().size;
+        let stale_known_size = actual_size - 1;
+
+        let roundtripped_manifest = read_manifest_proto(&store, &path, Some(stale_known_size))
+            .await
+            .unwrap();
+
+        assert_eq!(expected, roundtripped_manifest);
+        store.inner.delete(&path).await.unwrap();
     }
 
     #[tokio::test]
@@ -388,5 +704,268 @@ mod test {
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());
         assert_eq!(schema.metadata().get("lance:extra").unwrap(), "for_test");
+    }
+
+    /// A manifest whose fragments exercise most `DataFragment` fields.
+    fn manifest_with_fragments(num_fragments: u64) -> Manifest {
+        use crate::format::{DeletionFile, DeletionFileType, RowIdMeta};
+
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int64, false),
+            ArrowField::new("b", DataType::Utf8, true),
+        ]);
+        let fragments = (0..num_fragments)
+            .map(|id| {
+                let mut fragment = Fragment::new(id).with_physical_rows(1000 + id as usize);
+                for field_id in 0..2 {
+                    fragment.add_file(
+                        format!("data/{id}-{field_id}.lance"),
+                        vec![field_id],
+                        vec![field_id],
+                        ConcreteFileVersion::V2_0,
+                        std::num::NonZero::new(4096 + id),
+                    );
+                }
+                if id % 3 == 0 {
+                    fragment.deletion_file = Some(DeletionFile {
+                        read_version: id,
+                        id,
+                        file_type: DeletionFileType::Bitmap,
+                        num_deleted_rows: Some(7),
+                        base_id: None,
+                        inline: Some(Bytes::from_static(b"deleted-rows")),
+                    });
+                }
+                fragment.row_id_meta = Some(RowIdMeta::Inline(vec![id as u8; 5].into()));
+                fragment.clustering_id = Some(1);
+                fragment
+                    .metadata
+                    .insert("object-key".into(), format!("fragment-{id}"));
+                fragment
+            })
+            .collect();
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(fragments),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        // One entry per map keeps prost's map encoding order deterministic,
+        // so messages can be compared byte for byte.
+        manifest
+            .config_mut()
+            .insert("key".to_string(), "value".to_string());
+        manifest
+            .table_metadata
+            .insert("object-key".into(), "object-value".into());
+        manifest.clustering = vec![ClusteringDefinition {
+            id: 1,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        manifest.max_clustering_id = 1;
+        manifest.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        manifest.writer_feature_flags |= FLAG_STABLE_ROW_IDS | FLAG_OBJECT_METADATA;
+        manifest.version = 42;
+        manifest.update_max_fragment_id();
+        manifest
+    }
+
+    /// The length-prefixed message `write_protobuf` writes for `manifest`.
+    fn prost_manifest_message(manifest: &Manifest) -> Vec<u8> {
+        let message = pb::Manifest::from(manifest).encode_to_vec();
+        let mut buf = (message.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(&message);
+        buf
+    }
+
+    fn encode_message(manifest: &mut Manifest) -> Vec<u8> {
+        encode_message_with(manifest, PARALLEL_ENCODE)
+    }
+
+    fn encode_message_with(manifest: &mut Manifest, parallel: ParallelEncode) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let ranges = encode_manifest_message(manifest, &mut buf, parallel).unwrap();
+        let message = buf.clone();
+        cache_encoded_fragments(manifest, buf, ranges);
+        message
+    }
+
+    #[test]
+    fn test_cached_fragments_account_for_vec_allocation_capacity() {
+        let mut manifest = manifest_with_fragments(1);
+        let uncached_size = manifest.deep_size_of();
+
+        encode_message(&mut manifest);
+        let cached_size = manifest.deep_size_of();
+        let message_bytes = manifest.serialized().len() + 4;
+        let retained_bytes = cached_size - uncached_size;
+
+        assert!(
+            retained_bytes > message_bytes + 32 * 1024,
+            "cache retained {retained_bytes} bytes for a {message_bytes}-byte message; \
+             it must account for the Vec allocation capacity"
+        );
+    }
+
+    #[test]
+    fn test_encode_manifest_message_matches_prost() {
+        let mut manifest = manifest_with_fragments(20);
+        let expected = prost_manifest_message(&manifest);
+
+        // Cold: every fragment is encoded.
+        assert!(manifest.encoded_fragments().is_none());
+        assert_eq!(encode_message(&mut manifest), expected);
+        let cached = manifest.encoded_fragments().unwrap();
+        assert!(cached.iter().all(Option::is_some));
+
+        // Warm: every fragment is copied from the cache.
+        assert_eq!(encode_message(&mut manifest), expected);
+
+        // Partly warm: fragments without cached bytes are encoded.
+        let partial = manifest
+            .encoded_fragments()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| bytes.clone().filter(|_| i % 4 != 0))
+            .collect();
+        manifest.set_encoded_fragments(partial, expected.len());
+        assert_eq!(encode_message(&mut manifest), expected);
+
+        // No fragments.
+        let mut empty = manifest_with_fragments(0);
+        assert_eq!(encode_message(&mut empty), prost_manifest_message(&empty));
+    }
+
+    /// Parallel encoding, in chunks that do not divide the fragment count,
+    /// produces the same message as encoding sequentially.
+    #[rstest]
+    #[case::cold(0)]
+    #[case::partly_warm(3)]
+    fn test_encode_manifest_message_parallel_matches_prost(#[case] keep_every: usize) {
+        let parallel = ParallelEncode {
+            min_uncached: 8,
+            chunk_fragments: 7,
+        };
+        let mut manifest = manifest_with_fragments(50);
+        let expected = prost_manifest_message(&manifest);
+        if keep_every > 0 {
+            encode_message(&mut manifest);
+            let partial = manifest
+                .encoded_fragments()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(i, bytes)| bytes.clone().filter(|_| i % keep_every == 0))
+                .collect();
+            manifest.set_encoded_fragments(partial, expected.len());
+        }
+
+        assert_eq!(encode_message_with(&mut manifest, parallel), expected);
+        let cached = manifest.encoded_fragments().unwrap();
+        assert_eq!(cached.len(), 50);
+        assert!(cached.iter().all(Option::is_some));
+
+        // Warm: every fragment is copied from the cache.
+        assert_eq!(encode_message_with(&mut manifest, parallel), expected);
+    }
+
+    #[test]
+    fn test_encode_manifest_message_ignores_cache_of_replaced_fragments() {
+        let mut manifest = manifest_with_fragments(10);
+        encode_message(&mut manifest);
+        assert!(manifest.encoded_fragments().is_some());
+
+        // Replacing the fragment list, or mutating it, makes the cache stale.
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[3].physical_rows = Some(1);
+        manifest.fragments = Arc::new(fragments);
+        assert!(manifest.encoded_fragments().is_none());
+        assert_eq!(
+            encode_message(&mut manifest),
+            prost_manifest_message(&manifest)
+        );
+
+        Arc::make_mut(&mut manifest.fragments)[4].physical_rows = Some(2);
+        assert!(manifest.encoded_fragments().is_none());
+        assert_eq!(
+            encode_message(&mut manifest),
+            prost_manifest_message(&manifest)
+        );
+    }
+
+    #[test]
+    fn test_encode_manifest_message_does_not_cache_unknown_file_sizes() {
+        let mut manifest = manifest_with_fragments(3);
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[1].add_file(
+            "data/unsized.lance",
+            vec![1],
+            vec![1],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        manifest.fragments = Arc::new(fragments);
+
+        assert_eq!(
+            encode_message(&mut manifest),
+            prost_manifest_message(&manifest)
+        );
+        let cached = manifest.encoded_fragments().unwrap();
+        assert_eq!(
+            cached.iter().map(Option::is_some).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
+    fn test_manifest_message_len_prefix_rejects_oversized_messages() {
+        assert_eq!(manifest_message_len_prefix(0).unwrap(), 0);
+        assert_eq!(
+            manifest_message_len_prefix(u32::MAX as usize).unwrap(),
+            u32::MAX
+        );
+        let err = manifest_message_len_prefix(u32::MAX as usize + 1).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    async fn write_manifest_file(store: &ObjectStore, path: &Path, manifest: &mut Manifest) {
+        let mut writer = store.create(path).await.unwrap();
+        let pos = write_manifest(writer.as_mut(), manifest, Some(vec![]), None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+    }
+
+    /// A manifest file written from cached fragment bytes is byte-identical to
+    /// one written by encoding every fragment, and reads back the same.
+    #[tokio::test]
+    async fn test_write_manifest_from_cached_fragments_matches_cold_write() {
+        let store = ObjectStore::memory();
+        let mut manifest = manifest_with_fragments(50);
+
+        let cold = Path::from("cold");
+        write_manifest_file(&store, &cold, &mut manifest).await;
+        assert!(manifest.encoded_fragments().is_some());
+
+        let warm = Path::from("warm");
+        write_manifest_file(&store, &warm, &mut manifest).await;
+        assert_eq!(
+            store.read_one_all(&warm).await.unwrap(),
+            store.read_one_all(&cold).await.unwrap()
+        );
+
+        let read_back = read_manifest(&store, &warm, None).await.unwrap();
+        assert!(read_back.encoded_fragments().is_none());
+        assert_eq!(read_back, manifest);
     }
 }

@@ -6,8 +6,8 @@ use arrow_schema::{DataType, Field};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use geo_types::coord;
 use geoarrow_array::GeoArrowArray;
 use geoarrow_array::builder::RectBuilder;

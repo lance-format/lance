@@ -28,8 +28,8 @@ half.workspace = true
 lance-jsonb = { workspace = true }
 lance-arrow.workspace = true
 lance-core = {workspace = true, features = ["datafusion"]}
-lance-datagen = {workspace = true, optional = true}
-lance-geo = {workspace = true, optional = true}
+lance-datafusion-exec.workspace = true
+geodatafusion = { workspace = true, optional = true }
 chrono.workspace = true
 log.workspace = true
 pin-project.workspace = true
@@ -42,12 +42,15 @@ prost-build.workspace = true
 protobuf-src = { workspace = true, optional = true }
 
 [dev-dependencies]
+geo-types.workspace = true
+geoarrow-array.workspace = true
+geoarrow-schema.workspace = true
 lance-datagen.workspace = true
 rstest.workspace = true
 
 [features]
-datagen = ["dep:lance-datagen"]
-geo = ["dep:lance-geo"]
+datagen = ["lance-datafusion-exec/datagen"]
+geo = ["dep:geodatafusion"]
 substrait = ["dep:datafusion-substrait"]
 protoc = ["dep:protobuf-src"]
 

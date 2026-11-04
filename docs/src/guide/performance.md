@@ -157,13 +157,117 @@ Notes:
 Lance uses an index cache to speed up queries. This caches vector and scalar indices in memory. The
 max size of this cache can be configured when creating a `LanceDataset` using the `index_cache_size_bytes`
 parameter. This cache is an LRU cached that is sized by bytes. The default size is 6 GiB.
-You can view the size of this cache by inspecting the result of `dataset.session().size_bytes()`.
+Use `dataset.session().cache_diagnostics()` to inspect the index and metadata caches separately.
+`dataset.session().size_bytes()` remains available for the session's deep-size estimate.
 
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
 
 **Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
 `index_cache_size_bytes` (specified in bytes) for new code.
+
+### Diagnosing Cache Behavior
+
+Session cache diagnostics are available without configuring OpenTelemetry. Python returns a nested
+dictionary for both cache tiers:
+
+```python
+diagnostics = dataset.session().cache_diagnostics()
+index = diagnostics["index"]
+metadata = diagnostics["metadata"]
+
+print(index["activity"]["hits"], index["activity"]["misses"])
+print(index["backend"]["size_bytes"], index["backend"]["capacity_bytes"])
+print(metadata["utilization"])
+```
+
+Java provides the same complete snapshot through `Session.getCacheDiagnostics()`, and Rust through
+`Session::cache_diagnostics()`. Request a refreshed snapshot only when current Moka occupancy matters:
+`cache_diagnostics(refresh=True)` in Python, `getCacheDiagnostics(true)` in Java, or
+`cache_diagnostics_with_mode(CacheSnapshotMode::Refreshed)` in Rust. Refresh asks the backend to run
+maintenance and still samples fields independently while concurrent work continues.
+
+Request per-type detail only when you need to identify which cache contents cause the activity or
+occupancy. This scans resident records in the built-in backends, so its cost grows with the number of
+entries:
+
+```python
+detailed = dataset.session().cache_diagnostics(by_type=True)
+for type_name, activity in detailed["index"]["by_type"]["activity"].items():
+    print(type_name, activity["hits"], activity["misses"])
+
+occupancy = detailed["index"]["by_type"]["occupancy"]
+if occupancy is not None:
+    for type_name, resident in occupancy["types"].items():
+        print(type_name, resident["num_entries"], resident["size_bytes"])
+```
+
+Java passes `CacheDiagnosticsOptions.builder().byType(true).build()` to
+`getCacheDiagnostics`, and Rust uses
+`cache_diagnostics_by_type(CacheSnapshotMode::Approximate)`. Adding refresh requests backend
+maintenance before the scan. Ordinary diagnostics do not scan entries and omit `by_type`.
+
+Activity is grouped by stable cache-key identity, so two logical key types remain distinct even when
+they store the same Rust value type. Each logical cache retains at most 64 activity names and combines
+later names into `other`. OpenTelemetry also bounds exported type names process-wide and reports
+overflow through `lance_cache_type_overflow_total`. After operations finish, per-type activity rows sum
+to the aggregate activity. During concurrent work, the independently sampled fields may temporarily
+differ.
+
+Per-type occupancy uses the backend's recorded entry weight. Entries written directly through the old
+backend interface appear in the explicit untagged totals. A custom backend reports occupancy as
+unavailable unless it implements tagged enumeration. The scan remains approximate while entries are
+inserted, replaced, or removed.
+
+Compare snapshots around the same operation when diagnosing a workload:
+
+- A cold run normally increases `misses`, `loads_started`, and `loads_succeeded`. A warm repeat should
+  increase `hits` while executed-load counters stay stable.
+- For explicit prewarming, compare `activity.warm.attempts` with `activity.warm.hits` and
+  `activity.warm.loads_started`. The warm load counters include direct cache insertions as well as
+  loader executions; `load_bytes` uses cache-accounted value size. `loads_succeeded` means a value
+  was submitted, not that the backend admitted or retained it. Warm counters cover operations made
+  through prewarm-origin handles, including MemWAL and index prewarm paths.
+- A high `load_success_duration_ns` delta identifies time spent in expensive loaders. Divide the delta
+  by the `loads_succeeded` delta for an average across that interval, or use the exported loader-duration
+  histogram for a distribution.
+- Growth in `size_removals` and `size_removed_bytes` together with repeated loads indicates capacity or
+  admission pressure. Built-in policy callbacks can combine a resident victim with a candidate that was
+  never admitted, so `resident_evictions` and `admissions` remain absent when the backend cannot prove
+  those outcomes. Quick reports size removals by default. Standard Moka reports these fields as
+  unsupported unless size-removal collection is enabled with
+  `moka://?capacity=<bytes>&size_removal_metrics=true` or
+  `MokaCacheBackend::builder(capacity).with_size_removal_metrics().build()`. The opt-in listener
+  adds work to cache removals and replacements.
+- A zero-capacity cache reports `enabled=False` and no utilization. Depending on the backend path,
+  `disabled_write_rejections` or `disabled_bypasses` explains why loaded values were not retained.
+  Low utilization can also accompany an entry that is too large for policy admission.
+- Compare the index and metadata snapshots before changing either budget. Index-heavy queries and
+  repeated dataset opens stress different tiers, and one healthy tier does not compensate for churn in
+  the other.
+
+Activity belongs to a logical wrapper and is shared by its clones and child namespaces. Backend fields
+belong to a physical pool. Equal non-null `pool_id` values identify the same process-local pool, so its
+occupancy should be counted once. The counters are lifetime values and do not reset when a cache is
+cleared. Snapshot fields are approximate and can change concurrently.
+
+A hit means the caller's loader was skipped. With concurrent requests, this includes callers that shared
+another request's successful load as well as callers that found an already-resident entry. Neither
+standard Moka nor Quick can always distinguish those cases, so `coalesced_loads` is absent for both
+built-in backends and neither emits `lance_cache_coalesced_loads_total`. Query execution statistics
+cover cache observations made by that query; session diagnostics also cover metadata access, backend
+writes, loaders, and activity from other operations sharing the session.
+
+Metrics exporters also publish `lance_cache_warm_attempts_total`, `lance_cache_warm_hits_total`,
+`lance_cache_warm_loads_total` (labelled by outcome), `lance_cache_warm_load_bytes_total`, and
+`lance_cache_warm_errors_total`. Each carries a bounded `type` label; sum over it for aggregate
+activity. The warm counters do not reset when a cache is cleared.
+
+`size_bytes`, `capacity_bytes`, write bytes, and removal bytes are cache-policy weights. They include key
+accounting and can count a shared allocation for each entry that references it. They are different from
+the deep-size estimate returned by `Session.size_bytes()` and from process RSS. Cache fullness by itself
+is therefore weak evidence: a full cache serving warm hits can be healthy, while a partly empty cache can
+repeatedly reject an oversized entry. Use hit/miss deltas, loader time, and removal churn with occupancy.
 
 ### Scanning Data
 
@@ -182,6 +286,31 @@ decoded at any one time is determined by the `batch_size` and the size of your r
 need enough memory to hold one batch. Once batches are delivered to your application, they are no longer tracked
 by Lance and so if memory is a concern then you should also be careful not to accumulate memory in your own
 application (e.g. by running `to_table` or otherwise collecting all batches in memory.)
+
+#### Large allocations and transparent huge pages
+
+Decoding allocates a fresh output buffer for every batch, and large columns (long strings, JSON documents,
+vectors) fill gigabytes of such buffers per scan. With the default glibc allocator every 4 KiB page of those
+buffers is faulted in on first touch, and on a scan that produces several gigabytes of Arrow data the page
+faults can cost as much CPU as the decoding itself (one profile of an 11 GB string scan showed 5.4 million
+page faults and about half of the CPU time in the kernel memory manager).
+
+On Linux with transparent huge pages in `madvise` mode (the default on most distributions, see
+`/sys/kernel/mm/transparent_hugepage/enabled`) you can let glibc back large allocations with 2 MiB pages:
+
+```shell
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1 python scan.py
+```
+
+On the same 11 GB scan this cut page faults by 9x and the scan time by 2-3.5x, both for 2.0 files and for
+compressed 2.2 files, and it made a full-table rewrite to 2.2 about 1.5x faster. Takes of a few rows are not
+affected.
+
+The setting is opt-in because its effect depends on the host. Huge pages are managed in 2 MiB units, so
+check the resident set against your memory limits. When free memory is fragmented and
+`/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, the kernel may compact memory synchronously on
+first touch: one 256 MiB allocation measured 0.09 s without the tunable and 1.2 s with it on a long-running
+host. Measure scan latency and memory on the deployment host before enabling it.
 
 The default `batch_size` is 8192 rows. When you are working with mostly scalar data you want to keep batches
 around 1MB and so the amount of memory needed by the compute threads is fairly small. However, when working with
@@ -245,15 +374,15 @@ over environment variables:
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
 | Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-These initial settings are balanced and should work for most
-use cases. For example, S3 can typically get up to 5000
-req/s and with these settings we should get there in about
-10 seconds.
+Under sustained success, the default rate grows from 2000 to 10000 requests/s
+in about 27 seconds. Each operation category has its own rate controller.
+The ceiling is a client-side tuning parameter, not a storage-provider limit;
+override it to match the workload and the store's throttling behavior.
 
 ## Fragment Sizing
 

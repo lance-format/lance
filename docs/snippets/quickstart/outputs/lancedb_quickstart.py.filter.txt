@@ -1,0 +1,3 @@
+   id                    name  price
+0   1       red running shoes   89.0
+1   4  waterproof rain jacket   99.0

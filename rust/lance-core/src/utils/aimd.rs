@@ -20,12 +20,12 @@ use crate::Result;
 /// Configuration for the AIMD rate controller.
 ///
 /// Use builder methods to customize. Defaults are tuned for cloud object stores
-/// and will start at about 40% of the max rate and require 10 seconds to reach
-/// the max rate.
+/// and will start at 20% of the max rate and require about 27 seconds of
+/// sustained success to reach the max rate.
 ///
 /// - initial_rate: 2000 req/s
 /// - min_rate: 1 req/s
-/// - max_rate: 5000 req/s (0.0 disables the ceiling; must be finite otherwise)
+/// - max_rate: 10000 req/s (0.0 disables the ceiling; must be finite otherwise)
 /// - decrease_factor: 0.5 (halve on throttle)
 /// - additive_increment: 300 req/s per success window
 /// - window_duration: 1 second
@@ -46,7 +46,7 @@ impl Default for AimdConfig {
         Self {
             initial_rate: 2000.0,
             min_rate: 1.0,
-            max_rate: 5000.0,
+            max_rate: 10000.0,
             decrease_factor: 0.5,
             additive_increment: 300.0,
             window_duration: Duration::from_secs(1),
@@ -340,8 +340,8 @@ mod tests {
         "throttle_threshold must be in [0.0, 1.0]"
     )]
     #[case::initial_exceeds_max(
-        AimdConfig::default().with_initial_rate(6000.0),
-        "initial_rate (6000) must not exceed max_rate (5000)"
+        AimdConfig::default().with_initial_rate(11000.0),
+        "initial_rate (11000) must not exceed max_rate (10000)"
     )]
     #[case::initial_below_min(
         AimdConfig::default().with_initial_rate(0.5).with_min_rate(1.0),
@@ -398,8 +398,33 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config_is_valid() {
-        AimdConfig::default().validate().unwrap();
+    fn test_default_config_ramps_to_ceiling_and_backs_off() {
+        let controller = AimdController::new(AimdConfig::default()).unwrap();
+        assert_eq!(controller.current_rate(), 2000.0);
+
+        let mut state = controller.state.lock().unwrap();
+        let start = state.window_start;
+        controller.record_outcome_inner(&mut state, RequestOutcome::Success, start);
+        for seconds in 1..=28 {
+            controller.record_outcome_inner(
+                &mut state,
+                RequestOutcome::Success,
+                start + Duration::from_secs(seconds),
+            );
+        }
+        assert_eq!(state.rate, 10000.0);
+
+        controller.record_outcome_inner(
+            &mut state,
+            RequestOutcome::Throttled,
+            start + Duration::from_secs(28),
+        );
+        controller.record_outcome_inner(
+            &mut state,
+            RequestOutcome::Success,
+            start + Duration::from_secs(29),
+        );
+        assert_eq!(state.rate, 5000.0);
     }
 
     #[test]

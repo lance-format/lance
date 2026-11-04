@@ -70,9 +70,10 @@ use super::projection::{
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::index::FtsMemQuery;
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::{MemTableScanner, local_fts_query};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-use crate::dataset::scanner::apply_dataset_planner_auto_fuzziness_compatibility_gate;
+use crate::dataset::scanner::fts::apply_dataset_planner_auto_fuzziness_compatibility_gate;
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
 };
@@ -1125,8 +1126,8 @@ impl LsmFtsSearchPlanner {
                     )
                     .await?;
                     // The index is on this generation's own column, under the
-                    // name it had when the generation was sealed. A generation
-                    // sealed before the column existed has no index on it and
+                    // name it had when the generation was frozen. A generation
+                    // frozen before the column existed has no index on it and
                     // offers no granularity.
                     let generation = GenerationRead::new(
                         dataset.schema(),
@@ -1554,8 +1555,9 @@ impl LsmFtsSearchPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
@@ -4886,8 +4888,9 @@ mod tests {
     /// Regression for filter-before-dedup on the active FTS arm.
     #[tokio::test]
     async fn prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_schema::{DataType, Field};
         use datafusion::prelude::{col, lit};
 
@@ -4981,8 +4984,9 @@ mod tests {
     /// the newer active copy is archived; pk=5 must not leak from the base arm.
     #[tokio::test]
     async fn prefilter_blocks_base_hit_when_active_newest_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use datafusion::prelude::{col, lit};
         use lance_index::IndexType;
@@ -5855,7 +5859,7 @@ mod tests {
         assert_eq!(search_ids(&planner, combined(columns)).await, vec![1]);
     }
 
-    /// The same queries over a flushed generation sealed before `body` existed.
+    /// The same queries over a generation frozen before `body` existed.
     #[tokio::test]
     async fn a_generation_that_predates_a_column_still_answers_the_rest() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;

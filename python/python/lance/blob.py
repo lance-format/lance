@@ -21,6 +21,9 @@ from .lance import (
     LanceBlobFile,
 )
 from .lance import (
+    ManagedBlobWriter as ManagedBlobWriter,
+)
+from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
 
@@ -393,7 +396,7 @@ class BlobFile(io.BufferedIOBase):
     ``read_range`` and ``read_ranges`` do not use the sequential buffer and
     do not change the sequential cursor.
 
-    Obtain a handle from :py:meth:`lance.dataset.Dataset.take_blobs`.
+    Obtain a handle from :py:meth:`lance.LanceDataset.take_blobs`.
     """
 
     def __init__(

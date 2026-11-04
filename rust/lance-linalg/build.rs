@@ -84,7 +84,9 @@ fn main() -> Result<(), String> {
         } else if cfg!(feature = "fp16kernels") {
             println!("cargo:rustc-cfg=kernel_support=\"avx512_bf16\"");
         };
-        if let Err(err) = build_dist_table_with_flags("avx512", &["-march=sapphirerapids"]) {
+        // Only the ISA the intrinsics need, so the Rust candidate can require
+        // exactly these features and also run on AVX-512 CPUs without FP16.
+        if let Err(err) = build_dist_table_with_flags("avx512", &["-mavx512f", "-mavx512bw"]) {
             println!(
                 "cargo:warning=Skipping build of AVX-512 dist_table. Error: {}",
                 err
@@ -224,7 +226,6 @@ fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::E
         .flag("-O3")
         .flag("-Wall")
         .flag("-Wextra")
-        .flag("-mavx512bw")
         .flag(format!("-DSUFFIX=_{}", suffix).as_str());
     for flag in flags {
         builder.flag(flag);

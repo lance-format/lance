@@ -91,6 +91,7 @@ pub use extension::Date;
 pub use extension::Interval;
 pub use extension::Timestamp;
 pub use extension::TimestampTz;
+pub use functions::ArrayElementIterator;
 pub use number::Decimal64;
 pub use number::Decimal128;
 pub use number::Decimal256;
