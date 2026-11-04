@@ -9,6 +9,7 @@ mod commit;
 mod concurrent_reindex;
 mod execution;
 mod frag_reuse;
+mod frag_reuse_contract;
 mod index_remap;
 mod lineage;
 mod overlays;
@@ -31,8 +32,8 @@ use crate::dataset::{WriteMode, WriteParams};
 use crate::index::CreateIndexBuilder;
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::index::vector::{StageParams, VectorIndexParams};
-use crate::index::{DatasetIndexInternalExt, load_all_indices};
 use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
 use crate::utils::test::{
     AmbiguousCommitHandler, AmbiguousFailure, DatagenExt, FragmentCount, FragmentRowCount,

@@ -27,7 +27,7 @@ use crate::dataset::optimize::commit::normalize_source_fragments;
 use crate::dataset::optimize::execution::live_source_row_addrs;
 use crate::dataset::transaction::{Operation, RewriteGroup};
 use crate::index::frag_reuse::load_frag_reuse_index_details;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 
 /// The snapshot a writer read, fixed before any rebase, so a refusal can tell
 /// history the writer saw from history published after it read.
@@ -717,7 +717,7 @@ fn validate_appended_stamp(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::HashMap;
 
     use arrow_array::cast::AsArray;
@@ -755,7 +755,7 @@ mod tests {
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
     use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, inline_padding_capacity,
+        DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
         padding_reuse_versions,
     };
 
@@ -837,7 +837,7 @@ mod tests {
             .clone()
     }
 
-    async fn history(dataset: &Dataset) -> Vec<FragReuseVersion> {
+    pub async fn history(dataset: &Dataset) -> Vec<FragReuseVersion> {
         load_frag_reuse_index_details(dataset, &frag_reuse_entry(dataset).await)
             .await
             .unwrap()
@@ -2212,7 +2212,7 @@ mod tests {
     }
 
     /// Queries through `index_name` answer `filter` as a full scan does.
-    async fn assert_answers_through(dataset: &Dataset, index_name: &str, filter: &str) {
+    pub async fn assert_answers_through(dataset: &Dataset, index_name: &str, filter: &str) {
         let mut answers = Vec::new();
         for use_scalar_index in [false, true] {
             let mut scanner = dataset.scan();
@@ -2657,7 +2657,7 @@ mod tests {
 
     /// Catches `i_idx` up past every recorded compaction by merging its
     /// segments, which moves their coverage onto the current fragments.
-    async fn catch_up_i_idx(dataset: &mut Dataset) {
+    pub async fn catch_up_i_idx(dataset: &mut Dataset) {
         let segments = dataset.load_indices_by_name("i_idx").await.unwrap();
         let merged = dataset
             .merge_existing_index_segments(segments)
@@ -2669,7 +2669,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn create_zone_map(dataset: &mut Dataset) {
+    pub async fn create_zone_map(dataset: &mut Dataset) {
         dataset
             .create_index_builder(
                 &["i"],
@@ -3228,7 +3228,7 @@ mod tests {
             .unwrap()
     }
 
-    fn coverage_of(indices: &[IndexMetadata], name: &str) -> RoaringBitmap {
+    pub fn coverage_of(indices: &[IndexMetadata], name: &str) -> RoaringBitmap {
         indices
             .iter()
             .filter(|index| index.name == name)
@@ -3367,78 +3367,6 @@ mod tests {
             RoaringBitmap::from_iter([compacted])
         );
         assert_answers_through(&latest, "late", "i < 150").await;
-    }
-
-    /// Twelve recorded compactions each rewrite both fragments into two, so
-    /// both outputs come from both inputs. Traced back to the zone map's
-    /// build, each fragment is followed once and the build's two fragments
-    /// come back once each; caught up past every compaction, the zone map
-    /// covers both current fragments and answers through them.
-    #[tokio::test]
-    async fn test_tracing_a_zone_map_follows_each_shared_ancestor_once() {
-        let dir = TempStrDir::default();
-        let mut dataset = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_dataset_with_params(
-                dir.as_str(),
-                FragmentCount::from(2),
-                FragmentRowCount::from(50),
-                Some(WriteParams {
-                    enable_stable_row_ids: true,
-                    max_rows_per_file: 50,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-        create_zone_map(&mut dataset).await;
-        let version = dataset.manifest.version;
-        let built = RoaringBitmap::from_iter([0, 1]);
-        for _ in 0..12 {
-            let current = dataset
-                .manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.id)
-                .collect::<Vec<_>>();
-            compact_into_two(&mut dataset, &current).await;
-        }
-        let versions = history(&dataset).await;
-        let named = versions
-            .iter()
-            .flat_map(|reuse| reuse.old_frag_ids().into_iter().chain(reuse.new_frag_ids()))
-            .map(|id| id as u32)
-            .collect::<RoaringBitmap>();
-        assert_eq!((versions.len(), named.len()), (12, 26));
-
-        let current = dataset
-            .manifest
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id as u32)
-            .collect::<RoaringBitmap>();
-        for fragment in current.iter() {
-            let visits = std::cell::Cell::new(0);
-            let mut sources = crate::index::sources_at_build(&versions, version, fragment, |id| {
-                visits.set(visits.get() + 1);
-                built.contains(id)
-            })
-            .unwrap();
-            assert!(
-                visits.get() <= named.len(),
-                "tracing fragment {fragment} took {} visits and returned {} sources",
-                visits.get(),
-                sources.len()
-            );
-            sources.sort_unstable();
-            assert_eq!(sources, [0, 1]);
-        }
-        catch_up_i_idx(&mut dataset).await;
-        assert_eq!(
-            coverage_of(&load_all_indices(&dataset).await.unwrap(), "i_idx"),
-            current
-        );
-        assert_answers_through(&dataset, "i_idx", "i < 50").await;
     }
 
     #[derive(Clone, Copy, Debug)]

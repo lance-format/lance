@@ -32,7 +32,7 @@ use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -736,6 +736,7 @@ impl Index for RTreeIndex {
             let range = self.page_range(page_id).await?;
             let batch = Arc::new(self.pages_reader.read_range(range, None).await?);
             self.index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &RTreeCacheKey::Page(page_id),
                     Arc::new(RTreeCacheValue(batch.clone())),
@@ -745,6 +746,7 @@ impl Index for RTreeIndex {
 
         let batch = self.nulls_reader.read_range(0..1, None).await?;
         self.index_cache
+            .with_load_origin(CacheLoadOrigin::Warm)
             .insert_with_key(
                 &RTreeCacheKey::Nulls,
                 Arc::new(RTreeCacheValue(Arc::new(batch))),

@@ -21,7 +21,8 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import ScannerBuilder, VectorIndexReader, VectorSearchQuery
+from lance._dataset.index import VectorIndexReader
+from lance._dataset.scanner import ScannerBuilder, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402

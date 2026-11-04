@@ -3,6 +3,7 @@
 
 //! Wraps a Fragment of the dataset.
 
+mod aligned_update;
 pub mod session;
 pub mod write;
 
@@ -567,11 +568,37 @@ mod v2_adapter {
         pub fn new(
             reader: Arc<ProjectedFileReader>,
             projection: Arc<Schema>,
-            field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+            mut field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
             legacy_blobs: Arc<HashSet<i32>>,
             default_priority: u32,
             file_scheduler: FileScheduler,
         ) -> Self {
+            if reader.version() == ConcreteFileVersion::V2_0 {
+                // A child rewrite can tombstone its ancestor IDs in the manifest,
+                // but V2.0 still needs those physical headers to read other children.
+                // Recover only structural headers, leaving superseded values excluded.
+                let missing_headers = projection
+                    .fields_pre_order()
+                    .filter(|field| {
+                        field.logical_type.is_struct()
+                            && !field.is_packed_struct()
+                            && !field.is_blob()
+                            && !field_id_to_column_idx.contains_key(&(field.id as u32))
+                    })
+                    .map(|field| field.id)
+                    .collect::<HashSet<_>>();
+                if !missing_headers.is_empty() {
+                    let (field_ids, column_indices) =
+                        file_versions::data_file_columns(reader.version(), reader.schema());
+                    Arc::make_mut(&mut field_id_to_column_idx).extend(
+                        field_ids
+                            .into_iter()
+                            .zip(column_indices)
+                            .filter(|(field_id, _)| missing_headers.contains(field_id))
+                            .map(|(field_id, column_index)| (field_id as u32, column_index as u32)),
+                    );
+                }
+            }
             Self {
                 reader,
                 projection,
