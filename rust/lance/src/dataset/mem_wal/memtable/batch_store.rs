@@ -673,6 +673,23 @@ impl BatchStore {
         &self.blob_preprocessor
     }
 
+    /// The stored batch holding memtable row `row_position`, and the row's
+    /// index in it; `None` past the committed batches.
+    pub(crate) fn locate_row(&self, row_position: u64) -> Option<(&StoredBatch, usize)> {
+        let (mut low, mut high) = (0, self.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.get(mid)?.row_offset <= row_position {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let batch = self.get(low.checked_sub(1)?)?;
+        let row = usize::try_from(row_position - batch.row_offset).ok()?;
+        (row < batch.num_rows).then_some((batch, row))
+    }
+
     pub(crate) async fn fail_blob_pack(&self, error: &crate::Error) {
         self.blob_preprocessor.lock().await.fail(error);
     }
