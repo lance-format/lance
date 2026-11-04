@@ -32,7 +32,7 @@ use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse;
 use crate::index::frag_reuse_reader;
 use crate::index::frag_reuse_with_stable_row_ids::{
-    has_frag_reuse_with_stable_row_ids, is_hidden_by_frag_reuse,
+    has_frag_reuse_with_stable_row_ids, indices_visible_with_frag_reuse, is_hidden_by_frag_reuse,
 };
 use crate::index::loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name};
 use crate::index::optimize;
@@ -526,17 +526,13 @@ impl DatasetIndexExt for Dataset {
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
-        // Readers apply the fragment reuse index to every index they open.
+        // Readers apply the fragment reuse index to every index they open. The
+        // history's plan only excludes indices failing the kind check, so the
+        // history is decoded only when one does.
         let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
             && indices.iter().any(is_hidden_by_frag_reuse)
         {
-            Arc::new(
-                indices
-                    .iter()
-                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                    .cloned()
-                    .collect(),
-            )
+            Arc::new(indices_visible_with_frag_reuse(self, &indices).await?)
         } else {
             indices
         };
@@ -1008,7 +1004,7 @@ impl DatasetIndexExt for Dataset {
                 let staged_plan = new_indices
                     .iter()
                     .any(|staged| staged.uuid == segment.uuid)
-                    .then_some(&frag_reuse::SegmentRemappingPlan::Identity);
+                    .then_some(&frag_reuse::ReadPlan::Direct);
                 let index = self
                     .open_vector_index_from_metadata_with_plan(
                         column,

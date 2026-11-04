@@ -1214,7 +1214,6 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::loading::DatasetIndexInternalExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
@@ -1229,6 +1228,7 @@ mod tests {
     mod tagged_remap_plan {
         use super::*;
         use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::system_index::frag_reuse::history::HistoryFormat;
         use prost::Message;
 
         fn digest(id: u64, rows: u64, deleted: u64) -> pb_fri::FragmentDigest {
@@ -1295,14 +1295,13 @@ mod tests {
             }
         }
 
-        async fn ledger(transitions: Vec<pb_fri::Transition>) -> FragReuseLedger {
+        async fn ledger(transitions: Vec<pb_fri::Transition>) -> Arc<FragReuseLedger> {
             let content = pb_fri::InlineContent {
                 legacy_versions: vec![],
                 transitions,
             }
             .encode_to_vec();
-            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
+            crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
                 .unwrap()
         }
 
@@ -1403,14 +1402,13 @@ mod tests {
         async fn ledger_with_legacy(
             legacy_versions: Vec<pb_fri::Version>,
             transitions: Vec<pb_fri::Transition>,
-        ) -> FragReuseLedger {
+        ) -> Arc<FragReuseLedger> {
             let content = pb_fri::InlineContent {
                 legacy_versions,
                 transitions,
             }
             .encode_to_vec();
-            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
+            crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
                 .unwrap()
         }
 
@@ -2768,13 +2766,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(
-                !dataset
+            assert_eq!(
+                dataset
                     .load_indices()
                     .await
                     .unwrap()
                     .iter()
-                    .any(|idx| idx.uuid == superseded.uuid),
+                    .find(|idx| idx.uuid == superseded.uuid)
+                    .and_then(|idx| idx.fragment_bitmap.clone()),
+                Some(RoaringBitmap::new()),
                 "the direct sibling supersedes the translating segment"
             );
             let version = dataset.manifest.version;
@@ -3549,7 +3549,7 @@ mod tests {
             .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) else {
                 return vec![];
             };
-            crate::index::frag_reuse::load_frag_reuse_records(dataset, &entry)
+            crate::utils::test::frag_reuse_records(dataset, &entry)
                 .await
                 .unwrap()
                 .legacy_versions
@@ -5146,7 +5146,7 @@ mod tests {
             }],
         };
         let frag_reuse_index =
-            build_frag_reuse_index_metadata(&clone, None, details, RoaringBitmap::new())
+            crate::utils::test::legacy_frag_reuse_entry(&clone, details, RoaringBitmap::new())
                 .await
                 .unwrap();
         clone

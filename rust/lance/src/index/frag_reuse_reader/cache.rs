@@ -16,7 +16,8 @@ use lance_index::frag_reuse::row_map::{ROW_MAP_CACHE_CHUNK_BYTES, RowMapBlockCac
 use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
-use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping, Transition};
+use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+use lance_table::system_index::frag_reuse::ledger::{Mapping, Transition};
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -29,7 +30,7 @@ struct LedgerKey {
 }
 
 impl CacheKey for LedgerKey {
-    type ValueType = FragReuseLedger;
+    type ValueType = FragReuseHistory;
     fn key(&self) -> Cow<'_, str> {
         format!(
             "{}:{}:{}:{}",
@@ -38,10 +39,10 @@ impl CacheKey for LedgerKey {
         .into()
     }
     fn type_name() -> &'static str {
-        "FragmentReuseLedger"
+        "FragmentReuseHistory"
     }
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.fri-ledger", 1)
+        CacheKeySchema::new("lance.index.fri-history", 1)
     }
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_fixed_bytes(self.uuid.as_bytes());
@@ -51,10 +52,10 @@ impl CacheKey for LedgerKey {
     }
 }
 
-pub(super) async fn open_ledger(
+pub(super) async fn open_history(
     dataset: &Dataset,
     index: &IndexMetadata,
-) -> Result<Arc<FragReuseLedger>> {
+) -> Result<Arc<FragReuseHistory>> {
     let store = dataset.object_store_for_index(index).await?;
     let key = LedgerKey {
         uuid: index.uuid,
@@ -64,7 +65,7 @@ pub(super) async fn open_ledger(
     };
     dataset
         .index_cache
-        .get_or_insert_with_key(key, || super::load_ledger(dataset, index))
+        .get_or_insert_with_key(key, || super::load_history(dataset, index))
         .await
 }
 

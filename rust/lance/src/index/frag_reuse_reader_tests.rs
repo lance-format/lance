@@ -1372,7 +1372,7 @@ async fn legacy_reader_guard_rejects_new_entry_points() {
                     .to_string()
                     .contains("V1 operation entered the new FRI reader")
             );
-            let error = load_ledger(&dataset, &index).await.unwrap_err();
+            let error = load_history(&dataset, &index).await.unwrap_err();
             assert!(matches!(error, Error::Internal { .. }));
             assert!(
                 error
@@ -1640,7 +1640,8 @@ async fn released_legacy_fri_keeps_version_zero_on_append() {
         .unwrap();
     assert_eq!(fri.index_version, 0);
     // Decode the released writer's actual Any, not a reserialized modern protobuf.
-    let ledger = load_ledger(&dataset, fri).await.unwrap();
+    let history = load_history(&dataset, fri).await.unwrap();
+    let ledger = history.ledger();
     assert!(!ledger.transitions().is_empty());
     let legacy = dataset
         .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -2086,24 +2087,25 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         "{no_sibling_coverage}"
     );
     let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
-    let empty = RoaringBitmap::new();
-    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
-    let planned = match &plan.segments[&siblings[1].uuid] {
-        crate::index::frag_reuse::SegmentRemappingPlan::Translate { fingerprint, .. } => {
-            *fingerprint
-        }
+    let no_coverage =
+        *lance_table::system_index::frag_reuse::plan::TranslationPlan::empty(mapping.history())
+            .fingerprint();
+    let planned = match &plan.segments[&siblings[1].uuid].read {
+        crate::index::frag_reuse::ReadPlan::Translate(translation) => *translation.fingerprint(),
         other => panic!("the sibling translates: {other:?}"),
     };
     assert_ne!(planned, no_coverage);
-    let refused = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+    // The pruned plan derives nothing for the sibling: a query opens it as
+    // contributing nothing, its fragments being scanned.
+    match open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
         .await
-        .unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains("excludes it from the index listing"),
-        "{refused}"
-    );
+        .unwrap()
+    {
+        Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
+            assert_eq!(fingerprint, no_coverage);
+        }
+        other => panic!("expected an empty translation, got {other:?}"),
+    }
     match open_row_id_remapping_with_plan(
         &dataset,
         &siblings[1],
@@ -2533,8 +2535,8 @@ async fn dropped_unknown_transition_forces_scalar_query_to_scan(#[case] external
         counts
     };
     let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
-    assert!(mapping.ledger.has_unsupported_transitions());
-    assert!(mapping.ledger.transitions().is_empty());
+    assert!(mapping.history().ledger().has_unsupported_transitions());
+    assert!(mapping.history().ledger().transitions().is_empty());
 
     // The scalar index must not be used: the dropped unknown transition forbids
     // identity, so the segment cannot claim coverage and the query scans.
@@ -4420,8 +4422,9 @@ async fn segment_state_matrix_at_the_open_layer() {
         .filter_map(|index| Some((index.uuid, index.fragment_bitmap.clone()?)))
         .collect();
     let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
-    let empty = RoaringBitmap::new();
-    let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
+    let no_coverage =
+        *lance_table::system_index::frag_reuse::plan::TranslationPlan::empty(mapping.history())
+            .fingerprint();
 
     #[derive(Debug, PartialEq)]
     enum Cell {
@@ -4479,15 +4482,29 @@ async fn segment_state_matrix_at_the_open_layer() {
             Cell::Serves,
             Cell::Serves,
         ),
+        // Segments that derive no coverage stay listed with none: their
+        // fragments are scanned, and they open as contributing nothing.
         (
             "partially withdrawn",
             &partial,
-            None,
-            Cell::Error,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
             Cell::Empty,
         ),
-        ("empty last", &empty_last, None, Cell::Error, Cell::Empty),
-        ("superseded", &superseded, None, Cell::Error, Cell::Empty),
+        (
+            "empty last",
+            &empty_last,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
+            Cell::Empty,
+        ),
+        (
+            "superseded",
+            &superseded,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
+            Cell::Empty,
+        ),
         ("bitmap None", &unknown, None, Cell::Error, Cell::Skip),
         ("corrupt", &corrupt, None, Cell::Error, Cell::Error),
     ];

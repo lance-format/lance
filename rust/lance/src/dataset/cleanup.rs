@@ -1370,15 +1370,10 @@ impl<'a> CleanupTask<'a> {
         let entries = std::mem::take(&mut inspection.frag_reuse_entries);
         for (uuid, (entry, in_working_set)) in entries.iter() {
             let map_ids = async {
-                let content =
-                    crate::index::frag_reuse::load_raw_frag_reuse_content(self.dataset, entry)
-                        .await?;
-                let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
-                    entry.index_version,
-                    &content,
-                )
-                .await?;
-                if ledger.has_unsupported_transitions() {
+                let history =
+                    crate::index::frag_reuse::load_frag_reuse_history(self.dataset, entry).await?;
+                let ledger = history.ledger();
+                if !history.is_fully_interpretable() {
                     return Err(Error::not_supported(
                         "the tagged FRI history carries transitions this client cannot interpret",
                     ));
@@ -2272,73 +2267,73 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<Vec<String>> {
         use lance_table::system_index::frag_reuse::ledger::Mapping;
 
-        let details = entry
+        entry
             .index_details
             .as_ref()
             .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
             .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-        let content =
-            crate::index::frag_reuse::extract_raw_frag_reuse_content(details, |file| async move {
-                let end = file
-                    .offset
-                    .checked_add(file.size)
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named("FRI details", "external FRI range overflow")
+        let external = crate::index::frag_reuse::read_external_history(entry, |file| async move {
+            let end = file
+                .offset
+                .checked_add(file.size)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("FRI details", "external FRI range overflow")
+                })?;
+            let (store, indices_dir) = match entry.base_id {
+                None => (None, branch_root.clone().join(crate::dataset::INDICES_DIR)),
+                Some(id) => {
+                    let base_path = manifest.base_paths.get(&id).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "base_path id {} not found for index {}",
+                            id, entry.uuid
+                        ))
                     })?;
-                let (store, indices_dir) = match entry.base_id {
-                    None => (None, branch_root.clone().join(crate::dataset::INDICES_DIR)),
-                    Some(id) => {
-                        let base_path = manifest.base_paths.get(&id).ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "base_path id {} not found for index {}",
-                                id, entry.uuid
-                            ))
-                        })?;
-                        let path = base_path.extract_path(self.dataset.session.store_registry())?;
-                        let dir = if base_path.is_dataset_root {
-                            path.join(crate::dataset::INDICES_DIR)
-                        } else {
-                            path
-                        };
-                        let store = if parent_base_ids.contains(&Some(id)) {
-                            None
-                        } else {
-                            // Foreign bases are opened with default store
-                            // params; per-base credentials are not plumbed
-                            // through cleanup (see
-                            // <https://github.com/lance-format/lance/issues/6093>).
-                            Some(
-                                lance_io::object_store::ObjectStore::from_uri_and_params(
-                                    self.dataset.session.store_registry(),
-                                    &base_path.path,
-                                    &Default::default(),
-                                )
-                                .await?
-                                .0,
+                    let path = base_path.extract_path(self.dataset.session.store_registry())?;
+                    let dir = if base_path.is_dataset_root {
+                        path.join(crate::dataset::INDICES_DIR)
+                    } else {
+                        path
+                    };
+                    let store = if parent_base_ids.contains(&Some(id)) {
+                        None
+                    } else {
+                        // Foreign bases are opened with default store
+                        // params; per-base credentials are not plumbed
+                        // through cleanup (see
+                        // <https://github.com/lance-format/lance/issues/6093>).
+                        Some(
+                            lance_io::object_store::ObjectStore::from_uri_and_params(
+                                self.dataset.session.store_registry(),
+                                &base_path.path,
+                                &Default::default(),
                             )
-                        };
-                        (store, dir)
-                    }
-                };
-                let path = indices_dir
-                    .join(entry.uuid.to_string())
-                    .join(file.path.as_str());
-                let store = store.as_deref().unwrap_or(&self.dataset.object_store);
-                store
-                    .open(&path)
-                    .await?
-                    .get_range(file.offset as usize..end)
-                    .await
-                    .map_err(Error::from)
-            })
-            .await?;
-        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
-            entry.index_version,
-            &content,
-        )
+                            .await?
+                            .0,
+                        )
+                    };
+                    (store, dir)
+                }
+            };
+            let path = indices_dir
+                .join(entry.uuid.to_string())
+                .join(file.path.as_str());
+            let store = store.as_deref().unwrap_or(&self.dataset.object_store);
+            store
+                .open(&path)
+                .await?
+                .get_range(file.offset as usize..end)
+                .await
+                .map_err(Error::from)
+        })
         .await?;
-        if ledger.has_unsupported_transitions() {
+        // The branch's entry is committed, so it is read as stored history. A
+        // tagged history is never repaired, so nothing is dropped from it here.
+        let history = lance_table::system_index::frag_reuse::history::FragReuseHistory::decode(
+            entry, external,
+        )?;
+        let ledger = history.ledger();
+        if !history.is_fully_interpretable() {
             return Err(Error::not_supported(
                 "the branch's tagged FRI history carries transitions this client cannot interpret",
             ));

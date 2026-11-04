@@ -86,13 +86,17 @@ pub enum Operation {
         groups: Vec<RewriteGroup>,
         /// Indices that have been updated with the new row addresses
         rewritten_indices: Vec<RewrittenIndex>,
-        /// The fragment reuse index entry to be created or updated to: the
-        /// complete entry the caller wants installed, that is a base entry
-        /// plus this rewrite's own records.
+        /// The records this rewrite adds to the fragment reuse history,
+        /// expressed as an entry: the history the rewrite read plus its own
+        /// records. The commit path treats it as intent, never as the entry
+        /// to install: it validates the added records and publishes an entry
+        /// it encodes itself.
         ///
         /// On a v0 history (`index_version` 0) it must be the entry of the dataset
         /// the rewrite is committed through plus one version; a latest entry that
-        /// is neither that entry nor a trim of it is a retryable conflict.
+        /// is neither that entry nor a trim of it is a retryable conflict. The
+        /// added version must be valid against the history, or the rewrite is
+        /// refused.
         ///
         /// On a tagged history (`index_version` 1) the commit path does not
         /// splice this entry as it is. It works out which records the entry

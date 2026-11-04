@@ -1,10 +1,64 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! The fragment reuse index (FRI): the system index that records how
+//! compaction and other rewrites moved rows between fragments, so index
+//! segments built before a rewrite can still be read and later remapped.
+//!
+//! lance-table owns the control plane: the records, their validation, what a
+//! table allows a writer to record, and how a reader plans each segment. It
+//! does no object-store IO; callers hand it bytes and segment metadata.
+//!
+//! ```text
+//! frag_reuse
+//! ├── history         FragReuseHistory: decode, validate, edit, encode, plan
+//! ├── policy          FriPolicy: which format and edits the table allows
+//! ├── plan            ReadPlan and its inputs (SegmentSummary, ReadContext)
+//! ├── ledger          FragReuseLedger: decoded transitions, metadata only
+//! ├── lineage         TaggedLineage: may a segment keep its provenance?
+//! ├── gate            classify: which commits a tagged table admits
+//! ├── metadata        feature-flag and entry guards for the tagged format
+//! ├── impls (private) one FriImpl per format behind FragReuseHistory
+//! │   ├── legacy        index_version 0
+//! │   ├── legacy_srid   index_version 0 on a table with stable row IDs
+//! │   ├── tagged        index_version 1
+//! │   └── lift          legacy -> tagged
+//! └── contract_tests  one behavioral contract every format must pass
+//! ```
+//!
+//! Where to start:
+//!
+//! - Reading or writing an FRI entry: [`history::FragReuseHistory`]. It is
+//!   the only way to read or edit the records, and every edit revalidates.
+//!   [`history::HistoryFormat`] names the wire format and
+//!   [`history::RewriteRecord`] is what a rewrite appends.
+//! - Deciding whether a rewrite may record history, and onto which format:
+//!   [`policy::FriPolicy`].
+//! - Opening an index segment under a history:
+//!   [`history::FragReuseHistory::plan`] returns a [`plan::ReadPlan`] per
+//!   segment (`Direct`, `Translate` or `Excluded`).
+//! - Changing how one format behaves: its file under `impls`, checked by
+//!   `contract_tests`.
+//!
+//! The types at this level ([`FragReuseIndexDetails`],
+//! [`CompactFragReuseIndex`] and friends) are the released version 0
+//! in-memory representation, kept for its existing readers.
+
+#[cfg(test)]
+mod contract_tests;
 pub mod gate;
+pub mod history;
+mod impls;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata;
+pub mod plan;
+pub mod policy;
+
+// Version 0 cleanup in `lance` until trim owns it; not part of the stable
+// interface.
+#[doc(hidden)]
+pub use impls::legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 

@@ -238,7 +238,7 @@ pub async fn tagged_segment_coverage(
     segments: &[&IndexMetadata],
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<Option<HashMap<Uuid, RoaringBitmap>>> {
-    use crate::index::frag_reuse::SegmentRemappingPlan;
+    use crate::index::frag_reuse::ReadPlan;
 
     let stored = crate::index::loading::load_all_indices(dataset).await?;
     if !stored
@@ -252,13 +252,13 @@ pub async fn tagged_segment_coverage(
     for segment in segments {
         if let Some(plan) = staged.and_then(|plans| plans.get(&segment.uuid)) {
             let bitmap = match plan {
-                SegmentRemappingPlan::Identity => segment
+                ReadPlan::Direct => segment
                     .fragment_bitmap
                     .as_ref()
                     .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
-                SegmentRemappingPlan::Translate { coverage, .. } => coverage.clone(),
-                SegmentRemappingPlan::MissingCoverage(_) => {
+                ReadPlan::Translate(translation) => translation.coverage().clone(),
+                ReadPlan::Excluded => {
                     return Err(Error::not_supported(format!(
                         "FRI query coverage is unavailable for staged segment {}",
                         segment.uuid

@@ -102,16 +102,24 @@ pub(super) enum IndexKind {
     BloomFilter,
     LabelList,
     NGram,
+    Fm,
     Inverted,
     IvfFlat,
 }
 
 impl IndexKind {
+    /// Whether the kind has a batch row-id remapper, without which the tagged
+    /// reader leaves out every segment that has not caught up with the
+    /// history.
+    pub(super) fn translates_tagged_history(self) -> bool {
+        !matches!(self, Self::Fm)
+    }
+
     pub(super) fn column(self) -> &'static str {
         match self {
             Self::BTree | Self::Bitmap | Self::ZoneMap | Self::BloomFilter => "v",
             Self::LabelList => "tags",
-            Self::NGram | Self::Inverted => "text",
+            Self::NGram | Self::Fm | Self::Inverted => "text",
             Self::IvfFlat => "vec",
         }
     }
@@ -135,7 +143,7 @@ impl IndexKind {
                     row.tag == "updated"
                 }),
             ],
-            Self::NGram => vec![
+            Self::NGram | Self::Fm => vec![
                 Query::Filter("contains(text, 'w1')", |row| row.text.contains("w1")),
                 Query::Filter("contains(text, 'updated')", |row| {
                     row.text.contains("updated")
@@ -160,6 +168,7 @@ impl IndexKind {
             Self::BloomFilter => IndexType::BloomFilter,
             Self::LabelList => IndexType::LabelList,
             Self::NGram => IndexType::NGram,
+            Self::Fm => IndexType::Fm,
             Self::Inverted => IndexType::Inverted,
             Self::IvfFlat => IndexType::Vector,
         }
@@ -177,6 +186,7 @@ impl IndexKind {
             Self::BloomFilter => BuiltinIndexType::BloomFilter,
             Self::LabelList => BuiltinIndexType::LabelList,
             Self::NGram => BuiltinIndexType::NGram,
+            Self::Fm => BuiltinIndexType::Fm,
         };
         Box::new(ScalarIndexParams::for_builtin(builtin))
     }

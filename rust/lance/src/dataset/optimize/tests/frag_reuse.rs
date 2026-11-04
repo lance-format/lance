@@ -88,8 +88,7 @@ async fn test_shallow_clone_loads_external_frag_reuse_details() {
     let clone_dir = TempStrDir::default();
     let clone_uri = format!("{}/clone", clone_dir);
 
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-    use lance_index::frag_reuse::{FragDigest, FragReuseIndexDetails, FragReuseVersion};
+    use lance_index::frag_reuse::{FragDigest, FragReuseIndexDetails};
 
     let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
     let mut dataset = Dataset::write(
@@ -128,7 +127,7 @@ async fn test_shallow_clone_loads_external_frag_reuse_details() {
         }
         let mut serialized = Vec::new();
         addrs.serialize_into(&mut serialized).unwrap();
-        versions.push(FragReuseVersion {
+        versions.push(lance_index::frag_reuse::FragReuseVersion {
             dataset_version: i + 1,
             groups: vec![FragReuseGroup {
                 changed_row_addrs: serialized,
@@ -139,7 +138,7 @@ async fn test_shallow_clone_loads_external_frag_reuse_details() {
     }
     let details = FragReuseIndexDetails { versions };
     let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
-    let entry = build_frag_reuse_index_metadata(&dataset, None, details, bitmap)
+    let entry = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, bitmap)
         .await
         .unwrap();
     dataset
@@ -1554,7 +1553,6 @@ async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
 /// Two external entries of the same size each load their own details from one session.
 #[tokio::test]
 async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
     let dir = TempStrDir::default();
     let dataset = lance_datagen::gen_batch()
@@ -1574,10 +1572,13 @@ async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
             version.dataset_version = stamp;
         }
         let details = lance_index::frag_reuse::FragReuseIndexDetails { versions };
-        let entry =
-            build_frag_reuse_index_metadata(&dataset, None, details.clone(), RoaringBitmap::new())
-                .await
-                .unwrap();
+        let entry = crate::utils::test::legacy_frag_reuse_entry(
+            &dataset,
+            details.clone(),
+            RoaringBitmap::new(),
+        )
+        .await
+        .unwrap();
         entries.push((entry, details));
     }
     let sizes: Vec<_> = entries
@@ -1609,7 +1610,6 @@ async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
 /// Versions written out of stamp order load from memory as a read of the file decodes them.
 #[tokio::test]
 async fn test_reuse_details_cache_holds_what_a_read_decodes() {
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
     let dir = TempStrDir::default();
     let dataset = lance_datagen::gen_batch()
@@ -1626,9 +1626,8 @@ async fn test_reuse_details_cache_holds_what_a_read_decodes() {
     for (i, version) in versions.iter_mut().enumerate() {
         version.dataset_version = count - i as u64;
     }
-    let entry = build_frag_reuse_index_metadata(
+    let entry = crate::utils::test::legacy_frag_reuse_entry(
         &dataset,
-        None,
         lance_index::frag_reuse::FragReuseIndexDetails { versions },
         RoaringBitmap::new(),
     )
@@ -3230,4 +3229,119 @@ async fn test_deferred_compaction_rejects_crossing_an_unsupported_index_boundary
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("physical coverage boundary"));
     assert_eq!(dataset.manifest.version, version_before_commit);
+}
+
+/// A stored v0 history that an older writer left invalid is repaired by the
+/// next deferred compaction: the invalid version is dropped, the compaction
+/// records its own version, and indexed queries still return every live row.
+#[tokio::test]
+async fn test_deferred_compaction_repairs_an_invalid_stored_history() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    create_scalar_index(&mut dataset, "i", false).await;
+    let first = CompactionOptions {
+        target_rows_per_fragment: 20,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, first, None).await.unwrap();
+
+    // Plant a version that consumes fragment 0 a second time.
+    let entry = dataset
+        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut versions = load_frag_reuse_index_details(&dataset, &entry)
+        .await
+        .unwrap()
+        .versions
+        .clone();
+    let recorded = versions[0].dataset_version;
+    let digest = |id: u64| lance_index::frag_reuse::FragDigest {
+        id,
+        physical_rows: 10,
+        num_deleted_rows: 0,
+    };
+    let mut rows = RoaringTreemap::new();
+    rows.insert_range(0..10);
+    let mut changed_row_addrs = Vec::new();
+    rows.serialize_into(&mut changed_row_addrs).unwrap();
+    let invalid = dataset.manifest.version;
+    versions.push(lance_index::frag_reuse::FragReuseVersion {
+        dataset_version: invalid,
+        groups: vec![FragReuseGroup {
+            changed_row_addrs,
+            old_frags: vec![digest(0)],
+            new_frags: vec![digest(100)],
+        }],
+    });
+    let details = lance_index::frag_reuse::FragReuseIndexDetails { versions };
+    let bitmap = details.new_frag_bitmap();
+    let planted = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, bitmap)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![planted],
+                    removed_indices: vec![entry],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let second = CompactionOptions {
+        target_rows_per_fragment: 1000,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, second, None).await.unwrap();
+
+    let entry = dataset
+        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        .await
+        .unwrap()
+        .unwrap();
+    let kept: Vec<u64> = load_frag_reuse_index_details(&dataset, &entry)
+        .await
+        .unwrap()
+        .versions
+        .iter()
+        .map(|version| version.dataset_version)
+        .collect();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(kept[0], recorded);
+    assert!(!kept.contains(&invalid), "{kept:?}");
+
+    for filter in ["i = 13", "i >= 5 AND i < 45"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["i"]).unwrap();
+        let mut scanned = dataset.scan();
+        scanned
+            .filter(filter)
+            .unwrap()
+            .use_scalar_index(false)
+            .project(&["i"])
+            .unwrap();
+        let values = |batch: RecordBatch| {
+            let mut values = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            values
+        };
+        assert_eq!(
+            values(indexed.try_into_batch().await.unwrap()),
+            values(scanned.try_into_batch().await.unwrap()),
+            "{filter}"
+        );
+    }
 }

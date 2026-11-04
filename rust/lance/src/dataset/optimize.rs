@@ -169,21 +169,11 @@ pub async fn compact_files_with_planner(
     // remapping would rewrite provenance the tagged reader depends on.
     // Checked before any file is rewritten (commit_compaction re-checks for
     // callers that commit externally planned results).
-    if !compaction_plan.options.defer_index_remap
-        && dataset.manifest.writer_feature_flags
-            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
-            != 0
-        && crate::index::loading::load_all_indices(dataset)
-            .await?
-            .iter()
-            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
-    {
-        return Err(Error::not_supported(
-            "Compacting a table with a tagged fragment reuse history requires \
-             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
-             remaps tagged histories eagerly",
-        ));
-    }
+    lance_table::system_index::frag_reuse::policy::FriPolicy::new(
+        &dataset.manifest,
+        &crate::index::loading::load_all_indices(dataset).await?,
+    )
+    .require_rewrite_allowed(compaction_plan.options.defer_index_remap)?;
 
     // If nothing to compact, don't make a commit.
     if compaction_plan.tasks().is_empty() {

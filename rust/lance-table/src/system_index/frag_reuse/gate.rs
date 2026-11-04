@@ -12,7 +12,9 @@
 //! reason that says what to do instead.
 
 use super::FRAG_REUSE_INDEX_NAME;
-use super::metadata::{is_tagged, uses_tagged_fri};
+use super::history::HistoryFormat;
+use super::metadata::is_tagged;
+use super::policy::FriPolicy;
 use crate::format::{IndexMetadata, Manifest};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{FragReuseUpdate, Operation};
@@ -139,30 +141,31 @@ pub fn classify(
         false
     };
 
-    let replaces_entry = matches!(
-        operation,
+    // A v0 entry published whole: a rewrite's snapshot, or one a raw
+    // `CreateIndex` carries.
+    let publishes_legacy_entry = match operation {
         Operation::Rewrite {
             frag_reuse_index: Some(_),
             ..
-        }
-    ) && !appends_transitions;
+        } => !appends_transitions,
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && !is_tagged(index)),
+        _ => false,
+    };
     if !current_indices.iter().any(is_tagged) {
-        // The sticky flag is the final authority on the record form
-        // (`uses_tagged_fri`): once a manifest carries
+        // The sticky flag is the final authority on the history format
+        // (`FriPolicy::history_format`): once a manifest carries
         // FLAG_FRAGMENT_REUSE_INDEX every fragment reuse write is tagged,
         // even after a trim removed a fully drained entry. A v0 snapshot
         // would silently downgrade the table back to whole-history
         // replacement; the commit path converts a stale v0 intent into
-        // transitions before this point (`finish_rewrite`), so only a
-        // writer that skipped that conversion arrives here.
-        if replaces_entry
+        // transitions before this point (`finish_rewrite`), and the cleanup
+        // trims a v0 entry under the flag as a tagged history, so only a
+        // writer that skipped both arrives here.
+        if publishes_legacy_entry
             && current_manifest.is_some_and(|manifest| {
-                uses_tagged_fri(
-                    manifest,
-                    current_indices
-                        .iter()
-                        .find(|index| index.name == FRAG_REUSE_INDEX_NAME),
-                )
+                FriPolicy::new(manifest, current_indices).history_format() == HistoryFormat::Tagged
             })
         {
             return Err(Error::invalid_input(
@@ -866,6 +869,51 @@ mod tests {
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("id_idx"), "{error}");
         assert!(error.to_string().contains("no fragment bitmap"), "{error}");
+    }
+
+    /// The sticky flag keeps the tagged format after a drained entry is
+    /// trimmed away: a v0 entry is refused whether a rewrite or a raw
+    /// `CreateIndex` publishes it, and still admitted on an untagged table.
+    #[rstest::rstest]
+    #[case::rewrite(true)]
+    #[case::create_index(false)]
+    fn a_v0_entry_is_refused_once_the_table_is_flagged(#[case] by_rewrite: bool) {
+        let mut legacy = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+        legacy.fields.clear();
+        legacy.index_version = 0;
+        let operation = if by_rewrite {
+            rewrite(0, Some(legacy))
+        } else {
+            Operation::CreateIndex {
+                new_indices: vec![legacy],
+                removed_indices: vec![],
+            }
+        };
+
+        let (flagged, _) = table(Table::Tagged);
+        let error = classify(
+            &operation,
+            Some(&flagged),
+            &[],
+            &FragReuseUpdate::None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("sticky feature flag"), "{error}");
+
+        let (untagged, indices) = table(Table::Untagged);
+        assert_eq!(
+            classify(
+                &operation,
+                Some(&untagged),
+                &indices,
+                &FragReuseUpdate::None,
+                None
+            )
+            .unwrap(),
+            Admission::Untagged
+        );
     }
 
     #[test]

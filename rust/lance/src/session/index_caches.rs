@@ -160,6 +160,56 @@ impl CacheKey for FragReuseDetailsKey<'_> {
     }
 }
 
+/// The raw bytes of an external `details.binpb`, keyed like
+/// [`FragReuseDetailsKey`], so every decoder of one history shares one read.
+#[derive(Debug)]
+pub struct FragReuseContentKey<'a> {
+    pub store_identity: &'a str,
+    pub path: &'a object_store::path::Path,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// See [`FragReuseContentKey`].
+#[derive(Debug)]
+pub struct FragReuseContent(pub bytes::Bytes);
+
+impl DeepSizeOf for FragReuseContent {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        self.0.len()
+    }
+}
+
+impl CacheKey for FragReuseContentKey<'_> {
+    type ValueType = FragReuseContent;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "frag_reuse_content/{}:{}/{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.path,
+            self.offset,
+            self.size
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "FragReuseContent"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-content-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_str(self.path.as_ref());
+        builder.write_u64(self.offset);
+        builder.write_u64(self.size);
+    }
+}
+
 /// Restricted deletion mask of a vector index segment at one dataset version
 /// (`None`: the segment needs no restriction). Building it walks every
 /// fragment of the dataset, hence the cache entry.

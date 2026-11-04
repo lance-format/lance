@@ -7,23 +7,21 @@ use std::sync::Arc;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::index::frag_reuse::{
-    build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
-    decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
-    load_raw_frag_reuse_content,
+    encode_frag_reuse_entry, load_frag_reuse_history, load_frag_reuse_index_details,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
 use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
-use lance_index::frag_reuse::{
-    CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
-};
+use lance_index::frag_reuse::{CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseVersion};
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
+use lance_table::system_index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 use log::warn;
-use prost::Message;
 use roaring::RoaringBitmap;
 
 impl Dataset {
@@ -146,9 +144,10 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         return cleanup_stable_row_id_history(dataset, frag_reuse_index_meta, &indices).await;
     }
 
-    // Hard fork by index_version: tagged histories trim per transition in
-    // fresh code below, while the v0 path stays exactly as it was.
-    if frag_reuse_index_meta.index_version != 0 {
+    // A tagged table trims per record, a v0 entry under the sticky flag
+    // included (it is lifted, as compaction lifts it); a v0 table keeps the
+    // v0 path exactly as it was.
+    if FriPolicy::new(&dataset.manifest, &indices).history_format() == HistoryFormat::Tagged {
         return cleanup_tagged_frag_reuse_index(dataset).await;
     }
 
@@ -157,7 +156,6 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
 
     let mut retained_versions = Vec::new();
-    let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
         let check_results = indices
             .iter()
@@ -173,8 +171,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         }
 
         if !check_results.into_iter().all(|r| r.unwrap()) {
-            fragment_bitmaps.extend(version.new_frag_bitmap());
-            retained_versions.push(version.clone());
+            retained_versions.push(version);
         }
     }
 
@@ -183,17 +180,15 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         return Ok(());
     }
 
-    let frag_reuse_index_details = FragReuseIndexDetails {
-        versions: retained_versions,
-    };
-
-    let new_index_meta = build_frag_reuse_index_metadata(
-        dataset,
-        Some(frag_reuse_index_meta),
-        frag_reuse_index_details,
-        fragment_bitmaps,
-    )
-    .await?;
+    let (retained, dropped) = FragReuseHistory::repair_legacy_versions(
+        retained_versions
+            .into_iter()
+            .map(pb_fri::Version::from)
+            .collect(),
+    )?;
+    warn_dropped_versions(&dropped);
+    let new_index_meta =
+        encode_frag_reuse_entry(dataset, &retained, dataset.manifest.version).await?;
 
     let transaction = Transaction::new(
         dataset.manifest.version,
@@ -224,17 +219,15 @@ async fn cleanup_stable_row_id_history(
     if trimmed == 0 {
         return Ok(());
     }
-    let retained = FragReuseIndexDetails {
-        versions: details.versions[trimmed..].to_vec(),
-    };
-    let fragment_bitmap = retained.new_frag_bitmap();
-    let new_index_meta = build_frag_reuse_index_metadata(
-        dataset,
-        Some(frag_reuse_index_meta),
-        retained,
-        fragment_bitmap,
-    )
-    .await?;
+    let (retained, dropped) = FragReuseHistory::repair_legacy_versions(
+        details.versions[trimmed..]
+            .iter()
+            .map(pb_fri::Version::from)
+            .collect(),
+    )?;
+    warn_dropped_versions(&dropped);
+    let new_index_meta =
+        encode_frag_reuse_entry(dataset, &retained, dataset.manifest.version).await?;
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
@@ -249,76 +242,12 @@ async fn cleanup_stable_row_id_history(
     Ok(())
 }
 
-/// Every fragment the reuse chain touches (old + new) across all versions. An
-/// index disjoint from this set holds no row address the FRI remaps, so trimming
-/// can never strand it (fragment ids are never reused).
-pub(crate) fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
-    let mut bitmap = RoaringBitmap::new();
-    for version in versions {
-        bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
-        bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
-    }
-    bitmap
-}
-
-pub(crate) fn is_index_remap_caught_up(
-    frag_reuse_version: &FragReuseVersion,
-    index_meta: &IndexMetadata,
-    chain_frag_bitmap: &RoaringBitmap,
-) -> lance_core::Result<bool> {
-    if is_system_index(index_meta) {
-        return Ok(true);
-    }
-
-    // Disjoint coverage => caught up regardless of dataset_version, bypassing the
-    // stale-version gate below (see fn docs). The chain includes NEW fragments
-    // deliberately: a deferred-remap commit advances a covering index's bitmap
-    // onto them before its data is remapped, so an old-frag-only check would
-    // clear a still-stale index and trim a version it needs.
-    if let Some(index_frag_bitmap) = &index_meta.fragment_bitmap
-        && index_frag_bitmap.is_disjoint(chain_frag_bitmap)
-    {
-        return Ok(true);
-    }
-
-    // Inclusive: an index built at dataset_version predates the rewrite.
-    if index_meta.dataset_version <= frag_reuse_version.dataset_version {
-        return Ok(false);
-    }
-
-    match index_meta.fragment_bitmap.clone() {
-        Some(index_frag_bitmap) => {
-            for group in frag_reuse_version.groups.iter() {
-                let mut old_frag_in_index = 0;
-                for old_frag in group.old_frags.iter() {
-                    if index_frag_bitmap.contains(old_frag.id as u32) {
-                        old_frag_in_index += 1;
-                    }
-                }
-
-                if old_frag_in_index > 0 {
-                    if old_frag_in_index != group.old_frags.len() {
-                        // This should never happen because we always commit a full rewrite group
-                        // and we always reindex either the entire group or nothing.
-                        // We use invalid input to be consistent with
-                        // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(format!(
-                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                            group.old_frags
-                        )));
-                    }
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        None => {
-            warn!(
-                "Index {} ({}) missing fragment bitmap, cannot determine if it is caught up with the fragment reuse version, consider retraining the index",
-                index_meta.name, index_meta.uuid
-            );
-            Ok(true)
-        }
+pub(crate) fn warn_dropped_versions(dropped: &[u64]) {
+    if !dropped.is_empty() {
+        warn!(
+            "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
+             scanned until their indices are rebuilt"
+        );
     }
 }
 
@@ -425,15 +354,14 @@ pub(crate) async fn derive_superseded_segments(
     if let Some(entry) = stored
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0)
+        && !load_frag_reuse_history(dataset, entry)
+            .await?
+            .is_fully_interpretable()
     {
-        let content = load_raw_frag_reuse_content(dataset, entry).await?;
-        let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
-        if ledger.has_unsupported_transitions() {
-            return Err(Error::not_supported(
-                "the tagged FRI history carries transitions this client cannot interpret; \
-                 upgrade to a newer version of Lance before pruning superseded index segments",
-            ));
-        }
+        return Err(Error::not_supported(
+            "the tagged FRI history carries transitions this client cannot interpret; \
+             upgrade to a newer version of Lance before pruning superseded index segments",
+        ));
     }
     // The reader's own coverage derivation (translated through the ledger,
     // direct-coverage-wins applied); not reimplemented here.
@@ -619,65 +547,39 @@ pub(crate) fn is_tagged_trim_operation(
     }
 }
 
-/// One splice unit of the entry's content: a legacy version (field 1) or a
-/// transition (field 2), kept with its exact wire form so retained records
-/// are carried forward verbatim.
+/// One record of the history as the retention rules see it.
 enum TrimRecord {
     LegacyVersion(FragReuseVersion),
     Transition(pb_fri::Transition),
 }
 
 struct TrimElement {
-    raw: Vec<u8>,
     record: TrimRecord,
 }
 
-fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
-    use bytes::Buf;
-    use prost::encoding::{WireType, decode_key, decode_varint};
-
-    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
-    let total = content.len();
-    let mut buf = bytes::Bytes::copy_from_slice(content);
-    let mut elements = Vec::new();
-    while buf.has_remaining() {
-        let start = total - buf.remaining();
-        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        // Fields 1 and 2 are the only known records and both are messages. An
-        // unknown record may participate in lineage in ways this client cannot
-        // reason about, so refuse to trim rather than silently dropping or
-        // blindly retaining it.
-        if wire_type != WireType::LengthDelimited || !matches!(tag, 1 | 2) {
-            return Err(Error::not_supported(format!(
-                "the tagged FRI history carries an unknown record (field {tag}); \
-                 upgrade to a newer version of Lance before trimming"
-            )));
-        }
-        let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        if length > buf.remaining() as u64 {
-            return Err(corrupt(format!(
-                "field {tag} length {length} exceeds remaining {} bytes",
-                buf.remaining()
-            )));
-        }
-        let payload = buf.split_to(length as usize);
-        let end = total - buf.remaining();
-        let record = match tag {
-            1 => TrimRecord::LegacyVersion(
-                pb_fri::Version::decode(payload)
-                    .map_err(|e| corrupt(e.to_string()))?
-                    .try_into()?,
-            ),
-            _ => TrimRecord::Transition(
-                pb_fri::Transition::decode(payload).map_err(|e| corrupt(e.to_string()))?,
-            ),
-        };
-        elements.push(TrimElement {
-            raw: content[start..end].to_vec(),
-            record,
-        });
-    }
-    Ok(elements)
+/// The history's records in serialized order, for retention. Every record
+/// must be one this client interprets: an unknown record may participate in
+/// lineage in ways it cannot reason about, so trimming refuses it rather than
+/// silently dropping or blindly retaining it.
+fn trim_elements(history: &FragReuseHistory) -> Result<Vec<TrimElement>> {
+    history
+        .records()
+        .map(|record| {
+            let record = match record {
+                Record::LegacyVersion(version) => {
+                    TrimRecord::LegacyVersion(version.clone().try_into()?)
+                }
+                Record::Transition(transition) => TrimRecord::Transition(transition.clone()),
+                Record::Uninterpretable { field } => {
+                    return Err(Error::not_supported(format!(
+                        "the tagged FRI history carries an unknown record (field {field}); \
+                         upgrade to a newer version of Lance before trimming"
+                    )));
+                }
+            };
+            Ok(TrimElement { record })
+        })
+        .collect()
 }
 
 /// One logical index's coverage as the trim sees it: provenance is the union
@@ -882,24 +784,22 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     else {
         return Ok(TaggedTrimOutcome::NothingToTrim);
     };
-    if entry.index_version == 0 {
-        // Reachable only through a rebase whose entry was concurrently
-        // replaced by a v0 one; nothing tagged remains to trim.
+    if FriPolicy::new(&dataset.manifest, &indices).history_format() == HistoryFormat::Legacy {
+        // Reachable only through a rebase whose table is no longer tagged;
+        // nothing tagged remains to trim.
         return Ok(TaggedTrimOutcome::NothingToTrim);
     }
 
-    let content = load_raw_frag_reuse_content(dataset, &entry).await?;
-    // Full ledger validation (lineage order, digest conservation, mapping
-    // presence) plus unsupported-transition detection before interpreting
-    // anything.
-    let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
-    if ledger.has_unsupported_transitions() {
+    // A v0 entry under the sticky flag is trimmed as the tagged history it
+    // is lifted to.
+    let history = load_frag_reuse_history(dataset, &entry).await?.lift()?;
+    if !history.is_fully_interpretable() {
         return Err(Error::not_supported(
             "the tagged FRI history carries transitions this client cannot interpret; \
              upgrade to a newer version of Lance before trimming",
         ));
     }
-    let elements = split_trim_elements(&content)?;
+    let elements = trim_elements(&history)?;
     let retained = compute_tagged_retention(&elements, &indices);
 
     if retained.iter().all(|kept| *kept) {
@@ -911,32 +811,9 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
         });
     }
 
-    let mut new_content = Vec::new();
-    let mut fragment_bitmap = RoaringBitmap::new();
-    for (element, kept) in elements.iter().zip(retained.iter()) {
-        if !kept {
-            continue;
-        }
-        new_content.extend_from_slice(&element.raw);
-        match &element.record {
-            TrimRecord::LegacyVersion(version) => {
-                fragment_bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
-                fragment_bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
-            }
-            TrimRecord::Transition(transition) => {
-                for digest in transition
-                    .sources
-                    .iter()
-                    .chain(transition.destinations.iter())
-                {
-                    fragment_bitmap.insert(digest.id as u32);
-                }
-            }
-        }
-    }
-    // The filtered history must itself decode as a well-formed ledger.
-    decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
-    let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
+    let mut kept = retained.into_iter();
+    let trimmed = history.retain(&mut |_| kept.next().unwrap_or(true))?;
+    let new_entry = encode_frag_reuse_entry(dataset, &trimmed, dataset.manifest.version).await?;
     Ok(TaggedTrimOutcome::Replace {
         new_entry: Box::new(new_entry),
         current_entry: Box::new(entry),
@@ -958,6 +835,65 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use std::collections::HashMap;
+
+    /// A v0 entry under the sticky tagged flag is trimmed as a tagged
+    /// history: once every index has caught up, the cleanup removes the entry
+    /// instead of publishing a v0 replacement onto a table that keeps the
+    /// tagged format.
+    #[tokio::test]
+    async fn cleanup_lifts_a_v0_entry_under_the_tagged_flag() {
+        let mut dataset = crate::index::frag_reuse_reader::tests::fixture().await;
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let indices = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let entry = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(entry.index_version, 0);
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, indices).await;
+
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "the drained history is removed"
+        );
+        let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        for value in 0..8 {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("i = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+                "i = {value}"
+            );
+        }
+    }
 
     fn frag_digest(id: u64) -> lance_index::frag_reuse::FragDigest {
         lance_index::frag_reuse::FragDigest {
@@ -994,76 +930,6 @@ mod tests {
             clustering_id: None,
             metadata: Default::default(),
         }
-    }
-
-    /// The catch-up determination must not pin the FRI on an index that is
-    /// simply unrelated to the compaction, while still retaining versions that a
-    /// covering-but-not-yet-remapped index needs.
-    #[test]
-    fn test_caught_up_uses_fragment_coverage_not_only_version() {
-        // A reuse version at dataset_version 10 rewrote fragments [4, 5] -> [6].
-        let version = reuse_version(10, &[4, 5], &[6]);
-        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
-
-        // Non-covering, stale version: touches none of the rewritten frags, so
-        // caught up despite version 5 < 10 (the case the old gate got wrong).
-        assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), &chain).unwrap()
-        );
-
-        // Still holds an old fragment: not caught up.
-        assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain).unwrap()
-        );
-
-        // Bitmap advanced onto the new fragment but data not yet remapped: not
-        // caught up (why the chain must include new frags).
-        assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain).unwrap()
-        );
-
-        // Built at version 10 itself: still pre-rewrite data, not caught up.
-        assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(10, &[1, 6]), &chain).unwrap()
-        );
-
-        // Built or remapped after version 10: caught up.
-        assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain).unwrap()
-        );
-    }
-
-    /// The chain spans every reuse version, not just the one being checked: a
-    /// stale index touching only a *later* version's fragment must still fall to
-    /// the version gate (a per-version chain would wrongly clear it).
-    #[test]
-    fn test_caught_up_uses_whole_reuse_chain() {
-        let v1 = reuse_version(10, &[4, 5], &[6]); // 4,5 -> 6
-        let v2 = reuse_version(11, &[6], &[7]); // 6 -> 7
-        let chain = reuse_chain_frag_bitmap(&[v1.clone(), v2]);
-
-        // Stale index (version 5) covering only v2's new fragment [7]: not
-        // disjoint from the chain, so not caught up on v1.
-        assert_false!(is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain).unwrap());
-    }
-
-    /// Whole-fragment removal (every row deleted, no replacement): an index
-    /// emptied by the deletion has an empty bitmap and must count as caught up --
-    /// it holds only dead rows -- else its stale version pins the removed-fragment
-    /// version forever (remap hits the drop-everything path, never advancing it).
-    #[test]
-    fn test_caught_up_handles_fragment_removal() {
-        // Reuse version 20 removed fragment [7] outright (no replacement).
-        let version = reuse_version(20, &[7], &[]);
-        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
-
-        // Index emptied by the deletion (empty bitmap): caught up.
-        assert_true!(is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain).unwrap());
-
-        // Bitmap still lists the removed fragment (not yet updated): retained.
-        assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
-        );
     }
 
     #[tokio::test]
@@ -1368,15 +1234,14 @@ mod tests {
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::dataset::write::CommitBuilder;
         use crate::index::DatasetIndexExt;
-        use crate::index::frag_reuse::{
-            decode_frag_reuse_ledger, load_frag_reuse_records, load_raw_frag_reuse_content,
-        };
+        use crate::index::frag_reuse::decode_frag_reuse_ledger;
         use crate::index::frag_reuse_reader::tests as reader_tests;
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int32Type;
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::format::Fragment;
+        use lance_table::system_index::frag_reuse::history::HistoryFormat;
         use lance_table::system_index::frag_reuse::ledger::Mapping;
         use lance_table::transaction::RewriteGroup;
         use uuid::Uuid;
@@ -1391,7 +1256,6 @@ mod tests {
 
         fn transition_element(sources: &[u64], destinations: &[u64]) -> TrimElement {
             TrimElement {
-                raw: Vec::new(),
                 record: TrimRecord::Transition(pb_fri::Transition {
                     sources: sources.iter().copied().map(digest).collect(),
                     destinations: destinations.iter().copied().map(digest).collect(),
@@ -1408,7 +1272,6 @@ mod tests {
 
         fn legacy_element(dataset_version: u64, old: &[u64], new: &[u64]) -> TrimElement {
             TrimElement {
-                raw: Vec::new(),
                 record: TrimRecord::LegacyVersion(super::reuse_version(dataset_version, old, new)),
             }
         }
@@ -1813,10 +1676,10 @@ mod tests {
             assert!(matches!(kept.mapping(), Mapping::StablePartition(_)));
             // The drained transition's raw bytes are gone; the kept one's
             // content is a verbatim suffix of the previous entry.
-            let previous = load_raw_frag_reuse_content(&stale, &current_entry)
+            let previous = crate::utils::test::frag_reuse_content(&stale, &current_entry)
                 .await
                 .unwrap();
-            let trimmed = load_raw_frag_reuse_content(&stale, &trimmed_entry)
+            let trimmed = crate::utils::test::frag_reuse_content(&stale, &trimmed_entry)
                 .await
                 .unwrap();
             assert!(previous.ends_with(&trimmed));
@@ -2212,13 +2075,17 @@ mod tests {
             prost::encoding::encode_varint(6, &mut content);
             content.extend_from_slice(b"future");
 
-            let Err(error) = split_trim_elements(&content) else {
+            let history = crate::utils::test::frag_reuse_history_from_content(
+                HistoryFormat::Tagged,
+                &content,
+            )
+            .unwrap();
+            let Err(error) = trim_elements(&history) else {
                 panic!("an unknown envelope record must refuse the splice")
             };
             assert!(matches!(error, Error::NotSupported { .. }), "{error}");
             let ledger =
-                crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                    .await
+                crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
                     .unwrap();
             assert!(
                 ledger.has_unsupported_transitions(),
@@ -2248,7 +2115,9 @@ mod tests {
             // Splice an unknown envelope-level record into the committed
             // entry, standing in for a record written by a newer Lance.
             let entry = fri_entry(&dataset).await.unwrap();
-            let mut content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+            let mut content = crate::utils::test::frag_reuse_content(&dataset, &entry)
+                .await
+                .unwrap();
             content.extend(reader_tests::field(9, b"future envelope record"));
             let unknown_entry = IndexMetadata {
                 index_details: Some(Arc::new(prost_types::Any {
@@ -2558,7 +2427,9 @@ mod tests {
             assert!(destination > 3);
             let entry = fri_entry(&dataset).await.unwrap();
             assert_eq!(entry.index_version, 0);
-            let records = load_frag_reuse_records(&dataset, &entry).await.unwrap();
+            let records = crate::utils::test::frag_reuse_records(&dataset, &entry)
+                .await
+                .unwrap();
             assert_eq!(records.legacy_versions.len(), 1);
             assert!(records.transitions.is_empty());
             let legacy_version = records.legacy_versions[0].dataset_version;
@@ -2591,15 +2462,17 @@ mod tests {
             let mut dataset = commit_stable_partition(dataset, &sources, dest_base).await;
             let lifted = fri_entry(&dataset).await.unwrap();
             assert_eq!(lifted.index_version, 1);
-            let records = load_frag_reuse_records(&dataset, &lifted).await.unwrap();
+            let records = crate::utils::test::frag_reuse_records(&dataset, &lifted)
+                .await
+                .unwrap();
             assert_eq!(records.legacy_versions.len(), 1);
             assert_eq!(records.transitions.len(), 1);
-            // The lift keeps the v0 bitmap (destinations only) plus the
-            // partition's fragments; the legacy sources are not named yet.
+            // The lift names every fragment in the retained lineage, the
+            // legacy version's sources included.
             let lifted_bitmap = lifted.fragment_bitmap.clone().unwrap();
             assert!(lifted_bitmap.contains(destination), "{lifted_bitmap:?}");
-            assert!(!lifted_bitmap.contains(2), "{lifted_bitmap:?}");
-            assert!(!lifted_bitmap.contains(3), "{lifted_bitmap:?}");
+            assert!(lifted_bitmap.contains(2), "{lifted_bitmap:?}");
+            assert!(lifted_bitmap.contains(3), "{lifted_bitmap:?}");
 
             // The first tagged trim: the transition goes (no index derives
             // through it), the legacy version stays (the segment is stale
@@ -2613,7 +2486,9 @@ mod tests {
             let trimmed = fri_entry(&dataset).await.expect("the entry is retained");
             assert_ne!(trimmed.uuid, lifted.uuid);
             assert_eq!(trimmed.index_version, 1);
-            let records = load_frag_reuse_records(&dataset, &trimmed).await.unwrap();
+            let records = crate::utils::test::frag_reuse_records(&dataset, &trimmed)
+                .await
+                .unwrap();
             assert_eq!(records.legacy_versions.len(), 1);
             assert_eq!(records.legacy_versions[0].dataset_version, legacy_version);
             assert!(records.transitions.is_empty());
@@ -2904,7 +2779,7 @@ mod tests {
             roaring::RoaringTreemap::from_iter(rewritten.iter().map(|&(f, o)| addr(f, o)));
         let mut changed_row_addrs = Vec::with_capacity(changed.serialized_size());
         changed.serialize_into(&mut changed_row_addrs).unwrap();
-        let details = FragReuseIndexDetails {
+        let details = lance_index::frag_reuse::FragReuseIndexDetails {
             versions: vec![FragReuseVersion {
                 dataset_version: 1,
                 groups: vec![lance_index::frag_reuse::FragReuseGroup {

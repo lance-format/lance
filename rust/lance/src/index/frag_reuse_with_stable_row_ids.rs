@@ -12,10 +12,16 @@ use lance_table::feature_flags::{
     FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
 };
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
-use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
+use lance_table::system_index::frag_reuse::plan::{
+    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport,
+};
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use prost::Name;
 use prost_types::Any;
+use std::collections::HashMap;
+
+use crate::Dataset;
 
 use super::scalar::IndexDetails;
 use super::{segment::index_is_usable, segment::unsupported_index_version};
@@ -204,16 +210,7 @@ fn ensure_frag_reuse_recording_allowed_when(
     }
     // The tagged-history flag is sticky, so it can outlive a trim and a
     // migration to stable row ids.
-    let frag_reuse_entry = indices
-        .iter()
-        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-    if uses_tagged_fri(manifest, frag_reuse_entry) {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    FriPolicy::new(manifest, indices).require_recording_allowed()?;
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());
@@ -268,6 +265,65 @@ pub fn ensure_index_kind_allowed_with_frag_reuse(
 /// Only meaningful where [`has_frag_reuse_with_stable_row_ids`] holds.
 pub fn is_hidden_by_frag_reuse(index: &IndexMetadata) -> bool {
     ordinary_index_incompatibility(index).is_some()
+}
+
+/// The indices readers may use on a stable-row-id table carrying a fragment
+/// reuse index: the history's read plan excludes every index the legacy
+/// reader cannot apply it to.
+pub async fn indices_visible_with_frag_reuse(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+) -> Result<Vec<IndexMetadata>> {
+    let fri = indices
+        .iter()
+        .find(|index| is_frag_reuse_index_entry(index))
+        .ok_or_else(|| Error::internal("the stable-row-id listing has no fragment reuse index"))?;
+    let history = super::frag_reuse::load_frag_reuse_history(dataset, fri)
+        .await?
+        .on_stable_row_ids()?;
+    let context = ReadContext {
+        entry_version: fri.dataset_version,
+        live_fragments: &dataset.fragment_bitmap,
+    };
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (position, index) in indices.iter().enumerate() {
+        if !is_frag_reuse_index_entry(index) && !is_mem_wal_index_entry(index) {
+            groups.entry(&index.name).or_default().push(position);
+        }
+    }
+    let mut is_excluded = vec![false; indices.len()];
+    for members in groups.into_values() {
+        let summaries: Vec<SegmentSummary> = members
+            .iter()
+            .map(|&position| {
+                let index = &indices[position];
+                SegmentSummary {
+                    uuid: index.uuid,
+                    fragment_bitmap: index.fragment_bitmap.clone(),
+                    dataset_version: index.dataset_version,
+                    domain: if index.results_are_row_addrs() {
+                        RowDomain::Address
+                    } else {
+                        RowDomain::StableRowId
+                    },
+                    translation: if address_index_incompatibility(index).is_none() {
+                        TranslationSupport::Supported
+                    } else {
+                        TranslationSupport::Unsupported
+                    },
+                }
+            })
+            .collect();
+        for (position, plan) in members.into_iter().zip(history.plan(&context, &summaries)) {
+            is_excluded[position] = plan == ReadPlan::Excluded;
+        }
+    }
+    Ok(indices
+        .iter()
+        .zip(is_excluded)
+        .filter(|(_, is_excluded)| !is_excluded)
+        .map(|(index, _)| index.clone())
+        .collect())
 }
 
 pub fn warn_about_indices_hidden_by_frag_reuse(manifest: &Manifest, indices: &[IndexMetadata]) {
@@ -336,7 +392,6 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::dataset::{CommitBuilder, WriteParams};
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
     use crate::index::{
         DatasetIndexExt,
@@ -605,9 +660,8 @@ mod tests {
     }
 
     async fn empty_frag_reuse_index(dataset: &Dataset, bitmap: RoaringBitmap) -> IndexMetadata {
-        build_frag_reuse_index_metadata(
+        crate::utils::test::legacy_frag_reuse_entry(
             dataset,
-            None,
             FragReuseIndexDetails { versions: vec![] },
             bitmap,
         )
@@ -1121,7 +1175,7 @@ mod tests {
             }],
         };
         let new_bitmap = new_fragments.iter().map(|f| f.id as u32).collect();
-        let frag_reuse = build_frag_reuse_index_metadata(&dataset, None, details, new_bitmap)
+        let frag_reuse = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, new_bitmap)
             .await
             .unwrap();
         let mut indices = load_all_indices(&dataset).await.unwrap().as_ref().clone();

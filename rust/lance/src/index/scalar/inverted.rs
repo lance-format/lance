@@ -944,14 +944,13 @@ fn single_segment_keeps_row_addresses(
     uuid: &Uuid,
     source_coverage_moved: bool,
 ) -> bool {
-    use crate::index::frag_reuse::SegmentRemappingPlan;
+    use crate::index::frag_reuse::ReadPlan;
     if source_coverage_moved {
         return false;
     }
     match staged.and_then(|plans| plans.get(uuid)) {
-        None | Some(SegmentRemappingPlan::Identity) => true,
-        Some(SegmentRemappingPlan::Translate { .. })
-        | Some(SegmentRemappingPlan::MissingCoverage(_)) => false,
+        None | Some(ReadPlan::Direct) => true,
+        Some(ReadPlan::Translate(_)) | Some(ReadPlan::Excluded) => false,
     }
 }
 
@@ -1445,19 +1444,20 @@ mod tests {
 
     #[test]
     fn test_single_segment_keeps_row_addresses_only_without_translation() {
-        use crate::index::frag_reuse::{MissingCoverageReason, SegmentRemappingPlan};
+        use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat};
+        use lance_table::system_index::frag_reuse::plan::{ReadPlan, TranslationPlan};
         let uuid = Uuid::new_v4();
         let other = Uuid::new_v4();
         assert!(single_segment_keeps_row_addresses(None, &uuid, false));
         assert!(!single_segment_keeps_row_addresses(None, &uuid, true));
 
         let mut plans = crate::index::frag_reuse::StagedRemappingPlans::new();
-        plans.insert(other, SegmentRemappingPlan::Identity);
+        plans.insert(other, ReadPlan::Direct);
         assert!(
             single_segment_keeps_row_addresses(Some(&plans), &uuid, false),
             "a plan for another segment says nothing about this one"
         );
-        plans.insert(uuid, SegmentRemappingPlan::Identity);
+        plans.insert(uuid, ReadPlan::Direct);
         assert!(single_segment_keeps_row_addresses(
             Some(&plans),
             &uuid,
@@ -1465,21 +1465,16 @@ mod tests {
         ));
         plans.insert(
             uuid,
-            SegmentRemappingPlan::Translate {
-                coverage: RoaringBitmap::new(),
-                excluded_fragments: RoaringBitmap::new(),
-                fingerprint: [0; 32],
-            },
+            ReadPlan::Translate(TranslationPlan::empty(&FragReuseHistory::empty(
+                HistoryFormat::Tagged,
+            ))),
         );
         assert!(!single_segment_keeps_row_addresses(
             Some(&plans),
             &uuid,
             false
         ));
-        plans.insert(
-            uuid,
-            SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn),
-        );
+        plans.insert(uuid, ReadPlan::Excluded);
         assert!(!single_segment_keeps_row_addresses(
             Some(&plans),
             &uuid,

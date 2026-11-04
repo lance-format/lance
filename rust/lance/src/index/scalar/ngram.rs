@@ -181,11 +181,11 @@ pub(in crate::index) async fn open_and_merge_segments(
         .await?
         .is_some()
         && let Some(segment) = segments.iter().find(|segment| {
-            use crate::index::frag_reuse::SegmentRemappingPlan;
+            use crate::index::frag_reuse::ReadPlan;
             match staged.and_then(|plans| plans.get(&segment.uuid)) {
                 // A staged segment's bitmap already holds its planned live
                 // coverage; the plan says whether its rows translate.
-                Some(SegmentRemappingPlan::Translate { .. }) => true,
+                Some(ReadPlan::Translate(_)) => true,
                 Some(_) => false,
                 None => segment
                     .fragment_bitmap
