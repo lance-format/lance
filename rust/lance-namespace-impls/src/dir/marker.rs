@@ -53,9 +53,10 @@ pub async fn put_marker_file_atomic(
     file_description: &str,
 ) -> std::result::Result<(), MarkerFileError> {
     let staging_name = format!("lance-marker.staging.{}", uuid::Uuid::new_v4().simple());
-    let path_str = path.as_ref();
-    let staging_path = match path_str.rfind('/') {
-        Some(idx) => Path::from(format!("{}/{}", &path_str[..idx], staging_name)),
+    // Build staging path from the parent Path object (preserving its encoding)
+    // rather than string-rebuilding, which would double-encode non-ASCII parents.
+    let staging_path = match path.parent() {
+        Some(parent) => parent.join(staging_name.as_str()),
         None => Path::from(staging_name.as_str()),
     };
 

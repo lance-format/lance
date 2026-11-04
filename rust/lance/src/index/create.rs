@@ -8,18 +8,19 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, IntoIndexSegment,
+        frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        load_all_indices,
+        lifecycle::build_index_metadata_from_segments,
+        loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
         scalar::{build_bitmap_index_segment, build_scalar_index},
+        vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -552,7 +553,7 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let files = if train {
+                let (files, built_target) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
@@ -570,9 +571,9 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            files
+                            (files, None)
                         } else {
-                            Box::pin(build_filtered_vector_index(
+                            let built = Box::pin(build_filtered_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -582,11 +583,12 @@ impl<'a> CreateIndexBuilder<'a> {
                                 fragments,
                                 self.progress.clone(),
                             ))
-                            .await?
+                            .await?;
+                            (built.files, built.target_partition_size)
                         }
                     } else {
                         // Standard full dataset indexing
-                        Box::pin(build_vector_index(
+                        let built = Box::pin(build_vector_index(
                             self.dataset,
                             column,
                             &index_name,
@@ -595,21 +597,23 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             self.progress.clone(),
                         ))
-                        .await?
+                        .await?;
+                        (built.files, built.target_partition_size)
                     }
                 } else {
                     // Create empty vector index
-                    build_empty_vector_index(
+                    let files = build_empty_vector_index(
                         self.dataset,
                         column,
                         &index_name,
                         index_id,
                         vec_params,
                     )
-                    .await?
+                    .await?;
+                    (files, None)
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params),
+                    index_details: vector_index_details(vec_params, built_target),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -685,6 +689,8 @@ impl<'a> CreateIndexBuilder<'a> {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(index_files_to_table(created_index.files)),
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
@@ -730,13 +736,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Fetch the committed index metadata from the dataset.
-        // This ensures we return the version that may have been modified by the commit.
-        let indices = self.dataset.load_indices().await?;
-        indices
-            .iter()
-            .find(|idx| idx.uuid == index_uuid)
-            .cloned()
+        // Rebasing may withdraw all query coverage while keeping the committed
+        // segment's definition for rebuilding. Include that stored metadata.
+        self.dataset
+            .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
+            .await?
             .ok_or_else(|| {
                 Error::internal(format!(
                     "Index with UUID {} not found after commit",
@@ -854,6 +858,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &metadata)?;
             let segments = vec![metadata.into_index_segment()?];
@@ -886,6 +892,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            if let Some(index) = indices.into_iter().next() {
+                return Ok(index);
+            }
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
                     "FM-Index segments for '{}' not found after commit",
@@ -925,6 +937,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: Some(index_files_to_table(created_index.files)),
+                clustering_id: None,
+                metadata: Default::default(),
             };
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
@@ -963,6 +977,12 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
+        if let Some(index) = indices.into_iter().next() {
+            return Ok(index);
+        }
+        // A rebase can withdraw all query coverage and leave empty
+        // definitions, which tagged query listings omit.
+        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
         indices.into_iter().next().ok_or_else(|| {
             Error::internal(format!(
                 "FM-Index segments for '{}' not found after commit",
@@ -1124,7 +1144,7 @@ mod tests {
     mod staged_tagged;
 
     use super::*;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ColumnAlteration, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1553,6 +1573,118 @@ mod tests {
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
+    }
+
+    #[rstest]
+    #[case::drop_indexed("drop", "value", true)]
+    #[case::drop_unrelated("drop", "other", false)]
+    #[case::cast_indexed("cast", "value", true)]
+    #[case::cast_unrelated("cast", "other", false)]
+    #[case::rename_indexed("rename", "value", false)]
+    #[tokio::test]
+    async fn test_create_index_after_concurrent_schema_change(
+        #[case] change: &str,
+        #[case] column: &str,
+        #[case] expect_conflict: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            ("value", Int32, [Some(10), None, Some(20)]),
+            ("other", Int32, [Some(100), None, Some(200)])
+        )
+        .unwrap();
+        let reader =
+            RecordBatchIterator::new([Ok(batch.clone()), Ok(batch.clone())], batch.schema());
+        let mut writer = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.get_fragments().len(), 2);
+        let mut concurrent = writer.clone();
+        if change == "drop" {
+            concurrent.drop_columns(&[column]).await.unwrap();
+        } else {
+            let alteration = ColumnAlteration::new(column.to_string());
+            let alteration = match change {
+                "cast" => alteration.cast_to(DataType::Int64),
+                "rename" => alteration.rename("renamed".to_string()),
+                _ => panic!("unknown schema change: {change}"),
+            };
+            concurrent.alter_columns(&[alteration]).await.unwrap();
+        }
+        let schema_version = concurrent.manifest.version;
+        let expected = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
+            .name("value_idx".to_string())
+            .execute()
+            .await;
+        if expect_conflict {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            let operation = if change == "drop" { "Project" } else { "Merge" };
+            assert!(
+                error.to_string().contains(&format!(
+                    "CreateIndex transaction was preempted by concurrent transaction {operation}"
+                )),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+
+        concurrent.checkout_latest().await.unwrap();
+        assert_eq!(
+            concurrent.manifest.version,
+            schema_version + u64::from(!expect_conflict)
+        );
+        let indices = concurrent.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(indices.len(), usize::from(!expect_conflict));
+        let actual = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.num_rows(), 2);
+        if !expect_conflict {
+            let indexed_column = if change == "rename" {
+                "renamed"
+            } else {
+                "value"
+            };
+            let filter = format!("{indexed_column} = 10 OR {indexed_column} IS NULL");
+            let indexed = concurrent
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut scanner = concurrent.scan();
+            scanner.use_scalar_index(false);
+            scanner.filter(&filter).unwrap();
+            assert_eq!(indexed, scanner.try_into_batch().await.unwrap());
+            assert_eq!(indexed.num_rows(), 4);
+        }
     }
 
     #[tokio::test]
@@ -2738,7 +2870,7 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .join(crate::index::INDEX_FILE_NAME);
+                .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
                     .object_store
@@ -3208,6 +3340,170 @@ mod tests {
             .await
             .unwrap();
         assert!(result.num_rows() > 0);
+    }
+
+    #[rstest]
+    #[case::whole_fragment_delete(false)]
+    #[case::whole_and_partial_delete(true)]
+    #[tokio::test]
+    async fn test_staged_vector_retry_after_delete_and_index_append(
+        #[case] partial_deletion: bool,
+    ) {
+        let mut dataset = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+            )
+            .into_dataset(
+                "memory://",
+                FragmentCount::from(3),
+                FragmentRowCount::from(4),
+            )
+            .await
+            .unwrap();
+        let original = dataset.scan().try_into_batch().await.unwrap();
+        // A deleted vector is the closest candidate unless deletion filtering
+        // happens before the ANN top-k budget is consumed.
+        let query = original["vector"].as_fixed_size_list().value(8);
+        let centroids = FixedSizeListArray::try_new_from_values(
+            arrow_array::Float32Array::from(vec![0.0f32; 4]),
+            4,
+        )
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+        );
+        let mut segments = Vec::new();
+        for fragment in 0..3 {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", segments)
+            .await
+            .unwrap();
+        let original_indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        let replacement = dataset
+            .merge_existing_index_segments(original_indices[1..].to_vec())
+            .await
+            .unwrap();
+        let mut concurrent = dataset.clone();
+        concurrent
+            .delete(if partial_deletion {
+                "id >= 8 OR id = 0 OR id = 4"
+            } else {
+                "id >= 8"
+            })
+            .await
+            .unwrap();
+        let append = gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(12, 1))
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+            )
+            .into_batch_rows(3.into())
+            .unwrap();
+        concurrent = crate::dataset::InsertBuilder::new(Arc::new(concurrent))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append])
+            .await
+            .unwrap();
+        concurrent
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let append_index = concurrent
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let error = dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![replacement.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("CreateIndex"));
+
+        // Retry the exact same physical output at the latest version: no build,
+        // model training, or index rewrite is needed after the conflict.
+        concurrent
+            .commit_existing_index_segments("vector_idx", "vector", vec![replacement.clone()])
+            .await
+            .unwrap();
+        let indices = concurrent.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(
+            indices.contains(&original_indices[0]),
+            "base metadata changed"
+        );
+        assert!(
+            indices.contains(&append_index),
+            "concurrent append index changed"
+        );
+        let committed = indices
+            .iter()
+            .find(|index| index.uuid == replacement.uuid)
+            .unwrap();
+        assert_eq!(
+            committed.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([1]))
+        );
+        assert_eq!(committed.files, replacement.files);
+        let expected_rows = if partial_deletion { 9 } else { 11 };
+        let mut flat = concurrent.scan();
+        flat.nearest("vector", query.as_ref(), expected_rows)
+            .unwrap()
+            .use_index(false);
+        let expected = flat.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), expected_rows);
+        let expected_ids: BTreeSet<_> = expected["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        for fast_search in [false, true] {
+            let mut scan = concurrent.scan();
+            scan.nearest("vector", query.as_ref(), expected_rows)
+                .unwrap()
+                .minimum_nprobes(1)
+                .maximum_nprobes(1)
+                .refine(1);
+            if fast_search {
+                scan.fast_search();
+            }
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ANNSubIndex"), "{plan}");
+            let actual = scan.try_into_batch().await.unwrap();
+            let actual_ids: BTreeSet<_> = actual["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(actual.num_rows(), expected_rows);
+            assert_eq!(
+                actual_ids, expected_ids,
+                "indexed recall must be 1.0 without duplicates"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4639,7 +4935,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -4665,7 +4961,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params)),
+                    Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],

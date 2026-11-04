@@ -303,6 +303,10 @@ message Transaction {
      * manifests written before this change.
      */
     map<uint64, bytes> updated_fragment_offset_bitmaps = 10;
+    /* The `dir_id` of the MemWAL `compacted_sstables` belongs to; required
+     * when `compacted_sstables` is non-empty. See UpdateMemWalState.dir_id.
+     */
+    optional string mem_wal_dir_id = 11;
   }
 
   // The mode of update operation
@@ -364,7 +368,16 @@ message Transaction {
 
   // An operation that replaces the data in a region of the table with new data.
   message DataReplacement {
+    /* A fragment can be the target of several groups, one per new file. The
+     * groups apply in order, each to the fragment as the previous ones left it.
+     */
     repeated DataReplacementGroup replacements = 1;
+    /* Whether the new files change any value. Absent means true, which is what
+     * a writer that predates this field meant. False means the values were only
+     * moved to new files: index coverage, overlays, and row update versions are
+     * left as they are.
+     */
+    optional bool data_change = 2;
   }
 
   /* Overlay files to append to a single fragment, in order (the last entry is
@@ -399,6 +412,10 @@ message Transaction {
   message UpdateMemWalState {
     // SSTables being marked as compacted.
     repeated CompactedSsTable compacted_sstables = 1;
+    /* The `dir_id` of the MemWAL this update was built for. The commit is
+     * rejected unless the manifest it builds on carries that MemWAL.
+     */
+    string dir_id = 2;
   }
 
   // An operation that updates base paths in the dataset.

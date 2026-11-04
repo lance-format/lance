@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
@@ -41,6 +41,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -52,6 +53,7 @@ use lance_index::pbold::{
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
+use lance_index::scalar::inverted::builder::resolve_num_workers;
 use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
@@ -60,6 +62,7 @@ use lance_index::scalar::registry::{
     ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
+use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
@@ -152,20 +155,40 @@ pub(crate) enum TrainingRows {
     Rows(RowAddrTreeMap),
 }
 
+/// Optional row selection, progress, and decode concurrency for a training scan.
+#[derive(Default)]
+pub(crate) struct TrainingScanOptions {
+    /// Restricts the scan to these physical rows.
+    physical_rows: Option<RowAddrTreeMap>,
+    /// Progress total when the caller already knows the selected row count.
+    expected_rows: Option<u64>,
+    /// Decoded batches that may be in flight ahead of the consumer.
+    batch_readahead: Option<usize>,
+}
+
 /// Reads the rows a scalar index is built from: `column` projected as the
 /// index's value column, with row ids or addresses as `criteria` asks, sorted
 /// by value when the index type needs it. The scan goes through the regular
 /// reader, so deletions and data overlays are already applied to what it
 /// yields. `selection` restricts the rows read; `None` reads the whole dataset.
+/// `expected_rows`, when the caller knows how many rows the selection
+/// holds, is the progress total; otherwise the whole dataset is counted.
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let num_rows = dataset.count_all_rows().await?;
+    let num_rows = match options.expected_rows {
+        Some(rows) => rows as usize,
+        None => dataset.count_all_rows().await?,
+    };
 
     let mut scan = dataset.scan();
+    if let Some(batch_readahead) = options.batch_readahead {
+        scan.batch_readahead(batch_readahead);
+    }
     #[cfg(test)]
     if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
         scan.io_buffer_size(io_buffer_size);
@@ -199,6 +222,11 @@ pub(crate) async fn scan_training_data(
             scan.with_row_id_prefilter(RowAddrMask::from_allowed(rows));
         }
         None => {}
+    }
+    // A physical selection restricts the scan to these rows of the selected
+    // fragments (the two intersect); the caller includes every row it wants.
+    if let Some(physical_rows) = options.physical_rows {
+        scan.with_physical_row_addr_prefilter(physical_rows);
     }
 
     let batches = scan
@@ -239,6 +267,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -273,10 +302,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, options).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, options).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -290,19 +319,39 @@ pub(crate) async fn load_fts_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    params: &InvertedIndexParams,
 ) -> Result<SendableRecordBatchStream> {
+    // Row-count batching alone can retain large decoded text buffers in the
+    // scanner and indexing workers. Keep explicit reader settings, and apply
+    // a byte target only to this training scan, not to the caller's dataset.
+    let mut dataset = dataset.clone();
+    dataset
+        .file_reader_options
+        .get_or_insert_with(Default::default)
+        .batch_size_bytes
+        .get_or_insert(16 * 1024 * 1024);
     let scan_column = if resolved.has_lists() {
         resolved.root_column.as_str()
     } else {
         resolved.canonical_path.as_str()
     };
     let stream = load_training_data(
-        dataset,
+        &dataset,
         scan_column,
         criteria,
         fragments,
         train,
         fragment_ids,
+        TrainingScanOptions {
+            // Allow decoding to overlap consumption without scaling speculative
+            // input buffers to every CPU in a build with only a few workers.
+            batch_readahead: Some(
+                resolve_num_workers(params)
+                    .saturating_mul(2)
+                    .min(get_num_compute_intensive_cpus().max(1)),
+            ),
+            ..Default::default()
+        },
     )
     .await?;
     if resolved.has_lists() {
@@ -467,6 +516,44 @@ pub(super) async fn build_scalar_index(
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
 
+    // A zone map trained from the table reuses the write seeds its fragments
+    // already carry and scans only the fragments without one. A caller that
+    // supplies the rows itself has already chosen what to train from.
+    if train
+        && preprocessed_data.is_none()
+        && params
+            .index_type
+            .eq_ignore_ascii_case(BuiltinIndexType::ZoneMap.as_str())
+    {
+        let zone_map_params = serde_json::from_str::<ZoneMapIndexBuilderParams>(
+            params.params.as_deref().unwrap_or("{}"),
+        )?;
+        // The zones hold what the scan yields: a blob column arrives as its
+        // descriptor, not as the schema's binary type.
+        let value_type = dataset
+            .schema()
+            .field(column)
+            .map(|field| {
+                lance_core::datatypes::BlobHandling::default()
+                    .unload_if_needed(field.clone())
+                    .data_type()
+            })
+            .unwrap_or_else(|| field.data_type().clone());
+        progress.stage_start("load_data", None, "rows").await?;
+        let created = zonemap::build_segment_with_seeds(
+            dataset,
+            column,
+            zone_map_params,
+            &value_type,
+            fragment_ids,
+            training_request.criteria(),
+            &index_store,
+        )
+        .await?;
+        progress.stage_complete("load_data").await?;
+        return Ok(created);
+    }
+
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
         (Some((preprocessed_data, declared)), _) => {
@@ -481,6 +568,9 @@ pub(super) async fn build_scalar_index(
             preprocessed_data
         }
         (None, Some(resolved)) => {
+            let fts_params = inverted_params.as_ref().ok_or_else(|| {
+                Error::internal("resolved FTS field is missing its training parameters")
+            })?;
             load_fts_training_data(
                 dataset,
                 resolved,
@@ -488,6 +578,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                fts_params,
             )
             .await?
         }
@@ -499,6 +590,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                TrainingScanOptions::default(),
             )
             .await?
         }
@@ -584,8 +676,16 @@ pub(super) async fn build_bitmap_index_segment(
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    let training_data = load_training_data(
+        dataset,
+        column,
+        criteria,
+        None,
+        true,
+        Some(fragment_ids),
+        TrainingScanOptions::default(),
+    )
+    .await?;
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
@@ -863,13 +963,15 @@ pub(crate) async fn open_scalar_index_with_plan(
     });
 
     if batch_remapping.is_some() {
-        lance_index::scalar::registry::single_flight_store_bound_open(
+        let rebind_store = index_store.clone();
+        lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
             index_store,
             &index_cache,
             load,
-            // Batch remappers bind external mapping readers to their store;
-            // reload them when the storage binding changes.
-            |_| async { Ok(None) },
+            move |index| async move {
+                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
+            },
+            |index| plugin.cache_snapshot(index),
         )
         .await
     } else {
@@ -1155,7 +1257,7 @@ mod tests {
         name: &str,
         field_id: i32,
         index_type: Option<IndexType>,
-    ) -> crate::index::IndexMetadata {
+    ) -> lance_table::format::IndexMetadata {
         let index_details = index_type
             .map(|index_type| match index_type {
                 IndexType::BTree => {
@@ -1175,7 +1277,7 @@ mod tests {
                 }
             })
             .map(Arc::new);
-        crate::index::IndexMetadata {
+        lance_table::format::IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![field_id],
@@ -1187,6 +1289,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1655,6 +1759,7 @@ mod tests {
             None,
             true,
             None,
+            TrainingScanOptions::default(),
         )
         .await
         .unwrap();
@@ -1676,6 +1781,82 @@ mod tests {
             }
         }
         assert_eq!(max_frag_id_seen, 3);
+    }
+
+    #[rstest::rstest]
+    #[case::default_limit(None)]
+    #[case::explicit_limit(Some(64 * 1024 * 1024))]
+    #[tokio::test]
+    async fn test_fts_training_scan_byte_target(
+        #[case] byte_target: Option<u64>,
+        #[values(1, 3)] workers: usize,
+    ) {
+        async fn largest_original_batch(dataset: &Dataset) -> usize {
+            let mut scan = dataset.scan();
+            scan.project(&["content"]).unwrap();
+            scan.try_into_stream()
+                .await
+                .unwrap()
+                .map_ok(|batch| batch.num_rows())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .max()
+                .unwrap()
+        }
+
+        let text = "x".repeat(512 * 1024);
+        let mut dataset = lance_datagen::gen_batch()
+            .col("content", array::fill_utf8(text.clone()))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(40))
+            .await
+            .unwrap();
+        if let Some(byte_target) = byte_target {
+            dataset.file_reader_options = Some(lance_file::reader::FileReaderOptions {
+                batch_size_bytes: Some(byte_target),
+                read_chunk_size: 1024 * 1024,
+                ..Default::default()
+            });
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
+        let params = InvertedIndexParams::default().num_workers(workers);
+        let resolved = inverted::resolve_fts_field(
+            dataset.schema(),
+            "content",
+            params.get_document_granularity(),
+        )
+        .unwrap();
+        let mut stream = load_fts_training_data(
+            &dataset,
+            &resolved,
+            &TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            None,
+            true,
+            None,
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut batch_rows = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            batch_rows.push(batch.num_rows());
+            let values = batch[VALUE_COLUMN_NAME].as_string::<i32>();
+            for value in values.iter() {
+                assert_eq!(value, Some(text.as_str()));
+            }
+        }
+        assert_eq!(batch_rows.iter().sum::<usize>(), 80);
+        if byte_target.is_none() {
+            assert!(batch_rows.iter().all(|&rows| rows < 40), "{batch_rows:?}");
+            assert!(dataset.file_reader_options.is_none());
+        } else {
+            assert!(batch_rows.iter().any(|&rows| rows >= 40), "{batch_rows:?}");
+            let options = dataset.file_reader_options.as_ref().unwrap();
+            assert_eq!(options.batch_size_bytes, byte_target);
+            assert_eq!(options.read_chunk_size, 1024 * 1024);
+        }
+        assert!(largest_original_batch(&dataset).await >= 40);
     }
 
     #[tokio::test]
