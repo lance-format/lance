@@ -68,6 +68,35 @@ impl BatchRowIdRemapper for RemapperAsBatch {
     }
 }
 
+/// Translate the row addresses in column `addr_idx` of `batch` through
+/// `remapper`, as one batch, and drop the rows whose address translates to
+/// `None`. A null address is dropped too: it names no row.
+pub async fn translate_record_batch(
+    remapper: &Remapper,
+    batch: RecordBatch,
+    addr_idx: usize,
+) -> Result<RecordBatch> {
+    let addrs = batch
+        .columns()
+        .get(addr_idx)
+        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "row address column {addr_idx} must have type UInt64"
+            ))
+        })?;
+    let mut translated: Vec<Option<u64>> = addrs.iter().collect();
+    remapper.translate_in_place(&mut translated).await?;
+    let kept =
+        arrow_array::BooleanArray::from_iter(translated.iter().map(|addr| Some(addr.is_some())));
+    let batch = arrow_select::filter::filter_record_batch(&batch, &kept)?;
+    let mut columns = batch.columns().to_vec();
+    columns[addr_idx] = Arc::new(UInt64Array::from_iter_values(
+        translated.into_iter().flatten(),
+    ));
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
+
 /// A [`Remapper`] that applies a remapper handed to a deprecated entry point
 /// (a [`RowIdRemapper`] or [`BatchRowIdRemapper`] passed to
 /// `ScalarIndexPlugin::load_index`, its cache hooks or
