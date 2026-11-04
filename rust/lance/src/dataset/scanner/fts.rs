@@ -2563,7 +2563,6 @@ impl Scanner {
             params.clone(),
             plan,
             scanned_fragments,
-            resolved_fields,
             stats_scope,
             emit_prefilter,
         )?;

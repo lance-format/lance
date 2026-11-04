@@ -7,24 +7,70 @@ description: Choose vector indexes, run nearest-neighbor queries, and tune recal
 
 Lance supports exact nearest-neighbor search without an index and approximate nearest-neighbor (ANN) search with vector indexes. Vector columns should use an Arrow fixed-size list or fixed-shape tensor type with a consistent dimension.
 
-This guide covers Python's `LanceDataset` API. For a runnable end-to-end example, see the [Vector Search Quickstart](../quickstart/vector-search.md).
+This guide covers the Python (`pylance`), Rust (`lance`), and Java (`org.lance:lance-core`) SDKs. For runnable end-to-end examples, see the [Vector Search Quickstart](../quickstart/vector-search.md), [Rust Quickstart](../quickstart/rust.md), and [Java Quickstart](../quickstart/java.md).
 
 ## Search without an Index
 
-Pass `nearest` to `to_table` or `scanner` to retrieve the `k` nearest rows. Lance adds a `_distance` column to the result:
+Configure a nearest-neighbor scan to retrieve the `k` nearest rows. Include `_distance` in projected columns when specifying an explicit column list:
 
-```python
-result = dataset.to_table(
-    columns=["id", "category"],
-    nearest={
-        "column": "vector",
-        "q": query_vector,
-        "k": 10,
-    },
-)
-```
+=== "Python"
 
-Without a usable vector index, Lance computes distances against the vectors in the search scope. This is exact and is useful as a correctness baseline. To force exact search even when an index exists, set `nearest["use_index"] = False`.
+    ```python
+    result = dataset.to_table(
+        columns=["id", "category", "_distance"],
+        nearest={
+            "column": "vector",
+            "q": query_vector,
+            "k": 10,
+        },
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use arrow_array::{Float32Array, RecordBatch};
+    use futures::TryStreamExt;
+
+    let query = Float32Array::from(query_vector);
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .project(&["id", "category", "_distance"])?
+        .nearest("vector", &query, 10)?
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.ipc.ArrowReader;
+    import org.lance.ipc.LanceScanner;
+    import org.lance.ipc.Query;
+    import org.lance.ipc.ScanOptions;
+    import java.util.Arrays;
+
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Arrays.asList("id", "category", "_distance"))
+            .nearest(
+                new Query.Builder()
+                    .setColumn("vector")
+                    .setKey(queryVector)
+                    .setK(10)
+                    .build())
+            .build();
+    try (LanceScanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // process reader.getVectorSchemaRoot()
+      }
+    }
+    ```
+
+Without a usable vector index, Lance computes distances against the vectors in the search scope. This is exact and is useful as a correctness baseline. To force exact search even when an index exists, set `nearest["use_index"] = False` (Python), `.use_index(false)` (Rust), or `.setUseIndex(false)` (Java).
 
 Supported distance metrics include:
 
@@ -56,37 +102,131 @@ See [Performance Guide](performance.md#vector-index) for index-size formulas and
 
 Create an `IVF_RQ` index with the default 5-bit RaBitQ configuration:
 
-```python
-dataset.create_index(
-    "vector",
-    index_type="IVF_RQ",
-    metric="l2",
-    num_partitions=256,
-)
-```
+=== "Python"
+
+    ```python
+    dataset.create_index(
+        "vector",
+        index_type="IVF_RQ",
+        metric="l2",
+        num_partitions=256,
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::index::vector::VectorIndexParams;
+    use lance::index::DatasetIndexExt;
+    use lance_index::IndexType;
+    use lance_linalg::distance::MetricType;
+
+    let params = VectorIndexParams::ivf_rq(256, 5, MetricType::L2);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.index.DistanceType;
+    import org.lance.index.IndexOptions;
+    import org.lance.index.IndexParams;
+    import org.lance.index.IndexType;
+    import org.lance.index.vector.VectorIndexParams;
+    import java.util.Collections;
+
+    VectorIndexParams vecParams =
+        VectorIndexParams.ivfRq(256, (byte) 5, DistanceType.L2);
+    dataset.createIndex(
+        IndexOptions.builder(
+                Collections.singletonList("vector"),
+                IndexType.IVF_RQ,
+                IndexParams.builder().setVectorIndexParams(vecParams).build())
+            .replace(true)
+            .build());
+    ```
 
 The default `num_bits=5` is a good starting point for recall. Use `num_bits=1` when minimizing index size and build I/O is more important, then measure recall because searches cannot use the multi-bit distance estimate.
 
 Create an `IVF_PQ` or `IVF_HNSW_SQ` index when those alternatives better fit your workload:
 
-```python
-dataset.create_index(
-    "vector",
-    index_type="IVF_PQ",
-    metric="l2",
-    num_partitions=256,
-    num_sub_vectors=16,
-)
+=== "Python"
 
-dataset.create_index(
-    "vector",
-    index_type="IVF_HNSW_SQ",
-    metric="l2",
-    num_partitions=256,
-    m=20,
-    ef_construction=100,
-)
-```
+    ```python
+    dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        metric="l2",
+        num_partitions=256,
+        num_sub_vectors=16,
+    )
+
+    dataset.create_index(
+        "vector",
+        index_type="IVF_HNSW_SQ",
+        metric="l2",
+        num_partitions=256,
+        m=20,
+        ef_construction=100,
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance_index::vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
+    };
+
+    let pq_params = VectorIndexParams::ivf_pq(256, 8, 16, MetricType::L2, 50);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &pq_params, true)
+        .await?;
+
+    let hnsw_params = VectorIndexParams::with_ivf_hnsw_sq_params(
+        MetricType::L2,
+        IvfBuildParams::new(256),
+        HnswBuildParams::default().num_edges(20).ef_construction(100),
+        SQBuildParams::default(),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &hnsw_params, true)
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.index.vector.HnswBuildParams;
+    import org.lance.index.vector.IvfBuildParams;
+    import org.lance.index.vector.SQBuildParams;
+
+    VectorIndexParams pqParams =
+        VectorIndexParams.ivfPq(256, 8, 16, DistanceType.L2, 50);
+    dataset.createIndex(
+        IndexOptions.builder(
+                Collections.singletonList("vector"),
+                IndexType.IVF_PQ,
+                IndexParams.builder().setVectorIndexParams(pqParams).build())
+            .replace(true)
+            .build());
+
+    VectorIndexParams hnswParams =
+        VectorIndexParams.withIvfHnswSqParams(
+            DistanceType.L2,
+            new IvfBuildParams.Builder().setNumPartitions(256).build(),
+            new HnswBuildParams.Builder().setM(20).setEfConstruction(100).build(),
+            new SQBuildParams.Builder().build());
+    dataset.createIndex(
+        IndexOptions.builder(
+                Collections.singletonList("vector"),
+                IndexType.IVF_HNSW_SQ,
+                IndexParams.builder().setVectorIndexParams(hnswParams).build())
+            .replace(true)
+            .build());
+    ```
 
 Important creation parameters:
 
@@ -103,17 +243,55 @@ The default index name is `<column>_idx`. Vector index creation uses `replace=Fa
 
 Use `nprobes` and `refine_factor` to trade recall for query work:
 
-```python
-result = dataset.to_table(
-    nearest={
-        "column": "vector",
-        "q": query_vector,
-        "k": 10,
-        "nprobes": 20,
-        "refine_factor": 5,
+=== "Python"
+
+    ```python
+    result = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": query_vector,
+            "k": 10,
+            "nprobes": 20,
+            "refine_factor": 5,
+        }
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .nearest("vector", &query, 10)?
+        .nprobes(20)
+        .refine(5)
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .nearest(
+                new Query.Builder()
+                    .setColumn("vector")
+                    .setKey(queryVector)
+                    .setK(10)
+                    .setNprobes(20)
+                    .setRefineFactor(5)
+                    .build())
+            .build();
+    try (LanceScanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // process reader.getVectorSchemaRoot()
+      }
     }
-)
-```
+    ```
 
 - `nprobes`: number of IVF partitions to search. Higher values usually improve recall and increase latency.
 - `refine_factor`: retrieve up to `k * refine_factor` candidates, re-rank them using more accurate distances, and return the top `k`.
@@ -138,14 +316,54 @@ Use a representative set of query vectors and report average recall, not just a 
 
 The `prefilter` scanner option controls when SQL filtering happens relative to top-k selection:
 
-```python
-# Filter candidates before selecting top-k
-result = dataset.scanner(
-    nearest={"column": "vector", "q": query_vector, "k": 10},
-    filter="category = 'science'",
-    prefilter=True,
-).to_table()
-```
+=== "Python"
+
+    ```python
+    # Filter candidates before selecting top-k
+    result = dataset.scanner(
+        nearest={"column": "vector", "q": query_vector, "k": 10},
+        filter="category = 'science'",
+        prefilter=True,
+    ).to_table()
+    ```
+
+=== "Rust"
+
+    ```rust
+    // Filter candidates before selecting top-k
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .filter("category = 'science'")?
+        .prefilter(true)
+        .nearest("vector", &query, 10)?
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    // Filter candidates before selecting top-k
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .filter("category = 'science'")
+            .prefilter(true)
+            .nearest(
+                new Query.Builder()
+                    .setColumn("vector")
+                    .setKey(queryVector)
+                    .setK(10)
+                    .build())
+            .build();
+    try (LanceScanner scanner = dataset.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // process reader.getVectorSchemaRoot()
+      }
+    }
+    ```
 
 - `prefilter=False` (default): select top-k first and then apply the SQL filter. Rejected rows are not replaced, so fewer than `k` rows may be returned.
 - `prefilter=True`: restrict candidates to rows matching the SQL filter before selecting top-k. This is usually the desired behavior for metadata-constrained retrieval, although it can be more expensive and does not make an approximate index exact.
@@ -176,15 +394,63 @@ Appending rows does not automatically add them to existing vector indexes. By de
 
 Incrementally add new data to an index:
 
-```python
-dataset.optimize.optimize_indices(index_names=["vector_idx"])
-```
+=== "Python"
+
+    ```python
+    dataset.optimize.optimize_indices(index_names=["vector_idx"])
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance_index::optimize::OptimizeOptions;
+
+    dataset
+        .optimize_indices(
+            &OptimizeOptions::new().index_names(vec!["vector_idx".to_string()]),
+        )
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.index.OptimizeOptions;
+    import java.util.Collections;
+
+    dataset.optimizeIndices(
+        OptimizeOptions.builder()
+            .indexNames(Collections.singletonList("vector_idx"))
+            .build());
+    ```
 
 By default, this assigns new vectors to the existing IVF partitions and quantizer models without retraining. If the new data has a substantially different distribution, retrain the index:
 
-```python
-dataset.optimize.optimize_indices(index_names=["vector_idx"], retrain=True)
-```
+=== "Python"
+
+    ```python
+    dataset.optimize.optimize_indices(index_names=["vector_idx"], retrain=True)
+    ```
+
+=== "Rust"
+
+    ```rust
+    dataset
+        .optimize_indices(
+            &OptimizeOptions::retrain().index_names(vec!["vector_idx".to_string()]),
+        )
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    dataset.optimizeIndices(
+        OptimizeOptions.builder()
+            .indexNames(Collections.singletonList("vector_idx"))
+            .retrain(true)
+            .build());
+    ```
 
 Retraining is more expensive but can restore recall when existing centroids or codebooks no longer represent the data well.
 

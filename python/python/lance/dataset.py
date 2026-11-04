@@ -83,6 +83,8 @@ from .lance import (
     CleanupExplanation,
     CleanupStats,
     DatasetBasePath,
+    ExpireVersionsPlan,
+    ExpireVersionsStats,
     IOStats,
     LanceSchema,
     ScanStatistics,
@@ -93,7 +95,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _coerce_source, _WriteSource
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -2918,6 +2920,101 @@ class LanceDataset(pa.dataset.Dataset):
             _cleanup_policy_to_json(policy) if policy is not None else None,
         )
 
+    def expire_versions(
+        self,
+        before: Optional[timedelta] = None,
+        before_version: Optional[int] = None,
+        *,
+        keep_one_per: Optional[timedelta] = None,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+    ) -> "ExpireVersionsStats":
+        """Remove version history without deleting any data files.
+
+        Unlike :meth:`cleanup_old_versions`, this never computes the set of live data
+        files, so it does not read the manifests it is expiring. On a table with a very
+        large number of versions that difference is hours against minutes.
+
+        The data files that only an expired version referenced are **not** removed. They
+        become unreferenced, and the next :meth:`cleanup_old_versions` reclaims them --
+        and is much cheaper for having fewer manifests left to read. The intended order
+        is expire, then clean up.
+
+        The newest version, tags on the current branch, and versions a branch is rooted
+        at are never removed.
+
+        Parameters
+        ----------
+        before: timedelta, optional
+            Expire versions written more than this long ago. Age comes from the manifest
+            object's write time, not the commit timestamp recorded inside it; use
+            ``before_version`` when an exact boundary matters.
+        before_version: int, optional
+            Expire versions numbered below this. Exact, and needs no timestamps.
+        keep_one_per: timedelta, optional
+            Instead of expiring every version past the cutoff, keep the newest one in
+            each bucket of this width. ``timedelta(hours=1)`` keeps one per hour.
+            Applies only beyond the cutoff, so ``before=timedelta(days=7)`` with
+            ``keep_one_per=timedelta(hours=1)`` reads as "full history for a week,
+            hourly before that". Must be at least one hour.
+
+            .. warning::
+                Thinning carries a rollback risk on an actively committing table.
+                Resolving the latest version starts at the version hint and probes
+                upward, stopping at the first version that is missing. Expiry refuses to
+                remove anything at or above the hint, but that floor is read once and
+                hint writes are unconditional, so a commit that started earlier can
+                publish a *lower* hint afterwards. A gap above that lowered hint hides
+                every version above it, and the table reads as an older state while the
+                newer manifests are still there. The one-hour minimum bounds the
+                exposure rather than removing it. Use thinning to repair a table that
+                has accumulated far more versions than it can carry, not as a default.
+        error_if_tagged_old_versions: bool, default True
+            Raise instead of silently keeping a tagged version the policy would expire.
+        delete_rate_limit: int, optional
+            Maximum delete requests per second. One request is one manifest.
+
+        Returns
+        -------
+        ExpireVersionsStats
+            Counts of what was removed and retained. ``failed_deletes`` is non-zero
+            when the run completed but could not remove everything it selected; those
+            versions remain expirable and a later run retries them.
+
+        Notes
+        -----
+        With no ``before`` and no ``before_version`` this expires nothing, rather than
+        everything.
+        """
+        return self._ds.expire_versions(
+            td_to_micros(before) if before is not None else None,
+            before_version,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )
+
+    def explain_expire_versions(
+        self,
+        before: Optional[timedelta] = None,
+        before_version: Optional[int] = None,
+        *,
+        keep_one_per: Optional[timedelta] = None,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+    ) -> "ExpireVersionsPlan":
+        """Report what :meth:`expire_versions` would remove, without removing it.
+
+        Takes the same arguments as :meth:`expire_versions`.
+        """
+        return self._ds.explain_expire_versions(
+            td_to_micros(before) if before is not None else None,
+            before_version,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )
+
     def explain_cleanup_old_versions(
         self,
         older_than: Optional[timedelta] = None,
@@ -3375,8 +3472,11 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
         max_token_length: Optional[int], default 40
-            This is for the ``INVERTED`` index. The maximum token length.
-            Any token longer than this will be removed.
+            This is for the ``INVERTED`` index. The exclusive token length limit
+            in UTF-8 bytes, not characters. Tokens of this length or longer are
+            removed. For example, the default removes both 40 ASCII characters
+            and 20 repetitions of ``é`` (40 UTF-8 bytes). Set to ``None`` to
+            disable the limit.
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
@@ -5846,3 +5946,9 @@ def _merge_message_to_properties(
     if commit_message is not None:
         merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
     return merged_properties
+
+
+@_coerce_source.register(LanceDataset)
+def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> _WriteSource:
+    # Capture the native dataset version and all default scan options once.
+    return _coerce_source(data_obj.scanner(), schema)

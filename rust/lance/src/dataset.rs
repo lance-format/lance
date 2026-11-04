@@ -70,10 +70,12 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+pub mod compaction_stats;
 mod data_file;
 mod data_file_part;
 pub mod deletions;
 pub mod delta;
+pub mod expire;
 pub mod files;
 pub mod fragment;
 pub(crate) mod fragment_slice;
@@ -121,6 +123,7 @@ pub mod update_join_bench;
 mod update_join_options;
 pub mod updater;
 mod utils;
+pub mod version_retention;
 pub(crate) mod versions;
 pub mod write;
 
@@ -2751,7 +2754,7 @@ impl Dataset {
                 .base_paths
                 .get(&id)
                 .ok_or_else(|| {
-                    Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
                 })?
                 .extract_path(self.session.store_registry()),
             None => Ok(self.base.clone()),

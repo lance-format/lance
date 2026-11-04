@@ -24,14 +24,13 @@ use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
-use lance_datafusion::exec::OneShotExec;
+use lance_datafusion::exec::RecordBatchExec;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_select::result::IndexExprResultWireFormat;
@@ -577,7 +576,7 @@ impl Scanner {
         self.mask_as_take_input(RowAddrMask::from_allowed(row_ids))
     }
 
-    // Wrap a row-address mask as a one-shot index input for FilteredReadExec, so a
+    // Wrap a row-address mask as a replayable literal index input for FilteredReadExec, so a
     // plain scan reads only the rows the mask selects.
     //
     // Every take-shaped row source funnels through here: plain takes, the
@@ -595,10 +594,9 @@ impl Scanner {
         let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
         let format = self.index_expr_result_format();
         let batch = index_result.serialize(&fragments_covered, format)?;
-        let schema = batch.schema();
-        let stream = futures::stream::once(async move { Ok(batch) });
-        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
-        Ok(Arc::new(OneShotExec::new(stream)))
+        // An index result is one control frame. Preserve both rows even when
+        // the caller requests one-row data batches.
+        Ok(Arc::new(RecordBatchExec::new(batch)))
     }
 
     async fn row_addrs_as_take_input(&self, row_addrs: Vec<u64>) -> Result<Arc<dyn ExecutionPlan>> {

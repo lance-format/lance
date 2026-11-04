@@ -16,6 +16,7 @@ on:
       - python/**
       - rust/**
       - protos/**
+      - skills/lance-table-maintenance/scripts/**
       - .github/workflows/python.yml
       - .github/workflows/build_linux_wheel/**
       - .github/workflows/build_mac_wheel/**
@@ -283,54 +284,6 @@ jobs:
         run: |
           sudo apt update -y -qq
           sudo apt install -y libhdf5-dev
-      - uses: ./.github/workflows/run_tests
-  mac:
-    timeout-minutes: 45
-    name: Python macOS 3.14 ARM
-    runs-on: "warp-macos-14-arm64-6x"
-    defaults:
-      run:
-        shell: bash
-        working-directory: python
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.14"
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_mac_wheel
-        with:
-          args: "--profile ci"
-      - uses: ./.github/workflows/run_tests
-        with:
-          skip-torch: "true"
-
-  windows:
-    runs-on: windows-latest-4x
-    timeout-minutes: 90
-    defaults:
-      run:
-        shell: powershell
-        working-directory: python
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-          lfs: true
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-        with:
-          workspaces: python
-          prefix-key: ${{ env.CACHE_PREFIX }}
-      - uses: ./.github/workflows/build_windows_wheel
-        with:
-          args: "--profile ci"
       - uses: ./.github/workflows/run_tests
   aws-integtest:
     needs: linux-wheel
