@@ -11,6 +11,7 @@ mod materialize;
 mod prepared;
 mod read;
 mod rewrite;
+mod rewrite_plan;
 #[cfg(test)]
 pub mod test_util;
 mod write;
@@ -36,6 +37,7 @@ pub use read::{
 };
 pub(super) use read::{take_blobs, validate_blob_column};
 pub use rewrite::{BlobV2BatchRewritePlan, field_contains_blob_v2, transform_blob_v2_batch};
+pub use rewrite_plan::BlobRewritePlan;
 pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{
