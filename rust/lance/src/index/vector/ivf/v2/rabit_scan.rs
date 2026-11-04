@@ -40,10 +40,10 @@ use lance_index::vector::{
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
-    rotated_partition_centroid_slice,
+    global_heap_to_batch, rotated_partition_centroid_slice,
 };
 
-type RabitIndex = IVFIndex<FlatIndex, RabitQuantizer>;
+pub(super) type RabitIndex = IVFIndex<FlatIndex, RabitQuantizer>;
 
 /// Creates runtime execution state for an opened RaBitQ index with current plane storage.
 ///
@@ -731,6 +731,6 @@ impl RabitScanContext {
 
     /// Convert the final native heap to the standard vector result schema.
     pub fn finish(&self, heap: BinaryHeap<OrderedNode<u64>>) -> Result<RecordBatch> {
-        RabitIndex::global_heap_to_batch(heap, self.metrics.as_ref())
+        global_heap_to_batch(heap, self.metrics.as_ref())
     }
 }
