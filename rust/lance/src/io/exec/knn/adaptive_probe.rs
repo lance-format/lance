@@ -101,11 +101,10 @@ impl AutoProbePolicy {
             // Keep the existing metric/k-dependent shape and calibrate only the
             // fraction of its budget. Ordered anchors make probing monotone for
             // each query, including queries clipped by explicit caller bounds.
-            let scales = match (self, metric) {
-                (Self::Adaptive(_), DistanceType::L2) => Some((0.286, 0.601)),
-                (Self::Adaptive(_), DistanceType::Cosine) => Some((0.278, 0.563)),
-                (Self::Adaptive(_), DistanceType::Dot) => Some((0.161, 0.441)),
-                _ => None,
+            let scales = if matches!(self, Self::Adaptive(_)) {
+                effort_scales(query.k, metric)
+            } else {
+                None
             };
             if let Some((low_scale, medium_scale)) = scales {
                 let low = ((auto as f64 * low_scale).ceil() as usize).clamp(lower, auto);
@@ -123,6 +122,118 @@ impl AutoProbePolicy {
         } else {
             interpolate_budget(effort, (0.5, auto), (1.0, upper))
         };
+    }
+}
+
+/// Fractions of Auto fitted independently at each k on calibration queries.
+/// Adjacent anchors straddle every Auto-profile boundary; interpolation therefore
+/// stays within one profile. The full fit and held-out evidence are recorded in
+/// benchmarks/auto-ivf-effort/calibration-by-k.json and routing-by-k-evaluation.json.
+fn effort_scales(k: usize, metric: DistanceType) -> Option<(f64, f64)> {
+    const K: [usize; 26] = [
+        1, 2, 5, 10, 11, 20, 50, 100, 101, 150, 200, 201, 300, 500, 501, 750, 1_000, 1_001, 2_000,
+        5_000, 10_000, 10_001, 20_000, 50_000, 75_000, 100_000,
+    ];
+    let scales = match metric {
+        DistanceType::L2 => &[
+            (0.264, 0.601),
+            (0.209, 0.501),
+            (0.251, 0.501),
+            (0.286, 0.591),
+            (0.182, 0.364),
+            (0.182, 0.395),
+            (0.211, 0.474),
+            (0.264, 0.553),
+            (0.179, 0.401),
+            (0.201, 0.449),
+            (0.201, 0.471),
+            (0.161, 0.364),
+            (0.182, 0.410),
+            (0.209, 0.484),
+            (0.162, 0.380),
+            (0.176, 0.431),
+            (0.207, 0.483),
+            (0.068, 0.164),
+            (0.092, 0.215),
+            (0.143, 0.331),
+            (0.212, 0.488),
+            (0.057, 0.137),
+            (0.089, 0.206),
+            (0.172, 0.373),
+            (0.232, 0.482),
+            (0.288, 0.579),
+        ],
+        DistanceType::Cosine => &[
+            (0.278, 0.563),
+            (0.143, 0.383),
+            (0.174, 0.442),
+            (0.201, 0.530),
+            (0.133, 0.308),
+            (0.143, 0.352),
+            (0.161, 0.429),
+            (0.189, 0.501),
+            (0.129, 0.348),
+            (0.143, 0.388),
+            (0.154, 0.412),
+            (0.118, 0.322),
+            (0.136, 0.360),
+            (0.156, 0.422),
+            (0.126, 0.342),
+            (0.146, 0.388),
+            (0.161, 0.432),
+            (0.066, 0.184),
+            (0.088, 0.240),
+            (0.135, 0.352),
+            (0.193, 0.481),
+            (0.082, 0.209),
+            (0.118, 0.286),
+            (0.198, 0.437),
+            (0.250, 0.526),
+            (0.297, 0.601),
+        ],
+        DistanceType::Dot => &[
+            (0.179, 0.465),
+            (0.139, 0.341),
+            (0.160, 0.417),
+            (0.181, 0.473),
+            (0.136, 0.356),
+            (0.140, 0.381),
+            (0.161, 0.436),
+            (0.176, 0.481),
+            (0.166, 0.455),
+            (0.176, 0.484),
+            (0.185, 0.503),
+            (0.160, 0.435),
+            (0.173, 0.468),
+            (0.189, 0.509),
+            (0.165, 0.445),
+            (0.180, 0.477),
+            (0.190, 0.506),
+            (0.103, 0.273),
+            (0.122, 0.320),
+            (0.163, 0.414),
+            (0.211, 0.525),
+            (0.097, 0.229),
+            (0.130, 0.298),
+            (0.202, 0.434),
+            (0.248, 0.517),
+            (0.289, 0.584),
+        ],
+        DistanceType::Hamming => return None,
+    };
+    match K.binary_search(&k) {
+        Ok(position) => Some(scales[position]),
+        Err(upper) if upper > 0 && upper < K.len() => {
+            let lower = upper - 1;
+            let weight =
+                (k as f64 / K[lower] as f64).ln() / (K[upper] as f64 / K[lower] as f64).ln();
+            let interpolate = |start: f64, end: f64| start * (end / start).powf(weight);
+            Some((
+                interpolate(scales[lower].0, scales[upper].0),
+                interpolate(scales[lower].1, scales[upper].1),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -431,6 +542,7 @@ mod tests {
         #[values(None, Some(0), Some(16), Some(128))] maximum: Option<usize>,
         #[values(0, 1, 64)] available: usize,
         #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)] metric: DistanceType,
+        #[values(1, 1500, 100_000)] k: usize,
     ) {
         let config = AutoProbeConfig {
             min_initial_nprobes: 25,
@@ -453,6 +565,7 @@ mod tests {
         efforts.sort_by(f64::total_cmp);
         for (step, effort) in efforts.into_iter().enumerate() {
             let mut query = query();
+            query.k = k;
             query.minimum_nprobes = caller_minimum;
             query.maximum_nprobes = maximum;
             query.search_effort = effort;
@@ -479,15 +592,38 @@ mod tests {
     }
 
     #[rstest]
-    #[case::l2(DistanceType::L2, 29, 61)]
-    #[case::cosine(DistanceType::Cosine, 28, 57)]
-    #[case::dot(DistanceType::Dot, 17, 45)]
-    fn test_calibrated_effort_anchors(
+    #[case::l2_small(DistanceType::L2, 1, 27, 61)]
+    #[case::l2_ten(DistanceType::L2, 10, 29, 60)]
+    #[case::l2_thousand(DistanceType::L2, 1000, 21, 49)]
+    #[case::l2_after_thousand(DistanceType::L2, 1001, 7, 17)]
+    #[case::l2_interpolated(DistanceType::L2, 1500, 9, 20)]
+    #[case::l2_ten_thousand(DistanceType::L2, 10_000, 22, 49)]
+    #[case::l2_after_ten_thousand(DistanceType::L2, 10_001, 6, 14)]
+    #[case::l2_largest(DistanceType::L2, 100_000, 29, 58)]
+    #[case::cosine_small(DistanceType::Cosine, 1, 28, 57)]
+    #[case::cosine_ten(DistanceType::Cosine, 10, 21, 53)]
+    #[case::cosine_thousand(DistanceType::Cosine, 1000, 17, 44)]
+    #[case::cosine_after_thousand(DistanceType::Cosine, 1001, 7, 19)]
+    #[case::cosine_interpolated(DistanceType::Cosine, 1500, 8, 22)]
+    #[case::cosine_ten_thousand(DistanceType::Cosine, 10_000, 20, 49)]
+    #[case::cosine_after_ten_thousand(DistanceType::Cosine, 10_001, 9, 21)]
+    #[case::cosine_largest(DistanceType::Cosine, 100_000, 30, 61)]
+    #[case::dot_small(DistanceType::Dot, 1, 18, 47)]
+    #[case::dot_ten(DistanceType::Dot, 10, 19, 48)]
+    #[case::dot_thousand(DistanceType::Dot, 1000, 19, 51)]
+    #[case::dot_after_thousand(DistanceType::Dot, 1001, 11, 28)]
+    #[case::dot_interpolated(DistanceType::Dot, 1500, 12, 30)]
+    #[case::dot_ten_thousand(DistanceType::Dot, 10_000, 22, 53)]
+    #[case::dot_after_ten_thousand(DistanceType::Dot, 10_001, 10, 23)]
+    #[case::dot_largest(DistanceType::Dot, 100_000, 29, 59)]
+    fn test_calibrated_effort_by_k(
         #[case] metric: DistanceType,
+        #[case] k: usize,
         #[case] low: usize,
         #[case] medium: usize,
-        #[values(1, 10, 100, 1000, 10_000, 100_000)] k: usize,
     ) {
+        // Hold Auto fixed to isolate the k-dependent fractions. Expected budgets
+        // come from the frozen calibration, including both wide-bucket jumps.
         let config = AutoProbeConfig {
             min_initial_nprobes: 100,
             margin: 0.0,

@@ -58,6 +58,7 @@ def prepare(target, cache, output):
     result = {
         "flat": {
             "uri": SOURCE,
+            "metric": "l2",
             "version": 3,
             "rows": 10_000_000,
             "index_name": flat["name"],
@@ -65,6 +66,7 @@ def prepare(target, cache, output):
         },
         "rq": {
             "uri": target,
+            "metric": "l2",
             "version": dataset.version,
             "rows": 10_000_000,
             "index_name": rq["name"],
