@@ -3,6 +3,8 @@
 This workspace validates a Rust-native plugin boundary for Lance storage
 providers:
 
+![Rust-native storage extension boundary](docs/storage-extension-boundary.jpg)
+
 - `runtime` is a shared Rust dylib containing `lance-io`;
 - `goosefs-plugin` contains the existing GooseFS provider implementation and
   links the runtime;
