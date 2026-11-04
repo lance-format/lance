@@ -6,6 +6,7 @@
 //! expected outcome for that format rather than moving it to a separate
 //! suite.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -19,8 +20,8 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use super::history::tests::{
-    MAP_A, Source, address, digest, legacy, ordered, partition, transition_with_unknown_field,
-    translate, unknown_record, whole,
+    MAP_A, MAP_B, Source, address, digest, legacy, ordered, partition,
+    transition_with_unknown_field, translate, unknown_record, whole,
 };
 use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, RewriteRecord,
@@ -203,6 +204,23 @@ fn whole_history_edits_refuse_records_they_cannot_interpret(
             1,
             vec![ordered(&[whole(1, 1)], &[(2, 1)])],
         )));
+        // A tagged rewrite cannot tell whether the unknown record moves the
+        // segment's rows, so it refuses rather than publish a translation
+        // that may miss a hop. Version 0 composes as released readers did,
+        // ignoring such records.
+        let live = RoaringBitmap::from_iter([2, 8]);
+        let lineage = history.fragment_bitmap();
+        let rows = std::collections::HashMap::new();
+        let context = RewriteContext {
+            live_fragments: &live,
+            lineage: &lineage,
+            fragment_rows: &rows,
+            served: None,
+        };
+        let error = history
+            .compose(&context, &segment(&[7], 1, TranslationSupport::Supported))
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
     }
 }
 
@@ -736,6 +754,8 @@ fn remap_bases_changes_only_bases(#[case] format: HistoryFormat) {
 struct InMemoryMappings {
     maps: std::collections::HashMap<String, (Arc<CountsMatrix>, UInt16Array)>,
     reads: Mutex<Vec<Range<u64>>>,
+    /// Every row map consulted, counts included.
+    maps_read: Mutex<HashSet<MappingRef>>,
 }
 
 impl InMemoryMappings {
@@ -765,10 +785,12 @@ impl InMemoryMappings {
 #[async_trait::async_trait]
 impl MappingSource for InMemoryMappings {
     async fn counts(&self, mapping: &MappingRef) -> Result<Arc<CountsMatrix>> {
+        self.maps_read.lock().unwrap().insert(mapping.clone());
         Ok(self.maps[mapping.map_id()].0.clone())
     }
 
     async fn read(&self, mapping: &MappingRef, rows: Range<u64>) -> Result<UInt16Array> {
+        self.maps_read.lock().unwrap().insert(mapping.clone());
         self.reads.lock().unwrap().push(rows.clone());
         Ok(self.maps[mapping.map_id()]
             .1
@@ -1294,68 +1316,106 @@ fn trim_drops_a_version_a_segment_splits_unless_it_trims_a_prefix(
     assert_eq!(version_stamps(&trimmed), kept);
 }
 
-/// The files a history references cover every row map its trimmed form can
-/// still read, and a format without external mappings references none.
+/// The files a history references cover every row map its trimmed form
+/// still reads: each live segment is translated through the trimmed
+/// history and every map consulted must be listed. A stable partition
+/// downstream of a compaction is reached by a segment over the
+/// compaction's source, so the forward closure keeps its map. A format
+/// without external mappings references none.
 #[rstest]
 #[case::legacy(HistoryFormat::Legacy)]
 #[case::tagged(HistoryFormat::Tagged)]
-fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: HistoryFormat) {
+#[tokio::test]
+async fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: HistoryFormat) {
     let mut history = record_natively(
         FragReuseHistory::empty(format),
         REWRITE_VERSION,
         &[whole(0, 4)],
         &[(1, 4)],
     );
+    history = record_natively(history, REWRITE_VERSION, &[whole(7, 4)], &[(8, 4)]);
+    let mut live_fragments = RoaringBitmap::from_iter([1, 8]);
     if format == HistoryFormat::Tagged {
         history = history
             .append(RewriteRecord::new(
                 REWRITE_VERSION,
-                vec![partition(5, 6, MAP_A)],
+                vec![partition(5, 6, MAP_A), partition(8, 9, MAP_B)],
             ))
             .unwrap();
+        live_fragments = RoaringBitmap::from_iter([1, 6, 9]);
     }
-    let reachable = |history: &FragReuseHistory| -> Vec<String> {
-        history
-            .ledger()
-            .transitions()
-            .iter()
-            .filter_map(|transition| match transition.mapping() {
-                super::ledger::Mapping::StablePartition(partition) => {
-                    Some(partition.map_id.clone())
-                }
-                super::ledger::Mapping::OrderedCompaction(_) => None,
-            })
-            .collect()
-    };
-    let listed = |history: &FragReuseHistory| -> Vec<String> {
-        history
-            .referenced_files()
-            .unwrap()
-            .iter()
-            .map(|mapping| mapping.map_id().to_string())
-            .collect()
+    let labels = [Some(0); 4];
+    let listed = |history: &FragReuseHistory| -> HashSet<MappingRef> {
+        history.referenced_files().unwrap().into_iter().collect()
     };
     let over_partition = segment(&[5], 1, TranslationSupport::Supported);
     let over_compaction = segment(&[0], 1, TranslationSupport::Supported);
+    let upstream_of_partition = segment(&[7], 1, TranslationSupport::Supported);
     for live in [
         vec![vec![over_partition.clone()]],
         vec![vec![over_compaction.clone()]],
-        vec![vec![over_partition, over_compaction]],
+        vec![vec![upstream_of_partition.clone()]],
+        vec![
+            vec![over_partition.clone(), over_compaction.clone()],
+            vec![upstream_of_partition.clone()],
+        ],
         vec![],
     ] {
         let trimmed = history.trim(&live).unwrap();
-        let listed = listed(&trimmed);
-        let reachable = reachable(&trimmed);
-        for map_id in &reachable {
-            assert!(listed.contains(map_id), "{map_id} is not listed");
+        let mappings = Arc::new(
+            InMemoryMappings::default()
+                .with_map(MAP_A, &labels, 4)
+                .with_map(MAP_B, &labels, 4),
+        );
+        let context = ReadContext {
+            entry_version: REWRITE_VERSION,
+            live_fragments: &live_fragments,
+        };
+        for group in &live {
+            for (segment, plan) in group.iter().zip(trimmed.plan(&context, group)) {
+                // A direct segment reads no mapping.
+                let ReadPlan::Translate(plan) = plan else {
+                    continue;
+                };
+                let mut addrs: Vec<Option<u64>> = segment
+                    .fragment_bitmap
+                    .iter()
+                    .flatten()
+                    .flat_map(|fragment| (0..4).map(move |row| Some(address(fragment.into(), row))))
+                    .collect();
+                plan.bind(mappings.clone())
+                    .translate_in_place(&mut addrs)
+                    .await
+                    .unwrap();
+            }
         }
-        assert_eq!(listed.len(), reachable.len());
+        let read = mappings.maps_read.lock().unwrap().clone();
+        // Every map this history keeps is read by some live segment here,
+        // so the listing must be exactly what was read: it neither misses
+        // a file nor holds one back from cleanup.
+        assert_eq!(listed(&trimmed), read, "{live:?}");
+        let reaches_map_b = live
+            .iter()
+            .flatten()
+            .any(|segment| segment.uuid == upstream_of_partition.uuid);
+        assert_eq!(
+            read.iter().any(|mapping| mapping.map_id() == MAP_B),
+            reaches_map_b && format == HistoryFormat::Tagged,
+            "{live:?}"
+        );
     }
-    let expected: Vec<String> = match format {
-        HistoryFormat::Legacy => vec![],
-        HistoryFormat::Tagged => vec![MAP_A.to_string()],
+    let expected: HashSet<&str> = match format {
+        HistoryFormat::Legacy => HashSet::new(),
+        HistoryFormat::Tagged => [MAP_A, MAP_B].into(),
     };
-    assert_eq!(listed(&history), expected);
+    let all_listed = listed(&history);
+    assert_eq!(
+        all_listed
+            .iter()
+            .map(MappingRef::map_id)
+            .collect::<HashSet<_>>(),
+        expected
+    );
 }
 
 /// A composed rewrite moves every stored address exactly as following the

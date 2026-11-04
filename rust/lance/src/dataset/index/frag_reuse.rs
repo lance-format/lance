@@ -1861,6 +1861,34 @@ mod tests {
             assert_eq!(kept(&[named_index(FRAG_REUSE_INDEX_NAME, 1, &[1, 2])]), 0);
         }
 
+        /// Coverage is grouped per logical index: one index rebuilt over
+        /// the destinations does not release a transition another index
+        /// still derives from, so the transition and its row map stay.
+        #[test]
+        fn one_index_catching_up_does_not_release_another() {
+            let history = partition_history(&[1, 2], &[5, 6]);
+            let caught_up = named_index("a_idx", 2, &[5, 6]);
+            let still_deriving = named_index("b_idx", 1, &[1, 2]);
+            let trimmed = history
+                .trim(&trim_segments(&[caught_up.clone(), still_deriving]))
+                .unwrap();
+            assert_eq!(trimmed, history);
+            assert_eq!(
+                trimmed.referenced_files().unwrap(),
+                history.referenced_files().unwrap()
+            );
+            assert_eq!(trimmed.referenced_files().unwrap().len(), 1);
+            // Once the other index catches up too, the transition goes.
+            let trimmed = history
+                .trim(&trim_segments(&[
+                    caught_up,
+                    named_index("b_idx", 2, &[5, 6]),
+                ]))
+                .unwrap();
+            assert!(trimmed.is_empty());
+            assert!(trimmed.referenced_files().unwrap().is_empty());
+        }
+
         /// Integration: an unusable segment claiming the destinations
         /// neither prunes the usable old segment nor releases the
         /// transition.

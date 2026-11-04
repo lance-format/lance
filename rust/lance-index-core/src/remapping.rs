@@ -978,6 +978,69 @@ mod tests {
         }
     }
 
+    /// A backing moving fragment 1 to fragment 5 that records the size of
+    /// every batch it is handed.
+    #[derive(Debug, Default)]
+    struct RecordingBatches(std::sync::Mutex<Vec<usize>>);
+
+    impl lance_select::remapper::RemapperBacking for RecordingBatches {
+        fn fragment_needs_translation(&self, fragment: u32) -> bool {
+            fragment == 1
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            self.0.lock().unwrap().push(addrs.len());
+            for slot in addrs.iter_mut() {
+                if let Some(address) = *slot
+                    && address >> 32 == 1
+                {
+                    *slot = Some(addr(5, address & 0xffff_ffff));
+                }
+            }
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Driven through the translator, a large request reaches the
+    /// remapper in batches of at most `BATCH_SIZE` addresses with every
+    /// position kept across batch boundaries, and `resolve` builds a map of
+    /// exactly one unit of work.
+    #[test]
+    fn a_remapper_translator_bounds_batches_and_resolves_one_unit() {
+        block_on(async {
+            let backing = Arc::new(RecordingBatches::default());
+            let translator = RowAddrTranslator::from(Remapper::from_backing(backing.clone()));
+            assert!(matches!(translator, RowAddrTranslator::Remapper(_)));
+            assert!(!translator.is_empty());
+
+            let rows = 2 * BATCH_SIZE as u64 + 1;
+            let input: Vec<u64> = (0..rows).map(|offset| addr(1, offset)).collect();
+            let output = translator.remap_row_addrs(&input).await.unwrap();
+            assert_eq!(output.len(), input.len());
+            assert!(
+                output
+                    .iter()
+                    .zip(0..rows)
+                    .all(|(translated, offset)| *translated == Some(addr(5, offset)))
+            );
+            let batches = std::mem::take(&mut *backing.0.lock().unwrap());
+            assert_eq!(batches, [BATCH_SIZE, BATCH_SIZE, 1]);
+
+            let page = (10..20).map(|offset| addr(1, offset));
+            let resolved = translator.resolve(page).await.unwrap();
+            assert_eq!(resolved.get(addr(1, 15)), Some(Some(addr(5, 15))));
+            assert_eq!(resolved.get(addr(1, 25)), None, "not part of the unit");
+            assert_eq!(*backing.0.lock().unwrap(), [10]);
+        });
+    }
+
     #[test]
     fn an_in_memory_translation_rewrites_synchronously() {
         let remap = RowAddrRemap::direct(HashMap::from([(1, Some(5)), (3, None)]));

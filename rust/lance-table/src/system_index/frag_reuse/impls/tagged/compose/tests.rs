@@ -620,6 +620,62 @@ async fn rewrite_materializes_from_the_histories_digests() {
     assert_eq!(remap.get(addr(11, 0)), None);
 }
 
+/// More addresses than one batch holds reach a stable-partition hop in
+/// batches of at most `REWRITE_BATCH`, and every address lands at its own
+/// position, in whatever order it was asked for.
+#[tokio::test]
+async fn rewrite_bounds_batches_through_a_stable_partition() {
+    const ROWS: u32 = 150_000;
+    let history = history(vec![partition_rows(
+        SP1,
+        &[(1, u64::from(ROWS))],
+        &[(3, u64::from(ROWS / 2)), (4, u64::from(ROWS / 2))],
+    )]);
+    let labels: Vec<Option<u16>> = (0..ROWS).map(|row| Some((row % 2) as u16)).collect();
+    let mappings = Arc::new(InMemoryMappings::default().with_map(SP1, &labels, 2));
+    let live = bitmap(&[3, 4]);
+    let lineage = history.fragment_bitmap();
+    let rows = HashMap::new();
+    let context = RewriteContext {
+        live_fragments: &live,
+        lineage: &lineage,
+        fragment_rows: &rows,
+        served: None,
+    };
+    let segment = SegmentSummary {
+        uuid: Uuid::new_v4(),
+        fragment_bitmap: Some(bitmap(&[1])),
+        dataset_version: 1,
+        domain: RowDomain::Address,
+        translation: TranslationSupport::Supported,
+    };
+    let Composition::Rewrite(plan) = history.compose(&context, &segment).unwrap() else {
+        panic!("a covered stable partition is rewritten");
+    };
+    let remapper = plan.bind(mappings.clone());
+
+    let mut addrs: Vec<Option<u64>> = (0..ROWS).rev().map(|row| Some(addr(1, row))).collect();
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    for (translated, row) in addrs.iter().zip((0..ROWS).rev()) {
+        assert_eq!(*translated, Some(addr(3 + row % 2, row / 2)), "row {row}");
+    }
+    let reads = mappings.reads.lock().unwrap().clone();
+    assert!(reads.len() >= 3, "{reads:?}");
+    assert!(
+        reads
+            .iter()
+            .all(|(_, rows)| rows.end - rows.start <= REWRITE_BATCH as u64),
+        "{reads:?}"
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .map(|(_, rows)| rows.end - rows.start)
+            .sum::<u64>(),
+        u64::from(ROWS)
+    );
+}
+
 /// A rewrite that only drops coverage moves nothing.
 #[test]
 fn straddle_only_rewrite_moves_no_address() {
