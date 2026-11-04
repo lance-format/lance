@@ -1218,6 +1218,118 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
     );
 }
 
+/// Copying the whole dataset root must make branch bases resolve inside the
+/// copy, not at the absolute source URI recorded by `create_branch`.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_branch_bases_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    let version = dataset.version().version;
+    dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("feature", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 10);
+    let batch = copied.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 10);
+}
+
+/// A branch created from another branch records the parent branch's location.
+/// Copying the root must resolve both generations inside the copy.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_nested_branch_bases_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    let version = dataset.version().version;
+    let mut feature = dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+    feature
+        .create_branch("experiment", feature.version().version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("experiment", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 10);
+}
+
+/// Inherited deletion files must resolve inside the copy too.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_branch_deletions_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    dataset.delete("id < 50").await.unwrap();
+    let version = dataset.version().version;
+    dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("feature", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 50);
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_main_branch_management() {
     let tempdir = TempDir::default();
