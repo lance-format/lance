@@ -13,13 +13,18 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use super::history::tests::{
-    MAP_A, Source, legacy, ordered, partition, transition_with_unknown_field, unknown_record, whole,
+    MAP_A, Source, address, legacy, ordered, partition, transition_with_unknown_field, translate,
+    unknown_record, whole,
 };
 use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, RewriteRecord,
     length_delimited,
 };
 use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
+use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::format::{DataFile, Fragment};
+use lance_file::version::ConcreteFileVersion;
 
 /// Record one rewrite of `sources` into `destinations` at `dataset_version`.
 fn record_natively(
@@ -416,5 +421,240 @@ fn empty_remaining_coverage_still_translates(#[case] reading: Reading) {
             ReadPlan::Translate(plan) => assert!(plan.coverage().is_empty(), "{segment:?}"),
             other => panic!("{segment:?}: {other:?}"),
         }
+    }
+}
+
+/// Append, encode as an entry, then decode it as committed and as proposed:
+/// each reads back the history that was encoded.
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy)]
+#[case::tagged(HistoryFormat::Tagged)]
+fn appended_history_round_trips_through_its_entry(#[case] format: HistoryFormat) {
+    let history = record_natively(
+        FragReuseHistory::empty(format),
+        1,
+        &[whole(0, 2)],
+        &[(1, 2)],
+    );
+    let history = record_natively(history, 2, &[whole(1, 2)], &[(2, 1), (3, 1)]);
+
+    let encoded = history.encode(7);
+    assert!(encoded.external.is_none());
+    let entry = encoded.entry;
+    assert_eq!(entry.index_version, format.index_version());
+    assert_eq!(entry.dataset_version, 7);
+    assert_eq!(entry.fragment_bitmap, Some(history.fragment_bitmap()));
+    assert_eq!(FragReuseHistory::locate(&entry).unwrap(), None);
+    assert_eq!(FragReuseHistory::decode(&entry, None).unwrap(), history);
+    assert_eq!(
+        FragReuseHistory::decode_proposed(&entry, None).unwrap(),
+        history
+    );
+    let inline = history.encode_inline(7);
+    assert_eq!(inline.index_details, entry.index_details);
+}
+
+/// A history above the inline limit spills; decoding takes exactly the bytes
+/// the entry references.
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy)]
+#[case::tagged(HistoryFormat::Tagged)]
+fn spilled_history_decodes_from_the_external_bytes(#[case] format: HistoryFormat) {
+    let transitions = (0..5000)
+        .map(|id| ordered(&[whole(id, 1)], &[(100_000 + id, 1)]))
+        .collect();
+    let history = FragReuseHistory::empty(format)
+        .append(RewriteRecord::new(1, transitions))
+        .unwrap();
+    let encoded = history.encode(1);
+    let external = encoded.external.expect("spilled");
+    assert_eq!(external, history.content());
+    let entry = encoded.entry;
+    let file = FragReuseHistory::locate(&entry).unwrap().expect("external");
+    assert_eq!(file.size, external.len() as u64);
+    assert_eq!(file.offset, 0);
+    assert_eq!(
+        FragReuseHistory::decode(&entry, Some(external.clone())).unwrap(),
+        history
+    );
+
+    let error = FragReuseHistory::decode(&entry, None).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    let error = FragReuseHistory::decode(&entry, Some(external.slice(1..))).unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+}
+
+/// A committed version 0 entry is repaired; the same entry proposed by a
+/// caller is refused.
+#[test]
+fn only_a_committed_legacy_entry_is_repaired() {
+    let first = legacy(1, &[whole(0, 2)], &[(1, 2)]);
+    let reconsumes = legacy(2, &[whole(0, 2)], &[(2, 2)]);
+    let content: Vec<u8> = [&first, &reconsumes]
+        .iter()
+        .flat_map(|version| length_delimited(LEGACY_VERSION_FIELD, &version.encode_to_vec()))
+        .collect();
+    let mut entry = FragReuseHistory::empty(HistoryFormat::Legacy).encode_inline(2);
+    let mut details = entry.index_details.as_deref().unwrap().clone();
+    details.value = length_delimited(1, &content);
+    entry.index_details = Some(std::sync::Arc::new(details));
+
+    assert_eq!(
+        FragReuseHistory::decode(&entry, None).unwrap(),
+        FragReuseHistory::from_legacy_versions(vec![first]).unwrap()
+    );
+    let error = FragReuseHistory::decode_proposed(&entry, None).unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains("proposed"), "{error}");
+}
+
+fn overlaid_fragment(id: u64) -> Fragment {
+    let mut fragment = Fragment::new(id);
+    fragment.physical_rows = Some(1);
+    fragment.overlays.push(DataOverlayFile {
+        data_file: DataFile::new(
+            "overlay.lance",
+            vec![0],
+            vec![0],
+            ConcreteFileVersion::V2_0,
+            None,
+            None,
+        ),
+        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+        committed_version: 1,
+    });
+    fragment
+}
+
+/// Append refuses what the history's format cannot record, and nothing
+/// else. Rewriting an overlaid source bakes its values into the destination,
+/// which tagged provenance would keep serving through translation (the
+/// legacy format drops the destination from stale bitmaps instead). A
+/// rewrite already recorded would consume its sources twice. A stable
+/// partition needs the tagged format.
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy, false, true)]
+#[case::tagged(HistoryFormat::Tagged, true, false)]
+fn append_refuses_what_the_format_cannot_record(
+    #[case] format: HistoryFormat,
+    #[case] refuses_overlays: bool,
+    #[case] refuses_stable_partitions: bool,
+) {
+    let history = record_natively(
+        FragReuseHistory::empty(format),
+        1,
+        &[whole(0, 1)],
+        &[(1, 1)],
+    );
+
+    let overlaid = RewriteRecord::new(2, vec![ordered(&[whole(5, 1)], &[(6, 1)])])
+        .with_source_fragments([&overlaid_fragment(5)]);
+    match history.append(overlaid) {
+        Err(error) if refuses_overlays => {
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains("overlay"), "{error}");
+        }
+        Ok(_) if !refuses_overlays => {}
+        other => panic!("{other:?}"),
+    }
+
+    let error = history
+        .append(RewriteRecord::new(
+            2,
+            vec![ordered(&[whole(0, 1)], &[(1, 1)])],
+        ))
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+
+    match history.append(RewriteRecord::new(2, vec![partition(7, 8, MAP_A)])) {
+        Err(error) if refuses_stable_partitions => {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        }
+        Ok(appended) if !refuses_stable_partitions => {
+            assert_eq!(appended.ledger().transitions().len(), 2);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Lifting reinterprets the legacy records without re-encoding them, so
+/// every address translates exactly as before.
+#[test]
+fn lift_preserves_every_recorded_translation() {
+    let partly_deleted = Source {
+        id: 0,
+        physical_rows: 3,
+        deleted: [1].into(),
+    };
+    let history = record_natively(
+        FragReuseHistory::empty(HistoryFormat::Legacy),
+        1,
+        &[partly_deleted, whole(1, 2)],
+        &[(2, 2), (3, 2)],
+    );
+    let history = record_natively(history, 2, &[whole(2, 2)], &[(4, 2)]);
+    let lifted = history.lift().unwrap();
+    assert_eq!(lifted.format(), HistoryFormat::Tagged);
+    assert_eq!(lifted.content(), history.content());
+    assert_eq!(lifted.lift().unwrap(), lifted);
+
+    assert_eq!(
+        translate(lifted.ledger(), address(0, 0)),
+        Some(address(4, 0))
+    );
+    for fragment in 0..5 {
+        for offset in 0..3 {
+            let addr = address(fragment, offset);
+            assert_eq!(
+                translate(lifted.ledger(), addr),
+                translate(history.ledger(), addr),
+                "address {addr:#x}"
+            );
+        }
+    }
+}
+
+/// A shallow clone's relocation restamps stable-partition bases and leaves
+/// every other part of the history as it was.
+#[rstest]
+#[case::legacy(HistoryFormat::Legacy)]
+#[case::tagged(HistoryFormat::Tagged)]
+fn remap_bases_changes_only_bases(#[case] format: HistoryFormat) {
+    let history = record_natively(
+        FragReuseHistory::empty(format),
+        1,
+        &[whole(0, 1)],
+        &[(1, 1)],
+    );
+    let history = match format {
+        HistoryFormat::Legacy => history,
+        HistoryFormat::Tagged => history
+            .append(RewriteRecord::new(2, vec![partition(5, 6, MAP_A)]))
+            .unwrap(),
+    };
+    let remapped = history
+        .remap_bases(&|base| {
+            assert_eq!(base, None);
+            Ok(Some(9))
+        })
+        .unwrap();
+    assert_eq!(remapped.format(), history.format());
+    assert_eq!(remapped.fragment_bitmap(), history.fragment_bitmap());
+    let records: Vec<_> = history.records().cloned().collect();
+    let remapped_records: Vec<_> = remapped.records().cloned().collect();
+    assert_eq!(records.len(), remapped_records.len());
+    for (record, remapped) in records.into_iter().zip(remapped_records) {
+        let expected = match record {
+            Record::Transition(mut transition) => {
+                if let Some(pb::transition::Mapping::StablePartition(partition)) =
+                    &mut transition.mapping
+                {
+                    partition.base_id = Some(9);
+                }
+                Record::Transition(transition)
+            }
+            other => other,
+        };
+        assert_eq!(remapped, expected);
     }
 }

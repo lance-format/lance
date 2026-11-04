@@ -119,7 +119,8 @@ impl<'a> FriPolicy<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+    use crate::feature_flags::{FLAG_FRAGMENT_REUSE_INDEX, FLAG_STABLE_ROW_IDS};
+    use crate::system_index::frag_reuse::history::tests::{MAP_A, partition};
 
     fn entry(index_version: i32) -> IndexMetadata {
         IndexMetadata {
@@ -191,5 +192,60 @@ mod tests {
         FriPolicy::new(&flagged, &[])
             .require_rewrite_allowed(false)
             .unwrap();
+    }
+
+    /// The table records tagged history once it is tagged, or for a rewrite
+    /// only the tagged format can hold; a table with stable row ids never
+    /// does.
+    #[test]
+    fn recording_history_picks_the_format_a_rewrite_is_recorded_in() {
+        let ordered = RewriteRecord::new(1, vec![]);
+        let stable_partition = RewriteRecord::new(1, vec![partition(0, 1, MAP_A)]);
+        let format = |manifest: &Manifest, rewrite: &RewriteRecord| {
+            FriPolicy::new(manifest, &[])
+                .recording_history(None, rewrite)
+                .map(|history| history.format())
+        };
+
+        let untagged = manifest(false);
+        assert_eq!(format(&untagged, &ordered).unwrap(), HistoryFormat::Legacy);
+        assert_eq!(
+            format(&untagged, &stable_partition).unwrap(),
+            HistoryFormat::Tagged
+        );
+        let flagged = manifest(true);
+        assert_eq!(format(&flagged, &ordered).unwrap(), HistoryFormat::Tagged);
+        // A legacy entry under the sticky flag is lifted.
+        let lifted = FriPolicy::new(&flagged, &[])
+            .recording_history(
+                Some(FragReuseHistory::empty(HistoryFormat::Legacy)),
+                &ordered,
+            )
+            .unwrap();
+        assert_eq!(lifted.format(), HistoryFormat::Tagged);
+
+        let mut stable_row_ids = manifest(false);
+        stable_row_ids.reader_feature_flags |= FLAG_STABLE_ROW_IDS;
+        let history = FriPolicy::new(&stable_row_ids, &[])
+            .recording_history(None, &ordered)
+            .unwrap();
+        assert_eq!(history.format(), HistoryFormat::Legacy);
+        FriPolicy::new(&stable_row_ids, &[])
+            .require_recording_allowed()
+            .unwrap();
+        for result in [
+            history.lift().map(|_| ()),
+            format(&stable_row_ids, &stable_partition).map(|_| ()),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains("stable-row-id"), "{error}");
+        }
+        stable_row_ids.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        let error = FriPolicy::new(&stable_row_ids, &[])
+            .require_recording_allowed()
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("tagged"), "{error}");
     }
 }
