@@ -18,39 +18,17 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Built-in scalar index kinds that apply fragment reuse translation through
-/// the deprecated loaders rather than a
-/// [`RemappingIndexLoader`](lance_index::scalar::registry::RemappingIndexLoader).
-/// A kind leaves this list when it implements one.
-const DEPRECATED_LOADER_BUILTINS: &[&str] = &["FmIndexDetails"];
-
 /// Whether this build translates the row addresses of scalar segments with
 /// `details`: `None` when no plugin reads them.
 ///
-/// A plugin translates when it implements a remapping loader. Built-in
-/// kinds not yet on one keep their existing support: every one under a
-/// version 0 history (`is_tagged` false), the ones with a batch loader under
-/// a tagged history. A plugin outside the build that implements only the
-/// deprecated loaders does not translate, under either format.
-pub(super) fn scalar_plugin_translates(
-    details: &prost_types::Any,
-    is_tagged: bool,
-) -> Option<bool> {
+/// A plugin translates when it implements a remapping loader. One that
+/// implements only the deprecated loaders does not, under any history
+/// format.
+pub(super) fn scalar_plugin_translates(details: &prost_types::Any) -> Option<bool> {
     let plugin = super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
         .ok()?;
-    if plugin.remapping_loader().is_some() {
-        return Some(true);
-    }
-    let message = details
-        .type_url
-        .rsplit(['/', '.'])
-        .next()
-        .unwrap_or_default();
-    let is_deprecated_builtin = DEPRECATED_LOADER_BUILTINS
-        .iter()
-        .any(|builtin| builtin.eq_ignore_ascii_case(message));
-    Some(is_deprecated_builtin && (!is_tagged || plugin.supports_batch_row_id_remapping()))
+    Some(plugin.remapping_loader().is_some())
 }
 
 /// The source of the row maps `history`'s transitions reference, reading

@@ -111,7 +111,7 @@ async fn segment_supports_batch_remapping(
         ));
     }
     Ok(super::frag_reuse_remapping::scalar_plugin_translates(
-        details, true,
+        details,
     ))
 }
 

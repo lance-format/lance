@@ -773,7 +773,7 @@ pub(crate) async fn exclude_untranslatable_v0_segments(
         !lance_table::system_index::is_system_index(index)
             && !super::segment::segment_has_vector_details(index)
             && index.index_details.as_ref().is_some_and(|details| {
-                super::frag_reuse_remapping::scalar_plugin_translates(details, false) == Some(false)
+                super::frag_reuse_remapping::scalar_plugin_translates(details) == Some(false)
             })
     };
     if !indices.iter().any(untranslatable) {

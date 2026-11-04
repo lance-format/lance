@@ -33,6 +33,7 @@ use rstest::rstest;
 use super::bitmap::BitmapIndexPlugin;
 use super::bloomfilter::BloomFilterIndexPlugin;
 use super::btree::BTreeIndexPlugin;
+use super::fmindex::FMIndexPlugin;
 use super::inverted::InvertedIndexPlugin;
 use super::json::{JsonIndexPlugin, JsonQuery};
 use super::label_list::LabelListIndexPlugin;
@@ -201,6 +202,16 @@ fn ngram() -> Case {
     }
 }
 
+fn fm() -> Case {
+    Case {
+        plugin: Arc::new(FMIndexPlugin),
+        params: "{}",
+        fragment_ids: None,
+        data_type: DataType::Utf8,
+        query: |value| Box::new(TextQuery::StringContains(text(value))),
+    }
+}
+
 fn inverted() -> Case {
     Case {
         plugin: Arc::new(InvertedIndexPlugin),
@@ -333,6 +344,7 @@ async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTre
 #[case::inverted(inverted())]
 #[case::label_list(label_list())]
 #[case::json(json())]
+#[case::fm(fm())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -378,6 +390,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[case::inverted(inverted())]
 #[case::label_list(label_list())]
 #[case::json(json())]
+#[case::fm(fm())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();
