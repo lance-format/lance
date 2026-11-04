@@ -53,6 +53,10 @@ impl std::fmt::Debug for RowMapMappingSource {
 }
 
 impl RowMapMappingSource {
+    /// A source reading through `stores` and caching in `cache`, which it
+    /// holds weakly: once the cache is dropped, reads still work, uncached.
+    /// `stores` must resolve every base the history's row maps reference; a
+    /// base it cannot resolve fails the reads that need it.
     pub fn new(stores: Arc<BaseResolver>, cache: WeakLanceCache) -> Self {
         Self {
             stores,

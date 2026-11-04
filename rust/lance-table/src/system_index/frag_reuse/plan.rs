@@ -174,16 +174,16 @@ impl TranslationPlan {
         self.history.clone().bind(self, mappings)
     }
 
-    /// The live fragments the segment answers for. Transitional: the lance
-    /// crate builds its translator from this until translation is bound
-    /// through the plan.
+    /// The live fragments the segment answers for: its coverage in the
+    /// index listing. A reader also uses it to tell why a translated segment
+    /// answers for nothing.
     pub fn coverage(&self) -> &RoaringBitmap {
         &self.coverage
     }
 
     /// Fragments other segments of the same index cover directly: a
-    /// translated path entering one of them is dropped. Transitional, as
-    /// [`Self::coverage`].
+    /// translated path entering one of them is dropped. Exposed so a reader
+    /// caching plans can size them.
     pub fn excluded_fragments(&self) -> &RoaringBitmap {
         &self.excluded_fragments
     }
@@ -197,7 +197,6 @@ impl TranslationPlan {
     /// The translation identity: a hash of everything that decides the
     /// translated output, so cached objects that embed translated addresses
     /// can be keyed by it and go cold only when that state changes.
-    /// Transitional, as [`Self::coverage`].
     pub fn fingerprint(&self) -> &[u8; 32] {
         &self.fingerprint
     }

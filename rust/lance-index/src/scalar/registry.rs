@@ -206,9 +206,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// addresses implements [`remapping_loader`](Self::remapping_loader)
     /// instead, and Lance then opens its segments through that loader, not
     /// this method. Lance passes `Some` here only to a plugin without a
-    /// remapping loader, for a segment opened directly under a version 0
-    /// fragment reuse index (such segments are left out of query listings).
-    /// The parameter stays in the signature so existing plugins compile.
+    /// remapping loader, for a segment opened while the table has a version
+    /// 0 fragment reuse index. Query listings keep such a segment only when
+    /// the history moves none of its rows (it was built after every rewrite
+    /// it covers); `DatasetIndexInternalExt::open_scalar_index` opens one by
+    /// uuid whether listed or not. The parameter stays in the signature so
+    /// existing plugins compile.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -559,22 +562,29 @@ pub trait RemappingIndexLoader: Send + Sync {
     /// [`load_remapped`](Self::load_remapped) with the same `remapper`) only
     /// on a miss.
     ///
-    /// The caller namespaces `cache` per segment and per translation state,
-    /// so everything cached under it was loaded with an equivalent remapper.
-    /// An index rebuilt from cached state must still be given `remapper`:
-    /// only this one belongs to the current request.
+    /// The caller namespaces `cache` per segment and per translation (the
+    /// translation plan's fingerprint), so every remapper handed in under
+    /// one namespace translates every address the same way. What is specific
+    /// to a request is only the storage the remapper reads row maps through:
+    /// the stores of the request's dataset. An index rebuilt from cached
+    /// state takes `remapper`, so it reads through those.
     ///
-    /// The default caches the live index bound to `index_store`, reloading
-    /// when a request arrives with a different storage binding, and coalesces
-    /// concurrent cold opens. Plugins with a serializable form override it,
-    /// for example with [`single_flight_open`].
+    /// The default instead caches the live index bound to `index_store`,
+    /// with the remapper it was loaded with, and coalesces concurrent cold
+    /// opens. Serving it is sound: its remapper translates as this request's
+    /// would, and the index is reloaded with this request's remapper
+    /// whenever the request arrives with a different storage binding.
+    /// Plugins with a serializable form override it, for example with
+    /// [`single_flight_open`].
     async fn get_or_insert_remapped_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _remapper: Option<Remapper>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
+        // `load` already holds an equivalent remapper.
+        let _ = remapper;
         single_flight_store_bound_open(index_store, cache, load, |_| async { Ok(None) }).await
     }
 }
