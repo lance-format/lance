@@ -14,6 +14,7 @@ DirectoryNamespace and RestNamespace implementations.
 import json
 import tempfile
 import threading
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import lance.namespace
@@ -35,6 +36,7 @@ from lance_namespace import (
     RefreshMaterializedViewRequest,
     RegisterTableRequest,
     TableExistsRequest,
+    ThrottlingError,
     connect,
 )
 from pydantic import ConfigDict
@@ -926,11 +928,14 @@ class TestBackfillAndRefreshExtraOptions:
 class _ThrottlingHandler(BaseHTTPRequestHandler):
     """Answers every GET with a spec-shaped throttling error."""
 
+    retry_after: str | None = "2"
+
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
         body = json.dumps({"code": 21, "error": "Too many requests"}).encode()
         self.send_response(429)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Retry-After", "2")
+        if self.retry_after is not None:
+            self.send_header("Retry-After", self.retry_after)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -940,8 +945,13 @@ class _ThrottlingHandler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def throttling_server():
-    server = HTTPServer(("127.0.0.1", 0), _ThrottlingHandler)
+def throttling_server(request):
+    handler = type(
+        "_ConfiguredThrottlingHandler",
+        (_ThrottlingHandler,),
+        {"retry_after": request.param},
+    )
+    server = HTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -951,14 +961,17 @@ def throttling_server():
         thread.join()
 
 
-def test_throttling_error_exposes_retry_after(throttling_server):
+@pytest.mark.parametrize(
+    ("throttling_server", "expected_retry_after"),
+    [("2", timedelta(seconds=2)), (None, None)],
+    indirect=["throttling_server"],
+)
+def test_throttling_error_exposes_retry_after(throttling_server, expected_retry_after):
     client = connect(
         "rest", {"uri": f"http://127.0.0.1:{throttling_server.server_port}"}
     )
 
-    with pytest.raises(Exception) as exc_info:
+    with pytest.raises(ThrottlingError) as exc_info:
         client.list_namespaces(ListNamespacesRequest(id=["parent"]))
 
-    error = exc_info.value
-    assert type(error).__name__ == "ThrottlingError"
-    assert error.retry_after == 2.0
+    assert exc_info.value.retry_after == expected_retry_after
