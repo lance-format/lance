@@ -68,6 +68,29 @@ impl BatchRowIdRemapper for RemapperAsBatch {
     }
 }
 
+/// The translation of every row address in `addrs` through `remapper`,
+/// without the ones that translate to `None`.
+///
+/// A posting can hold millions of addresses, so they are translated in
+/// batches of at most `BATCH_SIZE` to bound the temporary buffer.
+pub async fn translate_treemap(
+    remapper: &Remapper,
+    addrs: &RoaringTreemap,
+) -> Result<RoaringTreemap> {
+    let mut translated = RoaringTreemap::new();
+    let mut iter = addrs.iter();
+    let mut batch: Vec<Option<u64>> = Vec::with_capacity(BATCH_SIZE.min(addrs.len() as usize));
+    loop {
+        batch.clear();
+        batch.extend(iter.by_ref().take(BATCH_SIZE).map(Some));
+        if batch.is_empty() {
+            return Ok(translated);
+        }
+        remapper.translate_in_place(&mut batch).await?;
+        translated.extend(batch.iter().filter_map(|addr| *addr));
+    }
+}
+
 /// Translate the row addresses in column `addr_idx` of `batch` through
 /// `remapper`, as one batch, and drop the rows whose address translates to
 /// `None`. A null address is dropped too: it names no row.

@@ -31,9 +31,10 @@ use super::bitmap::BitmapIndexPlugin;
 use super::bloomfilter::BloomFilterIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::lance_format::LanceIndexStore;
+use super::ngram::NGramIndexPlugin;
 use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
 use super::zonemap::ZoneMapIndexPlugin;
-use super::{AnyQuery, BloomFilterQuery, Remapper, SargableQuery, ScalarIndex};
+use super::{AnyQuery, BloomFilterQuery, Remapper, SargableQuery, ScalarIndex, TextQuery};
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
 
@@ -167,6 +168,16 @@ fn bloomfilter() -> Case {
     }
 }
 
+fn ngram() -> Case {
+    Case {
+        plugin: Arc::new(NGramIndexPlugin),
+        params: "{}",
+        fragment_ids: Some(vec![0, 2]),
+        data_type: DataType::Utf8,
+        query: |value| Box::new(TextQuery::StringContains(text(value))),
+    }
+}
+
 /// An index of `case`'s kind over [`rows`], loaded through its remapping
 /// loader with `remapper`.
 async fn load(
@@ -252,6 +263,7 @@ async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTre
 #[case::bitmap(bitmap())]
 #[case::zonemap(zonemap())]
 #[case::bloomfilter(bloomfilter())]
+#[case::ngram(ngram())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -293,6 +305,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[case::bitmap(bitmap())]
 #[case::zonemap(zonemap())]
 #[case::bloomfilter(bloomfilter())]
+#[case::ngram(ngram())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();

@@ -4,7 +4,9 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_roaring_tree_map_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, DeprecatedRemapper, Remapper, translate_treemap,
+};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -25,8 +27,8 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, RemappingIndexLoader, ScalarIndexPlugin,
+    TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -254,27 +256,13 @@ impl CacheKey for NGramPostingListKey {
 }
 
 impl NGramPostingList {
-    fn try_from_batch(
-        batch: RecordBatch,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
+    async fn try_from_batch(batch: RecordBatch, remapper: Option<&Remapper>) -> Result<Self> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
         let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
             .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
-        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
+        if let Some(remapper) = remapper {
+            bitmap = translate_treemap(remapper, &bitmap).await?;
         }
-        Ok(Self { bitmap })
-    }
-
-    async fn try_from_batch_with_remapping(
-        batch: RecordBatch,
-        remapper: Arc<dyn BatchRowIdRemapper>,
-    ) -> Result<Self> {
-        let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
-            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
-        let bitmap = remap_row_ids_roaring_tree_map_async(remapper.as_ref(), &bitmap).await?;
         Ok(Self { bitmap })
     }
 
@@ -294,11 +282,9 @@ impl NGramPostingList {
 /// Reads on-demand ngram posting lists from storage (and stores them in a cache)
 struct NGramPostingListReader {
     reader: Arc<dyn IndexReader>,
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates the posting lists' row addresses; `None` when they are
+    /// current.
+    remapper: Option<Remapper>,
     index_cache: WeakLanceCache,
 }
 
@@ -331,13 +317,7 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                if let Some(remapper) = self.batch_remapper.clone() {
-                    // Tagged asynchronous path.
-                    NGramPostingList::try_from_batch_with_remapping(batch, remapper).await
-                } else {
-                    // Legacy synchronous remapping path.
-                    NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
-                }
+                NGramPostingList::try_from_batch(batch, self.remapper.as_ref()).await
         }).await;
         match &result {
             Ok((_, true)) => metrics.record_index_cache_hit(),
@@ -394,7 +374,7 @@ impl DeepSizeOf for NGramIndex {
 impl NGramIndex {
     async fn from_store(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
     ) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
@@ -415,8 +395,7 @@ impl NGramIndex {
 
         let posting_reader = Arc::new(NGramPostingListReader {
             reader: store.open_index_file(POSTINGS_FILENAME).await?,
-            frag_reuse_index,
-            batch_remapper: None,
+            remapper,
             index_cache: WeakLanceCache::from(index_cache),
         });
 
@@ -478,37 +457,15 @@ impl NGramIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
     {
         Ok(Arc::new(
-            Self::from_store(store, frag_reuse_index, index_cache).await?,
+            Self::from_store(store, remapper, index_cache).await?,
         ))
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let mut index = Self::from_store(store, None, index_cache).await?;
-        index.list_reader = Arc::new(NGramPostingListReader {
-            reader: index.list_reader.reader.clone(),
-            frag_reuse_index: None,
-            batch_remapper: remapping,
-            index_cache: WeakLanceCache::from(index_cache),
-        });
-        debug_assert!(
-            index.list_reader.frag_reuse_index.is_none()
-                || index.list_reader.batch_remapper.is_none()
-        );
-        Ok(Arc::new(index))
     }
 
     /// Merge several built NGram segments (and optional new data) into a single
@@ -1972,13 +1929,25 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_details: &prost_types::Any,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(NGramIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
+        self.load_remapped(
+            index_store,
+            index_details,
+            index_version,
+            DeprecatedRemapper::sync(frag_reuse_index),
+            cache,
+        )
+        .await
     }
+
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
+    }
+
     fn supports_batch_row_id_remapping(&self) -> bool {
         true
     }
@@ -1986,12 +1955,33 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     async fn load_index_with_remapping(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
+        index_details: &prost_types::Any,
+        index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(NGramIndex::load_with_remapping(index_store, remapping, cache).await?)
+        self.load_remapped(
+            index_store,
+            index_details,
+            index_version,
+            DeprecatedRemapper::batch(remapping),
+            cache,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl RemappingIndexLoader for NGramIndexPlugin {
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(NGramIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
     }
 }
 

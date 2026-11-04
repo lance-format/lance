@@ -28,7 +28,6 @@ const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
     "JsonIndexDetails",
     "LabelListIndexDetails",
     "MinHashLshIndexDetails",
-    "NGramIndexDetails",
     "RTreeIndexDetails",
 ];
 
