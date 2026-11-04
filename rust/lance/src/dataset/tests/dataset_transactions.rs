@@ -2833,10 +2833,8 @@ mod composite {
     use futures::stream;
     use lance_core::datatypes::Field as LanceField;
     use lance_index::IndexType;
-    use lance_index::pb::vector_index_details::{
-        Compression, FlatCompression, ProductQuantization, RabitQuantization, ScalarQuantization,
-    };
-    use lance_index::pb::{HnswParameters, VectorIndexDetails, VectorMetricType};
+    use lance_index::pb::vector_index_details::{Compression, FlatCompression};
+    use lance_index::pb::{VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
     use lance_table::format::{
@@ -4624,78 +4622,67 @@ mod composite {
         assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
     }
 
-    /// `lance-table` reads the query contract out of `VectorIndexDetails`
-    /// through a mirror of the message, since the generated type lives in
-    /// `lance-index`. Encoding with the generated type keeps the two in step.
+    /// Concurrent writers extending one index must agree on its details byte
+    /// for byte, since `lance-table` cannot tell which ones matter to a query.
+    /// A training knob chosen per build is enough to conflict.
     #[rstest::rstest]
-    #[case::sub_index(true, Compression::Flat(FlatCompression {}), Some("sub-index"))]
-    #[case::quantization(
-        false,
-        Compression::Pq(ProductQuantization { num_bits: 8, num_sub_vectors: 4 }),
-        Some("quantization Product")
-    )]
-    #[case::scalar(false, Compression::Sq(ScalarQuantization { num_bits: 8 }), Some("Scalar"))]
-    #[case::rabit(
-        false,
-        Compression::Rq(RabitQuantization { num_bits: 1, rotation_type: 0 }),
-        Some("Rabit")
-    )]
-    #[case::same_contract(false, Compression::Flat(FlatCompression {}), None)]
+    #[case::identical_details(1024, false)]
+    #[case::different_target_partition_size(4096, true)]
     #[tokio::test]
-    async fn test_the_vector_query_contract_reads_the_generated_details(
-        #[case] hnsw: bool,
-        #[case] compression: Compression,
-        #[case] rejected_for: Option<&str>,
+    async fn test_concurrent_segments_of_one_index_must_share_details(
+        #[case] their_target_partition_size: u64,
+        #[case] conflicts: bool,
     ) {
-        let details = |hnsw: bool, compression: Compression, target_partition_size: u64| {
+        let details = |target_partition_size: u64| {
             Some(Arc::new(
                 prost_types::Any::from_msg(&VectorIndexDetails {
                     metric_type: VectorMetricType::L2.into(),
                     target_partition_size,
-                    hnsw_index_config: hnsw.then(HnswParameters::default),
-                    compression: Some(compression),
+                    hnsw_index_config: None,
+                    compression: Some(Compression::Flat(FlatCompression {})),
                     runtime_hints: Default::default(),
                 })
                 .unwrap(),
             ))
         };
         let dataset = test_dataset(false).await;
-        let dataset = commit(
+        let stale = Arc::new(dataset.clone());
+        commit(
             dataset,
             vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(false, Compression::Flat(FlatCompression {}), 1024),
+                index_details: details(1024),
                 ..index_segment("shared", vec![Ref::Committed(0)])
             })],
         )
         .await;
 
-        let result = try_commit(
-            dataset,
+        let result = commit_from_stale(
+            stale,
             vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(hnsw, compression, 4096),
+                index_details: details(their_target_partition_size),
                 ..index_segment("shared", vec![Ref::Committed(1)])
             })],
         )
         .await;
 
-        match rejected_for {
-            None => {
-                result.unwrap();
-            }
-            Some(reason) => {
-                let error = result.unwrap_err();
-                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-                assert!(error.to_string().contains(reason), "{error}");
-            }
+        if conflicts {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            );
+        } else {
+            result.unwrap();
         }
     }
 
     /// Two vector segments under one name are unioned by the query path, so
-    /// they must answer the same query contract. An L2 segment beside a Dot
-    /// segment would rank one half of the dataset by the wrong distance.
-    /// Independently trained models are fine; the metric is not.
+    /// an L2 segment beside a Dot segment would rank one half of the dataset by
+    /// the wrong distance. Concurrent writers conflict on the differing
+    /// details, so the loser retries against the version holding the L2
+    /// segment, where the segment commit API refuses the Dot one.
     #[tokio::test]
-    async fn test_vector_segments_with_different_metrics_cannot_share_an_index() {
+    async fn test_vector_segments_with_different_metrics_cannot_join_one_index() {
         use crate::index::vector::VectorIndexParams;
         use arrow_array::{Array, FixedSizeListArray, Float32Array};
         use lance_arrow::FixedSizeListArrayExt;
@@ -4773,13 +4760,14 @@ mod composite {
             "{error:?}"
         );
 
-        // Sequentially: the second writer built from the version with the L2
-        // segment, so only the final segment set can catch it.
+        // Sequentially, from the version holding the L2 segment. A raw action
+        // commit is not checked here, as on main:
+        // https://github.com/lance-format/lance/issues/10728
         let dot = build(&mut dataset, 1, DistanceType::Dot).await;
-        let error = try_commit(dataset, vec![add_built_segment(dot)])
+        let error = dataset
+            .commit_existing_index_segments("shared", "vector", vec![dot])
             .await
             .expect_err("a Dot segment cannot join an L2 index");
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("metric"), "{error}");
     }
 }

@@ -16,12 +16,12 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison.
 
-use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
 use lance_core::datatypes::{Field, Schema};
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// One thing an action set writes.
@@ -338,22 +338,19 @@ struct IndexClaim {
 /// What an index is, for the purpose of deciding whether two writers are
 /// building the same one.
 ///
-/// The same rule the apply-time segment check uses: keyed fields, carried
-/// fields, the index type, and the query contract that type defines. The rest
-/// of the details payload and the index version are left out, because segments
-/// of one index may legitimately differ in both -- independently trained, or
-/// built by a newer library.
+/// Keyed fields, carried fields, and the index details compared byte for byte.
+/// `lance-table` cannot tell which details matter to a query, so any
+/// difference counts; a conflict is only a retry, so being strict costs
+/// little. The apply-time segment check is looser, since its rejections are
+/// permanent. The index version is left out: a newer library may write
+/// segments of the same index.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct IndexIdentity {
     pub fields: Vec<FieldRef>,
     /// Which of `fields` are merely carried: two writers that disagree about
     /// this disagree about what the index answers for, not just what it holds.
     pub covering_fields: Vec<FieldRef>,
-    /// The type url of the segment's index details, or `None` when it has none.
-    pub type_url: Option<String>,
-    /// What a query against the index expects of every segment, or `None` for
-    /// an index type that defines no contract.
-    pub query_contract: Option<QueryContract>,
+    pub index_details: Option<Arc<prost_types::Any>>,
 }
 
 impl IndexClaim {

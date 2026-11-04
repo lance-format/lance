@@ -89,7 +89,6 @@ mod drop_field;
 mod drop_index;
 mod footprint;
 mod proto;
-mod query_contract;
 mod remove_fragment;
 mod remove_index_segment;
 mod reserve_fragment_ids;

@@ -6,7 +6,6 @@
 use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
-use super::query_contract::QueryContract;
 use super::{FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
@@ -271,11 +270,7 @@ impl AddIndexSegment {
             IndexIdentity {
                 fields: self.fields.clone(),
                 covering_fields: self.covering_fields.clone(),
-                type_url: self
-                    .index_details
-                    .as_ref()
-                    .map(|details| details.type_url.clone()),
-                query_contract: QueryContract::of(self.index_details.as_deref()),
+                index_details: self.index_details.clone(),
             },
             self.covered_fragments.clone(),
         );
@@ -430,7 +425,6 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
 mod tests {
     use super::*;
     use crate::format::{BasePath, DataFile};
-    use crate::transaction::action::query_contract::tests::{DOT, L2, vector_details};
     use crate::transaction::action::test_support::{
         added_field, apply_with_indices, backed_manifest, footprint, nested_schema,
         replace_field_data,
@@ -741,26 +735,18 @@ mod tests {
         manifest
     }
 
-    fn vector(
-        metric: i32,
-        hnsw: bool,
-        compression: &str,
-        target_partition_size: u64,
-    ) -> Option<Arc<prost_types::Any>> {
-        Some(Arc::new(vector_details(
-            metric,
-            hnsw,
-            Some(compression),
-            target_partition_size,
-        )))
+    fn type_url(url: &str) -> Option<Arc<prost_types::Any>> {
+        details(url, Vec::new())
     }
 
-    fn type_url(url: &str) -> Option<Arc<prost_types::Any>> {
+    fn details(url: &str, value: Vec<u8>) -> Option<Arc<prost_types::Any>> {
         Some(Arc::new(prost_types::Any {
             type_url: url.into(),
-            value: Vec::new(),
+            value,
         }))
     }
+
+    const VECTOR_DETAILS: &str = "type.googleapis.com/lance.index.pb.VectorIndexDetails";
 
     /// The query path unions a logical index's segments, so they have to agree
     /// on what the index is and not describe a fragment twice.
@@ -783,6 +769,13 @@ mod tests {
     )]
     #[case::compatible_and_disjoint(
         |_: &mut AddIndexSegment| {},
+        None
+    )]
+    // Rejections here are permanent, and segments of one index legitimately
+    // differ in details: a per-build training knob, say, or a different metric
+    // that only the query path can judge.
+    #[case::different_details_payload(
+        |added: &mut AddIndexSegment| added.index_details = details("btree.Details", vec![1, 2]),
         None
     )]
     fn test_a_segment_must_be_compatible_with_the_rest_of_its_index(
@@ -822,71 +815,6 @@ mod tests {
                 assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
                 let message = error.to_string();
                 assert!(message.contains("shared"), "{message}");
-                assert!(message.contains(reason), "{message}");
-            }
-        }
-    }
-
-    /// Vector segments under one name are searched together, so they must
-    /// agree on what a query computes. Whether the other segment is already
-    /// committed or added by the same operation makes no difference.
-    #[rstest]
-    #[case::metric(vector(DOT, false, "flat", 0), Some("metric Dot"))]
-    #[case::sub_index(vector(L2, true, "flat", 0), Some("sub-index HNSW"))]
-    #[case::quantization(vector(L2, false, "sq", 0), Some("quantization Scalar"))]
-    #[case::undecodable_details(
-        Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.index.pb.VectorIndexDetails".into(),
-            value: vec![0xff, 0xff],
-        })),
-        Some("index details")
-    )]
-    #[case::trained_independently(vector(L2, false, "flat", 4096), None)]
-    fn test_vector_segments_must_answer_the_same_query(
-        #[case] details: Option<Arc<prost_types::Any>>,
-        #[case] rejected_for: Option<&str>,
-        #[values(false, true)] same_operation: bool,
-    ) {
-        let first = AddIndexSegment {
-            index_details: vector(L2, false, "flat", 1024),
-            ..segment("shared", vec![FieldRef::Committed(0)])
-        };
-        let second = AddIndexSegment {
-            index_details: details,
-            covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![FieldRef::Committed(0)])
-        };
-        let first_uuid = first.uuid;
-        let second_uuid = second.uuid;
-
-        let manifest = two_fragment_manifest();
-        let result = if same_operation {
-            apply_with_indices(
-                &manifest,
-                vec![
-                    Action::AddIndexSegment(first),
-                    Action::AddIndexSegment(second),
-                ],
-                Vec::new(),
-            )
-        } else {
-            let (next, indices) =
-                apply_with_indices(&manifest, vec![Action::AddIndexSegment(first)], Vec::new())
-                    .unwrap();
-            apply_with_indices(&next, vec![Action::AddIndexSegment(second)], indices)
-        };
-
-        match rejected_for {
-            None => {
-                result.unwrap();
-            }
-            Some(reason) => {
-                let error = result.unwrap_err();
-                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-                let message = error.to_string();
-                assert!(message.contains("shared"), "{message}");
-                assert!(message.contains(&first_uuid.to_string()), "{message}");
-                assert!(message.contains(&second_uuid.to_string()), "{message}");
                 assert!(message.contains(reason), "{message}");
             }
         }
@@ -1656,33 +1584,21 @@ mod tests {
         AddIndexSegment { index_details: type_url("bitmap.Details"), ..covering("by_a", Some(vec![2])) },
         true,
     )]
-    #[case::vector_segments_under_different_metrics(
-        AddIndexSegment { index_details: vector(L2, false, "flat", 0), ..covering("by_a", Some(vec![0])) },
-        AddIndexSegment { index_details: vector(DOT, false, "flat", 0), ..covering("by_a", Some(vec![2])) },
+    // Only the bytes are compared: a training knob is as much a disagreement
+    // as the metric, since `lance-table` cannot tell which details matter.
+    #[case::details_differing_in_any_byte(
+        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]), ..covering("by_a", Some(vec![0])) },
+        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 2]), ..covering("by_a", Some(vec![2])) },
         true,
     )]
-    #[case::vector_segments_trained_independently(
+    // A newer library may write segments of the same index.
+    #[case::differing_only_in_index_version(
         AddIndexSegment {
             index_version: 2,
-            index_details: vector(L2, true, "pq", 1024),
+            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
             ..covering("by_a", Some(vec![0]))
         },
-        AddIndexSegment { index_details: vector(L2, true, "pq", 4096), ..covering("by_a", Some(vec![2])) },
-        false,
-    )]
-    // Same rule as the apply-time segment check: beyond the query contract,
-    // the details payload and the index version may differ between segments
-    // of one index, for instance across a library upgrade.
-    #[case::differing_only_in_index_version_and_details_payload(
-        AddIndexSegment {
-            index_version: 2,
-            index_details: Some(Arc::new(prost_types::Any {
-                type_url: "btree.Details".into(),
-                value: vec![1, 2, 3],
-            })),
-            ..covering("by_a", Some(vec![0]))
-        },
-        AddIndexSegment { index_details: type_url("btree.Details"), ..covering("by_a", Some(vec![2])) },
+        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]), ..covering("by_a", Some(vec![2])) },
         false,
     )]
     fn test_two_writers_extending_one_index(
