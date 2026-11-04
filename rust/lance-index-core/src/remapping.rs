@@ -24,6 +24,12 @@ use roaring::RoaringTreemap;
 use crate::scalar::RowIdRemapper;
 
 /// Translates a bounded batch of row IDs, allowing encodings to read external data.
+///
+/// Deprecated for loading indices: a plugin translates through the
+/// [`Remapper`] its `RemappingIndexLoader` is handed, and
+/// `ScalarIndexPlugin::load_index_with_remapping`, which took this trait, is
+/// deprecated. The trait itself is not marked `#[deprecated]` yet because
+/// index rewrites (`remap_streaming`, [`materialize_remap`]) still take it.
 #[async_trait]
 pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     /// Results correspond to input positions, including duplicates. `None` removes a row.

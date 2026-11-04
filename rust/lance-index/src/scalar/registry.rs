@@ -201,6 +201,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// (e.g. which domain a stored row identifier is in) uses it to read an
     /// older segment correctly instead of reinterpreting it under the newest
     /// format.
+    ///
+    /// `frag_reuse_index` is deprecated: a plugin that translates row
+    /// addresses implements [`remapping_loader`](Self::remapping_loader)
+    /// instead, and Lance then opens its segments through that loader, not
+    /// this method. Lance passes `Some` here only to a plugin without a
+    /// remapping loader, for a segment opened directly under a version 0
+    /// fragment reuse index (such segments are left out of query listings).
+    /// The parameter stays in the signature so existing plugins compile.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -235,6 +243,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// Returning `true` requires overriding
     /// [`load_index_with_remapping`](Self::load_index_with_remapping).
+    #[deprecated(
+        since = "15.0.0",
+        note = "implement `remapping_loader` instead; Lance no longer loads through \
+                `load_index_with_remapping`"
+    )]
     fn supports_batch_row_id_remapping(&self) -> bool {
         false
     }
@@ -243,6 +256,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// This entry point is additive; the legacy [`load_index`](Self::load_index)
     /// path never routes through it.
+    #[deprecated(
+        since = "15.0.0",
+        note = "implement `remapping_loader`; `RemappingIndexLoader::load_remapped` \
+                translates through a `Remapper`"
+    )]
+    #[allow(deprecated)]
     async fn load_index_with_remapping(
         &self,
         index_store: Arc<dyn IndexStore>,

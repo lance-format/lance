@@ -50,7 +50,8 @@ pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexM
 
 /// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
 /// fragment reuse index on load, so every admitted type needs a query test on
-/// that path.
+/// that path. It is deprecated in favor of `remapping_loader`, but switching
+/// would newly admit FM indices, which have no stable-row-ID query test yet.
 fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     let Some(details) = index.index_details.as_ref() else {
         return Some("a legacy index without type details, which stores stable row IDs".into());
@@ -80,6 +81,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
             "a {display_type} index, which stores stable row IDs"
         ));
     }
+    #[allow(deprecated)]
     let applies_frag_reuse = details
         .get_plugin()
         .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping());

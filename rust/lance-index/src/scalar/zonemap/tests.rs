@@ -10,7 +10,7 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
 use std::sync::Arc;
 
-use crate::scalar::registry::ScalarIndexPlugin;
+use crate::scalar::registry::{RemappingIndexLoader, ScalarIndexPlugin};
 use crate::scalar::zoned::ZoneBound;
 use crate::scalar::zonemap::{
     CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
@@ -5505,7 +5505,7 @@ async fn test_unsupported_index_version_is_refused() {
         .unwrap_err();
     assert!(matches!(err, Error::NotSupported { .. }), "{err}");
     let err = ZoneMapIndexPlugin
-        .load_index_with_remapping(
+        .load_remapped(
             index.store.clone(),
             &details,
             2,

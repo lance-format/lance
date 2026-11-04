@@ -904,6 +904,13 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
 /// This decouples scalar index plugins from the table-level frag reuse index type.
 /// The frag reuse index implements this trait, but callers may also supply custom
 /// implementations for testing or other remapping strategies.
+///
+/// Deprecated for loading indices: a plugin translates row addresses through
+/// the [`Remapper`](crate::remapping::Remapper) its
+/// `RemappingIndexLoader` is handed (see `ScalarIndexPlugin::remapping_loader`
+/// in `lance-index`). The trait is not marked `#[deprecated]` because the
+/// required `ScalarIndexPlugin::load_index` names it in its signature, so
+/// every plugin would have to silence the warning.
 pub trait RowIdRemapper: Send + Sync + std::fmt::Debug {
     /// Remap a single row id.  Returns `None` if the row was deleted.
     fn remap_row_id(&self, row_id: u64) -> Option<u64>;
