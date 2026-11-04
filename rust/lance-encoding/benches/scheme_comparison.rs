@@ -11,7 +11,7 @@ use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, finalize_miniblock_compressor,
         try_bitpacking_miniblock, try_byte_stream_split_miniblock, try_fixed_u8_rle_miniblock,
-        try_raw_block, try_raw_fixed_width_miniblock, try_raw_per_value,
+        try_pcodec_miniblock, try_raw_block, try_raw_fixed_width_miniblock, try_raw_per_value,
     },
     compression_config::{BssMode, CompressionFieldParams},
     data::DataBlock,
@@ -38,6 +38,8 @@ enum Scheme {
     Zstd,
     /// Flat values wrapped in lz4.
     Lz4,
+    /// pcodec at its default level (floats only).
+    Pcodec,
 }
 
 impl Scheme {
@@ -49,6 +51,7 @@ impl Scheme {
             Self::BssZstd => "bss_zstd",
             Self::Zstd => "zstd",
             Self::Lz4 => "lz4",
+            Self::Pcodec => "pcodec",
         }
     }
 }
@@ -60,9 +63,14 @@ const ALL_SCHEMES: &[Scheme] = &[
     Scheme::BssZstd,
     Scheme::Zstd,
     Scheme::Lz4,
+    Scheme::Pcodec,
 ];
 
-fn compressor_for(scheme: Scheme, data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
+fn compressor_for(
+    scheme: Scheme,
+    field: &LanceField,
+    data: &DataBlock,
+) -> Option<Box<dyn MiniBlockCompressor>> {
     match scheme {
         Scheme::Raw => try_raw_fixed_width_miniblock(data),
         Scheme::Rle => {
@@ -103,6 +111,13 @@ fn compressor_for(scheme: Scheme, data: &DataBlock) -> Option<Box<dyn MiniBlockC
             };
             let inner = try_raw_fixed_width_miniblock(data)?;
             finalize_miniblock_compressor(data, inner, &params).ok()
+        }
+        Scheme::Pcodec => {
+            let params = CompressionFieldParams {
+                compression: Some("pcodec".to_string()),
+                ..Default::default()
+            };
+            try_pcodec_miniblock(field, data, &params).ok().flatten()
         }
     }
 }
@@ -146,10 +161,10 @@ impl CompressionStrategy for SchemeCompressionStrategy {
 
     fn create_miniblock_compressor(
         &self,
-        _field: &LanceField,
+        field: &LanceField,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        compressor_for(self.scheme, data).ok_or_else(|| {
+        compressor_for(self.scheme, field, data).ok_or_else(|| {
             Error::not_supported_source(
                 format!(
                     "scheme {} is not applicable to this data",
@@ -185,6 +200,13 @@ fn corpora() -> Vec<(&'static str, ArrayRef)> {
             "f64_clustered",
             Arc::new(Float64Array::from_iter_values(
                 (0..8192).map(|i| 1.0 + (i % 1000) as f64 * 1e-9),
+            )),
+        ),
+        (
+            // A slowly varying sensor reading, the shape pcodec targets.
+            "f64_signal",
+            Arc::new(Float64Array::from_iter_values(
+                (0..8192).map(|i| (i as f64 * 0.01).sin() * 100.0),
             )),
         ),
         (

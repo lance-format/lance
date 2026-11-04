@@ -39,6 +39,8 @@ bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
 zstd = { version = "0.14", optional = true }
+# The Pcodec spec pins the chunk payload to the format written by pco 1.0.
+pco = { version = "~1.0.4", optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
@@ -57,11 +59,12 @@ prost-build.workspace = true
 protobuf-src = { workspace = true, optional = true }
 
 [features]
-default = ["lz4", "zstd", "bitpacking"]
+default = ["lz4", "zstd", "bitpacking", "pcodec"]
 protoc = ["dep:protobuf-src"]
 bitpacking = ["dep:lance-bitpacking"]
 lz4 = ["dep:lz4"]
 zstd = ["dep:zstd"]
+pcodec = ["dep:pco"]
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
