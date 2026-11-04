@@ -21,8 +21,11 @@
 //! ├── metadata        feature-flag and entry guards for the tagged format
 //! ├── impls (private) one FriImpl per format behind FragReuseHistory
 //! │   ├── legacy        index_version 0
+//! │   │   └── compose     version 0 rewrite of one segment
 //! │   ├── legacy_srid   index_version 0 on a table with stable row IDs
 //! │   ├── tagged        index_version 1
+//! │   │   ├── compose     tagged rewrite of one segment
+//! │   │   └── trim        which records live segments still need
 //! │   └── lift          legacy -> tagged
 //! └── contract_tests  one behavioral contract every format must pass
 //! ```
@@ -41,6 +44,11 @@
 //!   [`plan::TranslationPlan::bind`] takes the caller's
 //!   [`mapping::MappingSource`] and returns the segment's
 //!   [`lance_select::Remapper`].
+//! - Rewriting an index segment after its rows moved (index remap):
+//!   [`history::FragReuseHistory::compose`] returns a [`plan::Composition`].
+//! - Cleaning up: [`history::FragReuseHistory::trim`] drops the records no
+//!   live segment needs, and [`history::FragReuseHistory::referenced_files`]
+//!   lists the row-map files the remaining records reference.
 //! - Changing how one format behaves: its file under `impls`, checked by
 //!   `contract_tests`.
 //!
