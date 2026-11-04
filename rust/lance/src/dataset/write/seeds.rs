@@ -96,7 +96,8 @@ fn supports_zone_write_seeds(data_type: &DataType) -> bool {
     )
 }
 
-pub(crate) fn configured_zone_rows(field: &lance_core::datatypes::Field) -> Result<Option<u64>> {
+/// The validated row count requested by a field's persistent policy.
+pub fn configured_zone_rows(field: &lance_core::datatypes::Field) -> Result<Option<u64>> {
     let Some(value) = field.metadata.get(ZONE_WRITE_SEEDS_ROWS_PER_ZONE_KEY) else {
         return Ok(None);
     };
