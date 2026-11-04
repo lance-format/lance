@@ -18,12 +18,16 @@
 //! siblings.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use lance_select::Remapper;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::history::FragReuseHistory;
+use super::impls::FriImpl;
 use super::ledger::FragReuseLedger;
+use super::mapping::MappingSource;
 
 /// What the identifiers a segment stores refer to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +100,36 @@ pub enum ReadPlan {
 
 /// How one segment's addresses are translated.
 ///
-/// Opaque to readers: they hand it back to the module that translates.
-#[derive(Debug, Clone, PartialEq)]
+/// Opaque to readers: they [`bind`](Self::bind) it to the source of the
+/// history's external mappings and hand the resulting [`Remapper`] to the
+/// segment's index.
+#[derive(Clone)]
 pub struct TranslationPlan {
+    history: Arc<dyn FriImpl>,
     coverage: RoaringBitmap,
     excluded_fragments: RoaringBitmap,
+    stops: RoaringBitmap,
     fingerprint: [u8; 32],
+}
+
+impl PartialEq for TranslationPlan {
+    fn eq(&self, other: &Self) -> bool {
+        self.coverage == other.coverage
+            && self.excluded_fragments == other.excluded_fragments
+            && self.stops == other.stops
+            && self.fingerprint == other.fingerprint
+    }
+}
+
+impl std::fmt::Debug for TranslationPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TranslationPlan")
+            .field("format", &self.history.format())
+            .field("coverage", &self.coverage)
+            .field("excluded_fragments", &self.excluded_fragments)
+            .field("stops", &self.stops)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TranslationPlan {
@@ -109,26 +137,41 @@ impl TranslationPlan {
     /// segment answers for no fragment. Maintenance reads a segment the
     /// reader derives no coverage for through it.
     pub fn empty(history: &FragReuseHistory) -> Self {
-        Self::nothing(history.ledger())
+        Self::nothing(history.imp().clone())
     }
 
-    pub(super) fn nothing(ledger: &FragReuseLedger) -> Self {
+    pub(super) fn nothing(history: Arc<dyn FriImpl>) -> Self {
         let empty = RoaringBitmap::new();
-        Self::new(ledger, empty.clone(), empty, &[])
+        Self::new(history, empty.clone(), empty.clone(), empty, &[])
     }
 
     pub(super) fn new(
-        ledger: &FragReuseLedger,
+        history: Arc<dyn FriImpl>,
         coverage: RoaringBitmap,
         excluded_fragments: RoaringBitmap,
+        stops: RoaringBitmap,
         path: &[usize],
     ) -> Self {
-        let fingerprint = translation_fingerprint(ledger, &coverage, &excluded_fragments, path);
+        let fingerprint = translation_fingerprint(
+            &history.records().ledger,
+            &coverage,
+            &excluded_fragments,
+            path,
+        );
         Self {
+            history,
             coverage,
             excluded_fragments,
+            stops,
             fingerprint,
         }
+    }
+
+    /// The translation an index loads the segment with. `mappings` reads
+    /// the external mappings the plan's path passes through, when the
+    /// history has any, lazily and once per translated batch.
+    pub fn bind(self, mappings: Arc<dyn MappingSource>) -> Remapper {
+        self.history.clone().bind(self, mappings)
     }
 
     /// The live fragments the segment answers for. Transitional: the lance
@@ -143,6 +186,12 @@ impl TranslationPlan {
     /// [`Self::coverage`].
     pub fn excluded_fragments(&self) -> &RoaringBitmap {
         &self.excluded_fragments
+    }
+
+    /// Live fragments the history still records as rewritten: a translated
+    /// path stops at one rather than following the rewrite.
+    pub(super) fn stops(&self) -> &RoaringBitmap {
+        &self.stops
     }
 
     /// The translation identity: a hash of everything that decides the

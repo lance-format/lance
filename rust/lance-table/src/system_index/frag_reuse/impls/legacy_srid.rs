@@ -14,12 +14,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lance_core::{Error, Result};
+use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
 use super::{FriImpl, Records};
 use crate::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
+use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport,
+    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
 };
 
 #[derive(Debug)]
@@ -87,8 +89,9 @@ impl FriImpl for LegacySridHistory {
         true
     }
 
-    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+    fn plan(self: Arc<Self>, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
         self.0
+            .clone()
             .plan(context, group)
             .into_iter()
             .zip(group)
@@ -102,5 +105,9 @@ impl FriImpl for LegacySridHistory {
                 }
             })
             .collect()
+    }
+
+    fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {
+        self.0.bind(plan, mappings)
     }
 }

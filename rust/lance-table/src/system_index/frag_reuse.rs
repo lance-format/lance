@@ -51,10 +51,13 @@ pub mod history;
 mod impls;
 pub mod ledger;
 pub mod lineage;
+pub mod mapping;
 pub mod metadata;
 pub mod plan;
 pub mod policy;
 
+#[doc(hidden)]
+pub use impls::legacy::LegacyRemapper;
 // Version 0 cleanup in `lance` until trim owns it; not part of the stable
 // interface.
 #[doc(hidden)]

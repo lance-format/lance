@@ -6,20 +6,27 @@
 //! expected outcome for that format rather than moving it to a separate
 //! suite.
 
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
+
+use arrow_array::UInt16Array;
 use bytes::Bytes;
+use lance_core::utils::stable_partition::{CountsMatrix, CountsMatrixBuilder};
 use lance_core::{Error, Result};
+use lance_select::Remapper;
 use prost::Message;
 use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use super::history::tests::{
-    MAP_A, Source, address, legacy, ordered, partition, transition_with_unknown_field, translate,
-    unknown_record, whole,
+    MAP_A, Source, address, digest, legacy, ordered, partition, transition_with_unknown_field,
+    translate, unknown_record, whole,
 };
 use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, RewriteRecord,
     length_delimited,
 };
+use super::mapping::{MappingRef, MappingSource};
 use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
 use crate::format::pb::fragment_reuse_index_details as pb;
@@ -734,4 +741,152 @@ fn remap_bases_changes_only_bases(#[case] format: HistoryFormat) {
         };
         assert_eq!(remapped, expected);
     }
+}
+
+/// Row maps held in memory, recording the reads translation makes.
+#[derive(Debug, Default)]
+struct InMemoryMappings {
+    maps: std::collections::HashMap<String, (Arc<CountsMatrix>, UInt16Array)>,
+    reads: Mutex<Vec<Range<u64>>>,
+}
+
+impl InMemoryMappings {
+    /// A row map labelling each source row with `labels` (`None` for a
+    /// deleted row), in blocks of `block_rows`.
+    fn with_map(mut self, map_id: &str, labels: &[Option<u16>], block_rows: u32) -> Self {
+        let destinations = labels.iter().flatten().max().map_or(1, |&max| max + 1);
+        let mut counts = CountsMatrixBuilder::try_new(u32::from(destinations), block_rows).unwrap();
+        for &label in labels {
+            counts.push(label).unwrap();
+        }
+        self.maps.insert(
+            map_id.to_string(),
+            (
+                Arc::new(counts.finish()),
+                UInt16Array::from(labels.to_vec()),
+            ),
+        );
+        self
+    }
+
+    fn take_reads(&self) -> Vec<Range<u64>> {
+        std::mem::take(&mut self.reads.lock().unwrap())
+    }
+}
+
+#[async_trait::async_trait]
+impl MappingSource for InMemoryMappings {
+    async fn counts(&self, mapping: &MappingRef) -> Result<Arc<CountsMatrix>> {
+        Ok(self.maps[mapping.map_id()].0.clone())
+    }
+
+    async fn read(&self, mapping: &MappingRef, rows: Range<u64>) -> Result<UInt16Array> {
+        self.reads.lock().unwrap().push(rows.clone());
+        Ok(self.maps[mapping.map_id()]
+            .1
+            .slice(rows.start as usize, (rows.end - rows.start) as usize))
+    }
+}
+
+/// The remapper a segment over `covered`, built before the rewrite, is
+/// read with.
+fn bound(
+    history: &FragReuseHistory,
+    live: &RoaringBitmap,
+    covered: &[u32],
+    mappings: Arc<InMemoryMappings>,
+) -> Remapper {
+    let context = ReadContext {
+        entry_version: REWRITE_VERSION,
+        live_fragments: live,
+    };
+    let summary = segment(covered, 1, TranslationSupport::Supported);
+    let ReadPlan::Translate(plan) = history
+        .plan(&context, std::slice::from_ref(&summary))
+        .remove(0)
+    else {
+        panic!("a segment built before the rewrite is translated");
+    };
+    plan.bind(mappings)
+}
+
+/// A bound plan moves every address the way the history's lineage does, and
+/// a format whose mappings are decoded never reads one.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::tagged(Reading::Tagged)]
+#[tokio::test]
+async fn bound_plan_translates_through_the_lineage(#[case] reading: Reading) {
+    let (history, live) = rewritten(reading);
+    let mappings = Arc::new(InMemoryMappings::default());
+    let remapper = bound(&history, &live, &[0, 3], mappings.clone());
+
+    let mut addrs = vec![Some(address(0, 0)), Some(address(3, 0)), None];
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    assert_eq!(
+        addrs,
+        vec![
+            translate(history.ledger(), address(0, 0)),
+            translate(history.ledger(), address(3, 0)),
+            None,
+        ]
+    );
+    assert_eq!(addrs[0], Some(address(1, 0)));
+    assert!(remapper.fragment_needs_translation(0));
+    assert!(!remapper.fragment_needs_translation(1));
+    assert_eq!(
+        remapper.translate_fragments(&RoaringBitmap::from_iter([0, 3])),
+        RoaringBitmap::from_iter([1])
+    );
+    assert!(mappings.take_reads().is_empty());
+}
+
+/// A stable-partition translation reads only the row-map blocks the batch
+/// touches, a run of adjacent blocks in one read.
+#[tokio::test]
+async fn bound_plan_reads_only_the_row_map_blocks_it_needs() {
+    // Fragment 0's 12 rows alternate between destinations 1 and 2, and row 5
+    // was deleted; blocks hold 4 rows, so the map has 3 blocks.
+    let labels: Vec<Option<u16>> = (0..12u16)
+        .map(|row| (row != 5).then_some(row % 2))
+        .collect();
+    let mappings = Arc::new(InMemoryMappings::default().with_map(MAP_A, &labels, 4));
+    let transition = pb::Transition {
+        sources: vec![digest(0, 12, 1)],
+        destinations: vec![digest(1, 6, 0), digest(2, 5, 0)],
+        mapping: Some(pb::transition::Mapping::StablePartition(
+            pb::StablePartition {
+                map_id: MAP_A.to_string(),
+                map_size_bytes: 64,
+                base_id: None,
+            },
+        )),
+    };
+    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
+        .append(RewriteRecord::new(REWRITE_VERSION, vec![transition]))
+        .unwrap();
+    let live = RoaringBitmap::from_iter([1, 2]);
+    let remapper = bound(&history, &live, &[0], mappings.clone());
+
+    // Rows 9 and 0 are in blocks 2 and 0: two reads.
+    let mut addrs = vec![Some(address(0, 9)), Some(address(0, 0))];
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    assert_eq!(addrs, vec![Some(address(2, 3)), Some(address(1, 0))]);
+    assert_eq!(mappings.take_reads(), vec![0..4, 8..12]);
+
+    // Rows 5, 4 and 3 are in adjacent blocks 1 and 0: one read.
+    let mut addrs = vec![
+        Some(address(0, 5)),
+        Some(address(0, 4)),
+        Some(address(0, 3)),
+    ];
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    assert_eq!(addrs, vec![None, Some(address(1, 2)), Some(address(2, 1))]);
+    assert_eq!(mappings.take_reads(), vec![0..8]);
+
+    assert_eq!(
+        remapper.translate_fragments(&RoaringBitmap::from_iter([0])),
+        RoaringBitmap::from_iter([1, 2])
+    );
+    assert!(mappings.take_reads().is_empty());
 }

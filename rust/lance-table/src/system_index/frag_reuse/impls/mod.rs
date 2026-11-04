@@ -19,11 +19,13 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use lance_core::{Error, Result};
+use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
 use super::history::{HistoryFormat, Record, RewriteRecord, split_records};
 use super::ledger::FragReuseLedger;
-use super::plan::{ReadContext, ReadPlan, SegmentSummary};
+use super::mapping::MappingSource;
+use super::plan::{ReadContext, ReadPlan, SegmentSummary, TranslationPlan};
 
 /// One FRI format's rules over its records.
 pub trait FriImpl: Send + Sync + Debug {
@@ -68,7 +70,12 @@ pub trait FriImpl: Send + Sync + Debug {
     fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool;
 
     /// See [`FragReuseHistory::plan`](super::history::FragReuseHistory::plan).
-    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan>;
+    /// Translation plans keep the history they were planned under, so they
+    /// can be bound without it.
+    fn plan(self: Arc<Self>, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan>;
+
+    /// See [`TranslationPlan::bind`]. `plan` was planned by this history.
+    fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper;
 }
 
 /// The records every format stores: each record's exact wire bytes in

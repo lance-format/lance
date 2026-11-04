@@ -351,7 +351,7 @@ impl RowMapWriter {
 /// Reader over a row map file: one tail read at open, block reads on demand.
 pub struct RowMapReader {
     reader: Arc<dyn IndexReader>,
-    counts: CountsMatrix,
+    counts: Arc<CountsMatrix>,
     /// When present, block reads are served from (and populated into) the shared
     /// index cache in ~4 MiB chunks. When absent, reads go straight to the file.
     block_cache: Option<RowMapBlockCache>,
@@ -430,7 +430,7 @@ impl RowMapReader {
         }
         Ok(Self {
             reader,
-            counts,
+            counts: Arc::new(counts),
             block_cache,
         })
     }
@@ -439,6 +439,52 @@ impl RowMapReader {
     /// and per-block counter bases without any label IO.
     pub fn counts(&self) -> &CountsMatrix {
         &self.counts
+    }
+
+    /// [`Self::counts`], shared rather than borrowed.
+    pub fn shared_counts(&self) -> Arc<CountsMatrix> {
+        self.counts.clone()
+    }
+
+    /// The labels of the source rows `rows`. With a block cache attached, the
+    /// rows are served from (and populate) the ~4 MiB chunks that hold them;
+    /// without one, exactly `rows` are read.
+    pub async fn labels(&self, rows: Range<u64>) -> Result<UInt16Array> {
+        if rows.start > rows.end || rows.end > self.counts.total_rows() {
+            return Err(Error::invalid_input(format!(
+                "source rows {rows:?} are outside the {} rows of this row map",
+                self.counts.total_rows()
+            )));
+        }
+        let Some(block_cache) = &self.block_cache else {
+            return self
+                .read_labels(rows.start as usize..rows.end as usize)
+                .await;
+        };
+        if rows.is_empty() {
+            return Ok(UInt16Array::from(Vec::<u16>::new()));
+        }
+        let first_chunk = self.counts.block_of(rows.start) / ROW_MAP_CACHE_CHUNK_BLOCKS;
+        let last_chunk = self.counts.block_of(rows.end - 1) / ROW_MAP_CACHE_CHUNK_BLOCKS;
+        let mut parts = Vec::with_capacity(last_chunk - first_chunk + 1);
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_rows = self.chunk_row_range(chunk_idx);
+            let start = rows.start.max(chunk_rows.start);
+            let end = rows.end.min(chunk_rows.end);
+            let chunk = self.chunk_labels(block_cache, chunk_idx).await?;
+            parts.push(
+                chunk
+                    .labels
+                    .slice((start - chunk_rows.start) as usize, (end - start) as usize),
+            );
+        }
+        if let [labels] = parts.as_slice() {
+            return Ok(labels.clone());
+        }
+        let parts: Vec<&dyn Array> = parts.iter().map(|labels| labels as &dyn Array).collect();
+        Ok(arrow_select::concat::concat(&parts)?
+            .as_primitive::<UInt16Type>()
+            .clone())
     }
 
     /// The decoded labels of one block.
