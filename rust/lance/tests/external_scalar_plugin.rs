@@ -35,6 +35,7 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
+use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
 use prost::Name;
 use rstest::rstest;
 use tempfile::tempdir;
@@ -654,12 +655,15 @@ async fn commit_external_segments_replaces_only_overlapping_coverage() {
         .unwrap();
 }
 
-/// Under a version 0 fragment reuse history, a segment of a plugin without a
-/// remapping loader leaves the query listing once its rows move, so they are
-/// scanned instead of answered from stale addresses. A built-in index keeps
-/// serving its segment through the history.
+/// Under either fragment reuse history format, a segment of a plugin without
+/// a remapping loader leaves the query listing once its rows move, so they
+/// are scanned instead of answered from stale addresses. A built-in index
+/// keeps serving its segment through the history.
+#[rstest]
+#[case::v0(false)]
+#[case::tagged(true)]
 #[tokio::test]
-async fn v0_fragment_reuse_scans_rows_of_plugins_that_cannot_translate() {
+async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagged: bool) {
     LazyLock::force(&REGISTRATION);
     let directory = tempdir().unwrap();
     let batch = record_batch!(
@@ -694,6 +698,12 @@ async fn v0_fragment_reuse_scans_rows_of_plugins_that_cannot_translate() {
             .unwrap();
     }
     dataset.delete("value = 1").await.unwrap();
+    if tagged {
+        // The sticky flag makes the compaction record a tagged history.
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    }
     compact_files(
         &mut dataset,
         CompactionOptions {
@@ -713,7 +723,7 @@ async fn v0_fragment_reuse_scans_rows_of_plugins_that_cannot_translate() {
         .iter()
         .find(|index| index.name == "__lance_frag_reuse")
         .map(|index| index.index_version);
-    assert_eq!(fri, Some(0));
+    assert_eq!(fri, Some(i32::from(tagged)));
 
     let listed: Vec<String> = dataset
         .load_indices()
