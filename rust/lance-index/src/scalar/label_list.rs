@@ -1728,11 +1728,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_has_all_labels_stops_searching_once_intersection_is_empty() {
-        // 'a' covers rows 0-1 and 'b' covers rows 2-3 -- disjoint, so the
-        // accumulator empties after the second label and none of 'c'..='j',
-        // each present in the index, can change the answer. Rows 12 (a null
-        // element) and 13 (a null list) check that stopping early keeps the
-        // same null rows as intersecting every label.
+        // 'a' covers rows 0, 1 and 12 and 'b' covers rows 2-3 -- disjoint, so
+        // the accumulator empties after the second label and none of
+        // 'c'..='j', each present in the index, can change the answer. Row 12
+        // (a null element) must not leak into the null rows; row 13 (a null
+        // list) must stay NULL after the early stop.
         let mut rows: Vec<SampleRow> = vec![
             (0, Some(vec![Some("a".to_string())])),
             (1, Some(vec![Some("a".to_string())])),
