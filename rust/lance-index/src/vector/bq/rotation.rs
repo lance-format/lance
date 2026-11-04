@@ -215,6 +215,10 @@ pub fn apply_fast_rotation_in_place(output: &mut [f32], signs: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -269,39 +273,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_fast_rotation_is_orthonormal() {
-        // Power-of-two dimensions use plain FWHT rounds; the others exercise
-        // the truncated FWHT plus Kac path. RaBitQ only accepts dimensions
-        // divisible by 8.
-        for dim in [8, 16, 24, 32, 128, 200, 256] {
-            assert_orthonormal(dim);
-        }
+    // Power-of-two dimensions use plain FWHT rounds; the others exercise the
+    // truncated FWHT plus Kac path. RaBitQ only accepts dimensions divisible
+    // by 8.
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_is_orthonormal(#[case] dim: usize) {
+        assert_orthonormal(dim);
     }
 
     /// Random inputs must keep their norm under the rotation.
     ///
     /// `R^T R = I` is checked above; this covers the error-bound assumption
     /// on arbitrary vectors, including the truncated FWHT plus Kac path.
-    #[test]
-    fn test_fast_rotation_preserves_vector_norms() {
-        use rand::rngs::SmallRng;
-        use rand::{Rng, SeedableRng};
-
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_preserves_vector_norms(#[case] dim: usize) {
         let mut rng = SmallRng::seed_from_u64(42);
-        for dim in [8, 16, 24, 32, 128, 200, 256] {
-            let signs = deterministic_signs(dim);
-            for _ in 0..8 {
-                let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
-                let mut output = vec![0.0f32; dim];
-                apply_fast_rotation(&input, &mut output, &signs);
-                let in_sq: f32 = input.iter().map(|v| v * v).sum();
-                let out_sq: f32 = output.iter().map(|v| v * v).sum();
-                assert!(
-                    (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
-                    "dim={dim}: input norm {in_sq}, output norm {out_sq}"
-                );
-            }
+        let signs = deterministic_signs(dim);
+        for _ in 0..8 {
+            let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+            let mut output = vec![0.0f32; dim];
+            apply_fast_rotation(&input, &mut output, &signs);
+            let in_sq: f32 = input.iter().map(|v| v * v).sum();
+            let out_sq: f32 = output.iter().map(|v| v * v).sum();
+            assert!(
+                (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
+                "dim={dim}: input norm {in_sq}, output norm {out_sq}"
+            );
         }
     }
 }
