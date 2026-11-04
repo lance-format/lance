@@ -234,7 +234,7 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
                 .map(|bs| bs.parse().unwrap_or(0))
                 .unwrap_or(0)
         };
-        // The total bbox only lets a search skip the tree. serde_json writes an
+        // Search uses the total bbox only to skip the tree. serde_json writes an
         // infinite bound as null, which does not parse back, so a bbox that
         // cannot be read must cover every query instead of none.
         let bbox = metadata
@@ -1764,6 +1764,21 @@ mod tests {
         ));
         let mut expected = RowAddrTreeMap::new();
         expected.insert(1);
+        assert_eq!(
+            index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected
+        );
+
+        // The row holding the infinite coordinate must be found too.
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: -5.0, y: 1.0 },
+            coord! { x: 0.0, y: 2.0 },
+        ));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert(0);
         assert_eq!(
             index
                 .search_bbox(query, &NoOpMetricsCollector)
