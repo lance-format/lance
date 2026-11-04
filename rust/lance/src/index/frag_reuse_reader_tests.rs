@@ -3528,6 +3528,80 @@ async fn identity_segment_survives_two_appends() {
     assert_eq!(count(&dataset, 300).await, 1);
 }
 
+async fn legacy_fts_scores(
+    dataset: &Dataset,
+    query: &str,
+) -> std::collections::BTreeMap<String, f32> {
+    let batch = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(
+            lance_index::scalar::FullTextSearchQuery::new(query.to_owned())
+                .with_column("text".into())
+                .unwrap(),
+        )
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let texts = batch["text"].as_string::<i32>();
+    let scores = batch[lance_index::scalar::inverted::SCORE_COL]
+        .as_primitive::<arrow_array::types::Float32Type>();
+    (0..batch.num_rows())
+        .map(|row| (texts.value(row).to_owned(), scores.value(row)))
+        .collect()
+}
+
+// Global BM25 statistics are not adjusted on deletion or translation, so a
+// rebuilt index is no reference: the scores before compaction are. The
+// released 0.27.0 fixture holds a real legacy-layout index (one fragment).
+#[tokio::test]
+async fn legacy_layout_fts_keeps_scores_through_a_version_0_history() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let test_dir = crate::utils::test::copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    // The first document precedes the others in the documents file, so
+    // dropping it shifts every later document if lengths are not kept aligned.
+    dataset.delete("text = 'frodo was a puppy'").await.unwrap();
+    let queries = ["puppy", "happy", "tail", "frodo puppy"];
+    let mut before = Vec::new();
+    for query in queries {
+        before.push(legacy_fts_scores(&dataset, query).await);
+    }
+    assert_eq!(before[0].len(), 2, "{before:?}");
+    let text_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let fri = dataset
+        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        .await
+        .unwrap()
+        .expect("deferred remap records a fragment reuse history");
+    assert_eq!(fri.index_version, 0);
+    let text_idx = dataset.load_indices().await.unwrap();
+    assert!(
+        text_idx.iter().any(|index| index.uuid == text_uuid),
+        "the segment must answer through the history, not an eager remap"
+    );
+    assert_ne!(dataset.fragments()[0].id, 0, "compaction rewrote nothing");
+
+    for (query, before) in queries.into_iter().zip(&before) {
+        let after = legacy_fts_scores(&dataset, query).await;
+        assert_eq!(&after, before, "query {query:?}");
+    }
+}
+
 // A legacy-layout full-text index (tokens, postings and documents at the
 // index root, no metadata file) keeps its per-document lengths aligned with
 // the row ids it was built with, so it cannot be translated under a tagged
