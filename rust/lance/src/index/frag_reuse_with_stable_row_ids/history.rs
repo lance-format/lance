@@ -312,18 +312,6 @@ fn index_needing<'a>(
         .find(|index| !matches!(is_index_remap_caught_up(version, index, chain), Ok(true)))
 }
 
-/// How many of the oldest versions a cleanup of a stable-row-id table removes:
-/// those before the first version an index of `indices` still needs. The kept
-/// versions stay a complete suffix of the history, so an address they map
-/// translates through every later move.
-pub fn trimmable_versions(versions: &[FragReuseVersion], indices: &[IndexMetadata]) -> usize {
-    let chain = reuse_chain_frag_bitmap(versions);
-    versions
-        .iter()
-        .position(|version| index_needing(version, indices, &chain).is_some())
-        .unwrap_or(versions.len())
-}
-
 fn contains_version(versions: &[FragReuseVersion], version: &FragReuseVersion) -> Result<bool> {
     for candidate in versions {
         if same_version(candidate, version)? {

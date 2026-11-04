@@ -468,26 +468,6 @@ impl FragReuseHistory {
         self.0.append(&rewrite).map(Self)
     }
 
-    /// Keep only the records `keep` accepts. `keep` is called exactly once
-    /// per record, in serialized order (the order of [`Self::records`]), so
-    /// a caller may decide by position.
-    ///
-    /// Used by `lance`'s trim (`derive_tagged_trim`) until trimming moves
-    /// here; not part of the stable interface.
-    #[doc(hidden)]
-    pub fn retain(&self, keep: &mut dyn FnMut(&Record) -> bool) -> Result<Self> {
-        self.0.records().require_fully_interpretable("trim")?;
-        let records: Vec<StoredRecord> = self
-            .0
-            .records()
-            .stored
-            .iter()
-            .filter(|stored| keep(&stored.record))
-            .cloned()
-            .collect();
-        self.0.rebuilt(concat(&records)).map(Self)
-    }
-
     /// The history without the records no live index segment needs any
     /// more. `live` holds the table's stored index segments, one entry per
     /// logical index (system indices left out); a segment whose

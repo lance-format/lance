@@ -171,30 +171,6 @@ fn legacy_refuses_a_transition_only_tagged_records() {
     assert_eq!(lifted.format(), HistoryFormat::Tagged);
 }
 
-#[rstest]
-#[case::legacy(HistoryFormat::Legacy)]
-#[case::tagged(HistoryFormat::Tagged)]
-fn retain_drops_only_the_rejected_records(#[case] format: HistoryFormat) {
-    let history = record_natively(
-        FragReuseHistory::empty(format),
-        1,
-        &[whole(0, 1)],
-        &[(1, 1)],
-    );
-    let history = record_natively(history, 2, &[whole(5, 1)], &[(6, 1)]);
-    let trimmed = history
-        .retain(&mut |record| match record {
-            Record::Transition(transition) => transition.sources[0].id != 0,
-            Record::LegacyVersion(version) => version.groups[0].old_fragments[0].id != 0,
-            Record::Uninterpretable { .. } => true,
-        })
-        .unwrap();
-    assert_eq!(trimmed.format(), format);
-    assert_eq!(trimmed.ledger().transitions().len(), 1);
-    assert_eq!(trimmed.ledger().consumer(5), Some(0));
-    assert_eq!(trimmed.ledger().consumer(0), None);
-}
-
 /// A record only a newer writer understands is carried byte for byte, and
 /// no edit that reasons about the whole history goes past it. Version 0 has
 /// no transitions, so only an unknown envelope record applies to it.
@@ -218,7 +194,6 @@ fn whole_history_edits_refuse_records_they_cannot_interpret(
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("cannot maintain"), "{error}");
     };
-    assert_refused(history.retain(&mut |_| true));
     assert_refused(history.remap_bases(&Ok));
     if format == HistoryFormat::Tagged {
         assert_refused(history.append(RewriteRecord::new(
