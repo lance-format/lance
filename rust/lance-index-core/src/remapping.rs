@@ -210,10 +210,6 @@ impl lance_select::remapper::RemapperBacking for DeprecatedRemapper {
             }),
         }
     }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
 }
 
 /// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that

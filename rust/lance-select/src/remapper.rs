@@ -15,7 +15,6 @@
 //! returns futures that are complete on first poll. Indices never learn
 //! which format produced their remapper.
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
@@ -40,8 +39,6 @@ pub trait RemapperBacking: Send + Sync + Debug {
     fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap;
 
     fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a>;
-
-    fn as_any(&self) -> &dyn Any;
 }
 
 /// Translates the row addresses one index segment stores into the addresses
@@ -73,11 +70,6 @@ impl Remapper {
     #[doc(hidden)]
     pub fn from_backing(backing: Arc<dyn RemapperBacking>) -> Self {
         Self(backing)
-    }
-
-    #[doc(hidden)]
-    pub fn backing(&self) -> &dyn RemapperBacking {
-        self.0.as_ref()
     }
 
     /// Whether addresses in `fragment` may change under translation. When
@@ -231,10 +223,6 @@ impl RemapperBacking for ScriptedRemapper {
             Ok(())
         });
         Box::pin(std::future::ready(result))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

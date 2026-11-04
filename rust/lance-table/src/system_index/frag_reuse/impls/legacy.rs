@@ -5,7 +5,6 @@
 //! versions only, ordered by dataset version, which every released reader
 //! and writer understands.
 
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -384,9 +383,8 @@ impl FriImpl for LegacyHistory {
 /// The translation of a version 0 history: the compact in-memory remap
 /// released readers apply, wrapped unchanged. Every future it returns is
 /// complete.
-#[doc(hidden)]
 #[derive(Debug)]
-pub struct LegacyRemapper {
+pub(crate) struct LegacyRemapper {
     index: std::result::Result<Arc<CompactFragReuseIndex>, String>,
     sources: RoaringBitmap,
 }
@@ -412,10 +410,9 @@ impl LegacyRemapper {
         Self { index, sources }
     }
 
-    /// The version 0 remap itself, for index loaders that still take the
-    /// synchronous remapper. Fails when the history's mappings cannot be
-    /// decoded.
-    pub fn compact_index(&self) -> Result<Arc<CompactFragReuseIndex>> {
+    /// The version 0 remap itself. Fails when the history's mappings cannot
+    /// be decoded.
+    fn compact_index(&self) -> Result<Arc<CompactFragReuseIndex>> {
         self.index.clone().map_err(|message| {
             Error::corrupt_file_named(
                 "FRI details",
@@ -448,10 +445,6 @@ impl RemapperBacking for LegacyRemapper {
             .compact_index()
             .map(|index| index.remap_row_ids_in_place(addrs));
         Box::pin(std::future::ready(result))
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

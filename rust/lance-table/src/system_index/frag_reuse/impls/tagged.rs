@@ -5,7 +5,6 @@
 //! and tagged transitions. Every writer of this format validates it, so a
 //! tagged history is never repaired.
 
-use std::any::Any;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
@@ -425,10 +424,6 @@ impl RemapperBacking for TaggedRemapper {
             }
             Ok(())
         })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
