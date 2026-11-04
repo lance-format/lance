@@ -134,17 +134,7 @@ pub struct CacheBackendDiagnostics {
 }
 /// Nested message and enum types in `CacheBackendDiagnostics`.
 pub mod cache_backend_diagnostics {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Kind {
         Custom = 0,

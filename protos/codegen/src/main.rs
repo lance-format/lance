@@ -3,8 +3,10 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::process;
+use std::process::{Command, Stdio};
 
 const LICENSE_HEADER: &str = "// SPDX-License-Identifier: Apache-2.0\n\
 // SPDX-FileCopyrightText: Copyright The Lance Authors\n\n";
@@ -228,7 +230,7 @@ fn install_generated(
     }
     for file_name in file_names {
         let generated = fs::read_to_string(generated_dir.join(file_name))?;
-        let expected = format!("{LICENSE_HEADER}{generated}");
+        let expected = normalize_generated(&format!("{LICENSE_HEADER}{generated}"))?;
         let destination = destination_dir.join(file_name);
         if check {
             let checked_in = fs::read_to_string(&destination)?;
@@ -244,4 +246,33 @@ fn install_generated(
         }
     }
     Ok(())
+}
+
+/// Format generated sources with the repository toolchain's rustfmt.
+///
+/// Pre-commit runs `cargo fmt` over changed `.rs` files, including the
+/// `include!`d files under `src/pb`. Normalizing here keeps regeneration and
+/// repository formatting from rewriting each other, so `--check` still detects
+/// stale sources after hooks run.
+fn normalize_generated(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2024", "--emit", "stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("rustfmt stdin should be piped")
+        .write_all(source.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "rustfmt failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }

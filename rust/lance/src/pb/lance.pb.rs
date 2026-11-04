@@ -50,7 +50,11 @@ pub struct VectorQueryProto {
     #[prost(uint32, optional, tag = "9")]
     pub refine_factor: ::core::option::Option<u32>,
     /// Distance metric type. Absent means None (use the index's default metric).
-    #[prost(enumeration = "::lance_index::pb::VectorMetricType", optional, tag = "10")]
+    #[prost(
+        enumeration = "::lance_index::pb::VectorMetricType",
+        optional,
+        tag = "10"
+    )]
     pub metric_type: ::core::option::Option<i32>,
     #[prost(bool, tag = "11")]
     pub use_index: bool,
@@ -104,17 +108,7 @@ pub struct AnnIvfSubIndexExecProto {
 }
 /// Nested message and enum types in `ANNIvfSubIndexExecProto`.
 pub mod ann_ivf_sub_index_exec_proto {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum PreFilterType {
         None = 0,

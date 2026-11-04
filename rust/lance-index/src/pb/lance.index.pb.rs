@@ -52,17 +52,7 @@ pub struct Tensor {
 }
 /// Nested message and enum types in `Tensor`.
 pub mod tensor {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DataType {
         Bfloat16 = 0,
@@ -332,10 +322,8 @@ pub struct VectorIndexDetails {
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters", "lancedb.accelerator").
     /// Unrecognized keys must be silently ignored by all runtimes.
     #[prost(map = "string, string", tag = "9")]
-    pub runtime_hints: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub runtime_hints:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(oneof = "vector_index_details::Compression", tags = "4, 5, 6, 8")]
     pub compression: ::core::option::Option<vector_index_details::Compression>,
 }
@@ -383,15 +371,7 @@ pub mod vector_index_details {
     /// Nested message and enum types in `RabitQuantization`.
     pub mod rabit_quantization {
         #[derive(
-            Clone,
-            Copy,
-            Debug,
-            PartialEq,
-            Eq,
-            Hash,
-            PartialOrd,
-            Ord,
-            ::prost::Enumeration
+            Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration,
         )]
         #[repr(i32)]
         pub enum RotationType {

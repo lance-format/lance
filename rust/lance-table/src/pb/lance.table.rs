@@ -68,10 +68,8 @@ pub struct DataFragment {
     /// entries, including unknown keys. New fragments do not inherit entries automatically.
     /// Requires writer flag 1 << 17 while this map is nonempty.
     #[prost(map = "string, string", tag = "16")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// A serialized RowIdSequence message (see rowids.proto).
     ///
     /// These are the row ids for the fragment, in order of the rows as they appear.
@@ -80,13 +78,11 @@ pub struct DataFragment {
     #[prost(oneof = "data_fragment::RowIdSequence", tags = "5, 12")]
     pub row_id_sequence: ::core::option::Option<data_fragment::RowIdSequence>,
     #[prost(oneof = "data_fragment::LastUpdatedAtVersionSequence", tags = "7, 13")]
-    pub last_updated_at_version_sequence: ::core::option::Option<
-        data_fragment::LastUpdatedAtVersionSequence,
-    >,
+    pub last_updated_at_version_sequence:
+        ::core::option::Option<data_fragment::LastUpdatedAtVersionSequence>,
     #[prost(oneof = "data_fragment::CreatedAtVersionSequence", tags = "9, 14")]
-    pub created_at_version_sequence: ::core::option::Option<
-        data_fragment::CreatedAtVersionSequence,
-    >,
+    pub created_at_version_sequence:
+        ::core::option::Option<data_fragment::CreatedAtVersionSequence>,
 }
 /// Nested message and enum types in `DataFragment`.
 pub mod data_fragment {
@@ -393,17 +389,7 @@ pub mod deletion_file {
     /// Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
     /// offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there
     /// are densely deleted rows, then BITMAP is the most efficient.
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DeletionFileType {
         /// A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
@@ -824,10 +810,8 @@ pub struct Manifest {
     pub fields: ::prost::alloc::vec::Vec<::lance_file::format::pb::Field>,
     /// Schema metadata.
     #[prost(map = "string, bytes", tag = "5")]
-    pub schema_metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::vec::Vec<u8>,
-    >,
+    pub schema_metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
     /// Fragments of the dataset.
     #[prost(message, repeated, tag = "2")]
     pub fragments: ::prost::alloc::vec::Vec<DataFragment>,
@@ -976,10 +960,8 @@ pub struct Manifest {
     /// libraries may wish to similarly prefix their configuration keys
     /// appropriately.
     #[prost(map = "string, string", tag = "16")]
-    pub config: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub config:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// Metadata associated with the table.
     ///
     /// This is a key-value map that can be used to store arbitrary metadata
@@ -991,10 +973,8 @@ pub struct Manifest {
     /// This is different than schema metadata, which is used to describe the
     /// data itself and is attached to the output schema of scans.
     #[prost(map = "string, string", tag = "19")]
-    pub table_metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub table_metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// The base paths of data files.
     ///
     /// This is used to determine the base path of a data file. In common cases data file paths are under current dataset base path.
@@ -1157,10 +1137,8 @@ impl ::prost::Name for BasePath {
 pub struct VersionAuxData {
     /// key-value metadata.
     #[prost(map = "string, bytes", tag = "3")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::vec::Vec<u8>,
-    >,
+    pub metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
 }
 impl ::prost::Name for VersionAuxData {
     const NAME: &'static str = "VersionAuxData";
@@ -1281,10 +1259,8 @@ pub struct IndexMetadata {
     /// segment preserve all entries, including unknown keys. New segments do not
     /// inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
     #[prost(map = "string, string", tag = "13")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 impl ::prost::Name for IndexMetadata {
     const NAME: &'static str = "IndexMetadata";
@@ -1821,10 +1797,8 @@ pub struct MemWalIndexDetails {
     /// still override any value at runtime in its own ShardWriterConfig
     /// (which is not persisted).
     #[prost(map = "string, string", tag = "11")]
-    pub writer_config_defaults: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub writer_config_defaults:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// Names this MemWAL's storage directory, `_{dir_id}_mem_wal/` under the
     /// table's base path; empty means the legacy `_mem_wal/`. Minted at
     /// initialization and kept across rewrites of this index, so a
@@ -1888,10 +1862,8 @@ pub struct ShardingField {
     pub result_type: ::prost::alloc::string::String,
     /// Transform parameters (e.g., num_buckets for bucket transform).
     #[prost(map = "string, string", tag = "6")]
-    pub parameters: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub parameters:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 impl ::prost::Name for ShardingField {
     const NAME: &'static str = "ShardingField";
@@ -1958,10 +1930,8 @@ pub struct Transaction {
     /// Optional properties for the transaction
     /// __lance_commit_message is a reserved key
     #[prost(map = "string, string", tag = "4")]
-    pub transaction_properties: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub transaction_properties:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// The operation of this transaction.
     ///
     /// Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -2446,10 +2416,8 @@ pub mod transaction {
         /// Writers emit field 10 only. Readers prefer field 10; fall back to field 9 for
         /// manifests written before this change.
         #[prost(map = "uint64, bytes", tag = "10")]
-        pub updated_fragment_offset_bitmaps: ::std::collections::HashMap<
-            u64,
-            ::prost::alloc::vec::Vec<u8>,
-        >,
+        pub updated_fragment_offset_bitmaps:
+            ::std::collections::HashMap<u64, ::prost::alloc::vec::Vec<u8>>,
         /// The `dir_id` of the MemWAL `compacted_sstables` belongs to; required
         /// when `compacted_sstables` is non-empty. See UpdateMemWalState.dir_id.
         #[prost(string, optional, tag = "11")]
@@ -2530,10 +2498,7 @@ pub mod transaction {
             ::prost::alloc::string::String,
         >,
         #[prost(map = "uint32, message", tag = "4")]
-        pub field_metadata: ::std::collections::HashMap<
-            u32,
-            update_config::FieldMetadataUpdate,
-        >,
+        pub field_metadata: ::std::collections::HashMap<u32, update_config::FieldMetadataUpdate>,
     }
     /// Nested message and enum types in `UpdateConfig`.
     pub mod update_config {
@@ -2693,17 +2658,7 @@ pub mod transaction {
         }
     }
     /// The mode of update operation
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum UpdateMode {
         /// rows are deleted in current fragments and rewritten in new fragments.

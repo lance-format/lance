@@ -18,10 +18,8 @@ pub struct TableIdentifier {
     #[prost(bytes = "vec", optional, tag = "4")]
     pub serialized_manifest: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(map = "string, string", tag = "5")]
-    pub storage_options: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub storage_options:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 impl ::prost::Name for TableIdentifier {
     const NAME: &'static str = "TableIdentifier";
@@ -200,9 +198,7 @@ pub struct FilteredReadOptionsProto {
     /// Must not be combined with scan_range_before_filter. Physical addresses
     /// refer to the exact dataset snapshot used to plan the scan.
     #[prost(bytes = "vec", optional, tag = "15")]
-    pub physical_row_addr_allowlist: ::core::option::Option<
-        ::prost::alloc::vec::Vec<u8>,
-    >,
+    pub physical_row_addr_allowlist: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
 }
 impl ::prost::Name for FilteredReadOptionsProto {
     const NAME: &'static str = "FilteredReadOptionsProto";

@@ -129,7 +129,10 @@ pub struct InvertedIndexDetails {
     pub code_config: ::core::option::Option<inverted_index_details::CodeTokenizerConfig>,
     /// The logical FTS document boundary. The protobuf default preserves the
     /// legacy row-document behavior when this field is absent.
-    #[prost(enumeration = "inverted_index_details::DocumentGranularity", tag = "14")]
+    #[prost(
+        enumeration = "inverted_index_details::DocumentGranularity",
+        tag = "14"
+    )]
     pub document_granularity: i32,
     /// The posting-list payload format. This is separate from index_version,
     /// which identifies the overall inverted-index layout.
@@ -169,17 +172,7 @@ pub mod inverted_index_details {
             "/lance.table.InvertedIndexDetails.CodeTokenizerConfig".into()
         }
     }
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum DocumentGranularity {
         Row = 0,

@@ -20,17 +20,7 @@ pub struct Buffer {
 /// Nested message and enum types in `Buffer`.
 pub mod buffer {
     /// The collection holding the buffer
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum BufferType {
         /// The buffer is stored in the data page itself
@@ -86,9 +76,7 @@ pub mod nullable {
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct NoNull {
         #[prost(message, optional, boxed, tag = "1")]
-        pub values: ::core::option::Option<
-            ::prost::alloc::boxed::Box<super::ArrayEncoding>,
-        >,
+        pub values: ::core::option::Option<::prost::alloc::boxed::Box<super::ArrayEncoding>>,
     }
     impl ::prost::Name for NoNull {
         const NAME: &'static str = "NoNull";
@@ -115,13 +103,9 @@ pub mod nullable {
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct SomeNull {
         #[prost(message, optional, boxed, tag = "1")]
-        pub validity: ::core::option::Option<
-            ::prost::alloc::boxed::Box<super::ArrayEncoding>,
-        >,
+        pub validity: ::core::option::Option<::prost::alloc::boxed::Box<super::ArrayEncoding>>,
         #[prost(message, optional, boxed, tag = "2")]
-        pub values: ::core::option::Option<
-            ::prost::alloc::boxed::Box<super::ArrayEncoding>,
-        >,
+        pub values: ::core::option::Option<::prost::alloc::boxed::Box<super::ArrayEncoding>>,
     }
     impl ::prost::Name for SomeNull {
         const NAME: &'static str = "SomeNull";

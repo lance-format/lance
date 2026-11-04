@@ -364,17 +364,7 @@ pub struct SparseValiditySet {
 }
 /// Nested message and enum types in `SparseValiditySet`.
 pub mod sparse_validity_set {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Meaning {
         SparseValidityUnspecified = 0,
@@ -399,12 +389,8 @@ pub mod sparse_validity_set {
         pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
             match value {
                 "SPARSE_VALIDITY_UNSPECIFIED" => Some(Self::SparseValidityUnspecified),
-                "SPARSE_VALIDITY_NULL_POSITIONS" => {
-                    Some(Self::SparseValidityNullPositions)
-                }
-                "SPARSE_VALIDITY_VALID_POSITIONS" => {
-                    Some(Self::SparseValidityValidPositions)
-                }
+                "SPARSE_VALIDITY_NULL_POSITIONS" => Some(Self::SparseValidityNullPositions),
+                "SPARSE_VALIDITY_VALID_POSITIONS" => Some(Self::SparseValidityValidPositions),
                 _ => None,
             }
         }
@@ -729,9 +715,7 @@ pub struct Rle {
     pub values: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
     /// The compression used to store the run lengths data block
     #[prost(message, optional, boxed, tag = "2")]
-    pub run_lengths: ::core::option::Option<
-        ::prost::alloc::boxed::Box<CompressiveEncoding>,
-    >,
+    pub run_lengths: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
 }
 impl ::prost::Name for Rle {
     const NAME: &'static str = "Rle";
@@ -1139,9 +1123,7 @@ impl CompressionScheme {
     /// Creates an enum from field names used in the ProtoBuf definition.
     pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
         match value {
-            "COMPRESSION_ALGORITHM_UNSPECIFIED" => {
-                Some(Self::CompressionAlgorithmUnspecified)
-            }
+            "COMPRESSION_ALGORITHM_UNSPECIFIED" => Some(Self::CompressionAlgorithmUnspecified),
             "COMPRESSION_ALGORITHM_LZ4" => Some(Self::CompressionAlgorithmLz4),
             "COMPRESSION_ALGORITHM_ZSTD" => Some(Self::CompressionAlgorithmZstd),
             _ => None,

@@ -20,10 +20,8 @@ pub struct Schema {
     pub fields: ::prost::alloc::vec::Vec<Field>,
     /// Schema metadata.
     #[prost(map = "string, bytes", tag = "5")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::vec::Vec<u8>,
-    >,
+    pub metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
 }
 /// Metadata of one Lance file.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -154,10 +152,8 @@ pub struct Field {
     pub nullable: bool,
     /// optional field metadata (e.g. extension type name/parameters)
     #[prost(map = "string, bytes", tag = "10")]
-    pub metadata: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::vec::Vec<u8>,
-    >,
+    pub metadata:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::vec::Vec<u8>>,
     #[prost(bool, tag = "12")]
     pub unenforced_primary_key: bool,
     /// Position of this field in the primary key (1-based).
@@ -194,17 +190,7 @@ pub struct Field {
 }
 /// Nested message and enum types in `Field`.
 pub mod field {
-    #[derive(
-        Clone,
-        Copy,
-        Debug,
-        PartialEq,
-        Eq,
-        Hash,
-        PartialOrd,
-        Ord,
-        ::prost::Enumeration
-    )]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
     #[repr(i32)]
     pub enum Type {
         Parent = 0,
