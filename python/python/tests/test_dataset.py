@@ -721,6 +721,42 @@ def test_has_stable_row_ids_property(tmp_path: Path, enable_stable_row_ids: bool
     assert ds.has_stable_row_ids is enable_stable_row_ids
 
 
+def _live_row_addrs(ds):
+    rows = ds.to_table(columns=[], with_row_id=True, with_row_address=True)
+    return dict(zip(rows["_rowid"].to_pylist(), rows["_rowaddr"].to_pylist()))
+
+
+def test_get_row_addresses(tmp_path: Path):
+    table = pa.table({"a": range(6)})
+    ds = lance.write_dataset(
+        table, tmp_path / "stable", enable_stable_row_ids=True, max_rows_per_file=3
+    )
+    ds.update({"a": "a + 10"}, where="a = 1")
+    ds.delete("a = 4")
+    ds.optimize.compact_files(target_rows_per_fragment=100)
+    live = _live_row_addrs(ds)
+    assert sorted(live) == [0, 1, 2, 3, 5]
+    # an update rewrote row 1 and compaction moved every row, so addresses no
+    # longer equal ids
+    assert any(row_id != addr for row_id, addr in live.items())
+
+    ids = [5, 4, None, 1, 1, 100]
+    expected = [live[5], None, None, live[1], live[1], None]
+    assert ds.get_row_addresses(ids).to_pylist() == expected
+    chunked = pa.chunked_array([[5, 4], [None, 1, 1, 100]], type=pa.int64())
+    assert ds.get_row_addresses(chunked).to_pylist() == expected
+    assert ds.get_row_addresses([]).to_pylist() == []
+    with pytest.raises(pa.ArrowInvalid):
+        ds.get_row_addresses(pa.array([-1], type=pa.int64()))
+
+    plain = lance.write_dataset(table, tmp_path / "plain")
+    assert plain.get_row_addresses([0, None, 1 << 32]).to_pylist() == [
+        0,
+        None,
+        1 << 32,
+    ]
+
+
 def _list_manifests(versions_dir):
     # Ignore the version hint file, which is not a manifest.
     return [
