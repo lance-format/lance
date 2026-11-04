@@ -189,7 +189,8 @@ pub struct MinHashLshIndex {
     /// buckets not yet walked to their end.
     pub(super) window_pages: usize,
     cache: WeakLanceCache,
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Translates the stored row addresses; `None` when they are current.
+    remapper: Option<Remapper>,
 }
 
 impl std::fmt::Debug for MinHashLshIndex {
@@ -254,10 +255,32 @@ fn check_index_file(
 }
 
 impl MinHashLshIndex {
+    #[deprecated(
+        since = "15.0.0",
+        note = "a fragment reuse history translates through a Remapper; use \
+                MinHashLshIndex::load_remapped"
+    )]
     pub async fn load(
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::load_remapped(
+            store,
+            details,
+            DeprecatedRemapper::sync(frag_reuse_index),
+            cache,
+        )
+        .await
+    }
+
+    /// Load the index, translating every row address it reports through
+    /// `remapper` (`None` when they are current).
+    pub async fn load_remapped(
+        store: Arc<dyn IndexStore>,
+        details: &prost_types::Any,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let params = MinHashLshIndexParams::from_details_any(details)?;
@@ -333,7 +356,7 @@ impl MinHashLshIndex {
             candidate_batch,
             window_pages: (rows_per_batch(BAND_ROW_BYTES) / page_rows).max(1),
             cache: WeakLanceCache::from(cache),
-            frag_reuse_index,
+            remapper,
         }))
     }
 
@@ -374,32 +397,35 @@ impl MinHashLshIndex {
         mask: Arc<RowAddrMask>,
     ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
         let num_hashes = self.params.num_hashes as usize;
-        let remapper = self.frag_reuse_index.clone();
+        let remapper = self.remapper.clone();
         scan_rows(
             self.signatures.clone(),
             0,
             self.num_docs,
             rows_per_batch(signature_row_bytes(num_hashes)),
         )
-        .map(move |batch| {
-            let batch = batch?;
-            let (stored_ids, _) = signature_columns(&batch, num_hashes)?;
-            let mut row_ids = Vec::with_capacity(batch.num_rows());
-            let selected = BooleanArray::from_iter(stored_ids.values().iter().map(|&stored| {
-                let row_id = match remapper.as_deref() {
-                    Some(remapper) => remapper.remap_row_id(stored),
-                    None => Some(stored),
-                };
-                let keep = row_id.filter(|&row_id| mask.selected(row_id));
-                if let Some(row_id) = keep {
-                    row_ids.push(row_id);
+        .and_then(move |batch| {
+            let remapper = remapper.clone();
+            let mask = mask.clone();
+            async move {
+                let (stored_ids, _) = signature_columns(&batch, num_hashes)?;
+                let mut translated: Vec<Option<u64>> = stored_ids.iter().collect();
+                if let Some(remapper) = &remapper {
+                    remapper.translate_in_place(&mut translated).await?;
                 }
-                Some(keep.is_some())
-            }));
-            let filtered = filter_record_batch(&batch, &selected)?;
-            let mut columns = filtered.columns().to_vec();
-            columns[filtered.schema().index_of(ROW_ID)?] = Arc::new(UInt64Array::from(row_ids));
-            Ok(RecordBatch::try_new(filtered.schema(), columns)?)
+                let mut row_ids = Vec::with_capacity(batch.num_rows());
+                let selected = BooleanArray::from_iter(translated.into_iter().map(|row_id| {
+                    let keep = row_id.filter(|&row_id| mask.selected(row_id));
+                    if let Some(row_id) = keep {
+                        row_ids.push(row_id);
+                    }
+                    Some(keep.is_some())
+                }));
+                let filtered = filter_record_batch(&batch, &selected)?;
+                let mut columns = filtered.columns().to_vec();
+                columns[filtered.schema().index_of(ROW_ID)?] = Arc::new(UInt64Array::from(row_ids));
+                Ok(RecordBatch::try_new(filtered.schema(), columns)?)
+            }
         })
         .boxed()
     }
@@ -408,7 +434,7 @@ impl MinHashLshIndex {
         SignatureSource {
             reader: self.signatures.clone(),
             num_docs: self.num_docs,
-            frag_reuse_index: self.frag_reuse_index.clone(),
+            remapper: self.remapper.clone(),
             transform,
         }
     }
@@ -801,7 +827,7 @@ impl MinHashLshIndex {
             hits: TopHits::new(limit),
             query,
             mask,
-            remapper: self.frag_reuse_index.as_deref(),
+            remapper: self.remapper.as_ref(),
         };
         let mut levels = CandidateLevels::new(num_bands, cap);
         let missing = scorer.hits.missing();
@@ -971,6 +997,7 @@ impl MinHashLshIndex {
             metrics.record_index_cache_hit();
             let (row_ids, signatures) = signature_columns(&resident.batch, num_hashes)?;
             let first_doc = chunk * chunk_docs;
+            let mut rows = Vec::with_capacity(group.len());
             for &doc_id in group {
                 let offset = doc_id as usize - first_doc;
                 let Some(row_id) = row_ids.values().get(offset) else {
@@ -979,11 +1006,12 @@ impl MinHashLshIndex {
                         format!("resident signature chunk {chunk} has no doc {doc_id}"),
                     ));
                 };
-                scorer.score(
+                rows.push((
                     *row_id,
                     &signatures[offset * num_hashes..(offset + 1) * num_hashes],
-                );
+                ));
             }
+            scorer.score_rows(&rows).await?;
         }
         if pending.is_empty() {
             return Ok(());
@@ -1008,14 +1036,13 @@ impl MinHashLshIndex {
             ));
         }
         let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
-        for (row_id, signature) in row_ids
+        let rows: Vec<_> = row_ids
             .values()
             .iter()
+            .copied()
             .zip(signatures.chunks_exact(num_hashes))
-        {
-            scorer.score(*row_id, signature);
-        }
-        Ok(())
+            .collect();
+        scorer.score_rows(&rows).await
     }
 
     /// Score the rest of level `shared` by walking the buckets and the
@@ -1050,23 +1077,29 @@ impl MinHashLshIndex {
         while let Some(batch) = stream.try_next().await? {
             let end_row = first_row + batch.num_rows();
             let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
-            let mut scored = 0;
+            // The level's rows in this batch are scored together, so their
+            // addresses are translated as one batch.
+            let mut rows = Vec::new();
+            let mut level_done = false;
             while (pending as usize) < end_row {
                 let offset = pending as usize - first_row;
-                scorer.score(
+                rows.push((
                     row_ids.value(offset),
                     &signatures[offset * num_hashes..(offset + 1) * num_hashes],
-                );
-                scored += 1;
+                ));
                 match self.next_in_level(scan, shared, metrics).await? {
                     Some(doc_id) => pending = doc_id,
                     None => {
-                        metrics.record_comparisons(scored);
-                        return Ok(());
+                        level_done = true;
+                        break;
                     }
                 }
             }
-            metrics.record_comparisons(scored);
+            scorer.score_rows(&rows).await?;
+            metrics.record_comparisons(rows.len());
+            if level_done {
+                return Ok(());
+            }
             if scorer.done(floor) {
                 return Ok(());
             }
@@ -1376,18 +1409,27 @@ struct Scorer<'a> {
     hits: TopHits,
     query: &'a [SignatureValue],
     mask: &'a RowAddrMask,
-    remapper: Option<&'a dyn RowIdRemapper>,
+    remapper: Option<&'a Remapper>,
 }
 
 impl Scorer<'_> {
+    /// Score `rows`, `(stored row address, signature)` pairs, translating
+    /// their addresses as one batch.
+    async fn score_rows(&mut self, rows: &[(u64, &[SignatureValue])]) -> Result<()> {
+        let mut row_ids: Vec<Option<u64>> = rows.iter().map(|&(row_id, _)| Some(row_id)).collect();
+        if let Some(remapper) = self.remapper {
+            remapper.translate_in_place(&mut row_ids).await?;
+        }
+        for (row_id, &(_, signature)) in row_ids.into_iter().zip(rows) {
+            if let Some(row_id) = row_id {
+                self.score(row_id, signature);
+            }
+        }
+        Ok(())
+    }
+
+    /// Score one row at its current address.
     fn score(&mut self, row_id: u64, signature: &[SignatureValue]) {
-        let row_id = match self.remapper {
-            Some(remapper) => match remapper.remap_row_id(row_id) {
-                Some(row_id) => row_id,
-                None => return,
-            },
-            None => row_id,
-        };
         if !self.mask.selected(row_id) {
             return;
         }
@@ -2175,7 +2217,7 @@ mod selection_tests {
             .unwrap();
 
         let cache = LanceCache::no_cache();
-        let mut loaded = MinHashLshIndex::load(store, &details, None, &cache)
+        let mut loaded = MinHashLshIndex::load_remapped(store, &details, None, &cache)
             .await
             .unwrap();
         // One row per page and one page per refill make every later row of a

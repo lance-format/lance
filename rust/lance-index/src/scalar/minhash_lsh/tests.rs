@@ -63,7 +63,7 @@ async fn load(
     details: &prost_types::Any,
     cache: &LanceCache,
 ) -> Arc<MinHashLshIndex> {
-    MinHashLshIndex::load(store.clone(), details, None, cache)
+    MinHashLshIndex::load_remapped(store.clone(), details, None, cache)
         .await
         .unwrap()
 }
@@ -615,7 +615,7 @@ async fn test_load_rejects_mismatched_details_or_schema() {
         .await
         .unwrap();
     let other = MinHashLshIndexParams::from_json(r#"{"shingle_size": 4}"#).unwrap();
-    let err = MinHashLshIndex::load(
+    let err = MinHashLshIndex::load_remapped(
         store.clone(),
         &other.details_any().unwrap(),
         None,
@@ -640,7 +640,7 @@ async fn test_load_rejects_mismatched_details_or_schema() {
         .await
         .unwrap();
     writer.finish().await.unwrap();
-    let err = MinHashLshIndex::load(
+    let err = MinHashLshIndex::load_remapped(
         store.clone(),
         &params.details_any().unwrap(),
         None,
@@ -753,10 +753,10 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
         (2u64, None),
         (3u64, Some(compacted(3))),
     ]));
-    let index = MinHashLshIndex::load(
+    let index = MinHashLshIndex::load_remapped(
         store.clone(),
         &MinHashLshIndexParams::default().details_any().unwrap(),
-        Some(Arc::new(remapper)),
+        lance_index_core::remapping::DeprecatedRemapper::sync(Some(Arc::new(remapper))),
         &LanceCache::no_cache(),
     )
     .await
