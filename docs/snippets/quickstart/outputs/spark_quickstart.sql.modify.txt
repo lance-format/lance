@@ -1,0 +1,5 @@
+id	name	price
+1	red running shoes	79.0
+2	blue trail running shoes	120.0
+3	leather hiking boots	150.0
+6	trail socks	15.0

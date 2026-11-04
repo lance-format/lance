@@ -36,9 +36,11 @@ use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -118,6 +120,13 @@ impl ExecutionPlan for PkBlockFilterExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -295,7 +304,8 @@ impl datafusion::physical_plan::RecordBatchStream for PkBlockFilterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;

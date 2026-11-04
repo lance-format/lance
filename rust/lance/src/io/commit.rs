@@ -62,9 +62,12 @@ use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
     write_manifest_file,
 };
-use crate::index::DatasetIndexInternalExt;
+use crate::index::frag_reuse_with_stable_row_ids::history::{
+    ReadSnapshot, validate_frag_reuse_history,
+};
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::details::infer_missing_vector_details;
-use crate::index::{index_is_usable, load_all_indices};
+use crate::index::{loading::load_all_indices, segment::index_is_usable};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::Session;
 use crate::session::caches::DSMetadataCache;
@@ -78,6 +81,8 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
+#[cfg(test)]
+mod conflict_matrix;
 pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
@@ -1311,6 +1316,13 @@ pub(crate) async fn do_commit_detached_transaction(
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
     ensure_can_write_manifest(&dataset.manifest)?;
+    // Definitions are allocated against the version chain: a detached
+    // manifest's ids and field-identity activation would be invisible to it.
+    if write_config.has_clustering_definitions() {
+        return Err(Error::invalid_input(
+            "a clustering definitions list cannot be committed detached",
+        ));
+    }
     let mut transaction = transaction.clone();
     canonicalize_non_reusable_field_ids(Some(&dataset.manifest), &mut transaction.operation, None)?;
     let transaction = &transaction;
@@ -1420,6 +1432,24 @@ pub(crate) async fn do_commit_detached_transaction(
             &recovered_coverage,
             manifest.version,
         )?;
+
+        // Checked against the manifest the detached one is built on, which need
+        // not be the transaction's read version.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            dataset,
+            ReadSnapshot::Version {
+                base: dataset,
+                version: transaction.read_version,
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            return Err(error);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -1718,12 +1748,22 @@ pub(crate) async fn commit_transaction(
     retry_timeout: Duration,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
+    expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
+    let conditional_commit = expected_latest_version.is_some();
+    if let Some(expected) = expected_latest_version
+        && expected != read_version
+    {
+        return Err(Error::invalid_input(format!(
+            "expected latest version {expected} does not match the transaction read version \
+             {read_version}"
+        )));
+    }
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
@@ -1743,7 +1783,8 @@ pub(crate) async fn commit_transaction(
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
     // covering every fragment live here holds every row compaction had copied
-    // in by then.
+    // in by then. Fragment reuse history refusals are classified against it,
+    // never against a rebased read version.
     //
     // The Arc is kept rather than cloned out: `load_all_indices` returns shared
     // cached data, so the common case is a cache hit rather than a read.
@@ -1760,7 +1801,11 @@ pub(crate) async fn commit_transaction(
     // `transaction`.
     let mut tagged_rewrite = None;
 
-    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+    let num_attempts = if conditional_commit {
+        1
+    } else {
+        std::cmp::max(commit_config.num_retries, 1)
+    };
     let mut backoff = SlotBackoff::default();
     // `retry_timeout` bounds the conflict-retry phase, which starts once the
     // first attempt has caught up with the versions committed since
@@ -1769,12 +1814,18 @@ pub(crate) async fn commit_transaction(
     // catch-up is work the commit must do however many retries it gets.
     let mut retry_start: Option<Instant> = None;
 
-    // Other transactions that may have been committed since the read_version.
-    // We keep pair of (version, transaction). No other transactions to check initially
-    let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
     // Track the transaction file written in the current loop iteration so we can
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
+
+    // An allocating clustering submission from a reusable-id snapshot: judge
+    // every transaction in its window for field-identity changes; see
+    // `refuse_field_identity_change`. Decided from the version the transaction
+    // read, not from the handle it was submitted through, which may already
+    // be at a later, activated version.
+    let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
+        && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
+    .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1783,10 +1834,25 @@ pub(crate) async fn commit_transaction(
         // slower performance for concurrent writes. But that makes the fast path
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
-        // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if !strict_overwrite {
+        if let Some(expected_version) = expected_latest_version {
+            ensure_can_write_manifest(&dataset.manifest)?;
+            let (latest_manifest, _) = dataset.latest_manifest().await?;
+            if latest_manifest.version != expected_version {
+                return Err(Error::retryable_commit_conflict_source(
+                    expected_version,
+                    format!(
+                        "latest version advanced from the expected {expected_version} to {} \
+                         before the conditional restore could commit",
+                        latest_manifest.version
+                    )
+                    .into(),
+                ));
+            }
+        } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
-            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+            let (loaded_dataset, other_transactions) =
+                load_and_sort_new_transactions(&dataset).await?;
+            dataset = loaded_dataset;
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
@@ -1805,18 +1871,29 @@ pub(crate) async fn commit_transaction(
             let missing = (checked_since + 1..=dataset.manifest.version)
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
-            if rebase.needs_versions(&missing) {
-                return Err(Error::retryable_commit_conflict_source(
+            rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            // A cleaned-up version may have replaced a key field; an identity
+            // window with a hole cannot be judged, so it is refused.
+            if identity_fence.is_some() && !missing.is_empty() {
+                return Err(Error::commit_conflict_source(
                     dataset.manifest.version,
                     format!(
-                        "versions {missing:?} were cleaned up, so this index cannot be carried \
-                         through the deferred compaction it covers; rebuild it"
+                        "versions {missing:?} between this submission's read version and the \
+                         latest were cleaned up, so the field identity of its clustering keys \
+                         cannot be checked; reload the table and rebuild the list"
                     )
                     .into(),
                 ));
             }
 
             for (other_version, other_transaction) in other_transactions.iter() {
+                if let Some(read_schema) = &identity_fence {
+                    conflict_resolver::refuse_field_identity_change(
+                        read_schema,
+                        other_transaction,
+                        *other_version,
+                    )?;
+                }
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
@@ -1939,6 +2016,24 @@ pub(crate) async fn commit_transaction(
             &recovered_coverage,
             target_version,
         )?;
+
+        // Before the write, so a refusal is final rather than a commit outcome
+        // to verify. Every attempt checks against the manifest it replaces.
+        if let Err(error) = validate_frag_reuse_history(
+            &transaction.operation,
+            &dataset,
+            ReadSnapshot::Loaded {
+                dataset: &read_version_dataset,
+                indices: read_version_indices.as_slice(),
+            },
+            &manifest,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            return Err(error);
+        }
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -2088,6 +2183,12 @@ pub(crate) async fn commit_transaction(
                             &current_transaction_file,
                         )
                         .await;
+                        if conditional_commit {
+                            return Err(Error::retryable_commit_conflict_source(
+                                target_version,
+                                Box::new(err),
+                            ));
+                        }
                         return Err(err);
                     }
                     CommitOutcome::Unknown => {
@@ -2102,26 +2203,33 @@ pub(crate) async fn commit_transaction(
     }
 
     cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
-    Err(crate::Error::commit_conflict_source(
-        target_version,
-        format!(
-            "Failed to commit the transaction after {} retries.",
-            commit_config.num_retries
-        )
-        .into(),
-    ))
+    let message = format!(
+        "Failed to commit the transaction after {} retries.",
+        commit_config.num_retries
+    );
+    if conditional_commit {
+        Err(Error::retryable_commit_conflict_source(
+            target_version,
+            message.into(),
+        ))
+    } else {
+        Err(Error::commit_conflict_source(
+            target_version,
+            message.into(),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::datatypes::{Field, Schema};
+    use lance_core::datatypes::{Field, LANCE_UNENFORCED_PRIMARY_KEY, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
@@ -2140,7 +2248,12 @@ mod tests {
     use super::*;
 
     use crate::Dataset;
-    use crate::dataset::{CommitBuilder, WriteMode, WriteParams};
+    use crate::dataset::cleanup::CleanupPolicyBuilder;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::{
+        CommitBuilder, DeleteBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched,
+        WhenNotMatched, WriteMode, WriteParams,
+    };
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -2183,6 +2296,456 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::Cleanup { .. }));
         assert!(error.to_string().contains("lance.auto_cleanup.interval"));
+    }
+
+    #[rstest::rstest]
+    #[case::delete("delete")]
+    #[case::update("update")]
+    #[case::merge_insert("merge_insert")]
+    #[case::compact("compact")]
+    #[tokio::test]
+    async fn test_stale_mutation_preserves_deletes_after_cleanup(#[case] operation: &str) {
+        let stale = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let mut latest = stale.clone();
+        latest.delete("id = 0").await.unwrap();
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        let stats = latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, 2);
+        assert_eq!(stale.version().version, 1);
+
+        let result = match operation {
+            "update" => {
+                UpdateBuilder::new(Arc::new(stale))
+                    .update_where("id = 3")
+                    .unwrap()
+                    .set("id", "30")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .execute()
+                    .await
+                    .unwrap()
+                    .new_dataset
+            }
+            "delete" => {
+                DeleteBuilder::new(Arc::new(stale), "id = 3")
+                    .execute()
+                    .await
+                    .unwrap()
+                    .new_dataset
+            }
+            "merge_insert" => {
+                let batch = arrow_array::record_batch!(("id", Int32, [3])).unwrap();
+                MergeInsertBuilder::try_new(Arc::new(stale), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .try_build()
+                    .unwrap()
+                    .execute_reader(RecordBatchIterator::new(
+                        vec![Ok(batch.clone())],
+                        batch.schema(),
+                    ))
+                    .await
+                    .unwrap()
+                    .0
+            }
+            "compact" => {
+                let mut stale = stale;
+                let error = compact_files(&mut stale, CompactionOptions::default(), None)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("versions [2]"), "{error}");
+                Arc::new(latest)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(result.count_rows(Some("id = 0".into())).await.unwrap(), 0);
+        assert_eq!(
+            result.count_rows(Some("id = 3".into())).await.unwrap(),
+            usize::from(matches!(operation, "merge_insert" | "compact"))
+        );
+        assert_eq!(
+            result.count_rows(None).await.unwrap(),
+            if operation == "delete" { 6 } else { 7 }
+        );
+        if operation == "update" {
+            assert_eq!(result.count_rows(Some("id = 30".into())).await.unwrap(), 1);
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::partial("id = 3")]
+    #[case::whole_fragment("id < 4")]
+    #[tokio::test]
+    async fn test_staged_delete_rejects_cleaned_history(
+        #[case] predicate: &str,
+        #[values(false, true)] is_compaction: bool,
+        #[values(false, true)] keep_read_version: bool,
+    ) {
+        let stale = Arc::new(
+            gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        // Stage before cleanup, so a missing data file cannot mask the unsafe commit.
+        let staged = DeleteBuilder::new(stale.clone(), predicate)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let mut latest = stale.as_ref().clone();
+        if is_compaction {
+            compact_files(&mut latest, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+        } else {
+            latest.delete("id = 0").await.unwrap();
+        }
+        let concurrent_version = latest.version().version;
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                concurrent_version,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        let missing_versions = (2..=concurrent_version).collect::<Vec<_>>();
+        let versions =
+            (if keep_read_version { 2 } else { 1 }..=concurrent_version).collect::<Vec<_>>();
+        let stats = latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(versions.clone())
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, versions.len() as u64);
+
+        let mut builder = CommitBuilder::new(stale);
+        if let Some(affected_rows) = staged.affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        let error = builder.execute(staged.transaction).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("versions {missing_versions:?}")),
+            "{error}"
+        );
+        assert!(error.to_string().contains("existing fragments"), "{error}");
+        assert_eq!(
+            latest.latest_version_id().await.unwrap(),
+            concurrent_version + 1
+        );
+        assert_eq!(
+            latest.count_rows(None).await.unwrap(),
+            if is_compaction { 8 } else { 7 }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::intact_history(&[])]
+    #[case::gap_read_retained(&[2])]
+    #[case::gap_read_removed(&[1, 2])]
+    #[tokio::test]
+    async fn test_insert_only_merge_insert_after_cleanup(
+        #[case] cleaned_versions: &[u64],
+        #[values(false, true)] is_staged: bool,
+        #[values("id", "value")] on: &str,
+    ) {
+        let initial =
+            arrow_array::record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 1, 2, 3]))
+                .unwrap();
+        let mut fields = initial.schema().fields().to_vec();
+        fields[0] = Arc::new(
+            fields[0]
+                .as_ref()
+                .clone()
+                .with_nullable(false)
+                .with_metadata(HashMap::from([(
+                    LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+        );
+        let initial = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            initial.columns().to_vec(),
+        )
+        .unwrap();
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stale.get_fragments().len(), 2);
+        let upsert = |dataset| {
+            MergeInsertBuilder::try_new(dataset, vec![on.into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+        let batch = if on == "id" {
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [101])).unwrap()
+        } else {
+            arrow_array::record_batch!(("id", Int32, [101]), ("value", Int32, [100])).unwrap()
+        };
+        // Stage before the concurrent insert and cleanup, as a separate writer would.
+        let staged = if is_staged {
+            let staged = upsert(stale.clone())
+                .execute_uncommitted_batches(vec![batch.clone()])
+                .await
+                .unwrap();
+            let Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                inserted_rows_filter,
+                ..
+            } = &staged.transaction.operation
+            else {
+                panic!("expected an Update transaction");
+            };
+            assert!(updated_fragments.is_empty());
+            assert!(removed_fragment_ids.is_empty());
+            assert_eq!(inserted_rows_filter.is_some(), on == "id");
+            Some(staged)
+        } else {
+            None
+        };
+        let concurrent =
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [100])).unwrap();
+        let (latest, _) = upsert(stale.clone())
+            .execute_batches(vec![concurrent])
+            .await
+            .unwrap();
+        let latest = CommitBuilder::new(latest)
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        if !cleaned_versions.is_empty() {
+            let stats = latest
+                .cleanup(
+                    CleanupPolicyBuilder::default()
+                        .versions(cleaned_versions.to_vec())
+                        .unwrap()
+                        .build(),
+                )
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(stats.old_versions, cleaned_versions.len() as u64);
+        }
+
+        let result = if let Some(staged) = staged {
+            let mut builder = CommitBuilder::new(stale);
+            if let Some(affected_rows) = staged.affected_rows {
+                builder = builder.with_affected_rows(affected_rows);
+            }
+            let result = builder.execute(staged.transaction).await;
+            if on == "id" {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                let message = if cleaned_versions.is_empty() {
+                    "preempted by concurrent transaction"
+                } else {
+                    "inserted keys"
+                };
+                assert!(error.to_string().contains(message), "{error}");
+                if !cleaned_versions.is_empty() {
+                    assert!(error.to_string().contains("versions [2]"), "{error}");
+                }
+                assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+                assert_eq!(latest.count_rows(None).await.unwrap(), 5);
+                assert_eq!(latest.count_rows(Some("id = 100".into())).await.unwrap(), 1);
+                return;
+            }
+            result.unwrap()
+        } else {
+            let (result, stats) = upsert(stale).execute_batches(vec![batch]).await.unwrap();
+            assert_eq!(stats.num_attempts, if on == "id" { 2 } else { 1 });
+            result.as_ref().clone()
+        };
+        assert_eq!(result.version().version, 4);
+        assert_eq!(
+            result
+                .count_rows(Some(format!("{on} = 100")))
+                .await
+                .unwrap(),
+            if on == "id" { 1 } else { 2 }
+        );
+        assert_eq!(
+            result
+                .count_rows(Some(if on == "id" {
+                    "id = 100 AND value = 101".into()
+                } else {
+                    "id = 101 AND value = 100".into()
+                }))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            result.count_rows(None).await.unwrap(),
+            if on == "id" { 5 } else { 6 }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::append(false, false)]
+    #[case::index_after_delete(true, false)]
+    #[case::index_after_add_columns(true, true)]
+    #[tokio::test]
+    async fn test_safe_commit_survives_cleaned_history(
+        #[case] is_index: bool,
+        #[case] is_column_add: bool,
+    ) {
+        let stale = Arc::new(
+            gen_batch()
+                .col("id", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        let transaction = if is_index {
+            let params = lance_index::scalar::ScalarIndexParams::for_builtin(
+                lance_index::scalar::BuiltinIndexType::BTree,
+            );
+            let mut index_dataset = stale.as_ref().clone();
+            let index = crate::index::CreateIndexBuilder::new(
+                &mut index_dataset,
+                &["id"],
+                IndexType::BTree,
+                &params,
+            )
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            Transaction::new(
+                1,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            )
+        } else {
+            let batch = arrow_array::record_batch!(("id", Int32, [100])).unwrap();
+            crate::dataset::InsertBuilder::new(stale.clone())
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap()
+        };
+        let mut latest = stale.as_ref().clone();
+        if is_column_add {
+            latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            latest.delete("id = 0").await.unwrap();
+        }
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![1, 2])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+
+        let result = CommitBuilder::new(stale)
+            .execute(transaction)
+            .await
+            .unwrap();
+        assert_eq!(result.version().version, 4);
+        assert_eq!(
+            result.count_rows(Some("id = 0".into())).await.unwrap(),
+            usize::from(is_column_add)
+        );
+        assert_eq!(
+            result.count_rows(None).await.unwrap(),
+            if is_index {
+                7 + usize::from(is_column_add)
+            } else {
+                8
+            }
+        );
+        if is_index {
+            let indices = result.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1])
+            );
+            assert_eq!(result.count_rows(Some("id = 3".into())).await.unwrap(), 1);
+        }
     }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
@@ -3038,6 +3601,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3051,6 +3616,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -3089,6 +3656,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -3102,6 +3671,8 @@ mod tests {
                 physical_rows: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
         assert_eq!(manifest.fragments.as_ref(), &expected_fragments);
@@ -3147,6 +3718,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let mut manifest = Manifest::new(
@@ -3551,6 +4124,7 @@ mod tests {
             DEFAULT_COMMIT_RETRY_TIMEOUT,
             dataset.manifest_location.naming_scheme,
             None,
+            None,
         )
         .await
         .expect("the inline transaction must identify the landed commit");
@@ -3709,6 +4283,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             schema,
@@ -3745,6 +4321,8 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         Manifest::new(
             Schema::default(),
@@ -3993,6 +4571,8 @@ mod tests {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragments = vec![
             make_fragment(0, vec![shared_a.clone(), shared_b.clone()]),
@@ -4318,6 +4898,8 @@ mod tests {
             physical_rows: Some(100),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let manifest = Manifest::new(
             schema,
@@ -4404,6 +4986,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4450,6 +5034,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let transaction = Transaction::new(
             42,
@@ -4475,5 +5061,108 @@ mod tests {
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
         assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
+    }
+
+    /// The manifest message of the file `dataset` was committed to, without
+    /// its length prefix.
+    async fn committed_manifest_message(dataset: &Dataset) -> Vec<u8> {
+        let location = dataset.manifest_location();
+        let file = dataset
+            .object_store
+            .read_one_all(&location.path)
+            .await
+            .unwrap();
+        let footer = file.len() - 16;
+        let pos = i64::from_le_bytes(file[footer..footer + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(pos + 4 + len, footer);
+        file[pos + 4..footer].to_vec()
+    }
+
+    /// The committed message is byte-identical to encoding the committed
+    /// manifest from scratch.
+    async fn assert_committed_manifest_matches(dataset: &Dataset) {
+        use prost::Message;
+
+        assert_eq!(
+            committed_manifest_message(dataset).await,
+            lance_table::format::pb::Manifest::from(dataset.manifest.as_ref()).encode_to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_manifests_match_fresh_encoding() {
+        let test_dir = TempStrDir::default();
+        let rows = |start: i32| {
+            gen_batch()
+                .col("i", array::step_custom::<Int32Type>(start, 1))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(2))
+        };
+        let params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(rows(0), &test_dir, Some(params.clone()))
+            .await
+            .unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Append.
+        dataset
+            .append(rows(20), Some(params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 4);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Update: fragment 0 is rewritten entirely (removed), fragment 1 in
+        // part (updated with a deletion file), and the new rows are added.
+        let dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 15")
+            .unwrap()
+            .set("i", "i + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!(dataset.manifest.fragments[0].deletion_file.is_some());
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Delete: fragment 2 entirely, fragment 3 in part.
+        let mut dataset = dataset.as_ref().clone();
+        dataset.delete("i >= 20 AND i < 35").await.unwrap();
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Rewrite: compaction replaces the fragments with deletions.
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+        );
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Cold start: commit after reopening the dataset.
+        let mut dataset = Dataset::open(&test_dir).await.unwrap();
+        dataset.delete("i = 1001").await.unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
     }
 }

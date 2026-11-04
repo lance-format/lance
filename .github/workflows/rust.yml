@@ -49,6 +49,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  protobuf:
+    name: Check protobuf sources and build without protoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROTOC: /protoc-must-not-be-used
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          components: rustfmt, clippy
+      - name: Check generator formatting
+        run: cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check generator lints
+        run: cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
+      - name: Check generated sources
+        run: cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check Lance without protoc
+        run: cargo check --locked -p lance
+
   package:
     name: Check crates are publishable
     runs-on: ubuntu-24.04
@@ -59,14 +79,11 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Keep the excludes in sync with
-      # .github/workflows/cargo-publish.yml.
+      # which the other jobs already cover. Package the Arrow-versioned helper
+      # crates too even though releases publish them separately.
       - name: Package crates
         run: |
-          cargo package --workspace --no-verify \
-            --exclude lance-arrow-stats \
-            --exclude lance-arrow-scalar \
-            --all-features
+          cargo package --workspace --no-verify --all-features
 
   rustdoc:
     runs-on: ubuntu-24.04
@@ -413,6 +430,26 @@ jobs:
         run: cargo nextest run --cargo-profile ci --locked --no-run
       - name: Run tests
         run: cargo nextest run --cargo-profile ci
+  windows-arm-build:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci
 
   qemu-pre-haswell:
     # Builds lance-linalg's lib tests once in release mode and runs them twice: on
@@ -530,7 +567,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.94.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.95.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang

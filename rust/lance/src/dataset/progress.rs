@@ -10,10 +10,13 @@ use crate::Result;
 
 /// Progress of writing a [Fragment].
 ///
-/// When start writing a [`Fragment`], WriteProgress::begin() will be called before
-/// writing any data.
+/// `begin` is called before any data of a [`Fragment`] is written, and `complete` after
+/// its data file is closed. A `complete` does not mean the file will be committed: a
+/// later failure can still remove it. An error from either method fails the write.
 ///
-/// When stop writing a [`Fragment`], WriteProgress::complete() will be called after.
+/// `FragmentCreateBuilder::write` and `FileFragment::create` pass the caller's id (0 if
+/// none) and list the data file at `begin`. Every other write leaves the id at the
+/// placeholder 0 until commit and lists no data files at `begin`.
 ///
 /// This might be called concurrently when writing multiple [`Fragment`]s. Therefore,
 /// the methods require non-exclusive access to `self`.
@@ -21,7 +24,7 @@ use crate::Result;
 /// This is an experimental API and may change in the future.
 #[async_trait]
 pub trait WriteFragmentProgress: std::fmt::Debug + Sync + Send {
-    /// Indicate the beginning of writing a [Fragment], with the in-flight multipart ID.
+    /// Indicate the beginning of writing a [Fragment].
     async fn begin(&self, fragment: &Fragment) -> Result<()>;
 
     /// Complete writing a [Fragment].
