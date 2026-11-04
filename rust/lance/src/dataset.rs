@@ -70,10 +70,12 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+pub mod compaction_stats;
 mod data_file;
 mod data_file_part;
 pub mod deletions;
 pub mod delta;
+pub mod expire;
 pub mod files;
 pub mod fragment;
 pub(crate) mod fragment_slice;
@@ -121,6 +123,7 @@ pub mod update_join_bench;
 mod update_join_options;
 pub mod updater;
 mod utils;
+pub mod version_retention;
 pub(crate) mod versions;
 pub mod write;
 
@@ -913,7 +916,7 @@ impl Dataset {
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            crate::index::warn_about_unsupported_indices(&indices);
+            crate::index::loading::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
@@ -2090,7 +2093,7 @@ impl Dataset {
         let mut scan = self.scan();
         scan.with_row_address();
         let batches = scan.try_into_stream().await?;
-        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+        let plan = Arc::new(blob::BlobV2BatchRewritePlan::try_new(
             self.schema(),
             lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
             false,
@@ -2751,7 +2754,7 @@ impl Dataset {
                 .base_paths
                 .get(&id)
                 .ok_or_else(|| {
-                    Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
                 })?
                 .extract_path(self.session.store_registry()),
             None => Ok(self.base.clone()),
@@ -3452,7 +3455,7 @@ impl Dataset {
         // uuids or overlapping coverage are no less corrupt for involving an
         // index this build has no reader for. `migrate_indices` already runs the
         // same overlap check over the complete list on every commit.
-        let indices = crate::index::load_all_indices(self).await?;
+        let indices = crate::index::loading::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
@@ -3533,9 +3536,9 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them,
-    /// contiguously from `start`, and return the resulting `next_row_id`
-    /// high-water mark.
+    /// Assign a stable row ID sequence to every fragment, contiguously from
+    /// `start`, and return the resulting `next_row_id` high-water mark. Only
+    /// reached when the feature is off, so no fragment has a sequence yet.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
         let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
@@ -3557,9 +3560,14 @@ impl Dataset {
 
     /// Migrate a table to use stable row IDs.
     ///
-    /// Stable row IDs assign a persistent identifier to each row that remains
-    /// stable across compaction operations. This enables more efficient updates
-    /// to secondary indices.
+    /// Afterwards a row keeps the same id for its lifetime: compaction, update
+    /// and merge insert relocate or rewrite the row without changing its id.
+    ///
+    /// Migration assigns a fresh id to every physical row position, in fragment
+    /// order, starting from the dataset's `next_row_id` high-water mark. Before
+    /// migration `_rowid` is a row address, a different namespace from the ids
+    /// assigned here, so a `_rowid` recorded beforehand must not be reused as a
+    /// row id afterwards.
     ///
     /// A single Merge commit assigns row ID sequences to all fragments and
     /// activates the stable row ID feature flag atomically. Because `Merge`

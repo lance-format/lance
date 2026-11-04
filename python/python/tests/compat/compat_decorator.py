@@ -11,7 +11,6 @@ for testing forward and backward compatibility across Lance versions.
 import inspect
 import json
 import os
-import subprocess
 import sys
 import urllib.request
 from contextlib import contextmanager
@@ -29,11 +28,14 @@ def _fetch_stable_versions() -> List[Version]:
         ) as response:
             data = json.loads(response.read())
             releases = data["releases"].keys()
-            stable_versions = [
-                Version(v)
-                for v in releases
-                if not any(c in v for c in ["a", "b", "rc"])
-            ]
+            stable_versions = []
+            for release in releases:
+                try:
+                    version = Version(release)
+                except InvalidVersion:
+                    continue
+                if not version.is_prerelease and not version.is_devrelease:
+                    stable_versions.append(version)
             stable_versions.sort()
             return stable_versions
     except Exception as e:
@@ -65,106 +67,6 @@ def recent_major_versions(n: int) -> List[str]:
     return major_versions
 
 
-def _build_version() -> Optional[str]:
-    """The version of the build under test, when there is one to read.
-
-    A host interpreter that only drives provisioned venvs has no pylance of
-    its own (compat-pair.yml and nightly_run.yml install the suite's
-    dependencies and nothing else), so this is legitimately unavailable and
-    says why rather than looking like a failed index query.
-    """
-    try:
-        import lance
-    except ImportError as e:
-        print(
-            f"Warning: no pylance to read the build's own version from: {e}",
-            file=sys.stderr,
-        )
-        return None
-
-    return lance.__version__
-
-
-def _fetch_last_beta_release(current_version: Optional[str] = None):
-    """Returns the newest pre-release on the index older than the build under test.
-
-    Not simply the newest pre-release: the release automation bumps main's
-    version in the same commit that cuts a beta, so from the moment that beta
-    is published it carries the version every branch is also building. Pinning
-    it would hand a compat test a venv labelled with the build's own version
-    and call it the older build.
-
-    `current_version` is the build to measure against, defaulting to the
-    installed one. Without it there is no way to tell a release older than the
-    build from the build itself, so the slot stays empty.
-
-    Uses pip to query the fury.io indices, which are searched alongside PyPI,
-    for pre-release versions of pylance.
-    """
-    build_version = current_version or _build_version()
-    if build_version is None:
-        return None
-    build = Version(build_version)
-    try:
-        # Use pip index to get versions from fury.io
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "index",
-                "versions",
-                "pylance",
-                "--pre",
-                "--extra-index-url",
-                "https://pypi.fury.io/lance-format/",
-                "--extra-index-url",
-                "https://pypi.fury.io/lancedb/",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode == 0:
-            # Parse output to find available versions
-            # Output format: "pylance (x.y.z)"
-            # Available versions: x.y.z.betaN, x.y.z, ...
-            for line in result.stdout.splitlines():
-                if "Available versions:" in line:
-                    versions_str = line.split("Available versions:")[1].strip()
-                    older_prereleases = []
-                    for raw in versions_str.split(","):
-                        raw = raw.strip()
-                        try:
-                            parsed = Version(raw)
-                        except InvalidVersion:
-                            continue
-                        if parsed.is_prerelease and parsed < build:
-                            older_prereleases.append((parsed, raw))
-                    if older_prereleases:
-                        return max(older_prereleases)[1]
-                    print(
-                        "Warning: no pre-release older than the build under test "
-                        f"({build}) is available; compat tests will not cover one",
-                        file=sys.stderr,
-                    )
-                    return None
-
-        print(
-            "Warning: Could not fetch latest beta release from fury.io",
-            file=sys.stderr,
-        )
-        return None
-
-    except Exception as e:
-        print(
-            f"Warning: Could not fetch latest beta release from fury.io: {e}",
-            file=sys.stderr,
-        )
-        return None
-
-
 _SNAPSHOT: Optional[Dict[str, Any]] = None
 
 
@@ -173,17 +75,14 @@ def version_snapshot() -> Dict[str, Any]:
 
     Every process collecting these tests has to agree on this, because it
     decides the `version` parameters and pytest-xdist aborts a run whose workers
-    collected different tests. Resolving it takes two network queries, so it is
+    collected different tests. Resolving it takes a network query, so it is
     resolved once per process -- and once per run on the xdist controller, then
     handed down to the workers by `pytest_configure_node` in the root tests
     conftest.
     """
     global _SNAPSHOT
     if _SNAPSHOT is None:
-        _SNAPSHOT = {
-            "stable": [str(v) for v in _fetch_stable_versions()],
-            "beta": _fetch_last_beta_release(),
-        }
+        _SNAPSHOT = {"stable": [str(v) for v in _fetch_stable_versions()]}
     return _SNAPSHOT
 
 
@@ -194,16 +93,15 @@ def use_version_snapshot(snapshot: Dict[str, Any]) -> None:
 
 def pylance_stable_versions() -> List[Version]:
     """Sorted stable pylance versions published to PyPI."""
-    return [Version(v) for v in version_snapshot()["stable"]]
+    versions = [Version(v) for v in version_snapshot()["stable"]]
+    if any(v.is_prerelease or v.is_devrelease for v in versions):
+        raise ValueError("Compatibility tests accept only stable releases")
+    return versions
 
 
 def compat_versions() -> List[str]:
-    """The pylance versions every compat test is parametrized over."""
-    versions = recent_major_versions(3)
-    beta = version_snapshot()["beta"]
-    if beta is not None:
-        versions.append(beta)
-    return versions
+    """The stable pylance versions every compat test is parametrized over."""
+    return recent_major_versions(3)
 
 
 class UpgradeDowngradeTest:
@@ -218,15 +116,8 @@ class UpgradeDowngradeTest:
     #: True for the duration of a method body executing inside the pinned
     #: old venv (see VenvExecutor.execute_method). A subclass that needs to
     #: tell "the old build is running this" from "the current build is
-    #: running this" must read this flag, not compare `lance.__version__`
-    #: against `self.compat_version`: the current build's own version is not
-    #: a fixed marker distinct from every pinned release -- it tracks
-    #: whatever beta number the release automation has most recently cut on
-    #: main, which a long-lived PR branch can coincidentally match exactly
-    #: (both derive the "next" beta number from the same counter). When that
-    #: happens, a version-string comparison silently picks the wrong branch
-    #: with no error, which is far worse than this flag being technically
-    #: redundant with compat_version the rest of the time.
+    #: running this" must read this flag, not infer the runtime role from a
+    #: version string.
     _running_in_old_venv: bool = False
 
     def create(self):
@@ -322,16 +213,18 @@ def compat_test(min_version: str = "0.16.0"):
             # Write data
             pass
     """
+    minimum = Version(min_version)
+    if minimum.is_prerelease or minimum.is_devrelease:
+        raise ValueError(
+            f"Compatibility tests accept only stable releases, got {min_version!r}"
+        )
+
     # Sorted rather than taken straight off the set: set iteration order for
     # strings depends on PYTHONHASHSEED, which differs per process, so every
     # pytest-xdist worker would otherwise collect these parameters in its own
     # order and xdist rejects the run as an inconsistent collection.
     versions = sorted(
-        (
-            v
-            for v in {min_version, *compat_versions()}
-            if Version(v) >= Version(min_version)
-        ),
+        (v for v in {min_version, *compat_versions()} if Version(v) >= minimum),
         key=Version,
     )
 

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import timedelta
 from threading import Lock
 from typing import Dict, Optional
 
@@ -85,6 +86,7 @@ from lance_namespace.errors import (
     TableBranchAlreadyExistsError,
     TableBranchNotFoundError,
     TableNotFoundError,
+    ThrottlingError,
 )
 
 
@@ -691,6 +693,16 @@ class TestPythonNamespaceErrorMapping:
         ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
         with pytest.raises(TableBranchNotFoundError, match="no such branch"):
             lance.dataset(namespace_client=ns, table_id=["t"])
+
+    def test_throttling_retry_after_survives_callback_round_trip(self):
+        exc = ThrottlingError("slow down")
+        exc.retry_after = timedelta(seconds=7)
+        ns = _RaisingNamespace(exc)
+
+        with pytest.raises(ThrottlingError) as exc_info:
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        assert exc_info.value.retry_after == timedelta(seconds=7)
 
     def test_foreign_code_attribute_not_trusted(self):
         # The foreign exception must surface as itself, not be reinterpreted

@@ -9,6 +9,13 @@ import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
+from ._dataset.cleanup import CleanupPolicy, CleanupRule, KeepOne, RemoveAll
+from ._dataset.index import Index, IndexFile
+from ._dataset.merge_insert import MergeInsertBuilder
+from ._dataset.optimize import AutoCleanupConfig
+from ._dataset.scanner import LanceScanner
+from ._dataset.stats import DataStatistics, FieldStatistics
+from ._dataset.transaction import LanceOperation, Transaction
 from .blob import (
     Blob,
     BlobArray,
@@ -23,20 +30,8 @@ from .blob import (
     blob_field,
 )
 from .dataset import (
-    CleanupPolicy,
-    CleanupRule,
-    DataStatistics,
-    FieldStatistics,
-    Index,
-    IndexFile,
-    KeepOne,
     LanceDataset,
-    LanceOperation,
-    LanceScanner,
-    MergeInsertBuilder,
-    RemoveAll,
     Session,
-    Transaction,
     __version__,
     batch_udf,
     write_dataset,
@@ -51,6 +46,7 @@ from .lance import (
     FFILanceTableProvider,
     FragmentAddColumnsCleanup,
     FtsToken,
+    InsertedRowsFilter,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
@@ -99,6 +95,7 @@ __all__ = [
     "CleanupStats",
     "CleanupPolicy",
     "CleanupRule",
+    "AutoCleanupConfig",
     "KeepOne",
     "RemoveAll",
     "DatasetBasePath",
@@ -109,6 +106,7 @@ __all__ = [
     "FtsToken",
     "Index",
     "IndexFile",
+    "InsertedRowsFilter",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",
