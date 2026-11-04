@@ -4,7 +4,9 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, DeprecatedRemapper, remap_row_addrs_tree_map_async,
+};
 use std::{
     any::Any,
     fmt::Debug,
@@ -137,7 +139,7 @@ impl LabelListIndex {
     ) -> Result<Arc<Self>> {
         let values_index = BitmapIndex::load(
             store.clone(),
-            frag_reuse_index.clone(),
+            DeprecatedRemapper::sync(frag_reuse_index.clone()),
             index_cache,
             results_are_row_addresses,
         )
@@ -155,9 +157,9 @@ impl LabelListIndex {
         results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let values_index = BitmapIndex::load_with_remapping(
+        let values_index = BitmapIndex::load(
             store.clone(),
-            remapping.clone(),
+            DeprecatedRemapper::batch(remapping.clone()),
             index_cache,
             results_are_row_addresses,
         )
@@ -951,9 +953,11 @@ impl LabelListIndexState {
         index_cache: &LanceCache,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Arc<LabelListIndex>> {
-        let bitmap = self
-            .bitmap_state
-            .to_bitmap_index(store, index_cache, frag_reuse_index)?;
+        let bitmap = self.bitmap_state.to_bitmap_index(
+            store,
+            index_cache,
+            DeprecatedRemapper::sync(frag_reuse_index),
+        )?;
         Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
     }
 }

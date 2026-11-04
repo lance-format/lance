@@ -27,6 +27,7 @@ use lance_select::remapper::ScriptedRemapper;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use rstest::rstest;
 
+use super::bitmap::BitmapIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
@@ -38,46 +39,82 @@ fn address(fragment: u32, offset: u32) -> u64 {
     RowAddress::new_from_parts(fragment, offset).into()
 }
 
-/// Rows the index is built over: value `v` at `address(0, v)` for `v` in
-/// `0..8`, the fragment the script rewrites, and value `100 + v` at
-/// `address(2, v)` for `v` in `0..4`, a fragment it leaves alone.
+/// Rows the index is built over: value `v` at `address(0, v)` and
+/// `address(0, v + 8)` for `v` in `0..8`, the fragment the script rewrites,
+/// and value `100 + v` at `address(2, v)` for `v` in `0..4`, a fragment it
+/// leaves alone. Each rewritten value has two rows, so an index that
+/// translates a value's rows together is told apart from one that
+/// translates row by row.
 fn rows() -> Vec<(i32, u64)> {
-    let rewritten = (0..8).map(|value| (value, address(0, value as u32)));
+    let rewritten = (0..16).map(|offset| (offset as i32 % 8, address(0, offset)));
     let untouched = (0..4).map(|value| (100 + value, address(2, value as u32)));
     rewritten.chain(untouched).collect()
 }
 
+/// Offsets of fragment 0 whose rows the script deletes: one row of value
+/// 3, one of value 5, and both rows of value 6.
+const DELETED: [u32; 4] = [3, 13, 6, 14];
+
 /// Fragment 0 was rewritten into fragment 1 in reverse order, and the rows
-/// holding values 3 and 5 were deleted.
+/// at [`DELETED`] were deleted.
 fn script() -> ScriptedRemapper {
-    (0..8u32).fold(ScriptedRemapper::new(), |script, offset| {
-        if offset == 3 || offset == 5 {
+    (0..16u32).fold(ScriptedRemapper::new(), |script, offset| {
+        if DELETED.contains(&offset) {
             script.deleted(address(0, offset))
         } else {
-            script.moved(address(0, offset), address(1, 7 - offset))
+            script.moved(address(0, offset), address(1, 15 - offset))
         }
     })
 }
 
-/// Where the row holding `value` is after the script.
-fn current_address(value: i32) -> Option<u64> {
-    match value {
-        3 | 5 => None,
-        0..8 => Some(address(1, 7 - value as u32)),
-        _ => Some(address(2, (value - 100) as u32)),
-    }
+/// The rows holding `value` that the index was built over.
+fn built_addresses(value: i32) -> RowAddrTreeMap {
+    rows()
+        .into_iter()
+        .filter(|&(row_value, _)| row_value == value)
+        .map(|(_, addr)| addr)
+        .collect()
+}
+
+/// Where the rows holding `value` are after the script.
+fn current_addresses(value: i32) -> RowAddrTreeMap {
+    built_addresses(value)
+        .row_addrs()
+        .unwrap()
+        .map(u64::from)
+        .filter_map(|addr| {
+            let offset = RowAddress::from(addr).row_offset();
+            match RowAddress::from(addr).fragment_id() {
+                0 if DELETED.contains(&offset) => None,
+                0 => Some(address(1, 15 - offset)),
+                _ => Some(addr),
+            }
+        })
+        .collect()
 }
 
 /// One index kind under test.
 struct Case {
     plugin: Arc<dyn ScalarIndexPlugin>,
     params: &'static str,
+    /// The fragment IDs handed to training, for kinds that record them.
+    fragment_ids: Option<Vec<u32>>,
 }
 
 fn btree() -> Case {
     Case {
         plugin: Arc::new(BTreeIndexPlugin),
         params: "{}",
+        fragment_ids: Some(vec![0, 2]),
+    }
+}
+
+fn bitmap() -> Case {
+    Case {
+        plugin: Arc::new(BitmapIndexPlugin),
+        params: "{}",
+        // A bitmap build given several fragments expects a shard ID.
+        fragment_ids: None,
     }
 }
 
@@ -131,7 +168,7 @@ async fn load(
             data,
             store.as_ref(),
             request,
-            Some(vec![0, 2]),
+            case.fragment_ids.clone(),
             noop_progress(),
         )
         .await
@@ -166,6 +203,7 @@ async fn search(index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
 /// No answer names the rewritten fragment.
 #[rstest]
 #[case::btree(btree())]
+#[case::bitmap(bitmap())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -178,7 +216,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
             rows.get(&0).is_none(),
             "value {value} answered with a stale address: {rows:?}"
         );
-        let expected: RowAddrTreeMap = current_address(value).into_iter().collect();
+        let expected = current_addresses(value);
         if is_exact {
             assert_eq!(rows, expected, "value {value}");
         } else {
@@ -204,16 +242,24 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 /// over.
 #[rstest]
 #[case::btree(btree())]
+#[case::bitmap(bitmap())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();
     let index = load(&case, &store_dir, None).await;
-    for (value, addr) in rows() {
+    for value in (0..8).chain(100..104) {
         let (rows, is_exact) = search(index.as_ref(), value).await;
+        let expected = built_addresses(value);
         if is_exact {
-            assert_eq!(rows, RowAddrTreeMap::from_iter([addr]), "value {value}");
+            assert_eq!(rows, expected, "value {value}");
         } else {
-            assert!(rows.contains(addr), "value {value}: {rows:?}");
+            assert!(
+                expected
+                    .row_addrs()
+                    .unwrap()
+                    .all(|addr| rows.contains(addr.into())),
+                "value {value}: {rows:?} misses {expected:?}"
+            );
         }
     }
 }

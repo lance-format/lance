@@ -113,7 +113,9 @@ impl Remapper {
             let base = u64::from(fragment) << 32;
             pending.extend(bitmap.iter().map(|offset| Some(base | u64::from(offset))));
         }
-        self.translate_in_place(&mut pending).await?;
+        if !pending.is_empty() {
+            self.translate_in_place(&mut pending).await?;
+        }
         for addr in pending.into_iter().flatten() {
             translated.insert(addr);
         }
@@ -264,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn translate_set_keeps_untouched_fragments_whole() {
-        let (remapper, _) = script();
+        let (remapper, script) = script();
         let mut addrs = RowAddrTreeMap::new();
         addrs.insert(address(1, 0));
         addrs.insert(address(1, 1));
@@ -274,6 +276,11 @@ mod tests {
         expected.insert(address(3, 1));
         expected.insert_fragment(2);
         assert_eq!(translated, expected);
+
+        let untouched = RowAddrTreeMap::from_iter([address(2, 7)]);
+        let before = script.batches();
+        assert_eq!(remapper.translate_set(&untouched).await.unwrap(), untouched);
+        assert_eq!(script.batches(), before, "nothing needed translation");
 
         let mut whole_rewritten = RowAddrTreeMap::new();
         whole_rewritten.insert_fragment(1);

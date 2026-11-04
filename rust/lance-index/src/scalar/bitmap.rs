@@ -4,7 +4,9 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, DeprecatedRemapper, Remapper, remap_row_addrs_tree_map_async,
+};
 use std::{
     any::Any,
     borrow::Cow,
@@ -59,8 +61,9 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, RemappingIndexLoader, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+            single_flight_open,
         },
     },
 };
@@ -184,12 +187,8 @@ pub struct BitmapIndex {
 
     index_cache: WeakLanceCache,
 
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates the stored row addresses; `None` when they are current.
+    remapper: Option<Remapper>,
 
     lazy_reader: LazyIndexReader,
 
@@ -299,7 +298,7 @@ impl BitmapIndexState {
         &self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
     ) -> Result<Arc<BitmapIndex>> {
         Ok(Arc::new(BitmapIndex::new(
             self.index_map.clone(),
@@ -307,7 +306,7 @@ impl BitmapIndexState {
             self.value_type.clone(),
             store,
             WeakLanceCache::from(index_cache),
-            frag_reuse_index,
+            remapper,
             self.results_are_row_addresses,
         )))
     }
@@ -508,14 +507,13 @@ impl CacheKey for BitmapIndexStateKey {
 }
 
 impl BitmapIndex {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
         null_map: Arc<RowAddrTreeMap>,
         value_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         results_are_row_addresses: bool,
     ) -> Self {
         let lazy_reader = LazyIndexReader::new(store.clone());
@@ -525,40 +523,15 @@ impl BitmapIndex {
             value_type,
             store,
             index_cache,
-            frag_reuse_index,
-            batch_remapper: None,
+            remapper,
             lazy_reader,
             results_are_row_addresses,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_batch_remapping(
-        index_map: Arc<BTreeMap<OrderableScalarValue, usize>>,
-        null_map: Arc<RowAddrTreeMap>,
-        value_type: DataType,
-        store: Arc<dyn IndexStore>,
-        index_cache: WeakLanceCache,
-        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
-        results_are_row_addresses: bool,
-    ) -> Self {
-        let mut index = Self::new(
-            index_map,
-            null_map,
-            value_type,
-            store,
-            index_cache,
-            None,
-            results_are_row_addresses,
-        );
-        index.batch_remapper = batch_remapper;
-        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
-        index
-    }
-
     pub(crate) async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
@@ -573,7 +546,7 @@ impl BitmapIndex {
                 value_type,
                 store,
                 WeakLanceCache::from(index_cache),
-                frag_reuse_index,
+                remapper,
                 results_are_row_addresses,
             )));
         }
@@ -583,9 +556,8 @@ impl BitmapIndex {
         let mut null_map = Arc::new(RowAddrTreeMap::default());
         if let Some(null_loc) = null_location {
             let mut bitmap = Self::read_null_bitmap(page_lookup_file.as_ref(), null_loc).await?;
-            // Apply fragment remapping if needed
-            if let Some(fri) = &frag_reuse_index {
-                bitmap = fri.remap_row_addrs_tree_map(&bitmap);
+            if let Some(remapper) = &remapper {
+                bitmap = remapper.translate_set(&bitmap).await?;
             }
             null_map = Arc::new(bitmap);
         }
@@ -596,64 +568,14 @@ impl BitmapIndex {
             value_type,
             store,
             WeakLanceCache::from(index_cache),
-            frag_reuse_index,
-            results_are_row_addresses,
-        )))
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    pub(crate) async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-        results_are_row_addresses: bool,
-    ) -> Result<Arc<Self>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
-        let total_rows = page_lookup_file.num_rows();
-        let value_type = page_lookup_file.schema().fields[0].data_type();
-
-        if total_rows == 0 {
-            return Ok(Arc::new(Self::new_with_batch_remapping(
-                Arc::new(BTreeMap::new()),
-                Arc::new(RowAddrTreeMap::default()),
-                value_type,
-                store,
-                WeakLanceCache::from(index_cache),
-                remapping,
-                results_are_row_addresses,
-            )));
-        }
-
-        let (index_map, null_location) =
-            Self::load_key_map(page_lookup_file.as_ref(), total_rows).await?;
-        let mut null_map = Arc::new(RowAddrTreeMap::default());
-        if let Some(null_loc) = null_location {
-            let mut bitmap = Self::read_null_bitmap(page_lookup_file.as_ref(), null_loc).await?;
-            // Apply fragment remapping if needed
-            if let Some(remapper) = &remapping {
-                bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
-            }
-            null_map = Arc::new(bitmap);
-        }
-
-        Ok(Arc::new(Self::new_with_batch_remapping(
-            Arc::new(index_map),
-            null_map,
-            value_type,
-            store,
-            WeakLanceCache::from(index_cache),
-            remapping,
+            remapper,
             results_are_row_addresses,
         )))
     }
 
     /// Stream the page lookup file's keys column in bounded batches (never the
     /// whole column at once) into the value -> row offset map, reporting the
-    /// row offset of the null entry when the index has one. Shared by
-    /// [`Self::load`] and [`Self::load_with_remapping`], which differ only in
-    /// how the null bitmap is remapped afterwards.
+    /// row offset of the null entry when the index has one.
     async fn load_key_map(
         page_lookup_file: &dyn super::IndexReader,
         total_rows: usize,
@@ -780,14 +702,9 @@ impl BitmapIndex {
     /// Translate a bitmap as stored in the lookup file into current row
     /// addresses, through whichever remapping this index was loaded with.
     async fn remap_stored_bitmap(&self, bitmap: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
-        if let Some(fri) = &self.frag_reuse_index {
-            // Legacy synchronous remapping path.
-            Ok(fri.remap_row_addrs_tree_map(&bitmap))
-        } else if let Some(remapper) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await
-        } else {
-            Ok(bitmap)
+        match &self.remapper {
+            Some(remapper) => remapper.translate_set(&bitmap).await,
+            None => Ok(bitmap),
         }
     }
 
@@ -979,15 +896,8 @@ impl Index for BitmapIndex {
                 }
 
                 let bitmap_bytes = bitmap_binary_array.value(idx);
-                let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
-
-                if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
-                    // Legacy synchronous remapping path.
-                    bitmap = frag_reuse_index_ref.remap_row_addrs_tree_map(&bitmap);
-                } else if let Some(remapper) = self.batch_remapper.as_ref() {
-                    // Tagged asynchronous path.
-                    bitmap = remap_row_addrs_tree_map_async(remapper.as_ref(), &bitmap).await?;
-                }
+                let bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
+                let bitmap = self.remap_stored_bitmap(bitmap).await?;
 
                 let row_offset = start_row.checked_add(idx).ok_or_else(|| {
                     Error::internal(format!(
@@ -2666,6 +2576,24 @@ impl BasicTrainer for BitmapIndexPlugin {
 }
 
 #[async_trait]
+impl RemappingIndexLoader for BitmapIndexPlugin {
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
+        Ok(
+            BitmapIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+}
+
+#[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
@@ -2700,23 +2628,26 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         ))
     }
 
-    /// Load an index from storage
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
-        Ok(BitmapIndex::load(
+        self.load_remapped(
             index_store,
-            frag_reuse_index,
+            index_details,
+            index_version,
+            DeprecatedRemapper::sync(frag_reuse_index),
             cache,
-            results_are_row_addresses,
         )
-        .await? as Arc<dyn ScalarIndex>)
+        .await
+    }
+
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -2726,19 +2657,19 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn load_index_with_remapping(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
-        Ok(BitmapIndex::load_with_remapping(
+        self.load_remapped(
             index_store,
-            remapping,
+            index_details,
+            index_version,
+            DeprecatedRemapper::batch(remapping),
             cache,
-            results_are_row_addresses,
         )
-        .await?)
+        .await
     }
 
     async fn get_from_cache(
@@ -2750,7 +2681,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
-        let index = state.to_bitmap_index(index_store, cache, frag_reuse_index)?;
+        let index = state.to_bitmap_index(
+            index_store,
+            cache,
+            DeprecatedRemapper::sync(frag_reuse_index),
+        )?;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -2780,8 +2715,11 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             load,
             BitmapIndexState::from_scalar_index,
             move |state| {
-                Ok(state.to_bitmap_index(index_store, cache, frag_reuse_index)?
-                    as Arc<dyn ScalarIndex>)
+                Ok(state.to_bitmap_index(
+                    index_store,
+                    cache,
+                    DeprecatedRemapper::sync(frag_reuse_index),
+                )? as Arc<dyn ScalarIndex>)
             },
         )
         .await
@@ -4106,7 +4044,7 @@ mod tests {
         };
         let index = BitmapIndex::load(
             store,
-            Some(Arc::new(remapper)),
+            DeprecatedRemapper::sync(Some(Arc::new(remapper))),
             &LanceCache::no_cache(),
             true,
         )
@@ -5372,7 +5310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_load_with_remapping_rejects_corrupt_null_bitmap() {
+    async fn test_load_rejects_corrupt_null_bitmap() {
         let tmpdir = TempObjDir::default();
         let store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -5400,7 +5338,7 @@ mod tests {
         writer.write_record_batch(batch).await.unwrap();
         writer.finish().await.unwrap();
 
-        let error = BitmapIndex::load_with_remapping(store, None, &LanceCache::no_cache(), true)
+        let error = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap_err();
         assert!(
