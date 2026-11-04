@@ -1272,8 +1272,7 @@ fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: History
 
 /// A composed rewrite moves every stored address exactly as following the
 /// history one transition at a time does, and publishes the fragments the
-/// addresses land in. Version 0 histories are not composed: their segments
-/// are rewritten by the frozen version 0 remap.
+/// addresses land in, under every format.
 #[rstest]
 #[case::legacy(Reading::Legacy)]
 #[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
@@ -1281,15 +1280,10 @@ fn referenced_files_cover_what_the_trimmed_history_reads(#[case] format: History
 #[tokio::test]
 async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
     use super::plan::{Composition, RewriteContext};
-    let (history, live) = rewritten(reading);
-    let (history, live) = match reading {
-        // A second hop, so composition spans more than one transition.
-        Reading::Tagged => (
-            record_natively(history, REWRITE_VERSION, &[whole(1, 2)], &[(4, 2)]),
-            RoaringBitmap::from_iter([2, 4]),
-        ),
-        _ => (history, live),
-    };
+    let (history, _) = rewritten(reading);
+    // A second hop, so composition spans more than one transition.
+    let history = record_natively(history, REWRITE_VERSION + 1, &[whole(1, 2)], &[(4, 2)]);
+    let live = RoaringBitmap::from_iter([2, 4]);
     let lineage = history.fragment_bitmap();
     let rows = std::collections::HashMap::from([(2, 1)]);
     let context = RewriteContext {
@@ -1298,13 +1292,7 @@ async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
         fragment_rows: &rows,
     };
     let stale = segment(&[0, 2, 3], 1, TranslationSupport::Supported);
-    let composed = history.compose(&context, &stale);
-    if reading != Reading::Tagged {
-        let error = composed.unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        return;
-    }
-    let Composition::Rewrite(plan) = composed.unwrap() else {
+    let Composition::Rewrite(plan) = history.compose(&context, &stale).unwrap() else {
         panic!("a stale segment is rewritten");
     };
     assert_eq!(plan.coverage(), &RoaringBitmap::from_iter([2, 4]));
@@ -1319,7 +1307,7 @@ async fn compose_equals_step_by_step_translation(#[case] reading: Reading) {
     assert_eq!(addrs, expected);
     assert_eq!(addrs[0], Some(address(4, 0)));
 
-    let caught_up = segment(&[2, 4], REWRITE_VERSION + 1, TranslationSupport::Supported);
+    let caught_up = segment(&[2, 4], REWRITE_VERSION + 2, TranslationSupport::Supported);
     assert_eq!(
         history.compose(&context, &caught_up).unwrap(),
         Composition::CaughtUp
