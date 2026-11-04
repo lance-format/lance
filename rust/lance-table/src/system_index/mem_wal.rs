@@ -33,7 +33,9 @@ pub type ShardId = Uuid;
 pub struct SsTable {
     pub generation: u64,
     pub path: String,
-    /// Payload size of the rows, as the writer's MemTable accounted for them.
+    /// Payload size of the rows, as the writer's MemTable accounted for them,
+    /// plus the payload of the blob values the generation keeps in packed and
+    /// dedicated sidecar files.
     ///
     /// An estimate of the payload, not a bound on what reading the SSTable
     /// costs: it excludes the per-array structure a reader materializes, so a
@@ -253,6 +255,17 @@ pub struct ShardManifest {
     /// Lifecycle status (drop-table 2PC). Defaults to `Active`; preserved
     /// across claims via `..base` so only fresh constructions set it.
     pub status: ShardStatus,
+    /// The operation holding the seal; set with `Sealed`, cleared on unseal.
+    pub sealed_by: Option<SealedBy>,
+}
+
+/// The holder of a shard's seal, persisted in [`ShardManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedBy {
+    /// Caller-chosen id of the operation that sealed the shard.
+    pub txn: String,
+    /// When the seal was taken, in Unix milliseconds.
+    pub sealed_at_millis: i64,
 }
 
 impl ShardManifest {
@@ -293,6 +306,10 @@ impl From<&ShardManifest> for pb::ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.iter().map(|sstable| sstable.into()).collect(),
             status: rm.status.to_i32(),
+            sealed_by: rm.sealed_by.as_ref().map(|sealed_by| pb::SealedBy {
+                txn: sealed_by.txn.clone(),
+                sealed_at_millis: sealed_by.sealed_at_millis,
+            }),
         }
     }
 }
@@ -322,6 +339,10 @@ impl TryFrom<pb::ShardManifest> for ShardManifest {
             current_generation: rm.current_generation,
             sstables: rm.sstables.into_iter().map(SsTable::from).collect(),
             status: ShardStatus::from_i32(rm.status),
+            sealed_by: rm.sealed_by.map(|sealed_by| SealedBy {
+                txn: sealed_by.txn,
+                sealed_at_millis: sealed_by.sealed_at_millis,
+            }),
         })
     }
 }
@@ -406,6 +427,10 @@ pub struct MemWalIndexDetails {
     /// an individual writer may still override any value at runtime in its
     /// own (non-persisted) `ShardWriterConfig`.
     pub writer_config_defaults: HashMap<String, String>,
+    /// Names this MemWAL's storage directory (`_{dir_id}_mem_wal/`; empty is
+    /// the legacy `_mem_wal/`). Minted once per initialization, so unlike the
+    /// index UUID, which every rewrite re-mints, it identifies one incarnation.
+    pub dir_id: String,
 }
 
 impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
@@ -424,6 +449,7 @@ impl From<&MemWalIndexDetails> for pb::MemWalIndexDetails {
                 .collect(),
             index_catchup: details.index_catchup.iter().map(|icp| icp.into()).collect(),
             writer_config_defaults: details.writer_config_defaults.clone(),
+            dir_id: details.dir_id.clone(),
         }
     }
 }
@@ -454,6 +480,7 @@ impl TryFrom<pb::MemWalIndexDetails> for MemWalIndexDetails {
                 .map(IndexCatchupProgress::try_from)
                 .collect::<lance_core::Result<_>>()?,
             writer_config_defaults: details.writer_config_defaults,
+            dir_id: details.dir_id,
         })
     }
 }
@@ -513,6 +540,23 @@ pub fn open_mem_wal_index(index: IndexMetadata) -> Result<Arc<MemWalIndex>> {
     Ok(Arc::new(MemWalIndex::new(load_mem_wal_index_details(
         index,
     )?)))
+}
+
+/// Rejects with [`Error::StaleMemWal`] unless `indices` carries the MemWAL
+/// `dir_id`. Runs at manifest build, so it also catches commits that never rebase.
+pub fn check_mem_wal_dir_id(indices: &[IndexMetadata], dir_id: &str) -> Result<()> {
+    let Some(index) = indices.iter().find(|idx| idx.name == MEM_WAL_INDEX_NAME) else {
+        return Err(Error::stale_mem_wal(format!(
+            "the MemWAL `{dir_id}` this commit was built for was removed"
+        )));
+    };
+    let current = load_mem_wal_index_details(index.clone())?.dir_id;
+    if current != dir_id {
+        return Err(Error::stale_mem_wal(format!(
+            "the MemWAL `{dir_id}` this commit was built for was replaced by `{current}`"
+        )));
+    }
+    Ok(())
 }
 
 /// Update `compacted_sstables` in the MemWAL index.
@@ -614,6 +658,8 @@ pub fn new_mem_wal_index_meta(
         base_id: None,
         // Memory WAL index is inline (no files)
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -656,5 +702,44 @@ mod tests {
         assert_eq!(encoded.physical_rows, Some(10));
         assert_eq!(encoded.primary_key_bytes, Some(80));
         assert_eq!(SsTable::from(encoded), recorded);
+    }
+
+    /// The seal's holder and the MemWAL `dir_id` survive the round trip; a
+    /// manifest without a holder decodes as unsealed by anyone.
+    #[test]
+    fn the_seal_holder_and_dir_id_survive_the_round_trip() {
+        let sealed = ShardManifest {
+            shard_id: Uuid::new_v4(),
+            version: 3,
+            shard_spec_id: 0,
+            shard_field_values: HashMap::new(),
+            writer_epoch: 4,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            current_generation: 1,
+            sstables: vec![],
+            status: ShardStatus::Sealed,
+            sealed_by: Some(SealedBy {
+                txn: "txn-1".to_string(),
+                sealed_at_millis: 1_700_000_000_000,
+            }),
+        };
+        let decoded = ShardManifest::try_from(pb::ShardManifest::from(&sealed)).unwrap();
+        assert_eq!(decoded, sealed);
+
+        let unsealed = ShardManifest {
+            status: ShardStatus::Active,
+            sealed_by: None,
+            ..sealed
+        };
+        let decoded = ShardManifest::try_from(pb::ShardManifest::from(&unsealed)).unwrap();
+        assert_eq!(decoded.sealed_by, None);
+
+        let details = MemWalIndexDetails {
+            dir_id: "a1b2c3d4".to_string(),
+            ..Default::default()
+        };
+        let decoded = MemWalIndexDetails::try_from(pb::MemWalIndexDetails::from(&details)).unwrap();
+        assert_eq!(decoded.dir_id, "a1b2c3d4");
     }
 }

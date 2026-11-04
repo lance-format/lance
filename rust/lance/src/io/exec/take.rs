@@ -13,7 +13,11 @@ use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue, MetricsSet,
 };
@@ -41,9 +45,10 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
+use super::column_width::MeasuredWidths;
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
-mod batch;
+pub mod batch;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
@@ -490,6 +495,11 @@ impl TakeStream {
     }
 }
 
+/// Deprecation: This node is replaced by a FilteredReadExec with a RowSelector.
+/// It remains in use for legacy reads and dedicated modern query paths such as
+/// MemWAL and top-k late materialization.
+///
+/// Prefer targeted correctness fixes over general optimization or refactoring.
 #[derive(Debug)]
 pub struct TakeExec {
     // The dataset to take from
@@ -622,7 +632,11 @@ impl TakeExec {
         );
 
         let schema_to_take = projection.into_schema_ref();
-        let bytes_per_row = estimated_bytes_per_row(output_arrow.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_arrow.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         Ok(Some(Self {
             dataset,
@@ -739,6 +753,13 @@ impl ExecutionPlan for TakeExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// This preserves the output schema.
     fn with_new_children(
         self: Arc<Self>,
@@ -810,13 +831,18 @@ impl ExecutionPlan for TakeExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
         // Include fetched columns as well as carried columns when costing the
         // output of a late-materialized plan.
-        let num_rows = self.input.partition_statistics(partition)?.num_rows;
+        let num_rows = input_stats[0].num_rows;
         Ok(Arc::new(Statistics {
             num_rows,
             total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
@@ -836,6 +862,10 @@ impl ExecutionPlan for TakeExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use lance_core::datatypes::BlobHandling;
 
     use arrow_array::{
@@ -944,7 +974,9 @@ mod tests {
             scan_schema,
             config,
         ));
-        let input_stats = input.partition_statistics(None).unwrap();
+        let input_stats = StatisticsContext::new()
+            .compute(input.as_ref(), &StatisticsArgs::new())
+            .unwrap();
         // 30 rows of a non-null int32 plus the nullable row id: 12.125 bytes a row.
         assert_eq!(input_stats.num_rows, Precision::Exact(30));
         assert_eq!(input_stats.total_byte_size, Precision::Inexact(364));
@@ -958,7 +990,9 @@ mod tests {
         let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), widened)
             .unwrap()
             .unwrap();
-        let stats = take_exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, input_stats.num_rows);
         assert_eq!(stats.total_byte_size, Precision::Inexact(484));
         // A variable-width column is seeded from the decoder's estimate rather than
@@ -968,7 +1002,9 @@ mod tests {
             .union_column("s", OnMissing::Error)
             .unwrap();
         let take_exec = TakeExec::try_new(dataset, input, seeded).unwrap().unwrap();
-        let stats = take_exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, input_stats.num_rows);
         assert_eq!(stats.total_byte_size, Precision::Inexact(2404));
     }
@@ -1037,7 +1073,10 @@ mod tests {
             },
         ));
         assert_eq!(
-            input.partition_statistics(None).unwrap().total_byte_size,
+            StatisticsContext::new()
+                .compute(input.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .total_byte_size,
             Precision::Absent,
             "the scan must not bill the payload it materialized"
         );
@@ -1054,7 +1093,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let stats = take_exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&take_exec, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(3));
         assert_eq!(
             stats.total_byte_size,
@@ -1727,8 +1768,11 @@ mod tests {
             vec!["i", ROW_ID, "s", "f"],
         );
 
-        // with_new_children should preserve the output schema.
-        let edited = outer_take.with_new_children(vec![input])?;
+        // Replacing the children should preserve the output schema.
+        let edited = outer_take.replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
         assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "f", "s"],);
         Ok(())
     }

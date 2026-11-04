@@ -2,10 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::HashMap,
-    io::{BufReader, BufWriter},
+    io::{BufReader, BufWriter, Write},
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex},
 };
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -14,31 +13,20 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     execution::{
-        SendableRecordBatchStream, TaskContext,
-        disk_manager::{DiskManager, RefCountedTempFile},
+        SendableRecordBatchStream, SpillFile, TaskContext, disk_manager::DiskManager,
+        runtime_env::RuntimeEnv,
     },
-    physical_plan::{stream::RecordBatchStreamAdapter, streaming::PartitionStream},
+    physical_plan::{
+        SpillManager,
+        metrics::{ExecutionPlanMetricsSet, SpillMetrics},
+        stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream,
+    },
 };
 use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
-
-fn disk_manager_accounting_lock(disk_manager: &Arc<DiskManager>) -> Arc<Mutex<()>> {
-    static ACCOUNTING_LOCKS: OnceLock<Mutex<HashMap<usize, Weak<Mutex<()>>>>> = OnceLock::new();
-    let locks = ACCOUNTING_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
-    locks.retain(|_, lock| lock.strong_count() > 0);
-
-    let key = Arc::as_ptr(disk_manager) as usize;
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
-}
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -84,6 +72,143 @@ pub fn create_replay_spill(
     (sender, receiver)
 }
 
+enum MaterializedStreamStorage {
+    Memory(Arc<[RecordBatch]>),
+    Spill {
+        manager: SpillManager,
+        file: Arc<dyn SpillFile>,
+    },
+}
+
+/// A fully materialized stream that can be replayed sequentially.
+///
+/// The materialized batches remain in memory when they fit within the configured limit. Larger
+/// inputs are stored in a DataFusion-managed spill file, so temporary-disk accounting and cleanup
+/// follow the runtime's resource limits.
+pub struct MaterializedStream {
+    schema: SchemaRef,
+    storage: MaterializedStreamStorage,
+}
+
+impl MaterializedStream {
+    /// Opens a new stream over the materialized batches.
+    ///
+    /// Multiple streams may be opened, but callers should consume them sequentially to avoid
+    /// multiplying decoded-batch memory and disk IO.
+    pub fn read(&self) -> Result<SendableRecordBatchStream, DataFusionError> {
+        match &self.storage {
+            MaterializedStreamStorage::Memory(batches) => {
+                let batches = batches.to_vec();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                )))
+            }
+            MaterializedStreamStorage::Spill { manager, file } => {
+                manager.read_spill_as_stream_unbuffered(file.clone(), None)
+            }
+        }
+    }
+}
+
+/// Fully materializes a stream into replayable memory or managed spill storage.
+///
+/// Up to `memory_limit` bytes are retained in memory. Larger inputs are written once to a
+/// DataFusion-managed spill file and can subsequently be replayed without evaluating the source
+/// again. The returned metrics describe the materialization write, not later reads.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::RecordBatch;
+/// # use arrow_schema::Schema;
+/// # use datafusion::execution::{SendableRecordBatchStream, runtime_env::RuntimeEnvBuilder};
+/// # use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+/// # use datafusion_common::DataFusionError;
+/// # use lance_datafusion::spill::materialize_replayable_stream;
+/// # async fn example() -> Result<(), DataFusionError> {
+/// let schema = Arc::new(Schema::empty());
+/// let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+///     schema,
+///     futures::stream::empty::<Result<RecordBatch, DataFusionError>>(),
+/// ));
+/// let runtime = RuntimeEnvBuilder::new().build_arc()?;
+/// let (materialized, _metrics) =
+///     materialize_replayable_stream(source, runtime, 1024, "example").await?;
+///
+/// let first_read = materialized.read()?;
+/// drop(first_read);
+/// let second_read = materialized.read()?;
+/// drop(second_read);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn materialize_replayable_stream(
+    mut source: SendableRecordBatchStream,
+    runtime: Arc<RuntimeEnv>,
+    memory_limit: usize,
+    request_description: &str,
+) -> Result<(MaterializedStream, ExecutionPlanMetricsSet), DataFusionError> {
+    let schema = source.schema();
+    let metrics = ExecutionPlanMetricsSet::new();
+    let spill_metrics = SpillMetrics::new(&metrics, 0);
+    let spill_manager = SpillManager::new(runtime, spill_metrics, schema.clone())
+        .with_batch_read_buffer_capacity(1);
+    let mut buffered_batches = Vec::new();
+    let mut buffered_memory = MemoryAccumulator::default();
+    let mut spill_file = spill_manager.create_in_progress_file(request_description)?;
+    let mut is_spilled = false;
+
+    while let Some(batch) = source.next().await {
+        let batch = batch?;
+        if is_spilled {
+            spill_file.append_batch(&batch)?;
+            continue;
+        }
+
+        buffered_memory.record_batch(&batch);
+        buffered_batches.push(batch);
+        if buffered_memory.total() > memory_limit {
+            for buffered_batch in buffered_batches.drain(..) {
+                spill_file.append_batch(&buffered_batch)?;
+            }
+            is_spilled = true;
+        }
+    }
+
+    let storage = if is_spilled {
+        match spill_file.finish()? {
+            Some(file) => MaterializedStreamStorage::Spill {
+                manager: spill_manager,
+                file,
+            },
+            None => MaterializedStreamStorage::Memory(Arc::new([])),
+        }
+    } else {
+        MaterializedStreamStorage::Memory(buffered_batches.into())
+    };
+    Ok((MaterializedStream { schema, storage }, metrics))
+}
+
+/// Fully materializes a stream before replaying it.
+///
+/// Unlike [`spilling_table_provider_with_job_disk_manager`], this function does not allow replay
+/// to begin while the source is still running. It is intended as a pipeline barrier between
+/// operators whose non-spillable reservations cannot safely coexist in one memory pool. Up to
+/// `memory_limit` bytes are retained in memory; larger inputs use a DataFusion-managed spill file.
+pub async fn materialize_stream(
+    source: SendableRecordBatchStream,
+    runtime: Arc<RuntimeEnv>,
+    memory_limit: usize,
+    request_description: &str,
+) -> Result<(SendableRecordBatchStream, ExecutionPlanMetricsSet), DataFusionError> {
+    let (materialized, metrics) =
+        materialize_replayable_stream(source, runtime, memory_limit, request_description).await?;
+    let stream = materialized.read()?;
+    Ok((stream, metrics))
+}
+
 /// Wrap a one-shot stream in a replayable provider using a job-local disk manager.
 ///
 /// Up to `memory_limit` bytes are buffered before spilling, and scans can start
@@ -94,9 +219,8 @@ pub fn create_replay_spill(
 /// unfinished background drain of the source.
 ///
 /// The manager must belong to one operation and must be discarded if any spill
-/// reports an error. DataFusion 54.1.0 can retain a rejected operator charge;
-/// operation-scoped ownership prevents that failed accounting from affecting a
-/// later job.
+/// reports an error. Operation-scoped ownership prevents failed accounting from
+/// affecting a later job.
 ///
 /// # Examples
 ///
@@ -140,14 +264,16 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let schema = source.schema();
     let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
-    let spill_path = spill_file.path().to_owned();
+    let spill_path = spill_file
+        .path()
+        .ok_or_else(|| {
+            DataFusionError::NotImplemented(
+                "replay spills require a DiskManager with local file paths".to_string(),
+            )
+        })?
+        .to_owned();
     let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
-    let accounting_lock = disk_manager_accounting_lock(&disk_manager);
-    sender.managed_spill = Some(ManagedSpillFile {
-        file: spill_file.clone(),
-        disk_manager,
-        accounting_lock,
-    });
+    sender.managed_spill = Some(spill_file.clone());
 
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
@@ -185,7 +311,7 @@ pub async fn spilling_table_provider_with_job_disk_manager(
         schema: schema.clone(),
         receiver,
         _drain_handle: Arc::new(AbortOnDropHandle::new(drain_handle)),
-        _spill_file: Arc::new(spill_file),
+        _spill_file: spill_file,
     });
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
@@ -220,7 +346,7 @@ struct SpillPartition {
     // cancellation is requested before spill cleanup begins.
     _drain_handle: Arc<AbortOnDropHandle<SpillSender>>,
     // Keeps the DiskManager-owned spill file alive and accounts its disk usage.
-    _spill_file: Arc<RefCountedTempFile>,
+    _spill_file: Arc<dyn SpillFile>,
 }
 
 impl std::fmt::Debug for SpillPartition {
@@ -376,7 +502,7 @@ impl SpillReader {
 /// spill. Otherwise, they will return an error.
 pub struct SpillSender {
     memory_limit: usize,
-    managed_spill: Option<ManagedSpillFile>,
+    managed_spill: Option<Arc<dyn SpillFile>>,
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
@@ -663,15 +789,19 @@ impl AsyncStreamWriter {
     pub async fn open(
         path: PathBuf,
         schema: Arc<Schema>,
-        managed_spill: Option<ManagedSpillFile>,
+        managed_spill: Option<Arc<dyn SpillFile>>,
     ) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
-            let file = if let Some(spill) = managed_spill.as_ref() {
-                spill.file.inner().reopen().map_err(ArrowError::from)?
+            let writer: Box<dyn Write + Send> = if let Some(spill) = managed_spill {
+                Box::new(
+                    spill
+                        .open_writer()
+                        .map_err(|error| ArrowError::ExternalError(Box::new(error)))?,
+                )
             } else {
-                std::fs::File::create(&path).map_err(ArrowError::from)?
+                Box::new(std::fs::File::create(&path).map_err(ArrowError::from)?)
             };
-            TrackedStreamWriter::try_new(file, &schema, managed_spill)
+            TrackedStreamWriter::try_new(writer, &schema)
         })
         .await
         .unwrap()?;
@@ -700,93 +830,30 @@ impl AsyncStreamWriter {
     }
 }
 
-#[derive(Clone)]
-struct ManagedSpillFile {
-    file: RefCountedTempFile,
-    disk_manager: Arc<DiskManager>,
-    accounting_lock: Arc<Mutex<()>>,
-}
-
-impl ManagedSpillFile {
-    fn update_disk_usage(&mut self) -> Result<(), ArrowError> {
-        // Keep replay-file checks and mutations atomic with respect to other
-        // replay files. A mixed operator/replay failure aborts the owning job,
-        // which then discards this operation-scoped disk manager.
-        let _accounting_guard = self
-            .accounting_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let new_file_usage = self
-            .file
-            .inner()
-            .as_file()
-            .metadata()
-            .map_err(ArrowError::from)?
-            .len();
-        let old_file_usage = self.file.current_disk_usage();
-        let used_without_file = self
-            .disk_manager
-            .used_disk_space()
-            .checked_sub(old_file_usage)
-            .ok_or_else(|| {
-                ArrowError::ExternalError(Box::new(DataFusionError::Internal(format!(
-                    "replay spill accounting is inconsistent: used_disk_space={} is less than current_file_disk_usage={old_file_usage}",
-                    self.disk_manager.used_disk_space()
-                ))))
-            })?;
-        if used_without_file
-            .checked_add(new_file_usage)
-            .is_none_or(|usage| usage > self.disk_manager.max_temp_directory_size())
-        {
-            return Err(ArrowError::ExternalError(Box::new(
-                DataFusionError::ResourcesExhausted(format!(
-                    "The used disk space during the spilling process has exceeded the allowable limit of {} bytes. Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.",
-                    self.disk_manager.max_temp_directory_size()
-                )),
-            )));
-        }
-
-        self.file
-            .update_disk_usage()
-            .map_err(|error| ArrowError::ExternalError(Box::new(error)))
-    }
-}
-
 struct TrackedStreamWriter {
-    writer: StreamWriter<BufWriter<std::fs::File>>,
-    managed_spill: Option<ManagedSpillFile>,
+    writer: StreamWriter<BufWriter<Box<dyn Write + Send>>>,
 }
 
 impl TrackedStreamWriter {
-    fn try_new(
-        file: std::fs::File,
-        schema: &Schema,
-        managed_spill: Option<ManagedSpillFile>,
-    ) -> Result<Self, ArrowError> {
-        let writer = StreamWriter::try_new(BufWriter::new(file), schema)?;
-        let mut tracked = Self {
-            writer,
-            managed_spill,
-        };
-        tracked.flush_and_update_disk_usage()?;
+    fn try_new(writer: Box<dyn Write + Send>, schema: &Schema) -> Result<Self, ArrowError> {
+        let writer = StreamWriter::try_new(BufWriter::new(writer), schema)?;
+        let mut tracked = Self { writer };
+        tracked.flush()?;
         Ok(tracked)
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         self.writer.write(batch)?;
-        self.flush_and_update_disk_usage()
+        self.flush()
     }
 
     fn finish(&mut self) -> Result<(), ArrowError> {
         self.writer.finish()?;
-        self.flush_and_update_disk_usage()
+        self.flush()
     }
 
-    fn flush_and_update_disk_usage(&mut self) -> Result<(), ArrowError> {
+    fn flush(&mut self) -> Result<(), ArrowError> {
         self.writer.flush()?;
-        if let Some(spill) = self.managed_spill.as_mut() {
-            spill.update_disk_usage()?;
-        }
         Ok(())
     }
 }
@@ -824,6 +891,7 @@ impl AsyncStreamReader {
 mod tests {
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field};
+    use datafusion::execution::{disk_manager::DiskManagerBuilder, runtime_env::RuntimeEnvBuilder};
     use futures::{StreamExt, TryStreamExt, poll};
     use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
     use tokio::sync::{Barrier, oneshot};
@@ -839,6 +907,99 @@ mod tests {
                 let _ = sender.send(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_materialize_stream_to_managed_spill() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+            )
+            .unwrap(),
+        ];
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (stream, metrics) =
+            materialize_stream(source, runtime.clone(), 0, "test materialization")
+                .await
+                .unwrap();
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 1);
+        assert!(progress.current_bytes > 0);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .iter()
+                .filter_map(|metric| match metric.value() {
+                    datafusion::physical_plan::metrics::MetricValue::SpillCount(value) => {
+                        Some(value.value())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>(),
+            1
+        );
+
+        let replayed = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(replayed, batches);
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 0);
+        assert_eq!(progress.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_stream_in_memory() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok(batch.clone())]),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (stream, metrics) =
+            materialize_stream(source, runtime.clone(), 1024, "test materialization")
+                .await
+                .unwrap();
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            0
+        );
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .iter()
+                .filter_map(|metric| match metric.value() {
+                    datafusion::physical_plan::metrics::MetricValue::SpillCount(value) => {
+                        Some(value.value())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(stream.try_collect::<Vec<_>>().await.unwrap(), vec![batch]);
     }
 
     #[tokio::test]
@@ -1154,11 +1315,18 @@ mod tests {
         let (first_result, second_result) = tokio::join!(collect(first), collect(second));
         assert!(first_result.is_err());
         assert!(second_result.is_err());
-        tokio::task::yield_now().await;
-        assert_eq!(
-            disk_manager.used_disk_space(),
-            0,
-            "concurrent replay quota failures must release their disk reservations"
+        // A drain task publishes its error before it returns, and the spill file's last
+        // reference drops with the task on a worker thread, so the release can trail it.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while disk_manager.used_disk_space() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "concurrent replay quota failures must release their disk reservations, {} bytes still reserved",
+            disk_manager.used_disk_space()
         );
     }
 
@@ -1205,20 +1373,23 @@ mod tests {
             .await
             .unwrap();
 
-        let mut operator_spill = failed_job_manager
+        let operator_spill = failed_job_manager
             .create_tmp_file("testing mixed spill accounting")
             .unwrap();
-        operator_spill.inner().as_file().set_len(1).unwrap();
-        assert!(matches!(
-            operator_spill.update_disk_usage(),
-            Err(DataFusionError::ResourcesExhausted(_))
-        ));
+        let mut writer = operator_spill.open_writer().unwrap();
+        let error = writer.write_all(&[0]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("used disk space during the spilling process has exceeded")
+        );
+        drop(writer);
         drop(operator_spill);
         drop(provider);
         drop(failed_job_manager);
 
         // A quota error terminates the operation and discards its manager. The
-        // next job starts with independent accounting even on DataFusion 54.1.0.
+        // next job starts with independent accounting.
         let next_job_manager = Arc::new(
             DiskManager::builder()
                 .with_max_temp_directory_size(serialized_size)
