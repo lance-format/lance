@@ -367,6 +367,26 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     let new_row = 3_u64 << 32;
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
 
+    let raw_zones = source.zones_as_batch().unwrap();
+    let column_u64 = |name| {
+        raw_zones
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+    };
+    assert_eq!(column_u64("fragment_id").value(0), 0);
+    assert_eq!(column_u64("zone_start").value(0), 0);
+    assert_eq!(column_u64("zone_length").value(0), 2);
+    let negative_nan_count = raw_zones
+        .column_by_name("negative_nan_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert!(negative_nan_count.is_null(0));
+
     let remapped = remap_zone(
         &source.zones[0],
         source.fri.as_deref().unwrap(),

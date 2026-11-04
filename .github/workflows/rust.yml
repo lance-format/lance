@@ -49,6 +49,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  protobuf:
+    name: Check protobuf sources and build without protoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROTOC: /protoc-must-not-be-used
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          components: rustfmt, clippy
+      - name: Check generator formatting
+        run: cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check generator lints
+        run: cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
+      - name: Check generated sources
+        run: cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check Lance without protoc
+        run: cargo check --locked -p lance
+
   package:
     name: Check crates are publishable
     runs-on: ubuntu-24.04
