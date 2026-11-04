@@ -26,7 +26,6 @@ const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
     "FmIndexDetails",
     "JsonIndexDetails",
     "MinHashLshIndexDetails",
-    "RTreeIndexDetails",
 ];
 
 /// Whether this build translates the row addresses of scalar segments with
