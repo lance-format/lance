@@ -58,6 +58,7 @@ mod namespace;
 mod optimize;
 mod optimize_indices;
 mod otel;
+mod rq_model;
 mod schema;
 mod session;
 mod sql;
