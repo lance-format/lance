@@ -636,7 +636,13 @@ impl<'a> TransactionRebase<'a> {
         }
         // A missing transaction may have changed or removed any source fragment.
         // Publishing a staged fragment without checking it can undo that write.
-        if !self.modified_fragment_ids.is_empty() {
+        // An action set is checked by comparing footprints, which needs every
+        // transaction in the window: replay re-validates only what still
+        // exists, not that a read, key, or definition it depends on is
+        // unchanged. Nearly every action set depends on one, so refuse them all.
+        if !self.modified_fragment_ids.is_empty()
+            || matches!(self.transaction.operation, Operation::CompositeOperation(_))
+        {
             return Err(Error::retryable_commit_conflict_source(
                 latest_version,
                 format!(
