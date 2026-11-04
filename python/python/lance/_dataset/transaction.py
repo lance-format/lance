@@ -308,8 +308,8 @@ class LanceOperation:
             table's MemWAL has since been disabled or replaced.
         inserted_rows_filter: InsertedRowsFilter, optional
             Keys inserted by a merge-insert, used for concurrent conflict
-            detection. ``might_contain`` is exact for an exact set and may
-            have false positives for a bloom filter.
+            detection. ``might_contain`` compares stored key hashes for an
+            exact set and may have false positives for a bloom filter.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
