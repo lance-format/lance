@@ -401,6 +401,9 @@ impl BitPacker for BitPacker4x {
     }
 
     fn compress(&self, decompressed: &[u32], compressed: &mut [u8], num_bits: u8) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -425,6 +428,9 @@ impl BitPacker for BitPacker4x {
         compressed: &mut [u8],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -458,6 +464,9 @@ impl BitPacker for BitPacker4x {
         compressed: &mut [u8],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -485,6 +494,9 @@ impl BitPacker for BitPacker4x {
     }
 
     fn decompress(&self, compressed: &[u8], decompressed: &mut [u32], num_bits: u8) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -509,6 +521,9 @@ impl BitPacker for BitPacker4x {
         decompressed: &mut [u32],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -542,6 +557,9 @@ impl BitPacker for BitPacker4x {
         decompressed: &mut [u32],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -569,6 +587,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits(&self, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -581,6 +601,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits_sorted(&self, initial: u32, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -599,6 +621,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits_strictly_sorted(&self, initial: Option<u32>, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
