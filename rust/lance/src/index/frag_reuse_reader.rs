@@ -353,11 +353,10 @@ fn corrupt(message: impl Into<String>) -> Error {
 async fn load_history(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReuseHistory> {
     #[cfg(test)]
     check_reader_path()?;
-    let details = index
-        .index_details
-        .as_ref()
-        .ok_or_else(|| corrupt("missing FRI details"))?;
-    super::frag_reuse::read_raw_history(index.index_version, details, |file| async move {
+    if index.index_details.is_none() {
+        return Err(corrupt("missing FRI details"));
+    }
+    let external = super::frag_reuse::read_external_history(index, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -376,9 +375,9 @@ async fn load_history(dataset: &Dataset, index: &IndexMetadata) -> Result<FragRe
             .await
             .map_err(Error::from)
     })
-    .await?
+    .await?;
     // The reader only opens tagged histories, which are never repaired.
-    .validate()
+    FragReuseHistory::decode(index, external)
 }
 
 #[cfg(test)]
@@ -1669,15 +1668,10 @@ pub mod tests {
             }
             content.extend(field(2, &raw));
         }
-        let details = prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-            value: field(1, &content),
-        };
-        let history = super::super::frag_reuse::read_raw_history(1, &details, |_| async {
-            panic!("inline content")
-        })
-        .await
-        .unwrap()
+        let history = lance_table::system_index::frag_reuse::history::RawHistory::new(
+            lance_table::system_index::frag_reuse::history::HistoryFormat::Tagged,
+            content.into(),
+        )
         .validate()
         .unwrap();
         let mapping = Arc::new(FragmentReuseIndex {

@@ -12,10 +12,13 @@
 //!
 //! ```
 //! use lance_table::format::pb::fragment_reuse_index_details as pb;
-//! use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat};
+//! use lance_table::system_index::frag_reuse::history::{
+//!     FragReuseHistory, HistoryFormat, RewriteRecord,
+//! };
 //!
 //! # fn example(transition: pb::Transition) -> lance_core::Result<()> {
-//! let history = FragReuseHistory::empty(HistoryFormat::Tagged).append_transitions(&[transition])?;
+//! let history = FragReuseHistory::empty(HistoryFormat::Tagged)
+//!     .append(RewriteRecord::new(1, vec![transition]))?;
 //! assert_eq!(history.ledger().transitions().len(), 1);
 //! # Ok(())
 //! # }
@@ -30,18 +33,34 @@ use lance_core::{Error, Result};
 use prost::Message;
 use prost::encoding::WireType;
 use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use super::imp::{FriImpl, StoredRecord, concat};
-use super::ledger::{FragReuseLedger, corrupt, is_interpretable_transition, next_field};
+use super::ledger::{
+    DetailsContent, FragReuseLedger, corrupt, is_interpretable_transition, next_field,
+    verify_external_content,
+};
 use super::legacy::{self, LegacyHistory};
 use super::plan::{ReadContext, ReadPlan, SegmentSummary};
 use super::tagged::TaggedHistory;
+use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
+use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::format::{Fragment, IndexMetadata};
 
 /// `InlineContent.legacy_versions`.
 pub(super) const LEGACY_VERSION_FIELD: u32 = 1;
 /// `InlineContent.transitions`.
 pub(super) const TRANSITION_FIELD: u32 = 2;
+
+/// Serialized histories above this size spill to an external
+/// `details.binpb` file instead of living in the manifest.
+const INLINE_DETAILS_LIMIT: usize = 204800;
+const DETAILS_TYPE_URL: &str = "/lance.table.FragmentReuseIndexDetails";
+/// `FragmentReuseIndexDetails.inline`.
+const INLINE_CONTENT_FIELD: u32 = 1;
+/// `FragmentReuseIndexDetails.external`.
+const EXTERNAL_CONTENT_FIELD: u32 = 2;
 
 /// How an FRI entry's records are interpreted, as its `index_version` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +148,83 @@ impl RawHistory {
     }
 }
 
+/// One rewrite for [`FragReuseHistory::append`] to record: a transition per
+/// rewritten group, moving that group's rows from its source fragments to its
+/// destinations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RewriteRecord {
+    dataset_version: u64,
+    transitions: Vec<pb::Transition>,
+    overlaid_sources: Vec<u64>,
+}
+
+impl RewriteRecord {
+    /// A rewrite publishing at `dataset_version`, which a version 0 history
+    /// stamps its compaction version with.
+    pub fn new(dataset_version: u64, transitions: Vec<pb::Transition>) -> Self {
+        Self {
+            dataset_version,
+            transitions,
+            overlaid_sources: Vec::new(),
+        }
+    }
+
+    /// The fragments the rewrite consumes, as the table holds them, so the
+    /// history can refuse sources its format cannot record a rewrite of.
+    /// A caller that only builds intent for a later commit may leave them
+    /// out; the commit supplies them.
+    pub fn with_source_fragments<'a>(
+        mut self,
+        sources: impl IntoIterator<Item = &'a Fragment>,
+    ) -> Self {
+        self.overlaid_sources = sources
+            .into_iter()
+            .filter(|fragment| !fragment.overlays.is_empty())
+            .map(|fragment| fragment.id)
+            .collect();
+        self
+    }
+
+    pub fn dataset_version(&self) -> u64 {
+        self.dataset_version
+    }
+
+    pub fn transitions(&self) -> &[pb::Transition] {
+        &self.transitions
+    }
+
+    pub fn into_transitions(self) -> Vec<pb::Transition> {
+        self.transitions
+    }
+
+    /// Source fragments given through [`Self::with_source_fragments`] that
+    /// carry data overlay files.
+    pub(super) fn overlaid_sources(&self) -> &[u64] {
+        &self.overlaid_sources
+    }
+
+    /// Whether only the tagged format can record this rewrite.
+    pub fn needs_tagged_format(&self) -> bool {
+        self.transitions.iter().any(|transition| {
+            !matches!(
+                transition.mapping,
+                Some(pb::transition::Mapping::OrderedCompaction(_))
+            )
+        })
+    }
+}
+
+/// A history encoded as an FRI entry, by [`FragReuseHistory::encode`].
+#[derive(Debug, Clone)]
+pub struct EncodedHistory {
+    /// The entry, under a fresh uuid.
+    pub entry: IndexMetadata,
+    /// The bytes the entry's details reference, when they spilled. The caller
+    /// writes them to [`FRAG_REUSE_DETAILS_FILE_NAME`] in the entry's
+    /// directory before the entry is committed.
+    pub external: Option<Bytes>,
+}
+
 /// A validated fragment reuse history and its lineage view. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct FragReuseHistory(Arc<dyn FriImpl>);
@@ -169,6 +265,105 @@ impl FragReuseHistory {
             HistoryFormat::Legacy => Arc::new(LegacyHistory::decode(content)?),
             HistoryFormat::Tagged => Arc::new(TaggedHistory::decode(content)?),
         }))
+    }
+
+    /// The external file whose bytes [`Self::decode`] needs for `entry`, or
+    /// `None` when its history is inline (or it has no details, which decoding
+    /// refuses). Reading the file is the caller's IO.
+    pub fn locate(entry: &IndexMetadata) -> Result<Option<ExternalFile>> {
+        match &entry.index_details {
+            None => Ok(None),
+            Some(details) => Ok(match DetailsContent::of(details)? {
+                DetailsContent::Inline(_) => None,
+                DetailsContent::External(file) => Some(file),
+            }),
+        }
+    }
+
+    /// The history a committed FRI entry holds. `external` holds the bytes of
+    /// the file [`Self::locate`] named. A version 0 history an older writer
+    /// left invalid is repaired: invalid versions are dropped with a warning,
+    /// and rows they translated are scanned.
+    pub fn decode(entry: &IndexMetadata, external: Option<Bytes>) -> Result<Self> {
+        let raw = raw_history(entry, external, || {
+            Error::index("Index details is not for the fragment reuse index")
+        })?;
+        let (history, dropped) = raw.repair()?;
+        if !dropped.is_empty() {
+            log::warn!(
+                "fragment reuse entry {} records invalid versions {dropped:?}; they are dropped, \
+                 and rows they translated are scanned until their indices are rebuilt",
+                entry.uuid
+            );
+        }
+        Ok(history)
+    }
+
+    /// The history a caller's uncommitted FRI entry proposes. Unlike
+    /// [`Self::decode`] it never repairs: an invalid proposal is refused with
+    /// `InvalidInput`.
+    pub fn decode_proposed(entry: &IndexMetadata, external: Option<Bytes>) -> Result<Self> {
+        raw_history(entry, external, || {
+            Error::invalid_input("the proposed fragment reuse entry has no details")
+        })
+        .and_then(RawHistory::validate)
+        .map_err(|error| match error {
+            Error::CorruptFile { source, .. } => Error::invalid_input(format!(
+                "the proposed fragment reuse entry is invalid: {source}"
+            )),
+            other => other,
+        })
+    }
+
+    /// This history as a new FRI entry stamped `dataset_version`, spilling
+    /// details above the inline limit to an external file.
+    pub fn encode(&self, dataset_version: u64) -> EncodedHistory {
+        let content = self.content();
+        if content.len() <= INLINE_DETAILS_LIMIT {
+            return EncodedHistory {
+                entry: self.encode_inline(dataset_version),
+                external: None,
+            };
+        }
+        let file = ExternalFile {
+            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
+            offset: 0,
+            size: content.len() as u64,
+        };
+        let details = length_delimited(EXTERNAL_CONTENT_FIELD, &file.encode_to_vec());
+        EncodedHistory {
+            entry: self.entry_with_details(details, dataset_version),
+            external: Some(content),
+        }
+    }
+
+    /// This history as a new FRI entry with its details always inline, for an
+    /// entry that only carries intent to the commit path and is never itself
+    /// committed.
+    pub fn encode_inline(&self, dataset_version: u64) -> IndexMetadata {
+        let details = length_delimited(INLINE_CONTENT_FIELD, &self.content());
+        self.entry_with_details(details, dataset_version)
+    }
+
+    fn entry_with_details(&self, details: Vec<u8>, dataset_version: u64) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: FRAG_REUSE_INDEX_NAME.to_string(),
+            fields: vec![],
+            covering_fields: vec![],
+            dataset_version,
+            fragment_bitmap: Some(self.fragment_bitmap()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: DETAILS_TYPE_URL.into(),
+                value: details,
+            })),
+            index_version: self.format().index_version(),
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
     }
 
     /// The FRI format these records are interpreted under.
@@ -214,21 +409,30 @@ impl FragReuseHistory {
         self.0.fragment_bitmap()
     }
 
-    /// The same records interpreted under the tagged format. Version 0
-    /// records are valid tagged records, so the bytes are unchanged.
-    pub fn into_tagged(self) -> Result<Self> {
-        self.0.into_tagged().map(Self)
+    /// The same records in the tagged format. Version 0 records are valid
+    /// tagged records, so the bytes are unchanged and every recorded rewrite
+    /// translates as before; a tagged history is returned as is. A legacy
+    /// history read on a table with stable row IDs is refused: tagged
+    /// histories are address-based.
+    ///
+    /// Whether a table's history should be lifted is the table's
+    /// [`FriPolicy`](super::policy::FriPolicy) decision.
+    pub fn lift(&self) -> Result<Self> {
+        self.0.clone().lift().map(Self)
     }
 
-    /// Append `transitions` after every existing record.
-    pub fn append_transitions(&self, transitions: &[pb::Transition]) -> Result<Self> {
-        self.0.append_transitions(transitions).map(Self)
-    }
-
-    /// Insert a compaction version into a version 0 history, keeping
-    /// versions ordered by `dataset_version` as version 0 readers expect.
-    pub fn insert_legacy_version(&self, version: pb::Version) -> Result<Self> {
-        self.0.insert_legacy_version(version).map(Self)
+    /// Record `rewrite` after every existing record: a compaction version in
+    /// a version 0 history (kept ordered by `dataset_version`), transitions
+    /// in a tagged one.
+    ///
+    /// Refuses, with `InvalidInput`, a rewrite that would leave the history
+    /// invalid and, in a version 0 history, a transition only the tagged
+    /// format can hold (see [`Self::lift`]). A tagged history also refuses,
+    /// with `NotSupported`, a rewrite of sources carrying data overlay files
+    /// and any edit while it holds records this writer cannot maintain, and,
+    /// with `InvalidInput`, a transition it already records.
+    pub fn append(&self, rewrite: RewriteRecord) -> Result<Self> {
+        self.0.append(&rewrite).map(Self)
     }
 
     /// Keep only the records `keep` accepts.
@@ -245,14 +449,14 @@ impl FragReuseHistory {
         self.0.rebuilt(concat(&records)).map(Self)
     }
 
-    /// Restamp every stable-partition `base_id` through `remap`, leaving
+    /// Restamp every stable-partition `base_id` through `remap`, as a
+    /// shallow clone relocates the row maps it keeps referencing, leaving
     /// every other byte as written: unknown fields nested inside a mapping or
-    /// a digest survive.
-    pub fn remap_stable_partition_bases(
-        &self,
-        remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
-    ) -> Result<Self> {
-        self.0.clone().remap_stable_partition_bases(remap).map(Self)
+    /// a digest survive. Refused, with `NotSupported`, while the history
+    /// holds records this writer cannot interpret, since they may reference
+    /// bases too.
+    pub fn remap_bases(&self, remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>) -> Result<Self> {
+        self.0.clone().remap_bases(remap).map(Self)
     }
 
     /// The same history, read on a table with stable row IDs. Its read plans
@@ -417,6 +621,39 @@ impl std::fmt::Display for RecordIdentity {
             }
         }
     }
+}
+
+/// The unchecked history `entry` holds, its external content supplied as
+/// `external`.
+fn raw_history(
+    entry: &IndexMetadata,
+    external: Option<Bytes>,
+    missing_details: impl FnOnce() -> Error,
+) -> Result<RawHistory> {
+    let details = entry.index_details.as_ref().ok_or_else(missing_details)?;
+    let format = HistoryFormat::from_index_version(entry.index_version)?;
+    let content = match (DetailsContent::of(details)?, external) {
+        (DetailsContent::Inline(content), None) => content,
+        (DetailsContent::External(file), Some(content)) => {
+            verify_external_content(&file, &content)?;
+            content
+        }
+        (DetailsContent::Inline(_), Some(_)) => {
+            return Err(Error::invalid_input(format!(
+                "fragment reuse entry {} stores its history inline, but external content was \
+                 supplied",
+                entry.uuid
+            )));
+        }
+        (DetailsContent::External(file), None) => {
+            return Err(Error::invalid_input(format!(
+                "fragment reuse entry {} stores its history in {}; read it first (see \
+                 FragReuseHistory::locate)",
+                entry.uuid, file.path
+            )));
+        }
+    };
+    Ok(RawHistory::new(format, content))
 }
 
 pub(super) fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {

@@ -32,9 +32,9 @@ use crate::io::commit::{commit_transaction, default_commit_retry_timeout};
 use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
-use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
+use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseVersion};
 use lance_table::format::Fragment;
-use lance_table::system_index::frag_reuse::history::HistoryFormat;
+use lance_table::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
@@ -500,34 +500,7 @@ pub async fn commit_compaction(
         // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
         let stored = load_all_indices(dataset).await?;
-        let policy = FriPolicy::new(&dataset.manifest, &stored);
-        if policy.history_format() == HistoryFormat::Tagged {
-            policy.require_tagged_sources_supported(
-                rewrite_groups
-                    .iter()
-                    .flat_map(|group| group.old_fragments.iter()),
-            )?;
-            use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-            let transitions = frag_reuse_groups
-                .into_iter()
-                .map(|group| pb_fri::Transition {
-                    sources: group
-                        .old_frags
-                        .iter()
-                        .map(pb_fri::FragmentDigest::from)
-                        .collect(),
-                    destinations: group
-                        .new_frags
-                        .iter()
-                        .map(pb_fri::FragmentDigest::from)
-                        .collect(),
-                    mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
-                        pb_fri::OrderedCompaction {
-                            changed_row_addrs: group.changed_row_addrs,
-                        },
-                    )),
-                })
-                .collect();
+        if FriPolicy::new(&dataset.manifest, &stored).history_format() == HistoryFormat::Tagged {
             // The complete entry: the history at the read version plus this
             // compaction's own transitions, built from the same snapshot the
             // commit path diffs it against (see above). The commit path
@@ -539,8 +512,21 @@ pub async fn commit_compaction(
                 // than guessing the base from a later snapshot.
                 Cow::Owned(dataset.checkout_version(tasks_read_version).await?)
             };
+            let rewrite = RewriteRecord::from_legacy_version(
+                &lance_table::format::pb::fragment_reuse_index_details::Version::from(
+                    &FragReuseVersion {
+                        dataset_version: tasks_read_version,
+                        groups: frag_reuse_groups,
+                    },
+                ),
+            )
+            .with_source_fragments(
+                rewrite_groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter()),
+            );
             Some(
-                crate::index::frag_reuse::frag_reuse_entry_appending(&read_snapshot, transitions)
+                crate::index::frag_reuse::frag_reuse_entry_recording(&read_snapshot, rewrite)
                     .await?,
             )
         } else {

@@ -7,8 +7,8 @@ use crate::dataset::index::frag_reuse::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
-    build_frag_reuse_rewrite_entry, encode_frag_reuse_entry, legacy_version_transitions,
-    load_frag_reuse_history, load_frag_reuse_index_details, load_proposed_frag_reuse_history,
+    build_frag_reuse_rewrite_entry, encode_frag_reuse_entry, load_frag_reuse_history,
+    load_frag_reuse_index_details, load_proposed_frag_reuse_history,
 };
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -26,7 +26,9 @@ use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{self as pb_fri, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
+use lance_table::system_index::frag_reuse::history::{
+    FragReuseHistory, HistoryFormat, Record, RewriteRecord,
+};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
@@ -3203,7 +3205,9 @@ impl<'a> TransactionRebase<'a> {
                     for record in &added {
                         match record {
                             Record::LegacyVersion(version) => {
-                                transitions.extend(legacy_version_transitions(version));
+                                transitions.extend(
+                                    RewriteRecord::from_legacy_version(version).into_transitions(),
+                                );
                             }
                             Record::Transition(_) | Record::Uninterpretable { .. } => {
                                 return Err(Error::invalid_input(
@@ -3340,7 +3344,9 @@ impl<'a> TransactionRebase<'a> {
                     );
                 }
                 if let Some(own) = &own {
-                    history = history.insert_legacy_version(pb_fri::Version::from(own))?;
+                    history = history.append(RewriteRecord::from_legacy_version(
+                        &pb_fri::Version::from(own),
+                    ))?;
                 }
                 if !is_trimmed && !is_restamped && dropped.is_empty() {
                     return Ok((self.transaction, None));

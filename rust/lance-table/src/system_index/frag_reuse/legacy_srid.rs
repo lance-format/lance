@@ -13,13 +13,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
-use super::history::HistoryFormat;
+use super::history::{HistoryFormat, RewriteRecord};
 use super::imp::{FriImpl, Records};
 use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
-use crate::format::pb::fragment_reuse_index_details as pb;
 
 #[derive(Debug)]
 pub struct LegacySridHistory(Arc<dyn FriImpl>);
@@ -52,26 +51,26 @@ impl FriImpl for LegacySridHistory {
         self.0.fragment_bitmap()
     }
 
-    fn into_tagged(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
-        self.0.clone().into_tagged()
+    /// Tagged histories translate row addresses, which stable row IDs
+    /// replace, so a table with stable row IDs only ever records the legacy
+    /// format.
+    fn lift(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
+        Err(Error::not_supported(
+            "the dataset uses stable row IDs, which exclude tagged fragment reuse histories \
+             (they are address-based), so this rewrite cannot be recorded as tagged transitions \
+             on a stable-row-id dataset",
+        ))
     }
 
-    fn append_transitions(&self, transitions: &[pb::Transition]) -> Result<Arc<dyn FriImpl>> {
-        self.0.append_transitions(transitions).map(Self::wrap)
+    fn append(&self, rewrite: &RewriteRecord) -> Result<Arc<dyn FriImpl>> {
+        self.0.append(rewrite).map(Self::wrap)
     }
 
-    fn insert_legacy_version(&self, version: pb::Version) -> Result<Arc<dyn FriImpl>> {
-        self.0.insert_legacy_version(version).map(Self::wrap)
-    }
-
-    fn remap_stable_partition_bases(
+    fn remap_bases(
         self: Arc<Self>,
         remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Arc<dyn FriImpl>> {
-        self.0
-            .clone()
-            .remap_stable_partition_bases(remap)
-            .map(Self::wrap)
+        self.0.clone().remap_bases(remap).map(Self::wrap)
     }
 
     fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {

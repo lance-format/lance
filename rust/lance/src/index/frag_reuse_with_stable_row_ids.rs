@@ -12,7 +12,6 @@ use lance_table::feature_flags::{
     FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
 };
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::history::HistoryFormat;
 use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
 use lance_table::system_index::frag_reuse::plan::{
     ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport,
@@ -211,13 +210,7 @@ fn ensure_frag_reuse_recording_allowed_when(
     }
     // The tagged-history flag is sticky, so it can outlive a trim and a
     // migration to stable row ids.
-    if FriPolicy::new(manifest, indices).history_format() == HistoryFormat::Tagged {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    FriPolicy::new(manifest, indices).require_recording_allowed()?;
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());

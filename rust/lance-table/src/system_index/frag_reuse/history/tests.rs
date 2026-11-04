@@ -153,11 +153,14 @@ fn content_round_trips_byte_for_byte() {
 #[test]
 fn records_added_since_is_append_only() {
     let base = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
+        .append(RewriteRecord::new(
+            1,
+            vec![ordered(&[whole(0, 1)], &[(1, 1)])],
+        ))
         .unwrap();
     let added = ordered(&[whole(1, 1)], &[(2, 1)]);
     let proposed = base
-        .append_transitions(std::slice::from_ref(&added))
+        .append(RewriteRecord::new(1, vec![added.clone()]))
         .unwrap();
     assert_eq!(
         proposed.records_added_since(&base).unwrap(),
@@ -165,7 +168,10 @@ fn records_added_since_is_append_only() {
     );
 
     let dropped = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])])
+        .append(RewriteRecord::new(
+            1,
+            vec![ordered(&[whole(1, 1)], &[(2, 1)])],
+        ))
         .unwrap();
     let error = dropped.records_added_since(&base).unwrap_err();
     assert!(error.to_string().contains("drops"), "{error}");
@@ -176,10 +182,16 @@ fn records_added_since_is_append_only() {
         deleted: BTreeSet::from([deleted]),
     };
     let recorded = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[ordered(&[survivor(1)], &[(1, 1)])])
+        .append(RewriteRecord::new(
+            1,
+            vec![ordered(&[survivor(1)], &[(1, 1)])],
+        ))
         .unwrap();
     let changed = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[ordered(&[survivor(0)], &[(1, 1)])])
+        .append(RewriteRecord::new(
+            1,
+            vec![ordered(&[survivor(0)], &[(1, 1)])],
+        ))
         .unwrap();
     let error = changed.records_added_since(&recorded).unwrap_err();
     assert!(error.to_string().contains("changes"), "{error}");
@@ -280,13 +292,19 @@ fn simulate(
 
         history = if step < legacy_rewrites {
             history
-                .insert_legacy_version(legacy(step as u64 + 1, &sources, &destinations))
+                .append(RewriteRecord::new(
+                    step as u64 + 1,
+                    vec![ordered(&sources, &destinations)],
+                ))
                 .unwrap()
         } else {
             history
-                .into_tagged()
+                .lift()
                 .unwrap()
-                .append_transitions(&[ordered(&sources, &destinations)])
+                .append(RewriteRecord::new(
+                    1,
+                    vec![ordered(&sources, &destinations)],
+                ))
                 .unwrap()
         };
 

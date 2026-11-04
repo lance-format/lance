@@ -5,8 +5,11 @@
 //!
 //! Every writer that records, carries or refuses fragment reuse history asks
 //! [`FriPolicy`] instead of inspecting flags and entries itself, so a rule
-//! about the table (which record format, whether a rewrite may remap eagerly,
-//! whether tagged records are allowed) is decided in one place.
+//! about the table (which record format, whether a rewrite may remap
+//! eagerly) is decided in one place. The policy picks the history a rewrite
+//! is recorded onto ([`FriPolicy::recording_history`]); what that history
+//! may record is then refused by
+//! [`FragReuseHistory::append`](super::history::FragReuseHistory::append).
 //!
 //! ```
 //! use lance_table::format::Manifest;
@@ -22,9 +25,9 @@
 use lance_core::{Error, Result};
 
 use super::FRAG_REUSE_INDEX_NAME;
-use super::history::HistoryFormat;
+use super::history::{FragReuseHistory, HistoryFormat, RewriteRecord};
 use super::metadata::{is_tagged, uses_tagged_fri};
-use crate::format::{Fragment, IndexMetadata, Manifest};
+use crate::format::{IndexMetadata, Manifest};
 
 /// The fragment reuse rules of one table snapshot.
 #[derive(Debug, Clone, Copy)]
@@ -79,43 +82,37 @@ impl<'a> FriPolicy<'a> {
         Ok(())
     }
 
-    /// Refuse recording tagged records on a table that cannot carry them:
-    /// tagged histories translate row addresses, which stable row ids
-    /// replace.
-    pub fn require_tagged_records_allowed(&self) -> Result<()> {
+    /// The history a rewrite on this table appends to: `current`, the
+    /// table's history, or an empty one in [`Self::history_format`] when it
+    /// has none. It is read as the table reads it and lifted when the table
+    /// records tagged history or only the tagged format can record `rewrite`,
+    /// so the format of what [`FragReuseHistory::append`] records is decided
+    /// here.
+    ///
+    /// Refused, with `NotSupported`, on a table with stable row IDs whose
+    /// rewrite would need the tagged format: tagged histories are
+    /// address-based.
+    pub fn recording_history(
+        &self,
+        current: Option<FragReuseHistory>,
+        rewrite: &RewriteRecord,
+    ) -> Result<FragReuseHistory> {
+        let format = self.history_format();
+        let mut history = current.unwrap_or_else(|| FragReuseHistory::empty(format));
         if self.manifest.uses_stable_row_ids() {
-            return Err(Error::not_supported(
-                "Tagged fragment reuse histories are address-based and excluded on \
-                 stable-row-id datasets; this rewrite cannot carry transition intent here",
-            ));
+            history = history.on_stable_row_ids()?;
         }
-        Ok(())
+        if format == HistoryFormat::Tagged || rewrite.needs_tagged_format() {
+            history = history.lift()?;
+        }
+        Ok(history)
     }
 
-    /// Refuse a tagged transition over sources that carry data overlays.
-    ///
-    /// Rewriting such a source materializes the overlaid values, while an
-    /// index built before the overlay keeps the source as provenance and
-    /// would serve the destination through translation with the old values.
-    /// The legacy format handles this by dropping destination ids from stale
-    /// bitmaps, which has no effect on tagged provenance.
-    pub fn require_tagged_sources_supported<'f>(
-        &self,
-        sources: impl IntoIterator<Item = &'f Fragment>,
-    ) -> Result<()> {
-        if let Some(overlaid) = sources
-            .into_iter()
-            .find(|fragment| !fragment.overlays.is_empty())
-        {
-            return Err(Error::not_supported(format!(
-                "source fragment {} carries data overlay files; a rewrite recording a tagged \
-                 fragment reuse transition would materialize the overlaid values while indices \
-                 keep translated coverage over the old addresses. Compact the overlays away or \
-                 rebuild the covering indices eagerly first",
-                overlaid.id
-            )));
-        }
-        Ok(())
+    /// Refuse, before any rewrite runs, a table whose history no rewrite
+    /// could be recorded in (see [`Self::recording_history`]).
+    pub fn require_recording_allowed(&self) -> Result<()> {
+        self.recording_history(None, &RewriteRecord::new(self.manifest.version, Vec::new()))
+            .map(|_| ())
     }
 }
 

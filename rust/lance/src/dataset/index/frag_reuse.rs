@@ -792,9 +792,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
 
     // A v0 entry under the sticky flag is trimmed as the tagged history it
     // is lifted to.
-    let history = load_frag_reuse_history(dataset, &entry)
-        .await?
-        .into_tagged()?;
+    let history = load_frag_reuse_history(dataset, &entry).await?.lift()?;
     if !history.is_fully_interpretable() {
         return Err(Error::not_supported(
             "the tagged FRI history carries transitions this client cannot interpret; \

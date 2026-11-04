@@ -334,16 +334,21 @@ pub fn translation_fingerprint(
 mod tests {
     use super::*;
     use crate::system_index::frag_reuse::history::tests::{ordered, whole};
-    use crate::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat};
+    use crate::system_index::frag_reuse::history::{
+        FragReuseHistory, HistoryFormat, RewriteRecord,
+    };
 
     /// A,B -> C,D -> E,F. Each destination holds one row. Coverage is
     /// conservative for each mapping and requires both source fragments.
     fn chain() -> FragReuseHistory {
         FragReuseHistory::empty(HistoryFormat::Tagged)
-            .append_transitions(&[
-                ordered(&[whole(0, 1), whole(1, 1)], &[(2, 1), (3, 1)]),
-                ordered(&[whole(2, 1), whole(3, 1)], &[(4, 1), (5, 1)]),
-            ])
+            .append(RewriteRecord::new(
+                1,
+                vec![
+                    ordered(&[whole(0, 1), whole(1, 1)], &[(2, 1), (3, 1)]),
+                    ordered(&[whole(2, 1), whole(3, 1)], &[(4, 1), (5, 1)]),
+                ],
+            ))
             .unwrap()
     }
 

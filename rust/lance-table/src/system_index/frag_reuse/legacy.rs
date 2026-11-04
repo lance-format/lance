@@ -15,12 +15,13 @@ use roaring::RoaringBitmap;
 
 use super::FragReuseVersion;
 use super::history::{
-    FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, Record, length_delimited, split_records,
+    FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, Record, RewriteRecord, length_delimited,
+    split_records,
 };
 use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
 use super::legacy_srid::LegacySridHistory;
+use super::lift;
 use super::plan::{ReadContext, ReadPlan, SegmentSummary, TranslationPlan};
-use super::tagged::TaggedHistory;
 use crate::format::IndexMetadata;
 use crate::format::pb::fragment_reuse_index_details as pb;
 use crate::system_index::is_system_index;
@@ -261,19 +262,14 @@ impl FriImpl for LegacyHistory {
         bitmap
     }
 
-    // Version 0 records are valid tagged records, so the bytes are unchanged.
-    fn into_tagged(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
-        Ok(Arc::new(TaggedHistory::decode(concat(&self.0.stored))?))
+    fn lift(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
+        lift::lift_legacy(&self.0)
     }
 
-    fn append_transitions(&self, _transitions: &[pb::Transition]) -> Result<Arc<dyn FriImpl>> {
-        Err(Error::invalid_input(
-            "transitions require the tagged fragment reuse format; convert the history with \
-             `into_tagged` first",
-        ))
-    }
-
-    fn insert_legacy_version(&self, version: pb::Version) -> Result<Arc<dyn FriImpl>> {
+    /// Insert the rewrite's compaction version, keeping versions ordered by
+    /// `dataset_version` as version 0 readers expect.
+    fn append(&self, rewrite: &RewriteRecord) -> Result<Arc<dyn FriImpl>> {
+        let version = lift::legacy_version(rewrite)?;
         let position = self
             .0
             .stored
@@ -296,7 +292,7 @@ impl FriImpl for LegacyHistory {
 
     // A version 0 history has no stable partitions, so there is nothing to
     // restamp once it is known to hold no record a newer writer added.
-    fn remap_stable_partition_bases(
+    fn remap_bases(
         self: Arc<Self>,
         _remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Arc<dyn FriImpl>> {
@@ -357,14 +353,22 @@ impl FriImpl for LegacyHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system_index::frag_reuse::history::tests::{address, legacy, translate, whole};
+    use crate::system_index::frag_reuse::history::tests::{
+        address, legacy, ordered, translate, whole,
+    };
 
     #[test]
     fn legacy_versions_stay_ordered_by_dataset_version() {
         let history = FragReuseHistory::empty(HistoryFormat::Legacy)
-            .insert_legacy_version(legacy(5, &[whole(0, 1)], &[(1, 1)]))
+            .append(RewriteRecord::new(
+                5,
+                vec![ordered(&[whole(0, 1)], &[(1, 1)])],
+            ))
             .unwrap()
-            .insert_legacy_version(legacy(3, &[whole(2, 1)], &[(3, 1)]))
+            .append(RewriteRecord::new(
+                3,
+                vec![ordered(&[whole(2, 1)], &[(3, 1)])],
+            ))
             .unwrap();
         let versions: Vec<u64> = history
             .records()

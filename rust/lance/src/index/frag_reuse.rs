@@ -4,9 +4,8 @@
 mod entry;
 
 pub(crate) use entry::{
-    EncodedEntry, current_frag_reuse_history, encode_frag_reuse_entry, encode_frag_reuse_entry_at,
-    encode_inline_frag_reuse_entry, load_frag_reuse_history, load_proposed_frag_reuse_history,
-    read_raw_history,
+    EncodedEntry, encode_frag_reuse_entry, encode_frag_reuse_entry_at, load_frag_reuse_history,
+    load_proposed_frag_reuse_history, read_external_history, stored_frag_reuse_history,
 };
 use entry::{fri_external_location, read_fri_external_file};
 
@@ -28,7 +27,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, RewriteRecord};
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 pub(crate) use lance_table::system_index::frag_reuse::plan::{
     ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
@@ -734,9 +733,9 @@ pub(crate) async fn open_frag_reuse_index(
     CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
-/// Append a compaction version to the table's version 0 history.
-/// `dataset_version` stamps both the new reuse version and the entry, which
-/// must agree.
+/// Record a compaction of `frag_reuse_groups` in the table's history: a
+/// compaction version on a version 0 table. `dataset_version` stamps both
+/// the new reuse version and the entry, which must agree.
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
@@ -747,8 +746,12 @@ pub(crate) async fn build_new_frag_reuse_index(
         dataset_version,
         groups: frag_reuse_groups,
     };
-    let (_, history) = current_frag_reuse_history(dataset, HistoryFormat::Legacy).await?;
-    let history = history.insert_legacy_version(pb_fri::Version::from(&new_version))?;
+    let rewrite = RewriteRecord::from_legacy_version(&pb_fri::Version::from(&new_version));
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let current = stored_frag_reuse_history(dataset, &stored).await?;
+    let history = FriPolicy::new(&dataset.manifest, &stored)
+        .recording_history(current, &rewrite)?
+        .append(rewrite)?;
     encode_frag_reuse_entry(dataset, &history, dataset_version).await
 }
 
@@ -1044,33 +1047,26 @@ pub async fn frag_reuse_entry_appending(
     dataset: &Dataset,
     transitions: Vec<pb_fri::Transition>,
 ) -> lance_core::Result<IndexMetadata> {
-    let stored = super::loading::load_all_indices(dataset).await?;
-    FriPolicy::new(&dataset.manifest, &stored).require_tagged_records_allowed()?;
-    let (_, history) = current_frag_reuse_history(dataset, HistoryFormat::Tagged).await?;
-    let history = history.into_tagged()?.append_transitions(&transitions)?;
-    Ok(encode_inline_frag_reuse_entry(
-        &history,
-        dataset.manifest.version,
-    ))
+    frag_reuse_entry_recording(
+        dataset,
+        RewriteRecord::new(dataset.manifest.version, transitions),
+    )
+    .await
 }
 
-/// A legacy compaction version as the tagged history records it: one
-/// ordered-compaction transition per group, informationally equivalent
-/// (same digest ordering, same `changed_row_addrs` semantics).
-pub(crate) fn legacy_version_transitions(version: &pb_fri::Version) -> Vec<pb_fri::Transition> {
-    version
-        .groups
-        .iter()
-        .map(|group| pb_fri::Transition {
-            sources: group.old_fragments.clone(),
-            destinations: group.new_fragments.clone(),
-            mapping: Some(pb_fri::transition::Mapping::OrderedCompaction(
-                pb_fri::OrderedCompaction {
-                    changed_row_addrs: group.changed_row_addrs.clone(),
-                },
-            )),
-        })
-        .collect()
+/// [`frag_reuse_entry_appending`] for a `rewrite` that may also carry its
+/// source fragments.
+pub(crate) async fn frag_reuse_entry_recording(
+    dataset: &Dataset,
+    rewrite: RewriteRecord,
+) -> lance_core::Result<IndexMetadata> {
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let current = stored_frag_reuse_history(dataset, &stored).await?;
+    let history = FriPolicy::new(&dataset.manifest, &stored)
+        .recording_history(current, &rewrite)?
+        .lift()?
+        .append(rewrite)?;
+    Ok(history.encode_inline(dataset.manifest.version))
 }
 
 /// Refuse a bare group of a transition-carrying rewrite by the bare-rewrite
@@ -1129,10 +1125,21 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
     let stored = super::loading::load_all_indices(dataset).await?;
-    let policy = FriPolicy::new(&dataset.manifest, &stored);
-    // Deferred compaction records v0 entries on stable-row-id tables, so only a
-    // hand-built tagged rewrite committed directly reaches this.
-    policy.require_tagged_records_allowed()?;
+    let base_entry_version = stored
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .map(|entry| entry.dataset_version);
+    let current = stored_frag_reuse_history(dataset, &stored).await?;
+    // Lifted before the binding reads anything, so a table that cannot hold
+    // a tagged history (one with stable row ids, where deferred compaction
+    // records v0 entries and only a hand-built tagged rewrite reaches this)
+    // is refused first.
+    let history = FriPolicy::new(&dataset.manifest, &stored)
+        .recording_history(
+            current,
+            &RewriteRecord::new(dataset.manifest.version, Vec::new()),
+        )?
+        .lift()?;
 
     if transitions.is_empty() {
         return Err(Error::invalid_input(
@@ -1225,7 +1232,6 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             source_deltas.push(current - digest.num_deleted_rows);
         }
         let folding = source_deltas.iter().any(|&delta| delta > 0);
-        policy.require_tagged_sources_supported(group.old_fragments.iter())?;
 
         for (source_index, (frag, digest)) in group
             .old_fragments
@@ -1369,40 +1375,13 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         // ledger's digest conservation stands in for it at commit time.
     }
 
-    let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-    let (history, base_entry_version) = match existing {
-        None => (FragReuseHistory::empty(HistoryFormat::Tagged), None),
-        Some(entry) => (
-            load_frag_reuse_history(dataset, entry)
-                .await?
-                .into_tagged()?,
-            Some(entry.dataset_version),
+    let history = history.append(
+        RewriteRecord::new(dataset.manifest.version, transitions.to_vec()).with_source_fragments(
+            covered_groups
+                .iter()
+                .flat_map(|group| group.old_fragments.iter()),
         ),
-    };
-    // A transition is recorded once. The rewrite's intent was diffed against
-    // the entry at its read version; the current entry may have moved on
-    // (another writer's transitions, a trim), but it can only hold one of
-    // ours if the same sources were consumed twice, which the resolver
-    // refuses before this point. Check anyway rather than record it twice.
-    let source_ids = |transition: &pb_fri::Transition| -> Vec<u64> {
-        transition.sources.iter().map(|digest| digest.id).collect()
-    };
-    for transition in transitions {
-        let is_recorded = history.records().any(|record| {
-            matches!(record, Record::Transition(existing)
-                if source_ids(existing) == source_ids(transition)
-                    && existing.destinations.iter().map(|d| d.id).eq(
-                        transition.destinations.iter().map(|d| d.id)))
-        });
-        if is_recorded {
-            return Err(Error::invalid_input(format!(
-                "the fragment reuse history already records a transition from fragments {:?}; \
-                 the rewrite's entry cannot append it again",
-                source_ids(transition)
-            )));
-        }
-    }
-    let history = history.append_transitions(transitions)?;
+    )?;
     let entry = encode_frag_reuse_entry(dataset, &history, dataset.manifest.version).await?;
     Ok((entry, base_entry_version))
 }
@@ -1446,7 +1425,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     target_store: &ObjectStore,
     target_base: &Path,
 ) -> lance_core::Result<(IndexMetadata, Option<Path>)> {
-    let details = entry
+    entry
         .index_details
         .as_ref()
         .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
@@ -1455,7 +1434,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     // `Dataset`: the same rule as `read_fri_external_file`, against the
     // source manifest's `base_paths`.
     let registry = store_registry.clone();
-    let raw = read_raw_history(entry.index_version, details, |file| async move {
+    let external = read_external_history(entry, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -1506,29 +1485,28 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     .await?;
     // The source entry is committed, so it is read as stored history. A
     // tagged history is never repaired, so nothing is dropped from it here.
-    let (history, _) = raw.repair()?;
+    let history = FragReuseHistory::decode(entry, external)?;
 
-    let relocated =
-        history.remap_stable_partition_bases(&|base_id| match (&base_remap, base_id) {
-            // Deep clone materializes every referenced map into the clone's
-            // own `_fri/`, so every stamp clears to unset.
-            (CloneBaseRemap::Deep, _) => Ok(None),
-            // The source's own base gets the id the clone assigned to it.
-            (CloneBaseRemap::Shallow { new_base_id }, None) => Ok(Some(*new_base_id)),
-            // The clone carries the source's `base_paths` entries over under
-            // the same ids, so a foreign-base reference keeps its id; it must
-            // exist.
-            (CloneBaseRemap::Shallow { .. }, Some(id)) => {
-                if source_manifest.base_paths.contains_key(&id) {
-                    Ok(Some(id))
-                } else {
-                    Err(Error::corrupt_file_named(
-                        "FRI details",
-                        format!("stable partition mapping references missing base {id}"),
-                    ))
-                }
+    let relocated = history.remap_bases(&|base_id| match (&base_remap, base_id) {
+        // Deep clone materializes every referenced map into the clone's
+        // own `_fri/`, so every stamp clears to unset.
+        (CloneBaseRemap::Deep, _) => Ok(None),
+        // The source's own base gets the id the clone assigned to it.
+        (CloneBaseRemap::Shallow { new_base_id }, None) => Ok(Some(*new_base_id)),
+        // The clone carries the source's `base_paths` entries over under
+        // the same ids, so a foreign-base reference keeps its id; it must
+        // exist.
+        (CloneBaseRemap::Shallow { .. }, Some(id)) => {
+            if source_manifest.base_paths.contains_key(&id) {
+                Ok(Some(id))
+            } else {
+                Err(Error::corrupt_file_named(
+                    "FRI details",
+                    format!("stable partition mapping references missing base {id}"),
+                ))
             }
-        })?;
+        }
+    })?;
 
     let EncodedEntry {
         entry: mut relocated_entry,

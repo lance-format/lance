@@ -9,6 +9,7 @@ mod imp;
 pub mod ledger;
 mod legacy;
 mod legacy_srid;
+mod lift;
 pub mod lineage;
 pub mod metadata;
 pub mod plan;

@@ -16,10 +16,9 @@ use bytes::{Bytes, BytesMut};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
-use super::history::{HistoryFormat, Record, split_records};
+use super::history::{HistoryFormat, Record, RewriteRecord, split_records};
 use super::ledger::FragReuseLedger;
 use super::plan::{ReadContext, ReadPlan, SegmentSummary};
-use crate::format::pb::fragment_reuse_index_details as pb;
 
 /// One FRI format's rules over its records.
 pub trait FriImpl: Send + Sync + Debug {
@@ -34,13 +33,16 @@ pub trait FriImpl: Send + Sync + Debug {
     /// See [`FragReuseHistory::fragment_bitmap`](super::history::FragReuseHistory::fragment_bitmap).
     fn fragment_bitmap(&self) -> RoaringBitmap;
 
-    fn into_tagged(self: Arc<Self>) -> Result<Arc<dyn FriImpl>>;
+    /// See [`FragReuseHistory::lift`](super::history::FragReuseHistory::lift).
+    fn lift(self: Arc<Self>) -> Result<Arc<dyn FriImpl>>;
 
-    fn append_transitions(&self, transitions: &[pb::Transition]) -> Result<Arc<dyn FriImpl>>;
+    /// Record `rewrite` in this format. The format is already the one the
+    /// table's policy chose (see
+    /// [`FragReuseHistory::append`](super::history::FragReuseHistory::append)).
+    fn append(&self, rewrite: &RewriteRecord) -> Result<Arc<dyn FriImpl>>;
 
-    fn insert_legacy_version(&self, version: pb::Version) -> Result<Arc<dyn FriImpl>>;
-
-    fn remap_stable_partition_bases(
+    /// See [`FragReuseHistory::remap_bases`](super::history::FragReuseHistory::remap_bases).
+    fn remap_bases(
         self: Arc<Self>,
         remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Arc<dyn FriImpl>>;

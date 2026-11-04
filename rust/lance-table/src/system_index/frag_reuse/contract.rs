@@ -13,27 +13,27 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use super::history::tests::{
-    Source, legacy, ordered, transition_with_unknown_field, unknown_record, whole,
+    MAP_A, Source, legacy, ordered, partition, transition_with_unknown_field, unknown_record, whole,
 };
 use super::history::{
-    FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, length_delimited,
+    FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, RewriteRecord,
+    length_delimited,
 };
 use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
 
-/// Record one rewrite as the record kind `history`'s format writes.
+/// Record one rewrite of `sources` into `destinations` at `dataset_version`.
 fn record_natively(
     history: FragReuseHistory,
     dataset_version: u64,
     sources: &[Source],
     destinations: &[(u64, u64)],
 ) -> FragReuseHistory {
-    match history.format() {
-        HistoryFormat::Legacy => {
-            history.insert_legacy_version(legacy(dataset_version, sources, destinations))
-        }
-        HistoryFormat::Tagged => history.append_transitions(&[ordered(sources, destinations)]),
-    }
-    .unwrap()
+    history
+        .append(RewriteRecord::new(
+            dataset_version,
+            vec![ordered(sources, destinations)],
+        ))
+        .unwrap()
 }
 
 #[rstest]
@@ -132,29 +132,31 @@ fn fragment_bitmap_follows_the_format(#[case] format: HistoryFormat, #[case] exp
 #[test]
 fn lifted_legacy_records_name_their_sources() {
     let v0 = FragReuseHistory::empty(HistoryFormat::Legacy)
-        .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
+        .append(RewriteRecord::new(
+            1,
+            vec![ordered(&[whole(0, 1)], &[(1, 1)])],
+        ))
         .unwrap();
+    assert_eq!(v0.format(), HistoryFormat::Legacy);
     assert_eq!(v0.fragment_bitmap(), RoaringBitmap::from_iter([1]));
     assert_eq!(
-        v0.into_tagged().unwrap().fragment_bitmap(),
+        v0.lift().unwrap().fragment_bitmap(),
         RoaringBitmap::from_iter([0, 1])
     );
 }
 
-#[rstest]
-#[case::legacy(HistoryFormat::Legacy)]
-#[case::tagged(HistoryFormat::Tagged)]
-fn each_format_refuses_the_other_record_kind(#[case] format: HistoryFormat) {
-    let history = FragReuseHistory::empty(format);
-    let error = match format {
-        HistoryFormat::Legacy => history
-            .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
-            .unwrap_err(),
-        HistoryFormat::Tagged => history
-            .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
-            .unwrap_err(),
-    };
+/// A version 0 history holds only ordered compactions: a stable partition
+/// is refused until the history is lifted.
+#[test]
+fn legacy_refuses_a_transition_only_tagged_records() {
+    let rewrite = RewriteRecord::new(1, vec![partition(0, 1, MAP_A)]);
+    assert!(rewrite.needs_tagged_format());
+    let legacy = FragReuseHistory::empty(HistoryFormat::Legacy);
+    let error = legacy.append(rewrite.clone()).unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains("lift"), "{error}");
+    let lifted = legacy.lift().unwrap().append(rewrite).unwrap();
+    assert_eq!(lifted.format(), HistoryFormat::Tagged);
 }
 
 #[rstest]
@@ -205,9 +207,12 @@ fn whole_history_edits_refuse_records_they_cannot_interpret(
         assert!(error.to_string().contains("cannot maintain"), "{error}");
     };
     assert_refused(history.retain(&mut |_| true));
-    assert_refused(history.remap_stable_partition_bases(&Ok));
+    assert_refused(history.remap_bases(&Ok));
     if format == HistoryFormat::Tagged {
-        assert_refused(history.append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])]));
+        assert_refused(history.append(RewriteRecord::new(
+            1,
+            vec![ordered(&[whole(1, 1)], &[(2, 1)])],
+        )));
     }
 }
 

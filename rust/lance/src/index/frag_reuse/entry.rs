@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Reading and writing the FRI entry. Every entry is built from a
-//! [`FragReuseHistory`] here, so the inline-or-spill choice, the fragment
-//! bitmap and the `index_version` follow one rule.
+//! The IO around the FRI entry codec: reading the external history file
+//! [`FragReuseHistory::decode`] needs and writing the one
+//! [`FragReuseHistory::encode`] spills.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -17,59 +17,37 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::ExternalFile;
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::system_index::frag_reuse::history::{
-    FragReuseHistory, HistoryFormat, RawHistory, length_delimited,
-};
-use lance_table::system_index::frag_reuse::ledger::{DetailsContent, verify_external_content};
+use lance_table::system_index::frag_reuse::history::{EncodedHistory, FragReuseHistory};
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
-use uuid::Uuid;
 
 use crate::Dataset;
 use crate::session::index_caches::{FragReuseContent, FragReuseContentKey, FragReuseDetailsKey};
 
-/// Details above this size spill to an external `details.binpb` file.
-const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
-
-const DETAILS_TYPE_URL: &str = "/lance.table.FragmentReuseIndexDetails";
-/// `FragmentReuseIndexDetails.inline`.
-const INLINE_CONTENT_FIELD: u32 = 1;
-/// `FragmentReuseIndexDetails.external`.
-const EXTERNAL_CONTENT_FIELD: u32 = 2;
-
-/// The unchecked history FRI `details` of `index_version` hold, reading
-/// external content through `read_external`, which must return exactly the
-/// referenced byte range.
-pub async fn read_raw_history<F, Fut>(
-    index_version: i32,
-    details: &prost_types::Any,
+/// The bytes of `entry`'s external history file, read through
+/// `read_external`, which must return exactly the referenced byte range;
+/// `None` when the history is inline.
+pub async fn read_external_history<F, Fut>(
+    entry: &IndexMetadata,
     read_external: F,
-) -> Result<RawHistory>
+) -> Result<Option<Bytes>>
 where
     F: FnOnce(ExternalFile) -> Fut,
     Fut: Future<Output = Result<Bytes>>,
 {
-    let format = HistoryFormat::from_index_version(index_version)?;
-    let content = match DetailsContent::of(details)? {
-        DetailsContent::Inline(content) => content,
-        DetailsContent::External(file) => {
-            let content = read_external(file.clone()).await?;
-            verify_external_content(&file, &content)?;
-            content
-        }
-    };
-    Ok(RawHistory::new(format, content))
+    match FragReuseHistory::locate(entry)? {
+        Some(file) => Ok(Some(read_external(file).await?)),
+        None => Ok(None),
+    }
 }
 
-/// The unchecked history `entry` holds, reading external details through the
-/// entry's base once per session.
-async fn read_entry_raw_history(
+/// [`read_external_history`] through the entry's base, once per session.
+async fn read_entry_external_history(
     dataset: &Dataset,
     entry: &IndexMetadata,
-    details: &prost_types::Any,
-) -> Result<RawHistory> {
-    read_raw_history(entry.index_version, details, |file| async move {
+) -> Result<Option<Bytes>> {
+    read_external_history(entry, |file| async move {
         read_fri_external_file(dataset, entry, &file).await
     })
     .await
@@ -81,63 +59,40 @@ pub async fn load_frag_reuse_history(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> Result<FragReuseHistory> {
-    let details = entry
-        .index_details
-        .as_ref()
-        .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-    let (history, dropped) = read_entry_raw_history(dataset, entry, details)
-        .await?
-        .repair()?;
-    if !dropped.is_empty() {
-        log::warn!(
-            "fragment reuse entry {} records invalid versions {dropped:?}; they are dropped, and \
-             rows they translated are scanned until their indices are rebuilt",
-            entry.uuid
-        );
-    }
-    Ok(history)
+    let external = read_entry_external_history(dataset, entry).await?;
+    FragReuseHistory::decode(entry, external)
 }
 
-/// The history a caller's uncommitted FRI entry proposes. Unlike stored
-/// history it is never repaired: an invalid proposal is the caller's error.
+/// The history a caller's uncommitted FRI entry proposes (see
+/// [`FragReuseHistory::decode_proposed`]).
 pub async fn load_proposed_frag_reuse_history(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> Result<FragReuseHistory> {
-    let details = entry
-        .index_details
-        .as_ref()
-        .ok_or_else(|| Error::invalid_input("the proposed fragment reuse entry has no details"))?;
-    async {
-        read_entry_raw_history(dataset, entry, details)
-            .await?
-            .validate()
-    }
-    .await
-    .map_err(|error| match error {
-        Error::CorruptFile { source, .. } => Error::invalid_input(format!(
-            "the proposed fragment reuse entry is invalid: {source}"
-        )),
-        other => other,
-    })
+    let external =
+        read_entry_external_history(dataset, entry)
+            .await
+            .map_err(|error| match error {
+                Error::CorruptFile { source, .. } => Error::invalid_input(format!(
+                    "the proposed fragment reuse entry is invalid: {source}"
+                )),
+                other => other,
+            })?;
+    FragReuseHistory::decode_proposed(entry, external)
 }
 
-/// The current FRI entry's history, or an empty history in `format` when the
-/// table has none.
-pub async fn current_frag_reuse_history(
+/// The history of `indices`' FRI entry, if the table has one.
+pub async fn stored_frag_reuse_history(
     dataset: &Dataset,
-    format: HistoryFormat,
-) -> Result<(Option<IndexMetadata>, FragReuseHistory)> {
-    let current = super::super::loading::load_all_indices(dataset)
-        .await?
+    indices: &[IndexMetadata],
+) -> Result<Option<FragReuseHistory>> {
+    match indices
         .iter()
         .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
-        .cloned();
-    let history = match &current {
-        Some(entry) => load_frag_reuse_history(dataset, entry).await?,
-        None => FragReuseHistory::empty(format),
-    };
-    Ok((current, history))
+    {
+        Some(entry) => Ok(Some(load_frag_reuse_history(dataset, entry).await?)),
+        None => Ok(None),
+    }
 }
 
 /// An FRI entry and the external details file it wrote, if any.
@@ -163,9 +118,7 @@ pub async fn encode_frag_reuse_entry(
     )
     .await?;
     // Spares the commit's history checks from reading the file back.
-    if let Some(details) = &encoded.entry.index_details
-        && let Some(file) = external_file(details)?
-    {
+    if let Some(file) = FragReuseHistory::locate(&encoded.entry)? {
         let (store, path) = fri_external_location(dataset, &encoded.entry, &file).await?;
         dataset
             .index_cache
@@ -213,67 +166,20 @@ pub async fn encode_frag_reuse_entry_at(
     history: &FragReuseHistory,
     dataset_version: u64,
 ) -> Result<EncodedEntry> {
-    let uuid = Uuid::new_v4();
-    let content = history.content();
-    let (details, spilled) = if content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
-        let path = indices_dir
-            .join(uuid.to_string())
-            .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = store.create(&path).await?;
-        writer.write_all(&content[..]).await?;
-        writer.shutdown().await?;
-        let file = ExternalFile {
-            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
-            offset: 0,
-            size: content.len() as u64,
-        };
-        (
-            length_delimited(EXTERNAL_CONTENT_FIELD, &file.encode_to_vec()),
-            Some(path),
-        )
-    } else {
-        (length_delimited(INLINE_CONTENT_FIELD, &content), None)
+    let EncodedHistory { entry, external } = history.encode(dataset_version);
+    let spilled = match external {
+        Some(content) => {
+            let path = indices_dir
+                .join(entry.uuid.to_string())
+                .join(FRAG_REUSE_DETAILS_FILE_NAME);
+            let mut writer = store.create(&path).await?;
+            writer.write_all(&content[..]).await?;
+            writer.shutdown().await?;
+            Some(path)
+        }
+        None => None,
     };
-    Ok(EncodedEntry {
-        entry: entry_with_details(uuid, history, details, dataset_version),
-        spilled,
-    })
-}
-
-/// Encode `history` with its details always inline, for an entry that only
-/// carries intent to the commit path and is never itself committed.
-pub fn encode_inline_frag_reuse_entry(
-    history: &FragReuseHistory,
-    dataset_version: u64,
-) -> IndexMetadata {
-    let details = length_delimited(INLINE_CONTENT_FIELD, &history.content());
-    entry_with_details(Uuid::new_v4(), history, details, dataset_version)
-}
-
-fn entry_with_details(
-    uuid: Uuid,
-    history: &FragReuseHistory,
-    details: Vec<u8>,
-    dataset_version: u64,
-) -> IndexMetadata {
-    IndexMetadata {
-        uuid,
-        name: FRAG_REUSE_INDEX_NAME.to_string(),
-        fields: vec![],
-        covering_fields: vec![],
-        dataset_version,
-        fragment_bitmap: Some(history.fragment_bitmap()),
-        index_details: Some(Arc::new(prost_types::Any {
-            type_url: DETAILS_TYPE_URL.into(),
-            value: details,
-        })),
-        index_version: history.format().index_version(),
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: None,
-        clustering_id: None,
-        metadata: Default::default(),
-    }
+    Ok(EncodedEntry { entry, spilled })
 }
 
 /// Where an FRI entry's external details live, honoring the entry's base:
@@ -334,16 +240,4 @@ pub(super) async fn read_fri_external_file(
         )
         .await?;
     Ok(content.0.clone())
-}
-
-fn external_file(details: &prost_types::Any) -> Result<Option<ExternalFile>> {
-    let details =
-        lance_table::format::pb::FragmentReuseIndexDetails::decode(details.value.as_slice())
-            .map_err(|e| Error::corrupt_file_named("FRI details", e.to_string()))?;
-    Ok(match details.content {
-        Some(lance_table::format::pb::fragment_reuse_index_details::Content::External(file)) => {
-            Some(file)
-        }
-        _ => None,
-    })
 }

@@ -14,7 +14,7 @@ use prost::Message;
 use prost::encoding::{WireType, decode_key, decode_varint};
 use roaring::RoaringBitmap;
 
-use super::history::{HistoryFormat, Record, TRANSITION_FIELD, length_delimited};
+use super::history::{HistoryFormat, Record, RewriteRecord, TRANSITION_FIELD, length_delimited};
 use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
 use super::ledger::{STABLE_PARTITION_FIELD, corrupt, next_field, require_message};
 use super::plan::{
@@ -83,15 +83,48 @@ impl FriImpl for TaggedHistory {
         bitmap
     }
 
-    fn into_tagged(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
+    fn lift(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
         Ok(self)
     }
 
-    fn append_transitions(&self, transitions: &[pb::Transition]) -> Result<Arc<dyn FriImpl>> {
+    fn append(&self, rewrite: &RewriteRecord) -> Result<Arc<dyn FriImpl>> {
         self.0
             .require_fully_interpretable("append transitions to")?;
+        // Rewriting such a source materializes the overlaid values, while an
+        // index built before the overlay keeps the source as provenance and
+        // would serve the destination through translation with the old
+        // values. The legacy format handles this by dropping destination ids
+        // from stale bitmaps, which has no effect on tagged provenance.
+        if let Some(overlaid) = rewrite.overlaid_sources().first() {
+            return Err(Error::not_supported(format!(
+                "source fragment {overlaid} carries data overlay files; a rewrite recording a \
+                 tagged fragment reuse transition would materialize the overlaid values while \
+                 indices keep translated coverage over the old addresses. Compact the overlays \
+                 away or rebuild the covering indices eagerly first"
+            )));
+        }
+        // A rewrite merged onto a history that moved on since its intent was
+        // built could only find itself recorded if its sources were consumed
+        // twice, which the lineage check also refuses; this names the cause.
+        let ids = |digests: &[pb::FragmentDigest]| -> Vec<u64> {
+            digests.iter().map(|digest| digest.id).collect()
+        };
+        for transition in rewrite.transitions() {
+            let is_recorded = self.0.stored.iter().any(|stored| {
+                matches!(&stored.record, Record::Transition(existing)
+                    if ids(&existing.sources) == ids(&transition.sources)
+                        && ids(&existing.destinations) == ids(&transition.destinations))
+            });
+            if is_recorded {
+                return Err(Error::invalid_input(format!(
+                    "the fragment reuse history already records a transition from fragments \
+                     {:?}; a rewrite cannot append it again",
+                    ids(&transition.sources)
+                )));
+            }
+        }
         let mut content = BytesMut::from(concat(&self.0.stored));
-        for transition in transitions {
+        for transition in rewrite.transitions() {
             content.extend_from_slice(&length_delimited(
                 TRANSITION_FIELD,
                 &transition.encode_to_vec(),
@@ -100,14 +133,7 @@ impl FriImpl for TaggedHistory {
         self.rebuilt(content.freeze()).map_err(invalid_edit)
     }
 
-    fn insert_legacy_version(&self, _version: pb::Version) -> Result<Arc<dyn FriImpl>> {
-        Err(Error::invalid_input(
-            "a compaction version cannot be added to a tagged fragment reuse history; append \
-             transitions instead",
-        ))
-    }
-
-    fn remap_stable_partition_bases(
+    fn remap_bases(
         self: Arc<Self>,
         remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Arc<dyn FriImpl>> {
@@ -318,10 +344,16 @@ mod tests {
     #[test]
     fn appended_transitions_are_validated_against_the_whole_lineage() {
         let history = FragReuseHistory::empty(HistoryFormat::Tagged)
-            .append_transitions(&[ordered(&[whole(0, 2)], &[(1, 2)])])
+            .append(RewriteRecord::new(
+                1,
+                vec![ordered(&[whole(0, 2)], &[(1, 2)])],
+            ))
             .unwrap();
         let error = history
-            .append_transitions(&[ordered(&[whole(0, 2)], &[(2, 2)])])
+            .append(RewriteRecord::new(
+                1,
+                vec![ordered(&[whole(0, 2)], &[(2, 2)])],
+            ))
             .unwrap_err();
         assert!(error.to_string().contains("duplicate consumer"), "{error}");
     }
@@ -329,17 +361,17 @@ mod tests {
     #[test]
     fn a_row_map_belongs_to_one_transition() {
         let history = FragReuseHistory::empty(HistoryFormat::Tagged)
-            .append_transitions(&[partition(0, 1, MAP_A)])
+            .append(RewriteRecord::new(1, vec![partition(0, 1, MAP_A)]))
             .unwrap();
         let error = history
-            .append_transitions(&[partition(2, 3, MAP_A)])
+            .append(RewriteRecord::new(1, vec![partition(2, 3, MAP_A)]))
             .unwrap_err();
         assert!(
             error.to_string().contains("more than one transition"),
             "{error}"
         );
         history
-            .append_transitions(&[partition(2, 3, MAP_B)])
+            .append(RewriteRecord::new(1, vec![partition(2, 3, MAP_B)]))
             .unwrap();
     }
 
@@ -370,7 +402,7 @@ mod tests {
         .unwrap();
 
         let relocated = history
-            .remap_stable_partition_bases(&|base| {
+            .remap_bases(&|base| {
                 assert_eq!(base, Some(2));
                 Ok(Some(7))
             })
