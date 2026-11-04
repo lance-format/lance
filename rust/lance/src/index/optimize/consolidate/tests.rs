@@ -588,9 +588,10 @@ async fn indexed_rows(dataset: &Dataset, segment: &IndexMetadata) -> u64 {
 }
 
 fn select(segments: &[&IndexMetadata]) -> OptimizeOptions {
-    OptimizeOptions::consolidate(4 * BASE as u64)
-        .index_names(vec![NAME.to_string()])
-        .consolidate_segments(segments.iter().map(|segment| segment.uuid).collect())
+    OptimizeOptions::consolidate_selected(
+        NAME,
+        segments.iter().map(|segment| segment.uuid).collect(),
+    )
 }
 
 #[rstest]
@@ -694,19 +695,17 @@ async fn invalid_selections_are_rejected() {
     let dir = TempStrDir::default();
     let dataset = fixture(&dir, false).await;
     let old = segments(&dataset).await;
-    let unnamed =
-        OptimizeOptions::consolidate(4 * BASE as u64).consolidate_segments(vec![old[0].uuid]);
+    let mut unnamed = select(&[&old[0]]);
+    unnamed.index_names = None;
+    let mut budgeted = select(&[&old[0]]);
+    budgeted.max_rows_to_consolidate = Some(4 * BASE as u64);
     for invalid in [
         unnamed,
         select(&[&old[0], &old[0]]),
         select(&[]),
         select(&[&old[0]]).index_names(vec![NAME.to_string(), "other".to_string()]),
-        OptimizeOptions::default()
-            .index_names(vec![NAME.to_string()])
-            .consolidate_segments(vec![old[0].uuid]),
-        OptimizeOptions::consolidate(BASE as u64)
-            .index_names(vec![NAME.to_string()])
-            .consolidate_segments(vec![old[0].uuid, old[1].uuid]),
+        budgeted,
+        select(&[&old[0]]).num_indices_to_merge(Some(1)),
     ] {
         let error = plan_optimize_indices(&dataset, &invalid).await.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
