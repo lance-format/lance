@@ -13,18 +13,3 @@
 # crate = "some-crate"
 # version = "1.2.3"
 # reason = "RUSTSEC-2026-0000, allowlisted in Aikido 2026-09-16"
-
-[[allow]]
-crate = "rustls-webpki"
-version = "0.103.16"
-reason = "RUSTSEC-2026-0382 / CVE-2026-111943: rejects chains that carry the compromised eMudhra intermediate keys; remove after 2026-10-22T08:58Z"
-
-[[allow]]
-crate = "webpki-roots"
-version = "1.0.10"
-reason = "drops emSign ECC Root CA - G3 after the eMudhra intermediate compromise; remove after 2026-10-21T20:11Z"
-
-[[allow]]
-crate = "webpki-root-certs"
-version = "1.0.10"
-reason = "drops emSign ECC Root CA - G3 after the eMudhra intermediate compromise; remove after 2026-10-21T20:11Z"

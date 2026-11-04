@@ -489,6 +489,55 @@ message ByteStreamSplit {
   CompressiveEncoding values = 1;
 }
 
+/* ALP: Adaptive Lossless floating-Point encoding
+ *
+ * Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
+ * mini-block chunk is self-describing (mode, exponents, bit width, base
+ * values), so only the input width is declared here.
+ */
+message Alp {
+  // 32 for f32 and 64 for f64
+  uint32 bits_per_value = 1;
+}
+
+/* Length-preserving modular integer differences within each fixed-size tensor.
+ * The child is one or more fixed-size-list layers ending in plain 8/16/32/64-bit
+ * elements, without child validity. For each tensor, divide its elements into
+ * spans of axis_length * inner_stride. Copy the first inner_stride elements of
+ * each span. For every later element i, store input[i] - input[i-inner_stride]
+ * modulo 2^element_bits. Decode by adding the already reconstructed predecessor.
+ * Preserve little-endian representation and original element order. Each tensor
+ * is independent. This transform is valid only in per-value encoding positions.
+ */
+message AxisDelta {
+  // Required untransformed fixed-size-list encoding, retaining the tensor shape.
+  CompressiveEncoding values = 1;
+  // Positive number of positions along the predicted physical axis.
+  uint64 axis_length = 2;
+  // Positive number of elements between adjacent positions along that axis.
+  uint64 inner_stride = 3;
+}
+
+/* Pcodec (pco) compression of floating-point mini-block chunks.
+ *
+ * The values describe the uncompressed layout: a Flat leaf of 16 (float16),
+ * 32 (float32) or 64 (float64) bits without buffer compression, optionally
+ * wrapped in one or more FixedSizeList layers without validity. Let d be the
+ * product of the list dimensions (1 for a bare Flat leaf). A chunk of n values
+ * holds n * d items, stored item-major: item j of value i is at position
+ * j * n + i, so each list position forms one contiguous sequence. Those n * d little-endian items are
+ * compressed as a single pco standalone file (standalone version 3, format
+ * version 4.1, as written by pco 1.0) into the chunk's only buffer. The pco
+ * format is specified at https://github.com/pcodec/pcodec/blob/v1.0.4/docs/format.md.
+ * Decoding reverses the pco compression and the transpose; it is lossless,
+ * including NaN payloads and signed zeros. This encoding is valid only in
+ * mini-block positions.
+ */
+message Pcodec {
+  // Required untransformed Flat or FixedSizeList encoding of the values.
+  CompressiveEncoding values = 1;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -507,5 +556,8 @@ message CompressiveEncoding {
         VariablePackedStruct variable_packed_struct = 13;
         Range range = 14;
         Delta delta = 15;
+        AxisDelta axis_delta = 16;
+        Alp alp = 17;
+        Pcodec pcodec = 18;
     }
 }

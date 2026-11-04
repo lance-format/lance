@@ -10,8 +10,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arrow_array::builder::{ListBuilder, UInt64Builder};
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt8Type;
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
     RecordBatchReader, UInt32Array, UInt64Array,
@@ -110,28 +108,13 @@ pub fn hamming_distance_batch<'a>(
     Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
 }
 
+/// Compute Hamming distances with the validation of [`super::DistanceType::batch`].
+#[deprecated(note = "Use DistanceType::Hamming.batch")]
 pub fn hamming_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    let dists = match *from.data_type() {
-        DataType::UInt8 => hamming_distance_batch(
-            from.as_primitive::<UInt8Type>().values(),
-            to.values().as_primitive::<UInt8Type>().values(),
-            from.len(),
-        ),
-        _ => {
-            return Err(Error::InvalidArgumentError(format!(
-                "Unsupported data type: {:?}",
-                from.data_type()
-            )));
-        }
-    };
-
-    Ok(Arc::new(Float32Array::new(
-        dists.collect(),
-        to.nulls().cloned(),
-    )))
+    super::DistanceType::Hamming.batch(from, to).map(Arc::new)
 }
 
 /// Compute hamming distance between two 64-bit values using POPCNT.

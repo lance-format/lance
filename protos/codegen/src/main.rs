@@ -114,7 +114,10 @@ fn generate_table(
     let mut config = config(&out_dir)?;
     config.extern_path(".lance.file", "::lance_file::format::pb");
     config.enable_type_names();
-    config.bytes([".lance.table.DataFragment.inline_row_ids"]);
+    config.bytes([
+        ".lance.table.DataFragment.inline_row_ids",
+        ".lance.table.DeletionFile.inline",
+    ]);
     config.compile_protos(
         &[
             proto_dir.join("table.proto"),
@@ -198,11 +201,18 @@ fn generate_lance(
     config.extern_path(".lance.index.pb", "::lance_index::pb");
     config.extern_path(".lance.datafusion", "::lance_datafusion::pb");
     config.enable_type_names();
-    config.compile_protos(&[proto_dir.join("ann.proto")], &[&proto_dir])?;
+    config.compile_protos(
+        &[
+            proto_dir.join("ann.proto"),
+            proto_dir.join("fts.proto"),
+            proto_dir.join("cache_diagnostics.proto"),
+        ],
+        &[&proto_dir],
+    )?;
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance/src/pb"),
-        &["lance.pb.rs"],
+        &["lance.pb.rs", "lance.cache.rs"],
         check,
     )
 }

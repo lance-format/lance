@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 
 use arrow_array::StringArray;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
@@ -33,7 +33,7 @@ fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecor
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
         Field::new(ROW_ID, DataType::UInt64, false),
     ]));
-    let batches: Vec<datafusion::error::Result<RecordBatch>> = rows
+    let batches: Vec<datafusion_common::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))
         .map(|chunk| {
             let texts = StringArray::from(chunk.iter().map(|(text, _)| *text).collect::<Vec<_>>());
@@ -412,6 +412,15 @@ async fn test_rows_without_tokens_are_not_indexed() {
         vec![10, 14]
     );
     assert!(search(&index, "   ", 10).await.is_empty());
+    let mut signatures = index.scan_signatures(Arc::new(RowAddrMask::all_rows()));
+    let batch = signatures.try_next().await.unwrap().unwrap();
+    assert_eq!(
+        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[10, 14]
+    );
+    let values = batch[SIGNATURE_COL].as_fixed_size_list();
+    assert_eq!(values.value(0).to_data(), values.value(1).to_data());
+    assert!(signatures.try_next().await.unwrap().is_none());
 
     for rows in [vec![], vec![(None, 0), (Some(""), 1)]] {
         let (_tmpdir, store) = test_store();
@@ -419,6 +428,14 @@ async fn test_rows_without_tokens_are_not_indexed() {
             build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
         assert_eq!(empty.num_docs(), 0);
         assert!(search(&empty, "anything at all here", 5).await.is_empty());
+        assert!(
+            empty
+                .scan_signatures(Arc::new(RowAddrMask::all_rows()))
+                .try_next()
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -668,7 +685,6 @@ async fn test_remap_rewrites_and_drops_row_ids() {
     let (bases, _) = near_duplicate_corpus(4, 40);
     let rows = corpus_rows(&bases, &[]);
     let index = build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
-    assert!(index.can_remap());
 
     // Row 1 is deleted, row 2 is absent from the mapping and keeps its id
     let mapping = RowAddrRemap::direct(HashMap::from([
@@ -678,6 +694,11 @@ async fn test_remap_rewrites_and_drops_row_ids() {
     ]));
     let (_dest_dir, dest_store) = test_store();
     let created = index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+    assert!(
+        MinHashLshIndexPlugin
+            .can_remap(&created.index_details)
+            .unwrap()
+    );
     let remapped = load(&dest_store, &created.index_details, &LanceCache::no_cache()).await;
     assert_eq!(remapped.num_docs(), 3);
     assert_eq!(row_ids(&remapped, &bases[0], 1).await, vec![7]);
@@ -741,6 +762,20 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     .await
     .unwrap();
     assert_eq!(row_ids(&index, &bases[0], 1).await, vec![compacted(0)]);
+
+    // Filtering is in the current ID domain, after deferred remapping.
+    let live = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+        compacted(0),
+        compacted(2),
+        compacted(3),
+    ]));
+    let mut signatures = index.scan_signatures(Arc::new(live));
+    let batch = signatures.try_next().await.unwrap().unwrap();
+    assert_eq!(
+        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[compacted(0), compacted(3)]
+    );
+    assert!(signatures.try_next().await.unwrap().is_none());
 
     // Keep the compacted fragment, add a duplicate of row 3
     let filter = OldIndexDataFilter::Fragments {

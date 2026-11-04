@@ -419,7 +419,7 @@ fn choose_neighbors<S: VectorStore>(
             neighbors: &higher_level.search_ids,
         };
         let start = OrderedNode::new(ep, distances.distance(ep).into());
-        ep = greedy_search_borrowed(&view, start, &distances, None).id;
+        ep = greedy_search_borrowed(&view, start, &distances, None).0.id;
     }
     if !on_this_level(ep) {
         ep = node;
@@ -429,7 +429,8 @@ fn choose_neighbors<S: VectorStore>(
     };
     let start = OrderedNode::new(ep, distances.distance(ep).into());
     let mut visited = visited_gen.generate(level.neighbors.len());
-    let found = beam_search_borrowed(&view, &start, query, &distances, None, None, &mut visited);
+    let (found, _) =
+        beam_search_borrowed(&view, &start, query, &distances, None, None, &mut visited);
     drop(visited);
 
     let mut seen = HashSet::new();
@@ -823,7 +824,7 @@ mod tests {
                 .take(K)
                 .map(|(_, id)| id)
                 .collect::<HashSet<_>>();
-            let found = hnsw
+            let (found, _) = hnsw
                 .search_basic(query, K, &query_params(), None, &store)
                 .unwrap();
             hits += found.iter().filter(|n| truth.contains(&n.id)).count();
@@ -1078,6 +1079,7 @@ mod tests {
             .unwrap()
             .search_basic(vectors.value(0), 300, &params, None, &kept_store)
             .unwrap()
+            .0
             .len();
         assert_eq!(hits, 300);
     }

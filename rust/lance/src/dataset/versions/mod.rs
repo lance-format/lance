@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
@@ -38,6 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
+use super::blob::{BlobPayloadInventory, SidecarRewrite};
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -48,6 +49,7 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
+use super::write::dictionary_budget::DictionaryValueBudget;
 use super::write::seeds::SeedCollector;
 use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -120,7 +122,7 @@ fn create_current_file_writer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn write_fragments(
+pub(in crate::dataset) async fn write_fragments(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -131,7 +133,10 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
+    disable_dictionary_split: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
+    sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -140,12 +145,7 @@ pub async fn write_fragments(
     // the blob promotion, which gives every negative field id a new one.
     let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
     if dataset.is_none() {
-        if keep_field_ids {
-            normalized_schema.try_set_field_id(None)?;
-        } else {
-            // Input Arrow IDs must not seed allocation for a new dataset's blob children.
-            normalized_schema.try_reassign_field_ids(None)?;
-        }
+        write::assign_new_table_field_ids(&mut normalized_schema, inherited_field_ids)?;
     }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -159,7 +159,7 @@ pub async fn write_fragments(
         normalized_schema,
         &params,
         schema_compare_options(version),
-        keep_field_ids,
+        inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
     match version {
@@ -185,6 +185,9 @@ pub async fn write_fragments(
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
+        disable_dictionary_split,
+        sidecar_rewrite,
     )
     .await?;
     Ok((fragments, schema))
@@ -225,8 +228,32 @@ fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
     ))
 }
 
+/// Zero row limits cannot be honored: a zero `max_rows_per_file` panics when
+/// a V2 stream is split into files, and on V1 a zero `max_rows_per_group`
+/// chunks the input into no batches, so nothing is written.
+pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -> Result<()> {
+    if params.max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero",
+        ));
+    }
+    if params.max_rows_per_file > u32::MAX as usize {
+        return Err(Error::invalid_input(format!(
+            "max_rows_per_file cannot exceed the fragment row capacity of {} rows, got {}",
+            u32::MAX,
+            params.max_rows_per_file
+        )));
+    }
+    if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_group must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn write_fragments_direct(
+pub(in crate::dataset) async fn write_fragments_direct(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -238,20 +265,28 @@ pub async fn write_fragments_direct(
     seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
+    disable_dictionary_split: bool,
+    sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 ) -> Result<Vec<Fragment>> {
+    validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
-        if file_row_counts.contains(&0) {
-            return Err(Error::invalid_input(
-                "File row counts must be greater than zero",
-            ));
+        if let Some(rows) = file_row_counts.iter().find(|rows| **rows == 0) {
+            return Err(Error::invalid_input(format!(
+                "File row counts must be greater than zero, got {rows}"
+            )));
+        }
+        if let Some(rows) = file_row_counts
+            .iter()
+            .find(|rows| **rows > u32::MAX as usize)
+        {
+            return Err(Error::invalid_input(format!(
+                "File row counts cannot exceed the fragment row capacity of {} rows, got {rows}",
+                u32::MAX
+            )));
         }
         match version {
             ConcreteFileVersion::V1 => {
-                if params.max_rows_per_group == 0 {
-                    return Err(Error::invalid_input(
-                        "max_rows_per_group must be greater than zero when file row counts are specified",
-                    ));
-                }
                 let max_rows_per_group = params.max_rows_per_group;
                 let batch_row_counts =
                     file_row_counts
@@ -286,6 +321,20 @@ pub async fn write_fragments_direct(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    // The 2.0 writer stores a null as one more dictionary value and keeps its own key-type
+    // check, so its files are not split here. Neither is a write that must produce one
+    // file, the preassigned one or a MemWAL generation's; the encoder's key-type check
+    // applies to it instead.
+    let dictionary_budget = match version {
+        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            if preassigned_data_file_name.is_some() || disable_dictionary_split {
+                None
+            } else {
+                DictionaryValueBudget::try_new(&ArrowSchema::from(schema))?
+            }
+        }
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => None,
+    };
     write::do_write_fragments_impl(
         dataset,
         object_store,
@@ -293,14 +342,21 @@ pub async fn write_fragments_direct(
         schema,
         buffered_reader,
         params,
-        move |object_store, schema, base_dir, options| async move {
-            open_writer(version, &object_store, &schema, &base_dir, options).await
+        move |object_store, schema, base_dir, options| {
+            let sidecar_rewrite = sidecar_rewrite.clone();
+            async move {
+                let mut options = options;
+                options.sidecar_rewrite = sidecar_rewrite;
+                open_writer(version, &object_store, &schema, &base_dir, options).await
+            }
         },
         external_base_resolver,
         target_bases_info,
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
+        dictionary_budget,
     )
     .await
 }
@@ -331,7 +387,8 @@ pub async fn can_use_binary_copy(
             if !binary_copy_files_match(fragments, version)? {
                 return Ok(false);
             }
-            super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
+            super::optimize::execution::can_use_binary_copy_current(dataset, options, fragments)
+                .await
         }
     }
 }
@@ -599,23 +656,8 @@ pub async fn write_fragment(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
-            let file_writer_options = builder.file_writer_options();
             builder
-                .write_current_impl(
-                    move |object_writer, schema, filename| {
-                        create_current_file_writer(
-                            version,
-                            object_writer,
-                            schema,
-                            filename,
-                            None,
-                            file_writer_options,
-                        )
-                    },
-                    stream,
-                    schema,
-                    id,
-                )
+                .write_current_impl(version, stream, schema, id)
                 .await
         }
     }
@@ -692,6 +734,25 @@ pub async fn open_update_writer(
     schema: &Schema,
     allow_external_blob_outside_bases: bool,
 ) -> Result<Box<dyn GenericWriter>> {
+    // Blob v1 columns are stored as Blob v2 from 2.2 on, as `Dataset::write`
+    // does. The promoted children take ids above the table's so the file's
+    // schema reuses none of them; the commit assigns the manifest's own.
+    let promoted;
+    let schema = if writes_blob_v2(version)
+        && schema
+            .fields_pre_order()
+            .any(|field| field.is_blob() && !field.is_blob_v2())
+    {
+        let mut schema = schema.clone();
+        for field in &mut schema.fields {
+            field.promote_blob_v2()?;
+        }
+        schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
+        promoted = schema;
+        &promoted
+    } else {
+        schema
+    };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::blob_v2_external_base_resolver(Some(dataset), &WriteParams::default(), schema)
@@ -752,6 +813,15 @@ pub async fn create_fragment_from_file(
         | ConcreteFileVersion::V2_3 => {
             FileFragment::create_from_current_file(filename, dataset, fragment_id).await
         }
+    }
+}
+
+/// Whether `version` writes blob columns in the Blob v2 layout. Earlier
+/// versions only have the legacy layout; 2.2 reads both but writes v2.
+pub fn writes_blob_v2(version: ConcreteFileVersion) -> bool {
+    match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => false,
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => true,
     }
 }
 
@@ -1175,5 +1245,22 @@ mod tests {
         assert_eq!(user.fields, vec![key, named_like_lineage]);
         // Split out with its reserved id intact.
         assert_eq!(lineage, vec![hidden]);
+    }
+
+    #[test]
+    fn rejects_file_limit_above_fragment_row_capacity() {
+        let params = WriteParams {
+            max_rows_per_file: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+
+        let error = validate_row_limits(ConcreteFileVersion::V2_0, &params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
+        );
     }
 }

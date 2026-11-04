@@ -4,27 +4,31 @@
 //! Exec plan planner
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
-use crate::signed_zero::{normalize_zero_comparisons, rewrite_signed_zero_comparisons};
+use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{OffsetBuffer, i256};
 use arrow_cast::cast_with_options;
-use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType as ArrowDataType, Field,
+    SchemaRef, TimeUnit,
+};
 use arrow_select::concat::concat;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
@@ -58,6 +62,51 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+/// Parses the text of a SQL number, such as `0.05`, `.5` or `1.5e-3`, as a
+/// decimal holding exactly its digits. `None` when its digits, counting the
+/// zeros after the decimal point, are more than a 256-bit decimal holds, or
+/// its exponent puts the scale outside `i8`; such a number stays a float.
+fn parse_decimal(number: &str, negative: bool) -> Option<ScalarValue> {
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (number, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    let scale = i32::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+    let scale = i8::try_from(scale).ok()?;
+    // Arrow requires the scale to fit the precision.
+    let precision = u8::try_from(
+        digits
+            .len()
+            .max(1)
+            .max(usize::from(scale.max(0).unsigned_abs())),
+    )
+    .ok()?;
+    if precision > DECIMAL256_MAX_PRECISION {
+        return None;
+    }
+    let value = i256::from_string(if digits.is_empty() { "0" } else { digits })?;
+    let value = if negative {
+        value.checked_neg()?
+    } else {
+        value
+    };
+    if precision <= DECIMAL128_MAX_PRECISION {
+        Some(ScalarValue::Decimal128(
+            Some(value.to_i128()?),
+            precision,
+            scale,
+        ))
+    } else {
+        Some(ScalarValue::Decimal256(Some(value), precision, scale))
+    }
 }
 
 // The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
@@ -449,11 +498,90 @@ impl Planner {
             return Self::balanced_binary_expr(exprs, df_op);
         }
 
-        Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(self.parse_sql_expr(left)?),
+        let mut left_expr = self.parse_sql_expr(left)?;
+        let mut right_expr = self.parse_sql_expr(right)?;
+        if matches!(
             df_op,
-            Box::new(self.parse_sql_expr(right)?),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            if let Some(decimal) = self.decimal_operand(right, &left_expr) {
+                right_expr = decimal;
+            } else if let Some(decimal) = self.decimal_operand(left, &right_expr) {
+                left_expr = decimal;
+            }
+        }
+        Ok(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left_expr),
+            df_op,
+            Box::new(right_expr),
         )))
+    }
+
+    /// The type of the column or nested field `expr` refers to.
+    fn column_type(&self, expr: &Expr) -> Option<ArrowDataType> {
+        match expr {
+            Expr::Column(column) => Some(
+                self.schema
+                    .field_with_name(&column.name)
+                    .ok()?
+                    .data_type()
+                    .clone(),
+            ),
+            Expr::ScalarFunction(function) if function.name() == GetFieldFunc::default().name() => {
+                let ArrowDataType::Struct(fields) = self.column_type(function.args.first()?)?
+                else {
+                    return None;
+                };
+                let name = get_as_string_scalar_opt(function.args.get(1)?)?;
+                Some(fields.find(name)?.1.data_type().clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `operand` as an exact decimal literal when it is a fractional number
+    /// such as `0.05` and `column` is a decimal column. Parsed as a float, its
+    /// digits would no longer be known, so a comparison with the column could
+    /// neither be exact nor use an index on it.
+    fn decimal_operand(&self, operand: &SQLExpr, column: &Expr) -> Option<Expr> {
+        let (number, negative) = match operand {
+            SQLExpr::Value(ValueWithSpan {
+                value: Value::Number(number, _),
+                ..
+            }) => (number, false),
+            SQLExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                SQLExpr::Value(ValueWithSpan {
+                    value: Value::Number(number, _),
+                    ..
+                }) => (number, true),
+                _ => return None,
+            },
+            SQLExpr::Nested(inner) => return self.decimal_operand(inner, column),
+            _ => return None,
+        };
+        // Integers keep the integer literal the planner builds for them, which
+        // the lowering compares exactly. A negative literal past `i64` is
+        // built as a float, so it is parsed here too.
+        let is_integer =
+            number.parse::<i64>().is_ok() || (!negative && number.parse::<u64>().is_ok());
+        if is_integer {
+            return None;
+        }
+        if !matches!(
+            self.column_type(column)?,
+            ArrowDataType::Decimal128(..) | ArrowDataType::Decimal256(..)
+        ) {
+            return None;
+        }
+        Some(Expr::Literal(parse_decimal(number, negative)?, None))
     }
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
@@ -517,7 +645,11 @@ impl Planner {
             Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v)), None),
             Value::Null => Expr::Literal(ScalarValue::Null, None),
-            _ => todo!(),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Unsupported SQL value: {value:?}"
+                )));
+            }
         })
     }
 
@@ -544,6 +676,12 @@ impl Planner {
                     return Err(Error::invalid_input(format!(
                         "Function name must have 1 part, got: {:?}",
                         func.name.0
+                    )));
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::invalid_input(format!(
+                        "is_valid() takes exactly one argument, got {}",
+                        args.args.len()
                     )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
@@ -825,7 +963,10 @@ impl Planner {
                 let value_expr = self.parse_sql_expr(expr)?;
                 let list_exprs = list
                     .iter()
-                    .map(|e| self.parse_sql_expr(e))
+                    .map(|e| match self.decimal_operand(e, &value_expr) {
+                        Some(decimal) => Ok(decimal),
+                        None => self.parse_sql_expr(e),
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
@@ -937,8 +1078,14 @@ impl Planner {
             } => {
                 // Parse the main expression and bounds
                 let expr = self.parse_sql_expr(expr)?;
-                let low = self.parse_sql_expr(low)?;
-                let high = self.parse_sql_expr(high)?;
+                let low = match self.decimal_operand(low, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(low)?,
+                };
+                let high = match self.decimal_operand(high, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(high)?,
+                };
 
                 let between = Expr::Between(Between::new(
                     Box::new(expr),
@@ -1106,7 +1253,8 @@ impl Planner {
         // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
         // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
         // own result.
-        let expr = normalize_zero_comparisons(expr, &|operand| simplifier.simplify(operand))?;
+        let expr =
+            normalize_float_comparisons(expr, &|operand| simplifier.simplify(operand), &df_schema)?;
 
         // Again after simplify, which is what expands `BETWEEN` into two
         // comparisons and folds the casts `coerce` inserts, so those forms only
@@ -1115,7 +1263,7 @@ impl Planner {
         // Running the rewrite more than once is safe because its output is a fixed
         // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
-        let expr = rewrite_signed_zero_comparisons(expr)?;
+        let expr = rewrite_float_comparisons(expr, &df_schema)?;
 
         Ok(expr)
     }
@@ -1127,6 +1275,7 @@ impl Planner {
             expr,
             df_schema.as_ref(),
             &Default::default(),
+            &PhysicalPlanningContext::default(),
         )?)
     }
 
@@ -1147,60 +1296,7 @@ impl Planner {
     /// If the expr refers to nested columns these will be returned
     /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
-        let mut visitor = ColumnCapturingVisitor {
-            current_path: VecDeque::new(),
-            columns: BTreeSet::new(),
-        };
-        expr.visit(&mut visitor).unwrap();
-        visitor.columns.into_iter().collect()
-    }
-}
-
-struct ColumnCapturingVisitor {
-    // Current column path. If this is empty, we are not in a column expression.
-    current_path: VecDeque<String>,
-    columns: BTreeSet<String>,
-}
-
-impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
-    type Node = Expr;
-
-    fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
-        match node {
-            Expr::Column(Column { name, .. }) => {
-                // Build the field path from the column name and any nested fields
-                // The nested field names from get_field already come as literal strings,
-                // so we just need to concatenate them properly
-                let mut path = name.clone();
-                for part in self.current_path.drain(..) {
-                    path.push('.');
-                    // Check if the part needs quoting (contains dots)
-                    if part.contains('.') || part.contains('`') {
-                        // Quote the field name with backticks and escape any existing backticks
-                        let escaped = part.replace('`', "``");
-                        path.push('`');
-                        path.push_str(&escaped);
-                        path.push('`');
-                    } else {
-                        path.push_str(&part);
-                    }
-                }
-                self.columns.insert(path);
-                self.current_path.clear();
-            }
-            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
-                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                    self.current_path.push_front(name.to_string())
-                } else {
-                    self.current_path.clear();
-                }
-            }
-            _ => {
-                self.current_path.clear();
-            }
-        }
-
-        Ok(TreeNodeRecursion::Continue)
+        lance_datafusion_exec::expr::column_names_in_expr(expr)
     }
 }
 
@@ -1222,6 +1318,75 @@ mod tests {
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use rstest::rstest;
+
+    /// Literal spellings the planner has no mapping for, such as placeholders
+    /// and national strings, used to reach a `todo!()`.
+    #[rstest]
+    #[case::named_placeholder("i = :id")]
+    #[case::numbered_placeholder("i = $1")]
+    #[case::question_placeholder("i = ?")]
+    #[case::national_string("s = N'abc'")]
+    #[case::in_array_literal("s = [N'abc']")]
+    fn test_parse_filter_rejects_unsupported_literals(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int32, false),
+        ]));
+        let planner = Planner::new(schema);
+
+        let err = planner.parse_filter(filter).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for {filter}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Unsupported SQL value"),
+            "error should name the unsupported value for {filter}, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_checks_is_valid_arity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // Zero arguments used to panic on `args[0]`; extra ones were dropped.
+        for filter in ["is_valid()", "is_valid(s, s)"] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput for {filter}, got {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("is_valid() takes exactly one argument"),
+                "unexpected error for {filter}: {err}"
+            );
+        }
+        assert_eq!(
+            planner.parse_filter("is_valid(s)").unwrap(),
+            col("s").is_not_null()
+        );
+    }
+
+    #[test]
+    fn test_parse_expr_rejects_multiple_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A misplaced parenthesis turns `coalesce(s, 'x')` into two items;
+        // keeping only the first would silently compute `coalesce(s)`.
+        let err = planner.parse_expr("coalesce(s), 'x'").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Expression is not valid"),
+            "unexpected error: {err}"
+        );
+        assert!(planner.parse_expr("coalesce(s, 'x')").is_ok());
+    }
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1713,6 +1878,54 @@ mod tests {
             &BooleanArray::from(vec![
                 false, false, false, true, true, true, true, false, false, false
             ])
+        );
+    }
+
+    /// A literal under NOT or IS [NOT] TRUE/FALSE is narrowed to the column
+    /// type like one outside it. Otherwise the Float32 column is cast to
+    /// Float64, `0.1f32` no longer equals `0.1`, and the wrapped predicate
+    /// disagrees with the bare one on that row.
+    #[rstest]
+    #[case::eq("f = 0.1", vec![true, false])]
+    #[case::gt("f > 0.1", vec![false, true])]
+    #[case::between("f BETWEEN 0.0 AND 0.1", vec![true, false])]
+    #[case::in_list("f IN (0.1, 0.2)", vec![true, false])]
+    fn test_parse_filter_narrows_under_not_and_is(
+        #[case] filter: &str,
+        #[case] expected: Vec<bool>,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "f",
+            Arc::new(Float32Array::from(vec![0.1, 0.5])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |filter: &str| {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+
+        let negated = BooleanArray::from(expected.iter().map(|m| !m).collect::<Vec<_>>());
+        let expected = BooleanArray::from(expected);
+        assert_eq!(evaluate(filter).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("NOT ({filter})")).as_ref(), &negated);
+        assert_eq!(evaluate(&format!("({filter}) IS TRUE")).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("({filter}) IS FALSE")).as_ref(), &negated);
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT TRUE")).as_ref(),
+            &negated
+        );
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT FALSE")).as_ref(),
+            &expected
         );
     }
 

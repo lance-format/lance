@@ -68,6 +68,7 @@ const DEFAULT_DICT_VALUES_COMPRESSION: &str = "lz4";
 ///
 /// Mini-block level payload sizes are u16. After the eight-byte frame header, each run needs a
 /// two-byte value and a one-byte length, and each U8 run can represent at most 255 levels.
+/// It also bounds out-of-line bitpacked levels, which pack at least one bit per level.
 const MAX_LEGACY_RLE_LEVELS: u64 = ((u16::MAX as u64 - std::mem::size_of::<u64>() as u64)
     / (std::mem::size_of::<u16>() as u64 + std::mem::size_of::<u8>() as u64))
     * u8::MAX as u64;

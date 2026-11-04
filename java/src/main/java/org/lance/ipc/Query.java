@@ -26,11 +26,14 @@ public class Query {
   private final float[] key;
   private final int queryVectorDim;
   private final int k;
+  private final Optional<Float> lowerBound;
+  private final Optional<Float> upperBound;
   private final int minimumNprobes;
   private final Optional<Integer> maximumNprobes;
   private final Optional<Double> searchEffort;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
+  private final Optional<Integer> quantizedRefineFactor;
   private final Optional<DistanceType> distanceType;
   private final boolean useIndex;
   private final int queryParallelism;
@@ -58,9 +61,15 @@ public class Query {
         !maximumNprobes.isPresent() || maximumNprobes.get() >= minimumNprobes,
         "Maximum Nprobes must be greater than minimum Nprobes");
     this.k = builder.k;
+    this.lowerBound = builder.lowerBound;
+    this.upperBound = builder.upperBound;
     this.searchEffort = builder.searchEffort;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
+    Preconditions.checkArgument(
+        !builder.quantizedRefineFactor.isPresent() || builder.quantizedRefineFactor.get() > 0,
+        "Quantized refine factor must be greater than 0");
+    this.quantizedRefineFactor = builder.quantizedRefineFactor;
     this.distanceType = builder.distanceType;
     this.useIndex = builder.useIndex;
     this.queryParallelism = builder.queryParallelism;
@@ -87,6 +96,24 @@ public class Query {
 
   public int getK() {
     return k;
+  }
+
+  /**
+   * Returns the inclusive lower distance bound.
+   *
+   * @return The lower bound, or empty if the query has no lower distance bound.
+   */
+  public Optional<Float> getLowerBound() {
+    return lowerBound;
+  }
+
+  /**
+   * Returns the exclusive upper distance bound.
+   *
+   * @return The upper bound, or empty if the query has no upper distance bound.
+   */
+  public Optional<Float> getUpperBound() {
+    return upperBound;
   }
 
   public int getMinimumNprobes() {
@@ -120,6 +147,10 @@ public class Query {
     return refineFactor;
   }
 
+  public Optional<Integer> getQuantizedRefineFactor() {
+    return quantizedRefineFactor;
+  }
+
   public Optional<DistanceType> getDistanceType() {
     return distanceType;
   }
@@ -151,11 +182,14 @@ public class Query {
         .add("key", key)
         .add("queryVectorDim", queryVectorDim)
         .add("k", k)
+        .add("lowerBound", lowerBound.orElse(null))
+        .add("upperBound", upperBound.orElse(null))
         .add("minimumNprobes", minimumNprobes)
         .add("maximumNprobes", maximumNprobes.orElse(null))
         .add("searchEffort", searchEffort.orElse(null))
         .add("ef", ef.orElse(null))
         .add("refineFactor", refineFactor.orElse(null))
+        .add("quantizedRefineFactor", quantizedRefineFactor.orElse(null))
         .add("distanceType", distanceType.orElse(null))
         .add("useIndex", useIndex)
         .add("queryParallelism", queryParallelism)
@@ -168,12 +202,15 @@ public class Query {
     private float[] key;
     private int queryVectorDim = 0;
     private int k = 10;
+    private Optional<Float> lowerBound = Optional.empty();
+    private Optional<Float> upperBound = Optional.empty();
     private Optional<Integer> nprobes = Optional.empty();
     private Optional<Integer> minimumNprobes = Optional.empty();
     private Optional<Integer> maximumNprobes = Optional.empty();
     private Optional<Double> searchEffort = Optional.empty();
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
+    private Optional<Integer> quantizedRefineFactor = Optional.empty();
     private Optional<DistanceType> distanceType = Optional.empty();
     private boolean useIndex = true;
     private int queryParallelism = 0;
@@ -261,6 +298,34 @@ public class Query {
     }
 
     /**
+     * Sets the inclusive lower bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setUpperBound(float)}. A query with lower bound
+     * {@code lower} retains results whose distance satisfies {@code distance >= lower}.
+     *
+     * @param lowerBound The inclusive lower distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setLowerBound(float lowerBound) {
+      this.lowerBound = Optional.of(lowerBound);
+      return this;
+    }
+
+    /**
+     * Sets the exclusive upper bound for distances returned by the nearest-neighbor search.
+     *
+     * <p>This can be set independently of {@link #setLowerBound(float)}. A query with upper bound
+     * {@code upper} retains results whose distance satisfies {@code distance < upper}.
+     *
+     * @param upperBound The exclusive upper distance bound.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setUpperBound(float upperBound) {
+      this.upperBound = Optional.of(upperBound);
+      return this;
+    }
+
+    /**
      * Sets the number of probes to load and search.
      *
      * <p>Used only when search effort is absent. Explicit minimum and maximum bounds override the
@@ -328,7 +393,7 @@ public class Query {
 
     /**
      * Sets the number of candidates to reserve while searching. This is an optional parameter for
-     * HNSW related index types.
+     * HNSW related index types. Defaults to {@code 1.5 * k * refineFactor}, floored at 256.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.
@@ -346,6 +411,24 @@ public class Query {
      */
     public Builder setRefineFactor(int refineFactor) {
       this.refineFactor = Optional.of(refineFactor);
+      return this;
+    }
+
+    /**
+     * Reranks overfetched IVF_RQ candidates with the index's most accurate stored RQ data.
+     *
+     * <p>Indexed candidates are reranked without reading their original vectors. Unindexed
+     * fragments and stale overlay rows still use flat fallback and may read original vectors. It
+     * can be combined with {@link #setRefineFactor(int)}, in which case exact refinement remains
+     * the final stage and reads original vectors for its candidates. With a distance range, the
+     * selected partitions use Accurate RQ search directly so the range applies before top-k
+     * truncation.
+     *
+     * @param quantizedRefineFactor One-bit candidate overfetch factor; must be greater than zero.
+     * @return The Builder instance for method chaining.
+     */
+    public Builder setQuantizedRefineFactor(int quantizedRefineFactor) {
+      this.quantizedRefineFactor = Optional.of(quantizedRefineFactor);
       return this;
     }
 

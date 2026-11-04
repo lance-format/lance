@@ -4,13 +4,16 @@
 use async_trait::async_trait;
 use datafusion::common::Result as DFResult;
 use datafusion::{
+    catalog::Session,
     common::DFSchema,
-    execution::SessionState,
+    execution::context::SessionContext,
     physical_plan::ExecutionPlan,
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_datafusion::exec::LanceExecutionOptions;
 use std::{
     cmp::Ordering,
     sync::{Arc, atomic::AtomicU64},
@@ -21,7 +24,7 @@ use crate::dataset::write::merge_insert::exec::{
     DeleteOnlyMergeInsertExec, FullSchemaMergeInsertExec, InPlaceMergeInsertExec,
     MergeConditionExec,
 };
-use crate::dataset::{WhenMatched, WhenNotMatchedBySource};
+use crate::dataset::{WhenMatched, WhenNotMatchedBySource, WriteParams};
 
 use super::{MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertParams};
 
@@ -41,16 +44,6 @@ pub enum WriteSink {
     RewriteColumns,
 }
 
-/// Logical plan node for merge insert write.
-///
-/// Expects input schema:
-/// * `source.{col1, col2, ...}` - columns from the source relation
-/// * `target.{col1, col2, ...}` - columns from the target relation
-/// * `target._rowaddr` - special column to locate existing rows in the target
-/// * `__action` - unqualified column that describes the action to perform.
-///   See [`super::assign_action::merge_insert_action`]
-///
-/// Output is empty.
 /// Conditions over target columns, evaluated by [`MergeConditionExec`] on the
 /// rows they gate rather than folded into `__action`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd)]
@@ -61,17 +54,44 @@ pub struct DeferredConditions {
     pub delete_if: Option<Expr>,
 }
 
-#[derive(Debug)]
+/// Logical plan node for merge insert write.
+///
+/// Expects input schema:
+/// * `source.{col1, col2, ...}` - columns from the source relation
+/// * `target.{col1, col2, ...}` - columns from the target relation
+/// * `target._rowaddr` - special column to locate existing rows in the target
+/// * `__action` - unqualified column that describes the action to perform.
+///   See [`super::assign_action::merge_insert_action`]
+///
+/// Output is empty.
 pub struct MergeInsertWriteNode {
     input: LogicalPlan,
     pub(crate) dataset: Arc<Dataset>,
     pub(crate) params: MergeInsertParams,
     pub(crate) source_skipped_duplicates: Arc<AtomicU64>,
     pub(crate) write_sink: WriteSink,
+    pub(crate) spill_session_context: SessionContext,
+    pub(crate) spill_execution_options: LanceExecutionOptions,
     /// Blob columns supplied by the source, excluding target-filled columns.
     pub(crate) source_blob_columns: Vec<String>,
     pub(crate) deferred: DeferredConditions,
     schema: Arc<DFSchema>,
+}
+
+impl std::fmt::Debug for MergeInsertWriteNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MergeInsertWriteNode")
+            .field("input", &self.input)
+            .field("dataset", &self.dataset)
+            .field("params", &self.params)
+            .field("source_skipped_duplicates", &self.source_skipped_duplicates)
+            .field("write_sink", &self.write_sink)
+            .field("spill_execution_options", &self.spill_execution_options)
+            .field("source_blob_columns", &self.source_blob_columns)
+            .field("deferred", &self.deferred)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PartialEq for MergeInsertWriteNode {
@@ -117,12 +137,18 @@ impl PartialOrd for MergeInsertWriteNode {
 }
 
 impl MergeInsertWriteNode {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "The node carries both source provenance and operation-scoped spill resources"
+    )]
     pub fn new(
         input: LogicalPlan,
         dataset: Arc<Dataset>,
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         write_sink: WriteSink,
+        spill_session_context: SessionContext,
+        spill_execution_options: LanceExecutionOptions,
         source_blob_columns: Vec<String>,
         deferred: DeferredConditions,
     ) -> Self {
@@ -134,6 +160,8 @@ impl MergeInsertWriteNode {
             params,
             source_skipped_duplicates,
             write_sink,
+            spill_session_context,
+            spill_execution_options,
             source_blob_columns,
             deferred,
             schema,
@@ -211,6 +239,8 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
             self.params.clone(),
             self.source_skipped_duplicates.clone(),
             self.write_sink,
+            self.spill_session_context.clone(),
+            self.spill_execution_options.clone(),
             self.source_blob_columns.clone(),
             self.deferred.clone(),
         ))
@@ -218,7 +248,7 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 
     fn necessary_children_exprs(&self, _output_columns: &[usize]) -> Option<Vec<Vec<usize>>> {
         // Going to need:
-        // * all columns from the `source` relation (or just key columns for delete-only)
+        // * the dataset columns from the `source` relation (or just key columns for delete-only)
         // * `__action` column (unqualified)
         // * `target._rowaddr` column specifically
 
@@ -226,23 +256,25 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
         let mut necessary_columns = Vec::new();
 
         // Check if this is a delete-only operation (no writes needed)
-        // In delete-only mode, we only need the key columns from source for matching
-        let no_upsert = matches!(
-            self.params.when_matched,
-            crate::dataset::WhenMatched::Delete
-        ) && !self.params.insert_not_matched;
+        // In delete-only mode, we only need the key columns from source for matching.
+        // This must agree with the exec `MergeInsertPlanner` picks: every other exec
+        // reads the dataset columns the source carries from `source.*`.
+        let delete_only = MergeInsertPlanner::is_delete_only(&self.params);
 
         for (i, (qualifier, field)) in input_schema.iter().enumerate() {
             let should_include = match qualifier {
                 // For delete-only: only include source KEY columns (for matching) plus the
                 // sentinel column needed for action determination.
-                // For other ops: include all source columns - they contain the new data to write.
+                // For other ops: include the source's dataset columns - they contain the new data
+                // to write, and the exec looks up every dataset column by name even when it
+                // writes nothing. A source column the dataset lacks is never read.
                 Some(qualifier) if qualifier.table() == "source" => {
-                    if no_upsert {
+                    if delete_only {
                         self.params.on.iter().any(|k| k == field.name())
                             || field.name() == MERGE_SOURCE_SENTINEL
                     } else {
-                        true
+                        self.dataset.schema().field(field.name()).is_some()
+                            || field.name() == MERGE_SOURCE_SENTINEL
                     }
                 }
 
@@ -287,7 +319,11 @@ impl UserDefinedLogicalNodeCore for MergeInsertWriteNode {
 }
 
 /// Physical planner for MergeInsertWriteNode.
-pub struct MergeInsertPlanner {}
+pub struct MergeInsertPlanner {
+    /// The job's write parameters for the data files the planned node writes.
+    /// They live on the planner because the logical node must stay comparable.
+    pub(crate) write_params: Arc<WriteParams>,
+}
 
 impl MergeInsertPlanner {
     /// Check if this is a delete-only operation that can use the optimized path.
@@ -314,7 +350,8 @@ impl ExtensionPlanner for MergeInsertPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(write_node) = node.as_any().downcast_ref::<MergeInsertWriteNode>() {
@@ -330,7 +367,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.deferred.update_if.clone(),
                         write_node.deferred.delete_if.clone(),
-                        session_state,
+                        session,
                     )?);
                 }
 
@@ -347,6 +384,9 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
+                        write_node.spill_session_context.clone(),
+                        write_node.spill_execution_options.clone(),
+                        self.write_params.clone(),
                     )?;
                     match update_if_deferred {
                         true => Arc::new(exec.with_update_if_deferred()),
@@ -359,6 +399,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.params.clone(),
                         write_node.source_skipped_duplicates.clone(),
                         write_node.source_blob_columns.clone(),
+                        self.write_params.clone(),
                     )?;
                     match update_if_deferred {
                         true => Arc::new(exec.with_update_if_deferred()),

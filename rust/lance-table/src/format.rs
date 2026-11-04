@@ -4,6 +4,8 @@
 use arrow_buffer::ToByteSlice;
 use uuid::Uuid;
 
+pub(crate) mod clustering;
+mod encoded_fragments;
 mod fragment;
 mod index;
 pub mod key_existence;
@@ -15,9 +17,14 @@ mod transaction;
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
+pub use clustering::{
+    ClusteringDefinition, apply_complete_clustering_definitions,
+    refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
+};
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
+pub(crate) use manifest::pb_manifest_without_fragments;
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
     SelfDescribingFileReader, WriterVersion, is_detached_version,
