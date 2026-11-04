@@ -34,7 +34,9 @@ use lance_index::vector::storage::{
     DistanceCalculatorOptions, ExIndex, GatheredRabitEx, IndexFileKey, IvfQuantizationStorage,
     OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore, sequential_plane_loads,
 };
-use lance_index::vector::{ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA};
+use lance_index::vector::{
+    ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
+};
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -239,8 +241,18 @@ enum PreparedRabitPartition {
     },
 }
 
+/// Candidate and tie semantics used when preparing and scoring gathered rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RabitScanScope {
+    /// A single heap shared across the query's probes.
+    Query,
+    /// An independent native candidate batch for each controlled probe.
+    Partition,
+}
+
 /// A sign-only partition with native lower bounds and filter acceptance.
 pub struct RabitSignPartition {
+    scope: RabitScanScope,
     entry: Arc<PartitionEntry<FlatIndex, RabitQuantizer>>,
     partition_id: usize,
     dist_q_c: f32,
@@ -375,6 +387,31 @@ impl RabitScanContext {
         partition_id: usize,
         dist_q_c: f32,
     ) -> Result<Option<RabitSignPartition>> {
+        self.prepare_sign_partition_with_scope(partition_id, dist_q_c, RabitScanScope::Query)
+            .await
+    }
+
+    /// Prepare bounds with the scoring contract of a query or partition heap.
+    /// Partition scope preserves scalar filter precision and native local tie order.
+    /// Its bounds are negative infinity: gather every accepted row, since native
+    /// partition search does not use query-wide approximate distance pruning.
+    /// The caller must wait for the query filter before preparing either scope.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::index::vector::ivf::v2::rabit_scan::{RabitScanContext, RabitScanScope};
+    /// # async fn prepare(context: Arc<RabitScanContext>) -> lance::Result<()> {
+    /// context.pre_filter.wait_for_ready().await?;
+    /// let sign = context.prepare_sign_partition_with_scope(0, 0.0, RabitScanScope::Partition).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn prepare_sign_partition_with_scope(
+        self: &Arc<Self>,
+        partition_id: usize,
+        dist_q_c: f32,
+        scope: RabitScanScope,
+    ) -> Result<Option<RabitSignPartition>> {
         let loading = Instant::now();
         let io_stats = self.metrics.io_stats();
         let (index, sign) = tokio::try_join!(
@@ -420,12 +457,21 @@ impl RabitScanContext {
                         approx_mode: context.query.approx_mode,
                     },
                 );
-                calc.full_sign_stage_with_scratch(
-                    &mut stage,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                )
+                if scope == RabitScanScope::Partition && !pre_filter.is_empty() {
+                    calc.filtered_partition_sign_stage_with_scratch(
+                        &mut stage,
+                        &mut scratch.u16,
+                        &mut scratch.u8,
+                        &mut scratch.u32,
+                    )
+                } else {
+                    calc.full_sign_stage_with_scratch(
+                        &mut stage,
+                        &mut scratch.u16,
+                        &mut scratch.u8,
+                        &mut scratch.u32,
+                    )
+                }
                 .is_ok()
             });
             if !gated {
@@ -446,7 +492,14 @@ impl RabitScanContext {
                     .collect()
             });
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
+            if scope == RabitScanScope::Partition {
+                // The query heap's approximate pruning can skip intermediate
+                // native candidates and change the partition batch or its ties.
+                stage.lower_bounds.fill(f32::NEG_INFINITY);
+                context.metrics.record_comparisons(storage.len());
+            }
             Ok(Some(RabitSignPartition {
+                scope,
                 entry,
                 partition_id,
                 dist_q_c,
@@ -456,6 +509,33 @@ impl RabitScanContext {
             }))
         })
         .await
+    }
+
+    /// Execute native partition search when sign-bound pruning is unavailable.
+    /// The returned batch preserves the built-in partition candidate order.
+    ///
+    /// ```
+    /// # use lance::index::vector::ivf::v2::rabit_scan::RabitScanContext;
+    /// # async fn fallback(context: &RabitScanContext) -> lance::Result<()> {
+    /// let batch = context.search_partition(0, 0.0).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn search_partition(
+        &self,
+        partition_id: usize,
+        dist_q_c: f32,
+    ) -> Result<RecordBatch> {
+        let mut query = self.query.clone();
+        query.dist_q_c = dist_q_c;
+        self.index
+            .search_in_partition(
+                partition_id,
+                &query,
+                self.pre_filter.clone(),
+                self.metrics.as_ref(),
+            )
+            .await
     }
 
     /// Accumulate a prepared partition into a query-local heap using native scoring.
@@ -566,7 +646,9 @@ impl RabitScanContext {
         on_first_full: impl FnMut(f32),
     ) -> Result<RabitPruneCounters> {
         let storage = &sign.entry.storage;
-        self.metrics.record_comparisons(storage.len());
+        if sign.scope == RabitScanScope::Query {
+            self.metrics.record_comparisons(storage.len());
+        }
         let expected_rows = match index {
             ExIndex::Identity => storage.len(),
             ExIndex::Compact => survivors.len(),
@@ -624,6 +706,17 @@ impl RabitScanContext {
                 },
                 ex_rows,
             )?;
+            if sign.scope == RabitScanScope::Partition {
+                return Ok(calc.accumulate_partition_survivor_rows(
+                    self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+                    self.query.lower_bound,
+                    self.query.upper_bound,
+                    &rows,
+                    stage1,
+                    heap,
+                    on_first_full,
+                ));
+            }
             Ok(calc.accumulate_survivor_rows(
                 self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
                 self.query.lower_bound,

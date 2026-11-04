@@ -97,7 +97,7 @@ pub mod utils;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+    include!("pb/lance.pb.rs");
 }
 
 /// Protobuf transport used by cache diagnostics language bindings.
@@ -105,7 +105,7 @@ pub mod pb {
 /// These messages are runtime API payloads and are not part of the persisted
 /// Lance file format.
 pub mod cache_diagnostics_pb {
-    include!(concat!(env!("OUT_DIR"), "/lance.cache.rs"));
+    include!("pb/lance.cache.rs");
 }
 
 pub use blob::{

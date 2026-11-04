@@ -50,7 +50,7 @@ use crate::Dataset;
 use crate::blob::prepared_to_logical_blob_schema;
 use crate::dataset::blob::{
     BlobPayloadInventory, BlobPreprocessor, ExternalBaseCandidate, ExternalBaseResolver,
-    blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
+    SidecarRewrite, blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
     blob_pack_file_threshold_from_metadata,
 };
 use crate::session::Session;
@@ -1841,12 +1841,13 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         false,
         false,
         None,
+        None,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_fragments_internal_impl(
+pub(in crate::dataset) async fn write_fragments_internal_impl(
     storage_version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -1860,6 +1861,7 @@ pub(crate) async fn write_fragments_internal_impl(
     inherited_field_ids: bool,
     disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
 
@@ -1882,6 +1884,7 @@ pub(crate) async fn write_fragments_internal_impl(
         inherited_field_ids,
         disable_dictionary_split,
         created_blob_payloads,
+        sidecar_rewrite,
     )
     .await
 }
@@ -2309,6 +2312,7 @@ pub(crate) struct WriterOptions {
     blob_pack_file_size_threshold: Option<usize>,
     file_writer_options: FileWriterOptions,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    pub(super) sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 }
 
 impl WriterOptions {
@@ -2457,6 +2461,7 @@ where
         blob_pack_file_size_threshold,
         file_writer_options,
         created_blob_payloads,
+        sidecar_rewrite,
     } = options;
     let (data_file_key, filename, data_dir, final_path) = prepare_data_file_path(
         base_dir,
@@ -2493,6 +2498,7 @@ where
         source_store_params,
         blob_pack_file_size_threshold,
     )?;
+    preprocessor = preprocessor.with_sidecar_rewrite(sidecar_rewrite);
     if managed_blobs_enabled(schema)?
         && matches!(
             version,
@@ -5032,6 +5038,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -5098,6 +5105,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -5204,6 +5212,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await
     }
@@ -5545,6 +5554,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
