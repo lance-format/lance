@@ -38,6 +38,8 @@ pub enum Coordinate {
     FragmentExistence(u64),
     /// A committed fragment's deletion file.
     FragmentDeletions(u64),
+    /// A committed fragment's per-row version sequences.
+    FragmentRowVersions(u64),
     /// The data backing one field within one committed fragment.
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
@@ -101,7 +103,9 @@ impl Coordinate {
     /// The fragment this coordinate lives in, if it is fragment-scoped.
     fn fragment(&self) -> Option<u64> {
         match self {
-            Self::FragmentExistence(id) | Self::FragmentDeletions(id) => Some(*id),
+            Self::FragmentExistence(id)
+            | Self::FragmentDeletions(id)
+            | Self::FragmentRowVersions(id) => Some(*id),
             Self::FieldData { fragment, .. } => Some(*fragment),
             Self::FieldDefinition(_)
             | Self::NewRowSchema
@@ -185,8 +189,8 @@ impl Mode {
 /// containment: a region write is a write of every coordinate the region holds.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Region {
-    /// A committed fragment: its existence, its deletions, and the data of
-    /// every field in it.
+    /// A committed fragment: its existence, deletions, row versions, and the
+    /// data of every field in it.
     Fragment(u64),
     /// One of the manifest's string maps, every key included.
     Map(ConfigMap),

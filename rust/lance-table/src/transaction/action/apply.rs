@@ -214,6 +214,13 @@ pub(super) struct ApplyState<'a> {
     /// values no action in the operation may change.
     rearranged_fragments: HashSet<u64>,
 
+    /// Fragments the version applied onto already held that this operation
+    /// wrote changed data into, and the ones it refreshed, wholly or in part.
+    /// On a dataset with stable row ids every changed fragment has to be
+    /// refreshed.
+    data_changed_fragments: HashSet<u64>,
+    refreshed_fragments: HashSet<u64>,
+
     /// How many fragment ids this operation reserved for a later writer. Like
     /// [`Self::reserved_row_ids`], taken off the counter after this
     /// operation's own fragments are numbered.
@@ -289,6 +296,8 @@ impl<'a> ApplyState<'a> {
             base_tokens: HashMap::new(),
             new_fragments: HashSet::new(),
             rearranged_fragments: HashSet::new(),
+            data_changed_fragments: HashSet::new(),
+            refreshed_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
             touched_index_names: BTreeSet::new(),
@@ -314,6 +323,7 @@ impl<'a> ApplyState<'a> {
 
         self.check_spilled_lineage_is_bound()?;
         self.check_reencodes_are_rebound()?;
+        self.check_data_changes_are_refreshed()?;
         let publishes_frag_reuse = self.finish_frag_reuse_history()?;
 
         let mut next_row_id = current_manifest
@@ -610,6 +620,8 @@ impl<'a> ApplyState<'a> {
         self.rearranged_fragments.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
+        self.data_changed_fragments.remove(&fragment_id);
+        self.refreshed_fragments.remove(&fragment_id);
         true
     }
 
@@ -624,6 +636,8 @@ impl<'a> ApplyState<'a> {
         self.new_fragments.clear();
         self.rearranged_fragments.clear();
         self.tombstoned_fields.clear();
+        self.data_changed_fragments.clear();
+        self.refreshed_fragments.clear();
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -879,6 +893,58 @@ impl<'a> ApplyState<'a> {
             "{action} changes the values of fragment {fragment_id}, which this operation adds \
              with data_change = false; a fragment that only moves rows cannot also change \
              them, so add it with data_change = true, or change the rows in a later operation"
+        )))
+    }
+
+    /// Record that data written into `fragment_id` changes what its rows hold.
+    /// A fragment this operation added is stamped whole at apply, so only one
+    /// it found needs a refresh.
+    pub(super) fn note_data_change(&mut self, fragment_id: u64) {
+        if !self.is_new_fragment(fragment_id) {
+            self.data_changed_fragments.insert(fragment_id);
+        }
+    }
+
+    pub(super) fn note_refreshed(&mut self, fragment_id: u64) {
+        self.refreshed_fragments.insert(fragment_id);
+    }
+
+    /// Validate rather than derive: which rows a data change restamps is not
+    /// implied by the file it writes, so a change to a fragment that was
+    /// already there has to carry a
+    /// [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata) saying
+    /// so. Without one its rows would keep their old last-updated versions,
+    /// and a reader of changes since then would miss them. Checked once every
+    /// action has been seen, because the refresh may come before or after the
+    /// data it refreshes.
+    ///
+    /// Any selection of the fragment's rows satisfies it, down to one row: a
+    /// partial update rewrites a whole column file yet changes only its
+    /// matched rows, and which rows those are is exactly what the files cannot
+    /// say, so the writer's selection is taken as given.
+    fn check_data_changes_are_refreshed(&self) -> Result<()> {
+        if !self.uses_stable_row_ids() {
+            return Ok(());
+        }
+        let mut unrefreshed = self
+            .data_changed_fragments
+            .difference(&self.refreshed_fragments)
+            .copied()
+            .collect::<Vec<_>>();
+        if unrefreshed.is_empty() {
+            return Ok(());
+        }
+        unrefreshed.sort_unstable();
+        let unrefreshed = unrefreshed
+            .iter()
+            .map(|id| format!("fragment {id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(Error::invalid_input(format!(
+            "this operation writes changed data into {unrefreshed}, which the dataset already \
+             held, without a RefreshRowVersionMetadata covering it; the dataset uses stable row \
+             ids, so add one, or mark the data files data_change = false if no row's values \
+             change"
         )))
     }
 

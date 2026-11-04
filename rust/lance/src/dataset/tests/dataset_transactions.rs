@@ -2852,9 +2852,10 @@ mod composite {
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
         AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
-        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
-        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserStep,
+        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RefreshRowVersionMetadata,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -4961,6 +4962,57 @@ mod composite {
             .unwrap();
         assert_eq!(fragment.overlays.len(), 1);
         assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_restamps_row_versions_for_a_fragment_it_rewrote() {
+        let dataset = test_dataset(true).await;
+        let rewritten = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                // Rewriting a column in place leaves the rows where they are, so
+                // nothing else in the commit says when they last changed.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(rewritten),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(rewritten),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                    rows: vec![RowSelection {
+                        fragment_id: u32::try_from(rewritten).unwrap(),
+                        rows: SelectedRows::Full,
+                    }],
+                }),
+            ],
+        )
+        .await;
+
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == rewritten)
+            .unwrap();
+        let sequence = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("the rewritten fragment should carry a last-updated sequence")
+            .load_sequence()
+            .unwrap();
+        let versions = (0..fragment.physical_rows.unwrap())
+            .map(|offset| sequence.version_at(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![expected_version; versions.len()]);
     }
 
     #[tokio::test]

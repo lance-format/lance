@@ -147,6 +147,11 @@ impl AddOverlays {
     ///
     /// A fragment this operation mints has no cells or deletions a concurrent
     /// writer can name.
+    ///
+    /// The rows' last-updated versions are restamped without a claim on
+    /// [`Coordinate::FragmentRowVersions`](super::Coordinate::FragmentRowVersions);
+    /// see [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)'s
+    /// footprint for why.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         let fields = self
             .overlays
