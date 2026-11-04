@@ -120,7 +120,9 @@ async fn assert_segment_and_history_untouched(
     before: &[IndexMetadata],
     live: &[u32],
 ) {
-    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     let segment = user_segment(&stored);
     assert_eq!(segment.uuid, user_segment(before).uuid);
     assert_eq!(
@@ -147,7 +149,9 @@ async fn assert_segment_and_history_untouched(
 async fn tagged_table_accepts_partial_row_delete() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     dataset.delete("i = 5").await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
@@ -176,7 +180,9 @@ async fn tagged_table_accepts_partial_row_delete() {
 async fn tagged_table_accepts_whole_fragment_delete() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     // F10 holds the even values.
     dataset.delete("i % 2 = 0").await.unwrap();
@@ -205,7 +211,9 @@ async fn tagged_table_accepts_whole_fragment_delete() {
 async fn tagged_table_accepts_row_rewriting_update() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     let result = UpdateBuilder::new(Arc::new(dataset))
         .update_where("i = 2")
@@ -237,7 +245,9 @@ async fn tagged_table_accepts_row_rewriting_update() {
 async fn tagged_table_accepts_merge_insert_rewriting_rows() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     // A full-schema source: `Auto` rewrites rows (delete + new fragment).
     let schema = Arc::new(ArrowSchema::from(dataset.schema()));
@@ -296,11 +306,15 @@ async fn create_v_index(dataset: &mut Dataset) {
 async fn tagged_table_installs_a_new_user_index() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
     create_v_index(&mut dataset).await;
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_idx.fragment_bitmap.as_ref().unwrap(),
@@ -364,7 +378,9 @@ async fn user_index_built_before_a_stable_partition_lands_translating() {
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_idx.fragment_bitmap.as_ref().unwrap(),
@@ -422,7 +438,7 @@ async fn tagged_table_retires_an_emptied_segment_beside_a_serving_sibling() {
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let segments: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+    let segments: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -452,7 +468,7 @@ async fn tagged_table_retires_an_emptied_segment_beside_a_serving_sibling() {
     // translating segment's whole transition, emptying it.
     rewrite_in_place(dataset, "i", 2, 222).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let remaining: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+    let remaining: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -476,7 +492,7 @@ async fn tagged_table_retires_an_emptied_segment_beside_a_serving_sibling() {
     // The older snapshot still lists and serves the retired segment.
     let old = dataset.checkout_version(version_before).await.unwrap();
     assert!(
-        crate::index::load_all_indices(&old)
+        crate::index::loading::load_all_indices(&old)
             .await
             .unwrap()
             .iter()
@@ -586,7 +602,7 @@ async fn tagged_table_withdraws_a_child_index_when_its_packed_parent_is_rewritte
         .await
         .unwrap();
     let dataset = make_tagged(dataset).await;
-    let x_idx = crate::index::load_all_indices(&dataset)
+    let x_idx = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -625,7 +641,7 @@ async fn tagged_table_withdraws_a_child_index_when_its_packed_parent_is_rewritte
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let x_idx = crate::index::load_all_indices(&dataset)
+    let x_idx = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -770,7 +786,7 @@ async fn child_index_built_before_a_packed_parent_rewrite_lands_withdrawn() {
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let x_idx = crate::index::load_all_indices(&dataset)
+    let x_idx = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -831,7 +847,9 @@ async fn rewrite_in_place(
 async fn tagged_table_accepts_in_place_rewrite_of_an_unindexed_column() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
@@ -863,7 +881,9 @@ async fn tagged_table_withdraws_a_translated_index_after_an_in_place_rewrite() {
     untagged.restore().await.unwrap();
     create_v_index(&mut untagged).await;
     let dataset = make_tagged(untagged).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_before = before
         .iter()
         .find(|idx| idx.name == "v_idx")
@@ -876,7 +896,9 @@ async fn tagged_table_withdraws_a_translated_index_after_an_in_place_rewrite() {
 
     rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_after = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(v_after.uuid, v_before.uuid, "the segment stays listed");
     assert!(
@@ -946,7 +968,7 @@ async fn tagged_table_withdraws_exactly_through_an_external_history() {
     .encode_to_vec();
     crate::index::frag_reuse_reader::tests::install(&mut dataset, content, destinations, true)
         .await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -963,7 +985,9 @@ async fn tagged_table_withdraws_exactly_through_an_external_history() {
     // Row i = 3 lives in F11 (odd values of the first partition).
     rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_idx.fragment_bitmap.as_ref().unwrap(),
@@ -1002,7 +1026,7 @@ async fn tagged_table_withdraws_exactly_through_an_external_history() {
 async fn tagged_table_with_corrupt_history_refuses_the_commit() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1065,7 +1089,7 @@ async fn append_four(dataset: Dataset) -> Dataset {
 
 /// Rewrite the fixture's entry in place through `persist_fixture`.
 async fn persist_entry(dataset: &mut Dataset, edit: impl FnOnce(&mut IndexMetadata)) {
-    let mut indices = crate::index::load_all_indices(dataset)
+    let mut indices = crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1081,7 +1105,9 @@ async fn persist_entry(dataset: &mut Dataset, edit: impl FnOnce(&mut IndexMetada
 /// The entry is carried through exactly: same identity, same version, and
 /// the `i` segment's stored provenance untouched.
 async fn assert_entry_carried(dataset: &Dataset, before: &[IndexMetadata]) {
-    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     assert_eq!(fri_entry(&stored).uuid, fri_entry(before).uuid);
     assert_eq!(
         fri_entry(&stored).index_version,
@@ -1110,7 +1136,9 @@ async fn tagged_table_with_a_newer_history_admits_append_and_add_columns() {
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
     persist_entry(&mut dataset, |entry| entry.index_version = 2).await;
     let dataset = fresh_session(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(fri_entry(&before).index_version, 2);
 
     let mut dataset = append_four(dataset).await;
@@ -1159,7 +1187,9 @@ async fn tagged_table_with_corrupt_history_admits_append_and_add_columns() {
     })
     .await;
     let dataset = fresh_session(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     let mut dataset = append_four(dataset).await;
     dataset
@@ -1195,7 +1225,9 @@ async fn tagged_table_prunes_in_place_rewrite_from_a_direct_index() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
     create_v_index(&mut dataset).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_before = before.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_before.fragment_bitmap.as_ref().unwrap(),
@@ -1204,7 +1236,9 @@ async fn tagged_table_prunes_in_place_rewrite_from_a_direct_index() {
 
     rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_after = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(v_after.uuid, v_before.uuid);
     assert_eq!(
@@ -1250,7 +1284,9 @@ async fn i_values(dataset: &Dataset, predicate: Option<&str>, use_index: bool) -
 async fn tagged_table_accepts_add_and_drop_columns() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     dataset
         .add_columns(
@@ -1292,7 +1328,9 @@ async fn tagged_table_alter_columns_follows_the_in_place_rewrite_rule() {
 
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     dataset
         .alter_columns(&[ColumnAlteration::new("v".into()).cast_to(DataType::Int64)])
@@ -1343,7 +1381,7 @@ async fn tagged_table_accepts_overwrite() {
 
     let dataset = fresh_session(dir.as_str()).await;
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .is_empty()
@@ -1369,7 +1407,9 @@ async fn tagged_table_accepts_restore() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
     let tagged_version = dataset.manifest.version;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     // Version 2 is the indexed, untagged table (1 = data, 2 = i_idx).
     let mut untagged = dataset.checkout_version(2).await.unwrap();
@@ -1380,7 +1420,9 @@ async fn tagged_table_accepts_restore() {
         dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
         vec![0, 1]
     );
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert!(stored.iter().all(|idx| idx.name == "i_idx"), "{stored:?}");
     assert_eq!(
         assert_index_agrees_with_scan(&dataset, "i = 3").await,
@@ -1421,7 +1463,9 @@ async fn tagged_table_refuses_stable_row_id_migration() {
 async fn tagged_table_accepts_config_update() {
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     dataset.update_config([("tenant", "blue")]).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
@@ -1473,6 +1517,7 @@ mod mem_wal_state {
             dataset,
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
             },
         )
@@ -1489,14 +1534,18 @@ mod mem_wal_state {
     /// Two state updates land on the tagged table carrying `i_idx` and the
     /// MemWAL index; each replaces the MemWAL entry only.
     async fn assert_mem_wal_state_advances_beside_the_history(uri: &str, dataset: Dataset) {
-        let before = crate::index::load_all_indices(&dataset).await.unwrap();
+        let before = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let derived_before = dataset.load_indices().await.unwrap();
         let shard = Uuid::new_v4();
 
         let committed = advance_mem_wal_state(&dataset, shard, 3).await.unwrap();
         let dataset = fresh_session(uri).await;
         assert_eq!(dataset.manifest.version, committed.manifest.version);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), before.len());
 
         let mem_wal = mem_wal_entry(&stored);
@@ -1547,7 +1596,9 @@ mod mem_wal_state {
         let committed = advance_mem_wal_state(&dataset, shard, 4).await.unwrap();
         let dataset = fresh_session(uri).await;
         assert_eq!(dataset.manifest.version, committed.manifest.version);
-        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         let details = load_mem_wal_index_details(mem_wal_entry(&stored).clone()).unwrap();
         assert_eq!(
             details.compacted_sstables,
@@ -1609,7 +1660,9 @@ async fn retry_withdraws_an_index_created_concurrently_on_the_rewritten_column()
     let mut other = fresh_session(dir.as_str()).await;
     create_v_index(&mut other).await;
     assert_eq!(other.manifest.version, read_version + 1);
-    let stored = crate::index::load_all_indices(&other).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&other)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_idx.fragment_bitmap.as_ref().unwrap(),
@@ -1621,7 +1674,9 @@ async fn retry_withdraws_an_index_created_concurrently_on_the_rewritten_column()
     rewrite_in_place(stale, "v", 3, 333).await.unwrap();
     let dataset = fresh_session(dir.as_str()).await;
     assert_eq!(dataset.manifest.version, read_version + 2);
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert_eq!(
         v_idx.fragment_bitmap.as_ref().unwrap(),
@@ -1636,7 +1691,9 @@ async fn retry_withdraws_an_index_created_concurrently_on_the_rewritten_column()
     );
     assert_segment_and_history_untouched(
         &dataset,
-        &crate::index::load_all_indices(&other).await.unwrap(),
+        &crate::index::loading::load_all_indices(&other)
+            .await
+            .unwrap(),
         &[10, 11],
     )
     .await;
@@ -1679,7 +1736,9 @@ async fn detached_in_place_rewrite_on_a_tagged_table_withdraws_like_the_main_cha
     assert!(lance_table::format::is_detached_version(
         detached.manifest.version
     ));
-    let stored = crate::index::load_all_indices(&detached).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&detached)
+        .await
+        .unwrap();
     let segment = user_segment(&stored);
     assert!(
         segment.fragment_bitmap.as_ref().unwrap().is_empty(),
@@ -1786,7 +1845,9 @@ async fn vector_fixture(uri: &str, frag_count: u32) -> Dataset {
 }
 
 async fn vec_segment_bitmap(dataset: &Dataset) -> Option<RoaringBitmap> {
-    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     stored
         .iter()
         .find(|idx| idx.name == "vec_idx")
@@ -1815,7 +1876,7 @@ async fn vector_index_translating_remainder_agrees_with_the_scan() {
     .encode_to_vec();
     crate::index::frag_reuse_reader::tests::install(&mut dataset, content, destinations, true)
         .await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1846,7 +1907,9 @@ async fn vector_index_translating_remainder_agrees_with_the_scan() {
     let indexed = knn_rows(&dataset, &query, true).await;
     assert_eq!(indexed, knn_rows(&dataset, &query, false).await);
     assert_eq!(indexed[3], (3, vec![9.0, 9.0, 9.0, 9.0]));
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     for segment in stored.iter().filter(|idx| idx.name == "vec_idx") {
         let bitmap = segment.fragment_bitmap.as_ref().unwrap();
         assert!(
@@ -1892,7 +1955,7 @@ async fn vector_index_live_only_remainder_is_withdrawn_whole_and_agrees_with_the
             .map(|f| f.id as u32)
             .collect(),
     );
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1951,7 +2014,9 @@ async fn vector_index_live_only_remainder_is_withdrawn_whole_and_agrees_with_the
 async fn tagged_table_commit_of_a_stale_staged_index_drops_rewritten_destinations() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
 
     // Staged at the pre-rewrite version (2: data plus i_idx), over F0, F1.
     let mut pre = dataset.checkout_version(2).await.unwrap();
@@ -1980,7 +2045,9 @@ async fn tagged_table_commit_of_a_stale_staged_index_drops_rewritten_destination
         .unwrap();
 
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     // Both sources feed F11 (the partition splits every source by parity).
     assert!(
@@ -2017,7 +2084,9 @@ async fn tagged_table_refuses_committing_a_staged_index_after_a_cast_of_its_colu
 
     let dir = TempStrDir::default();
     let mut dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let mut pre = dataset.checkout_version(2).await.unwrap();
     let segment = crate::index::CreateIndexBuilder::new(
         &mut pre,
@@ -2045,7 +2114,7 @@ async fn tagged_table_refuses_committing_a_staged_index_after_a_cast_of_its_colu
     let dataset = fresh_session(dir.as_str()).await;
     assert_eq!(dataset.manifest.version, version, "nothing was committed");
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -2084,7 +2153,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
     .execute_uncommitted()
     .await
     .unwrap();
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -2096,7 +2165,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let merged: Vec<_> = crate::index::load_all_indices(&dataset)
+    let merged: Vec<_> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -2113,7 +2182,9 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
     // Row i = 2 lives in F10, the fragment the segment names directly.
     rewrite_in_place(dataset, "v", 2, 222).await.unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert!(
         v_idx.fragment_bitmap.as_ref().unwrap().is_empty(),
@@ -2125,7 +2196,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
     // answer would drop them); the maintenance entry opens it as contributing
     // nothing so it can be rebuilt.
     {
-        use crate::index::DatasetIndexInternalExt;
+        use crate::index::loading::DatasetIndexInternalExt;
         use lance_index::metrics::NoOpMetricsCollector;
         assert!(
             !dataset
@@ -2168,7 +2239,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let rebuilt: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+    let rebuilt: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -2185,7 +2256,7 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         &RoaringBitmap::from_iter([10u32, 11])
     );
     {
-        use crate::index::DatasetIndexInternalExt;
+        use crate::index::loading::DatasetIndexInternalExt;
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::{SargableQuery, SearchResult};
         let index = dataset
@@ -2240,7 +2311,9 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
 async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired_destination() {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
-    let before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let mut pre = dataset.checkout_version(2).await.unwrap();
     let segment = crate::index::CreateIndexBuilder::new(
         &mut pre,
@@ -2280,7 +2353,9 @@ async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired
         .await
         .unwrap();
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let v_idx = stored.iter().find(|idx| idx.name == "v_idx").unwrap();
     assert!(
         v_idx.fragment_bitmap.as_ref().unwrap().is_empty(),

@@ -507,7 +507,8 @@ pub async fn create_multi_base_blob_v2_fixture(
     std::fs::create_dir_all(&base_dir).unwrap();
     let base_uri = format!("file://{}", base_dir.display());
 
-    let mut blob_builder = BlobArrayBuilder::new(1);
+    let mut blob_builder = BlobArrayBuilder::new(2);
+    blob_builder.push_bytes(payload.clone()).unwrap();
     blob_builder.push_bytes(payload.clone()).unwrap();
     let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
 
@@ -527,7 +528,7 @@ pub async fn create_multi_base_blob_v2_fixture(
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(UInt32Array::from(vec![0])), blob_array],
+        vec![Arc::new(UInt32Array::from(vec![0, 1])), blob_array],
     )
     .unwrap();
     let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
@@ -545,6 +546,7 @@ pub async fn create_multi_base_blob_v2_fixture(
                     is_dataset_root,
                 }]),
                 target_bases: Some(vec![1]),
+                max_rows_per_file: 1,
                 ..Default::default()
             }),
         )
@@ -558,6 +560,7 @@ pub async fn create_multi_base_blob_v2_fixture(
             .iter()
             .all(|frag| frag.files.iter().all(|file| file.base_id == Some(1)))
     );
+    assert_eq!(dataset.fragments().len(), 2);
 
     MultiBaseBlobFixture {
         _test_dir: test_dir,

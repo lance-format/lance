@@ -160,10 +160,10 @@ Extracts a boolean value with strict type conversion.
 
 **Returns:** Boolean, null if conversion fails
 
-**Type Conversion:** Uses JSONB's strict `to_bool()` conversion:
+**Type Conversion:**
 - Numbers: 0 → false, non-zero → true
-- Strings: "true" → true, "false" → false (exact match required)
-- Other values may fail conversion
+- Strings: "true"/"yes" → true, "false"/"no" → false, case-insensitive
+- Other values are null
 
 **Example:**
 ```python
@@ -199,9 +199,8 @@ Checks if a JSON array contains a specific value.
 **Returns:** Boolean
 
 **Comparison Logic:** 
-- Compares array elements as JSON strings
-- For string matching, tries both with and without quotes
-- Example: searching for 'python' matches both `"python"` and `python` in the array
+- An element matches if the value equals its JSON text, or for a string element, its content
+- Example: searching for `'python'` or `'"python"'` matches the element `"python"`, and `'say "hi"'` matches the element `"say \"hi\""`
 
 **Example:**
 ```python
@@ -219,8 +218,7 @@ Returns the length of a JSON array.
 
 **Returns:** 
 - Integer: length of the array
-- null: if path doesn't exist
-- Error: if path points to a non-array value
+- null: if path doesn't exist or points to a non-array value
 
 **Example:**
 ```python
@@ -419,7 +417,7 @@ complex_projects = dataset.to_table(
 1. **Choose the right function**: Use `json_get_*` functions for direct field access and type conversion; use `json_extract` for complex JSONPath queries.
 2. **Index frequently queried paths**: Use a JSON scalar index on frequently filtered paths before creating computed columns for the same fields.
 3. **Minimize deep nesting**: While Lance supports arbitrary nesting, flatter structures generally perform better.
-4. **Understand type conversion**: The `json_get_*` functions use strict type conversion, which may fail if types don't match. Plan your schema accordingly.
+4. **Understand type conversion**: The `json_get_*` functions use strict type conversion and return null for a value that does not convert. Plan your schema accordingly.
 5. **Array access**: When working with JSON arrays, you can access elements by index using numeric strings (e.g., "0", "1") with `json_get` functions.
 
 ## Integration with DataFusion

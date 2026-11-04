@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 
 use super::overlay::{collect_overlay_stale_frags, overlaid_fragments};
 use super::{Dataset, fragment::FileFragment, versions};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {

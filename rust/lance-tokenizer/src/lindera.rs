@@ -5,6 +5,7 @@
 // Copyright (c) lindera-tantivy contributors.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use lindera::token::Token as LinderaToken;
 use lindera::tokenizer::{Tokenizer as LinderaCoreTokenizer, TokenizerBuilder};
@@ -13,7 +14,10 @@ use crate::{TextAnalyzer, TextAnalyzerBuilder, Token, TokenStream, Tokenizer};
 
 #[derive(Clone)]
 pub struct LinderaTokenizer {
-    tokenizer: LinderaCoreTokenizer,
+    // The core tokenizer owns the dictionary, which can be hundreds of MB
+    // (e.g. IPADIC). Query paths clone the tokenizer for every search, so it is
+    // shared behind an `Arc` to make cloning cheap. `tokenize` only needs `&self`.
+    tokenizer: Arc<LinderaCoreTokenizer>,
     token: Token,
 }
 
@@ -22,7 +26,7 @@ impl LinderaTokenizer {
         let builder = TokenizerBuilder::new().map_err(invalid_data)?;
         let tokenizer = builder.build().map_err(invalid_data)?;
         Ok(Self {
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             token: Token::default(),
         })
     }
@@ -31,14 +35,14 @@ impl LinderaTokenizer {
         let builder = TokenizerBuilder::from_file(file_path).map_err(invalid_data)?;
         let tokenizer = builder.build().map_err(invalid_data)?;
         Ok(Self {
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             token: Token::default(),
         })
     }
 
     pub fn from_segmenter(segmenter: lindera::segmenter::Segmenter) -> Self {
         Self {
-            tokenizer: LinderaCoreTokenizer::new(segmenter),
+            tokenizer: Arc::new(LinderaCoreTokenizer::new(segmenter)),
             token: Token::default(),
         }
     }
@@ -94,4 +98,69 @@ impl Tokenizer for LinderaTokenizer {
 
 fn invalid_data(err: impl std::fmt::Debug) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{err:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lindera::dictionary::{DictionaryBuilder, Metadata, load_fs_dictionary};
+    use lindera::mode::Mode;
+    use lindera::segmenter::Segmenter;
+
+    use super::*;
+
+    /// Build a tiny MeCab-format dictionary so the test does not depend on a
+    /// downloaded one.
+    fn tiny_tokenizer() -> LinderaTokenizer {
+        let root = std::env::temp_dir().join(format!(
+            "lance-lindera-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (src, dst) = (root.join("src"), root.join("dst"));
+        std::fs::create_dir_all(&src).unwrap();
+        let files = [
+            ("char.def", "DEFAULT 0 1 0\nSPACE 0 1 0\n0x0020 SPACE\n"),
+            (
+                "unk.def",
+                "DEFAULT,0,0,0,名詞,一般,*,*,*,*,*\nSPACE,0,0,0,記号,空白,*,*,*,*,*\n",
+            ),
+            ("matrix.def", "1 1\n0 0 0\n"),
+            (
+                "words.csv",
+                "東京,0,0,0,名詞,固有名詞,地域,一般,*,*,東京,トウキョウ,トーキョー\n",
+            ),
+        ];
+        for (name, content) in files {
+            std::fs::write(src.join(name), content).unwrap();
+        }
+        DictionaryBuilder::new(Metadata::default())
+            .build_dictionary(&src, &dst)
+            .unwrap();
+        // The dictionary is read fully into memory, so the files can go now.
+        let dictionary = load_fs_dictionary(&dst).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        LinderaTokenizer::from_segmenter(Segmenter::new(Mode::Normal, dictionary, None))
+    }
+
+    #[test]
+    fn test_clone_shares_dictionary() {
+        let tokenizer = tiny_tokenizer();
+        let mut cloned = tokenizer.clone();
+        assert!(Arc::ptr_eq(&tokenizer.tokenizer, &cloned.tokenizer));
+        assert_eq!(Arc::strong_count(&tokenizer.tokenizer), 2);
+
+        // The clone keeps its own token state and still tokenizes.
+        let mut stream = cloned.token_stream("東京");
+        assert!(stream.advance());
+        assert_eq!(stream.token().text, "東京");
+        assert!(!stream.advance());
+
+        drop(cloned);
+        assert_eq!(Arc::strong_count(&tokenizer.tokenizer), 1);
+    }
 }

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use lance_core::{Error, Result, datatypes::Field};
+use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
@@ -88,7 +89,12 @@ impl CompressionStrategy for Strategy {
         {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        if let Some(compressor) = try_variable_width_per_value(
+            field,
+            data,
+            &params,
+            PerValueGeneralCompression::ZstdOnly,
+        )? {
             return Ok(compressor);
         }
         Err(Error::not_supported_source(
