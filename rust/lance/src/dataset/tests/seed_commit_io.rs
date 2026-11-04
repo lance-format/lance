@@ -40,6 +40,15 @@ fn rows(ids: std::ops::Range<i32>) -> RecordBatch {
 /// (read_iops, write_iops) of one append, one update and one merge-insert.
 async fn commit_requests(dataset: &mut Dataset) -> [(u64, u64); 3] {
     let mut out = [(0, 0); 3];
+    // The first write of a process reads each seeded zone map's
+    // null-position policy once (cached afterwards); measure steady state.
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(rows(90..100))], schema()),
+            None,
+        )
+        .await
+        .unwrap();
     dataset.object_store.io_stats_incremental();
     dataset
         .append(

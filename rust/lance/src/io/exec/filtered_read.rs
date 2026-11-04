@@ -19,6 +19,10 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
+use datafusion::physical_plan::StatisticsContext;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{
@@ -44,8 +48,8 @@ use lance_core::{
 };
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
-    ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
+    RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
@@ -72,6 +76,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
@@ -345,12 +350,12 @@ impl FilteredReadGlobalMetrics {
 /// These represent work that is divisible by partition and this work is reported on the
 /// partition that it belongs to
 pub struct FilteredReadPartitionMetrics {
-    // Records the amount of time spent waiting on the lock to grab the next task
-    //
-    // This should typically be fairly small relative to the overall execution time.  If this
-    // value is large then it means we are bottlenecked on the read scheduler which is preventing
-    // this partition from being utilized.
+    /// Time waiting for the next decode task, i.e. for its I/O to be scheduled.
+    /// Large means the scan is I/O bound.
     task_wait_time: Time,
+    /// Wall time of the decode tasks themselves. Tasks run concurrently, so the
+    /// sum can exceed the elapsed time.
+    decode_time: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -358,6 +363,7 @@ impl FilteredReadPartitionMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
+            decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1409,9 +1415,18 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                            let maybe_task = task_stream.lock().await.next().await.transpose()?;
-                            Result::Ok(maybe_task.map(|task| (task, task_stream)))
+                            let maybe_task = {
+                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                task_stream.lock().await.next().await.transpose()?
+                            };
+                            Result::Ok(maybe_task.map(|task| {
+                                let partition_metrics = partition_metrics.clone();
+                                let task = async move {
+                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    task.await
+                                };
+                                (task, task_stream)
+                            }))
                         }
                     }
                 });
@@ -1483,7 +1498,10 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batches = task.await?;
+                                let batches = {
+                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    task.await?
+                                };
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
@@ -2303,7 +2321,10 @@ pub struct FilteredReadExec {
 }
 
 /// Describes which rows a [`FilteredReadExec`] should read
-#[derive(Debug)]
+///
+/// `Clone` shares the input plan rather than copying it, which is what
+/// [`FilteredReadExec::with_measured_widths`] needs.
+#[derive(Debug, Clone)]
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
@@ -2396,6 +2417,41 @@ impl FilteredReadInternalPlan {
 
 impl FilteredReadExec {
     /// Create a new filtered read
+    /// Carries this node's width onto `rebuilt`, when the two report the same
+    /// schema.
+    ///
+    /// `try_new` seeds the width from the schema alone, so every rebuild -- a
+    /// limit pushed down, a child rewritten -- would otherwise discard what an
+    /// earlier scan measured and fall back to no byte size at all.
+    fn carry_measured_width(&self, mut rebuilt: Self) -> Self {
+        if rebuilt.schema() == self.schema() {
+            rebuilt.bytes_per_row = self.bytes_per_row;
+        }
+        rebuilt
+    }
+
+    /// Returns this node with widths measured by earlier reads folded in.
+    ///
+    /// Separate from [`Self::try_new`] because reading them is async. The plan and
+    /// running stream are shared: this node stands in for the original.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            options: self.options.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.schema().as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            materialization_context: self.materialization_context.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            input: self.input.clone(),
+            plan: self.plan.clone(),
+            running_stream: self.running_stream.clone(),
+        }
+    }
+
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -2518,7 +2574,11 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2674,7 +2734,11 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -3670,18 +3734,26 @@ impl ExecutionPlan for FilteredReadExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        // Only a row-stream input bounds the output rows; a row-set input is
+        // costed from the fragments it selects from.
+        match &self.input {
+            RowSelector::AllRows => vec![],
+            RowSelector::RowSet(_) => vec![ChildStats::Skip],
+            RowSelector::RowStream(_) => vec![ChildStats::At(partition)],
+        }
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
     ) -> datafusion::error::Result<Arc<Statistics>> {
-        if let RowSelector::RowStream(source) = &self.input {
+        let partition = args.partition();
+        if let RowSelector::RowStream(_) = &self.input {
             // At most one output row per input row, since keys of deleted or
             // missing rows are dropped
-            let num_rows = source
-                .plan
-                .partition_statistics(partition)?
-                .num_rows
-                .to_inexact();
+            let num_rows = input_stats[0].num_rows.to_inexact();
             return Ok(Arc::new(Statistics {
                 num_rows,
                 total_byte_size: estimated_total_byte_size(num_rows, self.bytes_per_row),
@@ -3792,7 +3864,8 @@ impl ExecutionPlan for FilteredReadExec {
             None,
         )?);
         let df_filter_exec = FilterExec::try_new(physical_filter, mock_input)?;
-        let mut df_stats = Arc::unwrap_or_clone(df_filter_exec.partition_statistics(partition)?);
+        let mut df_stats =
+            Arc::unwrap_or_clone(StatisticsContext::new().compute(&df_filter_exec, args)?);
 
         // If we have an after-filter range, we should apply it to the stats (the before-filter range
         // is applied in the mock input)
@@ -3839,6 +3912,19 @@ impl ExecutionPlan for FilteredReadExec {
         Ok(Arc::new(df_stats))
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.options
+                .physical_filters
+                .iter()
+                .map(|(_, physical_filter)| physical_filter),
+            f,
+        )
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3853,7 +3939,7 @@ impl ExecutionPlan for FilteredReadExec {
             let child = children.into_iter().next();
             let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            Ok(Arc::new(rebuilt))
+            Ok(Arc::new(self.carry_measured_width(rebuilt)))
         }
     }
 
@@ -3886,9 +3972,44 @@ impl ExecutionPlan for FilteredReadExec {
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         });
+        // Measure what the read decodes and record it when the read finishes.
+        // A filter, a refine, an index input, a range, a fragment subset or a row
+        // address allow-list all mean this read saw a sample. Only an unrestricted
+        // read measures the column.
+        let representative = self.options.full_filter.is_none()
+            && self.options.refine_filter.is_none()
+            // Every selector but `AllRows` carries a chosen subset: a row set from
+            // an index, or a stream of rows another node already filtered.
+            && matches!(self.input, RowSelector::AllRows)
+            && self.options.scan_range_before_filter.is_none()
+            && self.options.scan_range_after_filter.is_none()
+            && !self.options.only_indexed_fragments
+            && !self.options.with_deleted_rows
+            && self.options.fragments.is_none()
+            && self.options.physical_row_addr_prefilter.is_none()
+            // Each partition wraps its own slice of the shared task stream and
+            // writes the same cache key, so the last one to finish would speak for
+            // the column. Only a single-partition read observes all of it.
+            && !matches!(
+                self.options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            );
+        let measured = column_width::measuring(
+            stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
+            output_schema.clone(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            measured,
         )))
     }
 
@@ -3959,7 +4080,7 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options,
             self.input.row_set_plan().cloned(),
         ) {
-            Ok(exec) => Some(Arc::new(exec)),
+            Ok(exec) => Some(Arc::new(self.carry_measured_width(exec))),
             Err(e) => {
                 log::warn!(
                     "Failed to create FilteredReadExec for {} with fetch limit: {}",
@@ -3974,6 +4095,10 @@ impl ExecutionPlan for FilteredReadExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4006,7 +4131,7 @@ mod tests {
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::scalar_index::ScalarIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
     };
@@ -4861,7 +4986,9 @@ mod tests {
 
         let plan = fixture.make_plan(options).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(expected_rows));
 
         // The estimate is only worth anything if it matches what the scan emits.
@@ -5177,7 +5304,10 @@ mod tests {
             .with_projection(fixture.dataset.empty_projection().with_row_id());
         let plan = fixture.make_plan(options).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Exact(300)
         );
         let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
@@ -5200,7 +5330,10 @@ mod tests {
             .with_physical_row_addr_prefilter(Arc::new(selected));
         let plan = fixture.make_plan(options.clone()).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(100)
         );
         fixture.test_plan(options, &u32s(vec![200..300])).await;
@@ -5212,7 +5345,10 @@ mod tests {
             .with_filter_plan(filter);
         let plan = fixture.make_plan(options.clone()).await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(300)
         );
         fixture.test_plan(options, &u32s(vec![250..400])).await;
@@ -5300,8 +5436,8 @@ mod tests {
         // The fixture's utf8 column is seeded from the decoder's estimate, so the
         // whole row reports a width rather than withdrawing.
         assert_eq!(
-            full_plan
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&full_plan, &StatisticsArgs::new())
                 .unwrap()
                 .total_byte_size,
             Precision::Inexact(25282)
@@ -5321,7 +5457,9 @@ mod tests {
 
         let plan = fixture.make_plan(base_options.clone()).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         // With no filter and no range we have an exact count
         assert_eq!(stats.num_rows, Precision::Exact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
@@ -5334,7 +5472,9 @@ mod tests {
             .clone()
             .with_physical_row_addr_prefilter(Arc::new(physical_rows));
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(3));
 
         let mut full_fragment = RowAddrTreeMap::new();
@@ -5347,7 +5487,10 @@ mod tests {
             )
             .await;
         assert_eq!(
-            plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(100)
         );
 
@@ -5355,7 +5498,10 @@ mod tests {
         source_options.projection.with_row_addr = true;
         let source = fixture.make_plan(source_options).await;
         assert_eq!(
-            source.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&source, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Exact(250)
         );
         let stream_plan = FilteredReadExec::try_new(
@@ -5367,7 +5513,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            stream_plan.partition_statistics(None).unwrap().num_rows,
+            StatisticsContext::new()
+                .compute(&stream_plan, &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
             Precision::Inexact(250)
         );
 
@@ -5377,7 +5526,9 @@ mod tests {
             .with_scan_range_before_filter(25..125)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(100));
         assert_eq!(stats.total_byte_size, Precision::Inexact(3300));
 
@@ -5396,7 +5547,9 @@ mod tests {
         )
         .unwrap();
         assert!(plan.options().full_filter.is_none() && plan.options().refine_filter.is_none());
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
@@ -5407,7 +5560,9 @@ mod tests {
             .unwrap();
         let plan =
             FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap();
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(10));
         assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
@@ -5417,7 +5572,9 @@ mod tests {
         // what a join above has to hold.
         let options = base_options.clone().with_deleted_rows().unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(300));
         // Keeping deleted rows also adds a nullable row id: 41.125 bytes per row.
         assert_eq!(stats.total_byte_size, Precision::Inexact(12338));
@@ -5428,7 +5585,9 @@ mod tests {
             .with_scan_range_before_filter(300..400)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Exact(0));
         assert_eq!(stats.total_byte_size, Precision::Inexact(0));
 
@@ -5440,7 +5599,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("not_indexed >= 200", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.total_byte_size, Precision::Inexact(8250));
 
@@ -5450,7 +5611,9 @@ mod tests {
             .clone()
             .with_filter_plan(fixture.filter_plan("random() < 0.5", false).await);
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(50));
         assert_eq!(stats.total_byte_size, Precision::Inexact(1650));
 
@@ -5462,7 +5625,9 @@ mod tests {
             .with_scan_range_after_filter(0..10)
             .unwrap();
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(10));
         assert_eq!(stats.total_byte_size, Precision::Inexact(330));
 
@@ -5480,7 +5645,9 @@ mod tests {
                     .unwrap(),
             );
         let plan = fixture.make_plan(options).await;
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(250));
         assert_eq!(stats.column_statistics.len(), 1);
         // Only the vector is projected, so only the vector is billed: 16 bytes of
@@ -5754,7 +5921,11 @@ mod tests {
         let base_options = FilteredReadOptions::basic_full_read(&fixture.dataset);
 
         let unfiltered = fixture.make_plan(base_options.clone()).await;
-        let Precision::Exact(rows) = unfiltered.partition_statistics(None).unwrap().num_rows else {
+        let Precision::Exact(rows) = StatisticsContext::new()
+            .compute(&unfiltered, &StatisticsArgs::new())
+            .unwrap()
+            .num_rows
+        else {
             panic!("a read with nothing selecting rows knows how many it returns");
         };
 
@@ -5770,7 +5941,9 @@ mod tests {
             "the refine filter has to be the only thing selecting rows here"
         );
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(rows));
     }
 
@@ -5811,7 +5984,9 @@ mod tests {
         options.scan_range_after_filter = Some(inverted);
         let plan = fixture.make_plan(options).await;
 
-        let stats = plan.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&plan, &StatisticsArgs::new())
+            .unwrap();
         assert_eq!(stats.num_rows, Precision::Inexact(0));
     }
 
@@ -6827,7 +7002,12 @@ mod tests {
             assert_eq!(plan.properties().output_ordering(), expected.as_ref());
 
             // Replacing the input must not leave stale ordering properties.
-            let rebuilt = plan.with_new_children(vec![input]).unwrap();
+            let rebuilt = plan
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .unwrap();
             assert!(rebuilt.output_ordering().is_none());
             assert_eq!(rebuilt.maintains_input_order(), vec![true]);
 
@@ -7648,7 +7828,10 @@ mod tests {
                 MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).unwrap();
             let plan = take_plan(&dataset, input, &["i"]).unwrap();
             assert_eq!(
-                plan.partition_statistics(None).unwrap().num_rows,
+                StatisticsContext::new()
+                    .compute(&plan, &StatisticsArgs::new())
+                    .unwrap()
+                    .num_rows,
                 Precision::Inexact(2)
             );
             let result = concat_batches(&plan.schema(), &run(&plan).await).unwrap();
@@ -7825,7 +8008,13 @@ mod tests {
             let input = rows_input(vec![batch]);
             let plan: Arc<dyn ExecutionPlan> =
                 Arc::new(take_plan(&fixture.dataset, input.clone(), &["s"]).unwrap());
-            let rebuilt = plan.clone().with_new_children(vec![input]).unwrap();
+            let rebuilt = plan
+                .clone()
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .unwrap();
             assert_eq!(plan.schema(), rebuilt.schema());
             assert!(
                 rebuilt

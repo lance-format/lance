@@ -3,11 +3,17 @@
 
 from typing import Literal, Optional, TypedDict
 
-# Re-exported from native module. See src/dataset/optimize.rs for implementation.
+# Re-exported from native module. See src/dataset/optimize.rs and
+# src/dataset/optimize_indices.rs for implementation.
 from .lance import Compaction as Compaction
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import CompactionPlan as CompactionPlan
 from .lance import CompactionTask as CompactionTask
+from .lance import IndexSegmentResult as IndexSegmentResult
+from .lance import OptimizeIndexMerge as OptimizeIndexMerge
+from .lance import OptimizeIndexTask as OptimizeIndexTask
+from .lance import OptimizeIndices as OptimizeIndices
+from .lance import OptimizeIndicesPlan as OptimizeIndicesPlan
 from .lance import RewriteResult as RewriteResult
 
 # from .lance import CompactionPlan as CompactionPlan
@@ -91,10 +97,10 @@ class CompactionOptions(TypedDict, total=False):
     """
     max_source_fragments: Optional[int]
     """
-    Maximum number of fragments whose identities may change in a single run.
-    This includes compacted source fragments and following fragments relabeled
-    to preserve row order. The planner selects candidates from a suffix within
-    this limit.
+    Maximum number of source fragments to compact in a single run. Tasks
+    are included until adding the next task would exceed this limit,
+    allowing for incremental compaction (e.g., compact 20 fragments at a
+    time). Fragments are processed oldest first.
     (default: None, no limit)
     """
     max_source_rows: Optional[int]
@@ -118,9 +124,8 @@ class CompactionOptions(TypedDict, total=False):
     """
     Fragment IDs to exclude from compaction planning. Excluded fragments
     remain unchanged and act as boundaries, so fragments on opposite sides
-    are not combined into the same task. To preserve row order, only candidates
-    after the last present excluded fragment are eligible. Duplicate and
-    unknown IDs are ignored. (default: None)
+    are not combined into the same task. Duplicate and unknown IDs are
+    ignored. (default: None)
     """
     data_storage_version: Optional[str]
     """

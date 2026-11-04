@@ -29,6 +29,7 @@ pub mod prune;
 pub mod raw_body;
 pub(crate) mod resident;
 pub mod rotation;
+pub(crate) mod row_addresses;
 pub mod scan_stats;
 pub mod storage;
 pub mod transform;

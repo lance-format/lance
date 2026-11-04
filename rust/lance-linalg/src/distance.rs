@@ -173,19 +173,6 @@ pub(crate) type PairKernel = unsafe fn(&[f32], &[f32]) -> f32;
 /// into the matching element of `output`.
 pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
 
-/// Target-feature tier for the cosine batch iterators.
-#[cfg(all(
-    target_arch = "x86_64",
-    not(all(target_feature = "avx2", target_feature = "fma"))
-))]
-#[derive(Clone, Copy)]
-pub(crate) enum BatchKind {
-    Scalar,
-    Avx,
-    AvxFma,
-    Avx512,
-}
-
 pub use cosine::*;
 pub use dot::*;
 #[allow(deprecated)]

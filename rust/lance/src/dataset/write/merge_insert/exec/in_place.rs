@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use arrow_array::{Array, RecordBatch, UInt8Array, UInt64Array};
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext, context::SessionContext},
@@ -408,6 +410,13 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -469,6 +478,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
         let merge_stats_holder = self.merge_stats.clone();
         let transaction_holder = self.transaction.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let mem_wal_dir_id = self.params.mem_wal_dir_id.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let spill_session_context = self.spill_session_context.clone();
         let spill_execution_options = self.spill_execution_options.clone();
@@ -523,6 +533,7 @@ impl ExecutionPlan for InPlaceMergeInsertExec {
                 updated_fragments,
                 new_fragments,
                 fields_modified,
+                mem_wal_dir_id,
                 compacted_sstables,
                 // In-place patches leave every row where it was, so no index's
                 // fragment bitmap needs extending.

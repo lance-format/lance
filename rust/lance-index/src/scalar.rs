@@ -58,6 +58,7 @@ mod remap_compat_tests;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;
+pub mod tuple;
 pub mod zoned;
 pub mod zonemap;
 

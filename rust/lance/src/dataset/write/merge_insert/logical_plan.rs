@@ -4,11 +4,13 @@
 use async_trait::async_trait;
 use datafusion::common::Result as DFResult;
 use datafusion::{
+    catalog::Session,
     common::DFSchema,
-    execution::{SessionState, context::SessionContext},
+    execution::context::SessionContext,
     physical_plan::ExecutionPlan,
     physical_planner::{ExtensionPlanner, PhysicalPlanner},
 };
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
 use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -348,7 +350,8 @@ impl ExtensionPlanner for MergeInsertPlanner {
         node: &dyn UserDefinedLogicalNode,
         logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        session: &dyn Session,
+        _planning_ctx: &PhysicalPlanningContext,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(write_node) = node.as_any().downcast_ref::<MergeInsertWriteNode>() {
@@ -364,7 +367,7 @@ impl ExtensionPlanner for MergeInsertPlanner {
                         write_node.dataset.clone(),
                         write_node.deferred.update_if.clone(),
                         write_node.deferred.delete_if.clone(),
-                        session_state,
+                        session,
                     )?);
                 }
 
