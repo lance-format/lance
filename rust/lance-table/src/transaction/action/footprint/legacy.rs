@@ -429,7 +429,7 @@ mod tests {
     use crate::transaction::action::test_support::added_field;
     use crate::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, AssertUniqueKeys,
-        CompositeOperation, TombstoneFieldData, UserStep, Verdict,
+        CompositeOperation, RowSelection, SelectedRows, TombstoneFieldData, UserStep, Verdict,
     };
     use crate::transaction::test_support::{
         default_build_config, overlay_with_field, sample_index_metadata, sample_manifest,
@@ -1133,7 +1133,10 @@ mod tests {
                 before.version,
                 actions(vec![Action::RefreshRowVersionMetadata(
                     RefreshRowVersionMetadata {
-                        fragment_ids: vec![0],
+                        rows: vec![RowSelection {
+                            fragment_id: 0,
+                            rows: SelectedRows::Full,
+                        }],
                     },
                 )]),
                 None,

@@ -50,8 +50,8 @@ update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L
 update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L
 data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L  L  L  L  L  L  L
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  R  R  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  R* R* R  L  R
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  R* R  R  L  R
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  R  R  R  L  R
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  R  R  R  L  R
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R
 create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L
@@ -192,14 +192,7 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
 /// Keyed by scenario rather than by cell because a gap comes from how the
 /// resolver treats a kind of operation, not from one particular pairing. When
 /// the last `*` cell involving a scenario is closed, its entry goes too.
-const PARITY_GAPS: &[(Scenario, &str)] = &[
-    (Scenario::Project, SCHEMA_METADATA_REVERTED),
-    (Scenario::ProjectAlterNullability, SCHEMA_METADATA_REVERTED),
-];
-
-const SCHEMA_METADATA_REVERTED: &str = "a legacy Project installs the schema it read, metadata \
-     included, so landing it over a concurrent schema-metadata edit discards the edit. Legacy \
-     lands the pair and loses the edit; the action path conflicts instead";
+const PARITY_GAPS: &[(Scenario, &str)] = &[];
 
 fn parity_gap_reason(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     [ours, theirs].into_iter().find_map(|scenario| {
