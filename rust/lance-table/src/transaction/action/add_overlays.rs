@@ -45,6 +45,7 @@ impl AddOverlays {
             ));
         }
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        state.reject_data_change_to_rearranged(fragment_id, "AddOverlays")?;
         let committed_version = state.new_version();
         let refreshes_lineage = state.uses_stable_row_ids() && self.fragment.committed().is_some();
         let spilled = state.spilled_row_lineage();

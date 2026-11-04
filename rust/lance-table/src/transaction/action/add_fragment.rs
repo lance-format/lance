@@ -56,7 +56,8 @@ pub struct AddFragment {
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
     /// `false` marks a pure rearrangement, e.g. a compaction rewrite. On a
     /// dataset with stable row ids such a fragment must carry all three
-    /// lineage sequences, since its rows keep their identity.
+    /// lineage sequences, since its rows keep their identity. No action in the
+    /// same operation may change such a fragment's values.
     pub data_change: bool,
 }
 
@@ -66,6 +67,9 @@ impl AddFragment {
             self.check_carries_lineage()?;
         }
         let id = state.add_fragment_id(self.id)?;
+        if !self.data_change {
+            state.note_rearranged(id);
+        }
         state.push_fragment(Fragment {
             id,
             files: Vec::new(),
@@ -528,5 +532,74 @@ mod tests {
         );
         assert!(error.to_string().contains("data_change = false"), "{error}");
         assert!(error.to_string().contains(missing), "{error}");
+    }
+
+    fn rearranged_data_file(data_change: bool) -> Action {
+        Action::AddDataFile(AddDataFile {
+            fragment: Ref::Local(0),
+            file: one_column_file("data/moved.lance"),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+            base: None,
+        })
+    }
+
+    /// A fragment added with `data_change = false` holds rows that were
+    /// already in the table, carrying their old row versions, and adds no row
+    /// a key assertion has to rule out. A write in the same operation that
+    /// changes those rows' values would hide behind both: an incremental
+    /// reader would miss the change, and a concurrent key assertion would not
+    /// see the changed key.
+    #[rstest]
+    #[case::an_overlay(vec![
+        rearranged_data_file(false),
+        Action::AddOverlays(crate::transaction::action::AddOverlays {
+            fragment: Ref::Local(0),
+            overlays: vec![crate::format::overlay::DataOverlayFile {
+                data_file: crate::format::DataFile::new(
+                    "data/overlay.lance",
+                    vec![0],
+                    vec![0],
+                    lance_file::version::ConcreteFileVersion::V2_0,
+                    None,
+                    None,
+                ),
+                coverage: crate::format::overlay::OverlayCoverage::dense(
+                    RoaringBitmap::from_iter([0u32]),
+                ),
+                committed_version: 0,
+            }],
+            data_change: true,
+        }),
+    ], "AddOverlays")]
+    #[case::a_changed_data_file(vec![rearranged_data_file(true)], "AddDataFile")]
+    #[case::a_changing_tombstone(vec![
+        rearranged_data_file(false),
+        Action::TombstoneFieldData(crate::transaction::action::TombstoneFieldData {
+            fragment: Ref::Local(0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change: true,
+        }),
+    ], "TombstoneFieldData")]
+    fn test_a_rearranged_fragment_takes_no_data_change(
+        #[case] writes: Vec<Action>,
+        #[case] action: &str,
+    ) {
+        let mut add = add_fragment(Ref::Local(0));
+        if let Action::AddFragment(fragment) = &mut add {
+            fragment.data_change = false;
+        }
+        let mut actions = vec![add];
+        actions.extend(writes);
+
+        let error = apply(&unbacked_manifest(), actions).unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains(action), "{message}");
+        assert!(
+            message.contains("which this operation adds with data_change = false"),
+            "{message}"
+        );
     }
 }
