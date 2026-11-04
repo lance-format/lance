@@ -1177,9 +1177,10 @@ impl Scanner {
 
     /// Configure the speed / accuracy tradeoff for approximate vector search.
     ///
-    /// This setting is currently used by RQ-quantized indexes (such as
-    /// IVF_RQ) and by prefiltered search on HNSW indexes, where `Fast`
-    /// enables the ACORN traversal. Other index types ignore this setting.
+    /// This setting currently affects RQ-quantized vector indexes (such as
+    /// IVF_RQ) and HNSW sub-index searches that exclude rows (for example
+    /// through a prefilter or deletions), where `Fast` enables the ACORN
+    /// traversal. Other index types ignore this setting.
     pub fn approx_mode(&mut self, approx_mode: ApproxMode) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.approx_mode = approx_mode;
