@@ -34,6 +34,7 @@ use crate::system_index::frag_reuse::plan::{
 };
 
 mod compose;
+mod trim;
 
 /// `StablePartition.base_id`.
 const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
@@ -215,6 +216,22 @@ impl FriImpl for TaggedHistory {
                 let recorded_at = transition.legacy_dataset_version().unwrap_or(entry_version);
                 !covers_sources && segment.dataset_version > recorded_at
             })
+    }
+
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
+        self.0.require_fully_interpretable("trim")?;
+        let retained = trim::retention(&self.0.stored, live);
+        if retained.iter().all(|kept| *kept) {
+            return Ok(self);
+        }
+        let kept: Vec<StoredRecord> = self
+            .0
+            .stored
+            .iter()
+            .zip(retained)
+            .filter_map(|(stored, kept)| kept.then(|| stored.clone()))
+            .collect();
+        self.rebuilt(concat(&kept))
     }
 
     fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {

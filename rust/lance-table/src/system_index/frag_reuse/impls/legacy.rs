@@ -117,6 +117,16 @@ pub fn repair_versions(mut versions: Vec<pb::Version>) -> Result<(FragReuseHisto
     Ok((from_versions(kept)?, dropped))
 }
 
+/// The warning every trim that drops invalid versions logs.
+pub(super) fn warn_dropped_versions(dropped: &[u64]) {
+    if !dropped.is_empty() {
+        log::warn!(
+            "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
+             scanned until their indices are rebuilt"
+        );
+    }
+}
+
 /// Every fragment the reuse chain touches (old + new) across all versions. An
 /// index disjoint from this set holds no row address the FRI remaps, so trimming
 /// can never strand it (fragment ids are never reused).
@@ -163,9 +173,20 @@ pub fn is_index_remap_caught_up(
     )
 }
 
+/// Warn, as the v0 trim always has, about a segment whose caught-up state
+/// with the version stamped `version_stamp` cannot be determined.
+pub(super) fn warn_missing_bitmap(segment: &SegmentSummary, version_stamp: u64) {
+    if segment.fragment_bitmap.is_none() && segment.dataset_version > version_stamp {
+        log::warn!(
+            "Index segment {} missing fragment bitmap, cannot determine if it is caught up with the fragment reuse version, consider retraining the index",
+            segment.uuid
+        );
+    }
+}
+
 /// The legacy caught-up rule for one compaction version stamped
 /// `version_stamp`, whose groups consume `group_sources`.
-fn is_caught_up_with_version(
+pub(super) fn is_caught_up_with_version(
     version_stamp: u64,
     group_sources: impl IntoIterator<Item = Vec<u64>>,
     fragment_bitmap: Option<&RoaringBitmap>,
@@ -373,6 +394,52 @@ impl FriImpl for LegacyHistory {
             .iter()
             .map(|segment| self.plan_segment(self.clone(), context, segment))
             .collect()
+    }
+
+    /// The version 0 cleanup: a version is kept while some segment is not
+    /// caught up with it, and dropped when some segment covers part of one
+    /// of its groups (only a corrupted version records that). The kept
+    /// versions are repaired as a committed history is.
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
+        let versions: Vec<&pb::Version> = self.versions().collect();
+        let mut chain = RoaringBitmap::new();
+        for version in &versions {
+            for group in &version.groups {
+                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
+                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
+            }
+        }
+        let mut retained = Vec::with_capacity(versions.len());
+        for &version in &versions {
+            let mut caught_up = true;
+            let mut corrupt = false;
+            for segment in live.iter().flatten() {
+                warn_missing_bitmap(segment, version.dataset_version);
+                match is_caught_up_with_version(
+                    version.dataset_version,
+                    version
+                        .groups
+                        .iter()
+                        .map(|group| group.old_fragments.iter().map(|digest| digest.id).collect()),
+                    segment.fragment_bitmap.as_ref(),
+                    segment.dataset_version,
+                    &chain,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => caught_up = false,
+                    Err(_) => corrupt = true,
+                }
+            }
+            if !corrupt && !caught_up {
+                retained.push(version.clone());
+            }
+        }
+        if retained.len() == versions.len() {
+            return Ok(self);
+        }
+        let (trimmed, dropped) = repair_versions(retained)?;
+        warn_dropped_versions(&dropped);
+        Ok(trimmed.imp().clone())
     }
 
     /// Version 0 segments are caught up by the frozen version 0 remap,

@@ -42,6 +42,7 @@ use super::ledger::{
     DetailsContent, FragReuseLedger, corrupt, is_interpretable_transition, next_field,
     verify_external_content,
 };
+use super::mapping::MappingRef;
 use super::plan::{Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary};
 use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
 use crate::format::pb::ExternalFile;
@@ -485,6 +486,47 @@ impl FragReuseHistory {
             .cloned()
             .collect();
         self.0.rebuilt(concat(&records)).map(Self)
+    }
+
+    /// The history without the records no live index segment needs any
+    /// more. `live` holds the table's stored index segments, one entry per
+    /// logical index (system indices left out); a segment whose
+    /// `translation` is [`TranslationSupport::Uninterpretable`] (this build
+    /// cannot serve it) still pins the records its addresses need, but its
+    /// coverage does not release anyone else's.
+    ///
+    /// A record is never dropped while a segment needs it: a version 0
+    /// history keeps every version some segment is not caught up with (the
+    /// rule its cleanup always applied), a version 0 history on a table
+    /// with stable row IDs only drops versions before the first one some
+    /// segment needs, and a tagged history keeps every transition some
+    /// logical index still translates through, with every record downstream
+    /// of a kept one. Returns the history unchanged when nothing can go and
+    /// an empty one when nothing is needed. A tagged history holding records
+    /// this writer cannot interpret is refused with `NotSupported`.
+    ///
+    /// [`TranslationSupport::Uninterpretable`]: super::plan::TranslationSupport::Uninterpretable
+    pub fn trim(&self, live: &[Vec<SegmentSummary>]) -> Result<Self> {
+        self.0.clone().trim(live).map(Self)
+    }
+
+    /// The row maps the history's records reference, which must outlive
+    /// it. Refused with `NotSupported` while the history holds records this
+    /// writer cannot interpret, since they may reference files too.
+    pub fn referenced_files(&self) -> Result<Vec<MappingRef>> {
+        self.0
+            .records()
+            .require_fully_interpretable("list the files of")?;
+        Ok(self
+            .records()
+            .filter_map(|record| match record {
+                Record::Transition(pb::Transition {
+                    mapping: Some(pb::transition::Mapping::StablePartition(partition)),
+                    ..
+                }) => Some(MappingRef::of(partition)),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Restamp every stable-partition `base_id` through `remap`, as a

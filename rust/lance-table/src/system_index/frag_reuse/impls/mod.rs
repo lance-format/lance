@@ -68,6 +68,9 @@ pub trait FriImpl: Send + Sync + Debug {
     /// released writers relied on.
     fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool;
 
+    /// See [`FragReuseHistory::trim`](super::history::FragReuseHistory::trim).
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>>;
+
     /// See [`FragReuseHistory::needs_translation_support`](super::history::FragReuseHistory::needs_translation_support).
     fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool;
 
