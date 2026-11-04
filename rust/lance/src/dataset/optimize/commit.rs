@@ -412,14 +412,6 @@ pub async fn commit_compaction(
                     .map(digest)
                     .collect::<Result<_>>()?,
             });
-            for frag in task.new_fragments.iter() {
-                u32::try_from(frag.id).map_err(|_| {
-                    Error::invalid_input(format!(
-                        "compacted fragment id {} is outside the row-address range",
-                        frag.id
-                    ))
-                })?;
-            }
         }
         rewrite_groups.push(rewrite_group);
     }
