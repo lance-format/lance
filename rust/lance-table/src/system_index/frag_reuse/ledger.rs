@@ -130,7 +130,7 @@ fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
 
 /// Where FRI `index_details` keep the serialized history.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DetailsContent {
+pub(crate) enum DetailsContent {
     /// The serialized history itself.
     Inline(Bytes),
     /// A byte range of a file in the entry's directory. The caller reads it
@@ -157,7 +157,7 @@ impl DetailsContent {
 
 /// Refuse `content` read for the external reference `file` unless it is
 /// exactly the referenced range.
-pub fn verify_external_content(file: &ExternalFile, content: &Bytes) -> Result<()> {
+pub(crate) fn verify_external_content(file: &ExternalFile, content: &Bytes) -> Result<()> {
     if content.len() as u64 != file.size {
         return Err(corrupt(format!(
             "external FRI size mismatch: expected {}, received {}",

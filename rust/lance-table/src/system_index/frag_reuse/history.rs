@@ -77,7 +77,7 @@ impl HistoryFormat {
     /// The format of an entry stamped `index_version`. A version this build
     /// does not know is refused with `NotSupported`: only a newer Lance can
     /// interpret it.
-    pub fn from_index_version(index_version: i32) -> Result<Self> {
+    pub(crate) fn from_index_version(index_version: i32) -> Result<Self> {
         match index_version {
             0 => Ok(Self::Legacy),
             1 => Ok(Self::Tagged),
@@ -88,7 +88,7 @@ impl HistoryFormat {
     }
 
     /// The `IndexMetadata::index_version` of an entry in this format.
-    pub fn index_version(self) -> i32 {
+    pub(crate) fn index_version(self) -> i32 {
         match self {
             Self::Legacy => 0,
             Self::Tagged => 1,
@@ -187,11 +187,11 @@ impl RewriteRecord {
         self
     }
 
-    pub fn dataset_version(&self) -> u64 {
+    pub(crate) fn dataset_version(&self) -> u64 {
         self.dataset_version
     }
 
-    pub fn transitions(&self) -> &[pb::Transition] {
+    pub(crate) fn transitions(&self) -> &[pb::Transition] {
         &self.transitions
     }
 
@@ -206,7 +206,7 @@ impl RewriteRecord {
     }
 
     /// Whether only the tagged format can record this rewrite.
-    pub fn needs_tagged_format(&self) -> bool {
+    pub(crate) fn needs_tagged_format(&self) -> bool {
         self.transitions.iter().any(|transition| {
             !matches!(
                 transition.mapping,
@@ -513,14 +513,9 @@ impl FragReuseHistory {
         self.0.on_stable_row_ids().map(Self)
     }
 
-    /// Whether `segment` holds no address the history still moves, so it can
-    /// be used without translation, and no record is needed for it.
-    ///
-    /// `entry_version` is the `dataset_version` of the FRI entry holding the
-    /// history (see [`ReadContext::entry_version`]). A segment without a
-    /// recorded fragment bitmap is caught up only under the legacy rule, which
-    /// released writers relied on.
-    pub fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool {
+    /// See [`FriImpl::is_caught_up`].
+    #[cfg(test)]
+    pub(crate) fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool {
         self.0.is_caught_up(entry_version, segment)
     }
 

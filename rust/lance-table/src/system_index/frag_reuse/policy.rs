@@ -54,7 +54,7 @@ impl<'a> FriPolicy<'a> {
     }
 
     /// Whether the table carries a tagged history.
-    pub fn has_tagged_history(&self) -> bool {
+    pub(crate) fn has_tagged_history(&self) -> bool {
         self.entry.is_some_and(is_tagged)
     }
 

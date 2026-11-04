@@ -55,7 +55,13 @@ pub trait FriImpl: Send + Sync + Debug {
     /// See [`FragReuseHistory::on_stable_row_ids`](super::history::FragReuseHistory::on_stable_row_ids).
     fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>>;
 
-    /// See [`FragReuseHistory::is_caught_up`](super::history::FragReuseHistory::is_caught_up).
+    /// Whether `segment` holds no address the history still moves, so it can
+    /// be used without translation, and no record is needed for it.
+    ///
+    /// `entry_version` is the `dataset_version` of the FRI entry holding the
+    /// history (see [`ReadContext::entry_version`]). A segment without a
+    /// recorded fragment bitmap is caught up only under the legacy rule, which
+    /// released writers relied on.
     fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool;
 
     /// See [`FragReuseHistory::needs_translation_support`](super::history::FragReuseHistory::needs_translation_support).
