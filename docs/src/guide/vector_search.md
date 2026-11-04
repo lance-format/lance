@@ -261,6 +261,8 @@ result = dataset.to_table(
 ```
 
 The calibrated profiles apply to L2, cosine and dot with `k <= 100000`.
+For a fixed effort, the probe budget adapts to both the metric and `k` while the
+target stays the same.
 Targets describe average coverage of the true neighbors' partitions on unfiltered
 calibration data. They are not guarantees for each query, dataset, or final Recall@k.
 Quantization, refinement, filtering and HNSW search can change final recall.

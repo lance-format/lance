@@ -7,11 +7,12 @@ parameter types and precedence are unchanged. Fractions of Auto's budget now
 depend on both metric and k, so the same effort retains its routing objective
 as the requested result count changes.
 
-[Initial native S3 measurements and interpretation](RESULTS.md) cover FLAT/RQ5,
-refinement, filtering and cold index caches. The `iops` / `Mean IOPS` fields
-in the audit output count read operations per query, not operations per second.
-Those initial measurements predate the per-k extension and are not performance
-evidence for its coefficients.
+[Native S3 measurements and interpretation](RESULTS.md) compare the per-k
+profiles with the preceding metric-wide policy on the same immutable indices.
+They cover FLAT/RQ5, refinement, filtering and cold index caches, with final
+Recall@k reported alongside query cost. The `iops` / `Mean IOPS` fields count
+read operations per query, not operations per second. The [initial study](RESULTS-initial.md)
+is preserved separately and predates the per-k extension.
 
 The implementation scales the existing metric/k-dependent Auto budget and
 rounds up to whole partitions. Each metric has two calibrated fractions at
@@ -66,6 +67,8 @@ k=1, 2, 5, 10, 11, 20, 50, 100, 101, 150, 200, 201, 300, 500, 501, 750,
 | 0.1 | 80% | 80.762%–88.600% | 155 / 155 |
 | 0.25 | 90% | 90.674%–93.926% | 155 / 155 |
 | 0.5 | 95% | 94.189%–99.510% | 152 / 155 |
+
+![Held-out routing recall at all 31 k values](routing-by-k.png)
 
 These are strict-ID routing predictions on frozen IVF_FLAT indices, not native
 latency measurements or end-to-end RQ recall. The unchanged default misses the
@@ -135,6 +138,10 @@ independently checks hashes, returned IDs, recall, coverage and identical defaul
 results. See the protocol for the full matrix and interpretation limits.
 
 ## Reproduce the initial study
+
+Use the scripts at `aff6f1d1a8df56dc72f6b3ab1498086e0688125c` for the commands
+below. The current calibrator fits per-k profiles and expects the expanded
+matrix; it does not reproduce the initial metric-wide fit.
 
 Use the repository's `python/` environment after `make install`. Restore and
 verify these existing campaign archives; `prepare.py` reuses their centroids,
