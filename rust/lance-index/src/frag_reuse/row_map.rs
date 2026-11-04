@@ -968,6 +968,24 @@ mod tests {
             reader.translate_many(&rows).await.unwrap(),
             "cache-off path is byte-identical to cache-on translations"
         );
+
+        // Label ranges: inside one chunk, straddling a chunk boundary (a
+        // chunk is 256 rows), spanning several chunks, empty, and the whole
+        // map, served from chunks by the cached reader and read exactly by
+        // the uncached one.
+        for rows in [3..9, 200..300, 250..800, 256..256, 0..total] {
+            let cached = reader.labels(rows.clone()).await.unwrap();
+            assert_eq!(cached.len() as u64, rows.end - rows.start, "{rows:?}");
+            assert_eq!(
+                cached,
+                uncached.labels(rows.clone()).await.unwrap(),
+                "{rows:?}"
+            );
+        }
+        for out_of_range in [total - 1..total + 1, Range { start: 9, end: 3 }] {
+            assert!(reader.labels(out_of_range.clone()).await.is_err());
+            assert!(uncached.labels(out_of_range).await.is_err());
+        }
     }
 
     /// Counts the label reads an [`IndexReader`] serves, and how many rows

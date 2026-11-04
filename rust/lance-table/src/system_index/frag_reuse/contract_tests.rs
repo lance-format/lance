@@ -26,7 +26,7 @@ use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, RewriteRecord,
     length_delimited,
 };
-use super::mapping::{MappingRef, MappingSource};
+use super::mapping::{MappingRef, MappingSource, translate_stable_partition};
 use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
 use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
 use crate::format::pb::fragment_reuse_index_details as pb;
@@ -54,6 +54,12 @@ fn record_natively(
 fn empty_round_trips(#[case] format: HistoryFormat) {
     let empty = FragReuseHistory::empty(format);
     assert_eq!(empty.format(), format);
+    // Only a version 0 history has a remap plugins without a remapping
+    // loader can apply.
+    assert_eq!(
+        empty.legacy_compact_index().is_some(),
+        format == HistoryFormat::Legacy
+    );
     assert!(empty.content().is_empty());
     assert!(empty.ledger().transitions().is_empty());
     assert!(empty.fragment_bitmap().is_empty());
@@ -114,6 +120,16 @@ fn validate_refuses_what_repair_repairs(
                 repaired,
                 FragReuseHistory::from_legacy_versions(vec![first]).unwrap()
             );
+            // The synchronous remap handed to plugins without a remapping
+            // loader is built from the repaired history too.
+            let compact = repaired.legacy_compact_index().unwrap().unwrap();
+            let kept: Vec<u64> = compact
+                .details
+                .versions
+                .iter()
+                .map(|version| version.dataset_version)
+                .collect();
+            assert_eq!(kept, vec![1]);
         }
         None => {
             let error = raw.repair().unwrap_err();
@@ -824,6 +840,7 @@ fn bound(
 /// a format whose mappings are decoded never reads one.
 #[rstest]
 #[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
 #[case::tagged(Reading::Tagged)]
 #[tokio::test]
 async fn bound_plan_translates_through_the_lineage(#[case] reading: Reading) {
@@ -899,4 +916,240 @@ async fn bound_plan_reads_only_the_row_map_blocks_it_needs() {
         RoaringBitmap::from_iter([1, 2])
     );
     assert!(mappings.take_reads().is_empty());
+}
+
+/// Fragment 0's `rows` rows alternate between destinations 1 and 2, in
+/// blocks of `block_rows`: row `r` lands at offset `r / 2` of destination
+/// `1 + r % 2`.
+fn alternating(rows: u16, block_rows: u32) -> (InMemoryMappings, Vec<pb::FragmentDigest>) {
+    let labels: Vec<Option<u16>> = (0..rows).map(|row| Some(row % 2)).collect();
+    let half = u64::from(rows / 2);
+    (
+        InMemoryMappings::default().with_map(MAP_A, &labels, block_rows),
+        vec![digest(1, half, 0), digest(2, half, 0)],
+    )
+}
+
+fn alternating_destination(row: u64) -> Option<u64> {
+    Some(address(1 + row % 2, row / 2))
+}
+
+/// [`InMemoryMappings`] whose reads return one label too few.
+#[derive(Debug)]
+struct ShortReads(InMemoryMappings);
+
+#[async_trait::async_trait]
+impl MappingSource for ShortReads {
+    async fn counts(&self, mapping: &MappingRef) -> Result<Arc<CountsMatrix>> {
+        self.0.counts(mapping).await
+    }
+
+    async fn read(&self, mapping: &MappingRef, rows: Range<u64>) -> Result<UInt16Array> {
+        let labels = self.0.read(mapping, rows).await?;
+        Ok(labels.slice(0, labels.len() - 1))
+    }
+}
+
+enum RowMapFault {
+    ShortRead,
+    /// Block 0's labels are reshuffled so they no longer add up to the
+    /// counters at block 1, though every total still matches.
+    LabelsDisagreeWithCounts,
+    InvalidLabel,
+    /// The transition records more source rows than the map labels.
+    SourceRowsDiffer,
+    DestinationCountDiffers,
+    DestinationTotalDiffers,
+}
+
+/// A row map that does not describe the transition it is read for is
+/// refused as corrupt, never used to translate.
+#[rstest]
+#[case::short_read(RowMapFault::ShortRead, "returned 7 labels")]
+#[case::labels_disagree_with_counts(RowMapFault::LabelsDisagreeWithCounts, "block 0")]
+#[case::invalid_label(RowMapFault::InvalidLabel, "invalid row-map label 7")]
+#[case::source_rows_differ(RowMapFault::SourceRowsDiffer, "dimensions")]
+#[case::destination_count_differs(RowMapFault::DestinationCountDiffers, "dimensions")]
+#[case::destination_total_differs(RowMapFault::DestinationTotalDiffers, "total differs")]
+#[tokio::test]
+async fn stable_partition_translation_refuses_a_mismatched_row_map(
+    #[case] fault: RowMapFault,
+    #[case] message: &str,
+) {
+    let (mut mappings, mut destinations) = alternating(8, 4);
+    let mut sources = vec![digest(0, 8, 0)];
+    let labels = &mut mappings.maps.get_mut(MAP_A).unwrap().1;
+    match fault {
+        RowMapFault::ShortRead => {}
+        RowMapFault::LabelsDisagreeWithCounts => {
+            *labels = UInt16Array::from(vec![0, 0, 0, 1, 1, 0, 1, 1]);
+        }
+        RowMapFault::InvalidLabel => {
+            *labels = UInt16Array::from(vec![0, 1, 0, 7, 0, 1, 0, 1]);
+        }
+        RowMapFault::SourceRowsDiffer => sources = vec![digest(0, 9, 0)],
+        RowMapFault::DestinationCountDiffers => destinations.push(digest(3, 0, 0)),
+        RowMapFault::DestinationTotalDiffers => {
+            destinations = vec![digest(1, 5, 0), digest(2, 3, 0)];
+        }
+    }
+    let source: Box<dyn MappingSource> = match fault {
+        RowMapFault::ShortRead => Box::new(ShortReads(mappings)),
+        _ => Box::new(mappings),
+    };
+    let error = translate_stable_partition(
+        source.as_ref(),
+        &MappingRef::new(MAP_A, None, 64),
+        &sources,
+        &destinations,
+        &[address(0, 0), address(0, 5)],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+    assert!(error.to_string().contains(message), "{error}");
+}
+
+/// An address the transition does not consume is the caller's error.
+#[rstest]
+#[case::outside_the_sources(address(7, 0), "outside stable-partition sources")]
+#[case::past_the_source_length(address(0, 8), "exceeds source length 8")]
+#[tokio::test]
+async fn stable_partition_translation_refuses_an_address_it_does_not_consume(
+    #[case] row: u64,
+    #[case] message: &str,
+) {
+    let (mappings, destinations) = alternating(8, 4);
+    let error = translate_stable_partition(
+        &mappings,
+        &MappingRef::new(MAP_A, None, 64),
+        &[digest(0, 8, 0)],
+        &destinations,
+        &[row],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(error.to_string().contains(message), "{error}");
+}
+
+/// An address repeated in a batch translates the same each time, from one
+/// read.
+#[tokio::test]
+async fn stable_partition_translation_answers_repeated_addresses() {
+    let (mappings, destinations) = alternating(8, 4);
+    let rows = [address(0, 5), address(0, 2), address(0, 5)];
+    let translated = translate_stable_partition(
+        &mappings,
+        &MappingRef::new(MAP_A, None, 64),
+        &[digest(0, 8, 0)],
+        &destinations,
+        &rows,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        translated,
+        vec![
+            alternating_destination(5),
+            alternating_destination(2),
+            alternating_destination(5)
+        ]
+    );
+    assert_eq!(mappings.take_reads(), vec![0..8]);
+}
+
+/// A run of adjacent blocks longer than one read may span is split.
+#[tokio::test]
+async fn stable_partition_translation_splits_long_runs() {
+    let (mappings, destinations) = alternating(40, 1);
+    let rows: Vec<u64> = (0..40).map(|row| address(0, row)).collect();
+    let translated = translate_stable_partition(
+        &mappings,
+        &MappingRef::new(MAP_A, None, 64),
+        &[digest(0, 40, 0)],
+        &destinations,
+        &rows,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        translated,
+        (0..40).map(alternating_destination).collect::<Vec<_>>()
+    );
+    assert_eq!(mappings.take_reads(), vec![0..32, 32..40]);
+}
+
+/// An empty batch reads nothing, not even the counts: this source has no
+/// row map, so any read would panic.
+#[tokio::test]
+async fn stable_partition_translation_of_an_empty_batch_reads_nothing() {
+    let mappings = InMemoryMappings::default();
+    let translated = translate_stable_partition(
+        &mappings,
+        &MappingRef::new(MAP_A, None, 64),
+        &[digest(0, 8, 0)],
+        &[digest(1, 8, 0)],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(translated.is_empty());
+}
+
+/// A stable partition of `source`'s 4 rows alternating between
+/// `destinations`, whose row map is [`MAP_A`].
+fn alternating_partition(source: u64, destinations: [u64; 2]) -> pb::Transition {
+    pb::Transition {
+        sources: vec![digest(source, 4, 0)],
+        destinations: destinations.map(|id| digest(id, 2, 0)).to_vec(),
+        mapping: Some(pb::transition::Mapping::StablePartition(
+            pb::StablePartition {
+                map_id: MAP_A.to_string(),
+                map_size_bytes: 64,
+                base_id: None,
+            },
+        )),
+    }
+}
+
+/// A path through both mapping kinds translates hop by hop, in either
+/// order.
+#[rstest]
+#[case::ordered_then_partition(
+    vec![ordered(&[whole(0, 4)], &[(1, 4)]), alternating_partition(1, [2, 3])],
+    [address(2, 0), address(3, 0), address(2, 1), address(3, 1)],
+)]
+#[case::partition_then_ordered(
+    vec![alternating_partition(0, [1, 2]), ordered(&[whole(1, 2)], &[(3, 2)])],
+    [address(3, 0), address(2, 0), address(3, 1), address(2, 1)],
+)]
+#[tokio::test]
+async fn bound_plan_translates_through_mixed_mappings(
+    #[case] transitions: Vec<pb::Transition>,
+    #[case] expected: [u64; 4],
+) {
+    let mut history = FragReuseHistory::empty(HistoryFormat::Tagged);
+    for (version, transition) in transitions.into_iter().enumerate() {
+        history = history
+            .append(RewriteRecord::new(version as u64 + 1, vec![transition]))
+            .unwrap();
+    }
+    let labels = [Some(0), Some(1), Some(0), Some(1)];
+    let mappings = Arc::new(InMemoryMappings::default().with_map(MAP_A, &labels, 4));
+    let remapper = bound(
+        &history,
+        &RoaringBitmap::from_iter([2, 3]),
+        &[0],
+        mappings.clone(),
+    );
+
+    let mut addrs: Vec<Option<u64>> = (0..4).map(|row| Some(address(0, row))).collect();
+    remapper.translate_in_place(&mut addrs).await.unwrap();
+    assert_eq!(addrs, expected.map(Some).to_vec());
+    assert_eq!(mappings.take_reads(), vec![0..4]);
+    assert_eq!(
+        remapper.translate_fragments(&RoaringBitmap::from_iter([0])),
+        RoaringBitmap::from_iter([2, 3])
+    );
 }

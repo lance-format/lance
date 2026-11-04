@@ -296,6 +296,9 @@ struct TaggedRemapper {
     /// Fragments sibling segments cover directly: a path entering one
     /// belongs to the sibling, so the address is dropped.
     excluded: RoaringBitmap,
+    /// Live fragments a transition still consumes: a path reaching one
+    /// ends there instead of following the rewrite, so the address keeps
+    /// pointing into it.
     stops: RoaringBitmap,
     mappings: Arc<dyn MappingSource>,
 }
@@ -602,6 +605,50 @@ mod tests {
         );
         assert!(remapper.fragment_needs_translation(2));
         assert!(!remapper.fragment_needs_translation(3));
+    }
+
+    /// A path that reaches a live fragment a transition still consumes ends
+    /// there: the address keeps pointing into it rather than following the
+    /// rewrite on.
+    #[tokio::test]
+    async fn paths_end_at_a_stop_fragment() {
+        // 0 -> 1 -> 2 -> 3, with fragment 1 still live.
+        let mut history = FragReuseHistory::empty(HistoryFormat::Tagged);
+        for (version, (source, destination)) in [(0, 1), (1, 2), (2, 3)].into_iter().enumerate() {
+            history = history
+                .append(RewriteRecord::new(
+                    version as u64 + 1,
+                    vec![ordered(&[whole(source, 2)], &[(destination, 2)])],
+                ))
+                .unwrap();
+        }
+        let remapper = Remapper::from_backing(Arc::new(TaggedRemapper {
+            ledger: history.ledger().clone(),
+            coverage: RoaringBitmap::from_iter([1, 3]),
+            excluded: RoaringBitmap::new(),
+            stops: RoaringBitmap::from_iter([1]),
+            mappings: Arc::new(NoRowMaps),
+        }));
+        let address = |fragment| u64::from(RowAddress::new_from_parts(fragment, 1));
+
+        let mut addrs = [0, 1, 2].map(|fragment| Some(address(fragment)));
+        remapper.translate_in_place(&mut addrs).await.unwrap();
+        assert_eq!(
+            addrs,
+            [Some(address(1)), Some(address(1)), Some(address(3))]
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([0])),
+            RoaringBitmap::from_iter([1])
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([1])),
+            RoaringBitmap::from_iter([1])
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([2])),
+            RoaringBitmap::from_iter([3])
+        );
     }
 
     #[test]
