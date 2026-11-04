@@ -2074,3 +2074,91 @@ async fn byte_full_fragment_preserves_small_runs_on_both_sides() {
             .all(|task| task.task.fragments.iter().all(|f| f.id != middle_id))
     );
 }
+
+#[tokio::test]
+async fn test_source_budget_progress_and_blocked_diagnostics() {
+    // Whole tasks fit the run cap and drain over separate atomic commits.
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(5), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_rows: Some(200),
+        ..Default::default()
+    };
+    let mut committed = 0;
+    loop {
+        let result = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .plan_with_budget(&dataset)
+            .await
+            .unwrap();
+        assert!(result.source_budget.selected_source_rows <= 200);
+        assert!(!result.source_budget.is_blocked());
+        if result.plan.num_tasks() == 0 {
+            break;
+        }
+        assert_eq!(result.plan.options.target_rows_per_fragment, 100);
+        let mut results = Vec::new();
+        for task in result.plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        committed += 1;
+        assert!(committed <= 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 250);
+    }
+    assert_eq!(committed, 2);
+
+    // A task larger than the cap is held back whole, even when some of its
+    // source fragments fit. Report that boundary rather than a silent no-op.
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(3), FragmentRowCount(99))
+        .await
+        .unwrap();
+    let blocked = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_rows: Some(200),
+        ..options
+    })
+    .unwrap()
+    .plan_with_budget(&dataset)
+    .await
+    .unwrap();
+    assert_eq!(blocked.plan.num_tasks(), 0);
+    assert!(blocked.source_budget.is_blocked());
+    assert_eq!(blocked.source_budget.next_task_source_rows, Some(297));
+    assert_eq!(blocked.source_budget.next_task_source_fragments, Some(3));
+}
+
+#[tokio::test]
+async fn test_source_budget_reports_remaining_work_and_live_rows() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 250,
+        max_source_rows: Some(270),
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .plan_with_budget(&dataset)
+        .await
+        .unwrap();
+    assert!(result.source_budget.budget_exhausted());
+    assert!(!result.source_budget.is_blocked());
+    assert_eq!(result.source_budget.selected_tasks, 1);
+    assert_eq!(result.source_budget.selected_source_rows, 250);
+    assert!(result.source_budget.candidate_tasks > 1);
+    assert_eq!(result.source_budget.next_task_source_rows, Some(300));
+    assert_eq!(result.source_budget.next_task_source_fragments, Some(3));
+}
