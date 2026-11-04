@@ -310,20 +310,6 @@ impl QuickCacheBackend {
         drop((dropped, replaced));
     }
 
-    fn get_entry(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
-        if (self.priority_active.load(Ordering::Acquire)
-            || codec.is_some_and(|c| c.memory_priority() > 0))
-            && let Some(value) = self
-                .priority
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(key)
-        {
-            return Some(value.entry);
-        }
-        self.cache.get(key).map(|v| v.entry)
-    }
-
     fn record_write(&self, key: &InternalCacheKey, size_bytes: usize) -> u64 {
         let bytes = key_footprint(key).saturating_add(size_bytes).max(1) as u64;
         let submission_id = self.metrics.write(bytes);
