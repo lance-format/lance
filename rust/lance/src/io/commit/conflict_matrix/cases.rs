@@ -37,7 +37,7 @@ const MATRIX: &str = "\
 append                    | L  L  L  L  L  L  L  L  R  R  R  L  L  X  X  L
 delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L
 delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
+update_rewrite_rows       | R  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
 update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L
 data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L

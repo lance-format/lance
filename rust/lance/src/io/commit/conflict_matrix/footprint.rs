@@ -90,7 +90,7 @@ const FOOTPRINT_MATRIX: &str = "\
                        | dl      df      ur      uc      ov      dr      ci      rw
 delete                 | R/-/L   R/-/L   L/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
 delete_whole_fragment  | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L
-update_rewrite_rows    | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L
+update_rewrite_rows    | L/-/L   R/-/L   R/-/L   R/R/R   R/R/L   R/R/L   L/-/L   R/-/L
 update_rewrite_columns | R/-/L   R/-/L   R/-/L   R/R/L   R/L/L   R/R/L   L/-/L   R/-/L
 data_overlay           | L/-/L   R/-/L   R/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L
 data_replacement       | L/-/L   X/-/L   R/-/L   R/L/L   L/L/L   R/L/L   L/-/L   R/-/L
