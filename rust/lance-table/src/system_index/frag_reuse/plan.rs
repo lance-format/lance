@@ -113,6 +113,8 @@ pub struct TranslationPlan {
     /// Set on a plan [`FragReuseHistory::compose`] made: the hops a rewrite
     /// moves the segment's stored addresses through.
     rewrite: Option<Arc<RewritePath>>,
+    /// See [`Self::published_bitmap`].
+    is_coverage_unknown: bool,
 }
 
 /// The hops a rewrite moves a segment's stored addresses through, in
@@ -163,7 +165,7 @@ pub enum Composition {
     Blocked { fragment: u32 },
     /// The segment is rewritten through the plan: bind it and translate the
     /// segment's files through the [`Remapper`], then publish the plan's
-    /// [`coverage`](TranslationPlan::coverage) as the segment's bitmap.
+    /// [`published_bitmap`](TranslationPlan::published_bitmap).
     Rewrite(TranslationPlan),
 }
 
@@ -173,6 +175,7 @@ impl PartialEq for TranslationPlan {
             && self.excluded_fragments == other.excluded_fragments
             && self.stops == other.stops
             && self.fingerprint == other.fingerprint
+            && self.is_coverage_unknown == other.is_coverage_unknown
     }
 }
 
@@ -244,6 +247,7 @@ impl TranslationPlan {
             stops,
             fingerprint,
             rewrite: None,
+            is_coverage_unknown: false,
         }
     }
 
@@ -257,6 +261,20 @@ impl TranslationPlan {
         let mut plan = Self::nothing(history);
         plan.coverage = coverage;
         plan.rewrite = Some(Arc::new(path));
+        plan
+    }
+
+    /// A rewrite plan of a version 0 history, which moves every address
+    /// through its whole history whatever the plan covers. `coverage` is
+    /// `None` for a segment that never recorded one.
+    pub(super) fn legacy_rewrite(
+        history: Arc<dyn FriImpl>,
+        coverage: Option<RoaringBitmap>,
+    ) -> Self {
+        let is_coverage_unknown = coverage.is_none();
+        let mut plan = Self::nothing(history);
+        plan.coverage = coverage.unwrap_or_default();
+        plan.is_coverage_unknown = is_coverage_unknown;
         plan
     }
 
@@ -281,6 +299,16 @@ impl TranslationPlan {
     pub fn restrict_coverage(mut self, fragments: &RoaringBitmap) -> Self {
         self.coverage &= fragments;
         self
+    }
+
+    /// The fragment bitmap the segment a rewrite plan rewrites publishes:
+    /// [`Self::coverage`], or `None` for a segment that never recorded a
+    /// bitmap. Released version 0 writers rewrote such a segment without
+    /// inventing one, so a rewrite publishing no bitmap also keeps the
+    /// segment's dataset version: without a bitmap, the version is all that
+    /// says which records the segment still needs.
+    pub fn published_bitmap(&self) -> Option<&RoaringBitmap> {
+        (!self.is_coverage_unknown).then_some(&self.coverage)
     }
 
     /// The translation an index loads the segment with. `mappings` reads

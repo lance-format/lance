@@ -602,11 +602,16 @@ impl FragReuseHistory {
     /// [`Remapper::materialize`](lance_select::Remapper::materialize) for an
     /// index that needs a complete map.
     ///
-    /// Only the tagged format composes; a version 0 history is refused with
-    /// `NotSupported`, since its segments are rewritten by the frozen
-    /// version 0 remap. A history holding transitions this build cannot
-    /// interpret is refused with `NotSupported` too, and a segment without a
-    /// fragment bitmap with `InvalidInput`.
+    /// A version 0 history decides as its released remap did: every
+    /// compaction version applies to the stored bitmap in turn, a segment
+    /// built at or before a version whose destinations it already claims is
+    /// still rewritten, a segment without a bitmap is always rewritten (and
+    /// publishes none), and one covering part of a rewrite group is refused
+    /// with `InvalidInput`. Its rewrite translates through the whole history
+    /// as one in-memory map. A tagged history plans from the segment's
+    /// provenance per transition, refuses a segment without a fragment
+    /// bitmap with `InvalidInput`, and refuses with `NotSupported` while it
+    /// holds transitions this build cannot interpret.
     pub fn compose(
         &self,
         context: &RewriteContext,

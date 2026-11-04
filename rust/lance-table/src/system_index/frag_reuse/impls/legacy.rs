@@ -35,6 +35,8 @@ use crate::system_index::frag_reuse::{
 };
 use crate::system_index::is_system_index;
 
+mod compose;
+
 /// The records, and the translation built from them the first time a plan
 /// of this history is bound.
 #[derive(Debug, Default)]
@@ -442,17 +444,15 @@ impl FriImpl for LegacyHistory {
         Ok(trimmed.imp().clone())
     }
 
-    /// Version 0 segments are caught up by the frozen version 0 remap,
-    /// which composes every compaction version into one in-memory map.
+    /// The version 0 remap: see [`compose::compose`]. Records this build
+    /// cannot interpret are ignored, as released readers ignored them.
     fn compose(
         self: Arc<Self>,
         _context: &RewriteContext,
-        _segment: &SegmentSummary,
+        segment: &SegmentSummary,
     ) -> Result<Composition> {
-        Err(Error::not_supported(
-            "a version 0 fragment reuse history is not composed per segment; its segments are \
-             remapped through the version 0 remap",
-        ))
+        let index = self.translation().compact_index()?;
+        compose::compose(self, &index, segment)
     }
 
     /// Every plan binds to the same translation, the frozen version 0 one:
