@@ -12,7 +12,7 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -156,6 +156,18 @@ impl StructuralMapDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralMapDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let child_limit = self.child.max_rows_to_drain(num_rows, byte_budget)?;
+        Ok(DrainLimit {
+            rows: child_limit.rows,
+            bytes: child_limit.bytes,
+            dictionary_rows: child_limit
+                .dictionary_rows
+                .filter(|rows| *rows < num_rows)
+                .map(|_| num_rows.min(1)),
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }

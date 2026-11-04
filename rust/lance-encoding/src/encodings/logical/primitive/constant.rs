@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array, new_null_array};
+use arrow_array::{Array, ArrayRef, cast::AsArray, new_empty_array, new_null_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -305,7 +305,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConstantPageDecoder {
     ranges: VecDeque<Range<u64>>,
     scalar: ArrayRef,
@@ -384,6 +384,63 @@ impl ConstantPageDecoder {
 }
 
 impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPageDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        let mut planned = self.clone();
+        let mut visible_items = 0_u64;
+        let mut non_null_items = 0_u64;
+        for range in planned.drain_ranges(num_rows) {
+            planned.skip_to_row(range.start)?;
+            let start = planned.cursor_level;
+            planned.skip_to_row(range.end)?;
+            let end = planned.cursor_level;
+            let (count, non_null_count) = if let Some(def) = &planned.def {
+                (
+                    def[start..end]
+                        .iter()
+                        .filter(|level| **level <= planned.max_visible_def)
+                        .count(),
+                    def[start..end].iter().filter(|level| **level == 0).count(),
+                )
+            } else {
+                (end - start, end - start)
+            };
+            visible_items = visible_items
+                .checked_add(count as u64)
+                .ok_or_else(|| Error::not_supported("constant item count overflowed u64"))?;
+            non_null_items = non_null_items
+                .checked_add(non_null_count as u64)
+                .ok_or_else(|| Error::not_supported("constant non-null count overflowed u64"))?;
+        }
+        let value_and_offset_bytes = match self.scalar.data_type() {
+            DataType::Binary => Some((self.scalar.as_binary::<i32>().value(0).len() as u64, 4)),
+            DataType::LargeBinary => {
+                Some((self.scalar.as_binary::<i64>().value(0).len() as u64, 8))
+            }
+            DataType::Utf8 => Some((self.scalar.as_string::<i32>().value(0).len() as u64, 4)),
+            DataType::LargeUtf8 => Some((self.scalar.as_string::<i64>().value(0).len() as u64, 8)),
+            _ => None,
+        };
+        if let Some((value_bytes, offset_bytes)) = value_and_offset_bytes {
+            let value_count = if self.scalar.is_null(0) {
+                0
+            } else {
+                non_null_items
+            };
+            return value_count
+                .checked_mul(value_bytes)
+                .and_then(|bytes| {
+                    visible_items
+                        .checked_add(1)?
+                        .checked_mul(offset_bytes)?
+                        .checked_add(bytes)
+                })
+                .ok_or_else(|| Error::not_supported("constant decoded byte count overflowed u64"));
+        }
+        visible_items
+            .checked_mul(self.scalar.get_buffer_memory_size() as u64)
+            .ok_or_else(|| Error::not_supported("constant decoded byte count overflowed u64"))
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
 
@@ -520,10 +577,55 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::BooleanArray;
+    use arrow_array::{BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, StringArray};
 
     use super::*;
-    use crate::encodings::logical::primitive::StructuralPageScheduler;
+    use crate::encodings::logical::primitive::{StructuralPageDecoder, StructuralPageScheduler};
+
+    #[test]
+    fn constant_byte_estimate_ignores_null_payloads_and_retained_buffers() {
+        let padding = "x".repeat(4096);
+        let scalars: Vec<(ArrayRef, u64)> = vec![
+            (
+                Arc::new(
+                    BinaryArray::from(vec![b"abc".as_slice(), padding.as_bytes()]).slice(0, 1),
+                ),
+                4,
+            ),
+            (
+                Arc::new(
+                    LargeBinaryArray::from(vec![b"abc".as_slice(), padding.as_bytes()]).slice(0, 1),
+                ),
+                8,
+            ),
+            (
+                Arc::new(StringArray::from(vec!["abc", padding.as_str()]).slice(0, 1)),
+                4,
+            ),
+            (
+                Arc::new(LargeStringArray::from(vec!["abc", padding.as_str()]).slice(0, 1)),
+                8,
+            ),
+        ];
+        for (scalar, offset_bytes) in scalars {
+            let mut decoder = ConstantPageDecoder {
+                ranges: VecDeque::from([0..4]),
+                scalar,
+                rep: None,
+                def: Some(ScalarBuffer::from(vec![0, 1, 1, 0])),
+                def_meaning: Arc::from([DefinitionInterpretation::NullableItem]),
+                max_rep: 0,
+                max_visible_def: 1,
+                cursor_row: 0,
+                cursor_level: 0,
+                num_rows: 4,
+            };
+            assert_eq!(decoder.decoded_bytes(4).unwrap(), 6 + 5 * offset_bytes);
+            assert_eq!(decoder.decoded_bytes(2).unwrap(), 3 + 3 * offset_bytes);
+            decoder.drain(2).unwrap();
+            assert_eq!(decoder.decoded_bytes(2).unwrap(), 3 + 3 * offset_bytes);
+        }
+    }
 
     #[test]
     fn rejects_cached_scalar_with_different_data_type() {

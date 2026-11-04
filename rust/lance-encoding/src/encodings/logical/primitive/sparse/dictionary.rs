@@ -384,6 +384,12 @@ struct IndexedDecoder {
     items: Arc<DataBlock>,
 }
 impl StructuralPageDecoder for IndexedDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        self.items.data_size().checked_mul(num_rows).ok_or_else(|| {
+            Error::not_supported("expanded sparse dictionary byte count overflowed u64")
+        })
+    }
+
     fn num_rows(&self) -> u64 {
         self.indices.len() as u64
     }

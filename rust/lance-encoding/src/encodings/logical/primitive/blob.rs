@@ -471,6 +471,25 @@ impl BlobPageDecoder {
 }
 
 impl StructuralPageDecoder for BlobPageDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if num_rows > self.blobs.len() as u64 {
+            return Err(Error::internal("blob byte planning exceeds loaded rows"));
+        }
+        let offset_bytes = num_rows
+            .checked_add(1)
+            .and_then(|rows| rows.checked_mul(8))
+            .ok_or_else(|| Error::not_supported("blob offset byte count overflowed u64"))?;
+        self.blobs
+            .iter()
+            .take(num_rows as usize)
+            .try_fold(offset_bytes, |bytes, blob| {
+                let value_bytes = blob.bytes.as_ref().map_or(0, |value| value.len() as u64);
+                bytes
+                    .checked_add(value_bytes)
+                    .ok_or_else(|| Error::not_supported("blob payload byte count overflowed u64"))
+            })
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let blobs = self.blobs.drain(0..num_rows as usize).collect::<Vec<_>>();
         Ok(Box::new(BlobDecodePageTask::new(
@@ -548,5 +567,27 @@ impl DecodePageTask for BlobDecodePageTask {
             data: data_block,
             repdef: RepDefUnraveler::new(rep, def, self.def_meaning, num_values),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planned_blob_bytes_follow_partial_drains() {
+        let blobs = [b"aaa".as_slice(), b"", b"bbbbb"]
+            .into_iter()
+            .map(|value| {
+                let mut blob = LoadedBlob::new(0, 0);
+                blob.set_bytes(Bytes::copy_from_slice(value));
+                blob
+            })
+            .collect();
+        let mut decoder =
+            BlobPageDecoder::new(blobs, Arc::from([DefinitionInterpretation::AllValidItem]));
+        assert_eq!(decoder.decoded_bytes(3).unwrap(), 40);
+        decoder.drain(1).unwrap();
+        assert_eq!(decoder.decoded_bytes(2).unwrap(), 29);
     }
 }
