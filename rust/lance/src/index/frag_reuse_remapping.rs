@@ -25,7 +25,6 @@ use std::sync::Arc;
 const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
     "FmIndexDetails",
     "JsonIndexDetails",
-    "LabelListIndexDetails",
     "MinHashLshIndexDetails",
     "RTreeIndexDetails",
 ];

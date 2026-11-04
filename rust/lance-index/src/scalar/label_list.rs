@@ -4,9 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, DeprecatedRemapper, remap_row_addrs_tree_map_async,
-};
+use lance_index_core::remapping::{BatchRowIdRemapper, DeprecatedRemapper, Remapper};
 use std::{
     any::Any,
     fmt::Debug,
@@ -55,8 +53,8 @@ use crate::scalar::bitmap::{
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
-    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+    BasicTrainer, DefaultTrainingRequest, RemappingIndexLoader, ScalarIndexLoad, ScalarIndexPlugin,
+    TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -133,38 +131,18 @@ impl LabelListIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         let values_index = BitmapIndex::load(
             store.clone(),
-            DeprecatedRemapper::sync(frag_reuse_index.clone()),
+            remapper.clone(),
             index_cache,
             results_are_row_addresses,
         )
         .await?;
-        let list_nulls = read_list_nulls(store, frag_reuse_index).await?;
-        Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-        results_are_row_addresses: bool,
-    ) -> Result<Arc<Self>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let values_index = BitmapIndex::load(
-            store.clone(),
-            DeprecatedRemapper::batch(remapping.clone()),
-            index_cache,
-            results_are_row_addresses,
-        )
-        .await?;
-        let list_nulls = read_list_nulls_with_remapping(store, remapping).await?;
+        let list_nulls = read_list_nulls(store, remapper.as_ref()).await?;
         Ok(Arc::new(Self::new(values_index, Arc::new(list_nulls))))
     }
 }
@@ -538,7 +516,7 @@ fn unnest_chunks(
 
 async fn read_list_nulls(
     store: Arc<dyn IndexStore>,
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    remapper: Option<&Remapper>,
 ) -> Result<RowAddrTreeMap> {
     let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
     if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
@@ -550,33 +528,9 @@ async fn read_list_nulls(
         })?;
         let bytes = reader.read_global_buffer(buffer_idx).await?;
         let null_map = RowAddrTreeMap::deserialize_from(bytes.as_ref())?;
-        return if let Some(frag_reuse_index) = frag_reuse_index {
-            Ok(frag_reuse_index.remap_row_addrs_tree_map(&null_map))
-        } else {
-            Ok(null_map)
-        };
-    }
-    Ok(RowAddrTreeMap::default())
-}
-
-async fn read_list_nulls_with_remapping(
-    store: Arc<dyn IndexStore>,
-    remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-) -> Result<RowAddrTreeMap> {
-    let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
-    if let Some(buffer_idx_str) = reader.schema().metadata.get(LABEL_LIST_NULLS_METADATA_KEY) {
-        let buffer_idx = buffer_idx_str.parse::<u32>().map_err(|err| {
-            Error::internal(format!(
-                "LabelList metadata key {} had invalid global buffer index {}: {}",
-                LABEL_LIST_NULLS_METADATA_KEY, buffer_idx_str, err
-            ))
-        })?;
-        let bytes = reader.read_global_buffer(buffer_idx).await?;
-        let null_map = RowAddrTreeMap::deserialize_from(bytes.as_ref())?;
-        return if let Some(remapper) = remapping {
-            remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await
-        } else {
-            Ok(null_map)
+        return match remapper {
+            Some(remapper) => remapper.translate_set(&null_map).await,
+            None => Ok(null_map),
         };
     }
     Ok(RowAddrTreeMap::default())
@@ -951,13 +905,11 @@ impl LabelListIndexState {
         self,
         store: Arc<dyn IndexStore>,
         index_cache: &LanceCache,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
     ) -> Result<Arc<LabelListIndex>> {
-        let bitmap = self.bitmap_state.to_bitmap_index(
-            store,
-            index_cache,
-            DeprecatedRemapper::sync(frag_reuse_index),
-        )?;
+        let bitmap = self
+            .bitmap_state
+            .to_bitmap_index(store, index_cache, remapper)?;
         Ok(Arc::new(LabelListIndex::new(bitmap, self.list_nulls)))
     }
 }
@@ -1111,6 +1063,24 @@ impl BasicTrainer for LabelListIndexPlugin {
 }
 
 #[async_trait]
+impl RemappingIndexLoader for LabelListIndexPlugin {
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let results_are_row_addresses = index_version >= LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
+        Ok(
+            LabelListIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+}
+
+#[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
@@ -1143,23 +1113,26 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
         )))
     }
 
-    /// Load an index from storage
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
-        Ok(LabelListIndex::load(
+        self.load_remapped(
             index_store,
-            frag_reuse_index,
+            index_details,
+            index_version,
+            DeprecatedRemapper::sync(frag_reuse_index),
             cache,
-            results_are_row_addresses,
         )
-        .await? as Arc<dyn ScalarIndex>)
+        .await
+    }
+
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -1169,19 +1142,19 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
     async fn load_index_with_remapping(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
         index_version: u32,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= LABEL_LIST_ROW_ADDR_DOMAIN_VERSION;
-        Ok(LabelListIndex::load_with_remapping(
+        self.load_remapped(
             index_store,
-            remapping,
+            index_details,
+            index_version,
+            DeprecatedRemapper::batch(remapping),
             cache,
-            results_are_row_addresses,
         )
-        .await?)
+        .await
     }
 
     async fn get_from_cache(
@@ -1194,7 +1167,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             return Ok(None);
         };
         let state = (*state).clone();
-        let index = state.into_label_list_index(index_store, cache, frag_reuse_index)?;
+        let index = state.into_label_list_index(
+            index_store,
+            cache,
+            DeprecatedRemapper::sync(frag_reuse_index),
+        )?;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -1224,10 +1201,11 @@ impl ScalarIndexPlugin for LabelListIndexPlugin {
             load,
             LabelListIndexState::from_scalar_index,
             move |state| {
-                Ok((*state)
-                    .clone()
-                    .into_label_list_index(index_store, cache, frag_reuse_index)?
-                    as Arc<dyn ScalarIndex>)
+                Ok((*state).clone().into_label_list_index(
+                    index_store,
+                    cache,
+                    DeprecatedRemapper::sync(frag_reuse_index),
+                )? as Arc<dyn ScalarIndex>)
             },
         )
         .await

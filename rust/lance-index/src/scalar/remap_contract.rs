@@ -13,7 +13,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::types::Int32Type;
+use arrow_array::{ArrayRef, Int32Array, ListArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -31,12 +32,14 @@ use super::bitmap::BitmapIndexPlugin;
 use super::bloomfilter::BloomFilterIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::inverted::InvertedIndexPlugin;
+use super::label_list::LabelListIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::ngram::NGramIndexPlugin;
 use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
 use super::zonemap::ZoneMapIndexPlugin;
 use super::{
-    AnyQuery, BloomFilterQuery, Remapper, SargableQuery, ScalarIndex, TextQuery, TokenQuery,
+    AnyQuery, BloomFilterQuery, LabelListQuery, Remapper, SargableQuery, ScalarIndex, TextQuery,
+    TokenQuery,
 };
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
@@ -126,6 +129,10 @@ fn value_array(data_type: &DataType, values: Vec<i32>) -> ArrayRef {
     match data_type {
         DataType::Int32 => Arc::new(Int32Array::from(values)),
         DataType::Utf8 => Arc::new(StringArray::from_iter_values(values.into_iter().map(text))),
+        // Each row's list holds its one value.
+        DataType::List(_) => Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+            values.into_iter().map(|value| Some([Some(value)])),
+        )),
         other => panic!("no rows of type {other}"),
     }
 }
@@ -190,6 +197,22 @@ fn inverted() -> Case {
         fragment_ids: None,
         data_type: DataType::Utf8,
         query: |value| Box::new(TokenQuery::TokensContains(text(value))),
+    }
+}
+
+fn label_list() -> Case {
+    Case {
+        plugin: Arc::new(LabelListIndexPlugin),
+        params: "{}",
+        // Like a bitmap build, a label list build given several fragments
+        // expects a shard ID.
+        fragment_ids: None,
+        data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        query: |value| {
+            Box::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Int32(Some(
+                value,
+            ))]))
+        },
     }
 }
 
@@ -280,6 +303,7 @@ async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTre
 #[case::bloomfilter(bloomfilter())]
 #[case::ngram(ngram())]
 #[case::inverted(inverted())]
+#[case::label_list(label_list())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -323,6 +347,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[case::bloomfilter(bloomfilter())]
 #[case::ngram(ngram())]
 #[case::inverted(inverted())]
+#[case::label_list(label_list())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();
