@@ -160,6 +160,63 @@ impl RowAddrMask {
         }
     }
 
+    /// Whether this mask can select a row of any of `fragments`, judged by
+    /// fragment key alone: an allow list must hold rows under one of the
+    /// keys, a block list must leave one of them less than whole. Addresses
+    /// name their fragment in the high 32 bits; row ids do not, so this is
+    /// only meaningful for address-domain masks.
+    pub fn may_select_fragments(&self, fragments: &RoaringBitmap) -> bool {
+        match self {
+            Self::AllowList(allow) => fragments.iter().any(|fragment| match allow.get(&fragment) {
+                None => false,
+                Some(RowAddrSelection::Full) => true,
+                Some(RowAddrSelection::Partial(rows)) => !rows.is_empty(),
+            }),
+            Self::BlockList(block) => fragments
+                .iter()
+                .any(|fragment| !matches!(block.get(&fragment), Some(RowAddrSelection::Full))),
+        }
+    }
+
+    /// Whether this mask can select any of `rows`, without building the
+    /// intersection. A whole fragment of `rows` against a partial block is
+    /// taken as selectable: the block would have to name every offset of
+    /// the fragment to rule it out, which the map cannot tell.
+    pub fn may_select_any(&self, rows: &RowAddrTreeMap) -> bool {
+        match self {
+            Self::AllowList(allow) => {
+                rows.iter().any(
+                    |(fragment, selection)| match (allow.get(fragment), selection) {
+                        (None, _) => false,
+                        (Some(RowAddrSelection::Full), RowAddrSelection::Full) => true,
+                        (Some(RowAddrSelection::Full), RowAddrSelection::Partial(rows))
+                        | (Some(RowAddrSelection::Partial(rows)), RowAddrSelection::Full) => {
+                            !rows.is_empty()
+                        }
+                        (
+                            Some(RowAddrSelection::Partial(allowed)),
+                            RowAddrSelection::Partial(rows),
+                        ) => !allowed.is_disjoint(rows),
+                    },
+                )
+            }
+            Self::BlockList(block) => {
+                rows.iter().any(
+                    |(fragment, selection)| match (block.get(fragment), selection) {
+                        (None, RowAddrSelection::Full) => true,
+                        (None, RowAddrSelection::Partial(rows)) => !rows.is_empty(),
+                        (Some(RowAddrSelection::Full), _) => false,
+                        (Some(RowAddrSelection::Partial(_)), RowAddrSelection::Full) => true,
+                        (
+                            Some(RowAddrSelection::Partial(blocked)),
+                            RowAddrSelection::Partial(rows),
+                        ) => !rows.is_subset(blocked),
+                    },
+                )
+            }
+        }
+    }
+
     /// Also allow the given addrs
     pub fn also_allow(self, allow_list: RowAddrTreeMap) -> Self {
         match self {
@@ -1405,6 +1462,48 @@ mod tests {
             RowAddrTreeMap::from_sorted_runs([&ids_a[..], &ids_b[..]]),
             rows(&[1, 2, 4, 9, 10])
         );
+    }
+
+    #[test]
+    fn may_select_checks_fragments_and_rows_without_intersecting() {
+        let addr = |fragment: u32, offset: u32| (u64::from(fragment) << 32) | u64::from(offset);
+        let frags = |ids: &[u32]| ids.iter().copied().collect::<RoaringBitmap>();
+
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert(addr(1, 3));
+        allow.insert_fragment(2);
+        let allow = RowAddrMask::from_allowed(allow);
+        assert!(allow.may_select_fragments(&frags(&[1])));
+        assert!(allow.may_select_fragments(&frags(&[2, 9])));
+        assert!(!allow.may_select_fragments(&frags(&[0, 9])));
+        assert!(!allow.may_select_fragments(&frags(&[])));
+
+        let mut block = RowAddrTreeMap::new();
+        block.insert(addr(1, 3));
+        block.insert_fragment(2);
+        let block = RowAddrMask::from_block(block);
+        assert!(block.may_select_fragments(&frags(&[1])));
+        assert!(!block.may_select_fragments(&frags(&[2])));
+        assert!(block.may_select_fragments(&frags(&[2, 7])));
+        assert!(!RowAddrMask::allow_nothing().may_select_fragments(&frags(&[0])));
+        assert!(RowAddrMask::all_rows().may_select_fragments(&frags(&[0])));
+
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert(addr(1, 4));
+        rows.insert(addr(1, 5));
+        assert!(!allow.may_select_any(&rows));
+        assert!(block.may_select_any(&rows));
+        rows.insert(addr(1, 3));
+        assert!(allow.may_select_any(&rows));
+        let mut whole = RowAddrTreeMap::new();
+        whole.insert_fragment(2);
+        assert!(allow.may_select_any(&whole));
+        assert!(!block.may_select_any(&whole));
+        let mut only_blocked = RowAddrTreeMap::new();
+        only_blocked.insert(addr(1, 3));
+        assert!(!block.may_select_any(&only_blocked));
+        assert!(!RowAddrMask::allow_nothing().may_select_any(&whole));
+        assert!(RowAddrMask::all_rows().may_select_any(&only_blocked));
     }
 
     #[test]

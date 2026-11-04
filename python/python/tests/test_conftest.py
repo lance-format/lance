@@ -43,7 +43,7 @@ def test_workers_have_separate_torch_inductor_caches(monkeypatch, tmp_path, cach
             spec=["addinivalue_line", "workerinput"],
             workerinput={
                 "workerid": worker_id,
-                "lance_compat_versions": {"stable": [], "beta": None},
+                "lance_compat_versions": {"stable": []},
             },
         )
 

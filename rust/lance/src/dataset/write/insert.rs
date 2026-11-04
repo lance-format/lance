@@ -54,7 +54,8 @@ pub struct InsertBuilder<'a> {
     params: Option<&'a WriteParams>,
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
+    disable_dictionary_split: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -64,7 +65,8 @@ impl<'a> InsertBuilder<'a> {
             params: None,
             write_progress: None,
             preassigned_data_file_name: None,
-            keep_field_ids: false,
+            inherited_field_ids: false,
+            disable_dictionary_split: false,
         }
     }
 
@@ -81,12 +83,18 @@ impl<'a> InsertBuilder<'a> {
         self
     }
 
-    /// Keep the field ids the input schema carries when creating a dataset,
-    /// instead of numbering its fields afresh.
-    ///
-    /// For a MemWAL generation, whose columns must keep the base table's ids.
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
+    /// The input's field IDs are an existing table's, so a new table keeps them
+    /// even past the limit for caller-supplied IDs. For a MemWAL generation.
+    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
+        self.inherited_field_ids = true;
+        self
+    }
+
+    /// Never starts another data file because a dictionary column outgrows its key
+    /// type; the encoder's own key-type check applies instead. For a MemWAL generation,
+    /// whose deletion vector and indexes address a single fragment.
+    pub(crate) fn with_dictionary_split_disabled(mut self) -> Self {
+        self.disable_dictionary_split = true;
         self
     }
 
@@ -175,8 +183,8 @@ impl<'a> InsertBuilder<'a> {
         if let Some(session) = context.params.session.as_ref() {
             commit_builder = commit_builder.with_session(session.clone());
         }
-        if self.keep_field_ids {
-            commit_builder = commit_builder.with_table_field_ids();
+        if self.inherited_field_ids {
+            commit_builder = commit_builder.with_inherited_field_ids();
         }
 
         commit_builder.execute(transaction).await
@@ -258,7 +266,10 @@ impl<'a> InsertBuilder<'a> {
             target_base_info,
             None,
             self.preassigned_data_file_name.clone(),
-            self.keep_field_ids,
+            self.inherited_field_ids,
+            self.disable_dictionary_split,
+            None,
+            None,
         ))
         .await?;
 
