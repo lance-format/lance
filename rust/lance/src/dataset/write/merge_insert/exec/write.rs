@@ -744,6 +744,7 @@ impl FullSchemaMergeInsertExec {
                         false,
                         false,
                         Some(created_blob_payloads.clone()),
+                        None,
                     )
                     .await?;
                     Ok(fragments)

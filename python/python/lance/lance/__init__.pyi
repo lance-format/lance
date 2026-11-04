@@ -81,6 +81,21 @@ from .optimize import (
     CompactionTask as CompactionTask,
 )
 from .optimize import (
+    IndexSegmentResult as IndexSegmentResult,
+)
+from .optimize import (
+    OptimizeIndexMerge as OptimizeIndexMerge,
+)
+from .optimize import (
+    OptimizeIndexTask as OptimizeIndexTask,
+)
+from .optimize import (
+    OptimizeIndices as OptimizeIndices,
+)
+from .optimize import (
+    OptimizeIndicesPlan as OptimizeIndicesPlan,
+)
+from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
@@ -113,6 +128,21 @@ class FtsToken:
     position: int
     def __repr__(self) -> str: ...
 
+class InsertedRowsFilter:
+    @property
+    def field_ids(self) -> List[int]: ...
+    @property
+    def kind(self) -> Literal["exact", "bloom"]: ...
+    @property
+    def payload(self) -> bytes: ...
+    @property
+    def number_of_items(self) -> Optional[int]: ...
+    @property
+    def probability(self) -> Optional[float]: ...
+    def might_contain(
+        self, values: Union[pa.Array, pa.RecordBatch, pa.Table]
+    ) -> List[bool]: ...
+
 def tokenize(
     query: str,
     *,
@@ -135,7 +165,9 @@ def tokenize(
 ) -> List[FtsToken]:
     """Tokenize an FTS query without an index.
 
-    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    ``max_token_length`` is an exclusive limit in UTF-8 bytes, not characters.
+    Tokens of this length or longer are removed. It defaults to 40; pass
+    ``None`` to disable the limit.
     """
     ...
 

@@ -99,7 +99,9 @@ async fn test_eager_compaction_over_a_pending_history_matches_the_table(
     )]
     kind: IndexKind,
 ) {
-    run_eager_after_deferred(kind).await;
+    // Boxed for CI clippy `large_futures`: the commit cache grows this
+    // compaction future past 16 KiB.
+    Box::pin(run_eager_after_deferred(kind)).await;
 }
 
 #[rstest]
