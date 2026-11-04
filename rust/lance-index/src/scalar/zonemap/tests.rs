@@ -35,6 +35,7 @@ use lance_core::{
 use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::ArrayGeneratorExt;
 use lance_datagen::{BatchCount, RowCount, array};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
 use lance_io::object_store::ObjectStore;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::ops::Bound;
@@ -157,6 +158,14 @@ impl TestRemapper {
             mappings: mappings.into_iter().collect(),
         }
     }
+
+    fn into_remapper(self) -> Remapper {
+        Remapper::from_backing(Arc::new(DeprecatedRemapper::Sync(Arc::new(self))))
+    }
+}
+
+fn remapping(remapper: Arc<TestRemapper>) -> Option<Remapper> {
+    DeprecatedRemapper::sync(Some(remapper))
 }
 
 impl RowIdRemapper for TestRemapper {
@@ -188,8 +197,8 @@ impl RowIdRemapper for TestRemapper {
     }
 }
 
-#[test]
-fn test_remap_zone_splits_discontiguous_runs() {
+#[tokio::test]
+async fn test_remap_zone_splits_discontiguous_runs() {
     let old_start = (2_u64 << 32) + 10;
     let new_start = 3_u64 << 32;
     let zone = ZoneMapStatistics {
@@ -228,7 +237,15 @@ fn test_remap_zone_splits_discontiguous_runs() {
     remapped_null_rows.insert(new_start + 1);
 
     assert_eq!(
-        remap_zone(&zone, &remapper, Some(&remapped_null_rows), false, None).unwrap(),
+        remap_zone(
+            &zone,
+            &remapper.into_remapper(),
+            Some(&remapped_null_rows),
+            false,
+            None,
+        )
+        .await
+        .unwrap(),
         vec![first_run, second_run]
     );
 }
@@ -253,11 +270,12 @@ async fn test_remap_nested_mixed_null_zone_keeps_non_null_candidates() {
     let remapped_null_rows = RowAddrTreeMap::new();
     let zones = remap_zone(
         &mixed_null_zone,
-        &remapper,
+        &remapper.into_remapper(),
         Some(&remapped_null_rows),
         true,
         None,
     )
+    .await
     .unwrap();
 
     assert_eq!(zones.len(), 1);
@@ -274,8 +292,8 @@ async fn test_remap_nested_mixed_null_zone_keeps_non_null_candidates() {
     );
 }
 
-#[test]
-fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
+#[tokio::test]
+async fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
     let zone = ZoneMapStatistics {
         min: ScalarValue::Null,
         max: ScalarValue::Null,
@@ -290,7 +308,9 @@ fn test_remap_nested_mixed_null_singleton_without_bitmap_is_rejected() {
     };
     let remapper = TestRemapper::new([(2, 0)]);
 
-    let error = remap_zone(&zone, &remapper, None, true, None).unwrap_err();
+    let error = remap_zone(&zone, &remapper.into_remapper(), None, true, None)
+        .await
+        .unwrap_err();
     assert!(matches!(error, lance_core::Error::NotSupported { .. }));
     assert!(
         error
@@ -307,7 +327,7 @@ async fn test_merge_legacy_decimal_mixed_null_singleton_is_rejected() {
     zone.min = ScalarValue::Decimal128(None, 38, 10);
     zone.max = ScalarValue::Decimal128(None, 38, 10);
     source_mut.null_rows = None;
-    source_mut.fri = Some(Arc::new(TestRemapper::new([(1, 3_u64 << 32)])));
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([(1, 3_u64 << 32)])));
 
     let candidate = ScalarValue::Decimal128(Some(200), 38, 10);
     let queries = [
@@ -365,7 +385,7 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     assert_eq!(zone.nan_count, 1);
     source_mut.null_rows = None;
     let new_row = 3_u64 << 32;
-    source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([(0, new_row)])));
 
     let raw_zones = source.zones_as_batch().unwrap();
     let column_u64 = |name| {
@@ -389,11 +409,12 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
 
     let remapped = remap_zone(
         &source.zones[0],
-        source.fri.as_deref().unwrap(),
+        source.remapper.as_ref().unwrap(),
         None,
         false,
         None,
     )
+    .await
     .unwrap();
     assert_eq!(remapped.len(), 1);
     assert_eq!(remapped[0].bound.length, 1);
@@ -464,15 +485,16 @@ async fn test_remapped_legacy_null_zone_keeps_bounded_range_candidate() {
     source_mut.version = ZoneMapIndexVersion::V0;
     source_mut.null_rows = None;
     let new_row = 3_u64 << 32;
-    source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([(0, new_row)])));
 
     let remapped = remap_zone(
         &source.zones[0],
-        source.fri.as_deref().unwrap(),
+        source.remapper.as_ref().unwrap(),
         None,
         false,
         None,
     )
+    .await
     .unwrap();
     assert_eq!(remapped.len(), 1);
     assert_eq!(remapped[0].bound.length, 1);
@@ -2057,8 +2079,7 @@ async fn test_like_prefix_query() {
         version: ZoneMapIndexVersion::V1,
         store_null_bitmap: true,
         store: test_store,
-        fri: None,
-        batch_remapper: None,
+        remapper: None,
         index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
         null_rows: None,
     };
@@ -2137,8 +2158,7 @@ async fn test_like_prefix_edge_cases() {
         version: ZoneMapIndexVersion::V1,
         store_null_bitmap: true,
         store: test_store,
-        fri: None,
-        batch_remapper: None,
+        remapper: None,
         index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
         null_rows: None,
     };
@@ -2211,8 +2231,7 @@ async fn test_like_prefix_large_utf8() {
         version: ZoneMapIndexVersion::V1,
         store_null_bitmap: true,
         store: test_store,
-        fri: None,
-        batch_remapper: None,
+        remapper: None,
         index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
         null_rows: None,
     };
@@ -5756,7 +5775,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     .await;
     assert_eq!(source.zones[0].nan_count, 2);
     let source_mut = Arc::get_mut(&mut source).unwrap();
-    source_mut.fri = Some(Arc::new(TestRemapper::new([(2, new_row)])));
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([(2, new_row)])));
     let dest_tmpdir = TempObjDir::default();
     let dest_store = local_store(&dest_tmpdir);
     let err = merge_zonemap_indices(
@@ -5777,7 +5796,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
         train_float_index_in(local_store(&tmpdir), 3, vec![None, Some(5.0), Some(6.0)]).await;
     let source_mut = Arc::get_mut(&mut source).unwrap();
     source_mut.null_rows = None;
-    source_mut.fri = Some(Arc::new(TestRemapper::new([
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([
         (1, new_row),
         (2, new_row + 1),
     ])));
@@ -5800,7 +5819,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
         train_float_index_in(local_store(&tmpdir), 3, vec![None, Some(5.0), Some(6.0)]).await;
     assert!(source.null_rows.is_some());
     let source_mut = Arc::get_mut(&mut source).unwrap();
-    source_mut.fri = Some(Arc::new(TestRemapper::new([
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([
         (1, new_row),
         (2, new_row + 1),
     ])));
@@ -5836,7 +5855,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     assert_eq!(source.zones[0].null_count, 3);
     let source_mut = Arc::get_mut(&mut source).unwrap();
     source_mut.null_rows = None;
-    source_mut.fri = Some(Arc::new(TestRemapper::new([
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([
         (1, new_row),
         (2, new_row + 1),
     ])));
@@ -5885,7 +5904,7 @@ async fn test_merge_refuses_inexact_remapped_zones_in_version_1() {
     )
     .await;
     let source_mut = Arc::get_mut(&mut source).unwrap();
-    source_mut.fri = Some(Arc::new(TestRemapper::new([
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([
         (0, new_row),
         (1, new_row + 1),
         (2, new_row + 2),
@@ -5943,7 +5962,7 @@ async fn test_merge_ignores_inexact_runs_outside_the_fragment_filter() {
     // Offset 2 alone to fragment 3 (narrowed, NaNs lost), offset 4 alone
     // to fragment 5 (mixed-null singleton without positions), and the
     // whole third zone to fragment 4.
-    source_mut.fri = Some(Arc::new(TestRemapper::new([
+    source_mut.remapper = remapping(Arc::new(TestRemapper::new([
         (2, new_row(3, 0)),
         (4, new_row(5, 0)),
         (6, new_row(4, 0)),

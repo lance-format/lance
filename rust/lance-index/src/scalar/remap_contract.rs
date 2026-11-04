@@ -31,6 +31,7 @@ use super::bitmap::BitmapIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::registry::{ScalarIndexPlugin, TrainingOrdering, VALUE_COLUMN_NAME};
+use super::zonemap::ZoneMapIndexPlugin;
 use super::{Remapper, SargableQuery, ScalarIndex};
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
@@ -115,6 +116,14 @@ fn bitmap() -> Case {
         params: "{}",
         // A bitmap build given several fragments expects a shard ID.
         fragment_ids: None,
+    }
+}
+
+fn zonemap() -> Case {
+    Case {
+        plugin: Arc::new(ZoneMapIndexPlugin),
+        params: r#"{"rows_per_zone": 4}"#,
+        fragment_ids: Some(vec![0, 2]),
     }
 }
 
@@ -204,6 +213,7 @@ async fn search(index: &dyn ScalarIndex, value: i32) -> (RowAddrTreeMap, bool) {
 #[rstest]
 #[case::btree(btree())]
 #[case::bitmap(bitmap())]
+#[case::zonemap(zonemap())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -243,6 +253,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[rstest]
 #[case::btree(btree())]
 #[case::bitmap(bitmap())]
+#[case::zonemap(zonemap())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();

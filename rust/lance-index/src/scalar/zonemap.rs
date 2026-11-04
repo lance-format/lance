@@ -15,7 +15,8 @@
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest,
 };
 use crate::scalar::seed::IndexSeedWriter;
 use crate::scalar::{
@@ -26,7 +27,7 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::{BatchRowIdRemapper, DeprecatedRemapper, Remapper};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -233,11 +234,8 @@ pub struct ZoneMapIndex {
     /// positions keeps `true` and regains one on a full retrain.
     store_null_bitmap: bool,
     store: Arc<dyn IndexStore>,
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    fri: Option<Arc<dyn RowIdRemapper>>,
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates the zones' row addresses; `None` when they are current.
+    remapper: Option<Remapper>,
     index_cache: WeakLanceCache,
     // Exact set of null row addresses across all zones; None when loaded from an
     // older index that did not persist this bitmap.
@@ -254,7 +252,7 @@ impl std::fmt::Debug for ZoneMapIndex {
             .field("version", &self.version)
             .field("store_null_bitmap", &self.store_null_bitmap)
             .field("store", &self.store)
-            .field("fri", &self.fri)
+            .field("remapper", &self.remapper)
             .field("index_cache", &self.index_cache)
             .finish()
     }
@@ -831,29 +829,11 @@ impl ZoneMapIndex {
         }
     }
 
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-        use_seeds: bool,
-        version: ZoneMapIndexVersion,
-    ) -> Result<Arc<Self>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let index = Self::load(store, None, index_cache, use_seeds, version).await?;
-        let mut index = Arc::into_inner(index)
-            .ok_or_else(|| Error::internal("freshly loaded zone map index must be unshared"))?;
-        index.batch_remapper = remapping;
-        debug_assert!(index.fri.is_none() || index.batch_remapper.is_none());
-        Ok(Arc::new(index))
-    }
-
     /// Load the scalar index from storage, decoding the file under the
     /// contract of `version` (the segment's `IndexMetadata.index_version`).
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         use_seeds: bool,
         version: ZoneMapIndexVersion,
@@ -890,7 +870,7 @@ impl ZoneMapIndex {
         Ok(Arc::new(Self::try_from_serialized(
             zone_maps,
             store,
-            fri,
+            remapper,
             index_cache,
             rows_per_zone,
             null_rows,
@@ -904,7 +884,7 @@ impl ZoneMapIndex {
     fn try_from_serialized(
         data: RecordBatch,
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
         rows_per_zone: u64,
         null_rows: Option<RowAddrTreeMap>,
@@ -995,8 +975,7 @@ impl ZoneMapIndex {
                 version,
                 store_null_bitmap,
                 store,
-                fri,
-                batch_remapper: None,
+                remapper,
                 index_cache: WeakLanceCache::from(index_cache),
                 null_rows,
             });
@@ -1066,8 +1045,7 @@ impl ZoneMapIndex {
             version,
             store_null_bitmap,
             store,
-            fri,
-            batch_remapper: None,
+            remapper,
             index_cache: WeakLanceCache::from(index_cache),
             null_rows,
         })
@@ -1130,26 +1108,15 @@ impl ScalarIndex for ZoneMapIndex {
             })?
         };
 
-        let (selected, nulls) = if let Some(remapper) = &self.fri {
-            // Legacy synchronous remapping path.
-            (
-                remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
-                remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
-            )
-        } else if let Some(remapper) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            (
-                remap_row_addrs_tree_map_async(
-                    remapper.as_ref(),
-                    result.row_addrs().selected_rows(),
-                )
-                .await?,
-                remap_row_addrs_tree_map_async(remapper.as_ref(), result.row_addrs().null_rows())
-                    .await?,
-            )
-        } else {
+        let Some(remapper) = &self.remapper else {
             return Ok(result);
         };
+        let selected = remapper
+            .translate_set(result.row_addrs().selected_rows())
+            .await?;
+        let nulls = remapper
+            .translate_set(result.row_addrs().null_rows())
+            .await?;
 
         Ok(match result {
             SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
@@ -1314,20 +1281,25 @@ impl ZoneMapIndex {
     }
 }
 
-/// The destination runs of `zone` under `remapper`. With `fragment_filter`,
-/// rows that land outside those fragments are dropped before the runs are
-/// built, so a run the caller would not keep can neither fail here nor be
-/// checked later.
-fn remap_zone(
+/// The destination runs of `zone` under `remapper`, whose rows are
+/// translated as one batch. With `fragment_filter`, rows that land outside
+/// those fragments are dropped before the runs are built, so a run the
+/// caller would not keep can neither fail here nor be checked later.
+async fn remap_zone(
     zone: &ZoneMapStatistics,
-    remapper: &dyn RowIdRemapper,
+    remapper: &Remapper,
     remapped_null_rows: Option<&RowAddrTreeMap>,
     is_nested: bool,
     fragment_filter: Option<&RoaringBitmap>,
 ) -> Result<Vec<ZoneMapStatistics>> {
     let zone_start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
-    let mut remapped = (0..zone.bound.length as u64)
-        .filter_map(|offset| remapper.remap_row_id(zone_start.saturating_add(offset)))
+    let mut translated: Vec<Option<u64>> = (0..zone.bound.length as u64)
+        .map(|offset| Some(zone_start.saturating_add(offset)))
+        .collect();
+    remapper.translate_in_place(&mut translated).await?;
+    let mut remapped = translated
+        .into_iter()
+        .flatten()
         .filter(|row_id| {
             fragment_filter.is_none_or(|filter| {
                 u32::try_from(row_id >> 32).is_ok_and(|fragment| filter.contains(fragment))
@@ -1458,11 +1430,6 @@ pub async fn merge_zonemap_indices(
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut any_missing_bitmap = false;
     for source in source_indices {
-        if source.batch_remapper.is_some() {
-            return Err(Error::not_supported(
-                "this index maintenance operation does not support asynchronous row-ID remapping",
-            ));
-        }
         if source.rows_per_zone != rows_per_zone {
             return Err(Error::invalid_input(format!(
                 "cannot merge ZoneMap segments with different rows_per_zone values: {} and {}",
@@ -1481,16 +1448,15 @@ pub async fn merge_zonemap_indices(
                 store_null_bitmap, source.store_null_bitmap
             )));
         }
-        let remapped_null_rows = source.null_rows.as_ref().map(|null_rows| {
-            source.fri.as_deref().map_or_else(
-                || null_rows.clone(),
-                |remapper| remapper.remap_row_addrs_tree_map(null_rows),
-            )
-        });
+        let remapped_null_rows = match (&source.null_rows, &source.remapper) {
+            (Some(null_rows), Some(remapper)) => Some(remapper.translate_set(null_rows).await?),
+            (null_rows, None) => null_rows.clone(),
+            (None, Some(_)) => None,
+        };
         for zone in &source.zones {
-            let source_zones = source.fri.as_deref().map_or_else(
-                || Ok(vec![zone.clone()]),
-                |remapper| {
+            let source_zones = match &source.remapper {
+                None => vec![zone.clone()],
+                Some(remapper) => {
                     remap_zone(
                         zone,
                         remapper,
@@ -1498,8 +1464,9 @@ pub async fn merge_zonemap_indices(
                         source.data_type.is_nested(),
                         Some(fragment_filter),
                     )
-                },
-            )?;
+                    .await?
+                }
+            };
             // Only the runs that are kept are held to the version 1 contract.
             let retained = source_zones.into_iter().filter(|zone| {
                 u32::try_from(zone.bound.fragment_id)
@@ -2159,6 +2126,29 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 }
 
 #[async_trait]
+impl RemappingIndexLoader for ZoneMapIndexPlugin {
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let use_seeds = index_details
+            .to_msg::<pbold::ZoneMapIndexDetails>()
+            .ok()
+            .and_then(|d| d.use_seeds)
+            .unwrap_or(false);
+        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
+        Ok(
+            ZoneMapIndex::load(index_store, remapper, cache, use_seeds, version).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+}
+
+#[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(false)
@@ -2207,16 +2197,18 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let use_seeds = index_details
-            .to_msg::<pbold::ZoneMapIndexDetails>()
-            .ok()
-            .and_then(|d| d.use_seeds)
-            .unwrap_or(false);
-        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
-        Ok(
-            ZoneMapIndex::load(index_store, frag_reuse_index, cache, use_seeds, version).await?
-                as Arc<dyn ScalarIndex>,
+        self.load_remapped(
+            index_store,
+            index_details,
+            index_version,
+            DeprecatedRemapper::sync(frag_reuse_index),
+            cache,
         )
+        .await
+    }
+
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
     }
 
     fn supports_batch_row_id_remapping(&self) -> bool {
@@ -2231,20 +2223,14 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let use_seeds = index_details
-            .to_msg::<pbold::ZoneMapIndexDetails>()
-            .ok()
-            .and_then(|d| d.use_seeds)
-            .unwrap_or(false);
-        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
-        Ok(ZoneMapIndex::load_with_remapping(
+        self.load_remapped(
             index_store,
-            frag_reuse_index,
+            index_details,
+            index_version,
+            DeprecatedRemapper::batch(frag_reuse_index),
             cache,
-            use_seeds,
-            version,
         )
-        .await? as Arc<dyn ScalarIndex>)
+        .await
     }
 
     fn might_use_seeds(&self, index_details: &prost_types::Any) -> bool {

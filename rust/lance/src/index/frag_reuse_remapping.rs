@@ -31,7 +31,6 @@ const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
     "MinHashLshIndexDetails",
     "NGramIndexDetails",
     "RTreeIndexDetails",
-    "ZoneMapIndexDetails",
 ];
 
 /// Whether this build translates the row addresses of scalar segments with
