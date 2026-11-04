@@ -42,6 +42,13 @@ pub trait Index: Send + Sync + DeepSizeOf {
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap>;
 }
 
+/// Manifest version of an IVF_RQ index that stores a PCA pre-transform.
+///
+/// Version 3 is the row-address domain. Version 4 keeps that domain and
+/// requires the `lance:pca` model buffer in `index.idx`. Indices that do not
+/// use PCA keep the version reported by their [`IndexType`].
+pub const VECTOR_PCA_INDEX_VERSION: u32 = 4;
+
 /// Index Type
 ///
 /// Do not add further entries to this enum except as a last resort.  We are attempting
@@ -278,6 +285,10 @@ impl IndexType {
     }
 
     /// Returns the highest supported vector index version in this Lance build.
+    ///
+    /// IVF_RQ without PCA keeps version 2. A PCA pre-transform records version
+    /// 4, which this build can read, so the readable maximum includes it even
+    /// though no [`IndexType`] variant reports 4 as its own version.
     pub fn max_vector_version() -> u32 {
         [
             Self::Vector,
@@ -293,6 +304,7 @@ impl IndexType {
         .map(|index_type| index_type.version() as u32)
         .max()
         .unwrap_or(1)
+        .max(VECTOR_PCA_INDEX_VERSION)
     }
 
     pub fn matches_details(&self, details: &prost_types::Any) -> bool {

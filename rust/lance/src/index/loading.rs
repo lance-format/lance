@@ -23,13 +23,15 @@ use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::pca::{PcaModel, decode_pca_model};
 use lance_index::vector::pq::ProductQuantizer;
+use lance_index::vector::pretransform::PreTransformIndex;
 use lance_index::vector::quantizer::Quantization;
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::ResidentColumns;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::{
-    INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index,
+    INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, VECTOR_PCA_INDEX_VERSION,
     frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME},
     is_system_index,
     mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex},
@@ -101,6 +103,30 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
+}
+
+struct PcaModelCacheKey<'a> {
+    uuid: &'a Uuid,
+}
+
+impl CacheKey for PcaModelCacheKey<'_> {
+    type ValueType = PcaModel;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.uuid.to_string().into()
+    }
+
+    fn type_name() -> &'static str {
+        "PcaModel"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.pca-model", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        write_index_identity(builder, self.uuid, None);
     }
 }
 
@@ -940,7 +966,7 @@ impl Dataset {
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            return entry
+            let index = entry
                 .0
                 .reconstruct(
                     object_store,
@@ -949,13 +975,16 @@ impl Dataset {
                     remapping,
                     open_context,
                 )
-                .await;
+                .await?;
+            return self.with_pca_pre_transform(index_meta, index).await;
         }
 
         // Fallback: in-memory cache for legacy indices.
         let cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            return Ok(cached.0.clone());
+            return self
+                .with_pca_pre_transform(index_meta, cached.0.clone())
+                .await;
         }
 
         // Only legacy vector file readers consume the V1 handle. A tagged
@@ -985,6 +1014,17 @@ impl Dataset {
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
+        if index_meta.index_version == VECTOR_PCA_INDEX_VERSION as i32
+            && !matches!((major_version, minor_version), (0, 3) | (2, _))
+        {
+            return Err(Error::corrupt_file_named(
+                INDEX_FILE_NAME,
+                format!(
+                    "PCA index metadata version {} requires lance file version 0.3 or 2.x, got {major_version}.{minor_version}",
+                    index_meta.index_version
+                ),
+            ));
+        }
 
         // Legacy vector indexes are cached whole and can outlive the files they
         // were opened from: cleanup unlinks old index files while the cache still
@@ -1082,6 +1122,11 @@ impl Dataset {
                     .ok_or(Error::index("Index Metadata not found".to_owned()))?;
                 let index_metadata: lance_index::IndexMetadata =
                     serde_json::from_str(index_metadata)?;
+                vector::pca_load::validate_pca_metadata(
+                    &reader.schema().metadata,
+                    index_meta.index_version,
+                    &index_metadata.index_type,
+                )?;
 
                 // Resolve the column name and field
                 let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
@@ -1263,7 +1308,69 @@ impl Dataset {
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))
                 .await;
         }
-        Ok(index)
+        self.with_pca_pre_transform(index_meta, index).await
+    }
+
+    async fn with_pca_pre_transform(
+        &self,
+        index_meta: &IndexMetadata,
+        index: Arc<dyn VectorIndex>,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        if index_meta.index_version != VECTOR_PCA_INDEX_VERSION as i32 {
+            return Ok(index);
+        }
+        let model = self.cached_pca_model(index_meta).await?;
+        Ok(Arc::new(PreTransformIndex::new_pca(index, model)))
+    }
+
+    async fn cached_pca_model(&self, index_meta: &IndexMetadata) -> Result<Arc<PcaModel>> {
+        let cache_key = PcaModelCacheKey {
+            uuid: &index_meta.uuid,
+        };
+        if let Some(model) = self.index_cache.get_with_key(&cache_key).await {
+            return Ok(model);
+        }
+        let object_store = self.object_store_for_index(index_meta).await?;
+        let index_dir = self.indice_files_dir(index_meta)?;
+        let index_file = index_dir
+            .join(index_meta.uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let file_sizes = index_meta.file_size_map();
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file = scheduler.open_file(&index_file, &cached_size).await?;
+        let reader = lance_file::reader::FileReader::try_open(
+            file,
+            None,
+            Default::default(),
+            &self.metadata_cache.file_metadata_cache(&index_file),
+            FileReaderOptions::default(),
+        )
+        .await?;
+        let index_type = reader
+            .schema()
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or_else(|| Error::index("Index Metadata not found".to_owned()))?;
+        let index_type: lance_index::IndexMetadata = serde_json::from_str(index_type)?;
+        vector::pca_load::validate_pca_metadata(
+            &reader.schema().metadata,
+            index_meta.index_version,
+            &index_type.index_type,
+        )?;
+        let buffer_index = vector::pca_load::pca_buffer_index(&reader.schema().metadata)?;
+        let bytes = reader.read_global_buffer(buffer_index).await?;
+        let model = Arc::new(decode_pca_model(&bytes)?);
+        self.index_cache
+            .insert_with_key(&cache_key, model.clone())
+            .await;
+        Ok(model)
     }
 }
 

@@ -2674,8 +2674,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
-                        let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
-                        policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
+                        let (search_index, mut query) = raw_index
+                            .clone()
+                            .prepare_partition_query(&query)
+                            .map_err(|err| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to prepare partition query: {err}"
+                                ))
+                            })?
+                            .unwrap_or((raw_index.clone(), query));
+                        let policy = AutoProbePolicy::from_env(&query, search_index.as_ref())?;
+                        policy.apply(&mut query, q_c_dists.values(), search_index.metric_type());
 
                         // A segment's index file may still physically contain rows for
                         // fragments that were pruned from its fragment_bitmap (e.g. after an
@@ -2693,7 +2702,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         };
 
                         let early_search = Self::initial_search(
-                            raw_index.clone(),
+                            search_index.clone(),
                             query.clone(),
                             part_ids.clone(),
                             q_c_dists.clone(),
@@ -2705,7 +2714,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             quantized_refine_factor,
                         );
                         let late_search = Self::late_search(
-                            raw_index.clone(),
+                            search_index,
                             query,
                             part_ids,
                             q_c_dists,

@@ -16,6 +16,8 @@ pub mod dedup;
 pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
+mod pca;
+pub(crate) mod pca_load;
 pub mod pq;
 pub mod utils;
 
@@ -45,6 +47,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use object_store::path::Path;
 
 use lance_arrow::FixedSizeListArrayExt;
+use lance_index::vector::pca::PcaParams;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::{Shuffler, create_owned_ivf_shuffler};
@@ -59,7 +62,9 @@ use lance_index::vector::{
     pq::PQBuildParams,
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType, pb};
+use lance_index::{
+    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType, VECTOR_PCA_INDEX_VERSION, pb,
+};
 use lance_io::object_reader::LazyReader;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
@@ -304,6 +309,15 @@ impl IndexFileVersion {
     }
 }
 
+/// Training parameters for a vector pre-transform.
+///
+/// The trained model is stored in `index.idx`. These parameters are build
+/// inputs and are not written to the manifest.
+#[derive(Debug, Clone)]
+pub enum PreTransformParams {
+    Pca(PcaParams),
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
@@ -322,6 +336,9 @@ pub struct VectorIndexParams {
     /// Keys use reverse-DNS namespacing (e.g., "lance.ivf.max_iters").
     /// Populated by the build path and merged into VectorIndexDetails at creation time.
     pub runtime_hints: HashMap<String, String>,
+
+    /// Optional projection applied before IVF and quantization.
+    pub pre_transform: Option<PreTransformParams>,
 }
 
 impl VectorIndexParams {
@@ -344,6 +361,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -355,6 +373,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -390,6 +409,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -417,6 +437,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -433,6 +454,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -448,6 +470,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -463,6 +486,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -478,6 +502,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -500,6 +525,7 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
         }
     }
 
@@ -522,6 +548,35 @@ impl VectorIndexParams {
             version: IndexFileVersion::V3,
             skip_transpose: false,
             runtime_hints: HashMap::new(),
+            pre_transform: None,
+        }
+    }
+
+    /// Project indexed and query vectors with PCA before IVF and quantization.
+    ///
+    /// Only IVF_RQ with L2 distance accepts this. The model is stored in
+    /// `index.idx` under `lance:pca`, and the index metadata version becomes
+    /// [`VECTOR_PCA_INDEX_VERSION`].
+    pub fn with_pca(mut self, params: PcaParams) -> Self {
+        self.pre_transform = Some(PreTransformParams::Pca(params));
+        self
+    }
+
+    pub fn pca_params(&self) -> Option<&PcaParams> {
+        match &self.pre_transform {
+            Some(PreTransformParams::Pca(params)) => Some(params),
+            None => None,
+        }
+    }
+
+    /// Manifest version written for this build.
+    ///
+    /// IVF_RQ with PCA records version 4. Every other index keeps the version
+    /// of its [`IndexType`], including IVF_RQ without PCA.
+    pub fn compatibility_version(&self) -> u32 {
+        match (self.pre_transform.is_some(), self.index_type()) {
+            (true, IndexType::IvfRq) => VECTOR_PCA_INDEX_VERSION,
+            (_, index_type) => index_type.version() as u32,
         }
     }
 
@@ -1472,6 +1527,9 @@ async fn build_vector_index_impl(
                 (),
                 frag_reuse_index,
             )?;
+            if let Some(pca_params) = params.pca_params() {
+                builder.with_pca_params(pca_params.clone());
+            }
 
             let summary = builder
                 .with_transpose(!params.skip_transpose)

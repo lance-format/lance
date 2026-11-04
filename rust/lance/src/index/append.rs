@@ -1667,6 +1667,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         }
     }
 
+    if first_is_vector_index
+        && old_indices
+            .iter()
+            .any(|idx| idx.index_version == lance_index::VECTOR_PCA_INDEX_VERSION as i32)
+    {
+        return Err(Error::not_supported(
+            "Appending or optimizing a vector index with a pre-transform is not supported",
+        ));
+    }
+
     let mut base_unindexed_bitmap = RoaringBitmap::new();
     unindexed.iter().for_each(|frag| {
         base_unindexed_bitmap.insert(frag.id as u32);
