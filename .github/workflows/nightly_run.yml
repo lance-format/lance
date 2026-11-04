@@ -45,6 +45,69 @@ jobs:
           # to avoid OOM issues (these tests use >5GiB memory each)
           cargo test --release --package lance-encoding -- --ignored jumbo --test-threads=1
 
+  # Full Rust test suite on Windows. PRs only test lance-io on Windows (see
+  # windows-build in rust.yml) to keep that job on the free 4-core runner.
+  windows-rust-tests:
+    if: github.repository == 'lance-format/lance'
+    name: Windows Rust tests (full)
+    runs-on: windows-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install Protoc v21.12
+        working-directory: C:\
+        run: |
+          New-Item -Path 'C:\protoc' -ItemType Directory
+          Set-Location C:\protoc
+          Invoke-WebRequest https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-win64.zip -OutFile C:\protoc\protoc.zip
+          7z x protoc.zip
+          Add-Content $env:GITHUB_PATH "C:\protoc\bin"
+        shell: powershell
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci
+
+  # Full Rust test suite on macOS. PRs only test lance-io on macOS (see
+  # mac-build in rust.yml) to keep that job on the free runner.
+  mac-rust-tests:
+    if: github.repository == 'lance-format/lance'
+    name: macOS Rust tests (full)
+    runs-on: macos-14
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Select new xcode
+        # Default Xcode has a bug that breaks backtraces; see
+        # https://github.com/rust-lang/rust/issues/113783
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+      - name: Install dependencies
+        run: brew install protobuf
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
+
   # AddressSanitizer over lance-linalg's tests. Its public entry points validate
   # the lengths a caller passes, but the SIMD kernels then walk the output buffer
   # with their own pointer arithmetic, and nothing checks that. An off-by-one in

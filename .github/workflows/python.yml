@@ -286,9 +286,10 @@ jobs:
           sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
   mac:
-    timeout-minutes: 45
+    timeout-minutes: 90
     name: Python macOS 3.14 ARM
-    runs-on: "warp-macos-14-arm64-6x"
+    # Standard (free) runner; see the note on mac-build in rust.yml.
+    runs-on: macos-14
     defaults:
       run:
         shell: bash
@@ -314,8 +315,9 @@ jobs:
           skip-torch: "true"
 
   windows:
-    runs-on: windows-latest-4x
-    timeout-minutes: 90
+    # Standard (free) runner; see the note on windows-build in rust.yml.
+    runs-on: windows-latest
+    timeout-minutes: 120
     defaults:
       run:
         shell: powershell
