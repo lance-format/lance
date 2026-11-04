@@ -14,7 +14,9 @@
 use std::sync::Arc;
 
 use arrow_array::types::Int32Type;
-use arrow_array::{ArrayRef, Int32Array, ListArray, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, StringArray, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -32,6 +34,7 @@ use super::bitmap::BitmapIndexPlugin;
 use super::bloomfilter::BloomFilterIndexPlugin;
 use super::btree::BTreeIndexPlugin;
 use super::inverted::InvertedIndexPlugin;
+use super::json::{JsonIndexPlugin, JsonQuery};
 use super::label_list::LabelListIndexPlugin;
 use super::lance_format::LanceIndexStore;
 use super::ngram::NGramIndexPlugin;
@@ -43,6 +46,7 @@ use super::{
 };
 use crate::metrics::NoOpMetricsCollector;
 use crate::progress::noop_progress;
+use crate::registry::IndexPluginRegistry;
 
 fn address(fragment: u32, offset: u32) -> u64 {
     RowAddress::new_from_parts(fragment, offset).into()
@@ -129,6 +133,15 @@ fn value_array(data_type: &DataType, values: Vec<i32>) -> ArrayRef {
     match data_type {
         DataType::Int32 => Arc::new(Int32Array::from(values)),
         DataType::Utf8 => Arc::new(StringArray::from_iter_values(values.into_iter().map(text))),
+        // Each row's document holds its value under `x`.
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter_values(
+            values.into_iter().map(|value| {
+                format!(r#"{{"x": {value}}}"#)
+                    .parse::<lance_jsonb::OwnedJsonb>()
+                    .unwrap()
+                    .to_vec()
+            }),
+        )),
         // Each row's list holds its one value.
         DataType::List(_) => Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
             values.into_iter().map(|value| Some([Some(value)])),
@@ -212,6 +225,21 @@ fn label_list() -> Case {
             Box::new(LabelListQuery::HasAnyLabel(vec![ScalarValue::Int32(Some(
                 value,
             ))]))
+        },
+    }
+}
+
+fn json() -> Case {
+    let plugin = JsonIndexPlugin::default();
+    plugin.attach_registry(IndexPluginRegistry::with_default_plugins());
+    Case {
+        plugin: Arc::new(plugin),
+        params: r#"{"target_index_type": "btree", "path": "x"}"#,
+        fragment_ids: None,
+        data_type: DataType::LargeBinary,
+        query: |value| {
+            let target = SargableQuery::Equals(ScalarValue::Int64(Some(value.into())));
+            Box::new(JsonQuery::new(Arc::new(target), "x".to_string()))
         },
     }
 }
@@ -304,6 +332,7 @@ async fn search(case: &Case, index: &dyn ScalarIndex, value: i32) -> (RowAddrTre
 #[case::ngram(ngram())]
 #[case::inverted(inverted())]
 #[case::label_list(label_list())]
+#[case::json(json())]
 #[tokio::test]
 async fn answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
@@ -348,6 +377,7 @@ async fn answers_with_current_addresses(#[case] case: Case) {
 #[case::ngram(ngram())]
 #[case::inverted(inverted())]
 #[case::label_list(label_list())]
+#[case::json(json())]
 #[tokio::test]
 async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
     let store_dir = TempObjDir::default();

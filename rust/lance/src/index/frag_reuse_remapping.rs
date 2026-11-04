@@ -22,11 +22,7 @@ use std::sync::Arc;
 /// the deprecated loaders rather than a
 /// [`RemappingIndexLoader`](lance_index::scalar::registry::RemappingIndexLoader).
 /// A kind leaves this list when it implements one.
-const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
-    "FmIndexDetails",
-    "JsonIndexDetails",
-    "MinHashLshIndexDetails",
-];
+const DEPRECATED_LOADER_BUILTINS: &[&str] = &["FmIndexDetails", "MinHashLshIndexDetails"];
 
 /// Whether this build translates the row addresses of scalar segments with
 /// `details`: `None` when no plugin reads them.

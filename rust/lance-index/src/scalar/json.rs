@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper, RowAddrTranslator};
 use std::{
     ops::Bound,
     sync::{Arc, Mutex},
@@ -42,8 +42,8 @@ use crate::{
         SearchOptions, SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
         },
     },
 };
@@ -1275,6 +1275,70 @@ impl BasicTrainer for JsonIndexPlugin {
 }
 
 #[async_trait]
+impl RemappingIndexLoader for JsonIndexPlugin {
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let registry = self.registry().unwrap();
+        let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
+        let target_details = json_details.target_details.as_ref().expect_ok()?;
+        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
+        // target's. The target's own persisted version lives in `target_index_version`;
+        //
+        // If `target_index_version` is missing then we have to guess.  Our best guess
+        // is that this is an old index written before `target_index_version` was added.
+        // These indexes were the old versions that stored row ids and not row addresses.
+        let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
+            // Minhash, ngram, and rtree have no row-id-domain version of their own.
+            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
+        });
+
+        let target_index = match (target_plugin.remapping_loader(), remapper) {
+            (Some(loader), remapper) => {
+                loader
+                    .load_remapped(
+                        index_store,
+                        target_details,
+                        target_index_version,
+                        remapper,
+                        cache,
+                    )
+                    .await?
+            }
+            (None, None) => {
+                target_plugin
+                    .load_index(
+                        index_store,
+                        target_details,
+                        target_index_version,
+                        None,
+                        cache,
+                    )
+                    .await?
+            }
+            (None, Some(_)) => {
+                return Err(Error::not_supported(format!(
+                    "a JSON index over a {} index cannot translate row addresses: that \
+                     plugin has no remapping loader",
+                    target_plugin.name()
+                )));
+            }
+        };
+        Ok(Arc::new(
+            JsonIndex::new(target_index, json_details.path)
+                .with_target_data_type(json_details.target_data_type),
+        ))
+    }
+}
+
+#[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
     fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
         let details = match crate::pb::JsonIndexDetails::decode(details.value.as_slice()) {
@@ -1368,39 +1432,24 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let registry = self.registry().unwrap();
-        let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
-        let target_details = json_details.target_details.as_ref().expect_ok()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
+        self.load_remapped(
+            index_store,
+            index_details,
+            index_version,
+            DeprecatedRemapper::sync(frag_reuse_index),
+            cache,
+        )
+        .await
+    }
 
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
-        // target's. The target's own persisted version lives in `target_index_version`;
-        //
-        // If `target_index_version` is missing then we have to guess.  Our best guess
-        // is that this is an old index written before `target_index_version` was added.
-        // These indexes were the old versions that stored row ids and not row addresses.
-        let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
-            // Minhash, ngram, and rtree have no row-id-domain version of their own.
-            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
-        });
-
-        let target_index = target_plugin
-            .load_index(
-                index_store,
-                target_details,
-                target_index_version,
-                frag_reuse_index,
-                cache,
-            )
-            .await?;
-        Ok(Arc::new(
-            JsonIndex::new(target_index, json_details.path)
-                .with_target_data_type(json_details.target_data_type),
-        ))
+    /// A JSON index answers through its target index, so it translates
+    /// whenever its target does; it forwards the remapper.
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
