@@ -1261,6 +1261,13 @@ def test_optimize_indices_distributed(tmp_path: Path):
         ("id_idx", (3, 4)),
     }
     assert len(plan.merges) == 2
+    segment_plan = OptimizeIndices.plan(dataset, {"max_rows_per_segment": 128})
+    assert {
+        (task.index_name, tuple(task.fragments)) for task in segment_plan.tasks
+    } == {(task.index_name, tuple(task.fragments)) for task in plan.tasks}
+    # The task and output bounds pack separately: four 128-row task results
+    # become four output segments instead of the two groups above.
+    assert sorted(merge.group for merge in segment_plan.merges) == [0, 1, 2, 3]
 
     # Each worker rebuilds its own dataset handle from the pickled one, as a
     # worker on another machine would; a unit reads the version it was
@@ -1271,8 +1278,9 @@ def test_optimize_indices_distributed(tmp_path: Path):
             OptimizeIndexTask.execute, [(task, dataset) for task in plan.tasks]
         ).get(timeout=300)
         assert len(built) == 4 and None not in built
-        # An append lands while the workers run: the commit still goes
-        # through, and the new fragment waits for the next optimize.
+        # An append lands after the task results and before the merges: the
+        # commit still goes through, and the new fragment waits for the next
+        # optimize.
         lance.write_dataset(table(512, 10), uri, mode="append")
         # Every merge may be given every task result.
         merged = pool.starmap_async(

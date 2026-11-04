@@ -268,6 +268,9 @@ class DatasetOptimizer:
         max_rows_per_segment: optional, int, default None
             Upper bound on the rows one committed segment holds.
 
+            The limits are packing targets: an indivisible fragment or segment
+            larger than a target is processed on its own.
+
         See :py:class:`lance.optimize.OptimizeIndices` to run the same
         optimization as a plan whose tasks execute on several workers.
         """
