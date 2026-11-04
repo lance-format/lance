@@ -534,22 +534,13 @@ impl JsonQuery {
     /// target index keys on: `json_get_<type>(col, path)`.
     fn accessor_expr(&self, col: &str) -> Expr {
         let accessor = match self.target_value_type() {
-            Some(DataType::Int64) => json_get_int_udf(),
-            Some(DataType::Float64) => json_get_float_udf(),
+            Some(value_type) if value_type.is_integer() => json_get_int_udf(),
+            Some(value_type) if value_type.is_floating() => json_get_float_udf(),
             Some(DataType::Boolean) => json_get_bool_udf(),
             // String-typed targets, and queries with no recoverable value type
             // (`IS NULL`), recheck through the string accessor, which is null
             // exactly where the indexed value is (path missing or JSON null).
-            value_type => {
-                debug_assert!(
-                    matches!(
-                        value_type,
-                        None | Some(DataType::Utf8 | DataType::LargeUtf8)
-                    ),
-                    "JSON query literals are coerced to an accessor type, got {value_type:?}"
-                );
-                json_get_string_udf()
-            }
+            _ => json_get_string_udf(),
         };
         Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(accessor),
@@ -1566,6 +1557,16 @@ mod tests {
         Arc::new(BloomFilterQuery::IsNull()),
         "tag",
         "json_get_string(json, Utf8(\"tag\")) IS NULL"
+    )]
+    #[case::bool_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(true)))),
+        "flag",
+        "json_get_bool(json, Utf8(\"flag\")) = Boolean(true)"
+    )]
+    #[case::large_utf8_prefix(
+        Arc::new(SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("ab".to_string())))),
+        "tag",
+        "json_get_string(json, Utf8(\"tag\")) LIKE LargeUtf8(\"ab%\")"
     )]
     #[case::range(
         Arc::new(SargableQuery::Range(
