@@ -51,7 +51,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use sort::hilbert_sort::HilbertSorter;
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
@@ -422,17 +422,19 @@ impl RTreeIndex {
         // concurrency instead of one awaited page at a time; the
         // root-to-leaf chain stays serial because a page is only enqueued
         // once its parent batch has been scanned. Results accumulate into a
-        // set, so completion order does not matter.
-        let io_parallelism = self.store.io_parallelism();
-        let mut deferred_pages: VecDeque<u64> = VecDeque::new();
+        // set, so completion order does not matter. Popping the most recently
+        // found page keeps the queue bounded by the tree depth, as the old
+        // depth-first walk was, instead of growing with the leaf count.
+        let io_parallelism = self.store.io_parallelism().max(1);
+        let mut deferred_pages: Vec<u64> = Vec::new();
         let mut pending_pages = stream::FuturesUnordered::new();
         pending_pages.push(self.fetch_page(self.metadata.num_pages - 1, metrics));
 
         loop {
-            let Some((is_leaf, result)) = pending_pages.next().await else {
+            let Some(result) = pending_pages.next().await else {
                 break;
             };
-            let batch = result?;
+            let (is_leaf, batch) = result?;
 
             let bbox_array =
                 extract_bounding_boxes(batch.column(0).as_ref(), batch.schema().field(0))?;
@@ -450,13 +452,13 @@ impl RTreeIndex {
                         row_addrs.insert(row_addr);
                     } else {
                         let page_id = rowaddr_or_pageid_array.value(i);
-                        deferred_pages.push_back(page_id);
+                        deferred_pages.push(page_id);
                     }
                 }
             }
 
             while pending_pages.len() < io_parallelism {
-                let Some(child_page) = deferred_pages.pop_front() else {
+                let Some(child_page) = deferred_pages.pop() else {
                     break;
                 };
                 pending_pages.push(self.fetch_page(child_page, metrics));
@@ -473,11 +475,8 @@ impl RTreeIndex {
         &self,
         page_idx: u64,
         metrics: &dyn MetricsCollector,
-    ) -> (bool, Result<Arc<RecordBatch>>) {
-        let range = match self.page_range(page_idx).await {
-            Ok(range) => range,
-            Err(error) => return (false, Err(error)),
-        };
+    ) -> Result<(bool, Arc<RecordBatch>)> {
+        let range = self.page_range(page_idx).await?;
         let is_leaf = range.start < self.metadata.num_items;
         let result = self
             .index_cache
@@ -491,7 +490,7 @@ impl RTreeIndex {
             Ok((_, true)) => metrics.record_index_cache_hit(),
             _ => metrics.record_index_cache_miss(),
         }
-        (is_leaf, result.map(|(value, _)| value.0.clone()))
+        Ok((is_leaf, result?.0.0.clone()))
     }
 
     async fn search_null(&self, metrics: &dyn MetricsCollector) -> Result<RowAddrTreeMap> {
@@ -767,10 +766,8 @@ impl Index for RTreeIndex {
         // One awaited read per page serializes prewarm into num_pages round
         // trips on remote storage. Buffer the per-page reads at the store's
         // IO parallelism (the same pattern `into_data_stream` uses) so the
-        // round trips overlap; `buffered` completes in page order, so cache
-        // inserts keep the order the serial loop produced. Unlike
-        // `IndexReaderStream`, each future reads exactly its page's range:
-        // uniform page_size batches would straddle level boundaries.
+        // round trips overlap. Each future reads exactly its page's range,
+        // because uniform page_size batches would straddle level boundaries.
         let mut page_reads = stream::iter(0..self.metadata.num_pages)
             .map(|page_id| async move {
                 let range = self.page_range(page_id).await?;
@@ -784,7 +781,7 @@ impl Index for RTreeIndex {
                     .await;
                 Ok::<(), Error>(())
             })
-            .buffered(self.store.io_parallelism());
+            .buffered(self.store.io_parallelism().max(1));
         while let Some(result) = page_reads.next().await {
             result?;
         }
@@ -2275,19 +2272,36 @@ mod tests {
         let (_, store, _tmpdir) = train_index(&point_arr, Some(32)).await;
 
         let cache = LanceCache::with_capacity(10 << 20);
-        let rtree_index = RTreeIndex::load(store, None, &cache).await.unwrap();
+        let mut rtree_index = RTreeIndex::load(store, None, &cache)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        rtree_index.pages_reader = InFlightCountingReader::wrap(
+            rtree_index.pages_reader.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            peak_in_flight.clone(),
+            None,
+        );
 
-        // Call prewarm
         rtree_index.prewarm().await.unwrap();
 
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) > 1 || rtree_index.store.io_parallelism() == 1,
+            "prewarm issued its page reads strictly serially"
+        );
+        // Every page lands under its own key, sized to its row range.
         for page_id in 0..rtree_index.metadata.num_pages {
-            assert!(
-                rtree_index
-                    .index_cache
-                    .get_with_key(&RTreeCacheKey::Page(page_id))
-                    .await
-                    .is_some()
-            )
+            let cached = rtree_index
+                .index_cache
+                .get_with_key(&RTreeCacheKey::Page(page_id))
+                .await
+                .expect("prewarm must cache every page");
+            assert_eq!(
+                cached.0.num_rows(),
+                rtree_index.page_range(page_id).await.unwrap().len()
+            );
         }
 
         assert!(
@@ -2301,13 +2315,13 @@ mod tests {
 
     /// Delegating reader that tracks how many `read_range` calls are in
     /// flight at once, so tests can assert whether a caller overlaps its page
-    /// reads. Each read parks once before delegating: local files answer
-    /// inside the first poll, which would otherwise hide even genuinely
-    /// buffered reads.
+    /// reads, and can fail the read of the range starting at `fail_at`. Each
+    /// read yields once before delegating so concurrent reads overlap.
     struct InFlightCountingReader {
         inner: Arc<dyn IndexReader>,
         in_flight: Arc<AtomicUsize>,
         peak_in_flight: Arc<AtomicUsize>,
+        fail_at: Option<usize>,
     }
 
     impl InFlightCountingReader {
@@ -2315,11 +2329,13 @@ mod tests {
             inner: Arc<dyn IndexReader>,
             in_flight: Arc<AtomicUsize>,
             peak_in_flight: Arc<AtomicUsize>,
+            fail_at: Option<usize>,
         ) -> Arc<dyn IndexReader> {
             Arc::new(Self {
                 inner,
                 in_flight,
                 peak_in_flight,
+                fail_at,
             })
         }
     }
@@ -2337,8 +2353,10 @@ mod tests {
         ) -> Result<RecordBatch> {
             let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
-            let result = {
-                tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            let result = if self.fail_at == Some(range.start) {
+                Err(Error::io("injected page read failure".to_string()))
+            } else {
                 self.inner.read_range(range, projection).await
             };
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
@@ -2356,56 +2374,6 @@ mod tests {
         fn schema(&self) -> &lance_core::datatypes::Schema {
             self.inner.schema()
         }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_prewarm_overlaps_page_reads() {
-        let point_type = PointType::new(Dimension::XY, Default::default());
-        let mut builder = PointBuilder::new(point_type.clone());
-        for i in 0..32 {
-            builder.push_point(Some(&geo_types::point!(x: i as f64, y: i as f64)));
-        }
-        let points = builder.finish();
-
-        let (_, store, _tmpdir) = train_index(&points, Some(4)).await;
-
-        let cache = LanceCache::with_capacity(10 << 20);
-        let mut index = RTreeIndex::load(store, None, &cache)
-            .await
-            .unwrap()
-            .as_ref()
-            .clone();
-        // 32 items at page_size 4 yields 8 leaf + 2 interior + 1 root pages.
-        assert!(index.metadata.num_pages >= 8);
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak_in_flight = Arc::new(AtomicUsize::new(0));
-        index.pages_reader = InFlightCountingReader::wrap(
-            index.pages_reader.clone(),
-            in_flight,
-            peak_in_flight.clone(),
-        );
-
-        index.prewarm().await.unwrap();
-
-        assert!(
-            peak_in_flight.load(Ordering::SeqCst) > 1,
-            "prewarm issued its page reads strictly serially (peak in-flight reads: {})",
-            peak_in_flight.load(Ordering::SeqCst)
-        );
-        // Every page must land in the cache under its own key, sized to its
-        // row range, so parallel reads still align with per-page entries.
-        for page_id in 0..index.metadata.num_pages {
-            let cached = cache
-                .get_with_key(&RTreeCacheKey::Page(page_id))
-                .await
-                .expect("prewarm must cache every page");
-            assert_eq!(
-                cached.0.num_rows(),
-                index.page_range(page_id).await.unwrap().len()
-            );
-        }
-        assert!(cache.get_with_key(&RTreeCacheKey::Nulls).await.is_some());
     }
 
     #[tokio::test]
@@ -2430,39 +2398,54 @@ mod tests {
         let points = builder.finish();
 
         let (_, store, _tmpdir) = train_index(&points, Some(2)).await;
-
-        let cache = LanceCache::with_capacity(10 << 20);
-        let mut index = RTreeIndex::load(store, None, &cache)
-            .await
-            .unwrap()
-            .as_ref()
-            .clone();
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak_in_flight = Arc::new(AtomicUsize::new(0));
-        index.pages_reader = InFlightCountingReader::wrap(
-            index.pages_reader.clone(),
-            in_flight,
-            peak_in_flight.clone(),
-        );
-
         let query = BoundingBox::new_with_rect(&Rect::new(
             coord! { x: -1.0, y: -1.0 },
             coord! { x: 200.0, y: 200.0 },
         ));
+        let load = |fail_at: Option<usize>| {
+            let store = store.clone();
+            async move {
+                let cache = LanceCache::with_capacity(10 << 20);
+                let mut index = RTreeIndex::load(store, None, &cache)
+                    .await
+                    .unwrap()
+                    .as_ref()
+                    .clone();
+                let peak_in_flight = Arc::new(AtomicUsize::new(0));
+                index.pages_reader = InFlightCountingReader::wrap(
+                    index.pages_reader.clone(),
+                    Arc::new(AtomicUsize::new(0)),
+                    peak_in_flight.clone(),
+                    fail_at,
+                );
+                (index, peak_in_flight)
+            }
+        };
+
+        let (index, peak_in_flight) = load(None).await;
         let hits = index
             .search_bbox(query, &NoOpMetricsCollector)
             .await
             .unwrap();
-
         let mut expected = RowAddrTreeMap::new();
         for row_id in 0..points.len() as u64 {
             expected.insert(row_id);
         }
         assert_eq!(hits, expected);
         assert!(
-            peak_in_flight.load(Ordering::SeqCst) >= 2,
-            "search_bbox fetched sibling pages one at a time (peak in-flight reads: {})",
-            peak_in_flight.load(Ordering::SeqCst)
+            peak_in_flight.load(Ordering::SeqCst) > 1 || index.store.io_parallelism() == 1,
+            "search_bbox fetched sibling pages one at a time"
+        );
+
+        // A failed leaf read while its siblings are in flight fails the search.
+        let (index, _) = load(Some(0)).await;
+        let err = index
+            .search_bbox(query, &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected page read failure"),
+            "{err}"
         );
     }
 }
