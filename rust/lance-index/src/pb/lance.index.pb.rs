@@ -506,10 +506,6 @@ pub struct JsonIndexDetails {
     /// rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
     /// recover the type when it is absent.
     ///
-    /// This completes the description of the extracted values only. These details
-    /// still do not record the target index's format version, so they are not a
-    /// general, lossless description of the index and must not be read as one.
-    ///
     /// An implementation that rewrites these details without retraining the target
     /// index -- compacting or updating it -- must preserve a recorded type
     /// exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
@@ -522,6 +518,15 @@ pub struct JsonIndexDetails {
     /// may replace it.
     #[prost(enumeration = "JsonTargetDataType", tag = "3")]
     pub target_data_type: i32,
+    /// The target index's own persisted format version, i.e. the
+    /// `CreatedIndex::index_version` it reported when it was built.
+    ///
+    /// Unset for details written before this field existed; readers should
+    /// fall back to the target plugin's current version in that case, which
+    /// matches those indexes' actual format since they always came from a
+    /// fresh training pass in the same codebase.
+    #[prost(uint32, optional, tag = "4")]
+    pub target_index_version: ::core::option::Option<u32>,
 }
 impl ::prost::Name for JsonIndexDetails {
     const NAME: &'static str = "JsonIndexDetails";

@@ -211,3 +211,301 @@ impl VectorApproxMode {
         }
     }
 }
+/// Query-bound corpus statistics used to calculate comparable BM25 scores
+/// across independently searched subsets of one logical FTS index.
+///
+/// The layout separates the shared prepared vocabulary from corpus-specific
+/// statistics so cross-column queries can be supported without restructuring
+/// the payload. V1 still represents exactly one BM25 corpus, uses DOCUMENT
+/// counts, and supports only MATCH and PHRASE leaves. Every leaf must resolve
+/// to that corpus's index, column, document granularity, and segment set.
+/// A producer must reject queries outside these V1 restrictions.
+///
+/// This is an opaque payload for a trusted planning flow. V1 does not carry the
+/// source query or its preparation parameters, so a consumer cannot
+/// independently prove query identity. The planner must attach the payload only
+/// to the same query used to produce it.
+///
+/// A consumer must reject an unsupported schema_version, any violation of the
+/// V1 restrictions (including UNSPECIFIED or unknown enum values), a missing
+/// required optional scalar, an out-of-range reference, an invalid segment
+/// UUID, non-canonical ordering, duplicate entries, or metadata that does not
+/// match the dataset snapshot and logical FTS index it will execute. These
+/// checks let V1 consumers reject future query kinds and count units instead
+/// of silently scoring with unsupported statistics.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FtsGlobalStatisticsProto {
+    /// V1 consumers must reject UNSPECIFIED and unknown values.
+    #[prost(enumeration = "FtsGlobalStatisticsSchemaVersion", tag = "1")]
+    pub schema_version: i32,
+    /// Dataset snapshot from which the committed FTS segments were resolved.
+    /// Version zero is invalid.
+    #[prost(uint64, tag = "2")]
+    pub dataset_version: u64,
+    /// Unique prepared terms referenced by query_leaves, sorted lexicographically
+    /// by their UTF-8 bytes. Per-corpus document frequencies reference this list.
+    #[prost(string, repeated, tag = "3")]
+    pub terms: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// V1: exactly one corpus, referenced by every query leaf.
+    #[prost(message, repeated, tag = "4")]
+    pub corpora: ::prost::alloc::vec::Vec<FtsCorpusStatisticsProto>,
+    /// Canonical prepared vocabulary for every scoring leaf in the query.
+    /// Entries are ordered by leaf_ordinal.
+    #[prost(message, repeated, tag = "5")]
+    pub query_leaves: ::prost::alloc::vec::Vec<FtsPreparedQueryLeafProto>,
+}
+impl ::prost::Name for FtsGlobalStatisticsProto {
+    const NAME: &'static str = "FtsGlobalStatisticsProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.FtsGlobalStatisticsProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.FtsGlobalStatisticsProto".into()
+    }
+}
+/// Statistics of one logical FTS index on one column over its committed segments.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FtsCorpusStatisticsProto {
+    /// Logical FTS index shared by every UUID in segment_uuids.
+    #[prost(string, tag = "1")]
+    pub index_name: ::prost::alloc::string::String,
+    /// Canonical indexed field path used by the query.
+    #[prost(string, tag = "2")]
+    pub column: ::prost::alloc::string::String,
+    /// Document unit shared by every segment in segment_uuids.
+    #[prost(enumeration = "FtsDocumentGranularity", tag = "3")]
+    pub document_granularity: i32,
+    /// V1: DOCUMENT only. Consumers must reject UNSPECIFIED and unknown values.
+    #[prost(enumeration = "FtsCorpusCountUnit", tag = "4")]
+    pub count_unit: i32,
+    /// Exact committed segment set whose corpus statistics were aggregated.
+    /// Each entry is a 16-byte UUID in RFC 4122 network byte order. Entries are
+    /// unique and sorted lexicographically by their raw bytes.
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    pub segment_uuids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Number of indexed documents across segment_uuids. Presence is required in
+    /// V1; zero is valid for an empty corpus.
+    #[prost(uint64, optional, tag = "6")]
+    pub num_docs: ::core::option::Option<u64>,
+    /// Sum of indexed document lengths across segment_uuids. Presence is required
+    /// in V1; zero is valid for an empty-token corpus.
+    #[prost(uint64, optional, tag = "7")]
+    pub total_tokens: ::core::option::Option<u64>,
+    /// Unique term statistics, sorted by term_index. Covers every term referenced
+    /// by a query leaf bound to this corpus.
+    #[prost(message, repeated, tag = "8")]
+    pub terms: ::prost::alloc::vec::Vec<FtsCorpusTermStatisticsProto>,
+}
+impl ::prost::Name for FtsCorpusStatisticsProto {
+    const NAME: &'static str = "FtsCorpusStatisticsProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.FtsCorpusStatisticsProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.FtsCorpusStatisticsProto".into()
+    }
+}
+/// Corpus-specific statistics for one term in the shared prepared vocabulary.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FtsCorpusTermStatisticsProto {
+    /// Zero-based index into FtsGlobalStatisticsProto.terms. Presence is required
+    /// in V1.
+    #[prost(uint32, optional, tag = "1")]
+    pub term_index: ::core::option::Option<u32>,
+    /// Number of indexed documents containing term. Presence is required in V1;
+    /// zero is valid when an exact query term is absent from the corpus.
+    #[prost(uint64, optional, tag = "2")]
+    pub document_frequency: ::core::option::Option<u64>,
+}
+impl ::prost::Name for FtsCorpusTermStatisticsProto {
+    const NAME: &'static str = "FtsCorpusTermStatisticsProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.FtsCorpusTermStatisticsProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.FtsCorpusTermStatisticsProto".into()
+    }
+}
+/// Canonical prepared vocabulary for one Match or Phrase leaf.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FtsPreparedQueryLeafProto {
+    /// Zero-based leaf identity in this canonical depth-first traversal:
+    /// Match/Phrase emits one leaf; Boost visits positive then negative;
+    /// MultiMatch visits match queries in input order; Boolean visits should,
+    /// must, then must_not, preserving input order within each group. Presence is
+    /// required in V1.
+    #[prost(uint32, optional, tag = "1")]
+    pub leaf_ordinal: ::core::option::Option<u32>,
+    /// V1: MATCH or PHRASE only; must match the source query leaf. Consumers must
+    /// reject UNSPECIFIED and unknown values.
+    #[prost(enumeration = "FtsQueryLeafKind", tag = "2")]
+    pub kind: i32,
+    /// Zero-based indices into FtsGlobalStatisticsProto.corpora.
+    /// V1: exactly \[0\], binding this leaf to the single DOCUMENT-counted corpus.
+    #[prost(uint32, repeated, tag = "3")]
+    pub corpus_indices: ::prost::alloc::vec::Vec<u32>,
+    /// Final tokens selected against the complete segment set. Entries are unique
+    /// by (query_position, term_index), ordered first by query_position and then
+    /// by term_index. query_position is interpreted according to kind.
+    #[prost(message, repeated, tag = "4")]
+    pub tokens: ::prost::alloc::vec::Vec<FtsPreparedTokenProto>,
+    /// Whether at least one final token remains for every original Match term
+    /// group or Phrase token position. Presence is required in V1. Consumers use
+    /// false to preserve empty results for AND and Phrase leaves after capped
+    /// fuzzy expansion.
+    #[prost(bool, optional, tag = "5")]
+    pub has_all_query_positions: ::core::option::Option<bool>,
+}
+impl ::prost::Name for FtsPreparedQueryLeafProto {
+    const NAME: &'static str = "FtsPreparedQueryLeafProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.FtsPreparedQueryLeafProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.FtsPreparedQueryLeafProto".into()
+    }
+}
+/// One final token and the query group or position to which it belongs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FtsPreparedTokenProto {
+    /// Zero-based index into FtsGlobalStatisticsProto.terms. Presence is required
+    /// in V1.
+    #[prost(uint32, optional, tag = "1")]
+    pub term_index: ::core::option::Option<u32>,
+    /// Stable grouping value for the prepared source token. For MATCH it is the
+    /// logical term group used by AND/OR scoring. For PHRASE it is the tokenizer
+    /// position, including offsets left by removed tokens. Fuzzy alternatives for
+    /// the same source token share this value. Presence is required in V1.
+    #[prost(uint32, optional, tag = "2")]
+    pub query_position: ::core::option::Option<u32>,
+}
+impl ::prost::Name for FtsPreparedTokenProto {
+    const NAME: &'static str = "FtsPreparedTokenProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.FtsPreparedTokenProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.FtsPreparedTokenProto".into()
+    }
+}
+/// Semantic version of the global FTS statistics wire contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FtsGlobalStatisticsSchemaVersion {
+    Unspecified = 0,
+    V1 = 1,
+}
+impl FtsGlobalStatisticsSchemaVersion {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_UNSPECIFIED",
+            Self::V1 => "FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_V1",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_UNSPECIFIED" => Some(Self::Unspecified),
+            "FTS_GLOBAL_STATISTICS_SCHEMA_VERSION_V1" => Some(Self::V1),
+            _ => None,
+        }
+    }
+}
+/// Unit represented by one document in the FTS index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FtsDocumentGranularity {
+    Unspecified = 0,
+    Row = 1,
+    ListElement = 2,
+}
+impl FtsDocumentGranularity {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FTS_DOCUMENT_GRANULARITY_UNSPECIFIED",
+            Self::Row => "FTS_DOCUMENT_GRANULARITY_ROW",
+            Self::ListElement => "FTS_DOCUMENT_GRANULARITY_LIST_ELEMENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FTS_DOCUMENT_GRANULARITY_UNSPECIFIED" => Some(Self::Unspecified),
+            "FTS_DOCUMENT_GRANULARITY_ROW" => Some(Self::Row),
+            "FTS_DOCUMENT_GRANULARITY_LIST_ELEMENT" => Some(Self::ListElement),
+            _ => None,
+        }
+    }
+}
+/// Unit used for corpus counts and per-term document frequencies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FtsCorpusCountUnit {
+    Unspecified = 0,
+    /// Count indexed documents at the corpus's document_granularity, which may
+    /// represent rows or individual list elements. This is the only V1 unit.
+    Document = 1,
+}
+impl FtsCorpusCountUnit {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FTS_CORPUS_COUNT_UNIT_UNSPECIFIED",
+            Self::Document => "FTS_CORPUS_COUNT_UNIT_DOCUMENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FTS_CORPUS_COUNT_UNIT_UNSPECIFIED" => Some(Self::Unspecified),
+            "FTS_CORPUS_COUNT_UNIT_DOCUMENT" => Some(Self::Document),
+            _ => None,
+        }
+    }
+}
+/// Scoring operation represented by one prepared query leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FtsQueryLeafKind {
+    Unspecified = 0,
+    Match = 1,
+    Phrase = 2,
+}
+impl FtsQueryLeafKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "FTS_QUERY_LEAF_KIND_UNSPECIFIED",
+            Self::Match => "FTS_QUERY_LEAF_KIND_MATCH",
+            Self::Phrase => "FTS_QUERY_LEAF_KIND_PHRASE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FTS_QUERY_LEAF_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "FTS_QUERY_LEAF_KIND_MATCH" => Some(Self::Match),
+            "FTS_QUERY_LEAF_KIND_PHRASE" => Some(Self::Phrase),
+            _ => None,
+        }
+    }
+}

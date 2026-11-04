@@ -237,6 +237,20 @@ pub struct DataFile {
     /// Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
     #[prost(uint32, optional, tag = "7")]
     pub base_id: ::core::option::Option<u32>,
+    /// Size in bytes of the file's metadata suffix, or 0 if unknown.
+    ///
+    /// For a Lance file of format version 2.0 or later, this is the file size minus
+    /// the position of global buffer 0, which holds the file's `FileDescriptor`.
+    /// That position is stored in the first entry of the global buffer offset
+    /// table, which the footer locates. It is always 0 for legacy (0.1) files.
+    /// Writers record either this exact value or 0.
+    ///
+    /// This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+    /// bytes of the file before decoding the footer. The footer stays
+    /// authoritative: readers must ignore a value larger than the file and read
+    /// any metadata the footer references outside the hinted range.
+    #[prost(uint64, tag = "8")]
+    pub file_metadata_size_bytes: u64,
 }
 impl ::prost::Name for DataFile {
     const NAME: &'static str = "DataFile";
@@ -343,7 +357,10 @@ impl ::prost::Name for FieldCoverage {
 /// The path of the deletion file is constructed as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
 /// where {extension} depends on DeletionFileType.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+///
+/// When `inline` is set there is no such file: the deletion vector lives in the
+/// manifest itself.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletionFile {
     /// Type of deletion file.
     #[prost(enumeration = "deletion_file::DeletionFileType", tag = "1")]
@@ -358,6 +375,13 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
+    /// The deletion vector itself, stored in the manifest instead of in a file.
+    /// Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
+    /// offsets), whatever `file_type` says. A reader that reads one request per
+    /// deletion file otherwise pays one request per fragment on a table whose
+    /// every fragment has a few deleted rows. Requires FLAG_INLINE_DELETIONS.
+    #[prost(bytes = "bytes", optional, tag = "8")]
+    pub inline: ::core::option::Option<::prost::bytes::Bytes>,
     /// The base path index of the deletion file. Used when the file is imported or referred from another
     /// dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
     /// path of the deletion file.
@@ -717,7 +741,7 @@ impl ::prost::Name for RemoveDataFile {
         "/lance.table.RemoveDataFile".into()
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddDeletionFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,
@@ -1156,6 +1180,11 @@ pub struct IndexMetadata {
     pub uuid: ::core::option::Option<Uuid>,
     /// The columns the index is keyed on, in key order. These refer to file.Field.id.
     ///
+    /// On a stable-row-ID table, -3 may reference the logical _rowid column even
+    /// though it is absent from the user schema. This identity is independent of
+    /// whether a fragment stores its row IDs inline or in a hidden data column.
+    /// An index on this field must store physical row addresses as its payload.
+    ///
     /// When the manifest has feature flag 1 << 13, this list contains only key
     /// fields. `covering_fields` independently declares the values the index
     /// carries.
@@ -1276,6 +1305,20 @@ pub struct IndexFile {
     /// Size of the file in bytes
     #[prost(uint64, tag = "2")]
     pub size_bytes: u64,
+    /// Size in bytes of the file's metadata suffix, or 0 if unknown.
+    ///
+    /// For a Lance file of format version 2.0 or later, this is the file size minus
+    /// the position of global buffer 0, which holds the file's `FileDescriptor`.
+    /// That position is stored in the first entry of the global buffer offset
+    /// table, which the footer locates. It is always 0 for legacy (0.1) Lance files
+    /// and for files in other formats. Writers record either this exact value or 0.
+    ///
+    /// This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+    /// bytes of the file before decoding the footer. The footer stays
+    /// authoritative: readers must ignore a value larger than the file and read
+    /// any metadata the footer references outside the hinted range.
+    #[prost(uint64, tag = "3")]
+    pub file_metadata_size_bytes: u64,
 }
 impl ::prost::Name for IndexFile {
     const NAME: &'static str = "IndexFile";
@@ -1541,6 +1584,10 @@ pub struct ShardManifest {
     /// (drop-table 2PC). A SEALED manifest refuses claims at claim_epoch.
     #[prost(enumeration = "ShardStatus", tag = "15")]
     pub status: i32,
+    /// The operation holding the seal; set with status SEALED, cleared on
+    /// unseal. Identifies the holder and when it sealed.
+    #[prost(message, optional, tag = "16")]
+    pub sealed_by: ::core::option::Option<SealedBy>,
 }
 impl ::prost::Name for ShardManifest {
     const NAME: &'static str = "ShardManifest";
@@ -1550,6 +1597,26 @@ impl ::prost::Name for ShardManifest {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lance.table.ShardManifest".into()
+    }
+}
+/// The holder of a shard's seal.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SealedBy {
+    /// Caller-chosen id of the operation that sealed the shard.
+    #[prost(string, tag = "1")]
+    pub txn: ::prost::alloc::string::String,
+    /// When the seal was taken (Unix timestamp in milliseconds).
+    #[prost(int64, tag = "2")]
+    pub sealed_at_millis: i64,
+}
+impl ::prost::Name for SealedBy {
+    const NAME: &'static str = "SealedBy";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.SealedBy".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.SealedBy".into()
     }
 }
 /// A shard field value stored as raw Arrow scalar bytes.
@@ -1583,7 +1650,8 @@ pub struct SsTable {
     #[prost(string, tag = "2")]
     pub path: ::prost::alloc::string::String,
     /// Payload size of the rows, as the writer's MemTable accounted for them: the
-    /// sum over its buffers of the window each one holds.
+    /// sum over its buffers of the window each one holds, plus the payload of the
+    /// blob values the generation keeps in packed and dedicated sidecar files.
     ///
     /// An estimate of the payload, not a bound on what reading the SSTable costs.
     /// It excludes the per-array structure a reader materializes, so a consumer
@@ -1757,6 +1825,15 @@ pub struct MemWalIndexDetails {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// Names this MemWAL's storage directory, `_{dir_id}_mem_wal/` under the
+    /// table's base path; empty means the legacy `_mem_wal/`. Minted at
+    /// initialization and kept across rewrites of this index, so a
+    /// re-initialized MemWAL shares no storage with an earlier one.
+    ///
+    /// Commits that change MemWAL state name their dir_id and are rejected when
+    /// the index they build on carries another one, or none.
+    #[prost(string, tag = "13")]
+    pub dir_id: ::prost::alloc::string::String,
 }
 impl ::prost::Name for MemWalIndexDetails {
     const NAME: &'static str = "MemWalIndexDetails";
@@ -2373,6 +2450,10 @@ pub mod transaction {
             u64,
             ::prost::alloc::vec::Vec<u8>,
         >,
+        /// The `dir_id` of the MemWAL `compacted_sstables` belongs to; required
+        /// when `compacted_sstables` is non-empty. See UpdateMemWalState.dir_id.
+        #[prost(string, optional, tag = "11")]
+        pub mem_wal_dir_id: ::core::option::Option<::prost::alloc::string::String>,
     }
     impl ::prost::Name for Update {
         const NAME: &'static str = "Update";
@@ -2505,8 +2586,16 @@ pub mod transaction {
     /// An operation that replaces the data in a region of the table with new data.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct DataReplacement {
+        /// A fragment can be the target of several groups, one per new file. The
+        /// groups apply in order, each to the fragment as the previous ones left it.
         #[prost(message, repeated, tag = "1")]
         pub replacements: ::prost::alloc::vec::Vec<DataReplacementGroup>,
+        /// Whether the new files change any value. Absent means true, which is what
+        /// a writer that predates this field meant. False means the values were only
+        /// moved to new files: index coverage, overlays, and row update versions are
+        /// left as they are.
+        #[prost(bool, optional, tag = "2")]
+        pub data_change: ::core::option::Option<bool>,
     }
     impl ::prost::Name for DataReplacement {
         const NAME: &'static str = "DataReplacement";
@@ -2571,6 +2660,10 @@ pub mod transaction {
         /// SSTables being marked as compacted.
         #[prost(message, repeated, tag = "1")]
         pub compacted_sstables: ::prost::alloc::vec::Vec<super::CompactedSsTable>,
+        /// The `dir_id` of the MemWAL this update was built for. The commit is
+        /// rejected unless the manifest it builds on carries that MemWAL.
+        #[prost(string, tag = "2")]
+        pub dir_id: ::prost::alloc::string::String,
     }
     impl ::prost::Name for UpdateMemWalState {
         const NAME: &'static str = "UpdateMemWalState";

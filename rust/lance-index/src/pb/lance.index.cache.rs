@@ -154,6 +154,31 @@ impl ::prost::Name for RangeToFile {
         "/lance.index.cache.RangeToFile".into()
     }
 }
+/// Header for a serialized `BitmapIndexState` cache entry, followed by a
+/// `RAW_BLOB` (the null-row bitmap) then a single Arrow IPC section holding
+/// the keys/offsets lookup batch.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BitmapIndexHeader {
+    /// Whether `BitmapIndex::load_bitmap` results are physical row addresses
+    /// rather than row ids directly.
+    ///
+    /// Absent (default false) on a cache entry rebuilt from a segment persisted
+    /// before address-domain support (these indexes always used row ids).
+    ///
+    /// This should be set (and true) on all bitmap indexes with version > 0.
+    #[prost(bool, tag = "1")]
+    pub results_are_row_addresses: bool,
+}
+impl ::prost::Name for BitmapIndexHeader {
+    const NAME: &'static str = "BitmapIndexHeader";
+    const PACKAGE: &'static str = "lance.index.cache";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.index.cache.BitmapIndexHeader".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.index.cache.BitmapIndexHeader".into()
+    }
+}
 /// Product quantizer. Sections: sub-index IPC, codebook IPC, storage IPC.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PqPartitionHeader {

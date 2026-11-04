@@ -927,12 +927,93 @@ impl ::prost::Name for ByteStreamSplit {
         "/lance.encodings23.ByteStreamSplit".into()
     }
 }
+/// ALP: Adaptive Lossless floating-Point encoding
+///
+/// Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
+/// mini-block chunk is self-describing (mode, exponents, bit width, base
+/// values), so only the input width is declared here.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Alp {
+    /// 32 for f32 and 64 for f64
+    #[prost(uint32, tag = "1")]
+    pub bits_per_value: u32,
+}
+impl ::prost::Name for Alp {
+    const NAME: &'static str = "Alp";
+    const PACKAGE: &'static str = "lance.encodings23";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.encodings23.Alp".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.encodings23.Alp".into()
+    }
+}
+/// Length-preserving modular integer differences within each fixed-size tensor.
+/// The child is one or more fixed-size-list layers ending in plain 8/16/32/64-bit
+/// elements, without child validity. For each tensor, divide its elements into
+/// spans of axis_length * inner_stride. Copy the first inner_stride elements of
+/// each span. For every later element i, store input\[i\] - input\[i-inner_stride\]
+/// modulo 2^element_bits. Decode by adding the already reconstructed predecessor.
+/// Preserve little-endian representation and original element order. Each tensor
+/// is independent. This transform is valid only in per-value encoding positions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AxisDelta {
+    /// Required untransformed fixed-size-list encoding, retaining the tensor shape.
+    #[prost(message, optional, boxed, tag = "1")]
+    pub values: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
+    /// Positive number of positions along the predicted physical axis.
+    #[prost(uint64, tag = "2")]
+    pub axis_length: u64,
+    /// Positive number of elements between adjacent positions along that axis.
+    #[prost(uint64, tag = "3")]
+    pub inner_stride: u64,
+}
+impl ::prost::Name for AxisDelta {
+    const NAME: &'static str = "AxisDelta";
+    const PACKAGE: &'static str = "lance.encodings23";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.encodings23.AxisDelta".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.encodings23.AxisDelta".into()
+    }
+}
+/// Pcodec (pco) compression of floating-point mini-block chunks.
+///
+/// The values describe the uncompressed layout: a Flat leaf of 16 (float16),
+/// 32 (float32) or 64 (float64) bits without buffer compression, optionally
+/// wrapped in one or more FixedSizeList layers without validity. Let d be the
+/// product of the list dimensions (1 for a bare Flat leaf). A chunk of n values
+/// holds n * d items, stored item-major: item j of value i is at position
+/// j * n + i, so each list position forms one contiguous sequence. Those n * d little-endian items are
+/// compressed as a single pco standalone file (standalone version 3, format
+/// version 4.1, as written by pco 1.0) into the chunk's only buffer. The pco
+/// format is specified at <https://github.com/pcodec/pcodec/blob/v1.0.4/docs/format.md.>
+/// Decoding reverses the pco compression and the transpose; it is lossless,
+/// including NaN payloads and signed zeros. This encoding is valid only in
+/// mini-block positions.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Pcodec {
+    /// Required untransformed Flat or FixedSizeList encoding of the values.
+    #[prost(message, optional, boxed, tag = "1")]
+    pub values: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
+}
+impl ::prost::Name for Pcodec {
+    const NAME: &'static str = "Pcodec";
+    const PACKAGE: &'static str = "lance.encodings23";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.encodings23.Pcodec".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.encodings23.Pcodec".into()
+    }
+}
 /// An encoding that compresses a data block into buffers
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompressiveEncoding {
     #[prost(
         oneof = "compressive_encoding::Compression",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
     )]
     pub compression: ::core::option::Option<compressive_encoding::Compression>,
 }
@@ -970,6 +1051,12 @@ pub mod compressive_encoding {
         Range(super::Range),
         #[prost(message, tag = "15")]
         Delta(::prost::alloc::boxed::Box<super::Delta>),
+        #[prost(message, tag = "16")]
+        AxisDelta(::prost::alloc::boxed::Box<super::AxisDelta>),
+        #[prost(message, tag = "17")]
+        Alp(super::Alp),
+        #[prost(message, tag = "18")]
+        Pcodec(::prost::alloc::boxed::Box<super::Pcodec>),
     }
 }
 impl ::prost::Name for CompressiveEncoding {
