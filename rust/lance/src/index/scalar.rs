@@ -916,7 +916,13 @@ pub(crate) async fn open_scalar_index_with_plan(
             // with no remapper; every plugin (including legacy-API-only ones)
             // supports this.
             Some(ResolvedRemapping::V1Identity) => (None, None),
-            Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
+            Some(ResolvedRemapping::V1Translate {
+                translation,
+                mappings,
+                ..
+            }) => lance_index::frag_reuse::deprecated_remappers(Some(
+                &translation.clone().bind(mappings.clone()),
+            ))?,
             None => (None, None),
         }
     };

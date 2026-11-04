@@ -20,7 +20,7 @@ use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
     FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, Remapper, RowIdRemapper};
+use lance_index::scalar::{MetricsCollector, Remapper, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_table::format::pb::FragmentReuseIndexDetails;
 use lance_table::format::pb::fragment_reuse_index_details::{
@@ -49,8 +49,7 @@ use uuid::Uuid;
 /// behavior: `V0` feeds the pre-existing synchronous consumers exactly as
 /// before tagged histories existed; `V1Identity` carries no remapper at all
 /// (the segment's rows are untouched, so the plugin's original load path
-/// applies); `V1Translate` feeds the additive `*_with_remapping` entry points
-/// that may await row-map reads.
+/// applies); `V1Translate` carries the plan a [`Remapper`] is bound from.
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
@@ -59,12 +58,10 @@ pub(crate) enum ResolvedRemapping {
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
     V1Translate {
-        remapper: Arc<dyn BatchRowIdRemapper>,
         /// The segment's translation identity (see
         /// [`TranslationPlan::fingerprint`]).
         fingerprint: [u8; 32],
-        /// The plan `remapper` translates by, for loaders that take a
-        /// [`Remapper`], and the source it is bound to.
+        /// The plan the segment translates by, and the source it is bound to.
         translation: TranslationPlan,
         mappings: Arc<dyn MappingSource>,
     },
@@ -75,8 +72,8 @@ impl std::fmt::Debug for ResolvedRemapping {
         match self {
             Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
-            Self::V1Translate { remapper, .. } => {
-                f.debug_tuple("V1Translate").field(remapper).finish()
+            Self::V1Translate { fingerprint, .. } => {
+                f.debug_tuple("V1Translate").field(fingerprint).finish()
             }
         }
     }
@@ -147,10 +144,10 @@ pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Opti
 ///   a rewrite of fragments the segment never covered leaves the fingerprint,
 ///   and the entry, in place.
 ///
-/// Soundness rests on the fingerprint covering every input of
-/// `remap_row_ids_excluding` (see [`TranslationPlan::fingerprint`]); cached
-/// translated objects hold the `FragmentReuseIndex` they were filled with, so
-/// a stale one must never be served under a changed state.
+/// Soundness rests on the fingerprint covering every input of the segment's
+/// translation (see [`TranslationPlan::fingerprint`]); cached translated
+/// objects hold the [`Remapper`] they were filled with, so a stale one must
+/// never be served under a changed state.
 pub(crate) fn scoped_index_cache(
     dataset: &Dataset,
     resolved: &Option<(Uuid, ResolvedRemapping)>,
@@ -673,11 +670,6 @@ pub(super) async fn open_row_id_remapping_with_plan(
         ReadPlan::Translate(translation) => Ok(Some((
             fri.uuid,
             ResolvedRemapping::V1Translate {
-                remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
-                    mapping.clone(),
-                    translation.coverage().clone(),
-                    translation.excluded_fragments().clone(),
-                )),
                 fingerprint: *translation.fingerprint(),
                 translation: translation.clone(),
                 mappings: mapping.mapping_source().clone(),

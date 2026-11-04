@@ -2,11 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Bridge common FRI address translation to scalar and vector index loading.
-use super::frag_reuse_reader::FragmentReuseIndex;
 use crate::Dataset;
-use async_trait::async_trait;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::INDEX_FILE_NAME;
 use lance_index::frag_reuse::mapping_source::RowMapMappingSource;
@@ -14,7 +11,6 @@ use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::history::FragReuseHistory;
 use lance_table::system_index::frag_reuse::ledger::Mapping;
 use lance_table::system_index::frag_reuse::mapping::MappingSource;
-use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -176,53 +172,4 @@ pub async fn vector_supports_batch_remapping(
         })
         .await?;
     Ok(*supported)
-}
-
-/// Applies the shared FRI history and limits translated rows to this segment's coverage.
-pub(super) struct QueryRowIdRemapper {
-    mapping: Arc<FragmentReuseIndex>,
-    coverage: RoaringBitmap,
-    excluded_fragments: RoaringBitmap,
-}
-
-impl std::fmt::Debug for QueryRowIdRemapper {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QueryRowIdRemapper")
-            .field("coverage", &self.coverage)
-            .field("excluded_fragments", &self.excluded_fragments)
-            .finish_non_exhaustive()
-    }
-}
-
-impl QueryRowIdRemapper {
-    pub(crate) fn new(
-        mapping: Arc<FragmentReuseIndex>,
-        coverage: RoaringBitmap,
-        excluded_fragments: RoaringBitmap,
-    ) -> Self {
-        Self {
-            mapping,
-            coverage,
-            excluded_fragments,
-        }
-    }
-}
-
-#[async_trait]
-impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        lance_index::scalar::check_batch_remapping_entry()?;
-        Ok(self
-            .mapping
-            .remap_row_ids_excluding(row_ids, &self.excluded_fragments)
-            .await?
-            .into_iter()
-            .map(|address| {
-                address.filter(|row_id| {
-                    self.coverage
-                        .contains(RowAddress::from(*row_id).fragment_id())
-                })
-            })
-            .collect())
-    }
 }
