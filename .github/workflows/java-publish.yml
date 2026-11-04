@@ -197,9 +197,21 @@ jobs:
           xcrun --show-sdk-version
           shasum -a 256 "$(xcrun --find ld)"
           if [ "$JNI_BUILD_PROFILE" = release-with-debug ]; then
-            # Reuse #10594's linker adaptation for tags predating that config.
+            # Xcode 15.4's linker cannot extend distant branches from ctor's
+            # startup section. Use the Mach-O linker in this Rust toolchain.
+            rust_sysroot=$(rustc --print sysroot)
+            rust_lld="$rust_sysroot/lib/rustlib/aarch64-apple-darwin/bin/rust-lld"
+            DYLD_LIBRARY_PATH="$rust_sysroot/lib" "$rust_lld" -flavor darwin --version
+            # Apple's compiler driver strips DYLD_LIBRARY_PATH before invoking
+            # the linker. Set it in the launcher for rust-lld's LLVM library.
+            cat > "$RUNNER_TEMP/ld64.lld" <<EOF
+          #!/bin/bash
+          export DYLD_LIBRARY_PATH="$rust_sysroot/lib"
+          exec "$rust_lld" -flavor darwin "\$@"
+          EOF
+            chmod +x "$RUNNER_TEMP/ld64.lld"
             cargo rustc --lib --profile "$JNI_BUILD_PROFILE" --locked --timings -- \
-              -C link-arg=-Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text
+              -C "link-arg=--ld-path=$RUNNER_TEMP/ld64.lld"
           else
             cargo build --release --locked --timings
           fi
@@ -214,8 +226,8 @@ jobs:
           library = f"java/lance-jni/target/{os.environ['JNI_BUILD_PROFILE']}/liblance_jni.dylib"
           headers = subprocess.check_output(["otool", "-l", library], text=True)
           sections = set(re.findall(r"sectname\s+(\S+)", headers))
-          assert "__text_startup" not in sections, "startup code must share the text section"
           assert "__mod_init_func" in sections, "constructor registration must be retained"
+          print(f"Constructor registration retained; startup section present: {'__text_startup' in sections}")
           PY
       - name: Set up Java 11 for native smoke tests
         if: env.JNI_BUILD_PROFILE == 'release-with-debug'
