@@ -114,6 +114,14 @@ mod tests {
     }
 
     fn compose(history: &FragReuseHistory, segment: &SegmentSummary) -> Composition {
+        compose_served(history, segment, None)
+    }
+
+    fn compose_served(
+        history: &FragReuseHistory,
+        segment: &SegmentSummary,
+        served: Option<&RoaringBitmap>,
+    ) -> Composition {
         let live = RoaringBitmap::from_iter([4]);
         let lineage = history.fragment_bitmap();
         let rows = HashMap::new();
@@ -123,11 +131,28 @@ mod tests {
                     live_fragments: &live,
                     lineage: &lineage,
                     fragment_rows: &rows,
-                    served: None,
+                    served,
                 },
                 segment,
             )
             .unwrap()
+    }
+
+    /// The version 0 reader translates every segment through the whole
+    /// history, whatever its siblings cover, so the rewrite cedes nothing to
+    /// them and publishes its bitmap whatever the reader serves.
+    #[test]
+    fn the_reader_coverage_does_not_narrow_the_published_bitmap() {
+        let served = RoaringBitmap::new();
+        let plan = rewritten(compose_served(
+            &two_rounds(),
+            &segment(Some(&[2, 3]), 15),
+            Some(&served),
+        ));
+        assert_eq!(
+            plan.published_bitmap(),
+            Some(&RoaringBitmap::from_iter([4]))
+        );
     }
 
     fn rewritten(composition: Composition) -> TranslationPlan {
