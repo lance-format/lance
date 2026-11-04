@@ -14,13 +14,17 @@ use prost::Message;
 use prost::encoding::{WireType, decode_key, decode_varint};
 use roaring::RoaringBitmap;
 
-use super::history::{HistoryFormat, Record, RewriteRecord, TRANSITION_FIELD, length_delimited};
-use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
-use super::ledger::{STABLE_PARTITION_FIELD, corrupt, next_field, require_message};
-use super::plan::{
+use super::{FriImpl, Records, StoredRecord, concat, invalid_edit};
+use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
+use crate::system_index::frag_reuse::history::{
+    HistoryFormat, Record, RewriteRecord, TRANSITION_FIELD, length_delimited,
+};
+use crate::system_index::frag_reuse::ledger::{
+    STABLE_PARTITION_FIELD, corrupt, next_field, require_message,
+};
+use crate::system_index::frag_reuse::plan::{
     ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport, segment_plans,
 };
-use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
 
 /// `StablePartition.base_id`.
 const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;

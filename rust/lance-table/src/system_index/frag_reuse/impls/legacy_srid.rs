@@ -16,9 +16,11 @@ use bytes::Bytes;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
-use super::history::{HistoryFormat, RewriteRecord};
-use super::imp::{FriImpl, Records};
-use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
+use super::{FriImpl, Records};
+use crate::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
+use crate::system_index::frag_reuse::plan::{
+    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport,
+};
 
 #[derive(Debug)]
 pub struct LegacySridHistory(Arc<dyn FriImpl>);

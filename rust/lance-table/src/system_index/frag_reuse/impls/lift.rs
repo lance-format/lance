@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 
-use super::history::RewriteRecord;
-use super::imp::{FriImpl, Records, concat};
 use super::tagged::TaggedHistory;
+use super::{FriImpl, Records, concat};
 use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
+use crate::system_index::frag_reuse::history::RewriteRecord;
 
 /// The tagged history holding the same records as the legacy `records`.
 pub fn lift_legacy(records: &Records) -> Result<Arc<dyn FriImpl>> {

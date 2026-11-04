@@ -13,17 +13,19 @@ use lance_core::{Error, Result};
 use prost::Message;
 use roaring::RoaringBitmap;
 
-use super::FragReuseVersion;
-use super::history::{
+use super::legacy_srid::LegacySridHistory;
+use super::lift;
+use super::{FriImpl, Records, StoredRecord, concat, invalid_edit};
+use crate::format::IndexMetadata;
+use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::system_index::frag_reuse::FragReuseVersion;
+use crate::system_index::frag_reuse::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, Record, RewriteRecord, length_delimited,
     split_records,
 };
-use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
-use super::legacy_srid::LegacySridHistory;
-use super::lift;
-use super::plan::{ReadContext, ReadPlan, SegmentSummary, TranslationPlan};
-use crate::format::IndexMetadata;
-use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::system_index::frag_reuse::plan::{
+    ReadContext, ReadPlan, SegmentSummary, TranslationPlan,
+};
 use crate::system_index::is_system_index;
 
 #[derive(Debug, Default)]
@@ -422,14 +424,14 @@ mod tests {
     }
 
     fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
-        let digest = |id| super::super::FragDigest {
+        let digest = |id| crate::system_index::frag_reuse::FragDigest {
             id,
             physical_rows: 100,
             num_deleted_rows: 0,
         };
         FragReuseVersion {
             dataset_version,
-            groups: vec![super::super::FragReuseGroup {
+            groups: vec![crate::system_index::frag_reuse::FragReuseGroup {
                 changed_row_addrs: Vec::new(),
                 old_frags: old.iter().copied().map(digest).collect(),
                 new_frags: new.iter().copied().map(digest).collect(),

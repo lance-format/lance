@@ -9,6 +9,11 @@
 //!
 //! [`FragReuseHistory`]: super::history::FragReuseHistory
 
+pub(super) mod legacy;
+mod legacy_srid;
+mod lift;
+pub(super) mod tagged;
+
 use std::fmt::Debug;
 use std::sync::Arc;
 

@@ -35,14 +35,14 @@ use prost::encoding::WireType;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
-use super::imp::{FriImpl, StoredRecord, concat};
+use super::impls::legacy::{self, LegacyHistory};
+use super::impls::tagged::TaggedHistory;
+use super::impls::{FriImpl, StoredRecord, concat};
 use super::ledger::{
     DetailsContent, FragReuseLedger, corrupt, is_interpretable_transition, next_field,
     verify_external_content,
 };
-use super::legacy::{self, LegacyHistory};
 use super::plan::{ReadContext, ReadPlan, SegmentSummary};
-use super::tagged::TaggedHistory;
 use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
 use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details as pb;

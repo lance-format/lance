@@ -2,24 +2,20 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 #[cfg(test)]
-mod contract;
+mod contract_tests;
 pub mod gate;
 pub mod history;
-mod imp;
+mod impls;
 pub mod ledger;
-mod legacy;
-mod legacy_srid;
-mod lift;
 pub mod lineage;
 pub mod metadata;
 pub mod plan;
 pub mod policy;
-mod tagged;
 
 // Version 0 cleanup in `lance` until trim owns it; not part of the stable
 // interface.
 #[doc(hidden)]
-pub use legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
+pub use impls::legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
