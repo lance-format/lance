@@ -2413,7 +2413,7 @@ pub struct SchedulerDecoderConfig {
 
 fn check_scheduler_on_drop(
     stream: BoxStream<'static, ReadBatchTask>,
-    scheduler_handle: tokio::task::JoinHandle<()>,
+    scheduler_handle: lance_core::utils::tokio::JoinHandle<()>,
 ) -> BoxStream<'static, ReadBatchTask> {
     // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
     // will panic if the scheduler panicked).  This let's us check if the scheduler panicked

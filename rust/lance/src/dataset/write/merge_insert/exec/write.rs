@@ -61,7 +61,7 @@ use super::apply_deletions;
 
 /// Consumers own the producer task so cancelling a merge also stops polling
 /// its source, including when the producer is waiting on a full output queue.
-struct SplitterTask(tokio::task::JoinHandle<()>);
+struct SplitterTask(lance_core::utils::tokio::JoinHandle<()>);
 
 impl Drop for SplitterTask {
     fn drop(&mut self) {

@@ -5431,7 +5431,7 @@ async fn finish_streaming_ivf_training<T>(
     training_result: Result<T>,
     progress_tx: mpsc::UnboundedSender<u64>,
     on_progress: KMeansProgressCallback,
-    progress_worker: tokio::task::JoinHandle<Result<()>>,
+    progress_worker: lance_core::utils::tokio::JoinHandle<Result<()>>,
     trainer_name: &str,
 ) -> Result<T> {
     drop(progress_tx);

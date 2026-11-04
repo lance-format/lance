@@ -458,7 +458,7 @@ struct RunSorter {
     spill_dir: Option<Arc<SpillDir>>,
     /// Runs being sorted and written, oldest first; at most
     /// [`MAX_INFLIGHT_SPILLS`] so the backlog of full runs stays bounded.
-    spills: FuturesOrdered<tokio::task::JoinHandle<Result<SpilledRun>>>,
+    spills: FuturesOrdered<lance_core::utils::tokio::JoinHandle<Result<SpilledRun>>>,
     spilled: Vec<SpilledRun>,
 }
 

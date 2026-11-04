@@ -317,11 +317,11 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 }
 
 struct AbortOnDropHandle<T> {
-    handle: tokio::task::JoinHandle<T>,
+    handle: lance_core::utils::tokio::JoinHandle<T>,
 }
 
 impl<T> AbortOnDropHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    fn new(handle: lance_core::utils::tokio::JoinHandle<T>) -> Self {
         Self { handle }
     }
 }

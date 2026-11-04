@@ -8,10 +8,10 @@ use std::sync::RwLock as StdRwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lance_core::utils::tokio::JoinHandle;
 use lance_core::{Error, Result};
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio::time::{Interval, interval_at};
 use tokio_util::sync::CancellationToken;
 

@@ -16,9 +16,9 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
+use lance_core::utils::tokio::JoinHandle;
 use lance_core::{Error, Result, cache::LanceCache, utils::parse::str_is_truthy};
 use log::trace;
-use tokio::task::JoinHandle;
 
 use crate::{
     EncodingsIo,

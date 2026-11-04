@@ -22,6 +22,7 @@ use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
+use lance_core::utils::tokio::JoinHandle;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -44,7 +45,6 @@ use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
 
 use crate::Result;
 
@@ -855,7 +855,7 @@ mod tests {
             let live = live.clone();
             let saw_missing_dir = saw_missing_dir.clone();
             let scratch_path = scratch_path.clone();
-            tasks.push(Some(tokio::spawn(async move {
+            tasks.push(Some(lance_core::utils::tokio::spawn(async move {
                 live.fetch_add(1, Ordering::SeqCst);
                 let _guard = LiveGuard(live.clone());
                 if !scratch_path.exists() {
@@ -872,8 +872,9 @@ mod tests {
         // cancelled and its error lost. So wait until this task has actually
         // completed before handing it to the drain; otherwise whether its error
         // surfaces would depend on the scheduler and the test would be flaky.
-        let failing =
-            tokio::spawn(async move { Err(Error::io("late partition failure".to_string())) });
+        let failing = lance_core::utils::tokio::spawn(async move {
+            Err(Error::io("late partition failure".to_string()))
+        });
         while !failing.is_finished() {
             tokio::task::yield_now().await;
         }
