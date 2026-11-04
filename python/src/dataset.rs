@@ -5981,6 +5981,7 @@ impl PySearchFilter {
             dist_q_c: 0.0,
             approx_mode,
             search_effort,
+            segment_ef: Default::default(),
         };
         vector_query
             .validate_search_effort()

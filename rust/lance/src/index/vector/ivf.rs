@@ -6424,6 +6424,7 @@ mod tests {
                     query_parallelism: lance_index::vector::DEFAULT_QUERY_PARALLELISM,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
+                    segment_ef: Default::default(),
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;

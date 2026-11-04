@@ -354,6 +354,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            segment_ef: Default::default(),
         }
     }
 

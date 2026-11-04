@@ -54,6 +54,17 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
+    /// Whether [`Self::search`] answers from [`PreFilter::allowed_mask`] when
+    /// the prefilter carries one.
+    ///
+    /// The IVF layer then resolves a deletion-only prefilter against each
+    /// partition once and caches the resulting mask with the partition,
+    /// instead of every query resolving it again. Sub-indexes that would not
+    /// read the mask return `false`, so no mask is built or cached for them.
+    fn uses_allowed_mask() -> bool {
+        false
+    }
+
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
     /// * `query` - The query vector

@@ -26,7 +26,7 @@ use super::builder::{HNSW_METADATA_KEY, HnswQueryParams, Level0Links, connect_st
 use super::{HNSW, HnswMetadata, VECTOR_ID_COL, select_neighbors_heuristic_owned};
 use crate::vector::DIST_COL;
 use crate::vector::graph::{
-    BorrowingGraph, NEIGHBORS_COL, OrderedNode, VisitedGenerator, beam_search_borrowed,
+    BorrowingGraph, NEIGHBORS_COL, OrderedNode, Visited, VisitedGenerator, beam_search_borrowed,
     greedy_search_borrowed,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
@@ -429,8 +429,15 @@ fn choose_neighbors<S: VectorStore>(
     };
     let start = OrderedNode::new(ep, distances.distance(ep).into());
     let mut visited = visited_gen.generate(level.neighbors.len());
-    let (found, _) =
-        beam_search_borrowed(&view, &start, query, &distances, None, None, &mut visited);
+    let (found, _) = beam_search_borrowed(
+        &view,
+        &start,
+        query,
+        &distances,
+        None::<&Visited>,
+        None,
+        &mut visited,
+    );
     drop(visited);
 
     let mut seen = HashSet::new();
