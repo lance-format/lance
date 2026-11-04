@@ -703,13 +703,21 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
-        // A restore replaces the manifest with an older one, schema and field
-        // metadata included. Rebasing a metadata update over it reinstates
-        // metadata the restore discarded, and re-reading cannot help: the
-        // update was computed against a schema the table no longer has.
-        if (matches!(ours, Operation::Restore { .. }) && updates_schema_or_field_metadata(theirs))
-            || (updates_schema_or_field_metadata(ours)
-                && matches!(theirs, Operation::Restore { .. }))
+        // Restore replaces table metadata as well as schema/field metadata.
+        // A stale provider update could otherwise select a definition that
+        // restore discarded. Re-reading cannot repair the computed update.
+        let updates_restored_metadata = |operation: &Operation| {
+            updates_schema_or_field_metadata(operation)
+                || matches!(
+                    operation,
+                    Operation::UpdateConfig {
+                        table_metadata_updates: Some(update),
+                        ..
+                    } if update.replace || !update.update_entries.is_empty()
+                )
+        };
+        if (matches!(ours, Operation::Restore { .. }) && updates_restored_metadata(theirs))
+            || (updates_restored_metadata(ours) && matches!(theirs, Operation::Restore { .. }))
         {
             return Err(self.incompatible_conflict_err(other_transaction, other_version));
         }
@@ -6017,25 +6025,39 @@ mod tests {
         }
     }
 
-    /// A restore rewinds schema and field metadata with the rest of the
+    /// A restore rewinds table, schema and field metadata with the rest of the
     /// manifest, so a metadata update must not rebase over it; a plain config
     /// upsert carries no metadata and still rebases.
     #[rstest::rstest]
-    #[case::field_metadata(Some(HashMap::from([(0, HashMap::from([("fresh".to_string(), "{}".to_string())]))])), None, true)]
-    #[case::schema_metadata(None, Some(HashMap::from([("owner".to_string(), "refresh".to_string())])), true)]
-    #[case::config_only(None, None, false)]
+    #[case::field_metadata(Some(HashMap::from([(0, HashMap::from([("fresh".to_string(), "{}".to_string())]))])), None, None, true)]
+    #[case::schema_metadata(None, Some(HashMap::from([("owner".to_string(), "refresh".to_string())])), None, true)]
+    #[case::table_upsert(None, None, Some(UpdateMap { update_entries: vec![("provider.active", Some("2")).into()], replace: false }), true)]
+    #[case::table_delete(None, None, Some(UpdateMap { update_entries: vec![("provider.active", None::<&str>).into()], replace: false }), true)]
+    #[case::table_replace(None, None, Some(UpdateMap { update_entries: vec![("provider.active", Some("2")).into()], replace: true }), true)]
+    #[case::table_clear(None, None, Some(UpdateMap { update_entries: vec![], replace: true }), true)]
+    #[case::empty_table_update(None, None, Some(UpdateMap { update_entries: vec![], replace: false }), false)]
+    #[case::config_only(None, None, None, false)]
     fn test_update_config_conflicts_with_restore(
         #[case] field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
         #[case] schema_metadata: Option<HashMap<String, String>>,
+        #[case] table_metadata: Option<UpdateMap>,
         #[case] conflicts: bool,
     ) {
         let restore = Transaction::new(0, Operation::Restore { version: 1 }, None);
-        let update = create_update_config_for_test(
+        let mut update = create_update_config_for_test(
             Some(HashMap::from([("key".to_string(), "value".to_string())])),
             None,
             schema_metadata,
             field_metadata,
         );
+        let Operation::UpdateConfig {
+            table_metadata_updates,
+            ..
+        } = &mut update
+        else {
+            unreachable!()
+        };
+        *table_metadata_updates = table_metadata;
         // Either commit order: the metadata the restore discarded must not
         // come back, whichever transaction rebases.
         for (ours, theirs) in [
@@ -6059,7 +6081,16 @@ mod tests {
                 staged_replay: false,
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
-            assert_eq!(result.is_err(), conflicts, "{result:?}");
+            if conflicts {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::IncompatibleTransaction { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("Restore"), "{error}");
+            } else {
+                result.unwrap();
+            }
         }
     }
 
