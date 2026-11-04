@@ -7,7 +7,7 @@ use super::apply::ApplyState;
 use super::row_selection::row_selections_from_proto;
 use super::{FieldRef, Footprint, Ref, RowSelection};
 use crate::format::pb_actions;
-use arrow_schema::DataType;
+use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -31,9 +31,10 @@ use lance_core::{Error, Result};
 /// for now it works at fragment granularity, so a row selection narrower than
 /// the whole fragment is honored as the whole fragment.
 ///
-/// Only top-level columns, and packed structs, can be declared. A footprint has
-/// no schema to relate a struct to its children, so a write to a child would go
-/// unnoticed by an assertion over its parent, and the reverse.
+/// Only top-level leaf columns, and packed structs, can be declared. A
+/// footprint has no schema to relate a field to its descendants, so a write to
+/// a struct child or a list item would go unnoticed by an assertion over its
+/// parent, and the reverse.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertCellsUnchanged {
     /// The fields read. Committed only: a field minted in the same operation
@@ -63,16 +64,7 @@ impl AssertCellsUnchanged {
                     "AssertCellsUnchanged names field {field_id}, which is not in the schema"
                 ))
             })?;
-            let is_unpacked_struct =
-                matches!(field.data_type(), DataType::Struct(_)) && !field.is_packed_struct();
-            if field.parent_id >= 0 || is_unpacked_struct {
-                return Err(Error::invalid_input(format!(
-                    "AssertCellsUnchanged names field {field_id} ('{}'), which is a struct or \
-                     inside one; only top-level columns and packed structs can be asserted, \
-                     because conflict detection cannot relate a struct to its children",
-                    field.name
-                )));
-            }
+            check_assertable(field, "AssertCellsUnchanged")?;
         }
         for selection in &self.rows {
             let fragment_id =
@@ -101,6 +93,26 @@ impl AssertCellsUnchanged {
                 .collect(),
         );
     }
+}
+
+/// Footprints match the fields an assertion names to the field ids a write
+/// records, exactly and without a schema. A write to a nested value is
+/// recorded under its descendants' ids -- a V2.1 list overlay under its item's,
+/// a struct rewrite under its children's -- so an assertion over a field with
+/// children, or over a child, would not see it. Only a top-level leaf column,
+/// or a packed struct, whose values live under its own id, can be asserted.
+pub(super) fn check_assertable(field: &Field, action: &str) -> Result<()> {
+    let has_own_values = field.children.is_empty() || field.is_packed_struct();
+    if field.parent_id < 0 && has_own_values {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "{action} names field {} ('{}'), which is nested or holds nested fields; only \
+         top-level leaf columns and packed structs can be asserted, because conflict \
+         detection matches field ids exactly and a write to a nested value is recorded \
+         under its descendants' ids",
+        field.id, field.name
+    )))
 }
 
 impl From<&AssertCellsUnchanged> for pb_actions::AssertCellsUnchanged {

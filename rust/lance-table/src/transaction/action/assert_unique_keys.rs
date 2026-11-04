@@ -4,6 +4,7 @@
 //! Assert that no concurrent commit inserted a colliding key.
 
 use super::apply::ApplyState;
+use super::assert_cells_unchanged::check_assertable;
 use super::proto::required;
 use super::{FieldRef, Footprint};
 use crate::format::key_existence::KeyExistenceFilter;
@@ -59,11 +60,12 @@ impl AssertUniqueKeys {
         }
         for key_field in &self.key_fields {
             let field_id = state.resolve_schema_field(*key_field, "AssertUniqueKeys")?;
-            if state.schema().field_by_id(field_id).is_none() {
-                return Err(Error::invalid_input(format!(
+            let field = state.schema().field_by_id(field_id).ok_or_else(|| {
+                Error::invalid_input(format!(
                     "AssertUniqueKeys names key field {field_id}, which is not in the schema"
-                )));
-            }
+                ))
+            })?;
+            check_assertable(field, "AssertUniqueKeys")?;
         }
         Ok(())
     }
