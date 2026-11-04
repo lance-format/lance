@@ -3,10 +3,11 @@
 
 //! Exercise registration from a downstream crate, without changing the builtin registry.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::{RecordBatchIterator, record_batch};
-use arrow_schema::{DataType, Field};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, record_batch};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance::{
@@ -17,6 +18,8 @@ use lance::{
     },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::{
@@ -657,7 +660,8 @@ async fn commit_external_segments_replaces_only_overlapping_coverage() {
 
 /// Under either fragment reuse history format, a segment of a plugin without
 /// a remapping loader leaves the query listing once its rows move, so they
-/// are scanned instead of answered from stale addresses. A built-in index
+/// are scanned instead of answered from stale addresses. So does a JSON
+/// index over such a plugin, which answers through it. A built-in index
 /// keeps serving its segment through the history.
 #[rstest]
 #[case::v0(false)]
@@ -671,6 +675,16 @@ async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagg
         ("other", Int64, [10, 20, 30, 40])
     )
     .unwrap();
+    let json_field = Field::new("doc", DataType::Utf8, false).with_metadata(HashMap::from([(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    )]));
+    let docs = StringArray::from_iter_values((1..=4).map(|val| format!(r#"{{"val": {val}}}"#)));
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(json_field));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(docs));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
     let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
@@ -682,16 +696,27 @@ async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagg
     )
     .await
     .unwrap();
-    for (column, name, plugin) in [
-        ("value", "btree_index", "btree"),
-        ("other", "stale_index", "stale"),
+    let json_over_stale = ScalarIndexParams::new("json".to_string())
+        .with_params(&serde_json::json!({"target_index_type": "stale", "path": "val"}));
+    for (column, name, params) in [
+        (
+            "value",
+            "btree_index",
+            ScalarIndexParams::new("btree".to_string()),
+        ),
+        (
+            "other",
+            "stale_index",
+            ScalarIndexParams::new("stale".to_string()),
+        ),
+        ("doc", "json_stale_index", json_over_stale),
     ] {
         dataset
             .create_index(
                 &[column],
                 IndexType::Scalar,
                 Some(name.to_string()),
-                &ScalarIndexParams::new(plugin.to_string()),
+                &params,
                 false,
             )
             .await
@@ -734,8 +759,12 @@ async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagg
         .collect();
     assert!(listed.contains(&"btree_index".to_string()), "{listed:?}");
     assert!(!listed.contains(&"stale_index".to_string()), "{listed:?}");
+    assert!(
+        !listed.contains(&"json_stale_index".to_string()),
+        "{listed:?}"
+    );
 
-    for filter in ["value = 3", "other = 30"] {
+    for filter in ["value = 3", "other = 30", "json_get_int(doc, 'val') = 3"] {
         let mut full_scan = dataset.scan();
         full_scan.filter(filter).unwrap().use_scalar_index(false);
         let expected = full_scan.try_into_batch().await.unwrap();

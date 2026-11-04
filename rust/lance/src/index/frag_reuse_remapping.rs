@@ -7,10 +7,12 @@ use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::{Error, Result};
 use lance_index::INDEX_FILE_NAME;
 use lance_index::frag_reuse::mapping_source::RowMapMappingSource;
+use lance_index::pb::JsonIndexDetails;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::history::FragReuseHistory;
 use lance_table::system_index::frag_reuse::ledger::Mapping;
 use lance_table::system_index::frag_reuse::mapping::MappingSource;
+use prost::Name;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -19,12 +21,20 @@ use std::sync::Arc;
 ///
 /// A plugin translates when it implements a remapping loader. One that
 /// implements only the deprecated loaders does not, under any history
-/// format.
+/// format. A JSON index answers through its target index, so it translates
+/// only when its target's plugin does.
 pub(super) fn scalar_plugin_translates(details: &prost_types::Any) -> Option<bool> {
     let plugin = super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
         .ok()?;
-    Some(plugin.remapping_loader().is_some())
+    if plugin.remapping_loader().is_none() {
+        return Some(false);
+    }
+    if details.type_url.ends_with(&JsonIndexDetails::full_name()) {
+        let json = details.to_msg::<JsonIndexDetails>().ok()?;
+        return scalar_plugin_translates(json.target_details.as_ref()?);
+    }
+    Some(true)
 }
 
 /// The source of the row maps `history`'s transitions reference, reading
@@ -75,6 +85,7 @@ pub(super) async fn frag_reuse_mapping_source(
         .with_metadata_cache(dataset.metadata_cache.0.clone()),
     ))
 }
+
 #[derive(Clone)]
 struct VectorFormatKey(uuid::Uuid);
 
