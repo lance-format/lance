@@ -1558,6 +1558,16 @@ mod tests {
         "tag",
         "json_get_string(json, Utf8(\"tag\")) IS NULL"
     )]
+    #[case::float32_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Float32(Some(1.5)))),
+        "score",
+        "json_get_float(json, Utf8(\"score\")) = Float32(1.5)"
+    )]
+    #[case::int32_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Int32(Some(7)))),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) = Int32(7)"
+    )]
     #[case::bool_equals(
         Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(true)))),
         "flag",
