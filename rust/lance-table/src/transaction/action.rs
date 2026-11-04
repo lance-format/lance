@@ -63,6 +63,7 @@ macro_rules! for_each_action {
             RemoveFragment,
             SetDeletionFile,
             AddOverlays,
+            UpdateCompactedSsTables,
             AlterField,
             DropField,
             AddIndexSegment,
@@ -99,6 +100,7 @@ mod reserve_row_ids;
 mod reset_table;
 mod set_deletion_file;
 mod tombstone_field_data;
+mod update_compacted_sstables;
 
 #[cfg(test)]
 mod test_support;
@@ -122,6 +124,7 @@ pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
+pub use update_compacted_sstables::UpdateCompactedSsTables;
 
 use apply::ApplyState;
 use lance_core::deepsize::DeepSizeOf;

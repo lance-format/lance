@@ -2844,11 +2844,15 @@ mod composite {
         BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
+    use lance_table::system_index::mem_wal::{
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
+    };
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
         AdjustIndexCoverage, AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef,
         Ref, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        SetDeletionFile, TombstoneFieldData, UserStep,
+        SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -4837,6 +4841,52 @@ mod composite {
             .unwrap();
         assert_eq!(fragment.overlays.len(), 1);
         assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_records_mem_wal_compaction_progress() {
+        let dataset = test_dataset(false).await;
+        let shard = Uuid::new_v4();
+
+        // Progress is only recordable against a table that already carries the
+        // index, so put one there the way the MemWAL writer would.
+        let read_version = dataset.version().version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![
+                        new_mem_wal_index_meta(read_version, MemWalIndexDetails::default())
+                            .unwrap(),
+                    ],
+                    removed_indices: Vec::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let dataset = commit(
+            dataset,
+            vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            })],
+        )
+        .await;
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let mem_wal = indices
+            .iter()
+            .find(|index| index.name == MEM_WAL_INDEX_NAME)
+            .expect("the MemWAL index should still be there");
+        let details = load_mem_wal_index_details((*mem_wal).clone()).unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard);
+        assert_eq!(details.compacted_sstables[0].generation, 3);
+
+        // The data is untouched: recording where rows live is not a change to
+        // them.
+        assert_eq!(dataset.fragments().len(), 2);
     }
 
     fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
