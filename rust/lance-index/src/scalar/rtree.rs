@@ -423,8 +423,9 @@ impl RTreeIndex {
         // root-to-leaf chain stays serial because a page is only enqueued
         // once its parent batch has been scanned. Results accumulate into a
         // set, so completion order does not matter. Popping the most recently
-        // found page keeps the queue to a few pages per tree level instead of
-        // the whole intersecting frontier.
+        // found page walks depth-first, so the queue holds the unvisited
+        // siblings along the current paths rather than every intersecting page
+        // of a level.
         let io_parallelism = self.store.io_parallelism().max(1);
         let mut deferred_pages: Vec<u64> = Vec::new();
         let mut pending_pages = stream::FuturesUnordered::new();
