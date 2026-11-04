@@ -448,14 +448,18 @@ fn append_fragments(
 /// manifest message and nothing else.
 fn cache_encoded_fragments(
     manifest: &mut Manifest,
-    buf: &Bytes,
+    buf: Vec<u8>,
     ranges: Vec<Option<Range<usize>>>,
 ) {
+    // `Bytes::from(Vec)` keeps the Vec allocation when capacity exceeds len,
+    // so cache the capacity before conversion rather than the logical length.
+    let retained_bytes = buf.capacity();
+    let buf = Bytes::from(buf);
     let encoded = ranges
         .into_iter()
         .map(|range| range.map(|range| buf.slice(range)))
         .collect();
-    manifest.set_encoded_fragments(encoded, buf.len());
+    manifest.set_encoded_fragments(encoded, retained_bytes);
 }
 
 /// Write the length-prefixed manifest message and return its position.
@@ -464,7 +468,7 @@ async fn write_manifest_message(writer: &mut dyn Writer, manifest: &mut Manifest
     let mut buf = Vec::new();
     let ranges = encode_manifest_message(manifest, &mut buf, PARALLEL_ENCODE)?;
     writer.write_all(&buf).await?;
-    cache_encoded_fragments(manifest, &Bytes::from(buf), ranges);
+    cache_encoded_fragments(manifest, buf, ranges);
     Ok(pos)
 }
 
@@ -518,6 +522,7 @@ mod test {
     use crate::format::ClusteringDefinition;
     use crate::format::SelfDescribingFileReader;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_core::deepsize::DeepSizeOf;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
@@ -782,9 +787,26 @@ mod test {
     fn encode_message_with(manifest: &mut Manifest, parallel: ParallelEncode) -> Vec<u8> {
         let mut buf = Vec::new();
         let ranges = encode_manifest_message(manifest, &mut buf, parallel).unwrap();
-        let bytes = Bytes::from(buf.clone());
-        cache_encoded_fragments(manifest, &bytes, ranges);
-        buf
+        let message = buf.clone();
+        cache_encoded_fragments(manifest, buf, ranges);
+        message
+    }
+
+    #[test]
+    fn test_cached_fragments_account_for_vec_allocation_capacity() {
+        let mut manifest = manifest_with_fragments(1);
+        let uncached_size = manifest.deep_size_of();
+
+        encode_message(&mut manifest);
+        let cached_size = manifest.deep_size_of();
+        let message_bytes = manifest.serialized().len() + 4;
+        let retained_bytes = cached_size - uncached_size;
+
+        assert!(
+            retained_bytes > message_bytes + 32 * 1024,
+            "cache retained {retained_bytes} bytes for a {message_bytes}-byte message; \
+             it must account for the Vec allocation capacity"
+        );
     }
 
     #[test]
