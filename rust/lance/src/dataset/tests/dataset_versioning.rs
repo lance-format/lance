@@ -2069,31 +2069,43 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
     let deleted_ref = branch_contents_path(&dataset.base, "deleted");
     let mut policy = ProxyObjectStorePolicy::new();
     let has_deleted_ref = Arc::new(AtomicBool::new(false));
-    let has_deleted_ref_for_policy = has_deleted_ref.clone();
-    let has_removed_concurrent = Arc::new(AtomicBool::new(false));
-    let has_removed_concurrent_for_policy = has_removed_concurrent.clone();
+    let has_deleted_ref_for_directory_policy = has_deleted_ref.clone();
+    let has_deleted_ref_for_ref_policy = has_deleted_ref.clone();
+    let has_removed_concurrent_ref = Arc::new(AtomicBool::new(false));
+    let has_removed_concurrent_ref_for_policy = has_removed_concurrent_ref.clone();
+    let concurrent_ref_reads = Arc::new(AtomicUsize::new(0));
+    let concurrent_ref_reads_for_policy = concurrent_ref_reads.clone();
+    let concurrent_base_for_policy = concurrent.base.clone();
+    let concurrent_ref_for_policy = concurrent_ref.clone();
     policy.set_before_policy(
         "target_ref_removed",
         Arc::new(move |method, path| {
             if method == "delete" && path == &deleted_ref {
-                has_deleted_ref_for_policy.store(true, AtomicOrdering::SeqCst);
+                has_deleted_ref_for_directory_policy.store(true, AtomicOrdering::SeqCst);
+                // The other delete has removed the branch directory but not its ref.
+                std::fs::remove_dir_all(to_local_path(&concurrent_base_for_policy)).unwrap();
             }
             Ok(())
         }),
     );
-    policy.set_obj_meta_policy(
-        "ref_disappears_during_cleanup",
-        Arc::new(move |method, meta| {
-            if method == "list"
-                && meta.location == concurrent_ref
-                && has_deleted_ref.load(AtomicOrdering::SeqCst)
-                && !has_removed_concurrent_for_policy.swap(true, AtomicOrdering::SeqCst)
+    policy.set_before_policy(
+        "concurrent_ref_disappears_before_recheck",
+        Arc::new(move |method, path| {
+            if method == "get_opts"
+                && path == &concurrent_ref_for_policy
+                && has_deleted_ref_for_ref_policy.load(AtomicOrdering::SeqCst)
             {
-                // Another delete completes between cleanup's LIST and GET.
-                std::fs::remove_file(to_local_path(&concurrent_ref)).unwrap();
-                std::fs::remove_dir_all(to_local_path(&concurrent.base)).unwrap();
+                let reads =
+                    concurrent_ref_reads_for_policy.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                // Local file reads bypass the proxy. Object-store refs are read once
+                // during the cleanup list before the existence recheck.
+                let recheck_read = if use_object_store { 2 } else { 1 };
+                if reads == recheck_read {
+                    std::fs::remove_file(to_local_path(&concurrent_ref_for_policy)).unwrap();
+                    has_removed_concurrent_ref_for_policy.store(true, AtomicOrdering::SeqCst);
+                }
             }
-            Ok(meta)
+            Ok(())
         }),
     );
     let mut store = dataset.object_store.as_ref().clone();
@@ -2103,13 +2115,47 @@ async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_s
     ));
     dataset.refs.object_store = Arc::new(store);
 
+    assert!(
+        dataset
+            .object_store
+            .exists(&branch.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !dataset
+            .object_store
+            .list(Some(branch.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
     dataset.delete_branch("deleted").await.unwrap();
-    assert!(has_removed_concurrent.load(AtomicOrdering::SeqCst));
+    assert!(has_deleted_ref.load(AtomicOrdering::SeqCst));
+    assert!(has_removed_concurrent_ref.load(AtomicOrdering::SeqCst));
+    assert!(
+        !dataset
+            .object_store
+            .exists(&branch.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(!dataset.object_store.exists(&concurrent_ref).await.unwrap());
     assert!(dataset.list_branches().await.unwrap().is_empty());
     assert!(
         dataset
             .object_store
             .list(Some(branch.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        dataset
+            .object_store
+            .list(Some(concurrent.base.clone()))
             .try_collect::<Vec<_>>()
             .await
             .unwrap()
