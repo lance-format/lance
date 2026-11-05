@@ -492,6 +492,14 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             })
             .transpose()?;
 
+        // The files may contain local ordinals or provisional row ids. Dropping
+        // the binding here would publish those numbers as committed identities.
+        if proto.row_binding.is_some() {
+            return Err(Error::not_supported(
+                "index segment has a row binding, which this build does not apply",
+            ));
+        }
+
         let metadata = Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -575,6 +583,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            row_binding: None,
         }
     }
 }
@@ -730,6 +739,23 @@ mod tests {
         let err = IndexMetadata::try_from(proto).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
         assert!(err.to_string().contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_rejects_a_row_binding() {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.row_binding = Some(pb::IndexRowBinding {
+            fragments: Some(pb::FragmentBinding {
+                encoding: Some(pb::fragment_binding::Encoding::Array(pb::FragmentArray {
+                    committed_fragment_ids: vec![42, 47],
+                })),
+            }),
+            row_ids: None,
+        });
+
+        let err = IndexMetadata::try_from(proto).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("row binding"), "got: {err}");
     }
 
     #[test]

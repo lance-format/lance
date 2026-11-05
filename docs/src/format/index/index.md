@@ -342,3 +342,9 @@ logical identifier that remains constant even when rows are moved during compact
 
 This feature is currently experimental. Performance evaluation is ongoing to determine
 when the tradeoff is worthwhile.
+
+## Durable row references
+
+Index files are immutable once written. Fragment IDs, and stable row IDs for new rows, are assigned when the commit builds the manifest. A concurrent commit can change those IDs after the index file has been written.
+
+[Durable index row references](durable_row_references.md) defines an optional `row_binding` on `IndexMetadata`. A retry replaces the binding and keeps the index files. Writers must not emit the field until its feature flag bit is assigned.

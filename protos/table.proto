@@ -459,6 +459,59 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Resolves references stored in index files to committed IDs.
+   * Absent when the files already store committed IDs.
+   * Requires reader and writer feature flags.
+   */
+  optional IndexRowBinding row_binding = 14;
+}
+
+/* A segment may bind fragment addresses, stable row IDs, or both.
+ * Readers reject an empty binding and an encoding they do not recognize.
+ */
+message IndexRowBinding {
+  optional FragmentBinding fragments = 1;
+  optional StableRowBinding row_ids = 2;
+}
+
+message FragmentBinding {
+  oneof encoding {
+    FragmentArray array = 1;
+  }
+}
+
+/* Fragment ordinal i resolves to committed_fragment_ids[i].
+ * The list is nonempty and its entries are unique.
+ * Entries remain in place when index coverage shrinks.
+ */
+message FragmentArray {
+  repeated uint32 committed_fragment_ids = 1;
+}
+
+message StableRowBinding {
+  oneof encoding {
+    RowIdSpans spans = 1;
+  }
+}
+
+/* Every stored row ID covered by this binding matches exactly one span.
+ * An empty list is corrupt.
+ */
+message RowIdSpans {
+  repeated RowIdSpan spans = 1;
+}
+
+/* Maps [stored_base, stored_base + count) to
+ * [committed_base, committed_base + count).
+ * count must be greater than zero.
+ * Spans must not overlap in the stored ID space or the committed ID space.
+ * A span must not overflow uint64.
+ */
+message RowIdSpan {
+  uint64 stored_base = 1;
+  uint64 committed_base = 2;
+  uint64 count = 3;
 }
 
 // Metadata about a single file within an index segment.
