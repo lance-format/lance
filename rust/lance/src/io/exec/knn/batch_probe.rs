@@ -44,7 +44,7 @@ use lance_select::RowAddrMask;
 use roaring::RoaringBitmap;
 
 use super::adaptive_probe::AutoProbePolicy;
-use super::{AnnIndexMetrics, restrict_to_segment};
+use super::{AnnIndexMetrics, LateSearchBudget, restrict_to_segment, segment_owns_rows};
 use crate::index::prefilter::DatasetPreFilter;
 
 /// One query's probe plan against one index delta.
@@ -98,13 +98,20 @@ impl BatchDelta {
     /// Release the rankings late search will not read and return whether any
     /// query still joins this delta's late search.
     ///
-    /// A query that already holds `k` candidates only gains rows, so it never
-    /// runs late search. Adaptive rankings cover every partition, so releasing
-    /// them between early scans keeps the batch from holding a full ranking for
-    /// every query of every delta until the early-search barrier.
-    pub(super) fn retain_late_work(&mut self, candidates: &[TopHits]) -> bool {
+    /// A query that already holds `budget` candidates (`k`, or fewer when the
+    /// prefilter allows fewer rows) never probes further, so its ranking can go.
+    /// Adaptive rankings cover every partition, so releasing them between early
+    /// scans keeps the batch from holding a full ranking for every query of every
+    /// delta until the early-search barrier.
+    pub(super) fn retain_late_work(
+        &mut self,
+        candidates: &[TopHits],
+        k: usize,
+        budget: usize,
+    ) -> bool {
         for (plan, hits) in self.plans.iter_mut().zip(candidates) {
-            if !plan.partitions.is_empty() && (hits.missing() == 0 || !plan.has_late_range()) {
+            let found = k - hits.missing();
+            if !plan.partitions.is_empty() && (found >= budget || !plan.has_late_range()) {
                 plan.release();
             }
         }
@@ -112,14 +119,14 @@ impl BatchDelta {
     }
 
     /// Whether this delta joins query `query_index`'s late search. Like the
-    /// single-query path, a segment whose fragments all moved to newer deltas can
-    /// produce no row, so it is skipped rather than probed to `maximum_nprobes`.
+    /// single-query path, a segment that can produce no row is skipped rather than
+    /// probed to `maximum_nprobes`: either its fragments all moved to newer deltas,
+    /// or its own prefilter selects nothing (counted in `segments_skipped` once its
+    /// early search has made the prefilter ready).
     fn joins_late_search(&self, query_index: usize) -> bool {
         self.plans[query_index].has_late_range()
-            && !self
-                .seg_mask
-                .as_ref()
-                .is_some_and(|mask| mask.max_len() == Some(0))
+            && !self.pre_filter.selects_nothing()
+            && segment_owns_rows(self.seg_mask.as_deref())
     }
 }
 
@@ -295,9 +302,10 @@ impl LateSearchProgress {
     ) -> Vec<Vec<(usize, usize)>> {
         let mut round = vec![Vec::new(); deltas.len()];
         let query_count = found.len();
-        if deltas.is_empty() || query_count == 0 {
-            return round;
-        }
+        debug_assert!(
+            !deltas.is_empty() && query_count > 0,
+            "late search plans rounds only when some query joins some delta"
+        );
         debug_assert!(max_probes > 0, "late-search probe cap must be positive");
         let mut remaining_probes = max_probes;
         let mut widths = Vec::with_capacity(deltas.len());
@@ -386,8 +394,8 @@ pub(super) async fn late_search(
     // makes the dependency explicit before reading the mask.
     pre_filter.wait_for_ready().await?;
     let prefilter_mask = pre_filter.mask();
-    let max_results = prefilter_mask.max_len().map(|len| len as usize);
-    let budget = max_results.unwrap_or(usize::MAX).min(k);
+    let stop = LateSearchBudget::new(&prefilter_mask, k);
+    let budget = stop.stop_at();
 
     // Rows found so far, counted like the single-query `initial_ids` (capped at k).
     let mut found: Vec<usize> = candidates.iter().map(|c| k - c.missing()).collect();
@@ -397,9 +405,7 @@ pub(super) async fn late_search(
             is_active.push(false);
             continue;
         }
-        if let Some(max_results) = max_results
-            && found[query_index] < max_results
-            && max_results <= k
+        if stop.emits_unseen_rows(found[query_index])
             && let Some(allowed) = prefilter_mask.iter_addrs()
         {
             // Fewer than k rows can match the prefilter: return every allowed row
@@ -499,9 +505,11 @@ pub(super) async fn late_search(
             for &(query_index, width) in &round[d] {
                 let batches: Vec<RecordBatch> = results.by_ref().take(width).collect();
                 if batches.len() != width {
-                    return Err(DataFusionError::Internal(
-                        "late batch search returned fewer results than probes".to_string(),
-                    ));
+                    return Err(DataFusionError::Internal(format!(
+                        "late batch search of delta {d} returned {} result batches for \
+                         query {query_index}'s {width} probes",
+                        batches.len()
+                    )));
                 }
                 per_query[query_index].push((d, batches.into_iter()));
                 progress.wave[d][query_index] = progress.wave[d][query_index]
@@ -624,7 +632,7 @@ mod tests {
             let partitions = Arc::downgrade(&delta.plans[0].partitions);
             let distances = Arc::downgrade(&delta.plans[0].q_c_dists);
             let candidates = vec![TopHits::new(1), TopHits::new(1)];
-            if delta.retain_late_work(&candidates) {
+            if delta.retain_late_work(&candidates, 1, 1) {
                 retained.push(delta);
             } else {
                 drop(delta);
@@ -656,13 +664,48 @@ mod tests {
             .collect();
         // Query 0 already holds k = 1 candidate; query 1 still needs late search.
         let mut candidates = vec![top_hits(1, &[(0.0, 7)]), TopHits::new(1)];
-        assert!(delta.retain_late_work(&candidates));
+        assert!(delta.retain_late_work(&candidates, 1, 1));
         assert!(rankings[0].upgrade().is_none());
         assert!(rankings[1].upgrade().is_some());
         // A later delta's early rows complete query 1 as well.
         candidates[1] = top_hits(1, &[(0.5, 8)]);
-        assert!(!delta.retain_late_work(&candidates));
+        assert!(!delta.retain_late_work(&candidates, 1, 1));
         assert!(rankings[1].upgrade().is_none());
+    }
+
+    /// A query that already holds every row the prefilter allows probes no further,
+    /// so its ranking is released even though it holds fewer than `k` rows.
+    #[tokio::test]
+    async fn test_retention_releases_rankings_once_budget_is_met() {
+        let pre_filter = empty_prefilter().await;
+        let (mut delta, _) = delta(vec![vec![]; 3], 2, pre_filter);
+        for plan in &mut delta.plans {
+            plan.partitions = Arc::new(UInt32Array::from(vec![0, 1, 2]));
+            plan.q_c_dists = Arc::new(Float32Array::from(vec![0.0, 1.0, 2.0]));
+        }
+        let rankings: Vec<_> = delta
+            .plans
+            .iter()
+            .map(|plan| Arc::downgrade(&plan.partitions))
+            .collect();
+        // k = 2, but the prefilter allows a single row: query 0 already holds it.
+        let candidates = vec![top_hits(2, &[(0.0, 7)]), TopHits::new(2)];
+        assert!(delta.retain_late_work(&candidates, 2, 1));
+        assert!(rankings[0].upgrade().is_none());
+        assert!(rankings[1].upgrade().is_some());
+    }
+
+    /// A delta whose own prefilter selects nothing can produce no row, so like the
+    /// single-query path it does not join late search.
+    #[tokio::test]
+    async fn test_delta_whose_prefilter_selects_nothing_skips_late_search() {
+        let pre_filter = prefilter_with_mask(Some(RowAddrMask::allow_nothing())).await;
+        pre_filter.wait_for_ready().await.unwrap();
+        assert!(pre_filter.selects_nothing());
+        let (mut delta, _) = delta(vec![vec![]; 3], 2, pre_filter);
+        let candidates = vec![TopHits::new(1), TopHits::new(1)];
+        assert!(!delta.joins_late_search(0));
+        assert!(!delta.retain_late_work(&candidates, 1, 1));
     }
 
     /// A query's late search must not depend on the rest of the batch. Here the
