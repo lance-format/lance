@@ -239,7 +239,7 @@ async fn cleanup_spilled_clone_files(object_store: &ObjectStore, spilled_files: 
 
 /// Who owns the manifest at a version, checked after a failed commit attempt.
 #[derive(Debug)]
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     /// The manifest at the version is the one this attempt wrote: the commit
     /// actually landed even though the store reported a failure (e.g. the
     /// response to a successful conditional PUT was lost and an internal
@@ -275,7 +275,7 @@ const COMMIT_VERIFICATION_ATTEMPTS: u32 = 3;
 ///
 /// Never returns an error. Read failures and non-definitive not-found results
 /// are retried briefly, then collapse to [`CommitOutcome::Unknown`].
-async fn verify_commit_outcome(
+pub(crate) async fn verify_commit_outcome(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,

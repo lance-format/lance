@@ -1417,7 +1417,7 @@ async fn test_concurrent_branch_creation_preserves_winner() {
 }
 
 #[tokio::test]
-async fn test_failed_branch_clone_can_be_deleted_and_recreated() {
+async fn test_failed_branch_clone_releases_reservation() {
     let tempdir = TempStrDir::default();
     let handler = Arc::new(AmbiguousCommitHandler::default());
     let data = gen_batch()
@@ -1443,20 +1443,178 @@ async fn test_failed_branch_clone_can_be_deleted_and_recreated() {
             .to_string()
             .contains("simulated outright commit failure")
     );
-    // The name stays reserved even if the clone fails, so another creator
-    // cannot race with an interrupted or ambiguously successful commit.
-    let contents = dataset.branches().get("retry").await.unwrap();
-    assert_eq!(contents.parent_version, 1);
-    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
-    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
-    assert!(error.to_string().contains("branch retry already exists"));
-
-    dataset.force_delete_branch("retry").await.unwrap();
+    assert!(dataset.list_branches().await.unwrap().is_empty());
     let branch = dataset.create_branch("retry", 1, None).await.unwrap();
     assert_eq!(
         branch.scan().try_into_batch().await.unwrap(),
         dataset.scan().try_into_batch().await.unwrap()
     );
+}
+
+#[rstest]
+#[case::lost_conflict_response(AmbiguousFailure::LandAndConflict, false)]
+#[case::lost_error_response(AmbiguousFailure::LandAndError, false)]
+#[case::unknown_outcome(AmbiguousFailure::LandAndErrorWithoutVerification, false)]
+#[case::custom_handler_error(AmbiguousFailure::LandAndError, true)]
+#[tokio::test]
+async fn test_branch_clone_preserves_landed_commit(
+    #[case] failure: AmbiguousFailure,
+    #[case] propagate_error: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let handler = Arc::new(AmbiguousCommitHandler::default());
+    let mut dataset = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            commit_handler: Some(handler.clone()),
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    handler
+        .propagate_error_after_success
+        .store(propagate_error, AtomicOrdering::SeqCst);
+    handler.fail_next(failure);
+
+    let result = dataset.create_branch("retry", 2, None).await;
+    if failure == AmbiguousFailure::LandAndErrorWithoutVerification {
+        let error = result.unwrap_err();
+        assert!(error.is_commit_status_unknown(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated ambiguous commit failure"),
+            "{error}"
+        );
+        handler.fail_resolve.store(false, AtomicOrdering::SeqCst);
+    } else if propagate_error {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated ambiguous commit failure"),
+            "{error}"
+        );
+    } else {
+        assert_eq!(result.unwrap().version().version, 2);
+    }
+    assert_eq!(
+        dataset
+            .branches()
+            .get("retry")
+            .await
+            .unwrap()
+            .parent_version,
+        2
+    );
+    let error = dataset.create_branch("retry", 2, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch retry already exists"));
+    let branch = dataset.checkout_branch("retry").await.unwrap();
+    assert_eq!(
+        branch.scan().try_into_batch().await.unwrap(),
+        dataset.scan().try_into_batch().await.unwrap()
+    );
+    assert_eq!(branch.versions().await.unwrap().len(), 1);
+}
+
+#[rstest]
+#[case::complete_history(false)]
+#[case::missing_first_manifest(true)]
+#[tokio::test]
+async fn test_create_branch_rejects_orphaned_versions(
+    #[case] remove_first_manifest: bool,
+    #[values(false, true)] enable_v2_manifest_paths: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let branch_location = dataset.branch_location().find_branch(Some("exp")).unwrap();
+    dataset.branches().create("exp", 1, None).await.unwrap();
+    // Choose the branch's naming scheme independently of create_branch's default.
+    let mut orphan = CommitBuilder::new(branch_location.uri.as_str())
+        .with_object_store(dataset.object_store.clone())
+        .with_commit_handler(dataset.commit_handler.clone())
+        .enable_v2_manifest_paths(enable_v2_manifest_paths)
+        .execute(Transaction::new(
+            1,
+            Operation::Clone {
+                is_shallow: true,
+                ref_name: None,
+                ref_version: 1,
+                ref_path: dataset.uri().to_string(),
+                branch_name: Some("exp".to_string()),
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let first_manifest = orphan.manifest_location.path.clone();
+    orphan.append(id_rows(999, 1), None).await.unwrap();
+    // Leave the same storage state as a write racing branch deletion, without
+    // depending on whether writes through deleted handles are permitted.
+    dataset
+        .object_store
+        .delete(&branch_contents_path(&dataset.base, "exp"))
+        .await
+        .unwrap();
+    if remove_first_manifest {
+        dataset.object_store.delete(&first_manifest).await.unwrap();
+    }
+    dataset.append(id_rows(10, 2), None).await.unwrap();
+    let source_version = if remove_first_manifest { 1 } else { 2 };
+    let expected = dataset
+        .checkout_version(source_version)
+        .await
+        .unwrap()
+        .scan()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = dataset
+            .create_branch("exp", source_version, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert!(error.to_string().contains("exp"), "{error}");
+        assert!(error.to_string().contains("_versions"), "{error}");
+        assert!(dataset.list_branches().await.unwrap().is_empty());
+        assert!(
+            dataset
+                .object_store
+                .exists(&orphan.manifest_location.path)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            dataset.object_store.exists(&first_manifest).await.unwrap(),
+            !remove_first_manifest
+        );
+    }
+
+    dataset.force_delete_branch("exp").await.unwrap();
+    let recreated = dataset
+        .create_branch("exp", source_version, None)
+        .await
+        .unwrap();
+    assert_eq!(recreated.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(recreated.versions().await.unwrap().len(), 1);
+    assert_eq!(recreated.version().version, source_version);
 }
 
 #[tokio::test]

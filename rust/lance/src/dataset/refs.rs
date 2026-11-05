@@ -466,13 +466,13 @@ impl Branches<'_> {
         }
     }
 
-    // Only create branch metadata
+    // Reserve branch metadata and return its identifier for ownership checks.
     pub(crate) async fn create(
         &self,
         branch_name: &str,
         version_number: u64,
         source_branch: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<BranchIdentifier> {
         check_valid_branch(branch_name)?;
 
         let source_branch = source_branch.and_then(standardize_branch);
@@ -534,7 +534,8 @@ impl Branches<'_> {
             serde_json::to_vec_pretty(&branch_contents)?,
             format!("branch {} already exists", branch_name),
         )
-        .await
+        .await?;
+        Ok(branch_contents.identifier)
     }
 
     pub async fn replace_metadata(

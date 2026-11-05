@@ -49,6 +49,7 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
+use crate::io::commit::{CommitOutcome, verify_commit_outcome};
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -643,9 +644,11 @@ impl Dataset {
     /// A concurrent creator that cannot reserve the name returns a conflict without
     /// writing to the branch dataset.
     ///
-    /// If cloning fails or is interrupted, the name remains reserved, since the clone
-    /// commit may have succeeded even if its result is unknown. Use
-    /// [`Self::force_delete_branch`] to clean up the incomplete branch before retrying.
+    /// Destinations with leftover version data are rejected without reserving the name.
+    /// Use [`Self::force_delete_branch`] to explicitly clean up the leftover data before
+    /// retrying. A definite clone failure releases the reservation. If cloning is
+    /// interrupted or its commit outcome is unknown, the name remains reserved since
+    /// the clone may have succeeded.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
@@ -667,6 +670,21 @@ impl Dataset {
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
+        if self.object_store.exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {branch} already exists"),
+            });
+        }
+        let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
+        if has_any_entry(&self.object_store, &versions_path).await? {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Cannot create branch {branch}: {versions_path} contains leftover version data. \
+                     Use force_delete_branch to clean up the unused branch before retrying"
+                ),
+            });
+        }
         let source_location = self
             .branch_location()
             .find_branch(source_branch.as_deref())?;
@@ -680,7 +698,8 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         // Claim the name before the clone can write into another creator's branch.
-        self.branches()
+        let branch_id = self
+            .branches()
             .create(branch, version_number, source_branch.as_deref())
             .await?;
 
@@ -692,7 +711,41 @@ impl Dataset {
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+        match builder.execute(transaction.clone()).await {
+            Err(error) if !error.is_commit_status_unknown() => {
+                // Custom handlers may return an error even after their commit landed.
+                // Release only the ref, preserving any foreign destination data.
+                if matches!(
+                    verify_commit_outcome(
+                        &self.object_store,
+                        self.commit_handler.as_ref(),
+                        &branch_location.path,
+                        version_number,
+                        &transaction,
+                    )
+                    .await,
+                    CommitOutcome::Absent | CommitOutcome::Foreign
+                ) {
+                    // A delete and recreate may have replaced our reservation during verification.
+                    match self.branches().get(branch).await {
+                        Ok(contents) if contents.identifier == branch_id => {
+                            if let Err(cleanup_error) = self.object_store.delete(&branch_file).await
+                            {
+                                warn!(
+                                    "Failed to release branch {branch} after clone failure: {cleanup_error}"
+                                );
+                            }
+                        }
+                        Ok(_) | Err(Error::RefNotFound { .. }) => {}
+                        Err(cleanup_error) => warn!(
+                            "Failed to verify branch {branch} reservation after clone failure: {cleanup_error}"
+                        ),
+                    }
+                }
+                Err(error)
+            }
+            result => result,
+        }
     }
 
     /// Deletes a branch and removes its directory when safe.
