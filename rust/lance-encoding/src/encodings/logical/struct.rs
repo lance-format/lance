@@ -339,28 +339,13 @@ impl StructuralStructDecoder {
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
-        self.children.iter().try_fold(
-            DrainLimit {
-                rows: num_rows,
-                bytes: 0,
-                dictionary_rows: None,
-            },
-            |limit, child| {
+        self.children
+            .iter()
+            .try_fold(DrainLimit::all_rows(num_rows), |limit, child| {
                 child
                     .max_rows_to_drain(num_rows, byte_budget)
-                    .map(|child_limit| DrainLimit {
-                        rows: limit.rows.min(child_limit.rows),
-                        bytes: limit.bytes.max(child_limit.bytes),
-                        dictionary_rows: match (limit.dictionary_rows, child_limit.dictionary_rows)
-                        {
-                            (Some(current), Some(child)) => Some(current.min(child)),
-                            (Some(current), None) => Some(current),
-                            (None, Some(child)) => Some(child),
-                            (None, None) => None,
-                        },
-                    })
-            },
-        )
+                    .map(|child_limit| limit.combine_sibling(child_limit))
+            })
     }
 
     fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
