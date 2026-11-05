@@ -443,19 +443,26 @@ impl BlobV2FieldRewritePlan {
 
         match (field.data_type(), input_field.data_type()) {
             (ArrowDataType::Struct(_), ArrowDataType::Struct(input_children)) => {
-                if field.children.len() != input_children.len() {
-                    return Err(Error::internal(format!(
-                        "Struct field '{}' expected {} children in blob rewrite plan, got {}",
-                        field.name,
-                        field.children.len(),
-                        input_children.len()
-                    )));
-                }
-                let children = field
-                    .children
+                // Bind each input child to the dataset child of the same name, in
+                // input order: a Blob v2 descriptor is resolved with its field id,
+                // so pairing children by position would resolve a reordered child
+                // against another child's payload. A child the dataset does not
+                // have cannot be given a field id, so it is refused rather than
+                // borrowing one.
+                let children = input_children
                     .iter()
-                    .zip(input_children.iter())
-                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
+                    .map(|input_child| {
+                        let child = field.child(input_child.name()).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "Struct field '{}' has no child '{}' in the dataset schema, so '{}.{}' cannot be rewritten",
+                                field.name,
+                                input_child.name(),
+                                field.name,
+                                input_child.name()
+                            ))
+                        })?;
+                        Self::try_new(child, input_child, preserve_managed)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -605,6 +612,19 @@ impl BlobV2FieldRewritePlan {
                             children.len(),
                             struct_arr.num_columns()
                         )));
+                    }
+                    // The children were bound to names at plan time, so a batch
+                    // whose columns arrive in another order must not be paired
+                    // positionally against them.
+                    for (child, array_field) in children.iter().zip(struct_arr.fields()) {
+                        if child.output_field().name() != array_field.name() {
+                            return Err(Error::invalid_input(format!(
+                                "Struct field '{}' child '{}' does not match the rewrite plan's child '{}'",
+                                field_name,
+                                array_field.name(),
+                                child.output_field().name()
+                            )));
+                        }
                     }
                     let mut child_arrays = Vec::with_capacity(children.len());
                     for (child, child_array) in children.iter().zip(struct_arr.columns()) {
