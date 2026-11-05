@@ -369,6 +369,16 @@ fn test_map_open_error() {
         ErrorCode::Internal
     );
 
+    // A damaged manifest must not read as a missing table: a caller could create it anew.
+    let corrupt_file = Error::corrupt_file_named("_versions/1.manifest", "cut short");
+    assert_eq!(
+        mutation_error_code(DirectoryNamespace::map_open_error(
+            corrupt_file,
+            not_found()
+        )),
+        ErrorCode::Internal
+    );
+
     let io_not_found: Error = ObjectStoreError::NotFound {
         path: "x".to_string(),
         source: "missing".into(),
