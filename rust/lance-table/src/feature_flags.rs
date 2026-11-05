@@ -451,6 +451,19 @@ fn data_overlay_files_enabled() -> bool {
 /// Refuse to publish a manifest that carries data overlay files from a build that
 /// does not understand them: every later open of the dataset by this build would
 /// be refused.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_table::feature_flags::validate_data_overlay_files;
+/// # use lance_table::format::Manifest;
+/// # fn publish(manifest: &Manifest) -> Result<()> {
+/// validate_data_overlay_files(manifest)?;
+/// // Publish the manifest only after this check succeeds.
+/// # Ok(())
+/// # }
+/// ```
 pub fn validate_data_overlay_files(manifest: &Manifest) -> Result<()> {
     validate_data_overlay_files_when(manifest, data_overlay_files_enabled())
 }
