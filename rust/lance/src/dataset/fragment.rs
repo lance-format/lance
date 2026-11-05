@@ -111,7 +111,7 @@ pub struct FileFragment {
 
 pub(crate) use lance_table_runtime::fragment::V1FragmentReader;
 pub use lance_table_runtime::fragment::{
-    BaseSchedulers, FragReadConfig, FragmentReader, GenericFileReader,
+    BaseSchedulers, FragReadConfig, FragmentOpenCache, FragmentReader, GenericFileReader,
 };
 
 pub(crate) use lance_table_runtime::fragment::{duplicate_field_path, relax_nullability};

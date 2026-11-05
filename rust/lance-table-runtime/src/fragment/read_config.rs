@@ -8,6 +8,8 @@ use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
+use super::FragmentOpenCache;
+
 /// A per-scan cache of `ScanScheduler`s for non-default bases.
 ///
 /// Files that live on an additional base (e.g. shallow clones) each need a
@@ -124,6 +126,10 @@ pub struct FragReadConfig {
     /// loaded and deleted rows come back with their stored values. Only for a
     /// caller that knows the rows it asks for are live.
     pub ignore_deletions: bool,
+    /// Per-scan cache of reader-open state, shared by the scan's fragments.
+    ///
+    /// Only used when opening with the projection the cache was built for.
+    pub open_cache: Option<Arc<FragmentOpenCache>>,
 }
 
 impl FragReadConfig {
@@ -204,6 +210,11 @@ impl FragReadConfig {
 
     pub fn with_base_schedulers(mut self, value: BaseSchedulers) -> Self {
         self.base_schedulers = Some(value);
+        self
+    }
+
+    pub fn with_open_cache(mut self, value: Arc<FragmentOpenCache>) -> Self {
+        self.open_cache = Some(value);
         self
     }
 }

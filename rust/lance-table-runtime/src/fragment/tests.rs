@@ -313,3 +313,219 @@ async fn storage_statistics_require_full_file_metadata() {
     let stats = reader.storage_stats().unwrap();
     assert_eq!(stats.len(), 5);
 }
+
+mod open_cache {
+    use std::sync::Arc;
+
+    use lance_core::datatypes::Schema;
+    use lance_file::version::ConcreteFileVersion;
+    use lance_table::format::DataFile;
+    use rstest::rstest;
+
+    use super::super::FileFragment;
+    use super::super::open_cache::FileOpenState;
+    use super::FragReadConfig;
+    use crate::fragment::FragmentOpenCache;
+    use crate::test_util::test_commit_table;
+
+    fn uncached_open_state(
+        fragment: &FileFragment,
+        data_file: &DataFile,
+        projection: &Schema,
+    ) -> Arc<FileOpenState> {
+        fragment
+            .file_open_state(data_file, Some(projection), &FragReadConfig::default())
+            .unwrap()
+    }
+
+    fn same_open_state(a: &FileOpenState, b: &FileOpenState) -> bool {
+        a.data_file_schema == b.data_file_schema
+            && a.schema_per_file == b.schema_per_file
+            && a.field_id_to_column_idx == b.field_id_to_column_idx
+            && a.physical == b.physical
+    }
+
+    /// `data_file` with its column indices shifted, which makes another layout.
+    fn layout_variant(data_file: &DataFile, shift: i32) -> DataFile {
+        let mut variant = data_file.clone();
+        variant.column_indices = data_file
+            .column_indices
+            .iter()
+            .map(|column_index| column_index + shift)
+            .collect();
+        variant
+    }
+
+    fn with_version(data_file: &DataFile, version: ConcreteFileVersion) -> DataFile {
+        let mut data_file = data_file.clone();
+        (data_file.file_major_version, data_file.file_minor_version) =
+            version.to_data_file_numbers();
+        data_file
+    }
+
+    /// A table, its first fragment and that fragment's first data file.
+    async fn first_file(num_fragments: usize) -> (Arc<crate::Table>, FileFragment, DataFile) {
+        let table = Arc::new(test_commit_table(num_fragments * 10, num_fragments).await);
+        let fragment = FileFragment::new(table.clone(), table.manifest.fragments[0].clone());
+        let data_file = fragment.metadata().files[0].clone();
+        (table, fragment, data_file)
+    }
+
+    #[rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0)]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_open_cache_keeps_one_entry_per_layout(#[case] version: ConcreteFileVersion) {
+        let (table, fragment, data_file) = first_file(3).await;
+        let data_file = with_version(&data_file, version);
+        let projection = Arc::new(table.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(
+            table.manifest.clone(),
+            projection.clone(),
+        ));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        let first = fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        let second = fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.physical.is_some());
+        assert!(same_open_state(
+            &first,
+            &uncached_open_state(&fragment, &data_file, &projection)
+        ));
+        assert_eq!(cache.num_entries(), 1);
+
+        // Every fragment's file shares the entry, by pointer or by value.
+        let by_value = layout_variant(&data_file, 0);
+        assert!(!Arc::ptr_eq(
+            &by_value.column_indices,
+            &data_file.column_indices
+        ));
+        for state in table
+            .manifest
+            .fragments
+            .iter()
+            .map(|f| FileFragment::new(table.clone(), f.clone()))
+            .map(|f| {
+                let file = with_version(&f.metadata().files[0], version);
+                f.file_open_state(&file, Some(projection.as_ref()), &config)
+                    .unwrap()
+            })
+            .chain([fragment
+                .file_open_state(&by_value, Some(projection.as_ref()), &config)
+                .unwrap()])
+        {
+            assert!(Arc::ptr_eq(&first, &state));
+        }
+        assert_eq!(cache.num_entries(), 1);
+
+        // Parallel misses on one layout keep the first insert.
+        let a = uncached_open_state(&fragment, &layout_variant(&data_file, 1), &projection);
+        let b = uncached_open_state(&fragment, &layout_variant(&data_file, 1), &projection);
+        assert!(Arc::ptr_eq(&cache.insert(a.clone()), &a));
+        assert!(Arc::ptr_eq(&cache.insert(b), &a));
+        assert_eq!(cache.num_entries(), 2);
+    }
+
+    /// `(0, 3)` and `(2, 0)` both decode as 2.0 but are distinct layouts.
+    #[tokio::test]
+    async fn test_open_cache_keys_on_file_version_numbers() {
+        let (table, fragment, data_file) = first_file(1).await;
+        let data_file = with_version(&data_file, ConcreteFileVersion::V2_0);
+        let projection = Arc::new(table.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(
+            table.manifest.clone(),
+            projection.clone(),
+        ));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        let mut other_version = data_file.clone();
+        (
+            other_version.file_major_version,
+            other_version.file_minor_version,
+        ) = match (data_file.file_major_version, data_file.file_minor_version) {
+            (0, 3) => (2, 0),
+            _ => (0, 3),
+        };
+        let first = fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        let second = fragment
+            .file_open_state(&other_version, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.num_entries(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_open_cache_beyond_capacity_computes_uncached() {
+        let (table, fragment, data_file) = first_file(1).await;
+        let projection = Arc::new(table.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(
+            table.manifest.clone(),
+            projection.clone(),
+        ));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        let num_layouts = FragmentOpenCache::MAX_ENTRIES as i32 + 4;
+        for shift in 0..num_layouts {
+            let variant = layout_variant(&data_file, shift);
+            let state = fragment
+                .file_open_state(&variant, Some(projection.as_ref()), &config)
+                .unwrap();
+            assert!(same_open_state(
+                &state,
+                &uncached_open_state(&fragment, &variant, &projection)
+            ));
+        }
+        assert_eq!(cache.num_entries(), FragmentOpenCache::MAX_ENTRIES);
+
+        let overflow = layout_variant(&data_file, num_layouts - 1);
+        let first = fragment
+            .file_open_state(&overflow, Some(projection.as_ref()), &config)
+            .unwrap();
+        let second = fragment
+            .file_open_state(&overflow, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(same_open_state(&first, &second));
+        assert_eq!(cache.num_entries(), FragmentOpenCache::MAX_ENTRIES);
+    }
+
+    #[tokio::test]
+    async fn test_open_cache_ignores_other_projections_and_manifests() {
+        let (table, fragment, data_file) = first_file(1).await;
+        let projection = Arc::new(table.schema().clone());
+        let cache = Arc::new(FragmentOpenCache::new(
+            table.manifest.clone(),
+            projection.clone(),
+        ));
+        let config = FragReadConfig::default().with_open_cache(cache.clone());
+
+        // An equal projection at another address is not the cache's projection.
+        let equal_projection = Arc::new(table.schema().clone());
+        let narrow_projection = Arc::new(table.schema().project(&["a"]).unwrap());
+        for other in [&equal_projection, &narrow_projection] {
+            let state = fragment
+                .file_open_state(&data_file, Some(other.as_ref()), &config)
+                .unwrap();
+            assert!(same_open_state(
+                &state,
+                &uncached_open_state(&fragment, &data_file, other)
+            ));
+        }
+        assert_eq!(cache.num_entries(), 0);
+
+        // An equal table with another manifest.
+        let (_, other_fragment, _) = first_file(1).await;
+        other_fragment
+            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .unwrap();
+        assert_eq!(cache.num_entries(), 0);
+    }
+}
