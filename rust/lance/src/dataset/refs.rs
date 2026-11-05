@@ -445,16 +445,14 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
-        }
-
-        let branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-
-        Ok(branch_contents)
+        BranchContents::from_path(&branch_file, self.object_store(), branch)
+            .await
+            .map_err(|error| match error {
+                error if error.is_not_found() => Error::RefNotFound {
+                    message: format!("branch {branch} does not exist"),
+                },
+                error => error,
+            })
     }
 
     pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
@@ -618,12 +616,21 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        if self.object_store().exists(&branch_file).await? {
+        let has_ref = self.object_store().exists(&branch_file).await?;
+        if has_ref {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
-        self.cleanup_branch_directories(branch).await
+        // Removing the ref completes the logical deletion. In-flight writers
+        // can still create files while cleanup runs, but cannot acknowledge a
+        // commit after observing the missing ref. Retained files are not a branch.
+        match self.cleanup_branch_directories(branch).await {
+            Err(error) if has_ref => {
+                log::warn!("Failed to clean up deleted branch {branch}: {error}");
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     pub async fn list_ordered(

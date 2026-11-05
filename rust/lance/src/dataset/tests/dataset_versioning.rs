@@ -13,10 +13,14 @@ use std::vec;
 use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{AutoCleanupParams, UpdateBuilder};
+use crate::dataset::{
+    AutoCleanupParams, MergeInsertBuilder, NewColumnTransform, UpdateBuilder, WhenNotMatched,
+};
 use crate::datatypes::Schema;
 use crate::io::commit::load_and_sort_new_transactions;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+};
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
 use arrow_array::RecordBatch;
@@ -1291,6 +1295,256 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_deleted_branch_rejects_stale_writes(
+    #[values(false, true)] recreate: bool,
+    #[values(false, true)] reopen: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let mut root = Dataset::write(
+        id_rows(0, 4),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(root.get_fragments().len(), 2);
+    let mut stale = root.create_branch("exp", 1, None).await.unwrap();
+    if reopen {
+        stale = Dataset::open(stale.uri()).await.unwrap();
+    }
+    let identifier = stale.branch_identifier().await.unwrap();
+    root.delete_branch("exp").await.unwrap();
+    if recreate {
+        let current = root.create_branch("exp", 1, None).await.unwrap();
+        assert_ne!(identifier, current.branch_identifier().await.unwrap());
+    }
+
+    let error = stale.append(id_rows(100, 1), None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    let error = stale.delete("id = 0").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = MergeInsertBuilder::try_new(Arc::new(stale.clone()), vec!["id".into()])
+        .unwrap()
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(id_rows(100, 1)) as Box<dyn RecordBatchReader + Send>)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = UpdateBuilder::new(Arc::new(stale.clone()))
+        .set("id", "id + 1")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = stale
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("twice".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = CommitBuilder::new(Arc::new(stale.clone()))
+        .with_detached(true)
+        .execute(Transaction::new(
+            stale.version().version,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+
+    assert_eq!(stale.version().version, 1);
+    let error = stale.checkout_version(1).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    assert_eq!(root.count_rows(None).await.unwrap(), 4);
+    if recreate {
+        let mut current = root.checkout_branch("exp").await.unwrap();
+        assert_eq!(current.version().version, 1);
+        assert_eq!(current.count_rows(None).await.unwrap(), 4);
+        current.append(id_rows(10, 1), None).await.unwrap();
+        assert_eq!(current.count_rows(None).await.unwrap(), 5);
+    } else {
+        assert!(root.list_branches().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_deleted_branch_cannot_checkout_retained_manifests() {
+    let mut root = Dataset::write(
+        id_rows(0, 2),
+        "memory://",
+        Some(WriteParams {
+            session: Some(Arc::default()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut stale = root.create_branch("exp", 1, None).await.unwrap();
+    root.tags().create("snapshot", ("exp", 1)).await.unwrap();
+    // Model an interrupted cleanup or an in-flight writer leaving manifests.
+    let metadata = branch_contents_path(&root.base, "exp");
+    root.object_store.delete(&metadata).await.unwrap();
+
+    for version in [None, Some(1)] {
+        let error = root.checkout_version(("exp", version)).await.unwrap_err();
+        assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+        assert!(error.to_string().contains("branch exp"), "{error}");
+    }
+    let error = root.checkout_version("snapshot").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = DatasetBuilder::from_uri(root.uri())
+        .with_session(root.session())
+        .with_branch("exp", None)
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = DatasetBuilder::from_uri(stale.uri())
+        .with_session(root.session())
+        .load()
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    let error = stale.checkout_latest().await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+}
+
+#[derive(Debug)]
+struct DeleteBranchOnCommit {
+    root: Dataset,
+    after_publish: bool,
+    inner: AmbiguousCommitHandler,
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for DeleteBranchOnCommit {
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base_path: &Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        if !self.after_publish {
+            self.root
+                .branches()
+                .delete("exp", false)
+                .await
+                .map_err(CommitError::OtherError)?;
+        }
+        let result = self
+            .inner
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await;
+        if self.after_publish {
+            self.root
+                .branches()
+                .delete("exp", false)
+                .await
+                .map_err(CommitError::OtherError)?;
+        }
+        result
+    }
+}
+
+#[rstest]
+#[case::success(None)]
+#[case::ambiguous_conflict(Some(AmbiguousFailure::LandAndConflict))]
+#[case::ambiguous_error(Some(AmbiguousFailure::LandAndError))]
+#[tokio::test]
+async fn test_deleted_branch_during_commit_is_not_acknowledged(
+    #[case] failure: Option<AmbiguousFailure>,
+    #[values(false, true)] after_publish: bool,
+    #[values(false, true)] detached: bool,
+) {
+    let mut root = Dataset::write(id_rows(0, 2), "memory://", None)
+        .await
+        .unwrap();
+    let stale = root.create_branch("exp", 1, None).await.unwrap();
+    let handler = Arc::new(DeleteBranchOnCommit {
+        root: root.clone(),
+        after_publish,
+        inner: AmbiguousCommitHandler::default(),
+    });
+    if let Some(failure) = failure {
+        handler.inner.fail_next(failure);
+    }
+    let error = CommitBuilder::new(Arc::new(stale))
+        .with_commit_handler(handler)
+        .with_detached(detached)
+        .execute(Transaction::new(
+            1,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch exp"), "{error}");
+    assert!(root.list_branches().await.unwrap().is_empty());
+    let error = root.checkout_branch("exp").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative() {
+    let mut root = Dataset::write(id_rows(0, 2), "memory://", None)
+        .await
+        .unwrap();
+    let deleted = root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    let mut store = root.object_store.as_ref().clone();
+    store.inner = Arc::new(DirectoryMarkerStore {
+        inner: store.inner.clone(),
+        marker: deleted.base.clone(),
+        // Force the shared-directory traversal to fail before removing files.
+        listings: AtomicUsize::new(1),
+    });
+    root.refs.object_store = Arc::new(store);
+
+    root.delete_branch("a").await.unwrap();
+    assert!(
+        deleted
+            .object_store
+            .exists(&deleted.manifest_location.path)
+            .await
+            .unwrap()
+    );
+    assert!(!root.list_branches().await.unwrap().contains_key("a"));
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let child = root.checkout_branch("a/b").await.unwrap();
+    assert_eq!(child.count_rows(None).await.unwrap(), 2);
+}
+
+#[rstest]
 #[case::older_source(1, 2)]
 #[case::newer_source(2, 1)]
 #[tokio::test]
@@ -1644,12 +1898,8 @@ async fn test_delete_branch_with_shared_directory(
     assert!(branches.contains_key(remaining_branch));
     for version in [None, Some(1), Some(2)] {
         let error = dataset.checkout_version(("a", version)).await.unwrap_err();
-        assert!(matches!(
-            error,
-            Error::NotFound { .. } | Error::DatasetNotFound { .. }
-        ));
-        let message = error.to_string().replace('\\', "/");
-        assert!(message.contains(deleted.base.as_ref()), "{error}");
+        assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+        assert!(error.to_string().contains("branch a"), "{error}");
     }
     let files = dataset
         .object_store
@@ -2006,17 +2256,8 @@ async fn test_delete_branch_preserves_nested_dataset_data(
         }
     }
     let error = root.checkout_branch("a").await.unwrap_err();
-    assert!(matches!(
-        error,
-        Error::NotFound { .. } | Error::DatasetNotFound { .. }
-    ));
-    assert!(
-        error
-            .to_string()
-            .replace('\\', "/")
-            .contains(deleted.base.as_ref()),
-        "{error}"
-    );
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
     let mut recreated = root.create_branch("a", 1, None).await.unwrap();
     recreated.append(id_rows(40, 1), None).await.unwrap();
     assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
@@ -2440,7 +2681,7 @@ async fn test_delete_branch_preserves_symlink_routed_child_namespace() {
         .checkout_version(("a", None))
         .await
     {
-        Err(Error::NotFound { .. } | Error::DatasetNotFound { .. }) => {}
+        Err(Error::RefNotFound { .. }) => {}
         Err(error) => panic!("unexpected checkout error: {error}"),
         Ok(still_readable) => panic!(
             "deleted branch is still readable: {:?}",
@@ -2812,9 +3053,8 @@ async fn test_branch() {
     assert_eq!(main_by_ref.manifest.branch, None);
 
     // A checkout whose resolved manifest is not on the requested branch must
-    // error loudly instead of handing back another branch's data: stage main's
-    // manifest under a branch path that was never created, so resolution finds
-    // a manifest belonging to main.
+    // error loudly instead of handing back another branch's data: reserve a
+    // branch name but stage main's manifest there instead of cloning it.
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",
@@ -2828,6 +3068,11 @@ async fn test_branch() {
         .copy(&staged_manifest, &staged_copy)
         .await
         .unwrap();
+    main_dataset
+        .branches()
+        .create("ghost", 1, None)
+        .await
+        .unwrap();
     let err = main_dataset.checkout_branch("ghost").await.unwrap_err();
     assert!(
         err.to_string().contains("resolved a manifest belonging to"),
@@ -2837,6 +3082,11 @@ async fn test_branch() {
     main_dataset
         .object_store
         .remove_dir_all(Path::parse(format!("{}/tree/ghost", test_uri)).unwrap())
+        .await
+        .unwrap();
+    main_dataset
+        .object_store
+        .delete(&branch_contents_path(&main_dataset.base, "ghost"))
         .await
         .unwrap();
 
@@ -2900,17 +3150,17 @@ async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
         ref_path: source_location.uri,
         branch_name: Some(branch.to_string()),
     };
+    source
+        .branches()
+        .create(branch, version, source_branch.as_deref())
+        .await
+        .unwrap();
     CommitBuilder::new(location.uri.as_str())
         .with_store_params(source.store_params.as_deref().cloned().unwrap_or_default())
         .with_object_store(Arc::new(source.object_store.as_ref().clone()))
         .with_commit_handler(source.commit_handler.clone())
         .with_exact_storage_format(source.manifest.data_storage_format.lance_file_format())
         .execute(Transaction::new(version, clone, None))
-        .await
-        .unwrap();
-    source
-        .branches()
-        .create(branch, version, source_branch.as_deref())
         .await
         .unwrap();
 }
@@ -2946,12 +3196,10 @@ async fn deleting_nested_branch_preserves_parent(
 
     assert!(!root.list_branches().await.unwrap().contains_key(&nested));
     let nested_dir = std::path::Path::new(uri).join("tree/outer").join(segment);
-    if directory_stays {
-        let preserved = root.checkout_branch(&nested).await.unwrap_or_else(|error| {
-            panic!("deleted branch {nested} should stay openable: {error}")
-        });
-        assert_eq!(preserved.count_rows(None).await.unwrap(), 5);
-    } else {
+    let error = root.checkout_branch(&nested).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains(&nested), "{error}");
+    if !directory_stays {
         assert!(
             !nested_dir.exists(),
             "ordinary nested branch directory should be removed: {}",
