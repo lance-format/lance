@@ -1474,7 +1474,10 @@ mod tests {
             .await
             .unwrap()
             .to_vec();
-        bytes[8] ^= 1;
+        // An inline transaction can precede the manifest protobuf. Change its
+        // final byte, immediately before the fixed 16-byte footer.
+        let manifest_byte = bytes.len() - 17;
+        bytes[manifest_byte] ^= 1;
         dataset
             .object_store
             .inner
