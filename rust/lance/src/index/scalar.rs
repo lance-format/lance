@@ -326,11 +326,13 @@ pub(crate) async fn load_fts_training_data(
     // scanner and indexing workers. Keep explicit reader settings, and apply
     // a byte target only to this training scan, not to the caller's dataset.
     let mut dataset = dataset.clone();
-    dataset
-        .file_reader_options
-        .get_or_insert_with(Default::default)
-        .batch_size_bytes
-        .get_or_insert(16 * 1024 * 1024);
+    Arc::make_mut(
+        dataset
+            .file_reader_options
+            .get_or_insert_with(Default::default),
+    )
+    .batch_size_bytes
+    .get_or_insert(16 * 1024 * 1024);
     let scan_column = if resolved.has_lists() {
         resolved.root_column.as_str()
     } else {
@@ -1814,11 +1816,11 @@ mod tests {
             .await
             .unwrap();
         if let Some(byte_target) = byte_target {
-            dataset.file_reader_options = Some(lance_file::reader::FileReaderOptions {
+            dataset.file_reader_options = Some(Arc::new(lance_file::reader::FileReaderOptions {
                 batch_size_bytes: Some(byte_target),
                 read_chunk_size: 1024 * 1024,
                 ..Default::default()
-            });
+            }));
         }
         assert!(largest_original_batch(&dataset).await >= 40);
         let params = InvertedIndexParams::default().num_workers(workers);
