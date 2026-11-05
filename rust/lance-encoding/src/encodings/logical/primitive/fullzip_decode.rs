@@ -930,8 +930,6 @@ impl VariableFullZipDecoder {
         }
 
         let sliced_data = data.slice_with_length(data_start, data_end - data_start);
-        // Copy into a compact buffer so each output batch owns only what it references.
-        let sliced_data = LanceBuffer::copy_slice(&sliced_data);
         let rebased_offsets = LanceBuffer::reinterpret_vec(rebased_offsets);
         Ok((sliced_data, rebased_offsets))
     }
@@ -1237,6 +1235,13 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         // Keep each batch's variable data buffer bounded to the selected rows.
         let (data, offsets) =
             Self::slice_batch_data_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
+        // Copy into a compact buffer so each output batch owns only what it references,
+        // unless the decompressor writes its output to new buffers anyway.
+        let data = if self.decompressor.allocates_output() {
+            data
+        } else {
+            LanceBuffer::copy_slice(&data)
+        };
 
         let repdef_start = self.repdef_starts[start];
         let repdef_end = self.repdef_starts[end];
@@ -2376,6 +2381,48 @@ mod tests {
             "planned {planned} bytes must cover actual {} bytes",
             actual.data_size
         );
+    }
+
+    /// A partial output batch must own its value buffer instead of aliasing the
+    /// full-zip page, for both pass-through and allocating decompressors.
+    #[test]
+    fn test_full_zip_batch_data_does_not_alias_page_buffer() {
+        use crate::decoder::StructuralPageDecoder;
+
+        let values = ["alpha-alpha", "beta-beta", "gamma-gamma"];
+        let num_rows = 2;
+        let expected: Vec<u8> = values[..num_rows]
+            .iter()
+            .flat_map(|value| value.as_bytes().iter().copied())
+            .collect();
+        let compressors: [(&str, Box<dyn PerValueCompressor>); 2] = [
+            ("pass-through", Box::new(VariableEncoder::default())),
+            (
+                "fsst",
+                Box::new(FsstPerValueEncoder::new(Box::new(
+                    VariableEncoder::default(),
+                ))),
+            ),
+        ];
+
+        for (name, compressor) in compressors {
+            let mut decoder = compressed_variable_full_zip(compressor.as_ref(), &values);
+            let page_data = decoder.data.clone();
+            let page_start = page_data.as_ptr() as usize;
+            let page_end = page_start + page_data.len();
+
+            let decoded = decoder.drain(num_rows as u64).unwrap().decode().unwrap();
+            let DataBlock::VariableWidth(block) = decoded.data else {
+                panic!("{name} full-zip decode did not produce variable-width data");
+            };
+            let out_start = block.data.as_ptr() as usize;
+            let out_end = out_start + block.data.len();
+            assert!(
+                out_end <= page_start || out_start >= page_end,
+                "{name} full-zip batch data aliases the page buffer"
+            );
+            assert_eq!(block.data.as_ref(), expected.as_slice());
+        }
     }
 
     fn decode_variable_full_zip(
