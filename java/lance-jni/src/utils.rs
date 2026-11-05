@@ -205,6 +205,7 @@ pub fn build_compaction_options(
     target_rows_per_fragment: &JObject,        // Optional<Long>
     max_rows_per_group: &JObject,              // Optional<Long>
     max_bytes_per_file: &JObject,              // Optional<Long>
+    min_bytes_per_file: &JObject,              // Optional<Long>
     materialize_deletions: &JObject,           // Optional<Boolean>
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
@@ -229,6 +230,13 @@ pub fn build_compaction_options(
     }
     if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
         compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(bytes) = env.get_long_opt(min_bytes_per_file)? {
+        compaction_options.min_bytes_per_file = Some(usize::try_from(bytes).map_err(|_| {
+            lance::Error::invalid_input(format!(
+                "min_bytes_per_file must be a positive integer, got {bytes}"
+            ))
+        })?);
     }
     if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
         compaction_options.materialize_deletions = materialize_deletions_val;

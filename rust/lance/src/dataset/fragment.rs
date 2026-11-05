@@ -1263,7 +1263,11 @@ impl FileFragment {
             None,
             Arc::<DecoderPlugins>::default(),
             &dataset.metadata_cache.file_metadata_cache(&filepath),
-            dataset.file_reader_options.clone().unwrap_or_default(),
+            dataset
+                .file_reader_options
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
         )
         .await?;
         // If the schemas are not compatible we can't calculate field id offsets
@@ -1672,9 +1676,32 @@ impl FileFragment {
                 0,
             )
         };
-        let file_scheduler = store_scheduler
-            .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
-            .await?;
+        let file_reader_options = read_config
+            .file_reader_options
+            .clone()
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned())
+            .unwrap_or_default();
+        let file_scheduler = if file_reader_options.decoder_config.list_structure.is_empty() {
+            store_scheduler
+                .open_file_with_priority(&path, reader_priority as u64, &data_file.file_size_bytes)
+                .await?
+        } else {
+            // Even a small file must remain a range reader: SmallReader fetches
+            // its entire body on the first metadata request.
+            let reader = self
+                .dataset
+                .object_store(data_file.base_id)
+                .await?
+                .open(&path)
+                .await?;
+            // Current-format footers occupy 40 bytes. A full tail block may
+            // otherwise fetch image payload before the structural read begins.
+            store_scheduler
+                .open_reader(reader.into())
+                .with_priority(reader_priority as u64)
+                .with_block_size(0)
+                .with_metadata_read_size(lance_file::reader::FOOTER_LEN)?
+        };
         let path = file_scheduler.reader().path().clone();
         let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);
         let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
@@ -1721,11 +1748,6 @@ impl FileFragment {
             &physical_schema,
             field_id_to_column_idx.as_ref(),
         )?;
-        let file_reader_options = read_config
-            .file_reader_options
-            .clone()
-            .or_else(|| self.dataset.file_reader_options.clone())
-            .unwrap_or_default();
         let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
             && reader_projection.column_indices.len().saturating_mul(4)
                 < data_file

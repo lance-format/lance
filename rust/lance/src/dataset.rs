@@ -277,7 +277,7 @@ pub struct Dataset {
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.
-    pub(crate) file_reader_options: Option<FileReaderOptions>,
+    pub(crate) file_reader_options: Option<Arc<FileReaderOptions>>,
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
@@ -836,7 +836,7 @@ impl Dataset {
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
-            self.file_reader_options.clone(),
+            self.file_reader_options.as_deref().cloned(),
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
@@ -914,19 +914,27 @@ impl Dataset {
 
         // A stale cached size yields a bogus footer offset. Detect it (the block
         // lacks the trailing magic) and retry with the true size, like
-        // read_manifest.
-        if manifest_location.size.is_some() && !last_block.ends_with(MAGIC) {
-            let manifest_location = ManifestLocation {
-                size: None,
-                ..manifest_location.clone()
-            };
-            return Box::pin(Self::load_manifest(
-                object_store,
-                &manifest_location,
-                uri,
-                session,
-            ))
-            .await;
+        // read_manifest. At the true size, the file itself is damaged.
+        if !last_block.ends_with(MAGIC) {
+            if manifest_location.size.is_some() {
+                let manifest_location = ManifestLocation {
+                    size: None,
+                    ..manifest_location.clone()
+                };
+                return Box::pin(Self::load_manifest(
+                    object_store,
+                    &manifest_location,
+                    uri,
+                    session,
+                ))
+                .await;
+            }
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: magic number does not match, manifest is {manifest_size} bytes"
+                ),
+            ));
         }
 
         let offset = read_metadata_offset(&last_block)?;
@@ -945,6 +953,17 @@ impl Dataset {
             manifest.detach_sparse_inline_row_ids(manifest_size - offset);
             Ok(manifest)
         }?;
+
+        // A zeroed length prefix decodes to an empty message without an error, which would
+        // open as an empty dataset. Versions start at 1.
+        if manifest.version == 0 {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest at offset {offset} of {manifest_size} bytes has version 0"
+                ),
+            ));
+        }
 
         ensure_can_read_manifest(&manifest)?;
 
@@ -1086,7 +1105,7 @@ impl Dataset {
             fragment_bitmap,
             metadata_cache,
             index_cache,
-            file_reader_options,
+            file_reader_options: file_reader_options.map(Arc::new),
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),

@@ -54,7 +54,7 @@ use super::{
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
-        let file_reader_options = dataset.file_reader_options.clone();
+        let file_reader_options = dataset.file_reader_options.as_deref().cloned();
         let mut scanner = Self {
             dataset,
             projection_plan,
@@ -254,6 +254,22 @@ impl Scanner {
     /// Projection with transform
     ///
     /// Only select the specified columns with the given transform.
+    ///
+    /// When a list is only used by `array_length` (`list_length`), nonempty
+    /// comparisons, or NULL checks, structural-format readers omit element
+    /// payloads. This applies to nested element types and struct field paths.
+    /// Selecting the list itself or otherwise inspecting its elements keeps the
+    /// ordinary value read. Legacy array-format files keep their normal reader.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let counts = dataset.scan()
+    ///     .project_with_transform(&[("image_count", "array_length(images)")])?
+    ///     .try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn project_with_transform(
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
@@ -1257,7 +1273,7 @@ impl Scanner {
         let base = self
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.clone());
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
                 opts.batch_size_bytes = Some(bsb);

@@ -55,8 +55,6 @@ pub mod ngram;
 pub mod registry;
 #[cfg(test)]
 mod remap_compat_tests;
-#[cfg(feature = "geo")]
-pub mod rtree;
 pub mod seed;
 pub mod tuple;
 pub mod zoned;
@@ -597,50 +595,6 @@ impl AnyQuery for TokenQuery {
                 ],
             }),
         }
-    }
-
-    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
-        match other.as_any().downcast_ref::<Self>() {
-            Some(o) => self == o,
-            None => false,
-        }
-    }
-}
-
-#[cfg(feature = "geo")]
-#[derive(Debug, Clone, PartialEq)]
-pub struct RelationQuery {
-    pub value: ScalarValue,
-    pub field: Field,
-}
-
-/// A query that a Geo index can satisfy
-#[cfg(feature = "geo")]
-#[derive(Debug, Clone, PartialEq)]
-pub enum GeoQuery {
-    IntersectQuery(RelationQuery),
-    IsNull,
-}
-
-#[cfg(feature = "geo")]
-impl AnyQuery for GeoQuery {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn format(&self, col: &str) -> String {
-        match self {
-            Self::IntersectQuery(query) => {
-                format!("Intersect({} {})", col, query.value)
-            }
-            Self::IsNull => {
-                format!("{} IS NULL", col)
-            }
-        }
-    }
-
-    fn to_expr(&self, _col: String) -> Expr {
-        todo!()
     }
 
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {

@@ -13,6 +13,7 @@
 mod aggregate;
 mod builder;
 pub(crate) mod fts;
+mod list_structure;
 mod minhash;
 mod plan;
 mod source;
