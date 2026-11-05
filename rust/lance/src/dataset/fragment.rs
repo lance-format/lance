@@ -1636,10 +1636,11 @@ impl FileFragment {
         metadata_mode: MetadataMode,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
-        let data_file_schema = Arc::new(data_file.schema(full_schema));
         let projection = projection.unwrap_or(full_schema);
-        let schema_per_file =
-            Arc::new(data_file_projection(projection, data_file_schema.as_ref())?);
+        let schema_per_file = Arc::new(data_file_projection(
+            projection,
+            &data_file_schema_for_projection(full_schema, data_file, projection),
+        )?);
         if schema_per_file.fields.is_empty() {
             return Ok(None);
         }
@@ -1755,10 +1756,7 @@ impl FileFragment {
                     .iter()
                     .filter(|column_index| **column_index >= 0)
                     .count();
-        let known_schema = self
-            .metadata
-            .physical_rows
-            .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+        let physical_rows = self.metadata.physical_rows;
 
         let encodings_io = Arc::new(
             LanceEncodingsIo::new(file_scheduler.clone())
@@ -1770,7 +1768,11 @@ impl FileFragment {
             prefer_indexed,
             || async {
                 let metadata_index = self
-                    .get_file_metadata_index(&file_scheduler, known_schema.clone())
+                    .get_file_metadata_index_with(&file_scheduler, || {
+                        physical_rows.map(|num_rows| {
+                            (Arc::new(data_file.schema(full_schema)), num_rows as u64)
+                        })
+                    })
                     .await?;
                 if (reader_projection.column_indices.len() as u32).saturating_mul(4)
                     >= metadata_index.num_columns()
@@ -2502,12 +2504,22 @@ impl FileFragment {
         file_scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<Arc<FileMetadataIndex>> {
+        self.get_file_metadata_index_with(file_scheduler, || known_schema)
+            .await
+    }
+
+    /// Like [`Self::get_file_metadata_index`], but builds the known schema only on a cache miss.
+    async fn get_file_metadata_index_with(
+        &self,
+        file_scheduler: &FileScheduler,
+        known_schema: impl FnOnce() -> Option<(Arc<Schema>, u64)> + Send,
+    ) -> Result<Arc<FileMetadataIndex>> {
         let path = file_scheduler.reader().path();
         let cache = self.dataset.metadata_cache.file_metadata_cache(path);
 
         let metadata_index = cache
             .get_or_insert_with_key(FileMetadataIndexCacheKey, || async {
-                let metadata_index = if let Some((file_schema, num_rows)) = known_schema {
+                let metadata_index = if let Some((file_schema, num_rows)) = known_schema() {
                     lance_file::reader::FileReader::read_metadata_index_with_schema(
                         file_scheduler,
                         file_schema,
@@ -3731,6 +3743,34 @@ impl std::fmt::Display for FragmentReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FragmentReader(id={})", self.fragment_id)
     }
+}
+
+/// `data_file.schema(full_schema)` restricted to the top-level fields that
+/// `projection.intersection_ignore_types` can match, so a narrow projection of a
+/// wide schema doesn't clone every field the file holds.
+fn data_file_schema_for_projection(
+    full_schema: &Schema,
+    data_file: &DataFile,
+    projection: &Schema,
+) -> Schema {
+    // A projection this broad matches nearly every field, so filtering costs more than it saves.
+    if projection.fields.len() >= full_schema.fields.len() {
+        return data_file.schema(full_schema);
+    }
+    let projected_names: HashSet<&str> = projection
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    data_file.schema_filtered(full_schema, |field| {
+        // `Schema::field` parses a field path; a top-level name without quotes
+        // is one segment, matched exactly against top-level names.
+        if field.name.contains('`') {
+            projection.field(&field.name).is_some()
+        } else {
+            projected_names.contains(field.name.as_str())
+        }
+    })
 }
 
 /// `projection` intersected with a data file's schema. A nested field none of
@@ -9221,5 +9261,137 @@ mod tests {
             "cache clones must share the per-scan scheduler map"
         );
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_data_file_schema_for_projection_matches_full_file_schema() {
+        let struct_of = |names: &[&str]| {
+            DataType::Struct(
+                names
+                    .iter()
+                    .map(|name| ArrowField::new(*name, DataType::Int32, true))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        let arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Utf8, true),
+            ArrowField::new("nested", struct_of(&["x", "y"]), true),
+            ArrowField::new(
+                "list",
+                DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                true,
+            ),
+            ArrowField::new(
+                "large_list",
+                DataType::LargeList(Arc::new(ArrowField::new(
+                    "item",
+                    struct_of(&["p", "q"]),
+                    true,
+                ))),
+                true,
+            ),
+            ArrowField::new("c", DataType::Float64, true),
+            ArrowField::new("`a`", DataType::Int64, true),
+            ArrowField::new("", DataType::Int64, true),
+        ]);
+        let full = Schema::try_from(&arrow_schema).unwrap();
+        let top = |name: &str| full.fields.iter().find(|f| f.name == name).unwrap();
+        let ids = |name: &str| {
+            Schema {
+                fields: vec![top(name).clone()],
+                metadata: HashMap::new(),
+            }
+            .fields_pre_order()
+            .map(|field| field.id)
+            .collect::<Vec<_>>()
+        };
+        let data_file = |version, fields: Vec<i32>, unmapped: &[i32]| {
+            let columns = (0..fields.len() as i32)
+                .zip(&fields)
+                .map(|(column, id)| if unmapped.contains(id) { -1 } else { column })
+                .collect();
+            DataFile::new("f.lance", fields, columns, version, None, None)
+        };
+        let nested = top("nested");
+        let large_list_item = &top("large_list").children[0];
+        let data_files = [
+            // Part of a struct, plus a field id the dataset no longer has.
+            data_file(
+                ConcreteFileVersion::V2_1,
+                vec![
+                    nested.id,
+                    nested.children[0].id,
+                    top("a").id,
+                    top("c").id,
+                    1_000,
+                ],
+                &[nested.id],
+            ),
+            data_file(
+                ConcreteFileVersion::V2_1,
+                [ids("a"), ids("nested"), ids("list"), ids("large_list")].concat(),
+                &[],
+            ),
+            data_file(
+                ConcreteFileVersion::V2_1,
+                [ids("b"), ids("list"), ids("`a`"), ids("")].concat(),
+                &[],
+            ),
+            // Part of a struct inside a large list.
+            data_file(
+                ConcreteFileVersion::V2_1,
+                vec![
+                    top("large_list").id,
+                    large_list_item.id,
+                    large_list_item.children[1].id,
+                ],
+                &[top("large_list").id, large_list_item.id],
+            ),
+            // A 2.0 struct header without its children.
+            data_file(ConcreteFileVersion::V2_0, vec![nested.id, top("b").id], &[]),
+            DataFile::new_legacy_from_fields(
+                "f.lance",
+                [ids("a"), ids("nested"), ids("`a`")].concat(),
+                None,
+            ),
+            data_file(ConcreteFileVersion::V2_1, vec![], &[]),
+        ];
+
+        let projections = [
+            full.project(&["a"]).unwrap(),
+            full.project(&["c", "a"]).unwrap(),
+            full.project(&["b", "list"]).unwrap(),
+            full.project(&["nested"]).unwrap(),
+            full.project(&["nested.y", "c"]).unwrap(),
+            full.project(&["large_list"]).unwrap(),
+            full.project_by_ids(&[large_list_item.children[0].id], false),
+            full.project_by_ids(&[top("`a`").id, top("").id], false),
+            full.clone(),
+            Schema::default(),
+        ];
+        for data_file in &data_files {
+            for projection in &projections {
+                let expected = data_file_projection(projection, &data_file.schema(&full));
+                let actual = data_file_projection(
+                    projection,
+                    &data_file_schema_for_projection(&full, data_file, projection),
+                );
+                match (expected, actual) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(
+                        actual, expected,
+                        "projection {projection:?}, data file {:?}",
+                        data_file.fields
+                    ),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => panic!(
+                        "projection {projection:?}, data file {:?}: expected {expected:?}, got \
+                         {actual:?}",
+                        data_file.fields
+                    ),
+                }
+            }
+        }
     }
 }
