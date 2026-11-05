@@ -403,6 +403,11 @@ pub async fn init_writer_for_rq(
     Ok(w)
 }
 
+/// Rows per batch when streaming a shard partition into the merged file. A
+/// batch size of `u32::MAX` makes the reader decode the whole partition range
+/// as one batch, so memory grows with the partition instead of staying flat.
+const MERGE_READ_BATCH_ROWS: u32 = 10_240;
+
 /// Stream and write a range of rows from reader into writer.
 ///
 /// The caller is responsible for ensuring that `range` corresponds to a
@@ -415,7 +420,7 @@ pub async fn write_partition_rows(
     let mut stream = reader
         .read_stream(
             lance_io::ReadBatchParams::Range(range),
-            u32::MAX,
+            MERGE_READ_BATCH_ROWS,
             4,
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
@@ -438,7 +443,7 @@ async fn write_filtered_partition_rows(
     let mut stream = reader
         .read_stream(
             lance_io::ReadBatchParams::Range(range),
-            u32::MAX,
+            MERGE_READ_BATCH_ROWS,
             4,
             lance_encoding::decoder::FilterExpression::no_filter(),
         )
@@ -2197,6 +2202,104 @@ mod tests {
             total_rows += batch.unwrap().num_rows();
         }
         assert_eq!(total_rows, 3, "stale source rows must not be copied");
+    }
+
+    /// A partition longer than one read batch is streamed in several batches;
+    /// the filter and the per-partition counts must hold across them.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_streams_partitions_longer_than_a_read_batch(
+        #[values(false, true)] filtered: bool,
+    ) {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid");
+        let aux = index_dir
+            .clone()
+            .join("shard")
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let batch_rows = MERGE_READ_BATCH_ROWS;
+        let lengths = vec![batch_rows * 2 + 7, 3, batch_rows + 1];
+        let total = write_flat_partial_aux(
+            &object_store,
+            &aux,
+            2,
+            &lengths,
+            0,
+            DistanceType::L2,
+            ConcreteFileVersion::V2_1,
+        )
+        .await
+        .unwrap() as u64;
+
+        // Drop every third row, so each read batch loses some of its rows.
+        let kept: Vec<u64> = (0..total).filter(|id| !filtered || id % 3 != 0).collect();
+        if filtered {
+            merge_partial_vector_auxiliary_files_with_row_filters(
+                &object_store,
+                std::slice::from_ref(&aux),
+                &index_dir,
+                &[OldIndexDataFilter::RowIds(
+                    lance_select::RowAddrTreeMap::from_iter(kept.iter().copied()),
+                )],
+                Arc::new(RecordingProgress::default()),
+            )
+            .await
+            .unwrap();
+        } else {
+            merge_partial_vector_auxiliary_files(
+                &object_store,
+                std::slice::from_ref(&aux),
+                &index_dir,
+                Arc::new(RecordingProgress::default()),
+            )
+            .await
+            .unwrap();
+        }
+
+        let aux_out = index_dir.join(INDEX_AUXILIARY_FILE_NAME);
+        let sched = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let reader = V2Reader::try_open(
+            sched
+                .open_file(&aux_out, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::default(),
+            &lance_core::cache::LanceCache::no_cache(),
+            V2ReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let mut offset = 0;
+        let expected_lengths: Vec<u32> = lengths
+            .iter()
+            .map(|&len| {
+                let range = offset..offset + len as u64;
+                offset = range.end;
+                kept.iter().filter(|id| range.contains(id)).count() as u32
+            })
+            .collect();
+        let merged_ivf = try_read_ivf_proto(&reader).await.unwrap().unwrap();
+        assert_eq!(merged_ivf.lengths, expected_lengths);
+
+        let mut row_ids = Vec::new();
+        let mut stream = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                u32::MAX,
+                4,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            row_ids.extend_from_slice(batch[ROW_ID].as_primitive::<UInt64Type>().values());
+        }
+        assert_eq!(row_ids, kept);
     }
 
     #[tokio::test]

@@ -61,7 +61,6 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
-    optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
@@ -117,6 +116,7 @@ pub(crate) mod delta;
 pub mod io_stats;
 pub(crate) mod merge_insert;
 pub mod optimize;
+pub mod optimize_indices;
 mod replayable;
 pub(crate) mod sql;
 pub mod stats;
@@ -2255,22 +2255,7 @@ impl Dataset {
     #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let mut options: OptimizeOptions = Default::default();
-        if let Some(kwargs) = kwargs {
-            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-                options.num_indices_to_merge = num_indices_to_merge.extract()?;
-            }
-            if let Some(retrain) = kwargs.get_item("retrain")? {
-                options.retrain = retrain.extract()?;
-            }
-            if let Some(index_names) = kwargs.get_item("index_names")? {
-                options.index_names = Some(
-                    index_names
-                        .extract::<Vec<String>>()
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                );
-            }
-        }
+        let options = optimize_indices::optimize_options(kwargs)?;
         rt().block_on(
             None,
             new_self
