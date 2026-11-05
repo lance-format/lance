@@ -525,6 +525,28 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF`, `HNSW` and `RQ` parameters, respectively.
+    /// This is used for `IVF_HNSW_RQ` index.
+    pub fn with_ivf_hnsw_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        rq: RQBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::RQ(rq),
+        ];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+            skip_transpose: false,
+            runtime_hints: HashMap::new(),
+        }
+    }
+
     pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
@@ -536,6 +558,7 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::RQ(_))) => IndexType::IvfHnswRq,
             _ => IndexType::Vector,
         }
     }
@@ -768,7 +791,7 @@ async fn prepare_vector_segment_build(
     }
 
     let index_type = params.index_type();
-    if index_type == IndexType::IvfRq {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq) {
         let Some(StageParams::RQ(rq_params)) = stages.last() else {
             return Err(Error::index(format!(
                 "{mode}: invalid stages: {:?}",
@@ -1307,7 +1330,20 @@ async fn build_vector_index_impl(
 
     // RaBitQ encodes against L2 or dot residuals, and its transform rejects
     // anything else, but only after the IVF model has been trained on a sample.
-    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq)
+        && params.metric_type == DistanceType::Hamming
+    {
+        return Err(Error::index(format!(
+            "Build Vector Index: {} does not support the {} metric",
+            index_type, params.metric_type
+        )));
+    }
+
+    // HNSW over RQ codes compares stored rows, which is only supported for l2
+    // (cosine is stored as l2 over normalized vectors).
+    if index_type == IndexType::IvfHnswRq
+        && !matches!(params.metric_type, DistanceType::L2 | DistanceType::Cosine)
+    {
         return Err(Error::index(format!(
             "Build Vector Index: {} does not support the {} metric",
             index_type, params.metric_type
@@ -1551,6 +1587,37 @@ async fn build_vector_index_impl(
                 shuffler,
                 Some(ivf_params),
                 Some(pq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+            Ok(summary)
+        }
+        IndexType::IvfHnswRq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let StageParams::RQ(rq_params) = &stages[2] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let summary = IvfIndexBuilder::<HNSW, RabitQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().clone().join(uuid.to_string()),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
@@ -2463,7 +2530,7 @@ fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
         (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
     }
 }
 
@@ -2564,6 +2631,7 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use lance_core::ROW_ID;
     use lance_core::utils::row_addr_remap::GroupInput;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2572,6 +2640,110 @@ mod tests {
     use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
     use roaring::RoaringTreemap;
+
+    #[test]
+    fn test_ivf_hnsw_rq_params_index_type() {
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            IvfBuildParams::default(),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+        assert_eq!(params.index_type(), IndexType::IvfHnswRq);
+    }
+
+    #[rstest::rstest]
+    #[case::l2(MetricType::L2, true)]
+    #[case::cosine(MetricType::Cosine, true)]
+    #[case::dot(MetricType::Dot, false)]
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_rq_index(#[case] metric_type: MetricType, #[case] builds: bool) {
+        let batch = lance_datagen::gen_batch()
+            .col("v", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        let mut dataset = Dataset::write(batch, "memory://", Some(WriteParams::default()))
+            .await
+            .unwrap();
+        let ivf = IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            metric_type,
+            ivf,
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+
+        let result = dataset
+            .create_index(&["v"], IndexType::IvfHnswRq, None, &params, false)
+            .await;
+
+        if builds {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("does not support the"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_search_recall() {
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 20;
+        let batch = lance_datagen::gen_batch()
+            .col("v", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        let mut dataset = Dataset::write(batch, "memory://", Some(WriteParams::default()))
+            .await
+            .unwrap();
+        let ivf = IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            ivf,
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["v"], IndexType::IvfHnswRq, None, &params, false)
+            .await
+            .unwrap();
+
+        let mut hits = 0;
+        for query_id in 0..NUM_QUERIES {
+            let query = Float32Array::from_iter_values(
+                (0..64).map(|d| ((query_id * 31 + d * 17) % 97) as f32 / 97.0),
+            );
+            let mut top_k_row_ids = |use_index: bool| {
+                let dataset = dataset.clone();
+                let query = query.clone();
+                async move {
+                    let batch = dataset
+                        .scan()
+                        .with_row_id()
+                        .nearest("v", &query, K)
+                        .unwrap()
+                        .nprobes(2)
+                        .use_index(use_index)
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                    batch[ROW_ID]
+                        .as_primitive::<arrow_array::types::UInt64Type>()
+                        .values()
+                        .to_vec()
+                }
+            };
+            let expected = top_k_row_ids(false).await;
+            let actual = top_k_row_ids(true).await;
+            hits += actual.iter().filter(|id| expected.contains(id)).count();
+        }
+        let recall = hits as f32 / (K * NUM_QUERIES) as f32;
+        assert!(recall >= 0.5, "recall {recall}");
+    }
 
     #[tokio::test]
     async fn test_nullable_vector_count_stops_at_threshold() {

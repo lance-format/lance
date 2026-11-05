@@ -2673,6 +2673,42 @@ def test_describe_indices(dataset):
     assert len(indices) == 1
 
 
+def test_create_ivf_hnsw_rq_index(tmp_path):
+    # Only index construction is supported for IVF_HNSW_RQ so far; searching it
+    # is not implemented yet.
+    vectors = np.random.default_rng(0).random((1024, 64), dtype=np.float32)
+    table = pa.table(
+        {"vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 64)}
+    )
+    dataset = lance.write_dataset(table, tmp_path / "ds.lance")
+
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=2,
+        num_bits=5,
+        m=4,
+        ef_construction=16,
+    )
+
+    info = dataset.describe_indices()[0]
+    assert info.index_type == "IVF_HNSW_RQ"
+    assert info.num_rows_indexed == 1024
+
+
+def test_create_ivf_hnsw_rq_index_rejects_dot(tmp_path):
+    vectors = np.random.default_rng(0).random((1024, 64), dtype=np.float32)
+    table = pa.table(
+        {"vector": pa.FixedSizeListArray.from_arrays(vectors.reshape(-1), 64)}
+    )
+    dataset = lance.write_dataset(table, tmp_path / "ds.lance")
+
+    with pytest.raises(Exception, match="does not support the"):
+        dataset.create_index(
+            "vector", index_type="IVF_HNSW_RQ", metric="dot", num_partitions=2
+        )
+
+
 def test_describe_vector_index(indexed_dataset: LanceDataset):
     info = indexed_dataset.describe_indices()[0]
 
