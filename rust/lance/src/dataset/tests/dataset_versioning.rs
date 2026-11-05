@@ -28,6 +28,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::{TempDir, TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreProvider};
 use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
@@ -44,6 +45,7 @@ use object_store::{
 };
 use rstest::rstest;
 use std::cmp::Ordering;
+use url::Url;
 
 fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNamingScheme) {
     let entries_names = test_dir
@@ -1525,6 +1527,115 @@ async fn test_create_branch_name_storage_limits(
                 .contains_key(&branch_name)
         );
     }
+}
+
+#[derive(Debug)]
+struct FixedMemoryStoreProvider(Arc<ObjectStore>);
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for FixedMemoryStoreProvider {
+    async fn new_store(
+        &self,
+        _base_path: Url,
+        _params: &ObjectStoreParams,
+    ) -> lance_core::Result<ObjectStore> {
+        Ok(self.0.as_ref().clone())
+    }
+}
+
+#[rstest]
+#[case::released_local("é".repeat(22), false)]
+#[case::object_store("x".repeat(300), true)]
+#[tokio::test]
+async fn test_existing_branch_above_creation_limit(
+    #[case] branch_name: String,
+    #[case] in_memory: bool,
+    #[values(false, true)] force_delete: bool,
+) {
+    let test_dir = copy_test_data_to_tmp("v14.0.2/long_branch.lance").unwrap();
+    let mut dataset = if in_memory {
+        let dataset = Dataset::write(
+            id_rows(0, 2),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Reopening the clone and its source must resolve to the same memory backend.
+        dataset.session.store_registry().insert(
+            "memory",
+            Arc::new(FixedMemoryStoreProvider(dataset.object_store.clone())),
+        );
+        create_branch_before_name_check(&dataset, &branch_name).await;
+        dataset
+    } else {
+        Dataset::open(&test_dir.path_str()).await.unwrap()
+    };
+
+    assert!(
+        dataset
+            .list_branches()
+            .await
+            .unwrap()
+            .contains_key(&branch_name)
+    );
+    assert_eq!(
+        dataset
+            .branches()
+            .get(&branch_name)
+            .await
+            .unwrap()
+            .parent_version,
+        1
+    );
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+    let branch = dataset.checkout_branch(&branch_name).await.unwrap();
+    assert_eq!(branch.get_fragments().len(), 2);
+    assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+    assert_eq!(branch.scan().try_into_batch().await.unwrap(), expected);
+    let reopened = DatasetBuilder::from_uri(dataset.uri())
+        .with_session(dataset.session.clone())
+        .with_branch(&branch_name, None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+
+    let metadata = HashMap::from([("description".to_string(), "existing branch".to_string())]);
+    dataset
+        .branches()
+        .replace_metadata(&branch_name, metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.branches().get(&branch_name).await.unwrap().metadata,
+        metadata
+    );
+
+    if force_delete {
+        dataset.force_delete_branch(&branch_name).await.unwrap();
+    } else {
+        dataset.delete_branch(&branch_name).await.unwrap();
+    }
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    let branch_path = dataset
+        .branch_location()
+        .find_branch(Some(&branch_name))
+        .unwrap()
+        .path;
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch_path))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
 }
 
 #[tokio::test]

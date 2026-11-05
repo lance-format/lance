@@ -1420,14 +1420,10 @@ impl BranchContents {
     }
 }
 
-// Local atomic creation needs room for `.json.tmp.<32-byte UUID>#1` within
-// the filesystem's 255-byte filename limit.
-const MAX_BRANCH_NAME_BYTES: usize = 211;
-
 /// Validate a branch name before constructing storage paths.
 ///
-/// Names cannot contain a `.` segment and must fit within 211 bytes after
-/// storage path encoding. This also bounds each `/`-separated segment.
+/// Names cannot contain a `.` segment. Storage length limits apply only when
+/// creating new branches so existing names remain accessible.
 ///
 /// ```
 /// # use lance::dataset::refs::check_valid_branch;
@@ -1487,19 +1483,6 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
         }
     }
 
-    // Metadata encodes the whole name as one path part. The local atomic
-    // writer encodes it again when constructing its staging path.
-    let encoded_name = PathPart::from(branch_name);
-    let storage_name_length = PathPart::from(encoded_name.as_ref()).as_ref().len();
-    if storage_name_length > MAX_BRANCH_NAME_BYTES {
-        return Err(Error::InvalidRef {
-            message: format!(
-                "Branch name '{}' uses {} bytes after storage path encoding; maximum is {} bytes",
-                branch_name, storage_name_length, MAX_BRANCH_NAME_BYTES
-            ),
-        });
-    }
-
     if branch_name.ends_with(".lock") {
         return Err(Error::InvalidRef {
             message: "Branch name cannot end with '.lock'".to_string(),
@@ -1536,9 +1519,28 @@ fn is_dataset_dir(segment: &str) -> bool {
         || is_mem_wal_dir_name(segment)
 }
 
-/// Only restrict new branches so older branch names remain accessible.
+// Local atomic creation needs room for `.json.tmp.<32-byte UUID>#1` within
+// the filesystem's 255-byte filename limit.
+const MAX_BRANCH_NAME_BYTES: usize = 211;
+
+/// Restrict storage length and reserved directories only for new branches so
+/// older branch names remain accessible.
 pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
     check_valid_branch(branch_name)?;
+
+    // Metadata encodes the whole name as one path part. The local atomic
+    // writer encodes it again when constructing its staging path.
+    let encoded_name = PathPart::from(branch_name);
+    let storage_name_length = PathPart::from(encoded_name.as_ref()).as_ref().len();
+    if storage_name_length > MAX_BRANCH_NAME_BYTES {
+        return Err(Error::InvalidRef {
+            message: format!(
+                "Branch name '{}' uses {} bytes after storage path encoding; maximum is {} bytes",
+                branch_name, storage_name_length, MAX_BRANCH_NAME_BYTES
+            ),
+        });
+    }
+
     if let Some(segment) = branch_name
         .split('/')
         .skip(1)
@@ -1744,7 +1746,8 @@ mod tests {
     #[case::unicode_boundary(format!("{}x", "é".repeat(21)), true)]
     #[case::unicode_too_long("é".repeat(22), false)]
     fn test_branch_name_storage_limits(#[case] branch_name: String, #[case] is_valid: bool) {
-        let result = check_valid_branch(&branch_name);
+        check_valid_branch(&branch_name).unwrap();
+        let result = check_new_branch(&branch_name);
         if is_valid {
             result.unwrap();
         } else {
