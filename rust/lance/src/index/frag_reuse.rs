@@ -2333,6 +2333,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> lance_core::Result<Vec<(String, Path)>> {
+    use crate::dataset::FRAG_REUSE_DIR;
     use futures::TryStreamExt;
     use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
@@ -2371,7 +2372,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
         };
         let map_dir = base_root
             .clone()
-            .join("_fri")
+            .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
         let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
@@ -2393,7 +2394,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
                         mapping_size = Some(meta.size);
                     }
                     paths.push((
-                        format!("_fri/{}/{relative}", reference.map_id),
+                        format!("{FRAG_REUSE_DIR}/{}/{relative}", reference.map_id),
                         base_root.clone(),
                     ));
                 }

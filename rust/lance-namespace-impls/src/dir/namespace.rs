@@ -2552,17 +2552,6 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, None, "create_table_branch")
             .await?;
 
-        // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
-        // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
-        // concurrent create can still race past this window. Remove once lance-core create_branch
-        // returns RefConflict up front.
-        if dataset.branches().get(&request.name).await.is_ok() {
-            return Err(NamespaceError::TableBranchAlreadyExists {
-                message: format!("branch '{}' for table at '{}'", request.name, table_uri),
-            }
-            .into());
-        }
-
         dataset
             .create_branch(
                 &request.name,
@@ -2571,9 +2560,13 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                // After load_dataset + the dup pre-check, a DatasetNotFound from create_branch
-                // means the requested fork source (from_branch/from_version) doesn't exist.
-                if matches!(e, lance_core::Error::DatasetNotFound { .. }) {
+                // Missing sources can be detected while reserving the branch name or cloning.
+                // Both phases must preserve the create API's InvalidInput response.
+                if matches!(
+                    e,
+                    lance_core::Error::DatasetNotFound { .. }
+                        | lance_core::Error::VersionNotFound { .. }
+                ) {
                     NamespaceError::InvalidInput {
                         message: format!(
                             "from_branch/from_version for branch '{}' refers to a source that does not exist: {}",

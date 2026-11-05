@@ -180,6 +180,8 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+pub(crate) const BLOBS_DIR: &str = "_blobs";
+pub(crate) const FRAG_REUSE_DIR: &str = "_fri";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
 
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
@@ -590,33 +592,60 @@ impl Dataset {
         self.checkout_by_ref(None, Some(branch)).await
     }
 
+    /// Create a branch from an existing version with a shallow clone.
+    ///
     /// This is a two-phase operation:
+    /// - Atomically reserve the name by creating the branch metadata (`BranchContents`).
     /// - Create the branch dataset by shallow cloning.
-    /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
     /// for the branch.
     ///
-    /// The cleanup procedure should:
-    /// - Clean up zombie branch datasets that have no related `BranchContents`.
-    /// - Delete broken `BranchContents` entries that have no related branch dataset.
+    /// A concurrent creator that cannot reserve the name returns a conflict without
+    /// writing to the branch dataset.
     ///
-    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
-    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
-    /// failure if we use the same name to `create_branch`. In that case, you need to call
-    /// `force_delete_branch` to interactively clean up the zombie dataset.
+    /// Destinations with leftover version data are rejected without reserving the name.
+    /// Use [`Self::force_delete_branch`] to explicitly clean up the leftover data before
+    /// retrying. If cloning fails or is interrupted, the name remains reserved: the
+    /// clone may have succeeded, and releasing the reservation cannot atomically
+    /// verify that it still belongs to this attempt. Use [`Self::force_delete_branch`]
+    /// to explicitly remove a failed creation before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
+    /// A segment after the first cannot be a reserved dataset directory.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let experiment = dataset.create_branch("experiment", ("main", None), None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn create_branch(
         &mut self,
         branch: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        refs::check_valid_branch(branch)?;
+        refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
+        if self.object_store.exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {branch} already exists"),
+            });
+        }
+        let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
+        if has_any_entry(&self.object_store, &versions_path).await? {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Cannot create branch {branch}: {versions_path} contains leftover version data. \
+                     Use force_delete_branch to clean up the unused branch before retrying"
+                ),
+            });
+        }
         let source_location = self
             .branch_location()
             .find_branch(source_branch.as_deref())?;
@@ -629,23 +658,27 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+        // Claim the name before the clone can write into another creator's branch.
+        self.branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+
+        CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        let dataset = builder.execute(transaction).await?;
-
-        // Create BranchContents after shallow_clone
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
-        Ok(dataset)
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .execute(transaction)
+            .await
     }
 
+    /// Deletes a branch and removes its directory when safe.
+    ///
+    /// Legacy branches like `outer/data` may share a directory with another
+    /// branch. Their files are retained, so checkout by name may still work.
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
     }
