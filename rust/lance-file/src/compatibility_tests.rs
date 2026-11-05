@@ -239,7 +239,10 @@ async fn write_current_fixture(
     let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
     let options = FileWriterOptions {
         data_cache_bytes: Some(1),
-        max_page_bytes: Some(1024),
+        // Only the 2.0 writer honoured the page limit when the fixtures were
+        // recorded; the structural writers now split wide columns by it too,
+        // so they keep the default, which these small batches never reach.
+        max_page_bytes: (version == ConcreteFileVersion::V2_0).then_some(1024),
         ..Default::default()
     };
     let summary = match version {
