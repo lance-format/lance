@@ -848,49 +848,31 @@ pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
 
+/// Unique id for cache scopes that must not be shared between readers.
+static READER_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Namespace for metadata cache entries read through `object_store`.
 ///
-/// `store_prefix` identifies the backing location for addressable stores, but
-/// every in-memory store reports the same `memory` prefix while holding
-/// independent data. Include the store instance there so two sessions opened
-/// on `memory://` cannot serve each other's cached pages.
-fn metadata_cache_namespace(object_store: &ObjectStore) -> String {
-    if object_store.scheme() == "memory" {
-        format!(
-            "{}@{:p}",
-            object_store.store_prefix,
-            Arc::as_ptr(&object_store.inner) as *const ()
-        )
-    } else {
-        object_store.store_prefix.clone()
-    }
-}
-
-/// Token that changes whenever the object at `path` is replaced.
-///
-/// The reader only prefixes cache entries with the file path, so a shared
-/// session cache would otherwise keep serving pages from a previous version
-/// of the file.
-async fn metadata_cache_generation(object_store: &ObjectStore, path: &Path) -> PyResult<String> {
+/// Cached pages are only shared between readers when the store identifies the
+/// object with an immutable version. ETags and mtimes can be restored after the
+/// bytes change, and addresses of freed in-memory stores can be reused, so
+/// neither is a stable identity. Without a version the entries are scoped to
+/// this reader, so a concurrent replacement cannot poison another reader's
+/// cache.
+async fn metadata_cache_namespace(object_store: &ObjectStore, path: &Path) -> PyResult<String> {
     let metadata = object_store
         .inner
         .head(path)
         .await
         .map_err(|e| PyIOError::new_err(format!("Failed to stat file: {}", e)))?;
-    if let Some(e_tag) = metadata.e_tag {
-        return Ok(format!("etag:{}", e_tag));
-    }
-    if let Some(version) = metadata.version {
-        return Ok(format!("version:{}", version));
-    }
-    Ok(format!(
-        "modified:{}:{}",
-        metadata
-            .last_modified
-            .timestamp_nanos_opt()
-            .unwrap_or(i64::MIN),
-        metadata.size
-    ))
+    let generation = match metadata.version {
+        Some(version) => format!("version:{}", version),
+        None => format!(
+            "reader:{}",
+            READER_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    };
+    Ok(format!("{}/{}", object_store.store_prefix, generation))
 }
 
 impl LanceFileReader {
@@ -916,19 +898,15 @@ impl LanceFileReader {
         columns: Option<Vec<String>>,
         session: Option<Session>,
     ) -> PyResult<Self> {
-        // Capture the generation before reading anything so a file replaced
-        // mid-open cannot publish its old pages under the new generation.
         let no_cache;
         let scoped_cache;
         let cache = match &session {
             Some(session) => {
-                let namespace = metadata_cache_namespace(&object_store);
-                let generation = metadata_cache_generation(&object_store, &path).await?;
+                let namespace = metadata_cache_namespace(&object_store, &path).await?;
                 scoped_cache = session
                     .inner
                     .file_metadata_cache()
-                    .with_key_prefix(&namespace)
-                    .with_key_prefix(&generation);
+                    .with_key_prefix(&namespace);
                 &scoped_cache
             }
             None => {

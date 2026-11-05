@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import gc
 import os
 import threading
 
@@ -182,6 +183,19 @@ def test_file_reader_cache_isolates_distinct_memory_stores():
             writer.write_batch(table)
     assert stores[0].open_reader("foo.lance").read_all().to_table() == old
     assert stores[1].open_reader("foo.lance").read_all().to_table() == new
+
+
+def test_file_reader_cache_isolates_destroyed_memory_stores():
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    for value in range(200):
+        store = LanceFileSession("memory://", session=session)
+        expected = pa.table({"a": [value] * 3})
+        with store.open_writer("foo.lance", version="2.2") as writer:
+            writer.write_batch(expected)
+        actual = store.open_reader("foo.lance").read_all().to_table()
+        assert actual == expected, (value, actual.to_pydict())
+        del store, actual, expected
+        gc.collect()
 
 
 def test_file_reader_cache_refreshes_replaced_file(tmp_path):
