@@ -42,7 +42,9 @@ use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_ret
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
 use super::refs::{TagContents, normalize_branch};
-use super::retention::{MaintenanceDeadline, MaintenanceDelete, SnapshotMaintenanceLock, clear_retiring, mark_retiring};
+use super::retention::{
+    MaintenanceDeadline, MaintenanceDelete, SnapshotMaintenanceLock, clear_retiring, mark_retiring,
+};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -1022,12 +1024,21 @@ impl<'a> CleanupTask<'a> {
 
         if self.policy.error_if_tagged_old_versions {
             // Query roots protect files without blocking cleanup of other versions.
-            let user_tags = tags.into_iter().filter(|(name, tag)| {
-                !super::retention::is_retention_tag(name, tag)
-                    && tag.branch.as_deref() == current_branch.as_deref()
-            }).collect::<HashMap<_, _>>();
-            if user_tags.values().any(|tag| inspection.tagged_old_versions.contains(&tag.version)) {
-                return Err(tagged_old_versions_cleanup_error(&user_tags, &inspection.tagged_old_versions));
+            let user_tags = tags
+                .into_iter()
+                .filter(|(name, tag)| {
+                    !super::retention::is_retention_tag(name, tag)
+                        && tag.branch.as_deref() == current_branch.as_deref()
+                })
+                .collect::<HashMap<_, _>>();
+            if user_tags
+                .values()
+                .any(|tag| inspection.tagged_old_versions.contains(&tag.version))
+            {
+                return Err(tagged_old_versions_cleanup_error(
+                    &user_tags,
+                    &inspection.tagged_old_versions,
+                ));
             }
         }
 

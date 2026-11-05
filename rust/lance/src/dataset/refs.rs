@@ -688,7 +688,11 @@ impl Branches<'_> {
     }
 
     /// Remove branch files while preserving branches that share directories.
-    async fn cleanup_branch_directories(&self, branch: &str, fence: Option<&SnapshotMaintenanceLock>) -> Result<()> {
+    async fn cleanup_branch_directories(
+        &self,
+        branch: &str,
+        fence: Option<&SnapshotMaintenanceLock>,
+    ) -> Result<()> {
         // Discover namespaces created during deletion before removing shared directories.
         let branches = self.list().await?;
         let remaining_branches = branches.keys().map(String::as_str).collect_vec();
@@ -783,7 +787,9 @@ impl Branches<'_> {
         match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
-                if let Some(fence) = fence { fence.check_valid()?; }
+                if let Some(fence) = fence {
+                    fence.check_valid()?;
+                }
                 if let Err(e) = self.object_store().remove_dir_all(path).await {
                     match &e {
                         Error::NotFound { .. } => {
@@ -814,7 +820,9 @@ impl Branches<'_> {
                         };
                     if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
                     {
-                        if let Some(fence) = fence { fence.check_valid()?; }
+                        if let Some(fence) = fence {
+                            fence.check_valid()?;
+                        }
                         if let Err(e) = self.object_store().remove_dir_all(path).await {
                             match &e {
                                 Error::NotFound { .. } => {
@@ -837,7 +845,9 @@ impl Branches<'_> {
                         .try_for_each_concurrent(
                             self.object_store().io_parallelism(),
                             |file| async move {
-                                if let Some(fence) = fence { fence.check_valid()?; }
+                                if let Some(fence) = fence {
+                                    fence.check_valid()?;
+                                }
                                 self.object_store().delete(&file.location).await
                             },
                         )

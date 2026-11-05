@@ -15,14 +15,19 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use lance_table::io::manifest::read_manifest;
+use lance_table::io::manifest::{read_manifest, read_manifest_bytes};
+use lance_table::snapshot::digest_manifest;
 use object_store::{Error as StoreError, ObjectStoreExt, path::Path};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::Dataset;
-use crate::dataset::snapshot::{SnapshotIdentity, canonical_uri, pb};
+use crate::dataset::snapshot::SnapshotRef;
+
+mod pb {
+    include!("../pb/lance.dataset.retention.rs");
+}
 
 use crate::dataset::refs::{Refs, TagContents, tag_path};
 use crate::utils::temporal::utc_now;
@@ -359,9 +364,9 @@ async fn maintenance_tickets(
 ///
 /// ```
 /// # use lance::{Dataset, Result};
-/// # use lance::dataset::{snapshot::SnapshotIdentity, retention::SnapshotRetention};
+/// # use lance::dataset::{snapshot::SnapshotRef, retention::SnapshotRetention};
 /// # async fn example(dataset: &Dataset) -> Result<()> {
-/// let context = SnapshotIdentity::from_dataset(dataset, "table-incarnation").await?;
+/// let context = dataset.snapshot_ref("table-incarnation").await?;
 /// let retention = SnapshotRetention::acquire(dataset, context, "unique-query-id").await?;
 /// let transferred = SnapshotRetention::decode(&retention.encode())?;
 /// // Issue references and wait for every consumer to finish before release.
@@ -372,7 +377,7 @@ async fn maintenance_tickets(
 /// ```
 #[derive(Clone, Debug)]
 pub struct SnapshotRetention {
-    snapshot: SnapshotIdentity,
+    snapshot: SnapshotRef,
     tag_name: String,
 }
 
@@ -381,15 +386,16 @@ impl SnapshotRetention {
     /// An expired/deleted snapshot fails before a usable retention token is returned.
     pub async fn acquire(
         dataset: &Dataset,
-        snapshot: SnapshotIdentity,
+        snapshot: SnapshotRef,
         retention_id: impl AsRef<str>,
     ) -> Result<Self> {
-        snapshot.validate_dataset(dataset)?;
+        dataset.ensure_snapshot_digest().await?;
+        dataset.validate_snapshot(&snapshot)?;
         if retention_id.as_ref().is_empty() {
             return Err(Error::invalid_input("retention_id must not be empty"));
         }
         for base in dataset.manifest().base_paths.values() {
-            if base.is_dataset_root && canonical_uri(&base.path)? != snapshot.table_uri() {
+            if base.is_dataset_root && snapshot.validate_table_uri(&base.path).is_err() {
                 return Err(Error::not_supported(format!(
                     "Snapshot retention requires separate protection for foreign dataset base {}",
                     base.path,
@@ -448,9 +454,9 @@ impl SnapshotRetention {
                 "Snapshot manifest {manifest_path} was selected by cleanup; retention cannot be acquired",
             )));
         }
-        let observed =
-            SnapshotIdentity::from_dataset(dataset, self.snapshot.table_identity()).await?;
-        if observed.serialized_manifest() != self.snapshot.serialized_manifest() {
+        let bytes =
+            read_manifest_bytes(&dataset.object_store, &location.path, location.size).await?;
+        if digest_manifest(bytes).as_slice() != self.snapshot.manifest_digest() {
             return Err(Error::invalid_input(format!(
                 "Snapshot manifest {manifest_path} changed before retention acquisition",
             )));
@@ -502,7 +508,7 @@ impl SnapshotRetention {
     }
 
     /// The general snapshot identity protected by this token.
-    pub fn snapshot(&self) -> &SnapshotIdentity {
+    pub fn snapshot(&self) -> &SnapshotRef {
         &self.snapshot
     }
 
@@ -531,7 +537,7 @@ impl SnapshotRetention {
                 token.protocol_version,
             )));
         }
-        let snapshot = SnapshotIdentity::decode(&token.snapshot)?;
+        let snapshot = SnapshotRef::decode(&token.snapshot)?;
         let tag_name = token.tag_name;
         let suffix = tag_name
             .strip_prefix(TAG_PREFIX)
@@ -545,7 +551,11 @@ impl SnapshotRetention {
     /// Idempotently release this query's GC root after its last consumer has stopped.
     /// `dataset` may be a later snapshot, but must use the same table and credentials.
     pub async fn release(&self, dataset: &Dataset) -> Result<()> {
-        if canonical_uri(&dataset.refs.root()?.uri)? != self.snapshot.table_uri() {
+        if self
+            .snapshot
+            .validate_table_uri(dataset.refs.root()?.uri)
+            .is_err()
+        {
             return Err(Error::invalid_input(
                 "Retention release dataset has a different table URI",
             ));
@@ -778,9 +788,7 @@ mod tests {
         if use_branch_handle {
             root = root.checkout_branch("dev").await.unwrap();
         }
-        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
-            .await
-            .unwrap();
+        let snapshot = branch.snapshot_ref("catalog/branch").await.unwrap();
         let manifest = branch.manifest_location().path.clone();
         let reached = Arc::new(Notify::new());
         let reached_hook = reached.clone();
@@ -834,9 +842,7 @@ mod tests {
         #[case] use_branch_handle: bool,
     ) {
         let (_directory, mut root, branch, _) = branch_retention_dataset().await;
-        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
-            .await
-            .unwrap();
+        let snapshot = branch.snapshot_ref("catalog/branch").await.unwrap();
         let retained = SnapshotRetention::acquire(&branch, snapshot, "before-delete")
             .await
             .unwrap();
@@ -917,9 +923,7 @@ mod tests {
         assert!(matches!(error, Error::RefConflict { .. }));
         assert!(error.to_string().contains("expired"), "{error}");
         assert!(branch.branches().get("dev").await.is_ok());
-        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
-            .await
-            .unwrap();
+        let snapshot = branch.snapshot_ref("catalog/branch").await.unwrap();
         SnapshotRetention::acquire(&branch, snapshot, "after-expiration")
             .await
             .unwrap()
@@ -962,9 +966,7 @@ mod tests {
     #[tokio::test]
     async fn branch_deletion_failure_does_not_allow_retention_of_leftover_manifest() {
         let (directory, mut root, branch, policy) = branch_retention_dataset().await;
-        let snapshot = SnapshotIdentity::from_dataset(&branch, "catalog/branch")
-            .await
-            .unwrap();
+        let snapshot = branch.snapshot_ref("catalog/branch").await.unwrap();
         let branch_file = directory
             .path()
             .join("_refs")
@@ -1072,9 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn independent_queries_share_acquisition_and_release() {
         let (dataset, _) = maintenance_dataset().await;
-        let snapshot = SnapshotIdentity::from_dataset(&dataset, "catalog/shared")
-            .await
-            .unwrap();
+        let snapshot = dataset.snapshot_ref("catalog/shared").await.unwrap();
         let reader = SnapshotMaintenanceLock::for_retention(&dataset)
             .await
             .unwrap();
@@ -1215,9 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn default_cleanup_retains_query_tags_and_errors_only_for_user_tags() {
         let (original, _) = maintenance_dataset().await;
-        let snapshot = SnapshotIdentity::from_dataset(&original, "catalog/cleanup")
-            .await
-            .unwrap();
+        let snapshot = original.snapshot_ref("catalog/cleanup").await.unwrap();
         let retention = SnapshotRetention::acquire(&original, snapshot, "query")
             .await
             .unwrap();
@@ -1329,9 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn partial_cleanup_prevents_retention_acquisition() {
         let (dataset, policy) = maintenance_dataset().await;
-        let source = SnapshotIdentity::from_dataset(&dataset, "catalog/partial")
-            .await
-            .unwrap();
+        let source = dataset.snapshot_ref("catalog/partial").await.unwrap();
         let old_manifest = dataset.manifest_location().path.clone();
         let failed_manifest = old_manifest.clone();
         policy.lock().unwrap().set_before_policy(
@@ -1379,9 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_preserves_roots_until_explicit_release(#[case] has_saved_token: bool) {
         let (dataset, _) = maintenance_dataset().await;
-        let context = SnapshotIdentity::from_dataset(&dataset, "catalog/recovery")
-            .await
-            .unwrap();
+        let context = dataset.snapshot_ref("catalog/recovery").await.unwrap();
         // The coordinator records acquisition intent before the storage operation.
         let saved_context = context.encode();
         let query_id = "query-recovery";
@@ -1428,13 +1422,13 @@ mod tests {
             batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
             2
         );
-        let restored = SnapshotIdentity::decode(&saved_context).unwrap();
+        let restored = SnapshotRef::decode(&saved_context).unwrap();
         assert_eq!(restored.version(), dataset.version().version);
         let recovered = match saved_token {
             Some(token) => SnapshotRetention::decode(&token).unwrap(),
             None => SnapshotRetention::acquire(
                 &dataset,
-                SnapshotIdentity::decode(&saved_context).unwrap(),
+                SnapshotRef::decode(&saved_context).unwrap(),
                 query_id,
             )
             .await
@@ -1466,21 +1460,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_validates_exact_source_and_token_protocol() {
+    async fn retention_revalidates_manifest_after_cached_capture() {
         let (dataset, _) = maintenance_dataset().await;
-        let source = SnapshotIdentity::from_dataset(&dataset, "catalog/token")
+        let snapshot = dataset.snapshot_ref("catalog/changed").await.unwrap();
+        let path = &dataset.manifest_location().path;
+        let mut bytes = dataset
+            .object_store
+            .inner
+            .get(path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .to_vec();
+        bytes[8] ^= 1;
+        dataset
+            .object_store
+            .inner
+            .put(path, bytes.into())
             .await
             .unwrap();
+        let error = SnapshotRetention::acquire(&dataset, snapshot, "query")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("changed before retention acquisition"),
+            "{error}"
+        );
+        assert!(dataset.tags().list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_validates_exact_source_and_token_protocol() {
+        let (mut dataset, _) = maintenance_dataset().await;
+        dataset
+            .update_config([("large-metadata", "x".repeat(128 * 1024))])
+            .await
+            .unwrap();
+        let source = dataset.snapshot_ref("catalog/token").await.unwrap();
         let retention = SnapshotRetention::acquire(&dataset, source, "query")
             .await
             .unwrap();
+        assert!(retention.encode().len() < 1024);
+        assert_eq!(
+            SnapshotRetention::decode(&retention.encode())
+                .unwrap()
+                .snapshot(),
+            retention.snapshot()
+        );
         let mut token = pb::SnapshotRetention::decode(retention.encode().as_slice()).unwrap();
         token.protocol_version = 2;
         let error = SnapshotRetention::decode(&token.encode_to_vec()).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("protocol version 2"));
         token.protocol_version = PROTOCOL_VERSION;
-        token.snapshot = SnapshotIdentity::from_dataset(&dataset, "catalog/different-incarnation")
+        token.snapshot = dataset
+            .snapshot_ref("catalog/different-incarnation")
             .await
             .unwrap()
             .encode()
@@ -1561,9 +1600,7 @@ mod tests {
     async fn expired_maintenance_owners_do_not_block_query_tags(#[case] ticket: u64) {
         MockClock::set_system_time(Duration::from_secs(3600));
         let (dataset, _) = maintenance_dataset().await;
-        let snapshot = SnapshotIdentity::from_dataset(&dataset, "catalog/plain-data")
-            .await
-            .unwrap();
+        let snapshot = dataset.snapshot_ref("catalog/plain-data").await.unwrap();
         let retention = SnapshotRetention::acquire(&dataset, snapshot, "query")
             .await
             .unwrap();

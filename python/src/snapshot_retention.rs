@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use lance::dataset::{retention::SnapshotRetention, snapshot::SnapshotIdentity};
+use lance::dataset::{retention::SnapshotRetention, snapshot::SnapshotRef};
 use pyo3::{prelude::*, types::PyBytes};
 
 use crate::{dataset::Dataset, error::PythonErrorExt, rt};
@@ -26,7 +26,7 @@ pub(crate) fn dataset_inner(dataset: &Bound<'_, PyAny>) -> PyResult<Arc<lance::D
 )]
 #[derive(Clone)]
 pub struct PySnapshotIdentity {
-    pub(crate) inner: SnapshotIdentity,
+    pub(crate) inner: SnapshotRef,
 }
 
 #[pymethods]
@@ -41,7 +41,7 @@ impl PySnapshotIdentity {
         let dataset = dataset_inner(dataset)?;
         let inner = rt()
             .block_on(Some(py), async move {
-                SnapshotIdentity::from_dataset(&dataset, table_identity).await
+                dataset.snapshot_ref(table_identity).await
             })?
             .infer_error()?;
         Ok(Self { inner })
@@ -54,7 +54,7 @@ impl PySnapshotIdentity {
     #[staticmethod]
     fn decode(bytes: &[u8]) -> PyResult<Self> {
         Ok(Self {
-            inner: SnapshotIdentity::decode(bytes).infer_error()?,
+            inner: SnapshotRef::decode(bytes).infer_error()?,
         })
     }
     #[getter]

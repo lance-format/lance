@@ -8,7 +8,7 @@ use jni::{
     objects::{JByteArray, JObject, JString},
     sys::{jbyteArray, jstring},
 };
-use lance::{SnapshotIdentity, SnapshotRetention};
+use lance::{SnapshotRef, SnapshotRetention};
 
 use crate::{
     Result, block_on,
@@ -39,7 +39,7 @@ pub extern "system" fn Java_org_lance_SnapshotIdentity_fromDatasetNative(
         (|| -> Result<_> {
             let dataset = dataset(&mut env, source)?;
             let table_identity: String = env.get_string(&table_identity)?.into();
-            let identity = block_on(SnapshotIdentity::from_dataset(&dataset, table_identity))?;
+            let identity = block_on(dataset.snapshot_ref(table_identity))?;
             java_bytes(&env, &identity.encode())
         })(),
         std::ptr::null_mut()
@@ -58,7 +58,7 @@ pub extern "system" fn Java_org_lance_SnapshotIdentity_validateNative(
         (|| -> Result<_> {
             java_bytes(
                 &env,
-                &SnapshotIdentity::decode(&env.convert_byte_array(encoded)?)?.encode(),
+                &SnapshotRef::decode(&env.convert_byte_array(encoded)?)?.encode(),
             )
         })(),
         std::ptr::null_mut()
@@ -77,7 +77,7 @@ pub extern "system" fn Java_org_lance_SnapshotRetention_acquireNative(
         env,
         (|| -> Result<_> {
             let dataset = dataset(&mut env, source)?;
-            let snapshot = SnapshotIdentity::decode(&env.convert_byte_array(snapshot)?)?;
+            let snapshot = SnapshotRef::decode(&env.convert_byte_array(snapshot)?)?;
             let retention_id: String = env.get_string(&retention_id)?.into();
             let retention = block_on(SnapshotRetention::acquire(&dataset, snapshot, retention_id))?;
             java_bytes(&env, &retention.encode())

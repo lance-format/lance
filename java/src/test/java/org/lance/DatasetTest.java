@@ -2298,7 +2298,7 @@ public class DatasetTest {
   // ===== Blob API tests =====
 
   @ParameterizedTest
-  @ValueSource(strings = {"acquire", "release", "cleanup"})
+  @ValueSource(strings = {"acquire", "release", "cleanup", "delete_branch"})
   void testSnapshotRetentionConflictException(String operation, @TempDir Path tempDir)
       throws Exception {
     Path path = tempDir.resolve("retention_conflict");
@@ -2307,6 +2307,9 @@ public class DatasetTest {
             new TestUtils.SimpleTestDataset(allocator, path.toString()).createEmptyDataset()) {
       SnapshotIdentity snapshot = SnapshotIdentity.fromDataset(dataset, "catalog/conflict");
       SnapshotRetention token = SnapshotRetention.acquire(dataset, snapshot, "query");
+      try (Dataset branch = dataset.createBranch("dev", Ref.ofMain(dataset.version()))) {
+        assertEquals(dataset.version(), branch.version());
+      }
       Path owner =
           path.resolve("_refs/retention-v1/maintenance").resolve(UUID.randomUUID().toString());
       Files.createDirectories(owner.getParent());
@@ -2327,6 +2330,9 @@ public class DatasetTest {
                     case "cleanup":
                       dataset.cleanup(CleanupPolicy.builder().build()).execute();
                       break;
+                    case "delete_branch":
+                      dataset.branches().delete("dev");
+                      break;
                     default:
                       throw new AssertionError(operation);
                   }
@@ -2337,6 +2343,9 @@ public class DatasetTest {
         token.release(dataset);
       }
       assertTrue(dataset.tags().list().isEmpty());
+      assertTrue(
+          dataset.branches().list().stream().anyMatch(branch -> branch.getName().equals("dev")));
+      dataset.branches().delete("dev");
     }
   }
 

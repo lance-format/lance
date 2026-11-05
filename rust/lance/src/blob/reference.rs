@@ -42,8 +42,6 @@ pub use crate::dataset::blob::{
     BlobReadRange, BlobRefBinding, BlobRefDemand, BlobRefReadStream, BlobRefReader, BlobRefRequest,
     ReadBlobRef,
 };
-use crate::dataset::snapshot::{SnapshotIdentity, pb as snapshot_pb};
-pub(crate) use crate::dataset::snapshot::{canonical_uri, matches_loaded_manifest};
 
 pub(crate) mod pb {
     include!("../pb/lance.blob.reference.rs");
@@ -205,22 +203,6 @@ impl BlobSourceContext {
     /// Generic snapshot reference, independent of worker storage binding keys.
     pub fn snapshot_ref(&self) -> &SnapshotRef {
         &self.snapshot
-    }
-
-    /// Extract the general snapshot identity, independent of blob capabilities
-    /// and the authenticated worker routing key. Use it with
-    /// [`SnapshotRetention`](crate::dataset::retention::SnapshotRetention).
-    pub fn snapshot_identity(&self) -> Result<SnapshotIdentity> {
-        SnapshotIdentity::from_proto(snapshot_pb::SnapshotIdentity {
-            protocol_version: 1,
-            table_identity: self.proto.table_identity.clone(),
-            table_uri: self.proto.table_uri.clone(),
-            branch: self.proto.branch.clone(),
-            version: self.proto.version,
-            manifest_path: self.proto.manifest_path.clone(),
-            manifest: self.proto.manifest.clone(),
-            manifest_identity: self.proto.manifest_identity.clone(),
-        })
     }
 
     pub(crate) fn validate_dataset(&self, dataset: &Dataset) -> Result<()> {
@@ -750,6 +732,22 @@ fn check_version(version: u32, component: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn canonical_uri(uri: &str) -> Result<String> {
+    if url::Url::parse(uri).is_err() && !std::path::Path::new(uri).is_absolute() {
+        return Err(Error::invalid_input(format!(
+            "Blob reference URI must be absolute: {uri}"
+        )));
+    }
+    let url = uri_to_url(uri)?;
+    let has_username = !url.username().is_empty() && !matches!(url.scheme(), "az" | "abfss");
+    if url.fragment().is_some() || has_username || url.password().is_some() {
+        return Err(Error::invalid_input(
+            "Blob reference URI must not contain credentials or a fragment",
+        ));
+    }
+    Ok(url.to_string())
 }
 
 #[cfg(test)]
@@ -1876,7 +1874,7 @@ mod tests {
             .unwrap();
         let error = crate::SnapshotRetention::acquire(
             &cloned,
-            cloned_source.snapshot_identity().unwrap(),
+            cloned_source.snapshot_ref().clone(),
             "foreign-owner",
         )
         .await
@@ -2454,33 +2452,27 @@ mod tests {
         let source = BlobSourceContext::from_dataset(&dataset, "catalog/retention", "workers")
             .await
             .unwrap();
-        let retention = crate::SnapshotRetention::acquire(
-            &dataset,
-            source.snapshot_identity().unwrap(),
-            "query-1",
-        )
-        .await
-        .unwrap();
-        let duplicate = crate::SnapshotRetention::acquire(
-            &dataset,
-            source.snapshot_identity().unwrap(),
-            "query-1",
-        )
-        .await
-        .unwrap();
+        let retention =
+            crate::SnapshotRetention::acquire(&dataset, source.snapshot_ref().clone(), "query-1")
+                .await
+                .unwrap();
+        let duplicate =
+            crate::SnapshotRetention::acquire(&dataset, source.snapshot_ref().clone(), "query-1")
+                .await
+                .unwrap();
         assert_eq!(retention.tag_name(), duplicate.tag_name());
-        assert_eq!(retention.snapshot(), &source.snapshot_identity().unwrap());
+        assert_eq!(retention.snapshot(), &source.snapshot_ref().clone());
         let other_binding =
             BlobSourceContext::from_dataset(&dataset, "catalog/retention", "different-workers")
                 .await
                 .unwrap();
         assert_ne!(source.source_id(), other_binding.source_id());
         assert_eq!(
-            source.snapshot_identity().unwrap(),
+            source.snapshot_ref().clone(),
             other_binding
                 .with_external_immutability_assumption()
-                .snapshot_identity()
-                .unwrap()
+                .snapshot_ref()
+                .clone()
         );
         assert_eq!(
             retention.encode(),
@@ -2599,13 +2591,9 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            crate::SnapshotRetention::acquire(
-                &dataset,
-                source.snapshot_identity().unwrap(),
-                "too-late"
-            )
-            .await
-            .is_err()
+            crate::SnapshotRetention::acquire(&dataset, source.snapshot_ref().clone(), "too-late")
+                .await
+                .is_err()
         );
     }
 
@@ -2658,13 +2646,10 @@ mod tests {
             .await
             .unwrap();
         let fence = SnapshotMaintenanceLock::acquire(&dataset).await.unwrap();
-        let error = crate::SnapshotRetention::acquire(
-            &dataset,
-            source.snapshot_identity().unwrap(),
-            "racing",
-        )
-        .await
-        .unwrap_err();
+        let error =
+            crate::SnapshotRetention::acquire(&dataset, source.snapshot_ref().clone(), "racing")
+                .await
+                .unwrap_err();
         assert!(matches!(error, Error::RefConflict { .. }));
         assert!(error.to_string().contains("maintenance lock"));
         assert!(dataset.tags().list().await.unwrap().is_empty());
@@ -2674,7 +2659,7 @@ mod tests {
         fence.release().await.unwrap();
         let error = crate::SnapshotRetention::acquire(
             &dataset,
-            source.snapshot_identity().unwrap(),
+            source.snapshot_ref().clone(),
             "after-partial-delete",
         )
         .await

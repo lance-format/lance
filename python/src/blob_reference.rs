@@ -43,7 +43,7 @@ impl PyBlobSourceContext {
     /// Snapshot identity shared with ordinary scans, independent of blob reader settings.
     fn snapshot_identity(&self) -> PyResult<PySnapshotIdentity> {
         Ok(PySnapshotIdentity {
-            inner: self.inner.snapshot_identity().infer_error()?,
+            inner: self.inner.snapshot_ref().clone(),
         })
     }
     /// Capture metadata from a resolved LanceDataset, without payload reads or retention.

@@ -609,7 +609,7 @@ pub extern "system" fn Java_org_lance_BlobReferences_snapshotIdentityNative(
         env,
         (|| -> Result<_> {
             let context = BlobSourceContext::decode(&env.convert_byte_array(context)?)?;
-            java_bytes(&env, &context.snapshot_identity()?.encode())
+            java_bytes(&env, &context.snapshot_ref().encode())
         })(),
         std::ptr::null_mut()
     )

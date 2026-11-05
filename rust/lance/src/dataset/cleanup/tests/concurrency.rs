@@ -113,7 +113,11 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
     if concurrency.is_some() {
         assert!(candidate_count >= window);
     }
-    let expected_duration = delete_latency * candidate_count.div_ceil(window) as u32;
+    // Retirement markers and the maintenance owner use the same deletion budget.
+    let delete_windows = candidate_count.div_ceil(window)
+        + (explanation.stats.old_versions as usize).div_ceil(window)
+        + 1;
+    let expected_duration = delete_latency * delete_windows as u32;
     let start = tokio::time::Instant::now();
     let stats = operation.execute().await.unwrap();
     let elapsed = start.elapsed();

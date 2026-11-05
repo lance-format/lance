@@ -6,9 +6,11 @@ roots. Opening a Dataset, creating a scanner, or serializing an identity does no
 protect files from cleanup.
 
 `SnapshotIdentity` captures the table incarnation, canonical table root, branch,
-exact version, original manifest bytes, and authoritative commit identity when
+exact version, manifest path and digest, and authoritative commit identity when
 available. It does not contain blob capabilities, worker routing keys, or storage
-credentials. Workers resolve authenticated storage independently.
+credentials. The bindings encode the compact `SnapshotRef` from the
+[snapshot reference contract](snapshot_references.md); they never embed manifest
+contents. Workers resolve authenticated storage independently.
 
 ## Acquire and release
 
@@ -32,15 +34,15 @@ finally:
     retention.release(dataset)
 ```
 
-Rust exposes the same types at `lance::SnapshotIdentity` and
+Rust exposes the shared identity at `lance::SnapshotRef` and retention at
 `lance::SnapshotRetention`. Java exposes `org.lance.SnapshotIdentity` and
 `org.lance.SnapshotRetention`.
 
 ```rust
-use lance::{Dataset, Result, SnapshotIdentity, SnapshotRetention};
+use lance::{Dataset, Result, SnapshotRetention};
 
 async fn query(dataset: &Dataset, query_id: &str) -> Result<()> {
-    let snapshot = SnapshotIdentity::from_dataset(dataset, "catalog/table-incarnation").await?;
+    let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
     let retention = SnapshotRetention::acquire(dataset, snapshot, query_id).await?;
     // Run scans and wait for all consumers and retries to stop.
     retention.release(dataset).await
