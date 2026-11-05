@@ -97,12 +97,13 @@ pub trait BasicTrainer: Send + Sync {
     ) -> Result<CreatedIndex>;
 }
 
-/// Whether a plugin's indices serve [`ScalarIndex::search_ordered`].
+/// Whether a plugin's indices serve ordered search through
+/// [`ScalarIndex::as_ordered`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IndexOrderingCapability {
     /// The index cannot stream keys in order.
-    None,
+    Unordered,
     /// The index streams keys in either direction, with nulls first or last.
     Bidirectional,
 }
@@ -149,15 +150,39 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
-    /// Whether an index with these details serves
-    /// [`ScalarIndex::search_ordered`], decided without loading the index.
+    /// Whether the persisted index described by these details supports remapping.
     ///
-    /// A loaded index can still return `NotSupported`, for example when it
-    /// spans several segments or its files are out of key order, so a planner
-    /// must keep a fallback.
+    /// This check must not read index files. It describes physical index segments,
+    /// not query-time wrappers that combine multiple segments. Details must belong
+    /// to this plugin.
+    ///
+    /// The default returns `true`, which keeps plugins written before this method
+    /// existed on the existing load-and-check path. Implementations should return
+    /// `Ok(false)` when they can determine the index cannot be remapped, or when
+    /// support cannot be determined safely; an error can prevent maintenance.
+    ///
+    /// ```
+    /// # fn example(details: &prost_types::Any) -> lance_core::Result<bool> {
+    /// let registry = lance_index::registry::IndexPluginRegistry::with_default_plugins();
+    /// let plugin = registry.get_plugin_by_details(details)?;
+    /// plugin.can_remap(details)
+    /// # }
+    /// ```
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether an index with these details serves ordered search through
+    /// [`ScalarIndex::as_ordered`], decided without loading the index.
+    ///
+    /// A loaded index can still return `None` from `as_ordered`, for example
+    /// when it spans several segments, or `NotSupported` from `search_ordered`,
+    /// for example when its files are out of key order, so a planner must keep
+    /// a fallback.
     ///
     /// ```
     /// # use lance_index::pbold;
+    /// # use lance_index::scalar::bitmap::BitmapIndexPlugin;
     /// # use lance_index::scalar::btree::BTreeIndexPlugin;
     /// # use lance_index::scalar::registry::{IndexOrderingCapability, ScalarIndexPlugin};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,11 +191,16 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///     BTreeIndexPlugin.ordering_capability(&details),
     ///     IndexOrderingCapability::Bidirectional
     /// );
+    /// let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BitmapIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Unordered
+    /// );
     /// # Ok(())
     /// # }
     /// ```
     fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
-        IndexOrderingCapability::None
+        IndexOrderingCapability::Unordered
     }
 
     /// The version of the index plugin

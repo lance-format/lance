@@ -1959,9 +1959,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
 ]
@@ -3196,7 +3196,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4508,7 +4508,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4577,6 +4577,8 @@ dependencies = [
  "libc",
  "log",
  "lzma-sys",
+ "metrics",
+ "metrics-util",
  "mock_instant",
  "moka",
  "num-traits",
@@ -4587,9 +4589,7 @@ dependencies = [
  "pprof",
  "pretty_assertions",
  "prost",
- "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rayon",
  "reqwest 0.13.4",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4666,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4677,7 +4677,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4695,6 +4695,8 @@ dependencies = [
  "libc",
  "libm",
  "log",
+ "metrics",
+ "metrics-util",
  "moka",
  "num_cpus",
  "object_store 0.14.2",
@@ -4718,7 +4720,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4748,8 +4750,6 @@ dependencies = [
  "log",
  "pin-project",
  "prost",
- "prost-build",
- "protobuf-src",
  "rstest",
  "tokio",
  "tracing",
@@ -4757,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion-exec"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4785,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4814,7 +4814,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4843,8 +4843,6 @@ dependencies = [
  "num-traits",
  "proptest",
  "prost",
- "prost-build",
- "protobuf-src",
  "rand 0.9.5",
  "rand_xoshiro",
  "rstest",
@@ -4859,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4885,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4914,9 +4912,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "prost",
- "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rstest",
  "serde",
@@ -4927,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "geo-traits",
  "geo-types",
@@ -4939,7 +4935,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "approx",
  "arc-swap",
@@ -5006,9 +5002,7 @@ dependencies = [
  "num-traits",
  "object_store 0.14.2",
  "prost",
- "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rand_distr",
  "rangemap",
@@ -5030,7 +5024,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5053,7 +5047,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5108,7 +5102,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -5128,7 +5122,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "approx",
  "argminmax",
@@ -5150,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5164,7 +5158,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5180,7 +5174,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -5242,7 +5236,7 @@ dependencies = [
 
 [[package]]
 name = "lance-select"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5258,7 +5252,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5287,11 +5281,10 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "prost",
- "prost-build",
  "prost-types",
- "protobuf-src",
  "rand 0.9.5",
  "rangemap",
+ "rayon",
  "roaring",
  "rstest",
  "semver",
@@ -5300,13 +5293,14 @@ dependencies = [
  "snafu",
  "tokio",
  "tracing",
+ "tracing-mock",
  "url",
  "uuid",
 ]
 
 [[package]]
 name = "lance-test-macros"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5315,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5328,7 +5322,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5342,13 +5336,23 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 dependencies = [
+ "arrow-array",
+ "chrono",
  "clap",
+ "futures",
+ "lance",
  "lance-core",
+ "lance-datagen",
  "lance-file",
  "lance-io",
+ "lance-table",
  "object_store 0.14.2",
+ "prost",
+ "rstest",
+ "serde_json",
+ "tempfile",
  "tokio",
  "url",
 ]
@@ -6318,7 +6322,6 @@ version = "0.59.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fe43e16d96bed57937eb7c4a28559bf4c5fc4a3951656505d1fdd4f856349b4"
 dependencies = [
- "ctor",
  "opendal-core",
  "opendal-http-transport-reqwest",
  "opendal-layer-concurrent-limit",
@@ -8927,6 +8930,7 @@ dependencies = [
  "prost",
  "prost-build",
  "prost-types",
+ "protobuf-src",
  "regress",
  "schemars 0.8.22",
  "semver",
@@ -10773,7 +10777,7 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d789b1514203a1120ad2429eae43a7bd32b90976a7bb8a05f7ec02fa88cc23a"
 dependencies = [
- "zstd-safe 7.2.1",
+ "zstd-safe 7.4.0",
 ]
 
 [[package]]
@@ -10787,9 +10791,9 @@ dependencies = [
 
 [[package]]
 name = "zstd-safe"
-version = "7.2.1"
+version = "7.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54a3ab4db68cea366acc5c897c7b4d4d1b8994a9cd6e6f841f8964566a419059"
+checksum = "1c8ea04668f5de8d8d51051714ba560c9536519cadcdb8829bba4fe2ad159b03"
 dependencies = [
  "zstd-sys",
 ]

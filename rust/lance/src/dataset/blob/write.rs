@@ -205,6 +205,8 @@ impl BlobPack {
 /// - Emits relative Managed addresses for dataset writes; low-level sidecar writers retain their existing descriptors.
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
+    sidecar_rewrite: Option<Arc<super::SidecarRewrite>>,
+    copied_dedicated: HashMap<u32, BlobDescriptor>,
     managed_base: Option<(Option<u32>, Path)>,
     created_payloads: Option<BlobPayloadInventory>,
     object_store: ObjectStore,
@@ -415,6 +417,8 @@ impl BlobPreprocessor {
             .map(|field| BlobPreprocessField::new(field.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            sidecar_rewrite: None,
+            copied_dedicated: HashMap::new(),
             managed_base: None,
             created_payloads: None,
             object_store,
@@ -431,6 +435,14 @@ impl BlobPreprocessor {
             source_store_registry,
             source_store_params,
         })
+    }
+
+    pub(in crate::dataset) fn with_sidecar_rewrite(
+        mut self,
+        context: Option<Arc<super::SidecarRewrite>>,
+    ) -> Self {
+        self.sidecar_rewrite = context;
+        self
     }
 
     pub(in crate::dataset) fn with_managed_base(
@@ -683,6 +695,114 @@ impl BlobPreprocessor {
         Ok((array, Arc::new(field)))
     }
 
+    /// Resolve task-local source IDs before descriptors reach the encoder.
+    /// Packed values stream through the rolling pack writer, so each output
+    /// retains only its live ranges. Dedicated objects can be copied whole.
+    async fn rewrite_sidecars(
+        &mut self,
+        array: ArrayRef,
+        field: &ArrowField,
+        pack_file_threshold: usize,
+        writer_metadata: &HashMap<String, String>,
+    ) -> Result<(ArrayRef, Arc<ArrowField>)> {
+        let context = self
+            .sidecar_rewrite
+            .clone()
+            .ok_or_else(|| Error::internal("Missing compaction sidecar context"))?;
+        let values = array.as_struct();
+        let kinds = values
+            .column_by_name("kind")
+            .expect("validated kind")
+            .as_primitive::<UInt8Type>();
+        let ids = values
+            .column_by_name("blob_id")
+            .expect("validated blob_id")
+            .as_primitive::<UInt32Type>();
+        let positions = values
+            .column_by_name("position")
+            .expect("validated position")
+            .as_primitive::<UInt64Type>();
+        let sizes = values
+            .column_by_name("blob_size")
+            .expect("validated blob_size")
+            .as_primitive::<UInt64Type>();
+        let data = values
+            .column_by_name("data")
+            .expect("validated data")
+            .as_binary::<i64>();
+        let uris = values
+            .column_by_name("uri")
+            .expect("validated uri")
+            .as_string::<i32>();
+        let mut output = self.blob_writer_with_metadata(field, writer_metadata.clone())?;
+        for row in 0..values.len() {
+            if values.is_null(row) {
+                output.push_null()?;
+                continue;
+            }
+            let kind = BlobKind::try_from(kinds.value(row))?;
+            match kind {
+                BlobKind::Packed | BlobKind::Dedicated => {
+                    if kind == BlobKind::Packed && sizes.value(row) == 0 {
+                        // Empty ranges need no object access, including readers
+                        // that reject empty range requests.
+                        output.push_inline(Bytes::new())?;
+                        continue;
+                    }
+                    if kind == BlobKind::Dedicated
+                        && let Some(descriptor) = self.copied_dedicated.get(&ids.value(row))
+                    {
+                        output.push(descriptor.clone())?;
+                        continue;
+                    }
+                    let source = context.source(ids.value(row))?;
+                    let descriptor = if kind == BlobKind::Packed {
+                        let source = ExternalBlobSource {
+                            reader: source.store.open(&source.path).await?,
+                            start: positions.value(row),
+                            size: sizes.value(row),
+                        };
+                        self.write_packed(pack_file_threshold, BlobWriteSource::External(&source))
+                            .await?
+                    } else {
+                        let id = self.blob_id_allocator.next()?;
+                        let destination = lance_core::utils::blob::blob_path(
+                            &self.data_dir,
+                            &self.data_file_key,
+                            id,
+                        );
+                        source
+                            .store
+                            .copy_bulk(&source.path, &self.object_store, &destination)
+                            .await?;
+                        BlobDescriptor::Dedicated {
+                            blob_id: id,
+                            size: sizes.value(row),
+                        }
+                    };
+                    output.push(descriptor.clone())?;
+                    if kind == BlobKind::Dedicated {
+                        self.copied_dedicated.insert(ids.value(row), descriptor);
+                    }
+                }
+                BlobKind::Inline => output.push_inline(Bytes::copy_from_slice(data.value(row)))?,
+                BlobKind::External => output.push(BlobDescriptor::External {
+                    base_id: ids.value(row),
+                    uri: uris.value(row).to_string(),
+                    offset: positions.value(row),
+                    size: sizes.value(row),
+                })?,
+                BlobKind::Managed | BlobKind::ManagedWithBase => {
+                    return Err(Error::internal(
+                        "Managed reference in ordinary sidecar rewrite",
+                    ));
+                }
+            }
+        }
+        let (field, array) = output.finish()?.into_parts();
+        Ok((array, Arc::new(field)))
+    }
+
     async fn resolve_external_reference(&mut self, uri: &str) -> Result<(u32, String)> {
         let mapped = if let Some(resolver) = &self.external_base_resolver {
             resolver.resolve_external_uri(uri).await?
@@ -859,6 +979,23 @@ impl BlobPreprocessor {
                             )));
                         }
                     }
+                }
+
+                if self.sidecar_rewrite.is_some()
+                    && let BlobPreprocessFieldKind::BlobV2 {
+                        pack_file_threshold,
+                        writer_metadata,
+                        ..
+                    } = &processor.kind
+                {
+                    return self
+                        .rewrite_sidecars(
+                            array,
+                            field.as_ref(),
+                            *pack_file_threshold,
+                            writer_metadata,
+                        )
+                        .await;
                 }
 
                 if self.is_part
@@ -1254,6 +1391,60 @@ impl BlobPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_rewrites_empty_packed_blob_without_source_io() {
+        let field = crate::blob_field("blob", true);
+        let schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![field]))
+                .unwrap();
+        let mut preprocessor = BlobPreprocessor::new(
+            ObjectStore::memory(),
+            Path::from("data"),
+            "output".into(),
+            &schema,
+            None,
+            false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap()
+        .with_sidecar_rewrite(Some(Arc::new(super::super::SidecarRewrite::default())));
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push_packed(
+                1,
+                BlobRange {
+                    offset: 123,
+                    size: 0,
+                },
+            )
+            .unwrap();
+        let (field, array) = values.finish().unwrap().into_parts();
+        let (array, _) = preprocessor
+            .rewrite_sidecars(array, &field, 1024, field.metadata())
+            .await
+            .unwrap();
+        let array = array.as_struct();
+        assert_eq!(
+            array
+                .column_by_name("kind")
+                .unwrap()
+                .as_primitive::<UInt8Type>()
+                .value(0),
+            BlobKind::Inline as u8
+        );
+        assert_eq!(
+            array
+                .column_by_name("data")
+                .unwrap()
+                .as_binary::<i64>()
+                .value(0),
+            b""
+        );
+    }
 
     use crate::dataset::blob::test_util::{
         complete_blob_v2_array, complete_blob_v2_field, nested_blob_v2_batch,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod composition;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +25,7 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::scalar::load_scalar_segment_params;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -164,6 +166,19 @@ async fn test_create_index(
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
     assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+    let segment_statistics = dataset
+        .index_segment_statistics("embeddings_idx", &[index_meta.uuid])
+        .await
+        .unwrap();
+    let assembled_statistics: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("embeddings_idx", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assembled_statistics.as_object().unwrap(), actual_statistics);
 
     assert!(dataset.index_statistics("non-existent_idx").await.is_err());
     assert!(dataset.index_statistics("").await.is_err());
@@ -898,6 +913,92 @@ async fn test_search_empty(
             &ArrowField::new(DIST_COL, DataType::Float32, true)
         );
     }
+}
+
+/// Rows deleted after the index was built must never come back from a vector
+/// search, also when deletions are the only prefilter and each segment's
+/// prefilter is its ownership mask alone. The compacted case retires fragment
+/// ids, so the masks have to restrict to the live fragments as well.
+#[rstest]
+#[tokio::test]
+async fn test_vector_search_excludes_rows_deleted_after_indexing(
+    #[values(false, true)] use_stable_row_id: bool,
+    #[values(false, true)] compact: bool,
+) {
+    let write_params = WriteParams {
+        max_rows_per_file: 300,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let rows = |first_id: u64, num_rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(num_rows), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(rows(0, 1200), "memory://", Some(write_params.clone()))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(rows(1200, 600), Some(write_params))
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+    dataset.delete("id % 3 = 0").await.unwrap();
+    if compact {
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("id % 3 = 1 AND id % 2 = 0").await.unwrap();
+    }
+
+    let live_ids = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let query = Float32Array::from_iter_values((0..16).map(|i| i as f32 / 16.0));
+    // Probing every partition with k above the row count returns every row the
+    // prefilter lets through, so the result must be exactly the live rows.
+    let results = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .nearest("vec", &query, 2000)
+        .unwrap()
+        .minimum_nprobes(2)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let found_ids = results["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert_eq!(found_ids.len(), results.num_rows());
+    assert_eq!(found_ids, live_ids);
 }
 
 #[rstest]
@@ -4059,6 +4160,7 @@ async fn test_fts_unindexed_data() {
 
 #[derive(Clone, Copy, Debug)]
 enum RestrictedMatchDomain {
+    Unrestricted,
     Prefilter,
     IndexedFragment,
     Filter(&'static str),
@@ -4149,6 +4251,24 @@ fn raw_match_oracle(corpus: &[(i32, &str)], query: &str) -> (RawMatchCorpus, Vec
     )
 }
 
+/// A phrase scores as the Match of its terms, so the oracle keeps the Match scores
+/// of the rows that hold the terms adjacently and in order.
+fn raw_phrase_oracle(corpus: &[(i32, &str)], phrase: &str) -> (RawMatchCorpus, Vec<(i32, f64)>) {
+    let terms: Vec<_> = phrase.split_whitespace().collect();
+    let (corpus_stats, mut scores) = raw_match_oracle(corpus, phrase);
+    scores.retain(|(id, _)| {
+        corpus.iter().any(|(row, text)| {
+            row == id
+                && text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(terms.len())
+                    .any(|window| window == terms.as_slice())
+        })
+    });
+    (corpus_stats, scores)
+}
+
 #[derive(Debug, serde::Serialize)]
 struct RestrictedMatchObservation {
     stage: &'static str,
@@ -4170,6 +4290,16 @@ async fn restricted_match_observation(
         .with_fuzziness(Some(0))
         .with_operator(Operator::Or)
         .with_document_granularity(DocumentGranularity::Row);
+    restricted_fts_observation(dataset, domain, stage, limit, query.into()).await
+}
+
+async fn restricted_fts_observation(
+    dataset: &Dataset,
+    domain: RestrictedMatchDomain,
+    stage: &'static str,
+    limit: Option<i64>,
+    query: FtsQuery,
+) -> RestrictedMatchObservation {
     let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
     let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
@@ -4179,11 +4309,12 @@ async fn restricted_match_observation(
         }))
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .limit(limit, None)
         .unwrap();
     match domain {
+        RestrictedMatchDomain::Unrestricted => {}
         RestrictedMatchDomain::Prefilter => {
             scanner.prefilter(true).filter("id < 2").unwrap();
         }
@@ -4366,7 +4497,24 @@ fn assert_restricted_match_oracle(
     candidate_ids: &[i32],
     observations: &[RestrictedMatchObservation],
 ) {
-    let (corpus_stats, mut expected) = raw_match_oracle(corpus, "alpha beta");
+    assert_restricted_oracle(
+        name,
+        corpus,
+        raw_match_oracle(corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        observations,
+    );
+}
+
+fn assert_restricted_oracle(
+    name: &str,
+    corpus: &[(i32, &str)],
+    (corpus_stats, mut expected): (RawMatchCorpus, Vec<(i32, f64)>),
+    domain: RestrictedMatchDomain,
+    candidate_ids: &[i32],
+    observations: &[RestrictedMatchObservation],
+) {
     expected.retain(|(id, _)| candidate_ids.contains(id));
     let evidence = serde_json::json!({
         "case": name,
@@ -5011,18 +5159,26 @@ async fn test_fts_9058_modest_indexed_corpus_with_tail(
 async fn test_fts_9058_reuses_optimized_physical_plan(
     #[values(false, true)] stable_row_ids: bool,
     #[values(false, true)] select_fragment: bool,
+    #[values(false, true)] combined: bool,
 ) {
     let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
     let dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
-    let query = MatchQuery::new("alpha beta".to_owned())
-        .with_column(Some("text".to_owned()))
-        .with_fuzziness(Some(0))
-        .with_document_granularity(DocumentGranularity::Row);
+    let query = if combined {
+        FtsQuery::CombinedFields(
+            CombinedFieldsQuery::try_new("alpha beta".to_owned(), vec!["text".to_owned()]).unwrap(),
+        )
+    } else {
+        MatchQuery::new("alpha beta".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(0))
+            .with_document_granularity(DocumentGranularity::Row)
+            .into()
+    };
     let mut scanner = dataset.scan();
     scanner
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .limit(Some(1), None)
         .unwrap();
@@ -5040,14 +5196,22 @@ async fn test_fts_9058_reuses_optimized_physical_plan(
     let explanation = DisplayableExecutionPlan::new(plan.as_ref())
         .indent(false)
         .to_string();
-    assert!(explanation.contains("MatchCorpus"), "{explanation}");
-    assert!(
-        explanation
-            .lines()
-            .any(|line| line.trim_start().starts_with("MatchQuery:")),
-        "{explanation}"
-    );
-    assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    if combined {
+        assert!(
+            explanation.contains("CombinedFieldsCorpus"),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatCombinedFields:"), "{explanation}");
+    } else {
+        assert!(explanation.contains("MatchCorpus"), "{explanation}");
+        assert!(
+            explanation
+                .lines()
+                .any(|line| line.trim_start().starts_with("MatchQuery:")),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    }
     let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
     let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
     expected.retain(|(id, _)| *id < if select_fragment { 3 } else { 2 });
@@ -5097,7 +5261,7 @@ enum RestrictedMatchControl {
 
 #[rstest]
 #[tokio::test]
-async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
+async fn test_fts_9058_match_planner_domains(
     #[values(
         RestrictedMatchControl::Unfiltered,
         RestrictedMatchControl::Postfilter,
@@ -5168,13 +5332,31 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         "ids": ids.as_ref(),
         "scores": scores.as_ref(),
     });
+    if matches!(
+        control,
+        RestrictedMatchControl::Unfiltered | RestrictedMatchControl::Postfilter
+    ) {
+        assert!(explanation.contains("MatchCorpus"), "{evidence:#}");
+        let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
+        expected.truncate(1);
+        if matches!(control, RestrictedMatchControl::Postfilter) {
+            expected.retain(|(id, _)| *id < 2);
+        }
+        assert_eq!(batch.num_rows(), expected.len(), "{evidence:#}");
+        for ((id, score), (expected_id, expected_score)) in ids.iter().zip(scores).zip(expected) {
+            assert_eq!(*id, expected_id, "{evidence:#}");
+            assert!(
+                (f64::from(*score) - expected_score).abs() < 1e-5,
+                "{evidence:#}"
+            );
+        }
+        return;
+    }
     assert!(
         !explanation.contains("MatchCorpus"),
         "unrelated query acquired restricted corpus execution: {evidence:#}"
     );
-    // The original flat paths have one input and apply any candidate predicate
-    // before scoring. A separate emission-selection child belongs only to the
-    // corrected restricted exact root Match path.
+    // Fuzzy and Boolean queries keep their existing candidate filtering paths.
     assert!(
         !flat_child_counts.is_empty(),
         "missing flat path: {evidence:#}"
@@ -5183,22 +5365,435 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         flat_child_counts.iter().all(|count| *count == 1),
         "unrelated query acquired corpus emission filtering: {evidence:#}"
     );
-    // Postfiltering happens after global top-k. In this unchanged mixed path,
-    // residual id 6 wins that top-k and is then excluded by id < 2.
-    let expected_rows = usize::from(!matches!(control, RestrictedMatchControl::Postfilter));
-    assert_eq!(
-        batch.num_rows(),
-        expected_rows,
-        "wrong candidates: {evidence:#}"
-    );
+    assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
     assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
-    if !matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
+    assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
+}
+
+/// Over the whole corpus "beta" is the more common term, so for the phrase
+/// "alpha beta" row 0 ("alpha" twice) outranks row 1 ("beta" twice). Over the
+/// first fragment alone the order flips.
+const PHRASE_CORPUS: [(i32, &str); 10] = [
+    (0, "alpha beta alpha"),
+    (1, "alpha beta beta"),
+    (2, "alpha"),
+    (3, "alpha gamma"),
+    (4, "beta"),
+    (5, "alpha beta"),
+    (6, "beta delta"),
+    (7, "beta gamma"),
+    (8, "gamma alpha beta"),
+    (9, "beta"),
+];
+
+/// `PHRASE_CORPUS` in three fragments.
+fn phrase_corpus_fragments() -> Vec<Vec<(i32, Option<&'static str>)>> {
+    [
+        &PHRASE_CORPUS[..4],
+        &PHRASE_CORPUS[4..7],
+        &PHRASE_CORPUS[7..],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect()
+}
+
+/// One fragment per entry of `fragments`. The first `indexed_fragments` are indexed,
+/// one segment each, and the rest form the unindexed tail. With none indexed the
+/// dataset has no FTS index.
+async fn phrase_dataset(
+    fragments: &[Vec<(i32, Option<&str>)>],
+    indexed_fragments: usize,
+    with_position: bool,
+    stable_row_ids: bool,
+) -> Dataset {
+    let mut dataset = restricted_match_dataset(fragments, 0, stable_row_ids).await;
+    if indexed_fragments > 0 {
+        let fragment_groups = dataset.get_fragments()[..indexed_fragments]
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect();
+        create_fragmented_fts_index_with_groups(
+            &mut dataset,
+            "text",
+            with_position,
+            fragment_groups,
+        )
+        .await;
     }
-    if matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(explanation.contains("MatchQuery:"), "{evidence:#}");
-        assert!(!explanation.contains("CompoundFtsScorer"), "{evidence:#}");
+    dataset
+}
+
+fn phrase_corpus_query() -> FtsQuery {
+    PhraseQuery::new("alpha beta".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into()
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0, 1])]
+#[case::indexed_fragment(RestrictedMatchDomain::IndexedFragment, &[0, 1, 2, 3])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[5, 6, 7, 8, 9])]
+#[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 1, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(0, 1, 2)] indexed_fragments: usize,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(
+        &phrase_corpus_fragments(),
+        indexed_fragments,
+        true,
+        stable_row_ids,
+    )
+    .await;
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            if indexed_fragments == 0 {
+                let fragment_ids = dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|fragment| fragment.id() as u32)
+                    .collect();
+                create_fragmented_fts_index_with_groups(
+                    &mut dataset,
+                    "text",
+                    true,
+                    vec![fragment_ids],
+                )
+                .await;
+            } else {
+                dataset
+                    .optimize_indices(&OptimizeOptions::append())
+                    .await
+                    .unwrap();
+            }
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
     }
+    assert_restricted_oracle(
+        &format!("9058-phrase-{domain:?}-indexed-{indexed_fragments}.json"),
+        &PHRASE_CORPUS,
+        raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
+    for observation in &observations[..2] {
+        let plan = observation.plan.as_ref().unwrap();
+        if indexed_fragments == 0 {
+            assert_contains!(plan, "FlatMatchQuery:");
+        } else {
+            assert_contains!(plan, "MatchCorpus");
+            assert_contains!(plan, "PhraseQuery:");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_requires_positions() {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, false, false).await;
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    let error = observation.rows.unwrap_err();
+    assert!(
+        error.contains("position is not found but required for phrase queries"),
+        "{error}"
+    );
+    // Only the indexed fragments need positions.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Fragments(&[2]),
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership("9058-phrase-without-positions", &[8], &[observation]);
+    // Like Match, a zero limit returns no rows, before positions are checked.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        Some(0),
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership(
+        "9058-phrase-without-positions-zero-limit",
+        &[],
+        &[observation],
+    );
+}
+
+#[rstest]
+#[case::all_null("all-null", &[None, None], &[None, None], &[])]
+#[case::all_empty("all-empty", &[Some(""), Some("")], &[Some(""), Some("")], &[])]
+#[case::empty_index("empty-index", &[None, Some("")], &[Some("alpha beta"), None], &[2])]
+#[case::empty_residual("empty-residual", &[Some("alpha beta"), None], &[None, Some("")], &[0])]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_text_corpus(
+    #[case] name: &str,
+    #[case] initial: &[Option<&str>],
+    #[case] residual: &[Option<&str>],
+    #[case] expected_ids: &[i32],
+) {
+    let fragments = vec![
+        initial
+            .iter()
+            .enumerate()
+            .map(|(id, text)| (id as i32, *text))
+            .collect(),
+        residual
+            .iter()
+            .enumerate()
+            .map(|(id, text)| ((initial.len() + id) as i32, *text))
+            .collect(),
+    ];
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations.push(
+            restricted_fts_observation(
+                &dataset,
+                RestrictedMatchDomain::Filter("id >= 0"),
+                stage,
+                None,
+                phrase_corpus_query(),
+            )
+            .await,
+        );
+    }
+    // Membership only, as in `test_fts_9058_empty_text_corpus`.
+    assert_restricted_match_membership(
+        &format!("9058-phrase-text-{name}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::zero_limit("zero-limit", "alpha beta", Some(0))]
+#[case::no_matches("no-matches", "gamma beta", Some(1))]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_results_complete(
+    #[case] name: &str,
+    #[case] phrase: &str,
+    #[case] limit: Option<i64>,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations
+            .push(restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await);
+    }
+    assert_restricted_match_membership(
+        &format!("9058-phrase-empty-{name}-{domain:?}.json"),
+        &[],
+        &observations,
+    );
+}
+
+/// Slop, a removed stop word and a repeated term change how a phrase matches and
+/// counts. Scores while the tail is unindexed must equal those once it is indexed,
+/// also when the filter drops an appended row that holds the phrase terms.
+#[rstest]
+#[case::slop("alpha delta", 1)]
+#[case::stop_word("alpha the beta", 0)]
+#[case::repeated_term("beta beta", 0)]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_matches_complete_index(
+    #[case] phrase: &str,
+    #[case] slop: u32,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::Filter("id != 4")
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let fragments: Vec<Vec<_>> = [
+        &[
+            (0, "alpha beta delta"),
+            (1, "alpha the beta beta"),
+            (2, "alpha delta gamma"),
+            (3, "beta beta"),
+        ][..],
+        &[
+            (4, "alpha the beta"),
+            (5, "beta beta gamma delta"),
+            (6, "alpha gamma delta"),
+        ],
+        &[
+            (7, "delta alpha beta delta"),
+            (8, "gamma beta beta alpha"),
+            (9, "alpha delta"),
+        ],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect();
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .with_slop(slop)
+        .into();
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await,
+            );
+        }
+    }
+    let evidence = serde_json::json!({
+        "phrase": phrase,
+        "slop": slop,
+        "domain": format!("{domain:?}"),
+        "observations": observations,
+    });
+    let rows = |observation: &RestrictedMatchObservation| {
+        let mut rows = observation
+            .rows
+            .clone()
+            .unwrap_or_else(|error| panic!("execution failed: {error}; {evidence:#}"));
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    };
+    let (partial, complete) = observations.split_at(2);
+    let expected = rows(&complete[1]);
+    assert!(!expected.is_empty(), "no row matches: {evidence:#}");
+    let top_score = expected
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f32::MIN, f32::max);
+    for observation in observations.iter().filter(|o| o.limit.is_none()) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), expected.len(), "wrong hits: {evidence:#}");
+        for ((actual_id, actual_score), (expected_id, expected_score)) in
+            actual.iter().zip(&expected)
+        {
+            assert_eq!(actual_id, expected_id, "wrong candidate: {evidence:#}");
+            assert!(
+                (actual_score - expected_score).abs() < 1e-5,
+                "score depends on index coverage: {evidence:#}"
+            );
+        }
+    }
+    // Ties may pick either row for the top-1, so compare its score.
+    for observation in observations.iter().filter(|o| o.limit == Some(1)) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), 1, "wrong top-1: {evidence:#}");
+        assert!(
+            (actual[0].1 - top_score).abs() < 1e-5,
+            "top-1 score depends on index coverage: {evidence:#}"
+        );
+    }
+    assert_contains!(partial[0].plan.as_ref().unwrap(), "MatchCorpus");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_reuses_physical_plan(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(phrase_corpus_query()))
+        .unwrap()
+        .prefilter(true)
+        .filter("id < 2")
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    // Each execution of the same physical plan needs its own scorer.
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .expect("phrase planning timed out")
+        .unwrap();
+    let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
+    let (_, mut expected) = raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta");
+    expected.retain(|(id, _)| *id < 2);
+    let expected = expected[0];
+    let assert_top_result = |batches: Vec<RecordBatch>| {
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        for batch in batches {
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
+            for (id, score) in ids.values().iter().zip(scores.values()) {
+                assert_eq!(*id, expected.0);
+                assert!((f64::from(*score) - expected.1).abs() < 1e-5);
+            }
+        }
+    };
+    for _ in 0..2 {
+        let batches = tokio::time::timeout(
+            Duration::from_secs(10),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        )
+        .await
+        .expect("reused phrase physical plan timed out")
+        .unwrap();
+        assert_top_result(batches);
+    }
+    let (left, right) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        ),
+    )
+    .await
+    .expect("concurrent phrase physical plan executions timed out")
+    .unwrap();
+    assert_top_result(left);
+    assert_top_result(right);
 }
 
 #[tokio::test]
@@ -8626,6 +9221,153 @@ async fn test_sql_contains_tokens() {
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
+    // The index drops stop words, and a query with no tokens left must still
+    // match the rows the scan matches.
+    for (query, expected) in [
+        (
+            "a",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+            ],
+        ),
+        (
+            "",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat catchup fish",
+                "cat fish catch",
+            ],
+        ),
+    ] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    // Counting reads the index result directly unless it needs a recheck, and
+    // the index lowercases and drops stop words.
+    for (query, expected) in [("a cat", 3), ("A", 0), ("cat catch fish", 4)] {
+        let count = dataset
+            .count_rows(Some(format!("contains_tokens(text, '{query}')")))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+
+    let appended = arrow_array::record_batch!(("text", Utf8, ["cat catch fish", "dog"])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset.append(reader, None).await.unwrap();
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .filter("contains_tokens(text, 'cat catch fish')")
+        .unwrap()
+        .with_ignored_scalar_indices([index_name]);
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_results(
+        vec![batch],
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+            "cat catch fish",
+        ]),
+    );
+}
+
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
+        );
+    }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
 }
 
 #[tokio::test]

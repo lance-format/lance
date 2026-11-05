@@ -12,7 +12,7 @@ use lance_core::Result;
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -165,6 +165,30 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let child_limit = self.child.max_rows_to_drain(num_rows, byte_budget)?;
+        let child_plan_rows = child_limit
+            .dictionary_rows
+            .map(|dictionary_rows| child_limit.rows.min(dictionary_rows))
+            .unwrap_or(child_limit.rows);
+        if child_plan_rows < num_rows {
+            // The child limit is expressed in decoded child rows. Without walking
+            // repetition levels here, one parent row is the largest universally safe
+            // batch size. A single parent row that still exceeds the limit will be
+            // reported by the dictionary conversion path.
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: child_limit.bytes,
+                dictionary_rows: Some(num_rows.min(1)),
+            });
+        }
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: child_limit.bytes,
+            dictionary_rows: None,
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
@@ -260,9 +284,13 @@ mod tests {
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use lance_core::Result;
     use lance_datagen::{RowCount, Seed, array, gen_batch};
     use rstest::rstest;
 
+    use crate::decoder::{
+        DecodedArray, DrainLimit, StructuralDecodeArrayTask, StructuralFieldDecoder,
+    };
     use crate::testing::{
         TestCases, TestEncoding, check_round_trip_encoding_of_data, create_test_field_encoder,
         test_encoding_strategy,
@@ -1620,7 +1648,6 @@ mod tests {
         // bytes depends on the per-row list lengths, which are not known at
         // planning time without inspecting page data.  For this PR we
         // explicitly reject the call rather than returning a wrong estimate.
-        use crate::decoder::StructuralFieldDecoder;
         use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
         use arrow_array::builder::{Int32Builder, ListBuilder};
         use arrow_schema::Field;
@@ -1657,5 +1684,61 @@ mod tests {
             err.to_string().contains("repetition"),
             "error should mention repetition, got: {err}"
         );
+    }
+
+    #[derive(Debug)]
+    struct RowLimitedStructuralDecoder {
+        data_type: DataType,
+        row_limit: u64,
+    }
+
+    #[derive(Debug)]
+    struct UnusedStructuralDecodeTask;
+
+    impl StructuralDecodeArrayTask for UnusedStructuralDecodeTask {
+        fn decode(self: Box<Self>) -> Result<DecodedArray> {
+            Err(lance_core::Error::internal(
+                "row-limited structural decoder is used only for planning".to_string(),
+            ))
+        }
+    }
+
+    impl StructuralFieldDecoder for RowLimitedStructuralDecoder {
+        fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+            Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: Some(self.row_limit),
+            })
+        }
+
+        fn accept_page(&mut self, _child: crate::decoder::LoadedPageShard) -> Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>> {
+            Ok(Box::new(UnusedStructuralDecodeTask))
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.data_type
+        }
+    }
+
+    #[test]
+    fn test_list_caps_parent_rows_when_repeated_child_has_row_limit() {
+        let item_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let list_type = DataType::List(Arc::new(Field::new("item", item_type.clone(), true)));
+        let child = Box::new(RowLimitedStructuralDecoder {
+            data_type: item_type,
+            row_limit: 128,
+        });
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let limit = decoder.max_rows_to_drain(300, i32::MAX as u64).unwrap();
+
+        assert_eq!(limit.rows, 300);
+        assert_eq!(limit.bytes, 0);
+        assert_eq!(limit.dictionary_rows, Some(1));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "15.0.0-beta.5"
+version = "15.0.0-beta.10"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -48,7 +48,7 @@ lance = { path = "../rust/lance", features = [
     "metrics",
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
-lance-core = { path = "../rust/lance-core" }
+lance-core = { path = "../rust/lance-core", features = ["metrics"] }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }
 lance-encoding = { path = "../rust/lance-encoding" }
 lance-file = { path = "../rust/lance-file" }

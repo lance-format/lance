@@ -339,7 +339,7 @@ impl UpdatePlan {
             .keys()
             .filter_map(|column| {
                 let field = dataset.schema().field(column)?;
-                crate::dataset::optimize::field_contains_blob_v2(field)
+                crate::dataset::blob::field_contains_blob_v2(field)
                     .then(|| (column.clone(), Arc::new(Field::from(field))))
             })
             .collect::<HashMap<_, _>>();
@@ -471,7 +471,7 @@ impl UpdateJob {
         }
 
         let stream = if has_blob_v2_columns {
-            let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+            let rewrite_plan = Arc::new(crate::dataset::blob::BlobV2BatchRewritePlan::try_new(
                 self.dataset.schema(),
                 scan_schema.as_ref(),
                 false,
@@ -699,6 +699,7 @@ impl UpdateJob {
         Ok(())
     }
 
+    /// Commit `update_data` against `dataset` as an `Update` transaction.
     async fn commit_impl(
         &self,
         dataset: Arc<Dataset>,
@@ -724,6 +725,7 @@ impl UpdateJob {
             // are moved(deleted and appended).
             // so we do not need to handle the frag bitmap of the index about it.
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap,
             update_mode: Some(RewriteRows),

@@ -5,9 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -69,6 +71,7 @@ pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
+use crate::scheduler::{SCHEDULER_ERROR_MODE_STORAGE_OPTION, SchedulerErrorMode};
 use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -104,6 +107,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 });
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
+
+/// Storage option that sets the registry-wide minimum prune threshold of the
+/// object store cache; see [`StorageOptions::object_store_cache_prune_threshold`].
+pub const OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
 
 #[derive(Debug)]
 struct StreamCopyError {
@@ -170,6 +177,17 @@ pub trait ObjectStoreExt {
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
+}
+
+pub(crate) fn canonicalize_local_io_result(
+    result: std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match result {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[async_trait]
@@ -219,6 +237,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// Scheduler error handling validated at the store construction boundary.
+    scheduler_error_mode: SchedulerErrorMode,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
@@ -353,6 +373,18 @@ pub struct ObjectStoreParams {
     #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// The connector that native S3, GCS and Azure stores open their HTTP clients with.
+    ///
+    /// Lance's own HTTP layers (the AIMD throttle and the metrics) wrap it, so it sees every
+    /// attempt object_store's retry loop makes, and the [`ClientOptions`] lance resolved from
+    /// the storage options. `None` is object_store's `ReqwestConnector`.
+    ///
+    /// object_store also opens its credential clients (IMDS, STS web identity, GCP metadata) with
+    /// it, while S3 bucket-region lookup and the GCS external-account token exchange open their
+    /// own clients and bypass it. Stores and AIMD state are shared only between params that hold
+    /// the same `Arc`, so reuse one connector for one bucket.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    pub http_connector: Option<Arc<dyn object_store::client::HttpConnector>>,
     /// Unified storage options accessor with caching and automatic refresh
     ///
     /// Provides storage options and optionally a dynamic provider for automatic
@@ -377,6 +409,8 @@ impl Default for ObjectStoreParams {
             #[cfg(feature = "aws")]
             aws_credentials: None,
             object_store_wrapper: None,
+            #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+            http_connector: None,
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
@@ -411,6 +445,10 @@ impl ObjectStoreParams {
         }
     }
 
+    pub(crate) fn scheduler_error_mode(&self) -> Result<SchedulerErrorMode> {
+        parse_scheduler_error_mode(self.storage_options())
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -433,10 +471,26 @@ impl ObjectStoreParams {
     }
 }
 
-fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
+fn parse_scheduler_error_mode(
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<SchedulerErrorMode> {
+    let value = storage_options.and_then(|options| {
+        options
+            .get(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+            .or_else(|| {
+                options.iter().find_map(|(key, value)| {
+                    key.eq_ignore_ascii_case(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+                        .then_some(value)
+                })
+            })
+    });
+    value.map_or(Ok(SchedulerErrorMode::BestEffort), |value| value.parse())
+}
+
+fn allocation_ptr<T: ?Sized>(arc: &Arc<T>) -> *const () {
     // Trait object pointers include vtable metadata, which is not stable across codegen units.
     // Cache identity must follow the Arc allocation instead.
-    Arc::as_ptr(wrapper) as *const ()
+    Arc::as_ptr(arc).cast::<()>()
 }
 
 // We implement hash for caching
@@ -455,7 +509,11 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(aws_credentials).hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            wrapper_allocation_ptr(wrapper).hash(state);
+            allocation_ptr(wrapper).hash(state);
+        }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if let Some(connector) = &self.http_connector {
+            allocation_ptr(connector).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -474,6 +532,12 @@ impl PartialEq for ObjectStoreParams {
         if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
             return false;
         }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if self.http_connector.as_ref().map(allocation_ptr)
+            != other.http_connector.as_ref().map(allocation_ptr)
+        {
+            return false;
+        }
 
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
         // For accessor, we use accessor_id() for semantic equality
@@ -487,14 +551,8 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self
-                .object_store_wrapper
-                .as_ref()
-                .map(wrapper_allocation_ptr)
-                == other
-                    .object_store_wrapper
-                    .as_ref()
-                    .map(wrapper_allocation_ptr)
+            && self.object_store_wrapper.as_ref().map(allocation_ptr)
+                == other.object_store_wrapper.as_ref().map(allocation_ptr)
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -699,6 +757,7 @@ impl ObjectStore {
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                scheduler_error_mode: params.scheduler_error_mode()?,
                 io_tracker,
                 store_prefix,
                 // Type-erased on the way in, so there is no telling if it can paginate.
@@ -786,6 +845,35 @@ impl ObjectStore {
         self.is_local() && self.store_prefix == self.scheme
     }
 
+    /// Canonicalize a local object path, resolving rooted and UNC stores through
+    /// their filesystem root mapping.
+    ///
+    /// Returns `Ok(None)` for non-local stores and when the filesystem identity cannot
+    /// be resolved, including missing paths and unsupported local root mappings. Other
+    /// local filesystem errors are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// let a = store.canonicalize_local_path(a).await?;
+    /// let b = store.canonicalize_local_path(b).await?;
+    /// # Ok(a.is_some() && a == b)
+    /// # }
+    /// ```
+    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            return local_dir_operations.canonicalize(path).await;
+        }
+        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+            return canonicalize_local_io_result(
+                tokio::fs::canonicalize(super::local::to_local_path(path)).await,
+            );
+        }
+        Ok(None)
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -835,12 +923,46 @@ impl ObjectStore {
             .max(1)
     }
 
+    pub(crate) fn scheduler_error_mode(&self) -> SchedulerErrorMode {
+        self.scheduler_error_mode
+    }
+
     /// Get the IO tracker for this object store
     ///
     /// The IO tracker can be used to get statistics about read/write operations
     /// performed on this object store.
     pub fn io_tracker(&self) -> &IOTracker {
         &self.io_tracker
+    }
+
+    /// A cumulative counter named `name` on the `metrics` facade, labelled
+    /// like this store's object store metrics (`base`, and `dataset` in
+    /// dataset mode) so work on the store's data is attributed the way its IO
+    /// is. Unlabelled for a store that is not metered (see `meter_store`); a
+    /// no-op without the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn example(store: &ObjectStore) {
+    /// let counter = store.counter("lance_example_items_total");
+    /// counter.increment(1);
+    /// # }
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn counter(&self, name: &'static str) -> StoreCounter {
+        let labels = self
+            .io_tracker
+            .metrics_base()
+            .map(metrics::store_labels)
+            .unwrap_or_default();
+        StoreCounter(::metrics::counter!(name, labels))
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub fn counter(&self, _name: &'static str) -> StoreCounter {
+        StoreCounter()
     }
 
     /// Get a snapshot of current IO statistics without resetting counters
@@ -1946,6 +2068,26 @@ impl StorageOptions {
         Ok(Some(block_size))
     }
 
+    /// Minimum cache size at which the session's object store registry sweeps
+    /// out entries whose store is no longer in use; `0` disables the sweep.
+    /// See [`ObjectStoreRegistry::get_store()`].
+    pub fn object_store_cache_prune_threshold(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION))
+        else {
+            return Ok(None);
+        };
+        let threshold = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option {OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
+                 non-negative integer, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(threshold))
+    }
+
     /// Whether local writes must sync files and directory entries before returning.
     pub(crate) fn local_fsync(&self) -> Result<bool> {
         let Some((_, value)) = self
@@ -2043,9 +2185,15 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
     std::sync::LazyLock::new(ObjectStoreRegistry::default);
 
 impl ObjectStore {
+    /// Wrap an object store implementation with Lance I/O behavior.
+    ///
+    /// `storage_options` may contain `scheduler_error_mode`. Valid values are
+    /// `best_effort` and `fail_fast`. Because this legacy constructor is
+    /// infallible, an invalid value is logged and falls back to `best_effort`.
+    /// Use [`Self::try_new`] when invalid storage options must be rejected.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut store: Arc<DynObjectStore>,
+        store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -2055,21 +2203,126 @@ impl ObjectStore {
         download_retry_count: usize,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Self {
-        let scheme = location.scheme();
-        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-        let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
-            Some(provider) => provider
-                .calculate_object_store_prefix(&location, storage_options)
-                .unwrap(),
+        let scheduler_error_mode = match parse_scheduler_error_mode(storage_options) {
+            Ok(mode) => mode,
+            Err(error) => {
+                log::warn!(
+                    "{error}; ObjectStore::new is falling back to best_effort. Use ObjectStore::try_new to reject invalid storage options"
+                );
+                SchedulerErrorMode::BestEffort
+            }
+        };
+        let store_prefix = Self::direct_store_prefix(&location, storage_options).unwrap();
+        Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        )
+    }
+
+    /// Wrap an object store implementation and validate Lance storage options.
+    ///
+    /// This is the fallible counterpart to [`Self::new`]. Custom object-store
+    /// providers may use it to reject an invalid `scheduler_error_mode` before
+    /// returning a store. A store returned through [`ObjectStoreRegistry`] is
+    /// validated by the registry independently of which constructor its provider
+    /// uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use lance_io::object_store::ObjectStore;
+    /// use object_store::memory::InMemory;
+    /// use url::Url;
+    ///
+    /// # fn build_store() -> lance_core::Result<()> {
+    /// let storage_options = HashMap::from([(
+    ///     "scheduler_error_mode".to_string(),
+    ///     "fail_fast".to_string(),
+    /// )]);
+    /// let _store = ObjectStore::try_new(
+    ///     Arc::new(InMemory::new()),
+    ///     Url::parse("memory:///").expect("valid memory URL"),
+    ///     None,
+    ///     None,
+    ///     false,
+    ///     true,
+    ///     64,
+    ///     3,
+    ///     Some(&storage_options),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Self> {
+        let scheduler_error_mode = parse_scheduler_error_mode(storage_options)?;
+        let store_prefix = Self::direct_store_prefix(&location, storage_options)?;
+        Ok(Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        ))
+    }
+
+    fn direct_store_prefix(
+        location: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(location.scheme()) {
+            Some(provider) => provider.calculate_object_store_prefix(location, storage_options),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
                 log::warn!(
                     "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
                     store_prefix
                 );
-                store_prefix
+                Ok(store_prefix)
             }
-        };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_scheduler_error_mode(
+        mut store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        scheduler_error_mode: SchedulerErrorMode,
+        store_prefix: String,
+    ) -> Self {
+        let scheme = location.scheme();
+        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
         let mut io_tracker = IOTracker::default();
         meter_store(
             &mut store,
@@ -2096,11 +2349,38 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            scheduler_error_mode,
             io_tracker,
             store_prefix,
             // Type-erased on the way in, so there is no telling if it can paginate.
             paginated_lister: None,
         }
+    }
+}
+
+/// Wall time of a scan's decode tasks in nanoseconds, summed over tasks and
+/// labelled like the store's object store metrics (`base`, and `dataset` in
+/// dataset mode). Tasks run concurrently, so the counter's rate is the number
+/// of batches decoding at once. Mirrors the scan node's `decode_time` plan
+/// metric, as a cumulative counter a scrape can read while the scan runs.
+pub const METRIC_SCAN_DECODE_TIME: &str = "lance_scan_decode_time_nanoseconds_total";
+/// Time scan partitions spent waiting for their next batch's I/O to be
+/// scheduled, in nanoseconds, labelled like [`METRIC_SCAN_DECODE_TIME`].
+/// Mirrors the scan node's `task_wait_time` plan metric.
+pub const METRIC_SCAN_TASK_WAIT_TIME: &str = "lance_scan_task_wait_time_nanoseconds_total";
+
+/// A cumulative counter on the `metrics` facade carrying a store's labels; see
+/// [`ObjectStore::counter`]. A no-op without the `metrics` feature.
+pub struct StoreCounter(#[cfg(feature = "metrics")] ::metrics::Counter);
+
+impl StoreCounter {
+    /// Add `value` to the counter. This is a no-op without the `metrics`
+    /// feature.
+    pub fn increment(&self, value: u64) {
+        #[cfg(feature = "metrics")]
+        self.0.increment(value);
+        #[cfg(not(feature = "metrics"))]
+        let _ = value;
     }
 }
 
@@ -2147,6 +2427,27 @@ fn infer_block_size(scheme: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[test]
+    fn test_params_with_different_http_connectors_are_not_shared() {
+        use crate::object_store::test_utils::RecordingConnector;
+        use std::hash::{BuildHasher, RandomState};
+
+        let one: Arc<dyn object_store::client::HttpConnector> =
+            Arc::new(RecordingConnector::default());
+        let other: Arc<dyn object_store::client::HttpConnector> =
+            Arc::new(RecordingConnector::default());
+        let with = |connector: &Arc<dyn object_store::client::HttpConnector>| ObjectStoreParams {
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+        let hasher = RandomState::new();
+        assert_eq!(with(&one), with(&one));
+        assert_eq!(hasher.hash_one(with(&one)), hasher.hash_one(with(&one)));
+        assert_ne!(with(&one), with(&other));
+        assert_ne!(with(&one), ObjectStoreParams::default());
+    }
     use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;
@@ -2164,6 +2465,26 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn test_canonicalize_local_io_result() {
+        let path = PathBuf::from("/tmp/lance-canonical");
+        assert_eq!(
+            canonicalize_local_io_result(Ok(path.clone())).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            canonicalize_local_io_result(Err(std::io::Error::from(std::io::ErrorKind::NotFound,)))
+                .unwrap(),
+            None
+        );
+
+        let error = canonicalize_local_io_result(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
@@ -2254,6 +2575,82 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::default(None, SchedulerErrorMode::BestEffort)]
+    #[case::best_effort(Some("best_effort"), SchedulerErrorMode::BestEffort)]
+    #[case::fail_fast(Some("fail_fast"), SchedulerErrorMode::FailFast)]
+    #[case::case_insensitive(Some("FAIL_FAST"), SchedulerErrorMode::FailFast)]
+    fn test_scheduler_error_mode_storage_option(
+        #[case] value: Option<&str>,
+        #[case] expected: SchedulerErrorMode,
+    ) {
+        let storage_options_accessor = value.map(|value| {
+            Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+                [(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    value.to_string(),
+                )],
+            )))
+        });
+        let params = ObjectStoreParams {
+            storage_options_accessor,
+            ..Default::default()
+        };
+
+        assert_eq!(params.scheduler_error_mode().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_scheduler_error_mode_storage_option() {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    "invalid".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let error = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_scheduler_error_mode() {
+        let storage_options = HashMap::from([(
+            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+            "invalid".to_string(),
+        )]);
+
+        let error = ObjectStore::try_new(
+            Arc::new(InMemory::new()),
+            Url::parse("memory:///").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            Some(&storage_options),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+    }
+
     #[tokio::test]
     async fn test_put_if_absent_rejects_cos() {
         let mut store = ObjectStore::memory();
@@ -2269,40 +2666,56 @@ mod tests {
         assert!(!store.exists(&path).await.unwrap());
     }
 
+    #[rstest]
+    #[case::zero_clamps_to_one("0", 1)]
+    #[case::positive_passes_through("3", 3)]
     #[tokio::test]
-    async fn test_io_parallelism_clamped_to_nonzero() {
+    async fn test_io_parallelism_clamped_to_nonzero(
+        #[case] io_threads: &str,
+        #[case] expected: usize,
+    ) {
+        // Other tests read the process-wide `LANCE_IO_THREADS`, so instead of setting it here the
+        // test re-runs itself in a child process that starts with it. libtest names the thread
+        // after the running test, so the child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_IO_PARALLELISM_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("LANCE_IO_THREADS", io_threads)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
         // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
         // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
         let store = ObjectStore::local();
+        assert_eq!(
+            store.io_parallelism(),
+            expected,
+            "LANCE_IO_THREADS={io_threads} must give {expected}"
+        );
+
         // Readers opened by the store must advertise the store's normalized
         // effective parallelism, not the hardcoded cloud default.
         let mem_store = ObjectStore::memory();
         let path = Path::from("/io_parallelism_probe");
         mem_store.put(&path, b"x").await.unwrap();
-
-        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
-        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
-        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
-        assert_eq!(
-            store.io_parallelism(),
-            1,
-            "LANCE_IO_THREADS=0 must clamp to 1"
-        );
         assert_eq!(
             mem_store.open(&path).await.unwrap().io_parallelism(),
-            1,
-            "an opened reader must report the store's clamped parallelism"
-        );
-
-        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
-        assert_eq!(
-            store.io_parallelism(),
-            8,
-            "a positive override must pass through unchanged"
-        );
-        assert_eq!(
-            mem_store.open(&path).await.unwrap().io_parallelism(),
-            8,
+            expected,
             "an opened reader must honor the configured request limit"
         );
         assert_eq!(
@@ -2311,14 +2724,8 @@ mod tests {
                 .await
                 .unwrap()
                 .io_parallelism(),
-            8,
+            expected,
             "a sized reader must honor the configured request limit"
-        );
-
-        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
-        assert!(
-            store.io_parallelism() >= 1,
-            "the configured default parallelism must be at least 1"
         );
     }
 
@@ -2513,13 +2920,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tilde_expansion() {
-        let uri = "~/foo.lance";
-        write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
-        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
-            .await
-            .unwrap();
-        assert_eq!(contents, "TILDE");
+        // Resolving the path is sufficient to verify expansion and avoids writing
+        // into the real user's home directory.
+        let expected_path = std::env::home_dir()
+            .expect("home directory should be available")
+            .join("foo.lance");
+        let (store, path) = ObjectStore::from_uri("~/foo.lance").await.unwrap();
+
+        assert!(store.is_local());
+        assert_eq!(
+            path,
+            Path::from_absolute_path(expected_path).expect("home path should be absolute")
+        );
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@
 
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
+pub(crate) mod column_width;
 pub mod count_from_mask;
 pub mod count_pushdown;
 mod filter;
@@ -26,7 +27,7 @@ pub mod scalar_index;
 mod scan;
 #[cfg(feature = "substrait")]
 pub mod table_identifier;
-mod take;
+pub(crate) mod take;
 #[cfg(test)]
 pub mod testing;
 pub mod topk_late_materialization;

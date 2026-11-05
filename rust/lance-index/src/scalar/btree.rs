@@ -4,6 +4,7 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
+use lance_index_core::scalar::OrderedScalarIndex;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -66,6 +67,7 @@ use datafusion_physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use hashbrown::{HashTable, hash_table::Entry};
+use lance_core::cache::CacheLoadOrigin;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -128,6 +130,29 @@ pub const BTREE_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
 pub const BTREE_INDEX_VERSION: u32 = BTREE_ROW_ADDR_DOMAIN_VERSION;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
+
+fn checked_batch_size(batch_size: u64) -> std::result::Result<usize, String> {
+    if batch_size == 0 {
+        return Err("BTree batch_size must be greater than zero, got 0".to_string());
+    }
+    usize::try_from(batch_size)
+        .map_err(|_| format!("BTree batch_size {batch_size} does not fit in usize"))
+}
+
+fn parse_batch_size(metadata: &HashMap<String, String>, source: &str) -> Result<u64> {
+    let Some(raw_batch_size) = metadata.get(BATCH_SIZE_META_KEY) else {
+        return Ok(DEFAULT_BTREE_BATCH_SIZE);
+    };
+    let batch_size = raw_batch_size.parse::<u64>().map_err(|error| {
+        Error::corrupt_file_named(
+            source,
+            format!("invalid BTree batch_size metadata {raw_batch_size:?}: {error}"),
+        )
+    })?;
+    checked_batch_size(batch_size)
+        .map(|_| batch_size)
+        .map_err(|error| Error::corrupt_file_named(source, error))
+}
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -1653,6 +1678,9 @@ impl CacheCodecImpl for BTreeIndexState {
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         let header: BTreeIndexHeader = r.read_header()?;
+        let batch_size = header.batch_size;
+        checked_batch_size(header.batch_size)
+            .map_err(|error| Error::corrupt_file_named("BTree index cache metadata", error))?;
         let ranges_to_files = if header.has_ranges_to_files {
             let map: RangeInclusiveMap<u32, (String, u32)> = header
                 .ranges_to_files
@@ -1666,7 +1694,7 @@ impl CacheCodecImpl for BTreeIndexState {
         let lookup_batch = r.read_ipc()?;
         Ok(Self {
             lookup_batch,
-            batch_size: header.batch_size,
+            batch_size,
             ranges_to_files,
             results_are_row_addresses: header.results_are_row_addresses,
         })
@@ -2331,6 +2359,8 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
     ) -> Result<Self> {
+        checked_batch_size(batch_size)
+            .map_err(|error| Error::corrupt_file_named("BTree index metadata", error))?;
         let data_type = data.column(0).data_type().clone();
         let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
@@ -2391,11 +2421,7 @@ impl BTreeIndex {
             .read_range(0..num_rows_in_lookup, None)
             .await?;
         let file_schema = page_lookup_file.schema();
-        let batch_size = file_schema
-            .metadata
-            .get(BATCH_SIZE_META_KEY)
-            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
-            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        let batch_size = parse_batch_size(&file_schema.metadata, "BTree lookup metadata")?;
 
         let range_partitioned = file_schema
             .metadata
@@ -2645,7 +2671,10 @@ fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
 /// the merge skip reading the segment entirely.
 pub(super) fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(
+            OldIndexDataFilter::Fragments { to_keep, .. }
+            | OldIndexDataFilter::RowAddresses { to_keep, .. },
+        ) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
         None => false,
     }
@@ -2744,6 +2773,7 @@ impl Index for BTreeIndex {
         while let Some((page_idx, page)) = pages.try_next().await? {
             let inserted = self
                 .index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -3064,13 +3094,8 @@ impl ScalarIndex for BTreeIndex {
         )))
     }
 
-    async fn search_ordered(
-        &self,
-        query: Option<&dyn AnyQuery>,
-        options: SortOptions,
-        metrics: Arc<dyn MetricsCollector>,
-    ) -> Result<SendableRecordBatchStream> {
-        self.search_ordered_stream(query, options, metrics)
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        Some(self)
     }
 
     fn lookup<'a>(
@@ -3316,6 +3341,7 @@ pub async fn train_btree_index(
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
 ) -> Result<Vec<IndexFile>> {
+    let batch_size_usize = checked_batch_size(batch_size).map_err(Error::invalid_input)?;
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -3366,7 +3392,7 @@ pub async fn train_btree_index(
         .data_type()
         .clone();
 
-    let mut batches_source = chunk_concat_stream(batches_source, batch_size as usize);
+    let mut batches_source = chunk_concat_stream(batches_source, batch_size_usize);
 
     while let Some(batch) = batches_source.try_next().await? {
         encoded_batches.push(
@@ -3497,12 +3523,10 @@ async fn merge_metadata_files(
 
     // Step 3: Extract shared metadata and generate lookup_schema
     let first_lookup_reader = store.open_index_file(&part_lookup_files[0]).await?;
-    let batch_size = first_lookup_reader
-        .schema()
-        .metadata
-        .get(BATCH_SIZE_META_KEY)
-        .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
-        .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+    let batch_size = parse_batch_size(
+        &first_lookup_reader.schema().metadata,
+        "BTree partition lookup metadata",
+    )?;
     let range_partitioned = first_lookup_reader
         .schema()
         .metadata
@@ -4030,6 +4054,13 @@ impl BasicTrainer for BTreeIndexPlugin {
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;
+        if let Some(zone_size) = params.zone_size
+            && zone_size == 0
+        {
+            return Err(Error::invalid_input_source(
+                format!("BTree zone_size must be greater than zero, got {zone_size}").into(),
+            ));
+        }
         Ok(Box::new(BTreeTrainingRequest::new(params)))
     }
 
@@ -4081,6 +4112,10 @@ impl BasicTrainer for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -4252,11 +4287,12 @@ mod tests {
     };
 
     use super::{
-        BTreeIndexPlugin, BTreeIndexState, BTreeLookup, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        Matches, OrderableScalarValue, PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        BATCH_SIZE_META_KEY, BTREE_LOOKUP_NAME, BTreeIndexPlugin, BTreeIndexState, BTreeLookup,
+        BTreePageKey, DEFAULT_BTREE_BATCH_SIZE, Matches, OrderableScalarValue,
+        PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path, part_page_data_file_path,
+        train_btree_index,
     };
-    use crate::scalar::registry::ScalarIndexPlugin;
+    use crate::scalar::registry::{BasicTrainer, ScalarIndexPlugin};
     use arrow_array::RecordBatch;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey};
 
@@ -4282,6 +4318,72 @@ mod tests {
         IndexBuildProgress,
         lance_core::Result<()>
     );
+
+    #[test]
+    fn test_btree_rejects_zero_zone_size() {
+        let params = r#"{"zone_size":0}"#;
+        let field = Field::new("value", DataType::Int64, true);
+
+        let Err(error) = BTreeIndexPlugin.new_training_request(params, &field) else {
+            panic!("zero zone size must be rejected");
+        };
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("zone_size"));
+    }
+
+    #[tokio::test]
+    async fn test_btree_load_rejects_zero_batch_size_metadata() {
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let lookup_batch = sample_lookup_batch();
+        let mut writer = store
+            .new_index_file(BTREE_LOOKUP_NAME, lookup_batch.schema())
+            .await
+            .unwrap();
+        writer.write_record_batch(lookup_batch).await.unwrap();
+        writer
+            .finish_with_metadata(HashMap::from([(
+                BATCH_SIZE_META_KEY.to_string(),
+                "0".to_string(),
+            )]))
+            .await
+            .unwrap();
+
+        let result = BTreeIndex::load(Arc::new(store), None, &LanceCache::no_cache(), true).await;
+        let Err(error) = result else {
+            panic!("zero batch size metadata must be rejected");
+        };
+
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("batch_size"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_writer_rejects_zero_batch_size() {
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(3), BatchCount::from(1));
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+
+        let error = train_btree_index(stream, &store, 0, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("batch_size"));
+    }
+
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();

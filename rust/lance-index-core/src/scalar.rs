@@ -14,6 +14,7 @@ use datafusion_expr::Expr;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
@@ -577,6 +578,13 @@ pub enum OldIndexDataFilter {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
+    /// Keep addresses in retained fragments except for deletion-marked positions.
+    /// The exclusion set stores only deleted offsets, not a mapping for every live row.
+    RowAddresses {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+        deleted_rows: RowAddrTreeMap,
+    },
     /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
     /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
@@ -594,6 +602,19 @@ impl OldIndexDataFilter {
                 .iter()
                 .map(|id| id.map(|id| valid_row_ids.contains(id)))
                 .collect(),
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => row_ids
+                .iter()
+                .map(|address| {
+                    address.map(|address| {
+                        to_keep.contains(RowAddress::from(address).fragment_id())
+                            && !deleted_rows.contains(address)
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -605,6 +626,14 @@ impl OldIndexDataFilter {
         match self {
             Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
             Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => {
+                rows.retain_fragments(to_keep.iter());
+                *rows -= deleted_rows;
+            }
         }
     }
 }
@@ -726,48 +755,10 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         self.search(query, metrics).await
     }
 
-    /// Stream the rows that satisfy `query` in the key order of `options`, or
-    /// every row, null keys included, when `query` is `None`.
-    ///
-    /// Each batch has two columns: the key, then the row identifier that
-    /// [`Self::search`] returns, named `_rowaddr` when
-    /// [`Self::results_are_row_addresses`] is true and `_rowid` otherwise.
-    /// A query yields only the rows where it is true, so null keys appear only
-    /// for `IS NULL` and for a range unbounded at both ends, which is true for
-    /// every row. The order of rows with equal keys is up to the index.
-    ///
-    /// The stream is complete and exact: it yields every matching row once.
-    /// It has no limit, so a consumer that stops reading early owns that
-    /// truncation and must not report what it read as the full answer.
-    /// Dropping the stream stops further index reads.
-    ///
-    /// The default returns [`Error::NotSupported`].
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use arrow_schema::SortOptions;
-    /// # use futures::StreamExt;
-    /// # use lance_index_core::metrics::NoOpMetricsCollector;
-    /// # use lance_index_core::scalar::ScalarIndex;
-    /// # async fn test(index: &dyn ScalarIndex) -> lance_core::Result<()> {
-    /// let options = SortOptions { descending: true, nulls_first: false };
-    /// let mut stream = index
-    ///     .search_ordered(None, options, Arc::new(NoOpMetricsCollector))
-    ///     .await?;
-    /// let largest_keys = stream.next().await;
-    /// # Ok(())
-    /// # }
-    /// ```
-    async fn search_ordered(
-        &self,
-        _query: Option<&dyn AnyQuery>,
-        _options: SortOptions,
-        _metrics: Arc<dyn MetricsCollector>,
-    ) -> Result<SendableRecordBatchStream> {
-        Err(Error::not_supported(format!(
-            "ordered search is not supported by this {} index",
-            self.index_type()
-        )))
+    /// This index as an [`OrderedScalarIndex`], or `None` when it cannot
+    /// stream rows in key order.
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        None
     }
 
     /// Find the rows whose indexed value equals each of `keys`.
@@ -777,7 +768,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// rows yields one match per row, a key matching nothing yields none, and
     /// matches come in no particular order. A key matches exactly the rows
     /// `search` returns for an equality query on it, so for floats `-0.0`
-    /// and `0.0` are distinct and NaN matches NaN. A null key never matches,
+    /// and `0.0` compare equal and NaN matches NaN. A null key never matches,
     /// not even a null indexed value. `keys` must have the index's value type.
     ///
     /// Like [`Self::search`], the rows may include deleted rows, so callers
@@ -803,8 +794,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         false
     }
 
-    /// Returns true if the remap operation is supported
-    fn can_remap(&self) -> bool;
+    /// Returns true if the remap operation is supported.
+    ///
+    /// Deprecated: new index implementations should report remap support from
+    /// persisted metadata through their scalar index plugin, so callers can
+    /// decide without opening the index. This instance-level check remains for
+    /// existing implementations; returning `false` keeps the index on the
+    /// safe fallback path during maintenance. The default is `true` because an
+    /// index that does not override this method may still be remappable.
+    #[deprecated(
+        note = "report remap support from persisted metadata through the scalar index plugin instead"
+    )]
+    fn can_remap(&self) -> bool {
+        true
+    }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     ///
@@ -900,6 +903,51 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
         None
     }
+}
+
+/// A [`ScalarIndex`] that streams rows in key order, reached through
+/// [`ScalarIndex::as_ordered`].
+pub trait OrderedScalarIndex: ScalarIndex {
+    /// Stream the rows that satisfy `query` in the key order of `options`, or
+    /// every row, null keys included, when `query` is `None`.
+    ///
+    /// Each batch has two columns: the key, then the row identifier that
+    /// [`ScalarIndex::search`] returns, named `_rowaddr` when
+    /// [`ScalarIndex::results_are_row_addresses`] is true and `_rowid`
+    /// otherwise. A query yields only the rows where it is true, so null keys
+    /// appear only for `IS NULL` and for a range unbounded at both ends, which
+    /// is true for every row. The order of rows with equal keys is up to the
+    /// index.
+    ///
+    /// The stream is complete and exact: it yields every matching row once.
+    /// It has no limit, so a consumer that stops reading early owns that
+    /// truncation and must not report what it read as the full answer.
+    /// Dropping the stream stops further index reads.
+    ///
+    /// An index that finds its files out of key order returns
+    /// [`Error::NotSupported`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::SortOptions;
+    /// # use futures::StreamExt;
+    /// # use lance_index_core::metrics::NoOpMetricsCollector;
+    /// # use lance_index_core::scalar::ScalarIndex;
+    /// # async fn test(index: &dyn ScalarIndex) -> lance_core::Result<()> {
+    /// if let Some(index) = index.as_ordered() {
+    ///     let options = SortOptions { descending: true, nulls_first: false };
+    ///     let mut stream = index.search_ordered(None, options, Arc::new(NoOpMetricsCollector))?;
+    ///     let largest_keys = stream.next().await;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn search_ordered(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        options: SortOptions,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Abstraction over any type that can remap row IDs during index loading.

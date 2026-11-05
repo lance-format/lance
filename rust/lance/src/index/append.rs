@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
@@ -40,16 +40,16 @@ use super::vector::ivf::{
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
-use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
+use super::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
-    scan_training_data,
+    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, load_fts_training_data,
+    load_training_data, scan_training_data,
 };
-use crate::index::vector_index_details_default;
+use crate::index::vector::details::vector_index_details_default;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -161,17 +161,9 @@ async fn live_row_ids(
 /// row addresses rather than row ids (see
 /// `ScalarIndex::results_are_row_addresses`). `build_stable_row_id_filter`
 /// below produces row ids, which would be the wrong domain to filter such an
-/// index's stored addresses against, so an address-domain index always falls
-/// back to coarse `Fragments` filtering instead, regardless of the dataset's
-/// row-id scheme.
-///
-/// That coarse filtering cannot tell a still-"effective" fragment's live rows
-/// from ones a same-fragment update superseded (under stable row ids,
-/// updating an indexed column deletes the row's old physical copy and writes
-/// the new value elsewhere, but the old fragment keeps its id and stays
-/// "effective"), so an address-domain index can merge in a stale posting this
-/// way. Exact address-level filtering would avoid that; left as a future
-/// optimization.
+/// index's stored addresses against. Address-domain indices instead use fragment
+/// membership and deletion vectors, without reading row-ID sequences or building
+/// an allow-list of every live row. The filter is applied after address remapping.
 pub async fn build_old_data_filter(
     dataset: &Dataset,
     effective_old_frags: &RoaringBitmap,
@@ -182,6 +174,41 @@ pub async fn build_old_data_filter(
         let valid_old_row_ids = build_stable_row_id_filter(dataset, effective_old_frags).await?;
         Ok(Some(OldIndexDataFilter::RowIds(valid_old_row_ids)))
     } else {
+        if address_domain {
+            let reader_dataset = Arc::new(dataset.clone());
+            let fragments = effective_old_frags.iter().filter_map(|fragment_id| {
+                dataset
+                    .find_fragment(u64::from(fragment_id))
+                    .filter(|fragment| fragment.deletion_file.is_some())
+                    .map(|fragment| (fragment_id, fragment.clone()))
+            });
+            let mut deletions = stream::iter(fragments)
+                .map(|(fragment_id, metadata)| {
+                    let reader_dataset = reader_dataset.clone();
+                    async move {
+                        let fragment =
+                            crate::dataset::fragment::FileFragment::new(reader_dataset, metadata);
+                        let deleted = fragment.get_deletion_vector().await?;
+                        Ok::<_, Error>((fragment_id, deleted))
+                    }
+                })
+                .buffer_unordered(dataset.object_store.io_parallelism());
+            let mut deleted_rows = RowAddrTreeMap::new();
+            while let Some((fragment_id, deleted)) = deletions.try_next().await? {
+                if let Some(deleted) = deleted
+                    && !deleted.is_empty()
+                {
+                    deleted_rows.insert_bitmap(fragment_id, RoaringBitmap::from(deleted.as_ref()));
+                }
+            }
+            if !deleted_rows.is_empty() {
+                return Ok(Some(OldIndexDataFilter::RowAddresses {
+                    to_keep: effective_old_frags.clone(),
+                    to_remove: deleted_old_frags.clone(),
+                    deleted_rows,
+                }));
+            }
+        }
         Ok(Some(OldIndexDataFilter::Fragments {
             to_keep: effective_old_frags.clone(),
             to_remove: deleted_old_frags.clone(),
@@ -213,7 +240,7 @@ pub async fn tagged_segment_coverage(
 ) -> Result<Option<HashMap<Uuid, RoaringBitmap>>> {
     use crate::index::frag_reuse::SegmentRemappingPlan;
 
-    let stored = crate::index::load_all_indices(dataset).await?;
+    let stored = crate::index::loading::load_all_indices(dataset).await?;
     if !stored
         .iter()
         .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
@@ -494,7 +521,19 @@ fn block_stale_rows(
         Some(OldIndexDataFilter::RowIds(valid)) => {
             Some(OldIndexDataFilter::RowIds(valid - stale_rows))
         }
-        other => other,
+        Some(OldIndexDataFilter::RowAddresses {
+            to_keep,
+            to_remove,
+            mut deleted_rows,
+        }) => {
+            deleted_rows |= stale_rows;
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                to_remove,
+                deleted_rows,
+            })
+        }
+        other @ (None | Some(OldIndexDataFilter::Fragments { .. })) => other,
     }
 }
 
@@ -713,8 +752,7 @@ async fn load_unindexed_training_data(
         field_path,
         &update_criteria.data_criteria,
         selection,
-        None,
-        None,
+        TrainingScanOptions::default(),
     )
     .await
 }
@@ -757,7 +795,7 @@ async fn rebuild_scalar_segment(
         None,
         true,
         Some(fragment_ids),
-        None,
+        TrainingScanOptions::default(),
     )
     .await?;
     super::scalar::build_scalar_index(
@@ -943,12 +981,26 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // Keep honoring the deprecated instance-level check for external plugins
+    // that predate ScalarIndexPlugin::can_remap. Short-circuit so their `false`
+    // never reaches the metadata check or a remap attempt.
+    #[allow(deprecated)]
+    let is_remappable = if reference_index.can_remap() {
+        let reference_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        IndexDetails(reference_details.clone())
+            .get_plugin()?
+            .can_remap(reference_details.as_ref())?
+    } else {
+        false
+    };
+
     // A remapping merge is stamped with the manifest it read (below): its sources were
     // translated through the fragment-reuse index, so the trim may retire the versions they
     // predate, and overlay masking will trust it for every overlay up to that manifest.
     // Entries carried over from a source never incorporate overlays committed after it was
     // built, so those rows are dropped from the carried-over data and re-read instead.
-    let (stale_rows, scan_selection) = if reference_index.can_remap() {
+    let (stale_rows, scan_selection) = if is_remappable {
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
@@ -1230,7 +1282,7 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        let new_dataset_version = if reference_index.can_remap() {
+        let new_dataset_version = if is_remappable {
             dataset.manifest.version
         } else {
             selected_old_indices
@@ -1255,7 +1307,7 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     // Declared type first: an index awaiting training declares itself a vector
     // index and has no file to find it by.
     if index.index_details.is_some() {
-        return Ok(crate::index::segment_has_vector_details(index));
+        return Ok(crate::index::segment::segment_has_vector_details(index));
     }
 
     if let Some(files) = &index.files {
@@ -1299,6 +1351,7 @@ async fn rebuild_vector_segment(
         .replace(true)
         .fragments(fragment_bitmap.iter().collect())
         .progress(progress)
+        .without_memory_observation()
         .execute_uncommitted()
         .await
 }
@@ -2009,6 +2062,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         )
                         .await?;
                     let update_criteria = reference_index.update_criteria();
+                    let reference_inverted_index = reference_index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            Error::index("expected inverted index training parameters")
+                        })?;
                     if update_criteria.requires_old_data {
                         let params = reference_index.derive_index_params()?;
                         let resolved = resolved_fts.as_ref().ok_or_else(|| {
@@ -2023,6 +2082,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             None,
                             true,
                             None,
+                            reference_inverted_index.params(),
                         )
                         .await?;
                         let new_uuid = Uuid::new_v4();
@@ -2061,6 +2121,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         fragments,
                         true,
                         None,
+                        reference_inverted_index.params(),
                     )
                     .await?;
 
@@ -2207,7 +2268,7 @@ mod tests {
     use super::*;
 
     use crate::index::DatasetIndexExt;
-    use crate::index::DatasetIndexInternalExt;
+    use crate::index::loading::DatasetIndexInternalExt;
     use crate::index::optimize::{
         OptimizeIndicesPlan, commit_optimize_indices, plan_optimize_indices,
     };
@@ -5667,6 +5728,7 @@ mod tests {
                 updated_fragments: vec![updated.fragment],
                 new_fragments: vec![],
                 fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -6239,11 +6301,16 @@ mod tests {
     /// silently reintroduce the stale entries this fix removes. Simulate an
     /// unreadable deletion vector by deleting the file the manifest still
     /// references, then assert optimize errors instead of succeeding.
+    #[rstest::rstest]
+    #[case::row_id_ngram(IndexType::NGram, BuiltinIndexType::NGram)]
+    #[case::address_btree(IndexType::BTree, BuiltinIndexType::BTree)]
     #[tokio::test]
-    async fn test_optimize_errors_when_deletion_vector_unreadable() {
+    async fn test_optimize_errors_when_deletion_vector_unreadable(
+        #[case] index_type: IndexType,
+        #[case] builtin: BuiltinIndexType,
+    ) {
         use crate::dataset::UpdateBuilder;
         use arrow_array::Int32Array;
-        use lance_index::scalar::BuiltinIndexType;
         use lance_table::io::deletion::deletion_file_path;
 
         let test_dir = TempStrDir::default();
@@ -6277,16 +6344,14 @@ mod tests {
         .await
         .unwrap();
 
-        // NGram, not Bitmap: this index must be row-id-domain to exercise the
-        // stable-row-id allow-list path below (Bitmap moved to row-address
-        // domain, which uses coarse fragment filtering instead and never reads
-        // a deletion vector).
+        // Exercise the stable-row-id allow-list and address-domain deletion
+        // filtering paths. Both must propagate unreadable deletion vectors.
         dataset
             .create_index(
                 &["cat"],
-                IndexType::NGram,
+                index_type,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -6324,12 +6389,16 @@ mod tests {
             "update should have left exactly one deletion file"
         );
 
-        let result = dataset.optimize_indices(&OptimizeOptions::default()).await;
+        let error = dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap_err();
         assert!(
-            result.is_err(),
+            matches!(error, Error::IO { .. } | Error::NotFound { .. }),
             "optimize must fail when a deletion vector cannot be read, not \
-             silently keep the deleted rows in the index"
+             silently keep the deleted rows in the index: {error}"
         );
+        assert!(error.to_string().contains("_deletions"), "{error}");
     }
 
     #[tokio::test]
