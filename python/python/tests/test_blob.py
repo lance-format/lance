@@ -3961,7 +3961,7 @@ def test_portable_factory_close_preserves_stream_and_slice(portable_blob_referen
     assert retained.to_pylist() == [b"abcde"]
     assert reader.reserved_bytes > 0
     del retained
-    assert reader.reserved_bytes == 0
+    _wait_for_blob_ref_budget_release(reader)
     assert next(stream, None) is None
 
 
@@ -4015,7 +4015,7 @@ def test_portable_error_after_yield_preserves_output(tmp_path):
             result = next(stream)
             assert result["data"].to_pylist() == [b"good"]
             del result
-        assert reader.reserved_bytes == 0
+        _wait_for_blob_ref_budget_release(reader)
 
 
 @pytest.mark.parametrize("large_list", [False, True])
