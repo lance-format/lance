@@ -617,7 +617,8 @@ async fn do_commit_new_dataset(
                     None,
                     None,
                     None,
-                )?;
+                )
+                .await?;
                 crate::dataset::blob::clone::copy_blob_columns(
                     Arc::new(source),
                     Arc::new(object_store.clone()),
@@ -1453,6 +1454,7 @@ pub(crate) async fn do_commit_detached_transaction(
         }
 
         // Try to commit the manifest
+        dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -1578,6 +1580,7 @@ pub(crate) async fn commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_branch_exists().await?;
     let guard = if matches!(transaction.operation, Operation::Restore { .. }) {
         Some(
             HistoryLock::acquire(
@@ -1600,6 +1603,7 @@ pub(crate) async fn commit_detached_transaction(
         retry_timeout,
     )
     .await;
+    let result = dataset.ensure_branch_exists().await.and(result);
     match guard {
         Some(guard) => guard.finish(result).await,
         None => result,
@@ -1712,7 +1716,8 @@ async fn record_successful_commit(
     location: &ManifestLocation,
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
-) {
+) -> Result<()> {
+    dataset.ensure_branch_exists().await?;
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
     };
@@ -1751,6 +1756,7 @@ async fn record_successful_commit(
             _ => {}
         };
     }
+    dataset.ensure_branch_exists().await
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
@@ -1767,6 +1773,7 @@ pub(crate) async fn commit_transaction(
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_branch_exists().await?;
     let mut history_lock = if matches!(transaction.operation, Operation::Restore { .. }) {
         Some(
             HistoryLock::acquire(
@@ -2101,6 +2108,7 @@ async fn do_commit_transaction(
         }
 
         // Try to commit the manifest
+        original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -2117,6 +2125,9 @@ async fn do_commit_transaction(
             may_change_schema,
         )
         .await;
+        // Deletion can race the manifest PUT. Never acknowledge an orphaned
+        // commit, including when the handler reports an ambiguous result.
+        original_dataset.ensure_branch_exists().await?;
 
         match result {
             Ok(manifest_location) => {
@@ -2133,7 +2144,7 @@ async fn do_commit_transaction(
                     indices,
                     commit_config.skip_auto_cleanup,
                 )
-                .await;
+                .await?;
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
@@ -2168,7 +2179,7 @@ async fn do_commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         return Ok((committed_manifest, location));
                     }
                     // Confirmed loss: another writer owns the version (or,
@@ -2244,7 +2255,7 @@ async fn do_commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         if commit_handler.propagate_commit_error_after_success() {
                             return Err(err);
                         }

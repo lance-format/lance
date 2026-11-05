@@ -477,16 +477,14 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
-        }
-
-        let branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-
-        Ok(branch_contents)
+        BranchContents::from_path(&branch_file, self.object_store(), branch)
+            .await
+            .map_err(|error| match error {
+                error if error.is_not_found() => Error::RefNotFound {
+                    message: format!("branch {branch} does not exist"),
+                },
+                error => error,
+            })
     }
 
     pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
@@ -663,7 +661,8 @@ impl Branches<'_> {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
+        // Callers must finish failed cleanup before reusing the branch name,
+        // since branch creation can otherwise expose retained version history.
         self.cleanup_branch_directories(branch).await
     }
 
