@@ -224,21 +224,14 @@ fn physical_field(field: &ArrowField) -> Option<ArrowField> {
         DataType::Utf8View => DataType::Utf8,
         DataType::BinaryView => DataType::Binary,
         DataType::Struct(fields) => {
-            let mut changed = false;
-            let fields = fields
-                .iter()
-                .map(|child| match physical_field(child) {
-                    Some(physical) => {
-                        changed = true;
-                        Arc::new(physical)
-                    }
-                    None => child.clone(),
-                })
-                .collect();
-            if !changed {
-                return None;
+            let mut physical_fields = None;
+            for (index, child) in fields.iter().enumerate() {
+                if let Some(physical) = physical_field(child) {
+                    physical_fields.get_or_insert_with(|| fields.to_vec())[index] =
+                        Arc::new(physical);
+                }
             }
-            DataType::Struct(fields)
+            DataType::Struct(physical_fields?.into())
         }
         DataType::List(child) => DataType::List(Arc::new(physical_field(child)?)),
         DataType::LargeList(child) => DataType::LargeList(Arc::new(physical_field(child)?)),
