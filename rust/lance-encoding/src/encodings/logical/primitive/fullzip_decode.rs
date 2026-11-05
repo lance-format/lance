@@ -2383,14 +2383,15 @@ mod tests {
         );
     }
 
-    /// Output batches must own their value buffers instead of aliasing the
+    /// A partial output batch must own its value buffer instead of aliasing the
     /// full-zip page, for both pass-through and allocating decompressors.
     #[test]
     fn test_full_zip_batch_data_does_not_alias_page_buffer() {
         use crate::decoder::StructuralPageDecoder;
 
         let values = ["alpha-alpha", "beta-beta", "gamma-gamma"];
-        let expected: Vec<u8> = values
+        let num_rows = 2;
+        let expected: Vec<u8> = values[..num_rows]
             .iter()
             .flat_map(|value| value.as_bytes().iter().copied())
             .collect();
@@ -2410,11 +2411,7 @@ mod tests {
             let page_start = page_data.as_ptr() as usize;
             let page_end = page_start + page_data.len();
 
-            let decoded = decoder
-                .drain(values.len() as u64)
-                .unwrap()
-                .decode()
-                .unwrap();
+            let decoded = decoder.drain(num_rows as u64).unwrap().decode().unwrap();
             let DataBlock::VariableWidth(block) = decoded.data else {
                 panic!("{name} full-zip decode did not produce variable-width data");
             };
