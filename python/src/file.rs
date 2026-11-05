@@ -848,6 +848,51 @@ pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
 
+/// Namespace for metadata cache entries read through `object_store`.
+///
+/// `store_prefix` identifies the backing location for addressable stores, but
+/// every in-memory store reports the same `memory` prefix while holding
+/// independent data. Include the store instance there so two sessions opened
+/// on `memory://` cannot serve each other's cached pages.
+fn metadata_cache_namespace(object_store: &ObjectStore) -> String {
+    if object_store.scheme() == "memory" {
+        format!(
+            "{}@{:p}",
+            object_store.store_prefix,
+            Arc::as_ptr(&object_store.inner) as *const ()
+        )
+    } else {
+        object_store.store_prefix.clone()
+    }
+}
+
+/// Token that changes whenever the object at `path` is replaced.
+///
+/// The reader only prefixes cache entries with the file path, so a shared
+/// session cache would otherwise keep serving pages from a previous version
+/// of the file.
+async fn metadata_cache_generation(object_store: &ObjectStore, path: &Path) -> PyResult<String> {
+    let metadata = object_store
+        .inner
+        .head(path)
+        .await
+        .map_err(|e| PyIOError::new_err(format!("Failed to stat file: {}", e)))?;
+    if let Some(e_tag) = metadata.e_tag {
+        return Ok(format!("etag:{}", e_tag));
+    }
+    if let Some(version) = metadata.version {
+        return Ok(format!("version:{}", version));
+    }
+    Ok(format!(
+        "modified:{}:{}",
+        metadata
+            .last_modified
+            .timestamp_nanos_opt()
+            .unwrap_or(i64::MIN),
+        metadata.size
+    ))
+}
+
 impl LanceFileReader {
     async fn open(
         uri_or_path: String,
@@ -871,8 +916,31 @@ impl LanceFileReader {
         columns: Option<Vec<String>>,
         session: Option<Session>,
     ) -> PyResult<Self> {
-        let scheduler =
-            ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
+        // Capture the generation before reading anything so a file replaced
+        // mid-open cannot publish its old pages under the new generation.
+        let no_cache;
+        let scoped_cache;
+        let cache = match &session {
+            Some(session) => {
+                let namespace = metadata_cache_namespace(&object_store);
+                let generation = metadata_cache_generation(&object_store, &path).await?;
+                scoped_cache = session
+                    .inner
+                    .file_metadata_cache()
+                    .with_key_prefix(&namespace)
+                    .with_key_prefix(&generation);
+                &scoped_cache
+            }
+            None => {
+                no_cache = LanceCache::no_cache();
+                &no_cache
+            }
+        };
+
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::new(2 * 1024 * 1024 * 1024),
+        );
         let file = scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await
@@ -892,15 +960,6 @@ impl LanceFileReader {
                 .map_err(|e| PyIOError::new_err(format!("Error creating projection: {}", e)))?,
             );
         }
-
-        let no_cache;
-        let cache = match &session {
-            Some(session) => session.inner.file_metadata_cache(),
-            None => {
-                no_cache = LanceCache::no_cache();
-                &no_cache
-            }
-        };
 
         let inner = FileReader::try_open_with_file_metadata(
             Arc::new(LanceEncodingsIo::new(file.clone())),

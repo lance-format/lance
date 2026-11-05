@@ -172,6 +172,33 @@ def test_file_reader_without_session_does_not_touch_cache(tmp_path):
     assert session.size_bytes() == before
 
 
+def test_file_reader_cache_isolates_distinct_memory_stores():
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    old = pa.table({"a": [1, 1, 1]})
+    new = pa.table({"a": [9, 9, 9]})
+    stores = [LanceFileSession("memory://", session=session) for _ in range(2)]
+    for store, table in zip(stores, [old, new]):
+        with store.open_writer("foo.lance", version="2.2") as writer:
+            writer.write_batch(table)
+    assert stores[0].open_reader("foo.lance").read_all().to_table() == old
+    assert stores[1].open_reader("foo.lance").read_all().to_table() == new
+
+
+def test_file_reader_cache_refreshes_replaced_file(tmp_path):
+    path = tmp_path / "foo.lance"
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    old = pa.table({"a": [1, 1, 1]})
+    new = pa.table({"a": [9, 9, 9]})
+    with LanceFileWriter(str(path), version="2.2") as writer:
+        writer.write_batch(old)
+    assert LanceFileReader(str(path), session=session).read_all().to_table() == old
+
+    with LanceFileWriter(str(path), version="2.2") as writer:
+        writer.write_batch(new)
+    assert LanceFileReader(str(path)).read_all().to_table() == new
+    assert LanceFileReader(str(path), session=session).read_all().to_table() == new
+
+
 def test_version(tmp_path):
     schema = pa.schema([pa.field("a", pa.int64())])
     cases = [
