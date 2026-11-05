@@ -1525,6 +1525,9 @@ async fn test_structured_merge_subplans(
     #[values(false, true)] indexed: bool,
     #[values(false, true)] streaming: bool,
 ) {
+    if run_trace_test_in_child() {
+        return;
+    }
     let directory = TempStrDir::default();
     let data = lance_datagen::gen_batch()
         .col("key", array::step::<UInt32Type>())
@@ -1662,6 +1665,9 @@ async fn test_structured_merge_subplans(
 
 #[tokio::test]
 async fn test_structured_merge_replay_quota_failure() {
+    if run_trace_test_in_child() {
+        return;
+    }
     let data = lance_datagen::gen_batch()
         .col("key", array::step::<UInt32Type>())
         .col("value", array::step::<UInt32Type>())
@@ -1715,6 +1721,30 @@ async fn test_structured_merge_replay_quota_failure() {
     assert!(report.replay_spills.spill_count > 0);
     assert_eq!(dataset.version().version, 1);
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+}
+
+// Other tests install global subscribers and change tracing callsite interest.
+// Run each capture assertion in a fresh process without weakening its checks.
+fn run_trace_test_in_child() -> bool {
+    if std::env::var_os("LANCE_MERGE_TRACE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            std::thread::current().name().unwrap(),
+            "--nocapture",
+        ])
+        .env("LANCE_MERGE_TRACE_TEST_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated trace test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 #[tokio::test]
