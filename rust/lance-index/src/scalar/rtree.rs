@@ -25,6 +25,7 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
+use geo_types::Coord;
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
@@ -233,10 +234,24 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
                 .map(|bs| bs.parse().unwrap_or(0))
                 .unwrap_or(0)
         };
+        // Search uses the total bbox only to skip the tree. serde_json writes an
+        // infinite bound as null, which does not parse back, so a bbox that
+        // cannot be read must cover every query instead of none.
         let bbox = metadata
             .get("bbox")
-            .map(|bs| serde_json::from_str(bs).unwrap_or_default())
-            .unwrap_or_default();
+            .and_then(|bs| serde_json::from_str(bs).ok())
+            .unwrap_or_else(|| {
+                BoundingBox::new_with_coords(&[
+                    Coord {
+                        x: f64::NEG_INFINITY,
+                        y: f64::NEG_INFINITY,
+                    },
+                    Coord {
+                        x: f64::INFINITY,
+                        y: f64::INFINITY,
+                    },
+                ])
+            });
         Self::new(page_size, num_pages, num_items, bbox)
     }
 }
@@ -1719,6 +1734,58 @@ mod tests {
         assert_eq!(stats.num_items, 1);
         assert_eq!(analyzed.try_next().await.unwrap().unwrap().num_rows(), 1);
         assert!(analyzed.try_next().await.unwrap().is_none());
+    }
+
+    /// An infinite coordinate makes the stored total bbox unreadable (serde_json
+    /// writes the bound as null). After a reload the index must still search
+    /// the tree instead of treating the dataset as empty.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_search_after_reload_with_infinite_bound() {
+        let rect_type = RectType::new(Dimension::XY, Default::default());
+        let mut builder = RectBuilder::new(rect_type);
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: f64::NEG_INFINITY, y: 1.0 },
+            coord! { x: 2.0, y: 3.0 },
+        )));
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: 10.0, y: 10.0 },
+            coord! { x: 11.0, y: 11.0 },
+        )));
+        let bounds = builder.finish();
+
+        let (index, store, _tmpdir) = train_index(&bounds, Some(4)).await;
+        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await.unwrap();
+        assert!(pages_reader.schema().metadata["bbox"].contains("null"));
+
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 9.0, y: 9.0 },
+            coord! { x: 12.0, y: 12.0 },
+        ));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert(1);
+        assert_eq!(
+            index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected
+        );
+
+        // The row holding the infinite coordinate must be found too.
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: -5.0, y: 1.0 },
+            coord! { x: -1.0, y: 2.0 },
+        ));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert(0);
+        assert_eq!(
+            index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected
+        );
     }
 
     #[rstest::rstest]

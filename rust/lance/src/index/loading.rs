@@ -1202,6 +1202,21 @@ impl Dataset {
                         }
                     },
 
+                    "IVF_HNSW_RQ" => {
+                        let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            remapping,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                            open_context,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             object_store.clone(),
