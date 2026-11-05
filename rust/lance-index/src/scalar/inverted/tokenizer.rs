@@ -1101,6 +1101,7 @@ impl InvertedIndexParams {
                 let mut tokenizer = TextTokenizer::new(tokenizer);
                 tokenizer.discount_overlaps =
                     self.base_tokenizer == "code" && self.split_identifiers;
+                tokenizer.has_independent_query_tokens = self.base_tokenizer == "ngram";
                 Ok(Box::new(tokenizer))
             }
             Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),

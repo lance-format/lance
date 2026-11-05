@@ -930,8 +930,6 @@ impl VariableFullZipDecoder {
         }
 
         let sliced_data = data.slice_with_length(data_start, data_end - data_start);
-        // Copy into a compact buffer so each output batch owns only what it references.
-        let sliced_data = LanceBuffer::copy_slice(&sliced_data);
         let rebased_offsets = LanceBuffer::reinterpret_vec(rebased_offsets);
         Ok((sliced_data, rebased_offsets))
     }
@@ -1118,6 +1116,113 @@ impl VariableFullZipDecoder {
 }
 
 impl StructuralPageDecoder for VariableFullZipDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if num_rows == 0 {
+            return Ok(0);
+        }
+
+        let start = self.current_idx;
+        let end = usize::try_from(
+            u64::try_from(start)
+                .map_err(|_| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        "decoder row index does not fit u64",
+                    )
+                })?
+                .checked_add(num_rows)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        "decoded byte planning row range overflowed u64",
+                    )
+                })?,
+        )
+        .map_err(|_| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                "decoded byte planning row range does not fit usize",
+            )
+        })?;
+        if end >= self.data_starts.len()
+            || end >= self.offset_starts.len()
+            || start >= self.data_starts.len()
+            || start >= self.offset_starts.len()
+        {
+            return Err(Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "decoded byte planning requested rows {start}..{end}, but the page has {} data starts and {} offset starts",
+                    self.data_starts.len(),
+                    self.offset_starts.len()
+                ),
+            ));
+        }
+
+        let data_start = self.data_starts[start];
+        let data_end = self.data_starts[end];
+        let data_slice = self.data.as_ref().get(data_start..data_end).ok_or_else(|| {
+            Error::corrupt_file_named(
+                "variable_full_zip",
+                format!(
+                    "decoded byte planning data range {data_start}..{data_end} exceeds {} bytes",
+                    self.data.len()
+                ),
+            )
+        })?;
+
+        let bytes_per_offset = usize::from(self.bits_per_offset / 8);
+        let offset_start = self.offset_starts[start];
+        let offset_end = self.offset_starts[end]
+            .checked_add(bytes_per_offset)
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    "decoded byte planning offset range overflowed usize",
+                )
+            })?;
+        let offsets_slice = self
+            .offsets
+            .as_ref()
+            .get(offset_start..offset_end)
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    format!(
+                        "decoded byte planning offset range {offset_start}..{offset_end} exceeds {} bytes",
+                        self.offsets.len()
+                    ),
+                )
+            })?;
+        let offset_bytes =
+            u64::try_from(offset_end.checked_sub(offset_start).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    "decoded byte planning selected reversed offset starts",
+                )
+            })?)
+            .map_err(|_| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    "decoded offset byte count does not fit u64",
+                )
+            })?;
+
+        let value_bytes = self
+            .decompressor
+            .decompressed_size(data_slice, offsets_slice, self.bits_per_offset)
+            .ok_or_else(|| {
+                Error::not_supported(
+                    "decoded_bytes: value decompressor does not report a reliable size".to_string(),
+                )
+            })?;
+        value_bytes.checked_add(offset_bytes).ok_or_else(|| {
+            Error::not_supported(
+                "decoded_bytes: variable full-zip byte count overflowed u64".to_string(),
+            )
+        })
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let start = self.current_idx;
         let end = start + num_rows as usize;
@@ -1130,6 +1235,13 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         // Keep each batch's variable data buffer bounded to the selected rows.
         let (data, offsets) =
             Self::slice_batch_data_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
+        // Copy into a compact buffer so each output batch owns only what it references,
+        // unless the decompressor writes its output to new buffers anyway.
+        let data = if self.decompressor.allocates_output() {
+            data
+        } else {
+            LanceBuffer::copy_slice(&data)
+        };
 
         let repdef_start = self.repdef_starts[start];
         let repdef_end = self.repdef_starts[end];
@@ -1366,16 +1478,26 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, UInt8Array, make_array};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, StringArray, UInt8Array, make_array,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::FixedPerValueDecompressor;
+    use crate::compression::{DecompressionStrategy, FixedPerValueDecompressor};
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::decoder::DecodePageTask;
-    use crate::encodings::logical::primitive::StructuralPageScheduler;
+    use crate::decoder::{DecodePageTask, LoadedPageShard, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
+    use crate::encodings::logical::primitive::{
+        StructuralPageScheduler, StructuralPrimitiveFieldDecoder,
+    };
+    use crate::encodings::physical::binary::VariableEncoder;
+    #[cfg(feature = "zstd")]
+    use crate::encodings::physical::block::{
+        CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+    };
+    use crate::encodings::physical::fsst::FsstPerValueEncoder;
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::metadata::compressive_encoding::Compression;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
@@ -2126,6 +2248,181 @@ mod tests {
             max_rep: 0,
             max_visible_def: 0,
         })
+    }
+
+    fn compressed_variable_full_zip(
+        compressor: &dyn PerValueCompressor,
+        values: &[&str],
+    ) -> VariableFullZipDecoder {
+        use crate::repdef::{ControlWordParser, DefinitionInterpretation};
+
+        let array = StringArray::from_iter_values(values.iter().copied());
+        let (encoded, encoding) = compressor.compress(DataBlock::from_array(array)).unwrap();
+        let PerValueDataBlock::Variable(encoded) = encoded else {
+            panic!("variable-width compressor returned a fixed-width block");
+        };
+
+        let (compressed_data, compressed_offsets) = match encoded.bits_per_offset {
+            32 => (
+                encoded.data,
+                encoded
+                    .offsets
+                    .borrow_to_typed_slice::<u32>()
+                    .as_ref()
+                    .to_vec(),
+            ),
+            64 => {
+                let offsets = encoded
+                    .offsets
+                    .borrow_to_typed_slice::<u64>()
+                    .as_ref()
+                    .to_vec();
+                assert!(
+                    offsets.iter().all(|offset| u32::try_from(*offset).is_ok()),
+                    "full-zip test page requires 32-bit lengths"
+                );
+                let offsets = offsets.into_iter().map(|offset| offset as u32).collect();
+                (encoded.data, offsets)
+            }
+            bits => panic!("unsupported offset width {bits}"),
+        };
+
+        let mut zipped = Vec::new();
+        for offsets in compressed_offsets.windows(2) {
+            let start = offsets[0] as usize;
+            let end = offsets[1] as usize;
+            let value = &compressed_data[start..end];
+            zipped.extend_from_slice(
+                &(u32::try_from(value.len()).expect("test value fits u32")).to_le_bytes(),
+            );
+            zipped.extend_from_slice(value);
+        }
+
+        let decompressor = crate::compression::DefaultDecompressionStrategy::default()
+            .create_variable_per_value_decompressor(&encoding)
+            .unwrap();
+        let details = Arc::new(FullZipDecodeDetails {
+            value_decompressor: PerValueDecompressor::Variable(Arc::from(decompressor)),
+            def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
+            ctrl_word_parser: ControlWordParser::new(0, 0),
+            max_rep: 0,
+            max_visible_def: 0,
+        });
+        VariableFullZipDecoder::new(
+            details,
+            std::collections::VecDeque::from([LanceBuffer::from(zipped)]),
+            values.len() as u64,
+            32,
+            32,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn test_planned_compressed_fullzip_matches_partial_drain() {
+        let compressor = CompressedBufferEncoder::try_new(CompressionConfig::new(
+            CompressionScheme::Zstd,
+            Some(0),
+        ))
+        .unwrap();
+        let page = compressed_variable_full_zip(
+            &compressor,
+            &[
+                "alpha-alpha",
+                "beta-beta",
+                "gamma-gamma",
+                "delta-delta",
+                "epsilon",
+            ],
+        );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
+
+        decoder.drain(2).unwrap().decode().unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
+        let actual = decoder.drain(3).unwrap().decode().unwrap();
+        assert_eq!(planned, actual.data_size);
+    }
+
+    #[test]
+    fn test_planned_fsst_fullzip_bounds_partial_drain() {
+        let compressor = FsstPerValueEncoder::new(Box::new(VariableEncoder::default()));
+        let page = compressed_variable_full_zip(
+            &compressor,
+            &[
+                "alpha-alpha-alpha",
+                "beta-beta-beta",
+                "gamma-gamma-gamma",
+                "delta-delta-delta",
+                "epsilon-epsilon",
+            ],
+        );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
+
+        decoder.drain(2).unwrap().decode().unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
+        let actual = decoder.drain(3).unwrap().decode().unwrap();
+        assert!(
+            planned >= actual.data_size,
+            "planned {planned} bytes must cover actual {} bytes",
+            actual.data_size
+        );
+    }
+
+    /// A partial output batch must own its value buffer instead of aliasing the
+    /// full-zip page, for both pass-through and allocating decompressors.
+    #[test]
+    fn test_full_zip_batch_data_does_not_alias_page_buffer() {
+        use crate::decoder::StructuralPageDecoder;
+
+        let values = ["alpha-alpha", "beta-beta", "gamma-gamma"];
+        let num_rows = 2;
+        let expected: Vec<u8> = values[..num_rows]
+            .iter()
+            .flat_map(|value| value.as_bytes().iter().copied())
+            .collect();
+        let compressors: [(&str, Box<dyn PerValueCompressor>); 2] = [
+            ("pass-through", Box::new(VariableEncoder::default())),
+            (
+                "fsst",
+                Box::new(FsstPerValueEncoder::new(Box::new(
+                    VariableEncoder::default(),
+                ))),
+            ),
+        ];
+
+        for (name, compressor) in compressors {
+            let mut decoder = compressed_variable_full_zip(compressor.as_ref(), &values);
+            let page_data = decoder.data.clone();
+            let page_start = page_data.as_ptr() as usize;
+            let page_end = page_start + page_data.len();
+
+            let decoded = decoder.drain(num_rows as u64).unwrap().decode().unwrap();
+            let DataBlock::VariableWidth(block) = decoded.data else {
+                panic!("{name} full-zip decode did not produce variable-width data");
+            };
+            let out_start = block.data.as_ptr() as usize;
+            let out_end = out_start + block.data.len();
+            assert!(
+                out_end <= page_start || out_start >= page_end,
+                "{name} full-zip batch data aliases the page buffer"
+            );
+            assert_eq!(block.data.as_ref(), expected.as_slice());
+        }
     }
 
     fn decode_variable_full_zip(

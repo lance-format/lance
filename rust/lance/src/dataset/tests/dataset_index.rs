@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod composition;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +25,7 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::scalar::load_scalar_segment_params;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -164,6 +166,19 @@ async fn test_create_index(
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
     assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+    let segment_statistics = dataset
+        .index_segment_statistics("embeddings_idx", &[index_meta.uuid])
+        .await
+        .unwrap();
+    let assembled_statistics: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("embeddings_idx", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assembled_statistics.as_object().unwrap(), actual_statistics);
 
     assert!(dataset.index_statistics("non-existent_idx").await.is_err());
     assert!(dataset.index_statistics("").await.is_err());
@@ -898,6 +913,92 @@ async fn test_search_empty(
             &ArrowField::new(DIST_COL, DataType::Float32, true)
         );
     }
+}
+
+/// Rows deleted after the index was built must never come back from a vector
+/// search, also when deletions are the only prefilter and each segment's
+/// prefilter is its ownership mask alone. The compacted case retires fragment
+/// ids, so the masks have to restrict to the live fragments as well.
+#[rstest]
+#[tokio::test]
+async fn test_vector_search_excludes_rows_deleted_after_indexing(
+    #[values(false, true)] use_stable_row_id: bool,
+    #[values(false, true)] compact: bool,
+) {
+    let write_params = WriteParams {
+        max_rows_per_file: 300,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let rows = |first_id: u64, num_rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(num_rows), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(rows(0, 1200), "memory://", Some(write_params.clone()))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(rows(1200, 600), Some(write_params))
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+    dataset.delete("id % 3 = 0").await.unwrap();
+    if compact {
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("id % 3 = 1 AND id % 2 = 0").await.unwrap();
+    }
+
+    let live_ids = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let query = Float32Array::from_iter_values((0..16).map(|i| i as f32 / 16.0));
+    // Probing every partition with k above the row count returns every row the
+    // prefilter lets through, so the result must be exactly the live rows.
+    let results = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .nearest("vec", &query, 2000)
+        .unwrap()
+        .minimum_nprobes(2)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let found_ids = results["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert_eq!(found_ids.len(), results.num_rows());
+    assert_eq!(found_ids, live_ids);
 }
 
 #[rstest]
@@ -8647,6 +8748,153 @@ async fn test_sql_contains_tokens() {
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
+    // The index drops stop words, and a query with no tokens left must still
+    // match the rows the scan matches.
+    for (query, expected) in [
+        (
+            "a",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+            ],
+        ),
+        (
+            "",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat catchup fish",
+                "cat fish catch",
+            ],
+        ),
+    ] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    // Counting reads the index result directly unless it needs a recheck, and
+    // the index lowercases and drops stop words.
+    for (query, expected) in [("a cat", 3), ("A", 0), ("cat catch fish", 4)] {
+        let count = dataset
+            .count_rows(Some(format!("contains_tokens(text, '{query}')")))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+
+    let appended = arrow_array::record_batch!(("text", Utf8, ["cat catch fish", "dog"])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset.append(reader, None).await.unwrap();
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .filter("contains_tokens(text, 'cat catch fish')")
+        .unwrap()
+        .with_ignored_scalar_indices([index_name]);
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_results(
+        vec![batch],
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+            "cat catch fish",
+        ]),
+    );
+}
+
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
+        );
+    }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
 }
 
 #[tokio::test]

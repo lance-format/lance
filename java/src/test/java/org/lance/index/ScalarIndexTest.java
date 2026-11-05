@@ -622,8 +622,14 @@ public class ScalarIndexTest {
       testDatasetB.createEmptyDataset().close();
       datasetA = testDatasetA.write(1, 20);
       datasetB = testDatasetB.write(1, 20);
-      optionsA = createInvertedSegmentOptions(datasetA.getFragments().get(0).getId());
-      optionsB = createInvertedSegmentOptions(datasetB.getFragments().get(0).getId());
+      // Committed builds, since only they hold the per-Dataset build lock.
+      optionsA =
+          IndexOptions.builder(
+                  Collections.singletonList("name"),
+                  IndexType.INVERTED,
+                  createInvertedIndexParams())
+              .build();
+      optionsB = optionsA;
     }
 
     private void runCreates(IndexBuildProgress progressA, IndexBuildProgress progressB)
@@ -1556,7 +1562,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  @Timeout(value = 10, unit = TimeUnit.SECONDS)
   public void testCreateInvertedIndexAllowsConcurrentCreate(@TempDir Path tempDir)
       throws Exception {
     String datasetPath = tempDir.resolve("inverted_concurrent_create").toString();
@@ -1586,8 +1592,9 @@ public class ScalarIndexTest {
         Thread concurrentCreate =
             new Thread(() -> concurrentResult.set(dataset.createIndex(segmentOptions)));
         concurrentCreate.start();
-        concurrentCreate.join(100);
-        assertTrue(concurrentCreate.isAlive(), "Concurrent create should wait for active create");
+        concurrentCreate.join(3000);
+        assertFalse(
+            concurrentCreate.isAlive(), "Uncommitted create should not wait for active create");
 
         progress.release.countDown();
         outerCreate.join(5000);

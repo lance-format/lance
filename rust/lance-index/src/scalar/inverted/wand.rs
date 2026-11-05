@@ -250,7 +250,7 @@ static USE_MAXSCORE_SEARCH: LazyLock<bool> =
     LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CompetitiveFloorMode {
+pub(super) enum CompetitiveFloorMode {
     #[default]
     Exclusive,
     Inclusive,
@@ -637,8 +637,6 @@ impl CompressedState {
 struct BlockMaxWindow {
     // Sliding block range used for Lucene-style getMaxScore(upTo). The deque is
     // monotonic by score and covers blocks in [start_block_idx, next_block_idx).
-    // Only used for compressed lists without impact skip data; impact lists
-    // answer window max scores from the anchored level caches instead.
     start_block_idx: usize,
     next_block_idx: usize,
     max_scores: VecDeque<(usize, f32)>,
@@ -1635,9 +1633,11 @@ impl PostingIterator {
 
     fn window_max_score<S: Scorer + ?Sized>(&self, up_to: Option<u64>, scorer: &S) -> f32 {
         if let Some(up_to) = up_to
-            && let PostingList::Compressed(ref list) = self.list
-            && list.impacts.is_some()
+            && let PostingList::Compressed(_) = self.list
         {
+            // The window end can come from other postings' block ends, so it can
+            // cover several of this posting's blocks; bound all of them,
+            // impacts or not.
             return self.block_max_score_up_to_with_stats(up_to, scorer).score;
         }
         self.block_max_score(scorer)
@@ -1838,7 +1838,7 @@ pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
 }
 
 #[inline]
-fn score_sum_cannot_compete(
+pub(super) fn score_sum_cannot_compete(
     partial_score: f32,
     remaining_upper_bound: f64,
     floor: f32,
@@ -9663,6 +9663,115 @@ mod tests {
             scored.load(Ordering::Relaxed) <= total_entries + 8,
             "bounds should be baked once instead of recomputed per window; scored={}",
             scored.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn or_search_finds_parked_union_hit_in_a_later_block_of_the_window() {
+        // A query-time fuzzy union (grouped, 128-doc blocks, no impacts) parks
+        // in the tail while the sparse clause's wide block sets the window end.
+        // The union's best document sits in a later block of that window, so a
+        // bound taken from its current block alone skips it and the top-1 is wrong.
+        let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
+        let codec = crate::scalar::inverted::PostingTailCodec::VarintDelta;
+        let non_impact_list = |doc_ids: &[u32], freqs: &[u32]| {
+            let block_maxes = freqs
+                .chunks(block)
+                .map(|chunk| chunk.iter().copied().max().unwrap() as f32)
+                .collect::<Vec<_>>();
+            let max_score = block_maxes.iter().copied().fold(0.0, f32::max);
+            let blocks = compress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len(),
+                doc_ids.iter(),
+                freqs.iter(),
+                block_maxes.into_iter(),
+                codec,
+                block,
+            )
+            .unwrap();
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                codec,
+                block,
+                None,
+                None,
+            ))
+        };
+
+        let block_docs = block as u32;
+        let num_docs = 6 * block_docs;
+        // Dense union over six blocks; every block max is 1 except block 2.
+        let hot_doc = 2 * block_docs + 44;
+        let union_docs = (0..num_docs).collect::<Vec<_>>();
+        let union_freqs = union_docs
+            .iter()
+            .map(|&doc| if doc == hot_doc { 12 } else { 1 })
+            .collect::<Vec<_>>();
+        // Sparse clause: a dense first block whose doc 0 sets the floor, then
+        // a stride-4 block spanning union blocks 1..=4, then a short tail. It
+        // carries no scorer-bound flag so its block maxes stay finite under
+        // `UnitScorer`.
+        let sparse_docs = (0..block_docs)
+            .chain((0..block_docs).map(|i| block_docs + 4 * i))
+            .chain([5 * block_docs, 5 * block_docs + 4])
+            .collect::<Vec<_>>();
+        let sparse_freqs = sparse_docs
+            .iter()
+            .map(|&doc| if doc == 0 { 9 } else { 1 })
+            .collect::<Vec<_>>();
+
+        let mut docs = DocSet::default();
+        let mut exhaustive = vec![0_u32; num_docs as usize];
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        for (doc_ids, freqs) in [(&union_docs, &union_freqs), (&sparse_docs, &sparse_freqs)] {
+            for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+                exhaustive[doc_id as usize] += freq;
+            }
+        }
+        let limit = 1;
+        let mut expected = (0..num_docs).map(u64::from).collect::<Vec<_>>();
+        expected.sort_by_key(|&doc| (std::cmp::Reverse(exhaustive[doc as usize]), doc));
+        expected.truncate(limit);
+        assert_eq!(expected, vec![u64::from(hot_doc)]);
+
+        let union_list = non_impact_list(&union_docs, &union_freqs);
+        let grouped_terms =
+            Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &union_list)]);
+        let union = PostingIterator::with_query_weight(
+            String::from("union"),
+            0,
+            0,
+            1.0,
+            union_list,
+            docs.len(),
+        )
+        .with_grouped_terms(grouped_terms);
+        let sparse = PostingIterator::with_query_weight(
+            String::from("sparse"),
+            1,
+            1,
+            1.0,
+            non_impact_list(&sparse_docs, &sparse_freqs),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, [union, sparse].into_iter(), &docs, UnitScorer);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(limit)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let found = hits
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found, expected,
+            "WAND OR top-{limit} must match exhaustive scoring"
         );
     }
 

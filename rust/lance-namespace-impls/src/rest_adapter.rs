@@ -14,7 +14,10 @@ use axum::{
     Json, Router, ServiceExt,
     body::Bytes,
     extract::{FromRequest, Path, Query, RawQuery, Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        header::{CONTENT_TYPE, RETRY_AFTER},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -384,7 +387,13 @@ fn error_to_response(err: Error) -> Response {
                 let status = error_code_to_status(code);
                 let mut resp = ErrorResponse::new(code as i32);
                 resp.error = Some(ns_err.message().to_string());
-                (status, Json(resp)).into_response()
+                let mut response = (status, Json(resp)).into_response();
+                if let Some(retry_after) = ns_err.retry_after()
+                    && let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string())
+                {
+                    response.headers_mut().insert(RETRY_AFTER, value);
+                }
+                response
             } else {
                 let mut resp = ErrorResponse::new(18);
                 resp.error = Some(source.to_string());
@@ -3855,8 +3864,8 @@ mod tests {
                 "branch must be forwarded in the request body and honored by the backend"
             );
 
-            // The directory backend ignores branch on these, or lacks the
-            // operation, so we check the request it received.
+            // The directory backend lacks update_field_metadata, so we check the
+            // branch each operation received.
             let branch = Some("dev".to_string());
             fixture
                 .namespace
@@ -3892,6 +3901,7 @@ mod tests {
             let mut create_index = CreateTableIndexRequest::new("id".into(), "BTREE".into());
             create_index.id = Some(id.clone());
             create_index.name = Some("id_idx".to_string());
+            create_index.branch = branch.clone();
             fixture
                 .namespace
                 .create_table_index(create_index)
@@ -4641,5 +4651,31 @@ mod tests {
                 "Index column should be 'vector'"
             );
         }
+    }
+
+    #[test]
+    fn test_error_to_response_includes_retry_after_for_throttling() {
+        let response = error_to_response(
+            NamespaceError::Throttling {
+                message: "slow down".to_string(),
+                retry_after: Some(std::time::Duration::from_secs(3)),
+            }
+            .into(),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "3");
+    }
+
+    #[test]
+    fn test_error_to_response_omits_retry_after_without_guidance() {
+        let response = error_to_response(
+            NamespaceError::Throttling {
+                message: "slow down".to_string(),
+                retry_after: None,
+            }
+            .into(),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(RETRY_AFTER).is_none());
     }
 }

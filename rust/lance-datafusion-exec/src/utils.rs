@@ -248,6 +248,7 @@ pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
 pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
 pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
 pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
+pub const DECODE_TIME_METRIC: &str = "decode_time";
 pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
 /// Index segments whose candidate search was omitted because the completed

@@ -48,8 +48,8 @@ use lance_core::{
 };
 use lance_datafusion::planner::Planner;
 use lance_datafusion::utils::{
-    ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC, RANGES_SCANNED_METRIC,
-    ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
+    DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
+    RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
@@ -76,6 +76,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
+use super::column_width::{self, MeasuredWidths};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
@@ -349,12 +350,12 @@ impl FilteredReadGlobalMetrics {
 /// These represent work that is divisible by partition and this work is reported on the
 /// partition that it belongs to
 pub struct FilteredReadPartitionMetrics {
-    // Records the amount of time spent waiting on the lock to grab the next task
-    //
-    // This should typically be fairly small relative to the overall execution time.  If this
-    // value is large then it means we are bottlenecked on the read scheduler which is preventing
-    // this partition from being utilized.
+    /// Time waiting for the next decode task, i.e. for its I/O to be scheduled.
+    /// Large means the scan is I/O bound.
     task_wait_time: Time,
+    /// Wall time of the decode tasks themselves. Tasks run concurrently, so the
+    /// sum can exceed the elapsed time.
+    decode_time: Time,
     baseline_metrics: BaselineMetrics,
 }
 
@@ -362,6 +363,7 @@ impl FilteredReadPartitionMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
+            decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
@@ -1413,9 +1415,18 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                            let maybe_task = task_stream.lock().await.next().await.transpose()?;
-                            Result::Ok(maybe_task.map(|task| (task, task_stream)))
+                            let maybe_task = {
+                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                task_stream.lock().await.next().await.transpose()?
+                            };
+                            Result::Ok(maybe_task.map(|task| {
+                                let partition_metrics = partition_metrics.clone();
+                                let task = async move {
+                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    task.await
+                                };
+                                (task, task_stream)
+                            }))
                         }
                     }
                 });
@@ -1487,7 +1498,10 @@ impl FilteredReadStream {
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batches = task.await?;
+                                let batches = {
+                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    task.await?
+                                };
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
@@ -2307,7 +2321,10 @@ pub struct FilteredReadExec {
 }
 
 /// Describes which rows a [`FilteredReadExec`] should read
-#[derive(Debug)]
+///
+/// `Clone` shares the input plan rather than copying it, which is what
+/// [`FilteredReadExec::with_measured_widths`] needs.
+#[derive(Debug, Clone)]
 enum RowSelector {
     /// Every live row of the dataset (no input plan)
     AllRows,
@@ -2400,6 +2417,41 @@ impl FilteredReadInternalPlan {
 
 impl FilteredReadExec {
     /// Create a new filtered read
+    /// Carries this node's width onto `rebuilt`, when the two report the same
+    /// schema.
+    ///
+    /// `try_new` seeds the width from the schema alone, so every rebuild -- a
+    /// limit pushed down, a child rewritten -- would otherwise discard what an
+    /// earlier scan measured and fall back to no byte size at all.
+    fn carry_measured_width(&self, mut rebuilt: Self) -> Self {
+        if rebuilt.schema() == self.schema() {
+            rebuilt.bytes_per_row = self.bytes_per_row;
+        }
+        rebuilt
+    }
+
+    /// Returns this node with widths measured by earlier reads folded in.
+    ///
+    /// Separate from [`Self::try_new`] because reading them is async. The plan and
+    /// running stream are shared: this node stands in for the original.
+    pub fn with_measured_widths(&self, measured: &MeasuredWidths) -> Self {
+        Self {
+            dataset: self.dataset.clone(),
+            options: self.options.clone(),
+            bytes_per_row: estimated_bytes_per_row(
+                self.schema().as_ref(),
+                self.dataset.schema(),
+                measured,
+            ),
+            materialization_context: self.materialization_context.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+            input: self.input.clone(),
+            plan: self.plan.clone(),
+            running_stream: self.running_stream.clone(),
+        }
+    }
+
     pub fn try_new(
         dataset: Arc<Dataset>,
         options: FilteredReadOptions,
@@ -2522,7 +2574,11 @@ impl FilteredReadExec {
                 &materialization_output_schema,
             ),
         ));
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
 
         // Row-stream reads preserve input order, but can drop identity columns.
         // Remap sort expressions to the output schema and retain only valid prefixes.
@@ -2678,7 +2734,11 @@ impl FilteredReadExec {
             }
         }
         let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
-        let bytes_per_row = estimated_bytes_per_row(output_schema.as_ref(), dataset.schema());
+        let bytes_per_row = estimated_bytes_per_row(
+            output_schema.as_ref(),
+            dataset.schema(),
+            &MeasuredWidths::default(),
+        );
         let num_partitions = match options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
             FilteredReadThreadingMode::MultiplePartitions(n) => n,
@@ -3879,7 +3939,7 @@ impl ExecutionPlan for FilteredReadExec {
             let child = children.into_iter().next();
             let rebuilt = Self::try_new(self.dataset.clone(), self.options.clone(), child)
                 .map_err(|e| DataFusionError::External(e.into()))?;
-            Ok(Arc::new(rebuilt))
+            Ok(Arc::new(self.carry_measured_width(rebuilt)))
         }
     }
 
@@ -3912,9 +3972,44 @@ impl ExecutionPlan for FilteredReadExec {
             )
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
         });
+        // Measure what the read decodes and record it when the read finishes.
+        // A filter, a refine, an index input, a range, a fragment subset or a row
+        // address allow-list all mean this read saw a sample. Only an unrestricted
+        // read measures the column.
+        let representative = self.options.full_filter.is_none()
+            && self.options.refine_filter.is_none()
+            // Every selector but `AllRows` carries a chosen subset: a row set from
+            // an index, or a stream of rows another node already filtered.
+            && matches!(self.input, RowSelector::AllRows)
+            && self.options.scan_range_before_filter.is_none()
+            && self.options.scan_range_after_filter.is_none()
+            && !self.options.only_indexed_fragments
+            && !self.options.with_deleted_rows
+            && self.options.fragments.is_none()
+            && self.options.physical_row_addr_prefilter.is_none()
+            // Each partition wraps its own slice of the shared task stream and
+            // writes the same cache key, so the last one to finish would speak for
+            // the column. Only a single-partition read observes all of it.
+            && !matches!(
+                self.options.threading_mode,
+                FilteredReadThreadingMode::MultiplePartitions(_)
+            );
+        let measured = column_width::measuring(
+            stream.boxed(),
+            self.dataset.metadata_cache.clone(),
+            self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
+            output_schema.clone(),
+            representative,
+        );
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             output_schema,
-            stream,
+            measured,
         )))
     }
 
@@ -3985,7 +4080,7 @@ impl ExecutionPlan for FilteredReadExec {
             updated_options,
             self.input.row_set_plan().cloned(),
         ) {
-            Ok(exec) => Some(Arc::new(exec)),
+            Ok(exec) => Some(Arc::new(self.carry_measured_width(exec))),
             Err(e) => {
                 log::warn!(
                     "Failed to create FilteredReadExec for {} with fetch limit: {}",
@@ -4036,7 +4131,7 @@ mod tests {
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::scalar_index::ScalarIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
     };

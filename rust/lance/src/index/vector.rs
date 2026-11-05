@@ -59,7 +59,8 @@ use lance_index::vector::{
     pq::PQBuildParams,
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType, pb};
+use lance_io::object_reader::LazyReader;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -69,10 +70,12 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb};
+use super::{DatasetIndexExt, IndexParams, loading::DatasetIndexInternalExt};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
+use crate::{Error, Result, dataset::Dataset};
+
+use lance_index::pb::vector_index_stage::Stage;
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
@@ -1956,7 +1959,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::loading::frag_reuse_cache_scope(&dataset).await;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -2039,6 +2042,37 @@ pub(crate) async fn open_index_file(
     }
 }
 
+/// Open an index file for storage inside a long-lived cache entry.
+///
+/// On local stores a reader keeps its file open, which pins the inode even
+/// after cleanup unlinks it. Legacy vector indexes are cached whole, so such a
+/// cache entry would hold a descriptor for every index it has seen. Those
+/// stores get a [`LazyReader`] instead, which reopens the file per read.
+///
+/// Other stores hold no descriptor, and their readers cache small files in
+/// memory, so they keep the regular reader.
+pub(crate) async fn open_cache_reader(
+    object_store: Arc<ObjectStore>,
+    path: &Path,
+    file_name: &str,
+    file_sizes: &HashMap<String, u64>,
+) -> Result<Arc<dyn Reader>> {
+    if object_store.scheme().starts_with("file") {
+        let known_size = file_sizes.get(file_name).map(|&size| size as usize);
+        Ok(Arc::new(LazyReader::new(
+            object_store,
+            path.clone(),
+            known_size,
+        )))
+    } else {
+        Ok(
+            open_index_file(object_store.as_ref(), path, file_name, file_sizes)
+                .await?
+                .into(),
+        )
+    }
+}
+
 #[instrument(level = "debug", skip(dataset, reader))]
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
@@ -2055,7 +2089,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
+    let frag_reuse_uuid = crate::index::loading::frag_reuse_cache_scope(&dataset).await;
     // Load the index metadata to get the correct index directory
     let index_meta = dataset
         .load_index(uuid)
@@ -2071,8 +2105,10 @@ pub(crate) async fn open_vector_index_v2(
                 .clone()
                 .join(uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = open_index_file(
-                object_store.as_ref(),
+            // The cached index keeps this reader alive, so it must not pin an
+            // open descriptor (see [`open_cache_reader`]).
+            let aux_reader = open_cache_reader(
+                object_store.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2083,7 +2119,7 @@ pub(crate) async fn open_vector_index_v2(
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;
@@ -2107,8 +2143,8 @@ pub(crate) async fn open_vector_index_v2(
                 .clone()
                 .join(uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = open_index_file(
-                object_store.as_ref(),
+            let aux_reader = open_cache_reader(
+                object_store.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2122,7 +2158,7 @@ pub(crate) async fn open_vector_index_v2(
 
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;
