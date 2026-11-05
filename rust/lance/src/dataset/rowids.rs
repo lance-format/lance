@@ -679,8 +679,8 @@ mod test {
 
     #[rstest::rstest]
     #[case::metadata_disabled(4096, 0, true)]
-    #[case::index_disabled(0, 4096, false)]
-    #[case::index_too_small(1, 4096, false)]
+    #[case::index_disabled(0, 1 << 20, false)]
+    #[case::index_too_small(1, 1 << 20, false)]
     #[tokio::test]
     async fn test_row_id_index_cache_budget(
         #[case] index_capacity: usize,
