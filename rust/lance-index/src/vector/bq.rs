@@ -29,9 +29,11 @@ pub mod prune;
 pub mod raw_body;
 pub(crate) mod resident;
 pub mod rotation;
+pub(crate) mod row_addresses;
 pub mod scan_stats;
 pub mod storage;
 pub mod transform;
+mod walk;
 
 pub const RABIT_MIN_NUM_BITS: u8 = 1;
 pub const RABIT_MAX_NUM_BITS: u8 = 9;

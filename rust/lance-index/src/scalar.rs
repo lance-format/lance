@@ -31,9 +31,9 @@ pub use lance_index_core::remapping::{
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
-    ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering,
-    UpdateCriteria, lookup_batch, lookup_schema,
+    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, OrderedScalarIndex, RowIdRemapper,
+    ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria,
+    TrainingOrdering, UpdateCriteria, lookup_batch, lookup_schema,
 };
 
 /// The most matches one built-in index's [`ScalarIndex::lookup`] batch holds.
@@ -58,6 +58,7 @@ mod remap_compat_tests;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;
+pub mod tuple;
 pub mod zoned;
 pub mod zonemap;
 

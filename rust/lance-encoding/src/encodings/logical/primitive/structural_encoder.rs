@@ -272,7 +272,35 @@ pub(super) struct PrimitivePlanContext<'a> {
 
 pub(super) enum PrimitiveEncodeAttempt {
     Encoded(EncodedPage),
+    FullZip(FullZipRequest),
     Unhandled(PrimitivePageData),
+}
+
+pub(super) struct FullZipRequest {
+    column_idx: u32,
+    data: DataBlock,
+    compressor: Arc<dyn PerValueCompressor>,
+    validity: Option<BooleanBuffer>,
+    repdef: SerializedRepDefs,
+    num_items: u64,
+    num_visible_items: u64,
+    row_number: u64,
+    num_rows: u64,
+    pub(super) planar: bool,
+}
+
+pub(super) enum DensePageEncoding {
+    Encoded(EncodedPage),
+    FullZip(FullZipRequest),
+}
+
+impl From<DensePageEncoding> for PrimitiveEncodeAttempt {
+    fn from(encoding: DensePageEncoding) -> Self {
+        match encoding {
+            DensePageEncoding::Encoded(page) => Self::Encoded(page),
+            DensePageEncoding::FullZip(request) => Self::FullZip(request),
+        }
+    }
 }
 
 // Immutable encoder state shared by per-page encode tasks.
@@ -318,24 +346,42 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn encode_page(
-        page_encodings: &[PrimitivePageEncoding],
-        ctx: &PrimitiveEncodeContext,
-        mut page: PrimitivePageData,
-    ) -> Result<EncodedPage> {
-        for page_encoding in page_encodings {
-            match page_encoding.behavior.try_encode_page(ctx, page)? {
-                PrimitiveEncodeAttempt::Encoded(page) => return Ok(page),
-                PrimitiveEncodeAttempt::Unhandled(unhandled) => page = unhandled,
+    fn encode_page_async(
+        page_encodings: Arc<[PrimitivePageEncoding]>,
+        ctx: PrimitiveEncodeContext,
+        page: PrimitivePageData,
+    ) -> BoxFuture<'static, Result<EncodedPage>> {
+        async move {
+            let field_name = ctx.field.name.clone();
+            let attempt = spawn_cpu(move || {
+                let mut page = page;
+                for page_encoding in page_encodings.iter() {
+                    match page_encoding.behavior.try_encode_page(&ctx, page)? {
+                        PrimitiveEncodeAttempt::Encoded(page) => {
+                            return Ok(PrimitiveEncodeAttempt::Encoded(page));
+                        }
+                        PrimitiveEncodeAttempt::FullZip(request) => {
+                            return Ok(PrimitiveEncodeAttempt::FullZip(request));
+                        }
+                        PrimitiveEncodeAttempt::Unhandled(unhandled) => page = unhandled,
+                    }
+                }
+                Err(Error::invalid_input_source(
+                    format!("No primitive page encoding atom supports field '{field_name}'").into(),
+                ))
+            })
+            .await?;
+            match attempt {
+                PrimitiveEncodeAttempt::Encoded(page) => Ok(page),
+                PrimitiveEncodeAttempt::FullZip(request) => {
+                    Self::encode_full_zip_async(request).await
+                }
+                PrimitiveEncodeAttempt::Unhandled(_) => Err(Error::internal(
+                    "primitive page encoding returned an unhandled page after selection",
+                )),
             }
         }
-        Err(Error::invalid_input_source(
-            format!(
-                "No primitive page encoding atom supports field '{}'",
-                ctx.field.name
-            )
-            .into(),
-        ))
+        .boxed()
     }
 
     // TODO: This is a heuristic we may need to tune at some point
@@ -1434,15 +1480,51 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_lists: u64,
     ) -> Result<EncodedPage> {
-        let max_rep = repdef
-            .repetition_levels
-            .as_ref()
-            .map_or(0, |r| r.iter().max().copied().unwrap_or(0));
-        let max_def = repdef
-            .definition_levels
-            .as_ref()
-            .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+        let request = Self::prepare_full_zip(
+            column_idx,
+            field,
+            compression_strategy,
+            data,
+            repdef,
+            row_number,
+            num_lists,
+        )?;
+        let FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar: _,
+        } = request;
+        let (compressed_data, value_encoding) =
+            compressor.compress_with_validity(data, validity.as_ref())?;
+        Self::finish_full_zip(
+            column_idx,
+            repdef,
+            compressed_data,
+            value_encoding,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            false,
+        )
+    }
 
+    fn prepare_full_zip(
+        column_idx: u32,
+        field: &Field,
+        compression_strategy: &dyn CompressionStrategy,
+        data: DataBlock,
+        repdef: SerializedRepDefs,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<FullZipRequest> {
         // To handle FSL we just flatten
         // let data = data.flatten();
 
@@ -1456,8 +1538,89 @@ impl PrimitiveStructuralEncoder {
                 (data.num_values(), data.num_values())
             };
 
-        let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
+        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
+        let data = match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            other => other,
+        };
 
+        let compressor: Arc<dyn PerValueCompressor> =
+            Arc::from(compression_strategy.create_per_value(field, &data)?);
+        let validity = if compressor.needs_row_validity() {
+            Self::leaf_validity(&repdef, data.num_values() as usize)?
+        } else {
+            None
+        };
+        Ok(FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar: false,
+        })
+    }
+
+    async fn encode_full_zip_async(request: FullZipRequest) -> Result<EncodedPage> {
+        let FullZipRequest {
+            column_idx,
+            data,
+            compressor,
+            validity,
+            repdef,
+            num_items,
+            num_visible_items,
+            row_number,
+            num_rows,
+            planar,
+        } = request;
+        let (compressed_data, value_encoding) = compressor
+            .compress_with_validity_async(data, validity)
+            .await?;
+
+        spawn_cpu(move || {
+            Self::finish_full_zip(
+                column_idx,
+                repdef,
+                compressed_data,
+                value_encoding,
+                num_items,
+                num_visible_items,
+                row_number,
+                num_rows,
+                planar,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_full_zip(
+        column_idx: u32,
+        repdef: SerializedRepDefs,
+        compressed_data: PerValueDataBlock,
+        value_encoding: CompressiveEncoding,
+        num_items: u64,
+        num_visible_items: u64,
+        row_number: u64,
+        num_lists: u64,
+        planar: bool,
+    ) -> Result<EncodedPage> {
+        let max_rep = repdef
+            .repetition_levels
+            .as_ref()
+            .map_or(0, |r| r.iter().max().copied().unwrap_or(0));
+        let max_def = repdef
+            .definition_levels
+            .as_ref()
+            .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+        let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
         let repdef_iter = build_control_word_iterator(
             repdef.repetition_levels.as_deref(),
             max_rep,
@@ -1468,23 +1631,6 @@ impl PrimitiveStructuralEncoder {
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
-
-        // Full-zip requires byte-aligned values; expand 1-bit booleans to 1 byte each.
-        let data = match data {
-            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
-                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
-            }
-            other => other,
-        };
-
-        let compressor = compression_strategy.create_per_value(field, &data)?;
-        let validity = if compressor.needs_row_validity() {
-            Self::leaf_validity(&repdef, data.num_values() as usize)?
-        } else {
-            None
-        };
-        let (compressed_data, value_encoding) =
-            compressor.compress_with_validity(data, validity.as_ref())?;
 
         let description = match &compressed_data {
             PerValueDataBlock::Fixed(fixed) => EncodingUtils::fixed_full_zip_layout(
@@ -1515,11 +1661,16 @@ impl PrimitiveStructuralEncoder {
             vec![zipped.values]
         };
 
+        let description = if planar {
+            PageEncoding::Planar(crate::format::planar::from_dense_execution(description)?)
+        } else {
+            PageEncoding::Structural(description)
+        };
         Ok(EncodedPage {
             num_rows: num_lists,
             column_idx,
             data,
-            description: PageEncoding::Structural(description),
+            description,
             row_number,
         })
     }
@@ -1963,7 +2114,7 @@ impl PrimitiveStructuralEncoder {
         miniblock_chunk_size: MiniblockChunkSize,
         complex_null_encoding: ComplexNullEncoding,
         dictionary_policy: DictionaryEncodingPolicy,
-    ) -> Result<EncodedPage> {
+    ) -> Result<DensePageEncoding> {
         let PrimitiveEncodeContext {
             column_idx,
             field,
@@ -1978,6 +2129,17 @@ impl PrimitiveStructuralEncoder {
             num_rows,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+        let full_zip_request = |data, repdef| {
+            Self::prepare_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        };
 
         let (repdef, single_row_miniblock_repdef_levels) = match structure {
             PrimitivePageStructure::Dense {
@@ -2005,7 +2167,8 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 complex_null_encoding,
                 compression_strategy.as_ref(),
-            );
+            )
+            .map(DensePageEncoding::Encoded);
         }
 
         let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
@@ -2015,7 +2178,7 @@ impl PrimitiveStructuralEncoder {
             .unwrap_or(false);
 
         if all_null {
-            return if is_simple_validity {
+            return (if is_simple_validity {
                 log::debug!(
                     "Encoding column {} with {} items ({} rows) using simple-null layout",
                     column_idx,
@@ -2038,7 +2201,8 @@ impl PrimitiveStructuralEncoder {
                     complex_null_encoding,
                     compression_strategy.as_ref(),
                 )
-            };
+            })
+            .map(DensePageEncoding::Encoded);
         }
 
         if let DataType::Struct(fields) = &field.data_type()
@@ -2049,7 +2213,8 @@ impl PrimitiveStructuralEncoder {
             }
             // This is maybe a little confusing but the reader should never look at this anyways and it
             // seems like overkill to invent a new layout just for "empty structs".
-            return Self::encode_simple_all_null(column_idx, num_values, row_number);
+            return Self::encode_simple_all_null(column_idx, num_values, row_number)
+                .map(DensePageEncoding::Encoded);
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
@@ -2114,15 +2279,9 @@ impl PrimitiveStructuralEncoder {
                     if let Some(reason) = fullzip_error {
                         return Err(Error::invalid_input_source(reason.into()));
                     }
-                    return Self::encode_full_zip(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    );
+                    return Ok(DensePageEncoding::FullZip(full_zip_request(
+                        data_block, repdef,
+                    )?));
                 }
                 Some(STRUCTURAL_ENCODING_MINIBLOCK) | None => {
                     if requested_encoding.is_none() && fullzip_error.is_none() {
@@ -2131,15 +2290,9 @@ impl PrimitiveStructuralEncoder {
                             column_idx,
                             num_values
                         );
-                        return Self::encode_full_zip(
-                            column_idx,
-                            &field,
-                            compression_strategy.as_ref(),
-                            data_block,
-                            repdef,
-                            row_number,
-                            num_rows,
-                        );
+                        return Ok(DensePageEncoding::FullZip(full_zip_request(
+                            data_block, repdef,
+                        )?));
                     }
                     return Err(Error::invalid_input_source(
                         format!(
@@ -2168,15 +2321,9 @@ impl PrimitiveStructuralEncoder {
                 column_idx,
                 num_values
             );
-            return Self::encode_full_zip(
-                column_idx,
-                &field,
-                compression_strategy.as_ref(),
-                data_block,
-                repdef,
-                row_number,
-                num_rows,
-            );
+            return Ok(DensePageEncoding::FullZip(full_zip_request(
+                data_block, repdef,
+            )?));
         }
 
         if let DataBlock::Dictionary(dict) = data_block {
@@ -2217,7 +2364,8 @@ impl PrimitiveStructuralEncoder {
                 Some(dictionary_data_block),
                 num_rows,
                 miniblock_chunk_size,
-            );
+            )
+            .map(DensePageEncoding::Encoded);
         }
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
@@ -2237,6 +2385,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 miniblock_chunk_size,
             )
+            .map(DensePageEncoding::Encoded)
         } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using mini-block layout",
@@ -2254,21 +2403,16 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 miniblock_chunk_size,
             )
+            .map(DensePageEncoding::Encoded)
         } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using full-zip layout",
                 column_idx,
                 num_values
             );
-            Self::encode_full_zip(
-                column_idx,
-                &field,
-                compression_strategy.as_ref(),
-                data_block,
-                repdef,
-                row_number,
-                num_rows,
-            )
+            Ok(DensePageEncoding::FullZip(full_zip_request(
+                data_block, repdef,
+            )?))
         } else {
             Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
         }
@@ -2418,9 +2562,7 @@ impl PrimitiveStructuralEncoder {
         for page in pages {
             let ctx = ctx.clone();
             let page_encodings = self.page_encodings.clone();
-            let task =
-                spawn_cpu(move || Self::encode_page(page_encodings.as_ref(), &ctx, page)).boxed();
-            tasks.push(task);
+            tasks.push(Self::encode_page_async(page_encodings, ctx, page));
         }
         Ok(tasks)
     }
@@ -2542,16 +2684,15 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
         if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
             return Ok(PrimitiveEncodeAttempt::Unhandled(page));
         }
-        Ok(PrimitiveEncodeAttempt::Encoded(
-            PrimitiveStructuralEncoder::encode_dense_page(
-                ctx.clone(),
-                page,
-                self.compression.clone(),
-                MiniblockChunkSize::U16,
-                ComplexNullEncoding::RawLevels,
-                DictionaryEncodingPolicy::LegacyU16,
-            )?,
-        ))
+        Ok(PrimitiveStructuralEncoder::encode_dense_page(
+            ctx.clone(),
+            page,
+            self.compression.clone(),
+            MiniblockChunkSize::U16,
+            ComplexNullEncoding::RawLevels,
+            DictionaryEncodingPolicy::LegacyU16,
+        )?
+        .into())
     }
 }
 
@@ -2578,16 +2719,15 @@ impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
         if !matches!(&page.structure, PrimitivePageStructure::Dense { .. }) {
             return Ok(PrimitiveEncodeAttempt::Unhandled(page));
         }
-        Ok(PrimitiveEncodeAttempt::Encoded(
-            PrimitiveStructuralEncoder::encode_dense_page(
-                ctx.clone(),
-                page,
-                self.compression.clone(),
-                MiniblockChunkSize::U32,
-                ComplexNullEncoding::CompressedLevels,
-                DictionaryEncodingPolicy::LegacyU32,
-            )?,
-        ))
+        Ok(PrimitiveStructuralEncoder::encode_dense_page(
+            ctx.clone(),
+            page,
+            self.compression.clone(),
+            MiniblockChunkSize::U32,
+            ComplexNullEncoding::CompressedLevels,
+            DictionaryEncodingPolicy::LegacyU32,
+        )?
+        .into())
     }
 }
 

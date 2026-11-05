@@ -9,14 +9,17 @@ use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
+use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{OffsetBuffer, i256};
 use arrow_cast::cast_with_options;
-use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DataType as ArrowDataType, Field,
+    SchemaRef, TimeUnit,
+};
 use arrow_select::concat::concat;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
@@ -59,6 +62,51 @@ fn encode_jsonb(json_str: &str) -> Result<Expr> {
     let bytes = lance_arrow::json::encode_json(json_str)
         .map_err(|e| Error::invalid_input(format!("Failed to encode JSONB: {e}")))?;
     Ok(Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None))
+}
+
+/// Parses the text of a SQL number, such as `0.05`, `.5` or `1.5e-3`, as a
+/// decimal holding exactly its digits. `None` when its digits, counting the
+/// zeros after the decimal point, are more than a 256-bit decimal holds, or
+/// its exponent puts the scale outside `i8`; such a number stays a float.
+fn parse_decimal(number: &str, negative: bool) -> Option<ScalarValue> {
+    let (mantissa, exponent) = match number.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
+        None => (number, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    let scale = i32::try_from(fraction.len()).ok()?.checked_sub(exponent)?;
+    let scale = i8::try_from(scale).ok()?;
+    // Arrow requires the scale to fit the precision.
+    let precision = u8::try_from(
+        digits
+            .len()
+            .max(1)
+            .max(usize::from(scale.max(0).unsigned_abs())),
+    )
+    .ok()?;
+    if precision > DECIMAL256_MAX_PRECISION {
+        return None;
+    }
+    let value = i256::from_string(if digits.is_empty() { "0" } else { digits })?;
+    let value = if negative {
+        value.checked_neg()?
+    } else {
+        value
+    };
+    if precision <= DECIMAL128_MAX_PRECISION {
+        Some(ScalarValue::Decimal128(
+            Some(value.to_i128()?),
+            precision,
+            scale,
+        ))
+    } else {
+        Some(ScalarValue::Decimal256(Some(value), precision, scale))
+    }
 }
 
 // The escape in `LIKE/ILIKE ... ESCAPE '<char>'` must be exactly one character.
@@ -450,11 +498,90 @@ impl Planner {
             return Self::balanced_binary_expr(exprs, df_op);
         }
 
-        Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(self.parse_sql_expr(left)?),
+        let mut left_expr = self.parse_sql_expr(left)?;
+        let mut right_expr = self.parse_sql_expr(right)?;
+        if matches!(
             df_op,
-            Box::new(self.parse_sql_expr(right)?),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+        ) {
+            if let Some(decimal) = self.decimal_operand(right, &left_expr) {
+                right_expr = decimal;
+            } else if let Some(decimal) = self.decimal_operand(left, &right_expr) {
+                left_expr = decimal;
+            }
+        }
+        Ok(Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left_expr),
+            df_op,
+            Box::new(right_expr),
         )))
+    }
+
+    /// The type of the column or nested field `expr` refers to.
+    fn column_type(&self, expr: &Expr) -> Option<ArrowDataType> {
+        match expr {
+            Expr::Column(column) => Some(
+                self.schema
+                    .field_with_name(&column.name)
+                    .ok()?
+                    .data_type()
+                    .clone(),
+            ),
+            Expr::ScalarFunction(function) if function.name() == GetFieldFunc::default().name() => {
+                let ArrowDataType::Struct(fields) = self.column_type(function.args.first()?)?
+                else {
+                    return None;
+                };
+                let name = get_as_string_scalar_opt(function.args.get(1)?)?;
+                Some(fields.find(name)?.1.data_type().clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `operand` as an exact decimal literal when it is a fractional number
+    /// such as `0.05` and `column` is a decimal column. Parsed as a float, its
+    /// digits would no longer be known, so a comparison with the column could
+    /// neither be exact nor use an index on it.
+    fn decimal_operand(&self, operand: &SQLExpr, column: &Expr) -> Option<Expr> {
+        let (number, negative) = match operand {
+            SQLExpr::Value(ValueWithSpan {
+                value: Value::Number(number, _),
+                ..
+            }) => (number, false),
+            SQLExpr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                SQLExpr::Value(ValueWithSpan {
+                    value: Value::Number(number, _),
+                    ..
+                }) => (number, true),
+                _ => return None,
+            },
+            SQLExpr::Nested(inner) => return self.decimal_operand(inner, column),
+            _ => return None,
+        };
+        // Integers keep the integer literal the planner builds for them, which
+        // the lowering compares exactly. A negative literal past `i64` is
+        // built as a float, so it is parsed here too.
+        let is_integer =
+            number.parse::<i64>().is_ok() || (!negative && number.parse::<u64>().is_ok());
+        if is_integer {
+            return None;
+        }
+        if !matches!(
+            self.column_type(column)?,
+            ArrowDataType::Decimal128(..) | ArrowDataType::Decimal256(..)
+        ) {
+            return None;
+        }
+        Some(Expr::Literal(parse_decimal(number, negative)?, None))
     }
 
     fn unary_expr(&self, op: &UnaryOperator, expr: &SQLExpr) -> Result<Expr> {
@@ -836,7 +963,10 @@ impl Planner {
                 let value_expr = self.parse_sql_expr(expr)?;
                 let list_exprs = list
                     .iter()
-                    .map(|e| self.parse_sql_expr(e))
+                    .map(|e| match self.decimal_operand(e, &value_expr) {
+                        Some(decimal) => Ok(decimal),
+                        None => self.parse_sql_expr(e),
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
@@ -948,8 +1078,14 @@ impl Planner {
             } => {
                 // Parse the main expression and bounds
                 let expr = self.parse_sql_expr(expr)?;
-                let low = self.parse_sql_expr(low)?;
-                let high = self.parse_sql_expr(high)?;
+                let low = match self.decimal_operand(low, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(low)?,
+                };
+                let high = match self.decimal_operand(high, &expr) {
+                    Some(decimal) => decimal,
+                    None => self.parse_sql_expr(high)?,
+                };
 
                 let between = Expr::Between(Between::new(
                     Box::new(expr),

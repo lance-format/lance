@@ -497,6 +497,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -562,12 +563,17 @@ mod tests {
     impl RestoreEnv {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: `#[serial]` only keeps the tests that use `RestoreEnv` from changing the
+            // environment at the same time. `set_var` and `remove_var` also require that no other
+            // thread reads or writes it outside `std::env` meanwhile, which nothing here
+            // guarantees when other tests share the process, as under `cargo test`.
             unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
 
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: see `RestoreEnv::unset`.
             unsafe { std::env::set_var(key, value) };
             Self { key, original }
         }
@@ -575,6 +581,7 @@ mod tests {
 
     impl Drop for RestoreEnv {
         fn drop(&mut self) {
+            // SAFETY: see `RestoreEnv::unset`.
             unsafe {
                 match &self.original {
                     Some(value) => std::env::set_var(self.key, value),

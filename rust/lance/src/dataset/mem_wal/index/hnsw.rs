@@ -48,7 +48,7 @@ use super::plugin::{
     MemIndexSpec, ResolveContext, ResolvedIndex,
 };
 use super::query::{MemMatches, MemQuery, RankedMatch, SearchContext, VectorMemQuery};
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::details::{vector_index_details_default, vector_params_from_details};
 
 pub use super::RowPosition;
