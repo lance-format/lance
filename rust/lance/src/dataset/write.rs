@@ -6459,22 +6459,22 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            let event = projected["event"].as_struct();
-            assert!(event.column_by_name("metadata").is_none());
-            assert!(event.column_by_name("value").is_none());
-            let typed = event.column_by_name("typed_value").unwrap().as_struct();
-            assert_eq!(typed.num_columns(), 1);
-            let id = typed.column_by_name("id").unwrap().as_struct();
-            let values = id.column_by_name("typed_value").unwrap();
+            assert_eq!(projected.num_columns(), 1);
+            let values = projected["event.typed_value.id.typed_value"]
+                .as_primitive::<arrow_array::types::Int64Type>();
             assert_eq!(
-                values
-                    .as_primitive::<arrow_array::types::Int64Type>()
-                    .value(3),
-                42
-            );
-            assert!(
-                values.is_null(4),
-                "mismatched types remain in residual data"
+                values,
+                &arrow_array::Int64Array::from(vec![
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ]),
             );
         }
     }
