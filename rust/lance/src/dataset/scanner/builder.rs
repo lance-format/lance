@@ -966,6 +966,9 @@ impl Scanner {
     /// increase it toward all available partitions, subject to
     /// [`Self::maximum_nprobes`]. At 0, at least one available partition is
     /// searched. Later expansion to find enough candidates remains unchanged.
+    /// For L2, cosine and dot with k <= 100000, effort 0.1, 0.25 and 0.5 target
+    /// 80%, 90% and 95% mean partition-routing recall, respectively. These are
+    /// empirical calibration objectives, not guaranteed end-to-end Recall@k.
     /// This is independent of refinement, HNSW ef and approximation mode, and
     /// is not a recall guarantee. Setting any effort, including 0.5, ignores
     /// [`Self::nprobes`] regardless of setter order. Explicit minimum and maximum
@@ -976,7 +979,7 @@ impl Scanner {
     /// # use lance::{Dataset, Result};
     /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
     /// let mut scanner = dataset.scan();
-    /// scanner.nearest("vector", vector, 10)?.search_effort(0.75)?;
+    /// scanner.nearest("vector", vector, 10)?.search_effort(0.25)?;
     /// # Ok(())
     /// # }
     /// ```
