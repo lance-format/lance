@@ -15,11 +15,11 @@
 #![allow(clippy::print_stdout)]
 
 use arrow_array::{
-    BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray,
+    ArrayRef, BinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
+    RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::stream::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
@@ -27,6 +27,7 @@ use lance_testing::pprof::{Output, PProfProfiler};
 use std::sync::Arc;
 
 use lance::dataset::{Dataset, WriteMode, WriteParams};
+use lance_core::utils::tempfile::TempStrDir;
 
 fn bench_scan(c: &mut Criterion) {
     // default tokio runtime
@@ -49,6 +50,60 @@ fn bench_scan(c: &mut Criterion) {
             assert!(!count.is_empty());
         })
     });
+}
+
+/// A selective scan over many small unindexed fragments of a wide table, where
+/// per-fragment open cost dominates the scan.
+fn bench_scan_many_fragments(c: &mut Criterion) {
+    const NUM_COLUMNS: usize = 100;
+    const ROWS_PER_FRAGMENT: usize = 16;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let schema = Arc::new(ArrowSchema::new(
+        (0..NUM_COLUMNS)
+            .map(|i| Field::new(format!("c{i}"), DataType::Int64, false))
+            .collect::<Vec<_>>(),
+    ));
+    let mut group = c.benchmark_group("Filtered scan of unindexed fragments");
+    for num_fragments in [16, 64, 256] {
+        let num_rows = num_fragments * ROWS_PER_FRAGMENT;
+        let columns = (0..NUM_COLUMNS)
+            .map(|i| {
+                Arc::new(Int64Array::from_iter_values(
+                    (0..num_rows as i64).map(|row| row * NUM_COLUMNS as i64 + i as i64),
+                )) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let dir = TempStrDir::default();
+        let dataset = rt.block_on(async {
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                dir.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+        });
+        assert_eq!(dataset.fragments().len(), num_fragments);
+        group.bench_function(BenchmarkId::from_parameter(num_fragments), |b| {
+            b.to_async(&rt).iter(|| async {
+                let batch = dataset
+                    .scan()
+                    .project(&["c1", "c2"])
+                    .unwrap()
+                    .filter("c0 % 7 = 0")
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                assert!(batch.num_rows() > 0);
+            })
+        });
+    }
+    group.finish();
 }
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
@@ -125,10 +180,10 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_scan);
+    targets = bench_scan, bench_scan_many_fragments);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_scan);
+    targets = bench_scan, bench_scan_many_fragments);
 criterion_main!(benches);
