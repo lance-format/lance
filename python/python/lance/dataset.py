@@ -3472,8 +3472,11 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
         max_token_length: Optional[int], default 40
-            This is for the ``INVERTED`` index. The maximum token length.
-            Any token longer than this will be removed.
+            This is for the ``INVERTED`` index. The exclusive token length limit
+            in UTF-8 bytes, not characters. Tokens of this length or longer are
+            removed. For example, the default removes both 40 ASCII characters
+            and 20 repetitions of ``é`` (40 UTF-8 bytes). Set to ``None`` to
+            disable the limit.
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
@@ -5058,7 +5061,14 @@ class LanceDataset(pa.dataset.Dataset):
     def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
-    def sql(self, sql: str) -> "SqlQueryBuilder":
+    def sql(
+        self,
+        sql: str,
+        *,
+        parameters: Optional[
+            Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+        ] = None,
+    ) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
 
         Parameters
@@ -5066,6 +5076,9 @@ class LanceDataset(pa.dataset.Dataset):
         sql : str
             SQL SELECT statement to execute. The query must reference the dataset
             as the FROM clause or omit the FROM clause to query the current dataset.
+        parameters : sequence, dict, or pyarrow.RecordBatch, optional
+            Values to bind to SQL placeholders. See
+            :meth:`SqlQueryBuilder.parameters` for supported forms.
 
         Returns
         -------
@@ -5082,7 +5095,10 @@ class LanceDataset(pa.dataset.Dataset):
             query.to_batch_records()
 
         """
-        return SqlQueryBuilder(self._ds.sql(sql))
+        builder = SqlQueryBuilder(self._ds.sql(sql))
+        if parameters is not None:
+            builder.parameters(parameters)
+        return builder
 
     def delta(
         self,
