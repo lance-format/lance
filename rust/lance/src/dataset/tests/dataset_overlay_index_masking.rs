@@ -52,7 +52,7 @@ use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInt
 use crate::io::exec::filtered_read::FilteredReadExec;
 #[cfg(feature = "substrait")]
 use crate::io::exec::filtered_read_proto::{
-    filtered_read_exec_from_proto, filtered_read_exec_to_proto,
+    filtered_read_exec_from_proto_v2, filtered_read_exec_to_proto_v2,
 };
 use crate::io::exec::fts::FlatMatchQueryExec;
 #[cfg(feature = "substrait")]
@@ -906,12 +906,12 @@ async fn roundtrip_visibility_reads(
                 .await
                 .unwrap();
         }
-        let proto = filtered_read_exec_to_proto(read, state).await.unwrap();
-        assert_eq!(proto.plan.is_some(), is_planned);
+        let proto = filtered_read_exec_to_proto_v2(read, state).await.unwrap();
+        assert_eq!(proto.read.as_ref().unwrap().plan.is_some(), is_planned);
         let proto =
-            lance_datafusion::pb::FilteredReadExecProto::decode(proto.encode_to_vec().as_slice())
+            lance_datafusion::pb::FilteredReadExecV2Proto::decode(proto.encode_to_vec().as_slice())
                 .unwrap();
-        let back = filtered_read_exec_from_proto(proto, Some(dataset), index_input, state)
+        let back = filtered_read_exec_from_proto_v2(proto, Some(dataset), index_input, state)
             .await
             .unwrap();
         assert_eq!(
