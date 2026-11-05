@@ -853,26 +853,18 @@ static READER_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 
 /// Namespace for metadata cache entries read through `object_store`.
 ///
-/// Cached pages are only shared between readers when the store identifies the
-/// object with an immutable version. ETags and mtimes can be restored after the
-/// bytes change, and addresses of freed in-memory stores can be reused, so
-/// neither is a stable identity. Without a version the entries are scoped to
-/// this reader, so a concurrent replacement cannot poison another reader's
-/// cache.
-async fn metadata_cache_namespace(object_store: &ObjectStore, path: &Path) -> PyResult<String> {
-    let metadata = object_store
-        .inner
-        .head(path)
-        .await
-        .map_err(|e| PyIOError::new_err(format!("Failed to stat file: {}", e)))?;
-    let generation = match metadata.version {
-        Some(version) => format!("version:{}", version),
-        None => format!(
-            "reader:{}",
-            READER_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ),
-    };
-    Ok(format!("{}/{}", object_store.store_prefix, generation))
+/// Entries are scoped to the reader and never shared with other readers. An
+/// immutable version returned by HEAD does not pin the footer and page GETs
+/// that populate the cache, S3's `"null"` version is mutable, and ETags,
+/// mtimes, and reused in-memory store addresses are not stable identities.
+/// Reader-local entries cannot poison a later reader after a concurrent
+/// replacement or version rollback.
+fn metadata_cache_namespace(object_store: &ObjectStore) -> String {
+    format!(
+        "{}/reader:{}",
+        object_store.store_prefix,
+        READER_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 impl LanceFileReader {
@@ -902,7 +894,7 @@ impl LanceFileReader {
         let scoped_cache;
         let cache = match &session {
             Some(session) => {
-                let namespace = metadata_cache_namespace(&object_store, &path).await?;
+                let namespace = metadata_cache_namespace(&object_store);
                 scoped_cache = session
                     .inner
                     .file_metadata_cache()
