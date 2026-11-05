@@ -64,7 +64,9 @@ use crate::index::vector::{
     ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key},
     utils::get_vector_type,
 };
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+};
 use crate::{Dataset, Error, Result};
 
 // Cache keys for different index types
@@ -400,6 +402,16 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
+        // Query planning loads the listing several times per scan, and each
+        // remap walks the whole reuse history.
+        let remapped_key = DerivedIndexListingKey {
+            version: metadata_key.version,
+            store_identity: metadata_key.store_identity,
+            e_tag: metadata_key.e_tag,
+        };
+        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
+            return Ok(remapped);
+        }
         let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
         let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
@@ -410,13 +422,24 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
                 open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
             })
             .await?;
-        let mut indices = indices.as_ref().clone();
-        for idx in indices.iter_mut() {
+        let mut remapped = indices.as_ref().clone();
+        for idx in remapped.iter_mut() {
             if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                 frag_reuse_index.remap_fragment_bitmap(bitmap)?;
             }
         }
-        Ok(Arc::new(indices))
+        let remapped = Arc::new(remapped);
+        // A later call may still infer the missing details; don't pin this list.
+        if !indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
+        {
+            dataset
+                .index_cache
+                .insert_with_key(&remapped_key, remapped.clone())
+                .await;
+        }
+        Ok(remapped)
     } else {
         Ok(indices)
     }
