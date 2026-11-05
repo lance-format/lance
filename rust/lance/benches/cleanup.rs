@@ -10,21 +10,27 @@
 //! - `versions`: a dataset with `V` versions, each with one data file.
 //!   Cleanup removes every version but the latest.
 //!
-//! The benchmark also counts object-store delete requests. This lets a
-//! one-request-per-file implementation be compared with a bulk-delete
+//! The benchmark also counts calls made through the wrapped object store. This
+//! lets a one-request-per-file implementation be compared with a bulk-delete
 //! implementation without changing the benchmark: `delete_paths` is the number
 //! of files cleanup deletes, while `delete_requests` is the number of
-//! underlying requests. On a one-request-per-file implementation the two are
-//! equal; on a bulk-delete implementation `delete_requests` is much smaller.
-//! The counts are printed once per scenario.
+//! `delete_stream` calls the wrapper observes. On a one-request-per-file
+//! implementation the two are equal; on a bulk-delete implementation
+//! `delete_requests` is much smaller. These are not physical cloud HTTP
+//! requests: provider retries, request splitting, and network latency are not
+//! represented. The counts are printed once per scenario.
 //!
 //! ## Configuration
 //!
-//! - `CLEANUP_BENCH_ORPHANS`: number of orphan files (default: 2000).
-//! - `CLEANUP_BENCH_VERSIONS`: number of dataset versions (default: 200).
-//! - `CLEANUP_BENCH_SAMPLE_SIZE`: criterion sample size (default: 10).
-//! - `CLEANUP_BENCH_SKIP_ORPHANS`: skip the orphan scenario when truthy.
-//! - `CLEANUP_BENCH_SKIP_VERSIONS`: skip the version scenario when truthy.
+//! - `CLEANUP_BENCH_ORPHANS`: number of orphan files (default: 2000, minimum: 1).
+//! - `CLEANUP_BENCH_VERSIONS`: number of dataset versions (default: 200, minimum: 2).
+//! - `CLEANUP_BENCH_SAMPLE_SIZE`: criterion sample size (default: 10, minimum: 10).
+//! - `CLEANUP_BENCH_SKIP_ORPHANS`: set to 1/true/yes to skip the orphan scenario.
+//! - `CLEANUP_BENCH_SKIP_VERSIONS`: set to 1/true/yes to skip the version scenario.
+//!
+//! Malformed or out-of-range values are rejected instead of silently falling
+//! back to a default or resizing the requested workload. Skip flags also accept
+//! 0/false/no to run the scenario; other values are rejected.
 //!
 //! Run with:
 //!
@@ -56,7 +62,7 @@ use object_store::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
-/// Delete requests observed at the raw object-store layer.
+/// Delete work observed at the wrapped object-store layer.
 #[derive(Debug, Default)]
 struct DeleteCounters {
     delete_requests: AtomicU64,
@@ -86,7 +92,7 @@ struct DeleteCountSnapshot {
 /// A pass-through object store that counts how cleanup deletes files.
 ///
 /// Every delete eventually goes through `delete_stream` at this layer, so the
-/// counter sees one request per single-file delete and one request per bulk
+/// counter sees one call per single-file delete and one call per bulk
 /// delete. The wrapper does not change which paths are deleted, so the same
 /// benchmark works for both implementations.
 #[derive(Debug)]
@@ -214,6 +220,17 @@ fn batch_reader() -> RecordBatchIterator<Vec<Result<RecordBatch, ArrowError>>> {
     RecordBatchIterator::new(vec![Ok(batch)], schema)
 }
 
+/// Builds a `file-object-store` URI without letting a Windows drive letter
+/// become the URL authority.
+///
+/// This follows the local URI construction used by the cleanup tests: normalize
+/// separators and ensure the path starts with `/` after the scheme.
+fn file_object_store_uri(path: &std::path::Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
+    let path_prefix = if path.starts_with('/') { "" } else { "/" };
+    format!("file-object-store://{path_prefix}{path}")
+}
+
 /// Creates a dataset with `versions` versions through the wrapped store.
 ///
 /// Each version overwrites the table so that every version has its own data
@@ -222,7 +239,7 @@ fn batch_reader() -> RecordBatchIterator<Vec<Result<RecordBatch, ArrowError>>> {
 /// `file-object-store://` scheme keeps writes on the object-store path so that
 /// the delete counter observes cleanup's requests.
 async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: usize) -> Dataset {
-    let uri = format!("file-object-store://{}", dir.path().join("db").display());
+    let uri = file_object_store_uri(&dir.path().join("db"));
     let write_params = || WriteParams {
         mode: WriteMode::Overwrite,
         store_params: Some(ObjectStoreParams {
@@ -249,7 +266,7 @@ async fn write_dataset(dir: &TempDir, counters: Arc<DeleteCounters>, versions: u
 async fn setup_versions(versions: usize) -> (TempDir, Dataset, Arc<DeleteCounters>) {
     let dir = TempDir::new().unwrap();
     let counters = Arc::new(DeleteCounters::default());
-    let dataset = write_dataset(&dir, Arc::clone(&counters), versions.max(1)).await;
+    let dataset = write_dataset(&dir, Arc::clone(&counters), versions).await;
     (dir, dataset, counters)
 }
 
@@ -290,17 +307,31 @@ fn orphans_policy() -> CleanupPolicy {
     }
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+fn env_usize(name: &str, default: usize, minimum: usize) -> usize {
+    let value = match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be an integer, got {value:?}")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => panic!("failed to read {name}: {error}"),
+    };
+    assert!(
+        value >= minimum,
+        "{name} must be at least {minimum}, got {value}"
+    );
+    value
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    match std::env::var(name) {
+        Ok(value) => match value.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => true,
+            "0" | "false" | "FALSE" | "no" | "NO" => false,
+            _ => panic!("{name} must be one of 1, true, yes, 0, false, no; got {value:?}"),
+        },
+        Err(std::env::VarError::NotPresent) => false,
+        Err(error) => panic!("failed to read {name}: {error}"),
+    }
 }
 
 fn report_once(
@@ -311,6 +342,38 @@ fn report_once(
     counts: DeleteCountSnapshot,
 ) {
     if !reported.swap(true, Ordering::Relaxed) {
+        assert_eq!(
+            stats.failed_deletes, 0,
+            "{scenario} cleanup reported failed deletes"
+        );
+        assert_eq!(
+            counts.delete_paths,
+            stats.old_versions
+                + stats.data_files_removed
+                + stats.transaction_files_removed
+                + stats.index_files_removed
+                + stats.deletion_files_removed,
+            "wrapped-store delete paths must match the reported removals"
+        );
+        match scenario {
+            "orphans" => assert_eq!(
+                stats.data_files_removed, size as u64,
+                "orphans cleanup must remove every orphan data file"
+            ),
+            "versions" => {
+                assert_eq!(
+                    stats.old_versions,
+                    size as u64 - 1,
+                    "versions cleanup must remove every version but the latest"
+                );
+                assert_eq!(
+                    stats.data_files_removed,
+                    size as u64 - 1,
+                    "versions cleanup must remove one data file per expired version"
+                );
+            }
+            _ => {}
+        }
         eprintln!(
             "cleanup {scenario} (n={size}): delete_requests={} \
              delete_paths={} | old_versions={} data_files_removed={} \
@@ -329,12 +392,12 @@ fn report_once(
 
 fn bench_cleanup(c: &mut Criterion) {
     let runtime = Runtime::new().unwrap();
-    let sample_size = env_usize("CLEANUP_BENCH_SAMPLE_SIZE", 10).max(10);
+    let sample_size = env_usize("CLEANUP_BENCH_SAMPLE_SIZE", 10, 10);
     let mut group = c.benchmark_group("cleanup");
     group.sample_size(sample_size);
 
     if !env_flag("CLEANUP_BENCH_SKIP_ORPHANS") {
-        let orphans = env_usize("CLEANUP_BENCH_ORPHANS", 2000).max(1);
+        let orphans = env_usize("CLEANUP_BENCH_ORPHANS", 2000, 1);
         let reported = AtomicBool::new(false);
         group.bench_function(BenchmarkId::new("orphans", orphans), |b| {
             b.iter_batched(
@@ -357,7 +420,7 @@ fn bench_cleanup(c: &mut Criterion) {
     }
 
     if !env_flag("CLEANUP_BENCH_SKIP_VERSIONS") {
-        let versions = env_usize("CLEANUP_BENCH_VERSIONS", 200).max(2);
+        let versions = env_usize("CLEANUP_BENCH_VERSIONS", 200, 2);
         let reported = AtomicBool::new(false);
         group.bench_function(BenchmarkId::new("versions", versions), |b| {
             b.iter_batched(
