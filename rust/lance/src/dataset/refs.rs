@@ -616,21 +616,13 @@ impl Branches<'_> {
 
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
-        let has_ref = self.object_store().exists(&branch_file).await?;
-        if has_ref {
+        if self.object_store().exists(&branch_file).await? {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Removing the ref completes the logical deletion. In-flight writers
-        // can still create files while cleanup runs, but cannot acknowledge a
-        // commit after observing the missing ref. Retained files are not a branch.
-        match self.cleanup_branch_directories(branch).await {
-            Err(error) if has_ref => {
-                log::warn!("Failed to clean up deleted branch {branch}: {error}");
-                Ok(())
-            }
-            result => result,
-        }
+        // Callers must finish failed cleanup before reusing the branch name,
+        // since branch creation can otherwise expose retained version history.
+        self.cleanup_branch_directories(branch).await
     }
 
     pub async fn list_ordered(

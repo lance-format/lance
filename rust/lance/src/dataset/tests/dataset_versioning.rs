@@ -1512,12 +1512,16 @@ async fn test_deleted_branch_during_commit_is_not_acknowledged(
     assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative() {
-    let mut root = Dataset::write(id_rows(0, 2), "memory://", None)
-        .await
-        .unwrap();
-    let deleted = root.create_branch("a", 1, None).await.unwrap();
+async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
+    #[values(false, true)] local: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let uri = if local { tempdir.as_ref() } else { "memory://" };
+    let mut root = Dataset::write(id_rows(0, 2), uri, None).await.unwrap();
+    root.append(id_rows(2, 1), None).await.unwrap();
+    let mut deleted = root.create_branch("a", 2, None).await.unwrap();
     root.create_branch("a/b", 1, None).await.unwrap();
     let mut store = root.object_store.as_ref().clone();
     store.inner = Arc::new(DirectoryMarkerStore {
@@ -1528,7 +1532,14 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative() {
     });
     root.refs.object_store = Arc::new(store);
 
-    root.delete_branch("a").await.unwrap();
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("shared directory was listed more than once"),
+        "{error}"
+    );
     assert!(
         deleted
             .object_store
@@ -1540,6 +1551,19 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative() {
     let error = root.checkout_branch("a").await.unwrap_err();
     assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
     assert!(error.to_string().contains("branch a"), "{error}");
+    let error = deleted.append(id_rows(3, 1), None).await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let child = root.checkout_branch("a/b").await.unwrap();
+    assert_eq!(child.count_rows(None).await.unwrap(), 2);
+
+    // Finish the failed cleanup before reusing the name for a different history.
+    root.refs.object_store = root.object_store.clone();
+    root.force_delete_branch("a").await.unwrap();
+    let recreated = root.create_branch("a", 1, None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    let reopened = root.checkout_branch("a").await.unwrap();
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 2);
     let child = root.checkout_branch("a/b").await.unwrap();
     assert_eq!(child.count_rows(None).await.unwrap(), 2);
 }
