@@ -3895,7 +3895,7 @@ def test_portable_range_boundaries(portable_blob_references, offset, length, exp
             assert next(stream, None) is None
         assert reader.metrics["payload_bytes"] == length
         assert reader.metrics["metadata_requests"] == 0
-        assert reader.reserved_bytes == 0
+        _wait_for_blob_ref_budget_release(reader)
 
 
 @pytest.mark.parametrize("offset,length", [(10, 1), (11, 0), ((1 << 64) - 1, 1)])
@@ -4283,6 +4283,7 @@ def test_portable_blob_references_in_separate_process(
     dataset.cleanup_old_versions(older_than=timedelta(0))
     script = textwrap.dedent("""
         import sys
+        import time
         from pathlib import Path
         import lance
         refs = lance.BlobRefBatch.decode(Path(sys.argv[1]).read_bytes())
@@ -4299,7 +4300,14 @@ def test_portable_blob_references_in_separate_process(
                     values[batch['request_index'][0].as_py()] = batch['data'][0].as_py()
                     del batch
             assert values == {(1 << 64) - 1: b'cdef', 1: b'abc', 2: None, 3: b''}
+            deadline = time.monotonic() + 1
+            while (
+                (reader.reserved_bytes != 0 or reader.io_reserved_bytes != 0)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
             assert reader.reserved_bytes == 0
+            assert reader.io_reserved_bytes == 0
     """)
     completed = subprocess.run(
         [sys.executable, "-c", script, str(reference_path), str(token_path)],
