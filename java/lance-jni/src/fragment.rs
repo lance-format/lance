@@ -29,7 +29,7 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocking_dataset::extract_namespace_info;
+use crate::blocking_dataset::conversions::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
