@@ -9303,6 +9303,88 @@ async fn test_sql_contains_tokens() {
     );
 }
 
+/// An ngram FTS index with positions, which 13.0.0 could create and current
+/// versions refuse to, still loads, takes appended rows and answers queries.
+#[rstest]
+#[tokio::test]
+async fn test_existing_ngram_index_with_positions_keeps_working(
+    #[values(false, true)] merge: bool,
+) {
+    let test_dir =
+        copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_with_position.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let schema = Arc::new(dataset.schema().into());
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["yellow"]))]).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let options = if merge {
+        OptimizeOptions::merge(2)
+    } else {
+        OptimizeOptions::append()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("ello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut texts = results["text"]
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    texts.sort_unstable();
+    assert_eq!(texts, ["hello world", "world hello", "yellow"]);
+
+    // Copying the index to another dataset keeps its settings.
+    let target_dir = TempStrDir::default();
+    let rows = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema());
+    let mut target = Dataset::write(reader, &target_dir, None).await.unwrap();
+    target.initialize_indices(&dataset).await.unwrap();
+    let copied = target.load_indices().await.unwrap();
+    assert_eq!(copied.len(), 1);
+    let copied_params = load_scalar_segment_params(&target, &copied[0])
+        .await
+        .unwrap();
+    let copied_params: serde_json::Value =
+        serde_json::from_str(copied_params.params.as_deref().unwrap()).unwrap();
+    assert_eq!(copied_params["base_tokenizer"], "ngram");
+    assert_eq!(copied_params["with_position"], true);
+
+    // Creating such an index anew is rejected.
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".to_string())
+        .with_position(true);
+    let err = dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("with_position is not supported with base_tokenizer='ngram'"),
+        "{err}"
+    );
+}
+
 /// On legacy storage the index result is materialized before the recheck. The
 /// query parser does not see the index's custom stop words: 'cat' reaches the
 /// index, which drops it, and 'a' is dropped by the parser but not the index.

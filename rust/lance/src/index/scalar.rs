@@ -26,6 +26,7 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
+use crate::index::create::CreateIndexBuilder;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
@@ -1207,15 +1208,15 @@ pub async fn initialize_scalar_index(
             inverted_params.get_document_granularity(),
         )?;
 
-        target_dataset
-            .create_index(
-                &[&resolved.canonical_path],
-                index_type,
-                Some(source_index.name.clone()),
-                &inverted_params,
-                false,
-            )
-            .await?;
+        CreateIndexBuilder::new(
+            target_dataset,
+            &[&resolved.canonical_path],
+            index_type,
+            &inverted_params,
+        )
+        .name(source_index.name.clone())
+        .copy_of_existing()
+        .await?;
     } else {
         target_dataset
             .create_index(
