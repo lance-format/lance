@@ -1586,22 +1586,19 @@ async fn test_list_branches_with_concurrent_ref_deletion(#[case] is_not_found: b
 }
 
 #[rstest]
-#[case::memory(false)]
-#[case::local(true)]
+#[case::local(false)]
+#[case::object_store(true)]
 #[tokio::test]
-async fn test_delete_branch_does_not_relist_refs_after_deletion(#[case] is_local: bool) {
+async fn test_delete_branch_with_ref_removed_during_cleanup(#[case] use_object_store: bool) {
     let tempdir = TempDir::default();
-    let uri = if is_local {
+    let uri = if use_object_store {
         let path_prefix = if cfg!(windows) { "/" } else { "" };
         format!("file-object-store://{path_prefix}{}", tempdir.path_str())
     } else {
-        "memory://".to_string()
+        tempdir.path_str()
     };
-    let data = gen_batch()
-        .col("id", array::step::<Int32Type>())
-        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
     let mut dataset = Dataset::write(
-        data,
+        id_rows(0, 2),
         &uri,
         Some(WriteParams {
             max_rows_per_file: 1,
@@ -1614,30 +1611,117 @@ async fn test_delete_branch_does_not_relist_refs_after_deletion(#[case] is_local
     let concurrent = dataset.create_branch("concurrent", 1, None).await.unwrap();
     let concurrent_ref = branch_contents_path(&dataset.base, "concurrent");
     let deleted_ref = branch_contents_path(&dataset.base, "deleted");
-    let branch_refs = base_branches_contents_path(&dataset.base);
     let mut policy = ProxyObjectStorePolicy::new();
-    let has_deleted_ref = AtomicBool::new(false);
+    let has_deleted_ref = Arc::new(AtomicBool::new(false));
+    let has_deleted_ref_for_policy = has_deleted_ref.clone();
+    let has_removed_concurrent = Arc::new(AtomicBool::new(false));
+    let has_removed_concurrent_for_policy = has_removed_concurrent.clone();
     policy.set_before_policy(
-        "listing_fails_after_ref_deletion",
+        "target_ref_removed",
         Arc::new(move |method, path| {
             if method == "delete" && path == &deleted_ref {
-                has_deleted_ref.store(true, AtomicOrdering::SeqCst);
-                if is_local {
-                    // Another delete finishes after the validation snapshot, before
-                    // cleanup inspects the remaining branches' filesystem paths.
-                    std::fs::remove_file(to_local_path(&concurrent_ref)).unwrap();
-                    std::fs::remove_dir_all(to_local_path(&concurrent.base)).unwrap();
-                }
+                has_deleted_ref_for_policy.store(true, AtomicOrdering::SeqCst);
             }
+            Ok(())
+        }),
+    );
+    policy.set_obj_meta_policy(
+        "ref_disappears_during_cleanup",
+        Arc::new(move |method, meta| {
             if method == "list"
-                && path == &branch_refs
+                && meta.location == concurrent_ref
                 && has_deleted_ref.load(AtomicOrdering::SeqCst)
+                && !has_removed_concurrent_for_policy.swap(true, AtomicOrdering::SeqCst)
             {
-                return Err(object_store::Error::Generic {
-                    store: "test",
-                    source: "cannot list refs after deletion".into(),
-                }
-                .into());
+                // Another delete completes between cleanup's LIST and GET.
+                std::fs::remove_file(to_local_path(&concurrent_ref)).unwrap();
+                std::fs::remove_dir_all(to_local_path(&concurrent.base)).unwrap();
+            }
+            Ok(meta)
+        }),
+    );
+    let mut store = dataset.object_store.as_ref().clone();
+    store.inner = Arc::new(ProxyObjectStore::new(
+        store.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    dataset.refs.object_store = Arc::new(store);
+
+    dataset.delete_branch("deleted").await.unwrap();
+    assert!(has_removed_concurrent.load(AtomicOrdering::SeqCst));
+    assert!(dataset.list_branches().await.unwrap().is_empty());
+    assert!(
+        dataset
+            .object_store
+            .list(Some(branch.base.clone()))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case::local(false)]
+#[case::object_store(true)]
+#[tokio::test]
+async fn test_delete_preserves_branch_created_before_ref_removal(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset.create_branch("a", 1, None).await.unwrap();
+
+    let mut creator = dataset.clone();
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    // The proxy hook is synchronous, so keep the other client on a separate
+    // runtime and OS thread rather than blocking the async or CPU pools.
+    let creator_thread = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let mut child = creator.create_branch("a/b", 1, None).await.unwrap();
+                child.append(id_rows(10, 2), None).await.unwrap();
+                assert_eq!(child.count_rows(None).await.unwrap(), 4);
+                done_tx.send(()).unwrap();
+            });
+    });
+
+    let target = branch_contents_path(&dataset.base, "a");
+    let done_rx = Mutex::new(done_rx);
+    let has_created_child = AtomicBool::new(false);
+    let mut policy = ProxyObjectStorePolicy::new();
+    policy.set_before_policy(
+        "create_before_ref_removal",
+        Arc::new(move |method, path| {
+            if method == "delete"
+                && path == &target
+                && !has_created_child.swap(true, AtomicOrdering::SeqCst)
+            {
+                start_tx.send(()).unwrap();
+                done_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
             }
             Ok(())
         }),
@@ -1649,22 +1733,16 @@ async fn test_delete_branch_does_not_relist_refs_after_deletion(#[case] is_local
     ));
     dataset.refs.object_store = Arc::new(store);
 
-    dataset.delete_branch("deleted").await.unwrap();
-    assert!(
-        !dataset
-            .object_store
-            .exists(&branch_contents_path(&dataset.base, "deleted"))
-            .await
-            .unwrap()
-    );
-    assert!(
-        dataset
-            .object_store
-            .list(Some(branch.base.clone()))
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap()
-            .is_empty()
+    dataset.delete_branch("a").await.unwrap();
+    creator_thread.join().unwrap();
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    assert!(branches.contains_key("a/b"));
+    let child = dataset.checkout_branch("a/b").await.unwrap();
+    let batch = child.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 1, 10, 11]
     );
 }
 

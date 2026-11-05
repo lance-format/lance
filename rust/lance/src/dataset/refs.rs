@@ -621,13 +621,6 @@ impl Branches<'_> {
             });
         }
 
-        // Reuse the validated snapshot so cleanup cannot fail on a second ref
-        // listing after this branch's ref has already been removed.
-        let remaining_branches = all_branches
-            .keys()
-            .map(String::as_str)
-            .filter(|name| *name != branch)
-            .collect_vec();
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if self.object_store().exists(&branch_file).await? {
@@ -635,8 +628,7 @@ impl Branches<'_> {
         }
 
         // Clean up branch directories
-        self.cleanup_branch_directories(branch, &remaining_branches)
-            .await
+        self.cleanup_branch_directories(branch).await
     }
 
     pub async fn list_ordered(
@@ -657,13 +649,12 @@ impl Branches<'_> {
     }
 
     /// Remove branch files while preserving branches that share directories.
-    async fn cleanup_branch_directories(
-        &self,
-        branch: &str,
-        remaining_branches: &[&str],
-    ) -> Result<()> {
+    async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
+        // Discover namespaces created during deletion before removing shared directories.
+        let branches = self.list().await?;
+        let remaining_branches = branches.keys().map(String::as_str).collect_vec();
         let mut cleanup =
-            Self::get_cleanup_path(branch, remaining_branches, &self.refs.base_location)?;
+            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
         if matches!(cleanup, BranchCleanup::Skip) {
             return Ok(());
         }
@@ -671,7 +662,7 @@ impl Branches<'_> {
         let has_local_paths =
             self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
         let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
-        for remaining in remaining_branches {
+        for remaining in &remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
             let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
             let canonical_retained_dirs = if has_local_paths {
@@ -683,7 +674,7 @@ impl Branches<'_> {
                 let Some(retained_dirs) = retained_dirs else {
                     let remaining_ref = branch_contents_path(&self.refs.root()?.path, remaining);
                     if !self.object_store().exists(&remaining_ref).await? {
-                        // Another delete finished after the validation snapshot.
+                        // Another delete finished after cleanup listed the refs.
                         continue;
                     }
                     log::warn!(
