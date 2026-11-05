@@ -67,3 +67,18 @@ def test_duckdb_pushdown_extension_types(tmp_path):
         expected = duckdb.query(f"SELECT * FROM tab WHERE {filt}").to_arrow_table()
         actual = duckdb.query(f"SELECT * FROM ds WHERE {filt}").to_arrow_table()
         assert actual == expected
+
+
+def test_duckdb_pushdown_struct_field(tmp_path):
+    # DuckDB pushes a filter on a struct field down as a nested field reference.
+    tab = pa.table(
+        {
+            "id": [1, 2, 3],
+            "meta": [{"x": 1, "y": "a"}, {"x": 6, "y": "b"}, {"x": 9, "y": "c"}],
+        }
+    )
+    ds = lance.write_dataset(tab, str(tmp_path))  # noqa: F841
+    actual = duckdb.query("SELECT id FROM ds WHERE meta.x > 5 ORDER BY id").fetchall()
+    assert actual == [(2,), (3,)]
+    actual = duckdb.query("SELECT id FROM ds WHERE meta.y = 'a'").fetchall()
+    assert actual == [(1,)]

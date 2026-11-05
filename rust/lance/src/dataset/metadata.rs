@@ -113,6 +113,7 @@ impl<'a> std::future::IntoFuture for UpdateMetadataBuilder<'a> {
 pub struct UpdateFieldMetadataBuilder<'a> {
     dataset: &'a mut Dataset,
     field_metadata_updates: HashMap<i32, UpdateMap>,
+    expected_latest_version: Option<u64>,
 }
 
 impl<'a> UpdateFieldMetadataBuilder<'a> {
@@ -120,6 +121,7 @@ impl<'a> UpdateFieldMetadataBuilder<'a> {
         Self {
             dataset,
             field_metadata_updates: HashMap::new(),
+            expected_latest_version: None,
         }
     }
 
@@ -152,6 +154,28 @@ impl<'a> UpdateFieldMetadataBuilder<'a> {
     ) -> Result<Self> {
         self.apply(field, values, true)
     }
+
+    /// Require `expected_latest_version` to still be latest when the metadata
+    /// commit lands. This uses Lance's conditional commit path: the commit
+    /// gets one attempt at `expected_latest_version + 1` and fails on any
+    /// intervening manifest, such as a Restore.
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # async fn update(mut dataset: Dataset) -> lance::Result<()> {
+    /// let expected = dataset.version_id();
+    /// dataset
+    ///     .update_field_metadata()
+    ///     .update("column", [("key", "value")])?
+    ///     .with_expected_latest_version(expected)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_expected_latest_version(mut self, expected_latest_version: u64) -> Self {
+        self.expected_latest_version = Some(expected_latest_version);
+        self
+    }
 }
 
 impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
@@ -160,16 +184,24 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            execute_metadata_update(
-                self.dataset,
-                Operation::UpdateConfig {
-                    config_updates: None,
-                    table_metadata_updates: None,
-                    schema_metadata_updates: None,
-                    field_metadata_updates: self.field_metadata_updates,
-                },
-            )
-            .await?;
+            let operation = Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: self.field_metadata_updates,
+            };
+            if let Some(expected_latest_version) = self.expected_latest_version {
+                self.dataset
+                    .apply_commit_with_expected_latest_version(
+                        Transaction::new(self.dataset.manifest.version, operation, None),
+                        &Default::default(),
+                        &Default::default(),
+                        Some(expected_latest_version),
+                    )
+                    .await?;
+            } else {
+                execute_metadata_update(self.dataset, operation).await?;
+            }
             Ok(self.dataset.schema())
         })
     }
@@ -177,18 +209,81 @@ impl<'a> std::future::IntoFuture for UpdateFieldMetadataBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use lance_core::Error;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
+    use lance_table::io::commit::{
+        CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+        RenameCommitHandler,
+    };
+    use object_store::path::Path as ObjectPath;
     use rstest::rstest;
 
     use super::*;
     use crate::dataset::WriteParams;
+    use crate::dataset::builder::DatasetBuilder;
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+
+    struct AppendBeforeCommit {
+        inner: Arc<dyn CommitHandler>,
+        append: Mutex<Option<Dataset>>,
+        triggered: AtomicBool,
+    }
+
+    impl std::fmt::Debug for AppendBeforeCommit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AppendBeforeCommit").finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl CommitHandler for AppendBeforeCommit {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &ObjectPath,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<ManifestTransaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            if !self.triggered.swap(true, Ordering::SeqCst) {
+                let mut append = self
+                    .append
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("append fixture is available once");
+                let data = gen_batch()
+                    .col("i", array::step::<Int32Type>())
+                    .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+                append
+                    .append(data, None)
+                    .await
+                    .map_err(CommitError::OtherError)?;
+            }
+            self.inner
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
 
     /// A dataset whose columns are all **non-nullable**, so a primary key can be
     /// installed on one. `gen_batch` produces nullable columns, and a primary
@@ -258,6 +353,160 @@ mod tests {
             .await
             .unwrap();
         assert!(dataset.config().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_config_rejects_policy_with_legacy_filters() {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let error = dataset
+            .update_config([
+                ("lance.auto_cleanup.policy_interval", "1"),
+                (
+                    "lance.auto_cleanup.policy",
+                    r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#,
+                ),
+                ("lance.auto_cleanup.older_than", "7days"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        assert_eq!(dataset.version_id(), 1);
+    }
+
+    #[tokio::test]
+    async fn field_metadata_expected_latest_version_commits_when_current() {
+        let mut dataset = test_dataset_nested().await;
+        let expected_latest_version = dataset.version_id();
+
+        let schema = dataset
+            .update_field_metadata()
+            .update("name", [("fixture.freshness", "committed")])
+            .unwrap()
+            .with_expected_latest_version(expected_latest_version)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            schema
+                .field("name")
+                .unwrap()
+                .metadata
+                .get("fixture.freshness"),
+            Some(&"committed".to_string())
+        );
+        assert_eq!(dataset.version_id(), expected_latest_version + 1);
+        assert_eq!(
+            dataset
+                .schema()
+                .field("name")
+                .unwrap()
+                .metadata
+                .get("fixture.freshness"),
+            Some(&"committed".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn field_metadata_expected_latest_version_rejects_restore_race() {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        dataset
+            .update_config([("fixture.version", "2")])
+            .await
+            .unwrap();
+        let expected_latest_version = dataset.version_id();
+        let mut restore = dataset.checkout_version(1).await.unwrap();
+        let update = dataset
+            .update_field_metadata()
+            .update("i", [("fixture.freshness", "must-not-land")])
+            .unwrap()
+            .with_expected_latest_version(expected_latest_version);
+
+        restore.restore_from(expected_latest_version).await.unwrap();
+
+        let error = update.await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("latest version advanced from the expected"),
+            "{error}"
+        );
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await.unwrap();
+        assert!(
+            !latest
+                .schema()
+                .field("i")
+                .unwrap()
+                .metadata
+                .contains_key("fixture.freshness")
+        );
+    }
+
+    /// The append lands from the commit handler after the version precheck.
+    /// The default path retries and rebases; the version fence must not retry.
+    #[rstest]
+    #[case::default_retries_compatible_append(false)]
+    #[case::expected_version_rejects_after_cas(true)]
+    #[tokio::test]
+    async fn field_metadata_append_before_commit_respects_expected_version(#[case] fenced: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let dataset = Dataset::write(data, uri, None).await.unwrap();
+        let expected_latest_version = dataset.version_id();
+
+        let handler = Arc::new(AppendBeforeCommit {
+            inner: Arc::new(RenameCommitHandler),
+            append: Mutex::new(Some(dataset)),
+            triggered: AtomicBool::new(false),
+        });
+        let mut guarded = DatasetBuilder::from_uri(uri)
+            .with_commit_handler(handler.clone())
+            .load()
+            .await
+            .unwrap();
+        let update = guarded
+            .update_field_metadata()
+            .update("i", [("fixture.freshness", "committed")])
+            .unwrap();
+        if fenced {
+            let error = update
+                .with_expected_latest_version(expected_latest_version)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+        } else {
+            update.await.unwrap();
+        }
+
+        assert!(handler.triggered.load(Ordering::SeqCst));
+        guarded.checkout_latest().await.unwrap();
+        assert_eq!(
+            guarded.version_id(),
+            expected_latest_version + if fenced { 1 } else { 2 }
+        );
+        assert_eq!(guarded.count_rows(None).await.unwrap(), 8);
+        assert_eq!(
+            guarded
+                .schema()
+                .field("i")
+                .unwrap()
+                .metadata
+                .contains_key("fixture.freshness"),
+            !fenced
+        );
     }
 
     #[tokio::test]

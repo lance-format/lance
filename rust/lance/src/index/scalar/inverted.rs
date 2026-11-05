@@ -822,10 +822,14 @@ pub(crate) fn transform_fts_document_stream(
             .column_by_name(&resolved.root_column)
             .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
             .expect("FTS document input schema was validated");
-        let documents = resolved
+        let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
         let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        // The row-ID validity bitmap can carry the scan's selection vector.
+        if input_row_ids.null_count() > 0 {
+            documents.retain(|document| input_row_ids.is_valid(document.row_index));
+        }
         let texts =
             StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
         let row_ids = UInt64Array::from_iter_values(

@@ -24,6 +24,8 @@ use super::{
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
+use crate::scalar::inverted::InvertedIndexParams;
+use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
 use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
@@ -1131,6 +1133,7 @@ fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
 pub struct FtsQueryParser {
     index_name: String,
     index_type: String,
+    tokenizer_params: Option<InvertedIndexParams>,
 }
 
 impl FtsQueryParser {
@@ -1138,7 +1141,26 @@ impl FtsQueryParser {
         Self {
             index_name: name,
             index_type,
+            tokenizer_params: None,
         }
+    }
+
+    /// The tokenizer settings of the index. A query the index tokenizer reduces
+    /// to no tokens, such as one made only of stop words, is left to the scan,
+    /// since the index cannot narrow the rows it matches.
+    pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
+        self.tokenizer_params = Some(params);
+        self
+    }
+
+    fn has_index_tokens(&self, query: &str) -> bool {
+        let Some(params) = &self.tokenizer_params else {
+            return true;
+        };
+        params
+            .build()
+            .and_then(|mut tokenizer| try_collect_query_tokens(query, &mut tokenizer))
+            .is_ok_and(|tokens| !tokens.is_empty())
     }
 }
 
@@ -1186,13 +1208,17 @@ impl ScalarQueryParser for FtsQueryParser {
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar
             && func.name() == "contains_tokens"
+            && self.has_index_tokens(&scalar_str)
         {
             let query = TokenQuery::TokensContains(scalar_str);
-            return Some(IndexedExpression::index_query(
+            // The index tokenizer can lowercase, fold and drop stop words, so
+            // its rows are candidates the scan still has to check.
+            return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),
                 self.index_type.clone(),
                 Arc::new(query),
+                true,
             ));
         }
         None
