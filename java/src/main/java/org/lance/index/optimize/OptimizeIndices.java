@@ -36,10 +36,10 @@ import java.util.stream.Collectors;
  * Optional<IndexSegmentResult> built = task.execute(workerDataset);
  * Optional<IndexSegmentResult> merged = merge.execute(workerDataset, builtResultsOfItsGroup);
  * // driver
- * OptimizeIndices.commit(dataset, mergedResults);
+ * OptimizeIndices.commit(dataset, mergedResults, options);
  * }</pre>
  *
- * <p>Without {@link OptimizeOptions#getMaxRowsPerTask()} and {@link
+ * <p>For ordinary optimization, without {@link OptimizeOptions#getMaxRowsPerTask()} and {@link
  * OptimizeOptions#getMaxRowsPerSegment()} every index is one task: the single-process optimize over
  * all of its segments and all of its unindexed fragments, with the caller's options, and a merge
  * that passes the result through. With a bound set, an index whose kind can merge segments (vector,
@@ -49,9 +49,9 @@ import java.util.stream.Collectors;
  * skipped with a warning unless {@link OptimizeOptions#getIndexNames()} names it, which fails
  * instead.
  *
- * <p>The commit publishes every merged segment in one transaction anchored at the plan's read
- * version, so conflict detection covers everything committed since the plan was made. Results may
- * be partial: whatever they do not cover stays unindexed for the next optimize.
+ * <p>An ordinary commit publishes every merged segment in one transaction anchored at the plan's
+ * read version, so conflict detection covers everything committed since the plan was made. Results
+ * may be partial: whatever they do not cover stays unindexed for the next optimize.
  *
  * <p>Tasks, merges and results are {@link java.io.Serializable} so an engine can ship them to its
  * workers; a worker only needs a {@link Dataset} opened on the same table, at any version.
@@ -79,25 +79,32 @@ public class OptimizeIndices {
   }
 
   /**
-   * Commit the merged results of one plan. The dataset is left at the new version.
+   * Commit the merged results of one plan with the options passed to {@link #plan(Dataset,
+   * OptimizeOptions)}. The dataset is left at the new version.
    *
    * <p>The results must all come from the same plan. With no results nothing is committed, unless
    * the table requires a MemWAL catch-up commit.
    *
+   * <p>Consolidation requires complete coverage of surviving source fragments.
+   *
    * @param dataset the dataset
    * @param results the results of the plan's merges
+   * @param options the options used to plan the optimization
    */
-  public static void commit(Dataset dataset, List<IndexSegmentResult> results) {
+  public static void commit(
+      Dataset dataset, List<IndexSegmentResult> results, OptimizeOptions options) {
     Preconditions.checkNotNull(dataset);
     Preconditions.checkNotNull(results);
+    Preconditions.checkNotNull(options);
     List<String> resultJsons =
         results.stream().map(IndexSegmentResult::getJson).collect(Collectors.toList());
     try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
-      nativeCommit(dataset, resultJsons);
+      nativeCommit(dataset, resultJsons, options);
     }
   }
 
   private static native OptimizeIndicesPlan nativePlan(Dataset dataset, OptimizeOptions options);
 
-  private static native void nativeCommit(Dataset dataset, List<String> results);
+  private static native void nativeCommit(
+      Dataset dataset, List<String> results, OptimizeOptions options);
 }
