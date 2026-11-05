@@ -564,7 +564,7 @@ class DirectoryNamespace(LanceNamespace):
         Returns
         -------
         InsertIntoTableResponse
-            Response with optional transaction_id
+            Response with optional transaction_id, num_inserted_rows, and version
         """
         response_dict = self._inner.insert_into_table(
             request.model_dump(), request_data
@@ -1163,7 +1163,7 @@ class RestNamespace(LanceNamespace):
         Returns
         -------
         InsertIntoTableResponse
-            Response with optional transaction_id
+            Response with optional transaction_id, num_inserted_rows, and version
         """
         response_dict = self._inner.insert_into_table(
             request.model_dump(), request_data

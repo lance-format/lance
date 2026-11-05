@@ -20,6 +20,7 @@
 //!   - Row IDs and doc_start_positions in metadata
 //!   - File metadata: c_table, huffman_codes, tree topology
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,14 +29,15 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
-use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
+use lance_index_core::remapping::RowAddrTranslator;
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -1138,6 +1140,7 @@ impl FMIndex {
 #[derive(Debug)]
 struct LazyFMIndex {
     wavelet: LazyHuffmanWaveletTree,
+    // Document positions must stay aligned even when remapping deletes a row.
     row_ids: Vec<u64>,
     sa_samples: Vec<u64>,
     doc_start_positions: Vec<u64>,
@@ -1246,7 +1249,10 @@ impl LazyFMIndex {
         for i in lo..hi {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
-            result.insert(self.row_ids[doc_idx] as u32);
+            let row_addr = self.row_ids[doc_idx];
+            if row_addr != RowAddress::TOMBSTONE_ROW {
+                result.insert(row_addr as u32);
+            }
         }
         result
     }
@@ -1263,7 +1269,7 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1281,7 +1287,7 @@ impl LazyFMIndex {
             let text_pos = self.locate_async(i).await?;
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1510,7 +1516,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1528,8 +1534,16 @@ impl FMIndexScalarIndex {
         let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
+                let fri = fri.clone();
                 async move {
-                    let partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    let mut partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    if let Some(fri) = fri {
+                        for row_id in &mut partition.fm.row_ids {
+                            *row_id = fri
+                                .remap_row_id(*row_id)
+                                .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                        }
+                    }
                     Result::<_>::Ok((id, Arc::new(partition)))
                 }
             })
@@ -1620,7 +1634,9 @@ impl Index for FMIndexScalarIndex {
         let mut frags = RoaringBitmap::new();
         for p in &self.partitions {
             for &rid in &p.fm.row_ids {
-                frags.insert((rid >> 32) as u32);
+                if rid != RowAddress::TOMBSTONE_ROW {
+                    frags.insert(RowAddress::from(rid).fragment_id());
+                }
             }
         }
         Ok(frags)
@@ -1658,7 +1674,16 @@ impl ScalarIndex for FMIndexScalarIndex {
     fn can_remap(&self) -> bool {
         false
     }
+
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+        Err(Error::not_supported("Fm does not support remap"))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _: &RowAddrTranslator,
+        _: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }
     async fn update(
@@ -2296,6 +2321,10 @@ impl BasicTrainer for FMIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -2321,7 +2350,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
             false,
             // supports_regex: regex acceleration is only implemented for ngram.
             false,
-            // min_contains_chars: the FM-index can match a needle of any length.
+            // min_contains_chars: the FM-index can match any non-empty needle.
             0,
         )))
     }
@@ -2329,6 +2358,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
+        _index_version: u32,
         fri: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -2348,7 +2378,7 @@ impl ScalarIndexPlugin for FMIndexPlugin {
 mod tests {
     use super::*;
     use arrow_array::{BinaryArray, LargeBinaryArray, LargeStringArray, StringArray, UInt64Array};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::{ROW_ADDR, cache::LanceCache};
     use lance_io::object_store::ObjectStore;
@@ -2356,6 +2386,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::CompactedToFragmentOne;
     use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
@@ -2386,6 +2417,12 @@ mod tests {
         fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
             Arc::new(Self {
                 inner: self.inner.with_io_priority(io_priority),
+            })
+        }
+
+        fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+            Arc::new(Self {
+                inner: self.inner.with_io_buffer_size(bytes),
             })
         }
 
@@ -2656,6 +2693,77 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::no_deletions(vec![])]
+    #[case::middle_deleted(vec![1])]
+    #[case::all_deleted(vec![0, 1, 2, 3])]
+    #[tokio::test]
+    async fn test_load_remaps_positional_row_addresses(
+        #[case] deleted: Vec<u64>,
+        #[values(false, true)] is_prewarmed: bool,
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tempdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let texts: Vec<(u64, &[u8])> = vec![
+            (0, b"alpha needle"),
+            (1, b"beta needle"),
+            (2, b"gamma needle needle"),
+            (3, b"delta needle"),
+        ];
+        for (id, texts) in texts.chunks(3).enumerate() {
+            write_fmindex(
+                &FMIndex::build(texts).unwrap(),
+                store.as_ref(),
+                &fmindex_partition_path(id as u64),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let remapper = Arc::new(CompactedToFragmentOne {
+            deleted: deleted.into_iter().collect(),
+        });
+        let index =
+            FMIndexScalarIndex::load(store, Some(remapper.clone()), &LanceCache::no_cache())
+                .await
+                .unwrap();
+        if is_prewarmed {
+            index.prewarm().await.unwrap();
+        }
+
+        for pattern in ["needle", "alpha", "beta", "gamma", "delta", "absent"] {
+            let expected: lance_select::RowAddrTreeMap = texts
+                .iter()
+                .filter(|(_, text)| text.windows(pattern.len()).any(|w| w == pattern.as_bytes()))
+                .filter_map(|(row_id, _)| remapper.remap_row_id(*row_id))
+                .collect();
+            let result = index
+                .search(
+                    &TextQuery::StringContains(pattern.to_string()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let SearchResult::Exact(rows) = result else {
+                panic!("expected exact result");
+            };
+            assert_eq!(rows.selected_rows(), &expected, "{pattern}");
+        }
+        let expected_fragments: RoaringBitmap = if remapper.deleted.len() == texts.len() {
+            RoaringBitmap::new()
+        } else {
+            [1].into_iter().collect()
+        };
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            expected_fragments
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_public_prewarm_loads_lazy_blocks() {
         let docs: Vec<Vec<u8>> = (0..30)
@@ -2839,7 +2947,13 @@ mod tests {
             .unwrap();
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
 
@@ -3268,7 +3382,13 @@ mod tests {
         assert_eq!(created.files[1].path, fmindex_partition_path(1));
 
         let index = FMIndexPlugin
-            .load_index(store, &created.index_details, None, &LanceCache::no_cache())
+            .load_index(
+                store,
+                &created.index_details,
+                0,
+                None,
+                &LanceCache::no_cache(),
+            )
             .await
             .unwrap();
         let r = index

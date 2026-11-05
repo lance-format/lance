@@ -38,6 +38,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -59,6 +60,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             target_rows_per_fragment,
             max_rows_per_group,
             max_bytes_per_file,
+            min_bytes_per_file,
             materialize_deletions,
             materialize_deletions_threshold,
             num_threads,
@@ -83,6 +85,7 @@ fn inner_plan_compaction<'local>(
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -106,6 +109,7 @@ fn inner_plan_compaction<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -205,6 +209,7 @@ fn inner_commit_compaction<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &JObject::null(),
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -246,6 +251,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -269,6 +275,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             target_rows_per_fragment,
             max_rows_per_group,
             max_bytes_per_file,
+            min_bytes_per_file,
             materialize_deletions,
             materialize_deletions_threshold,
             num_threads,
@@ -295,6 +302,7 @@ fn inner_execute_task<'local>(
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -319,6 +327,7 @@ fn inner_execute_task<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -338,11 +347,14 @@ fn inner_execute_task<'local>(
         read_version: read_version as u64,
         options: compaction_options,
     };
-    let rewrite_result = {
+    // Executing a task only reads the snapshot, so clone it and release the native field guard;
+    // holding the guard would serialize every task sharing this Java Dataset.
+    let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(compaction_task.execute(&dataset.inner))?
+        dataset.inner.clone()
     };
+    let rewrite_result = block_on(compaction_task.execute(&dataset))?;
     rewrite_result.into_java(env)
 }
 
@@ -358,10 +370,26 @@ const REWRITE_RESULT_CONSTRUCTOR_SIG: &str =
     "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[B)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;)V";
+
+/// The Java `TaskData` carries no output properties, so a task whose outputs
+/// carry a clustering id or metadata cannot cross into Java without losing
+/// the planner's instruction; it is refused rather than exported stripped.
+fn refuse_output_properties(task: &TaskData) -> Result<()> {
+    if task.output_clustering_id.is_none() && task.output_metadata.is_empty() {
+        return Ok(());
+    }
+    Err(crate::Error::unsupported_error(format!(
+        "a compaction task whose outputs carry clustering definition {:?} and {} metadata \
+         entries cannot be passed through the Java binding, which has no fields for them",
+        task.output_clustering_id,
+        task.output_metadata.len()
+    )))
+}
 
 impl IntoJava for &TaskData {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        refuse_output_properties(self)?;
         let fragments = export_vec(env, &self.fragments)?;
         Ok(env.new_object(
             TASK_DATA_CLASS,
@@ -395,6 +423,8 @@ impl IntoJava for &CompactionOptions {
         let max_rows_per_group_opt = to_java_optional(env, max_rows_per_group)?;
         let max_bytes_per_file = to_java_long_obj(env, self.max_bytes_per_file.map(|v| v as i64))?;
         let max_bytes_per_file_opt = to_java_optional(env, max_bytes_per_file)?;
+        let min_bytes_per_file = to_java_long_obj(env, self.min_bytes_per_file.map(|v| v as i64))?;
+        let min_bytes_per_file_opt = to_java_optional(env, min_bytes_per_file)?;
         let materialize_deletions = to_java_boolean_obj(env, Some(self.materialize_deletions))?;
         let materialize_deletions_opt = to_java_optional(env, materialize_deletions)?;
         let materialize_deletions_threshold =
@@ -453,6 +483,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&target_rows_per_fragment_opt),
                 JValueGen::Object(&max_rows_per_group_opt),
                 JValueGen::Object(&max_bytes_per_file_opt),
+                JValueGen::Object(&min_bytes_per_file_opt),
                 JValueGen::Object(&materialize_deletions_opt),
                 JValueGen::Object(&materialize_deletions_threshold_opt),
                 JValueGen::Object(&num_threads_opt),
@@ -534,8 +565,12 @@ impl FromJObjectWithEnv<TaskData> for JObject<'_> {
         let task_data = import_vec_from_method(env, self, "getFragments", |env, fragment| {
             fragment.extract_object(env)
         })?;
+        // A Java task carries no output properties: its outputs carry no
+        // definition and no metadata.
         Ok(TaskData {
             fragments: task_data,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
         })
     }
 }
@@ -576,5 +611,37 @@ impl FromJObjectWithEnv<RewriteResult> for JObject<'_> {
             original_fragments,
             row_addrs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lance::dataset::optimize::TaskData;
+
+    use super::refuse_output_properties;
+
+    fn task(clustering_id: Option<u32>, metadata: &[(&str, &str)]) -> TaskData {
+        TaskData {
+            fragments: vec![],
+            output_clustering_id: clustering_id,
+            output_metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_task_with_output_properties_is_refused_and_a_plain_one_passes() {
+        refuse_output_properties(&task(None, &[])).unwrap();
+        for (id, metadata) in [
+            (Some(7), &[][..]),
+            (None, &[("bucket", "3")][..]),
+            (Some(7), &[("bucket", "3")][..]),
+        ] {
+            let error = refuse_output_properties(&task(id, metadata)).unwrap_err();
+            let text = format!("{error:?}");
+            assert!(text.contains("Java binding"), "{text}");
+        }
     }
 }

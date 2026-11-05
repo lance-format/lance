@@ -49,6 +49,14 @@ message FilteredReadThreadingModeProto {
 
 // Serializable form of FilteredReadOptions.
 message FilteredReadOptionsProto {
+  enum ListReadMode {
+    LIST_READ_MODE_UNSPECIFIED = 0;
+    // Preserve exact outer list lengths and validity without element payloads.
+    LIST_READ_MODE_LENGTH = 1;
+    // Preserve outer validity and emptiness; nonempty lengths may become one.
+    LIST_READ_MODE_NON_EMPTY = 2;
+  }
+
   optional U64Range scan_range_before_filter = 1;
   optional U64Range scan_range_after_filter = 2;
   bool with_deleted_rows = 3;
@@ -74,6 +82,23 @@ message FilteredReadOptionsProto {
    * row-based batch_size. This corresponds to FileReaderOptions.batch_size_bytes.
    */
   optional uint64 batch_size_bytes = 14;
+  /* If present, only these physical (fragment_id, row_offset) addresses are
+   * eligible for the scan. The bytes contain a serialized RowAddrTreeMap.
+   * If absent, no physical row-address restriction is applied.
+   * Requires coordinated planner/executor upgrades: mixed-version execution
+   * with executors that do not recognize this field is unsupported. There is
+   * no capability handshake; older executors may silently ignore the restriction.
+   * Must not be combined with scan_range_before_filter. Physical addresses
+   * refer to the exact dataset snapshot used to plan the scan.
+   */
+  optional bytes physical_row_addr_allowlist = 15;
+  /* List field IDs whose consumers need only the specified structural property.
+   * Element values are placeholders and must not be consumed or returned.
+   * An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+   * Older executors may ignore this field and read full values, preserving results
+   * but losing the optimization. These modes apply only to this read, not the dataset.
+   */
+  map<int32, ListReadMode> list_structure = 16;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).

@@ -3,11 +3,10 @@
 
 use std::{iter::Sum, ops::AddAssign};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, Float32Array};
-use arrow_schema::{ArrowError, DataType};
 use half::{bf16, f16};
+
+use super::arrow::{Norm, Operation, dispatch};
 #[allow(unused_imports)]
 use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
 use num_traits::{AsPrimitive, Float, Num};
@@ -417,80 +416,37 @@ pub fn norm_l2<T: Normalize>(vector: &[T]) -> f32 {
 
 /// L2 norm of every vector in a [FixedSizeListArray], Returns one norm per row.
 pub fn norm_l2_fsl(fsl: &FixedSizeListArray) -> crate::Result<Float32Array> {
-    let dim = fsl.value_length() as usize;
-    if dim == 0 {
-        return Err(ArrowError::InvalidArgumentError(
-            "cannot compute L2 norms of a FixedSizeListArray with value_length 0".into(),
-        ));
-    }
-    let values = fsl.values();
-    Ok(match fsl.value_type() {
-        DataType::Float16 => values
-            .as_primitive::<Float16Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(<f16 as Normalize>::norm_l2)
-            .collect(),
-        DataType::Float32 => values
-            .as_primitive::<Float32Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(<f32 as Normalize>::norm_l2)
-            .collect(),
-        DataType::Float64 => values
-            .as_primitive::<Float64Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(<f64 as Normalize>::norm_l2)
-            .collect(),
-        value_type => {
-            return Err(ArrowError::SchemaError(format!(
-                "norm_l2_fsl only supports float16/float32/float64 vectors, got: {value_type}"
-            )));
-        }
-    })
+    dispatch(Operation::Norm(Norm::L2), None, fsl).map(Float32Array::from)
 }
 
-/// Squared L2 norm of every vector in a [FixedSizeListArray].
+/// Squared L2 norm of every vector in a [`FixedSizeListArray`].
 ///
-/// Each square is accumulated in `f32` (or wider) rather than in the element
-/// type: squaring an `f16` saturates to `inf` at `|x| >= 256` and to zero at
-/// `|x| <= 1.726e-4`.
+/// Supports Float16/Float32/Float64 and rejects zero dimensions. Each square is
+/// accumulated in `f32` (or wider) rather than the element type, avoiding f16
+/// overflow and underflow. Like [`norm_l2_fsl`], reads the values of null rows.
+///
+/// ```
+/// use arrow_array::{FixedSizeListArray, types::Float32Type};
+/// use lance_linalg::distance::try_norm_squared_fsl;
+/// let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+///     [Some(vec![Some(3.0), Some(4.0)])], 2);
+/// assert_eq!(try_norm_squared_fsl(&vectors)?, vec![25.0]);
+/// # Ok::<(), arrow_schema::ArrowError>(())
+/// ```
+pub fn try_norm_squared_fsl(fsl: &FixedSizeListArray) -> crate::Result<Vec<f32>> {
+    dispatch(Operation::Norm(Norm::Squared), None, fsl)
+}
+
+/// Squared L2 norms through the legacy infallible API.
+///
+/// # Panics
+/// Panics for unsupported element types or zero dimensions. Use
+/// [`try_norm_squared_fsl`] to receive an error instead.
+#[deprecated(note = "Use try_norm_squared_fsl")]
 pub fn norm_squared_fsl(fsl: &FixedSizeListArray) -> Vec<f32> {
-    let dim = fsl.value_length() as usize;
-    match fsl.value_type() {
-        DataType::Float16 => fsl
-            .values()
-            .as_primitive::<Float16Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(|v| {
-                v.iter()
-                    .map(|v| {
-                        let v = v.to_f32();
-                        v * v
-                    })
-                    .sum::<f32>()
-            })
-            .collect::<Vec<_>>(),
-        DataType::Float32 => fsl
-            .values()
-            .as_primitive::<Float32Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(|v| v.iter().map(|v| v * v).sum::<f32>())
-            .collect::<Vec<_>>(),
-        DataType::Float64 => fsl
-            .values()
-            .as_primitive::<Float64Type>()
-            .values()
-            .chunks_exact(dim)
-            .map(|v| v.iter().map(|v| v * v).sum::<f64>() as f32)
-            .collect::<Vec<_>>(),
-        _ => {
-            unimplemented!("Unsupported data type: {}", fsl.value_type())
-        }
-    }
+    // Retain the public signature while callers migrate to the fallible API.
+    try_norm_squared_fsl(fsl)
+        .expect("squared L2 norms require float vectors with positive dimension")
 }
 
 #[cfg(test)]
@@ -501,9 +457,11 @@ mod tests {
         run_vector_proptest,
     };
     use arrow_array::{Float16Array, Float64Array, UInt8Array};
+    use arrow_schema::{ArrowError, DataType};
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::ToPrimitive;
     use proptest::prelude::*;
+    use std::sync::Arc;
 
     /// Reference implementation of L2 norm.
     fn norm_l2_reference(data: &[f64]) -> f32 {
@@ -735,7 +693,10 @@ mod tests {
         let fsl = FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![1u8, 2, 3, 4]), 2)
             .unwrap();
         let err = norm_l2_fsl(&fsl).unwrap_err().to_string();
-        assert!(err.contains("float16/float32/float64"), "got: {err}");
+        assert!(
+            err.contains("unsupported vector element type UInt8"),
+            "got: {err}"
+        );
     }
 
     /// `norm_squared_fsl` must accumulate in a type wider than the element type.
@@ -753,7 +714,7 @@ mod tests {
         let field = Arc::new(Field::new("item", DataType::Float16, true));
         let fsl = FixedSizeListArray::try_new(field, 2, Arc::new(values), None).unwrap();
 
-        let got = norm_squared_fsl(&fsl);
+        let got = try_norm_squared_fsl(&fsl).unwrap();
         // Independent reference: square and sum the same f16 inputs in f64.
         let expected = raw
             .chunks(2)
@@ -771,6 +732,55 @@ mod tests {
             assert!(
                 approx::relative_eq!(got as f64, want, max_relative = 1e-3),
                 "row {row}: got {got}, want {want}"
+            );
+        }
+    }
+    #[rstest::rstest]
+    #[case::f16(DataType::Float16)]
+    #[case::f32(DataType::Float32)]
+    #[case::f64(DataType::Float64)]
+    #[case::i8(DataType::Int8)]
+    #[case::u8(DataType::UInt8)]
+    #[case::i32(DataType::Int32)]
+    fn test_arrow_norm_support_and_dimension(#[case] dtype: DataType) {
+        let values = super::super::tests::arrow_values(&dtype, vec![99, 99, 3, 4, 5, 12]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2)
+            .unwrap()
+            .slice(1, 2);
+        let supported = matches!(
+            dtype,
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        );
+        let norms = norm_l2_fsl(&vectors);
+        let squared = try_norm_squared_fsl(&vectors);
+        if supported {
+            assert_eq!(norms.unwrap().values(), &[5.0, 13.0]);
+            assert_eq!(squared.unwrap(), vec![25.0, 169.0]);
+        } else {
+            for error in [norms.unwrap_err(), squared.unwrap_err()] {
+                assert!(
+                    matches!(&error, ArrowError::InvalidArgumentError(message)
+                    if message.contains("unsupported vector element type") && message.contains(&dtype.to_string())),
+                    "{error}"
+                );
+            }
+        }
+        let zero_dim = FixedSizeListArray::try_new_with_length(
+            Arc::new(arrow_schema::Field::new("item", dtype.clone(), true)),
+            0,
+            super::super::tests::arrow_values(&dtype, vec![]),
+            None,
+            1,
+        )
+        .unwrap();
+        for error in [
+            norm_l2_fsl(&zero_dim).unwrap_err(),
+            try_norm_squared_fsl(&zero_dim).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&error, ArrowError::InvalidArgumentError(message)
+                if message.contains(if supported {"dimension 0"} else {"unsupported vector element type"})),
+                "{error}"
             );
         }
     }

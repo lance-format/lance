@@ -13,21 +13,24 @@
 //! The caller minimum takes precedence over the learned cap, while the caller
 //! maximum and available candidate count limit the final initial budget.
 //! Explicit fixed nprobes bypasses both the heuristic and these overrides.
-//! Only ordinary Float32 IVF_FLAT queries using L2, cosine, or dot with k <= 100
-//! use these profiles. Hamming, other index types, and explicitly bounded
-//! Auto queries retain their existing heuristic and ignore these overrides.
+//! Queries using L2, cosine, or dot with k <= 100000 use these profiles across IVF
+//! index types, vector types, and refinement factors. The policy selects partitions
+//! from centroid distances independently of query values, quantization, or the
+//! search within each partition.
+//! Explicit maximum bounds limit adaptive probing without disabling it.
+//! Larger k and Hamming retain their existing heuristic and ignore these overrides.
 //! Dot uses the magnitude of the best centroid inner product to scale its gap,
 //! rather than the signed `1 - dot` distance. Corpus and query norms are preserved.
 //! No extra index statistics or file-format changes are needed.
+//! Below default effort, 0.1 and 0.25 target 80% and 90% mean routing recall.
+//! Fractions of the metric/k-dependent Auto budget were selected on calibration
+//! queries and independently evaluated (benchmarks/auto-ivf-effort). These targets
+//! do not account for quantization, filtering, or approximate centroid routing.
 
 use std::env;
 
-use arrow_array::{Array, cast::AsArray};
-use arrow_schema::DataType;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use lance_index::vector::{
-    Query, VectorIndex, quantizer::QuantizationType, v3::subindex::SubIndexType,
-};
+use lance_index::vector::{Query, VectorIndex};
 use lance_linalg::distance::DistanceType;
 
 const MARGIN_ENV: &str = "LANCE_AUTO_PROBE_MARGIN";
@@ -43,49 +46,23 @@ pub(super) enum AutoProbePolicy {
 }
 
 impl AutoProbePolicy {
-    pub(super) fn from_env(
-        query: &Query,
-        index: &dyn VectorIndex,
-        vector_type: &DataType,
-    ) -> DataFusionResult<Self> {
-        Self::select_with_config(query, index, vector_type, AutoProbeConfig::from_env)
+    pub(super) fn from_env(query: &Query, index: &dyn VectorIndex) -> DataFusionResult<Self> {
+        Self::select_with_config(query, index, AutoProbeConfig::from_env)
     }
 
     pub(super) fn select_with_config(
         query: &Query,
         index: &dyn VectorIndex,
-        vector_type: &DataType,
         read_config: impl FnOnce(&Query, DistanceType) -> DataFusionResult<Option<AutoProbeConfig>>,
     ) -> DataFusionResult<Self> {
+        query.validate_search_effort()?;
         if query.maximum_nprobes == Some(query.minimum_nprobes) {
             return Ok(Self::Fixed);
         }
-        // Legacy IVF indices do not expose sub-index metadata. Keep their
-        // original probing without calling those unsupported methods.
-        if !index.supports_prepared_partition_search() {
-            return Ok(Self::Legacy);
-        }
-        if query.maximum_nprobes.is_some()
-            || query.key.data_type() != &DataType::Float32
-            || query.key.null_count() != 0
-            || !matches!(vector_type, DataType::FixedSizeList(item, dimension)
-                if item.data_type() == &DataType::Float32 && *dimension as usize == query.key.len())
-            || !matches!(
-                index.sub_index_type(),
-                (SubIndexType::Flat, QuantizationType::Flat)
-            )
-            || !matches!(
-                index.metric_type(),
-                DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
-            )
-            || query.k > 100
-            || query.refine_factor.is_some_and(|factor| factor > 1)
-            || !query
-                .key
-                .as_primitive::<arrow_array::types::Float32Type>()
-                .values()
-                .iter()
-                .all(|x| x.is_finite())
+        if !matches!(
+            index.metric_type(),
+            DistanceType::L2 | DistanceType::Cosine | DistanceType::Dot
+        ) || query.k > 100_000
         {
             return Ok(Self::Legacy);
         }
@@ -93,12 +70,179 @@ impl AutoProbePolicy {
     }
 
     pub(super) fn apply(self, query: &mut Query, distances: &[f32], metric: DistanceType) {
+        let caller_minimum = query.minimum_nprobes;
         match self {
             Self::Fixed => {}
             Self::Legacy => apply_legacy_probes(query, distances),
             Self::Adaptive(config) => config.apply(query, distances, metric),
         }
+        // Preserve the original budget exactly, including legacy rounding and
+        // clipping behavior, when the new option is omitted or set to default.
+        if query.search_effort == 0.5 {
+            return;
+        }
+        let upper = distances
+            .len()
+            .min(query.maximum_nprobes.unwrap_or(distances.len()));
+        if upper == 0 {
+            query.minimum_nprobes = 0;
+            return;
+        }
+        let lower = caller_minimum.max(1).min(upper);
+        let auto = query.minimum_nprobes.clamp(lower, upper);
+        let effort = query.search_effort;
+        // Round-off near 0.5 can move the geometric budget past Auto. Bound
+        // each half separately so increasing effort preserves the midpoint.
+        query.minimum_nprobes = if effort == 0.0 {
+            lower
+        } else if effort == 1.0 {
+            upper
+        } else if effort < 0.5 {
+            // Keep the existing metric/k-dependent shape and calibrate only the
+            // fraction of its budget. Ordered anchors make probing monotone for
+            // each query, including queries clipped by explicit caller bounds.
+            let scales = if matches!(self, Self::Adaptive(_)) {
+                effort_scales(query.k, metric)
+            } else {
+                None
+            };
+            if let Some((low_scale, medium_scale)) = scales {
+                let low = ((auto as f64 * low_scale).ceil() as usize).clamp(lower, auto);
+                let medium = ((auto as f64 * medium_scale).ceil() as usize).clamp(lower, auto);
+                if effort <= 0.1 {
+                    interpolate_budget(effort, (0.0, lower), (0.1, low))
+                } else if effort <= 0.25 {
+                    interpolate_budget(effort, (0.1, low), (0.25, medium))
+                } else {
+                    interpolate_budget(effort, (0.25, medium), (0.5, auto))
+                }
+            } else {
+                interpolate_budget(effort, (0.0, lower), (0.5, auto))
+            }
+        } else {
+            interpolate_budget(effort, (0.5, auto), (1.0, upper))
+        };
     }
+}
+
+/// Fractions of Auto fitted independently at each k on calibration queries.
+/// Adjacent anchors straddle every Auto-profile boundary; interpolation therefore
+/// stays within one profile. The full fit and held-out evidence are recorded in
+/// benchmarks/auto-ivf-effort/calibration-by-k.json and routing-by-k-evaluation.json.
+fn effort_scales(k: usize, metric: DistanceType) -> Option<(f64, f64)> {
+    const K: [usize; 26] = [
+        1, 2, 5, 10, 11, 20, 50, 100, 101, 150, 200, 201, 300, 500, 501, 750, 1_000, 1_001, 2_000,
+        5_000, 10_000, 10_001, 20_000, 50_000, 75_000, 100_000,
+    ];
+    let scales = match metric {
+        DistanceType::L2 => &[
+            (0.264, 0.601),
+            (0.209, 0.501),
+            (0.251, 0.501),
+            (0.286, 0.591),
+            (0.182, 0.364),
+            (0.182, 0.395),
+            (0.211, 0.474),
+            (0.264, 0.553),
+            (0.179, 0.401),
+            (0.201, 0.449),
+            (0.201, 0.471),
+            (0.161, 0.364),
+            (0.182, 0.410),
+            (0.209, 0.484),
+            (0.162, 0.380),
+            (0.176, 0.431),
+            (0.207, 0.483),
+            (0.068, 0.164),
+            (0.092, 0.215),
+            (0.143, 0.331),
+            (0.212, 0.488),
+            (0.057, 0.137),
+            (0.089, 0.206),
+            (0.172, 0.373),
+            (0.232, 0.482),
+            (0.288, 0.579),
+        ],
+        DistanceType::Cosine => &[
+            (0.278, 0.563),
+            (0.143, 0.383),
+            (0.174, 0.442),
+            (0.201, 0.530),
+            (0.133, 0.308),
+            (0.143, 0.352),
+            (0.161, 0.429),
+            (0.189, 0.501),
+            (0.129, 0.348),
+            (0.143, 0.388),
+            (0.154, 0.412),
+            (0.118, 0.322),
+            (0.136, 0.360),
+            (0.156, 0.422),
+            (0.126, 0.342),
+            (0.146, 0.388),
+            (0.161, 0.432),
+            (0.066, 0.184),
+            (0.088, 0.240),
+            (0.135, 0.352),
+            (0.193, 0.481),
+            (0.082, 0.209),
+            (0.118, 0.286),
+            (0.198, 0.437),
+            (0.250, 0.526),
+            (0.297, 0.601),
+        ],
+        DistanceType::Dot => &[
+            (0.179, 0.465),
+            (0.139, 0.341),
+            (0.160, 0.417),
+            (0.181, 0.473),
+            (0.136, 0.356),
+            (0.140, 0.381),
+            (0.161, 0.436),
+            (0.176, 0.481),
+            (0.166, 0.455),
+            (0.176, 0.484),
+            (0.185, 0.503),
+            (0.160, 0.435),
+            (0.173, 0.468),
+            (0.189, 0.509),
+            (0.165, 0.445),
+            (0.180, 0.477),
+            (0.190, 0.506),
+            (0.103, 0.273),
+            (0.122, 0.320),
+            (0.163, 0.414),
+            (0.211, 0.525),
+            (0.097, 0.229),
+            (0.130, 0.298),
+            (0.202, 0.434),
+            (0.248, 0.517),
+            (0.289, 0.584),
+        ],
+        DistanceType::Hamming => return None,
+    };
+    match K.binary_search(&k) {
+        Ok(position) => Some(scales[position]),
+        Err(upper) if upper > 0 && upper < K.len() => {
+            let lower = upper - 1;
+            let weight =
+                (k as f64 / K[lower] as f64).ln() / (K[upper] as f64 / K[lower] as f64).ln();
+            let interpolate = |start: f64, end: f64| start * (end / start).powf(weight);
+            Some((
+                interpolate(scales[lower].0, scales[upper].0),
+                interpolate(scales[lower].1, scales[upper].1),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Interpolate between positive partition budgets, preserving both anchor bounds
+/// when floating-point rounding puts the result just outside the interval.
+fn interpolate_budget(effort: f64, start: (f64, usize), end: (f64, usize)) -> usize {
+    let fraction = (effort - start.0) / (end.0 - start.0);
+    let budget = start.1 as f64 * (end.1 as f64 / start.1 as f64).powf(fraction);
+    (budget.ceil() as usize).clamp(start.1, end.1)
 }
 
 /// Preserve the pre-experiment f32 heuristic, including signed distances and
@@ -187,26 +331,36 @@ impl AutoProbeConfig {
         let bucket = match query.k {
             ..=1 => 0,
             2..=10 => 1,
-            _ => 2,
+            11..=100 => 2,
+            101..=200 => 3,
+            201..=500 => 4,
+            501..=1000 => 5,
+            1001..=10_000 => 6,
+            _ => 7,
         };
         // Profiles depend only on metric and k; every index uses the same values.
+        // Larger-k buckets are calibrated at their upper endpoints on separate
+        // queries from the native evaluation (benchmarks/auto-ivf-large-k).
+        // Each bucket uses its measured upper-endpoint profile; measurements do
+        // not establish recall guarantees for every intermediate k. The policy
+        // gate retains legacy probing above the largest calibrated endpoint.
         let (default_margin, default_minimum, cap) = match metric {
             DistanceType::L2 => (
-                [0.2175, 0.265, 0.33][bucket],
-                [5, 6, 11][bucket],
-                [19, 24, 38][bucket],
+                [0.2175, 0.265, 0.33, 0.375, 0.3725, 0.4175, 0.57, 0.75][bucket],
+                [5, 6, 11, 15, 22, 29, 98, 463][bucket],
+                [19, 24, 38, 56, 81, 93, 238, 704][bucket],
             ),
             DistanceType::Cosine => (
-                [0.235, 0.2875, 0.38][bucket],
-                [3, 8, 7][bucket],
-                [50, 77, 106][bucket],
+                [0.235, 0.2875, 0.38, 0.415, 0.45, 0.47, 0.6475, 0.58][bucket],
+                [3, 8, 7, 18, 28, 34, 104, 738][bucket],
+                [50, 77, 106, 156, 192, 248, 447, 958][bucket],
             ),
             // Calibrated on unnormalized Wiki-Cohere and DPR vectors. An initial
             // cap controls overscanning without limiting later filtered search.
             DistanceType::Dot => (
-                [0.14, 0.055, 0.0625][bucket],
-                [56, 144, 200][bucket],
-                [112, 432, 768][bucket],
+                [0.14, 0.055, 0.0625, 0.0675, 0.07, 0.0725, 0.0825, 0.21][bucket],
+                [56, 144, 200, 211, 244, 279, 517, 1009][bucket],
+                [112, 432, 768, 833, 971, 1092, 1824, 2528][bucket],
             ),
             _ => return Ok(Some(Self::default())),
         };
@@ -334,6 +488,7 @@ mod tests {
             upper_bound: None,
             minimum_nprobes: 1,
             maximum_nprobes: None,
+            search_effort: 0.5,
             ef: None,
             refine_factor: None,
             metric_type: None,
@@ -345,21 +500,256 @@ mod tests {
     }
 
     #[rstest]
+    #[case::low_start(0.0, (0.0, 1), (0.1, 4), 1)]
+    #[case::low_middle(0.05, (0.0, 1), (0.1, 4), 2)]
+    #[case::low_end(0.1, (0.0, 1), (0.1, 4), 4)]
+    #[case::middle(0.175, (0.1, 4), (0.25, 16), 8)]
+    #[case::at_auto(0.5, (0.25, 16), (0.5, 32), 32)]
+    #[case::equal_budgets(0.2, (0.1, 8), (0.25, 8), 8)]
+    fn test_interpolate_budget(
+        #[case] effort: f64,
+        #[case] start: (f64, usize),
+        #[case] end: (f64, usize),
+        #[case] expected: usize,
+    ) {
+        assert_eq!(interpolate_budget(effort, start, end), expected);
+    }
+
+    #[rstest]
+    #[case::minimum(0.0, 1)]
+    #[case::recall80(0.1, 5)]
+    #[case::recall90(0.25, 10)]
+    #[case::auto(0.5, 16)]
+    #[case::above_auto(0.75, 32)]
+    #[case::all(1.0, 64)]
+    fn test_search_effort_interpolation(#[case] effort: f64, #[case] expected: usize) {
+        let mut query = query();
+        query.search_effort = effort;
+        AutoProbePolicy::Adaptive(AutoProbeConfig {
+            min_initial_nprobes: 16,
+            margin: 0.0,
+            max_initial_nprobes: Some(16),
+        })
+        .apply(&mut query, &[1.0; 64], DistanceType::L2);
+        // The learned floor/cap must not be reapplied after interpolation.
+        assert_eq!(query.minimum_nprobes, expected);
+        assert_eq!(query.maximum_nprobes, None);
+    }
+
+    #[rstest]
+    fn test_search_effort_bounds_and_monotonicity(
+        #[values(0, 1, 7, 11, 64, 100)] caller_minimum: usize,
+        #[values(None, Some(0), Some(16), Some(128))] maximum: Option<usize>,
+        #[values(0, 1, 64)] available: usize,
+        #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)] metric: DistanceType,
+        #[values(1, 1500, 100_000)] k: usize,
+    ) {
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 25,
+            margin: 0.0,
+            max_initial_nprobes: Some(25),
+        };
+        let distances = vec![1.0; available];
+        let upper = available.min(maximum.unwrap_or(available));
+        let lower = caller_minimum.max(1).min(upper);
+        let mut previous = lower;
+        let mut efforts = (0..=100)
+            .map(|step| f64::from(step) / 100.0)
+            .collect::<Vec<_>>();
+        for anchor in [0.1_f64, 0.25, 0.5] {
+            efforts.extend([
+                f64::from_bits(anchor.to_bits() - 1),
+                f64::from_bits(anchor.to_bits() + 1),
+            ]);
+        }
+        efforts.sort_by(f64::total_cmp);
+        for (step, effort) in efforts.into_iter().enumerate() {
+            let mut query = query();
+            query.k = k;
+            query.minimum_nprobes = caller_minimum;
+            query.maximum_nprobes = maximum;
+            query.search_effort = effort;
+            // Equal caller bounds select fixed probing, covered separately.
+            if maximum == Some(caller_minimum) {
+                continue;
+            }
+            AutoProbePolicy::Adaptive(config).apply(&mut query, &distances, metric);
+            assert!((lower..=upper).contains(&query.minimum_nprobes));
+            assert!(
+                query.minimum_nprobes >= previous,
+                "search_effort={effort}, budget={} must be at least previous budget={previous}",
+                query.minimum_nprobes,
+            );
+            assert_eq!(query.maximum_nprobes, maximum);
+            previous = query.minimum_nprobes;
+            if step == 0 {
+                assert_eq!(query.minimum_nprobes, lower);
+            }
+        }
+        if maximum != Some(caller_minimum) {
+            assert_eq!(previous, upper);
+        }
+    }
+
+    #[rstest]
+    #[case::l2_small(DistanceType::L2, 1, 27, 61)]
+    #[case::l2_ten(DistanceType::L2, 10, 29, 60)]
+    #[case::l2_thousand(DistanceType::L2, 1000, 21, 49)]
+    #[case::l2_after_thousand(DistanceType::L2, 1001, 7, 17)]
+    #[case::l2_interpolated(DistanceType::L2, 1500, 9, 20)]
+    #[case::l2_ten_thousand(DistanceType::L2, 10_000, 22, 49)]
+    #[case::l2_after_ten_thousand(DistanceType::L2, 10_001, 6, 14)]
+    #[case::l2_largest(DistanceType::L2, 100_000, 29, 58)]
+    #[case::cosine_small(DistanceType::Cosine, 1, 28, 57)]
+    #[case::cosine_ten(DistanceType::Cosine, 10, 21, 53)]
+    #[case::cosine_thousand(DistanceType::Cosine, 1000, 17, 44)]
+    #[case::cosine_after_thousand(DistanceType::Cosine, 1001, 7, 19)]
+    #[case::cosine_interpolated(DistanceType::Cosine, 1500, 8, 22)]
+    #[case::cosine_ten_thousand(DistanceType::Cosine, 10_000, 20, 49)]
+    #[case::cosine_after_ten_thousand(DistanceType::Cosine, 10_001, 9, 21)]
+    #[case::cosine_largest(DistanceType::Cosine, 100_000, 30, 61)]
+    #[case::dot_small(DistanceType::Dot, 1, 18, 47)]
+    #[case::dot_ten(DistanceType::Dot, 10, 19, 48)]
+    #[case::dot_thousand(DistanceType::Dot, 1000, 19, 51)]
+    #[case::dot_after_thousand(DistanceType::Dot, 1001, 11, 28)]
+    #[case::dot_interpolated(DistanceType::Dot, 1500, 12, 30)]
+    #[case::dot_ten_thousand(DistanceType::Dot, 10_000, 22, 53)]
+    #[case::dot_after_ten_thousand(DistanceType::Dot, 10_001, 10, 23)]
+    #[case::dot_largest(DistanceType::Dot, 100_000, 29, 59)]
+    fn test_calibrated_effort_by_k(
+        #[case] metric: DistanceType,
+        #[case] k: usize,
+        #[case] low: usize,
+        #[case] medium: usize,
+    ) {
+        // Hold Auto fixed to isolate the k-dependent fractions. Expected budgets
+        // come from the frozen calibration, including both wide-bucket jumps.
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 100,
+            margin: 0.0,
+            max_initial_nprobes: Some(100),
+        };
+        for (effort, expected) in [(0.1, low), (0.25, medium), (0.5, 100)] {
+            let mut query = query();
+            query.k = k;
+            query.search_effort = effort;
+            AutoProbePolicy::Adaptive(config).apply(&mut query, &[1.0; 200], metric);
+            assert_eq!(query.minimum_nprobes, expected);
+            assert_eq!(query.maximum_nprobes, None);
+        }
+    }
+
+    #[rstest]
+    #[case::hamming(DistanceType::Hamming, 10)]
+    #[case::large_k(DistanceType::L2, 100_001)]
+    fn test_uncalibrated_effort_preserves_interpolation(
+        #[case] metric: DistanceType,
+        #[case] k: usize,
+    ) {
+        let mut query = query();
+        query.k = k;
+        query.search_effort = 0.25;
+        AutoProbePolicy::Legacy.apply(&mut query, &[1.0; 64], metric);
+        assert_eq!(query.minimum_nprobes, 8);
+        assert_eq!(query.maximum_nprobes, None);
+    }
+
+    #[rstest]
+    fn test_search_effort_default_preserves_policy(
+        #[values(0, 1, 100)] minimum: usize,
+        #[values(None, Some(8))] maximum: Option<usize>,
+        #[values(0, 16)] available: usize,
+        #[values(AutoProbePolicy::Fixed, AutoProbePolicy::Legacy)] policy: AutoProbePolicy,
+    ) {
+        let mut actual = query();
+        actual.minimum_nprobes = minimum;
+        actual.maximum_nprobes = maximum;
+        let mut expected = actual.clone();
+        let distances = vec![1.0; available];
+        if policy == AutoProbePolicy::Legacy {
+            apply_legacy_probes(&mut expected, &distances);
+        }
+        policy.apply(&mut actual, &distances, DistanceType::Hamming);
+        assert_eq!(actual.minimum_nprobes, expected.minimum_nprobes);
+        assert_eq!(actual.maximum_nprobes, expected.maximum_nprobes);
+    }
+
+    #[rstest]
+    #[case::negative(-0.01)]
+    #[case::too_large(1.01)]
+    #[case::nan(f64::NAN)]
+    #[case::positive_infinity(f64::INFINITY)]
+    #[case::negative_infinity(f64::NEG_INFINITY)]
+    fn test_search_effort_invalid(#[case] effort: f64) {
+        let mut query = query();
+        query.search_effort = effort;
+        let error = query.validate_search_effort().unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("search_effort must be finite and in [0, 1]")
+        );
+    }
+
+    #[rstest]
+    fn test_search_effort_equal_explicit_bounds(#[values(0.0, 0.25, 0.5, 0.75, 1.0)] effort: f64) {
+        let mut query = query();
+        query.minimum_nprobes = 8;
+        query.maximum_nprobes = Some(8);
+        query.search_effort = effort;
+        query.validate_search_effort().unwrap();
+        AutoProbePolicy::Fixed.apply(&mut query, &[1.0; 16], DistanceType::L2);
+        assert_eq!(query.minimum_nprobes, 8);
+        assert_eq!(query.maximum_nprobes, Some(8));
+    }
+
+    #[rstest]
     #[case::l2_top1(DistanceType::L2, 1, 0.2175, 5, 19)]
     #[case::l2_top10_lower_boundary(DistanceType::L2, 2, 0.265, 6, 24)]
     #[case::l2_top10_upper_boundary(DistanceType::L2, 10, 0.265, 6, 24)]
     #[case::l2_top100_lower_boundary(DistanceType::L2, 11, 0.33, 11, 38)]
     #[case::l2_top100(DistanceType::L2, 100, 0.33, 11, 38)]
+    #[case::l2_top200_lower_boundary(DistanceType::L2, 101, 0.375, 15, 56)]
+    #[case::l2_top200(DistanceType::L2, 200, 0.375, 15, 56)]
+    #[case::l2_top500_lower_boundary(DistanceType::L2, 201, 0.3725, 22, 81)]
+    #[case::l2_top500(DistanceType::L2, 500, 0.3725, 22, 81)]
+    #[case::l2_top1000_lower_boundary(DistanceType::L2, 501, 0.4175, 29, 93)]
+    #[case::l2_top1000(DistanceType::L2, 1000, 0.4175, 29, 93)]
+    #[case::l2_top10000_lower_boundary(DistanceType::L2, 1001, 0.57, 98, 238)]
+    #[case::l2_top10000(DistanceType::L2, 10_000, 0.57, 98, 238)]
+    #[case::l2_top100000_lower_boundary(DistanceType::L2, 10_001, 0.75, 463, 704)]
+    #[case::l2_top100000(DistanceType::L2, 100_000, 0.75, 463, 704)]
     #[case::cosine_top1(DistanceType::Cosine, 1, 0.235, 3, 50)]
     #[case::cosine_top10_lower_boundary(DistanceType::Cosine, 2, 0.2875, 8, 77)]
     #[case::cosine_top10_upper_boundary(DistanceType::Cosine, 10, 0.2875, 8, 77)]
     #[case::cosine_top100_lower_boundary(DistanceType::Cosine, 11, 0.38, 7, 106)]
     #[case::cosine_top100(DistanceType::Cosine, 100, 0.38, 7, 106)]
+    #[case::cosine_top200_lower_boundary(DistanceType::Cosine, 101, 0.415, 18, 156)]
+    #[case::cosine_top200(DistanceType::Cosine, 200, 0.415, 18, 156)]
+    #[case::cosine_top500_lower_boundary(DistanceType::Cosine, 201, 0.45, 28, 192)]
+    #[case::cosine_top500(DistanceType::Cosine, 500, 0.45, 28, 192)]
+    #[case::cosine_top1000_lower_boundary(DistanceType::Cosine, 501, 0.47, 34, 248)]
+    #[case::cosine_top1000(DistanceType::Cosine, 1000, 0.47, 34, 248)]
+    #[case::cosine_top10000_lower_boundary(DistanceType::Cosine, 1001, 0.6475, 104, 447)]
+    #[case::cosine_top10000(DistanceType::Cosine, 10_000, 0.6475, 104, 447)]
+    #[case::cosine_top100000_lower_boundary(DistanceType::Cosine, 10_001, 0.58, 738, 958)]
+    #[case::cosine_top100000(DistanceType::Cosine, 100_000, 0.58, 738, 958)]
     #[case::dot_top1(DistanceType::Dot, 1, 0.14, 56, 112)]
     #[case::dot_top10_lower_boundary(DistanceType::Dot, 2, 0.055, 144, 432)]
     #[case::dot_top10_upper_boundary(DistanceType::Dot, 10, 0.055, 144, 432)]
     #[case::dot_top100_lower_boundary(DistanceType::Dot, 11, 0.0625, 200, 768)]
     #[case::dot_top100(DistanceType::Dot, 100, 0.0625, 200, 768)]
+    #[case::dot_top200_lower_boundary(DistanceType::Dot, 101, 0.0675, 211, 833)]
+    #[case::dot_top200(DistanceType::Dot, 200, 0.0675, 211, 833)]
+    #[case::dot_top500_lower_boundary(DistanceType::Dot, 201, 0.07, 244, 971)]
+    #[case::dot_top500(DistanceType::Dot, 500, 0.07, 244, 971)]
+    #[case::dot_top1000_lower_boundary(DistanceType::Dot, 501, 0.0725, 279, 1092)]
+    #[case::dot_top1000(DistanceType::Dot, 1000, 0.0725, 279, 1092)]
+    #[case::dot_top10000_lower_boundary(DistanceType::Dot, 1001, 0.0825, 517, 1824)]
+    #[case::dot_top10000(DistanceType::Dot, 10_000, 0.0825, 517, 1824)]
+    #[case::dot_top100000_lower_boundary(DistanceType::Dot, 10_001, 0.21, 1009, 2528)]
+    #[case::dot_top100000(DistanceType::Dot, 100_000, 0.21, 1009, 2528)]
     fn test_auto_probe_metric_profiles(
         #[case] metric: DistanceType,
         #[case] k: usize,
@@ -464,7 +854,7 @@ mod tests {
     #[rstest]
     fn test_dot_gap_preserves_positive_query_scaling(
         #[values(0.125, 1.0, 8.0)] scale: f32,
-        #[values(1, 10, 100)] k: usize,
+        #[values(1, 10, 100, 101, 200, 500, 1000)] k: usize,
     ) {
         let distances = [4.0, 2.0, 1.0, -1.0].map(|inner_product| 1.0 - scale * inner_product);
         let mut query = query();

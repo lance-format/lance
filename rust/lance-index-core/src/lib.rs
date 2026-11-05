@@ -43,6 +43,13 @@ pub trait Index: Send + Sync + DeepSizeOf {
 }
 
 /// Index Type
+///
+/// Do not add further entries to this enum except as a last resort.  We are attempting
+/// to move away from using hard-coded enums to represent index types and instead use
+/// index plugins.
+///
+/// For example, if you need to decide if some index needs capability X then add a
+/// has_capability_x method to one of the index plugin traits.
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf, Serialize, Deserialize)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
@@ -82,6 +89,7 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
+    IvfHnswRq = 108,
 }
 
 impl std::fmt::Display for IndexType {
@@ -106,6 +114,7 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
             Self::IvfRq => write!(f, "IVF_RQ"),
+            Self::IvfHnswRq => write!(f, "IVF_HNSW_RQ"),
         }
     }
 }
@@ -136,6 +145,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
             v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
+            v if v == Self::IvfHnswRq as i32 => Ok(Self::IvfHnswRq),
             _ => Err(Error::invalid_input_source(
                 format!("the input value {} is not a valid IndexType", value).into(),
             )),
@@ -166,6 +176,7 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(Self::IvfHnswRq),
             "FragmentReuse" => Ok(Self::FragmentReuse),
             "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(format!(
@@ -205,6 +216,7 @@ impl IndexType {
                 | Self::IvfFlat
                 | Self::IvfSq
                 | Self::IvfRq
+                | Self::IvfHnswRq
         )
     }
 
@@ -247,6 +259,9 @@ impl IndexType {
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
             Self::IvfRq => 2,
+            // Released readers accept vector versions up to 2 and cannot tell
+            // subtypes apart, so 3 makes them skip IVF_HNSW_RQ.
+            Self::IvfHnswRq => 3,
         }
     }
 
@@ -266,6 +281,7 @@ impl IndexType {
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
+            Self::IvfHnswRq => 1 << 20,
             _ => 8192,
         }
     }
@@ -281,6 +297,7 @@ impl IndexType {
             Self::IvfHnswPq,
             Self::IvfHnswFlat,
             Self::IvfRq,
+            Self::IvfHnswRq,
         ]
         .into_iter()
         .map(|index_type| index_type.version() as u32)
@@ -310,7 +327,8 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat
-            | Self::IvfRq => url.ends_with("VectorIndexDetails"),
+            | Self::IvfRq
+            | Self::IvfHnswRq => url.ends_with("VectorIndexDetails"),
         }
     }
 }

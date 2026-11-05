@@ -21,6 +21,8 @@ on:
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
+      - ci/check_advisory_ignores.py
+      - ci/arrow_upgrade.py
 
 permissions:
   contents: read
@@ -47,6 +49,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  protobuf:
+    name: Check protobuf sources and build without protoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROTOC: /protoc-must-not-be-used
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          components: rustfmt, clippy
+      - name: Check generator formatting
+        run: cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check generator lints
+        run: cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
+      - name: Check generated sources
+        run: cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check Lance without protoc
+        run: cargo check --locked -p lance
+
   package:
     name: Check crates are publishable
     runs-on: ubuntu-24.04
@@ -57,14 +79,11 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Keep the excludes in sync with
-      # .github/workflows/cargo-publish.yml.
+      # which the other jobs already cover. Package the Arrow-versioned helper
+      # crates too even though releases publish them separately.
       - name: Package crates
         run: |
-          cargo package --workspace --no-verify \
-            --exclude lance-arrow-stats \
-            --exclude lance-arrow-scalar \
-            --all-features
+          cargo package --workspace --no-verify --all-features
 
   rustdoc:
     runs-on: ubuntu-24.04
@@ -96,6 +115,12 @@ jobs:
           echo "ALL_FEATURES=${ALL_FEATURES}" >> $GITHUB_ENV
       - name: Clippy
         run: cargo clippy --profile ci --locked --features ${{ env.ALL_FEATURES }} --all-targets -- -D warnings
+      # The Arrow ordering fixtures in `lance` are `test = false`, which
+      # `--all-targets` skips (and a named `--test` is ignored next to
+      # `--tests`), so lint them in their own invocation. `--workspace` keeps
+      # feature unification identical to the step above.
+      - name: Clippy (Arrow ordering fixtures)
+        run: cargo clippy --profile ci --locked --workspace --features ${{ env.ALL_FEATURES }} --test arrow_ordering -- -D warnings
 
   cargo-deny:
     name: Check Rust dependencies (cargo-deny)
@@ -110,6 +135,139 @@ jobs:
       # fetched. The script falls back to the network when that misses.
       - name: Check dependency age
         run: python3 ci/check_dependency_age.py
+      # Fails if an ignore in deny.toml has no `expires` or `no fix` marker, or
+      # its expires date has passed. It runs even if a step above failed, so
+      # one CI run reports every problem.
+      - name: Check advisory ignores
+        if: ${{ !cancelled() }}
+        run: python3 ci/check_advisory_ignores.py
+
+  arrow-ordering-detect:
+    # Lance inherits its comparison semantics from Arrow, DataFusion and `half`.
+    # The ordering fixtures are excluded from the default test run (`test =
+    # false` in rust/lance/Cargo.toml) and run only from the
+    # `arrow-ordering-compat` job below, which this small job gates: it fires
+    # when a PR changes one of those versions in Cargo.lock, or touches the
+    # fixtures, these jobs, the detector, or the Lance crates the fixtures
+    # exercise, so edits to the check itself are verified too.
+    name: Detect Arrow ordering-relevant changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+      base_sha: ${{ steps.detect.outputs.base_sha }}
+    env:
+      FIXTURE: rust/lance/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Depth 2 keeps both parents of the PR's merge commit; a depth-1
+          # checkout hides them, so `HEAD^1` cannot resolve.
+          fetch-depth: 2
+      - name: Detect dependency or fixture changes
+        id: detect
+        run: |
+          # The checkout is the PR's merge commit, whose first parent is the base
+          # branch as merged. The event payload's base SHA goes stale on a re-run
+          # after the base branch moved, so the parent is the reference used.
+          # `--verify -q` prints nothing on failure, so the fallback value is
+          # never mixed with an unresolved expression.
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+            base_sha=$(git rev-parse --verify -q HEAD^1)
+          else
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags --depth=1 origin "$base_sha"
+          git show "$base_sha:Cargo.lock" > "$RUNNER_TEMP/base.Cargo.lock"
+          python3 ci/arrow_upgrade.py "$RUNNER_TEMP/base.Cargo.lock" Cargo.lock
+          # Changes to the check itself, or to the Lance crates it exercises,
+          # also run the fixtures so the check is never merged untested.
+          self_changed=$(git diff --name-only "$base_sha" HEAD -- \
+            rust/lance/tests/arrow_ordering.rs rust/lance/Cargo.toml ci/arrow_upgrade.py .github/workflows/rust.yml \
+            rust/arrow-scalar rust/arrow-stats)
+          if [ -n "$self_changed" ]; then
+            echo "fixtures or the paths they exercise changed:"
+            echo "$self_changed"
+          fi
+          if [ -n "$self_changed" ] || grep -q '^changed=true$' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  arrow-ordering-compat:
+    # The fixtures *from the base branch* run first, so an upgrade cannot pass
+    # by refreshing the expectations in the same PR; a reviewed change is
+    # admitted with the `arrow-ordering-reviewed` label, read live so a re-run
+    # after labelling sees it. The PR's own copy runs after.
+    name: Arrow ordering compatibility
+    needs: arrow-ordering-detect
+    if: needs.arrow-ordering-detect.outputs.run == 'true'
+    runs-on: "ubuntu-24.04-8x"
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      CC: clang
+      CXX: clang++
+      # No `-D warnings` here: this job builds with default features, under
+      # which feature-gated code warns as dead, and a dependency bump may
+      # deprecate an API the base fixtures use. The clippy job enforces
+      # warnings; this job's only question is whether the ordering changed.
+      BASE_SHA: ${{ needs.arrow-ordering-detect.outputs.base_sha }}
+      FIXTURE: rust/lance/tests/arrow_ordering.rs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Run base-branch fixtures against the upgraded dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # The base branch's expectations are the contract under test.
+          if ! git cat-file -e "$BASE_SHA:$FIXTURE" 2>/dev/null; then
+            echo "::notice::No ordering fixtures on the base branch; only the PR's copy is checked."
+            exit 0
+          fi
+          git show "$BASE_SHA:$FIXTURE" > "$FIXTURE"
+          # Labels are read live rather than from the event payload so that a
+          # re-run after labelling admits the change.
+          reviewed=false
+          if gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels -q '.labels[].name' | grep -qx 'arrow-ordering-reviewed'; then
+            reviewed=true
+          fi
+          # A compile failure means the upgrade renamed an API the fixtures use;
+          # that is a port, not an ordering finding, and is reported as such.
+          if ! cargo test --profile ci --locked -p lance --test arrow_ordering --no-run; then
+            if [ "$reviewed" = "true" ]; then
+              echo "::warning::Base-branch fixtures do not compile against the upgraded dependencies; admitted by the arrow-ordering-reviewed label. Only the PR's copy is checked."
+              exit 0
+            fi
+            echo "::error::Base-branch fixtures do not compile against the upgraded dependencies, so the ordering contract could not be checked. Port the fixture file without changing expectations, review the release notes in the job summary, then apply the arrow-ordering-reviewed label."
+            exit 1
+          fi
+          if cargo test --profile ci --locked -p lance --test arrow_ordering; then
+            exit 0
+          fi
+          if [ "$reviewed" = "true" ]; then
+            echo "::warning::Arrow ordering changed; admitted by the arrow-ordering-reviewed label."
+            exit 0
+          fi
+          echo "::error::Arrow ordering changed against the base-branch fixtures. Review the release notes in the job summary, record the affected Lance paths and any persisted-structure handling in the PR, then apply the arrow-ordering-reviewed label."
+          exit 1
+      - name: Run the PR's fixtures against the upgraded dependencies
+        run: |
+          git checkout -- "$FIXTURE"
+          cargo test --profile ci --locked -p lance --test arrow_ordering
 
   linux-build:
     runs-on: "ubuntu-24.04-8x"
@@ -207,8 +365,11 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: warp-macos-14-arm64-6x
-    timeout-minutes: 45
+    # Standard macOS runners are free for public repos; Warp runners are billed.
+    # Only lance-io is tested here to keep PR feedback fast on 3 cores. The full
+    # workspace runs nightly in nightly_run.yml.
+    runs-on: macos-14
+    timeout-minutes: 60
     strategy:
       matrix:
         toolchain:
@@ -233,19 +394,17 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      # macOS runner capacity is the scarcest in CI, so this job is kept as short
-      # as it can be. nextest runs each test in its own process and schedules
-      # across all cores, rather than one test binary at a time. Benchmarks are
-      # only compile-checked here, which build-no-lock already does on Linux;
-      # nothing about bench compilation is macOS-specific.
       - name: Build tests
-        run: |
-          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
       - name: Run tests
-        run: |
-          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
+        run: cargo nextest run --cargo-profile ci -p lance-io
   windows-build:
-    runs-on: windows-latest-4x
+    # Standard Windows runners are free for public repos; the larger ones are
+    # billed at a high per-minute rate. To keep PR feedback reasonably fast on
+    # 4 cores, only lance-io (local filesystem, paths, object store) is tested
+    # here. The full workspace runs nightly in nightly_run.yml.
+    runs-on: windows-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: rust
@@ -265,25 +424,54 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      # Same reasoning as mac-build: nextest schedules across all cores instead
-      # of running one test binary at a time, and build-no-lock already
-      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo nextest run --cargo-profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
       - name: Run tests
-        run: cargo nextest run --cargo-profile ci
+        run: cargo nextest run --cargo-profile ci -p lance-io
+  windows-arm-build:
+    # Same scope as windows-build: lance-io on PRs, full suite nightly.
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci -p lance-io
 
   qemu-pre-haswell:
-    # Verifies that lance-linalg's runtime SIMD dispatch still works
-    # correctly when the binary is built with the lower x86-64-v2 baseline
-    # (the legacy build path documented in CONTRIBUTING.md). Emulates a
-    # Nehalem CPU under qemu-user; catches any accidental AVX2/FMA
-    # instructions that leak past the runtime dispatch.
+    # Builds lance-linalg's lib tests once in release mode and runs them twice: on
+    # the runner's own CPU, and under qemu emulating a Nehalem.
     #
-    # The published-wheel default baseline (`target-cpu=haswell`) is set in
-    # `.cargo/config.toml`; this job overrides RUSTFLAGS for one job to
-    # exercise the legacy path without affecting any other build.
-    name: pre-Haswell SIGILL check (qemu Nehalem)
+    # Release mode, not the `ci` profile the other test jobs use: `ci` inherits
+    # `dev`, so the Rust there compiles at opt-level 0.
+    #
+    # The qemu run is the pre-Haswell check: it verifies that runtime SIMD
+    # dispatch still works when the binary is built with the lower x86-64-v2
+    # baseline (the legacy build path documented in CONTRIBUTING.md), and catches
+    # any accidental AVX2/FMA instructions that leak past the dispatch. A Nehalem
+    # fails every feature gate, so that run takes the fallback arms; the native
+    # run is there to reach the SIMD arms a Nehalem cannot.
+    #
+    # `test_x86_runtime_feature_report` writes the features each run detected to
+    # stderr. Both runs use default features, so `fp16kernels` is off.
+    #
+    # The x86_64-linux baseline (`target-cpu=haswell`) comes from
+    # `.cargo/config.toml`; this job overrides RUSTFLAGS to exercise the legacy
+    # path, which affects only this job.
+    name: lance-linalg release tests (native + qemu Nehalem)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -308,6 +496,18 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
         with:
           tool: protoc
+      # Ordered before the QEMU build so a failure there cannot skip the native
+      # run: a step runs only if the ones before it succeeded.
+      - name: Build lance-linalg lib tests in release mode
+        run: |
+          cargo test --release -p lance-linalg --lib --no-run
+      # `env` is a no-op runner: it overrides the job-level qemu runner for this
+      # step, so the binary built above runs on the runner's own CPU.
+      - name: Run lance-linalg lib tests on the runner's own CPU
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: env
+        run: |
+          cargo test --release -p lance-linalg --lib
       - name: Install QEMU build dependencies
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
@@ -357,9 +557,6 @@ jobs:
             echo "Expected QEMU 8.2.10, got: ${QEMU_VERSION_OUTPUT}" >&2
             exit 1
           fi
-      - name: Build lance-linalg lib tests in release mode
-        run: |
-          cargo test --release -p lance-linalg --lib --no-run
       - name: Run lance-linalg lib tests under qemu Nehalem
         run: |
           cargo test --release -p lance-linalg --lib
@@ -370,7 +567,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.91.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.95.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang

@@ -5,12 +5,19 @@
 //! document views, index and flat-scan corpora, and the exact reference scans
 //! the tests compare against.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream;
 use lance_core::Result;
 use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::error::DataFusionResult;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;
@@ -27,13 +34,82 @@ use super::super::index::{
     PostingListBuilder, PostingTailCodec, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
 };
 use super::super::query::{FtsSearchParams, Operator, Tokens};
+use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::super::tokenizer::document_tokenizer::DocType;
 use super::super::tokenizer::{InvertedIndexParams, LEGACY_BLOCK_SIZE};
-use super::{CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search};
+use super::cursor::{CombinedTermPostings, MaterializedTerm};
+use super::maxscore::{MaxscoreStats, combined_maxscore};
+use super::{
+    CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
+};
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexStore, RowIdRemapper};
+
+pub(super) fn term(idf: f32, entries: &[(u64, f32)]) -> MaterializedTerm {
+    let mut postings = entries.to_vec();
+    postings.sort_unstable_by_key(|(row_id, _)| *row_id);
+    MaterializedTerm::new(CombinedTermPostings { idf, postings })
+}
+
+// A varying blended length so scores are not all equal.
+pub(super) fn dl_of(row_id: u64) -> f32 {
+    3.0 + (row_id % 4) as f32
+}
+
+/// Exhaustive reference: score every row in the union of the postings (only
+/// rows holding every term for AND) and return the top `limit` scores,
+/// descending.
+pub(super) fn exact_topk_scores(
+    cursors: &[MaterializedTerm],
+    dl_prime: impl Fn(u64) -> f32,
+    limit: usize,
+    require_all_terms: bool,
+    scorer: &CombinedFieldsBM25Scorer,
+) -> Vec<f32> {
+    let union: BTreeSet<u64> = cursors
+        .iter()
+        .flat_map(|t| t.postings.postings.iter().map(|(row_id, _)| *row_id))
+        .collect();
+    let mut scores: Vec<f32> = union
+        .into_iter()
+        .filter_map(|row_id| {
+            let dl = dl_prime(row_id);
+            let mut score = 0.0f32;
+            let mut missing = false;
+            for t in cursors {
+                let tf = t.postings.tf_prime(row_id);
+                if tf <= 0.0 {
+                    missing = true;
+                    continue;
+                }
+                score += t.postings.idf * scorer.doc_weight(tf, dl);
+            }
+            (!(require_all_terms && missing)).then_some(score)
+        })
+        .collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    scores.truncate(limit);
+    scores
+}
+
+pub(super) fn maxscore_scores(
+    cursors: &mut [MaterializedTerm],
+    dl_prime: impl Fn(u64) -> f32,
+    limit: usize,
+    require_all_terms: bool,
+    scorer: &CombinedFieldsBM25Scorer,
+) -> (Vec<f32>, MaxscoreStats) {
+    let (top, stats) = combined_maxscore(cursors, dl_prime, limit, require_all_terms, scorer);
+    let mut scores: Vec<f32> = top.into_iter().map(|Reverse(doc)| doc.score.0).collect();
+    scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    (scores, stats)
+}
+
+pub(super) fn test_scorer() -> CombinedFieldsBM25Scorer {
+    CombinedFieldsBM25Scorer::new(1000, 5.0, HashMap::new())
+}
 
 pub(super) fn compressed_list(postings: &[(u32, u32)]) -> CompressedPostingList {
     let doc_ids: Vec<u32> = postings.iter().map(|(d, _)| *d).collect();
@@ -135,6 +211,71 @@ pub(super) async fn modern_identity_docs(
     .unwrap()
 }
 
+/// `_rowid` plus one `Utf8` document column per entry of `docs`
+/// (`docs[column][row]`), delivered as `num_batches` equal batches.
+pub(super) fn flat_input(
+    row_ids: &[u64],
+    docs: &[Vec<Option<&str>>],
+    num_batches: usize,
+) -> SendableRecordBatchStream {
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+
+    let mut fields = vec![lance_core::ROW_ID_FIELD.clone()];
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(row_ids.to_vec()))];
+    for (slot, column) in docs.iter().enumerate() {
+        fields.push(Field::new(format!("doc{slot}"), DataType::Utf8, true));
+        arrays.push(Arc::new(StringArray::from(column.clone())));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    // No rows means no batches at all, the way an empty scan arrives.
+    let rows_per_batch = row_ids.len().div_ceil(num_batches.max(1));
+    let batches = (0..row_ids.len().div_ceil(rows_per_batch.max(1)))
+        .map(|i| {
+            let start = i * rows_per_batch;
+            let len = (row_ids.len() - start).min(rows_per_batch);
+            DataFusionResult::Ok(batch.slice(start, len))
+        })
+        .collect::<Vec<_>>();
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches)))
+}
+
+pub(super) fn flat_columns(weights: &[f32]) -> Vec<CombinedFieldColumn> {
+    weights
+        .iter()
+        .enumerate()
+        .map(|(slot, weight)| CombinedFieldColumn {
+            column: format!("doc{slot}"),
+            weight: *weight,
+            indices: Vec::new(),
+            stale_rows: None,
+        })
+        .collect()
+}
+
+/// Every `(row_id, score)` the flat scan emits, in emission order, with the
+/// score as raw bits so the comparison is exact.
+pub(super) async fn flat_scores(
+    stream: SendableRecordBatchStream,
+) -> (Vec<usize>, Vec<(u64, u32)>) {
+    use futures::TryStreamExt;
+
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let sizes = batches.iter().map(|batch| batch.num_rows()).collect();
+    let scored = batches
+        .iter()
+        .flat_map(|batch| {
+            let row_ids = batch.column(0).as_primitive::<UInt64Type>();
+            let scores = batch.column(1).as_primitive::<Float32Type>();
+            (0..batch.num_rows())
+                .map(|i| (row_ids.value(i), scores.value(i).to_bits()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (sizes, scored)
+}
+
 // Legacy element-per-document corpus statistics.
 //
 // Released V1/V2 indexes indexed every `List<String>` element as its own document,
@@ -184,7 +325,7 @@ pub(super) async fn element_document_index(
     let mut postings: Vec<PostingListBuilder> = vocab
         .iter()
         .map(|token| {
-            builder.tokens.add((*token).to_owned());
+            builder.tokens.get_or_add(token);
             PostingListBuilder::new_with_posting_tail_codec_and_block_size(
                 false,
                 posting_tail_codec,
@@ -270,6 +411,7 @@ pub(super) fn combined_columns(indices: Vec<Arc<InvertedIndex>>) -> Vec<Combined
             column: format!("col{slot}"),
             weight: 1.0,
             indices: vec![index],
+            stale_rows: None,
         })
         .collect()
 }
@@ -284,7 +426,7 @@ pub(super) async fn combined_top_k(
         terms.iter().map(|t| (*t).to_owned()).collect(),
         DocType::Text,
     );
-    let scorer = build_combined_bm25_scorer(columns, &tokens, None)
+    let scorer = build_combined_bm25_scorer(columns, &tokens, CombinedCorpusStats::IndexOnly, None)
         .await
         .unwrap();
     let params = FtsSearchParams::new().with_limit(Some(limit));
