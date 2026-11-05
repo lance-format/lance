@@ -3,20 +3,23 @@
 
 use super::*;
 
-fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
-    let mut request = CreateTableIndexRequest::new("vector".to_string(), "IVF_RQ".to_string());
+fn build_rq_num_bits(index_type: &str, num_bits: Option<i32>) -> Result<u8> {
+    let mut request = CreateTableIndexRequest::new("vector".to_string(), index_type.to_string());
     request.num_bits = num_bits;
 
     let DirectoryIndexParams::Vector {
-        index_type: IndexType::IvfRq,
+        index_type: built,
         params,
     } = DirectoryNamespace::build_index_params(&request)?
     else {
-        panic!("expected IVF_RQ vector index params");
+        panic!("expected {index_type} vector index params");
     };
-    match params.stages.as_slice() {
-        [StageParams::Ivf(_), StageParams::RQ(rq)] => Ok(rq.num_bits),
-        stages => panic!("expected IVF and RQ stages, got {stages:?}"),
+    // The stage shape decides the index that gets built.
+    assert_eq!(built.to_string(), index_type);
+    assert_eq!(params.index_type(), built);
+    match params.stages.last() {
+        Some(StageParams::RQ(rq)) => Ok(rq.num_bits),
+        stages => panic!("expected an RQ stage, got {stages:?}"),
     }
 }
 
@@ -24,8 +27,12 @@ fn build_ivf_rq_num_bits(num_bits: Option<i32>) -> Result<u8> {
 #[case::omitted(None, 5)]
 #[case::explicit_one(Some(1), 1)]
 #[case::explicit_max(Some(9), 9)]
-fn test_build_index_params_ivf_rq_num_bits(#[case] requested: Option<i32>, #[case] expected: u8) {
-    assert_eq!(build_ivf_rq_num_bits(requested).unwrap(), expected);
+fn test_build_index_params_ivf_rq_num_bits(
+    #[case] requested: Option<i32>,
+    #[case] expected: u8,
+    #[values("IVF_RQ", "IVF_HNSW_RQ")] index_type: &str,
+) {
+    assert_eq!(build_rq_num_bits(index_type, requested).unwrap(), expected);
 }
 
 #[rstest]
@@ -33,15 +40,18 @@ fn test_build_index_params_ivf_rq_num_bits(#[case] requested: Option<i32>, #[cas
 #[case::zero(0)]
 #[case::above_max(10)]
 #[case::conversion_overflow(i32::MAX)]
-fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(#[case] requested: i32) {
-    let error =
-        build_ivf_rq_num_bits(Some(requested)).expect_err("invalid IVF_RQ num_bits should fail");
+fn test_build_index_params_rejects_invalid_ivf_rq_num_bits(
+    #[case] requested: i32,
+    #[values("IVF_RQ", "IVF_HNSW_RQ")] index_type: &str,
+) {
+    let error = build_rq_num_bits(index_type, Some(requested))
+        .expect_err("invalid RQ num_bits should fail");
     let message = error.to_string();
 
     assert_eq!(mutation_error_code(error), ErrorCode::InvalidInput);
     assert!(
         message.contains(&format!(
-            "IVF_RQ num_bits must be in 1..=9, got {requested}"
+            "{index_type} num_bits must be in 1..=9, got {requested}"
         )),
         "unexpected error message: {message}"
     );
