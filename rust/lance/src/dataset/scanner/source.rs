@@ -739,7 +739,9 @@ impl Scanner {
 
         if let Some(ordering) = &self.ordering {
             let projected = projection.to_schema();
-            let sort_column_missing = ordering.iter().any(|column| projected.field(&column.column_name).is_none());
+            let sort_column_missing = ordering
+                .iter()
+                .any(|column| projected.field(&column.column_name).is_none());
             if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
                 // Fetching an unselected sort column later needs a physical row identity.
                 projection.with_row_addr = true;

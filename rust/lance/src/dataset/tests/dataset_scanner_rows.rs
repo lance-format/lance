@@ -1173,9 +1173,17 @@ async fn test_scan_sort(
 
     assert_eq!(batches_by_str[0], sorted_by_str);
 
-    let unprojected_sort = dataset.scan().project(&["int"]).unwrap()
-        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("str".to_string())])).unwrap()
-        .try_into_batch().await.unwrap();
+    let unprojected_sort = dataset
+        .scan()
+        .project(&["int"])
+        .unwrap()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "str".to_string(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
     assert_eq!(unprojected_sort, sorted_by_str.project(&[0]).unwrap());
 
     // Ensure an empty sort vec does not break anything (sorting is disabled)

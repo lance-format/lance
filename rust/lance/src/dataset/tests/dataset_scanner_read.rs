@@ -1508,7 +1508,10 @@ async fn test_limit(
         let actual = scan.limit(Some(0), offset)?.try_into_batch().await?;
         assert_eq!(actual.num_rows(), 0);
         assert_eq!(actual.schema(), expected_schema);
-        assert_eq!(dataset.object_store.io_stats_snapshot().requests.len(), before.requests.len());
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().requests.len(),
+            before.requests.len()
+        );
     }
     Ok(())
 }

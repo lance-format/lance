@@ -454,7 +454,12 @@ impl Scanner {
     fn validate_options(&self) -> Result<()> {
         if let Some(ordering) = &self.ordering {
             for column in ordering {
-                let mut fields = self.dataset.schema().field(&column.column_name).into_iter().collect::<Vec<_>>();
+                let mut fields = self
+                    .dataset
+                    .schema()
+                    .field(&column.column_name)
+                    .into_iter()
+                    .collect::<Vec<_>>();
                 while let Some(field) = fields.pop() {
                     if field.is_blob_v2() && self.blob_handling.returns_description(field) {
                         return Err(Error::invalid_input(format!(
@@ -939,7 +944,10 @@ impl Scanner {
         };
 
         // Load columns needed for filter and ordering
-        let mut pre_filter_projection = self.dataset.empty_projection().with_blob_handling(self.blob_handling.clone());
+        let mut pre_filter_projection = self
+            .dataset
+            .empty_projection()
+            .with_blob_handling(self.blob_handling.clone());
 
         // We may need to take filter columns if we are going to refine
         // an indexed scan.
