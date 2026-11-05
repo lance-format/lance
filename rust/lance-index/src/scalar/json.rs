@@ -1194,7 +1194,13 @@ impl BasicTrainer for JsonIndexPlugin {
                     DataType::from(target_data_type),
                 )
             } else {
-                Self::extract_json_with_type_info(data, path.clone()).await?
+                // Reads until the first value at `path`, holding what it read.
+                progress
+                    .stage_start("infer_json_type", None, "rows")
+                    .await?;
+                let extracted = Self::extract_json_with_type_info(data, path.clone()).await?;
+                progress.stage_complete("infer_json_type").await?;
+                extracted
             };
 
         // Captured before `target_type` is consumed below. Recorded even when it

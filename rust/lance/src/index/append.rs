@@ -785,6 +785,7 @@ async fn rebuild_scalar_segment(
             Some(fragment_ids),
             &update_criteria.data_criteria,
             &index_store,
+            &NoopIndexBuildProgress,
         )
         .await;
     }

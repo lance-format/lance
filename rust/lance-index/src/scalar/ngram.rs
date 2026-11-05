@@ -1883,11 +1883,31 @@ impl NGramIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
+        Self::train_ngram_index_with_progress(
+            batches_source,
+            index_store,
+            &crate::progress::NoopIndexBuildProgress,
+        )
+        .await
+    }
+
+    async fn train_ngram_index_with_progress(
+        batches_source: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        progress: &dyn crate::progress::IndexBuildProgress,
+    ) -> Result<IndexFile> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
 
+        progress.stage_start("tokenize_docs", None, "rows").await?;
         let spill_files = builder.train(batches_source).await?;
+        progress.stage_complete("tokenize_docs").await?;
 
-        builder.write_index(index_store, spill_files, None).await
+        progress
+            .stage_start("write_ngram_index", None, "files")
+            .await?;
+        let file = builder.write_index(index_store, spill_files, None).await?;
+        progress.stage_complete("write_ngram_index").await?;
+        Ok(file)
     }
 }
 
@@ -1916,11 +1936,12 @@ impl BasicTrainer for NGramIndexPlugin {
         index_store: &dyn IndexStore,
         _request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         // `fragment_ids` only scopes the rows scanned into `data`; the builder
         // always writes one canonical file, so a per-fragment build is a segment.
-        let file = Self::train_ngram_index(data, index_store).await?;
+        let file =
+            Self::train_ngram_index_with_progress(data, index_store, progress.as_ref()).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::NGramIndexDetails::default())?,
             index_version: NGRAM_INDEX_VERSION,

@@ -2308,9 +2308,13 @@ impl BasicTrainer for FMIndexPlugin {
         store: &dyn IndexStore,
         _req: Box<dyn TrainingRequest>,
         _fids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
+        progress
+            .stage_start("build_fmindex_partitions", None, "rows")
+            .await?;
         let files = write_partitioned_fmindex_stream(data, store).await?;
+        progress.stage_complete("build_fmindex_partitions").await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {}).unwrap(),
             index_version: FMINDEX_INDEX_VERSION,
