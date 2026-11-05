@@ -48,10 +48,10 @@ use datafusion::{
     execution::context::{SessionConfig, SessionContext},
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
-        ExecutionPlan, PhysicalExpr, SendableRecordBatchStream, display::DisplayableExecutionPlan,
-        joins::SortMergeJoinExec, projection::ProjectionExec, repartition::RepartitionExec,
-        sorts::sort::SortExec, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
-        union::UnionExec,
+        ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, display::DisplayableExecutionPlan,
+        joins::SortMergeJoinExec, projection::ProjectionExec, sorts::sort::SortExec,
+        stream::RecordBatchStreamAdapter, streaming::PartitionStream, union::UnionExec,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
@@ -70,10 +70,10 @@ use lance_core::{
 };
 use lance_datafusion::{
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, analyze_plan,
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan,
         execute_plan_with_session_context, new_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider_with_job_disk_manager,
+    spill::{materialize_stream, spilling_table_provider_with_job_disk_manager},
     utils::StreamingWriteSource,
 };
 use lance_index::IndexCriteria;
@@ -434,11 +434,10 @@ impl MergeInsertJob {
                 .create_plan()
                 .await?;
             let unioned = UnionExec::try_new(vec![target, fallback_data])?;
-            // Enforce only 1 partition.
-            target = Arc::new(RepartitionExec::try_new(
-                unioned,
-                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?);
+            // Enforce only 1 partition. RepartitionExec would take a share of the fair pool
+            // from the target sort, and until DataFusion 56 spilling from two inputs can
+            // deadlock it (apache/datafusion#24883).
+            target = Arc::new(CoalescePartitionsExec::new(unioned));
         }
 
         // We need to prefix the fields in the target with target_ so that we don't have any duplicate
@@ -507,7 +506,22 @@ impl MergeInsertJob {
         }
         let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
         let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
-        let source_input = Arc::new(SortExec::new(source_ordering, source_input));
+        // A sort spilled to several runs keeps a merge reservation until its output is read,
+        // and that reservation grows with the number of runs, up to the whole pool. Finish
+        // the source sort first, so that each sort has the pool to itself.
+        let sorted_source = execute_plan_with_session_context(
+            Arc::new(SortExec::new(source_ordering, source_input)),
+            execution_options.clone(),
+            session_ctx,
+        )?;
+        let (sorted_source, _) = materialize_stream(
+            sorted_source,
+            session_ctx.runtime_env(),
+            execution_options.mem_pool_size() as usize / 8,
+            "materializing sorted merge insert source",
+        )
+        .await?;
+        let source_input = Arc::new(OneShotExec::new(sorted_source));
         let target = Arc::new(SortExec::new(target_ordering, target));
         let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
             source_input,

@@ -150,6 +150,10 @@ reqwest = { workspace = true, features = ["rustls"] }
 name = "arrow_ordering"
 test = false
 
+[[test]]
+name = "memory_metrics"
+required-features = ["metrics"]
+
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
@@ -169,7 +173,7 @@ tencent = ["lance-io/tencent"]
 goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
-# Publish object store metrics via the `metrics` crate.
+# Publish object store and memory metrics via the `metrics` crate.
 metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
@@ -223,6 +227,10 @@ harness = false
 
 [[bench]]
 name = "count_pushdown"
+harness = false
+
+[[bench]]
+name = "list_structure"
 harness = false
 
 [[bench]]
@@ -360,6 +368,10 @@ harness = false
 
 [[bench]]
 name = "hamming_ivf_training"
+harness = false
+
+[[bench]]
+name = "cleanup"
 harness = false
 
 [lints]

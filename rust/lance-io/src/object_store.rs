@@ -373,6 +373,18 @@ pub struct ObjectStoreParams {
     #[cfg(feature = "aws")]
     pub aws_credentials: Option<AwsCredentialProvider>,
     pub object_store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    /// The connector that native S3, GCS and Azure stores open their HTTP clients with.
+    ///
+    /// Lance's own HTTP layers (the AIMD throttle and the metrics) wrap it, so it sees every
+    /// attempt object_store's retry loop makes, and the [`ClientOptions`] lance resolved from
+    /// the storage options. `None` is object_store's `ReqwestConnector`.
+    ///
+    /// object_store also opens its credential clients (IMDS, STS web identity, GCP metadata) with
+    /// it, while S3 bucket-region lookup and the GCS external-account token exchange open their
+    /// own clients and bypass it. Stores and AIMD state are shared only between params that hold
+    /// the same `Arc`, so reuse one connector for one bucket.
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    pub http_connector: Option<Arc<dyn object_store::client::HttpConnector>>,
     /// Unified storage options accessor with caching and automatic refresh
     ///
     /// Provides storage options and optionally a dynamic provider for automatic
@@ -397,6 +409,8 @@ impl Default for ObjectStoreParams {
             #[cfg(feature = "aws")]
             aws_credentials: None,
             object_store_wrapper: None,
+            #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+            http_connector: None,
             storage_options_accessor: None,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: None,
@@ -473,10 +487,10 @@ fn parse_scheduler_error_mode(
     value.map_or(Ok(SchedulerErrorMode::BestEffort), |value| value.parse())
 }
 
-fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
+fn allocation_ptr<T: ?Sized>(arc: &Arc<T>) -> *const () {
     // Trait object pointers include vtable metadata, which is not stable across codegen units.
     // Cache identity must follow the Arc allocation instead.
-    Arc::as_ptr(wrapper) as *const ()
+    Arc::as_ptr(arc).cast::<()>()
 }
 
 // We implement hash for caching
@@ -495,7 +509,11 @@ impl std::hash::Hash for ObjectStoreParams {
             Arc::as_ptr(aws_credentials).hash(state);
         }
         if let Some(wrapper) = &self.object_store_wrapper {
-            wrapper_allocation_ptr(wrapper).hash(state);
+            allocation_ptr(wrapper).hash(state);
+        }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if let Some(connector) = &self.http_connector {
+            allocation_ptr(connector).hash(state);
         }
         if let Some(accessor) = &self.storage_options_accessor {
             accessor.accessor_id().hash(state);
@@ -514,6 +532,12 @@ impl PartialEq for ObjectStoreParams {
         if self.aws_credentials.is_some() != other.aws_credentials.is_some() {
             return false;
         }
+        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+        if self.http_connector.as_ref().map(allocation_ptr)
+            != other.http_connector.as_ref().map(allocation_ptr)
+        {
+            return false;
+        }
 
         // For equality, we use pointer comparison for ObjectStore, S3 credentials, wrapper
         // For accessor, we use accessor_id() for semantic equality
@@ -527,14 +551,8 @@ impl PartialEq for ObjectStoreParams {
                     .as_ref()
                     .map(|(store, url)| (Arc::as_ptr(store), url))
             && self.s3_credentials_refresh_offset == other.s3_credentials_refresh_offset
-            && self
-                .object_store_wrapper
-                .as_ref()
-                .map(wrapper_allocation_ptr)
-                == other
-                    .object_store_wrapper
-                    .as_ref()
-                    .map(wrapper_allocation_ptr)
+            && self.object_store_wrapper.as_ref().map(allocation_ptr)
+                == other.object_store_wrapper.as_ref().map(allocation_ptr)
             && self
                 .storage_options_accessor
                 .as_ref()
@@ -915,6 +933,36 @@ impl ObjectStore {
     /// performed on this object store.
     pub fn io_tracker(&self) -> &IOTracker {
         &self.io_tracker
+    }
+
+    /// A cumulative counter named `name` on the `metrics` facade, labelled
+    /// like this store's object store metrics (`base`, and `dataset` in
+    /// dataset mode) so work on the store's data is attributed the way its IO
+    /// is. Unlabelled for a store that is not metered (see `meter_store`); a
+    /// no-op without the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn example(store: &ObjectStore) {
+    /// let counter = store.counter("lance_example_items_total");
+    /// counter.increment(1);
+    /// # }
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn counter(&self, name: &'static str) -> StoreCounter {
+        let labels = self
+            .io_tracker
+            .metrics_base()
+            .map(metrics::store_labels)
+            .unwrap_or_default();
+        StoreCounter(::metrics::counter!(name, labels))
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub fn counter(&self, _name: &'static str) -> StoreCounter {
+        StoreCounter()
     }
 
     /// Get a snapshot of current IO statistics without resetting counters
@@ -2310,6 +2358,32 @@ impl ObjectStore {
     }
 }
 
+/// Wall time of a scan's decode tasks in nanoseconds, summed over tasks and
+/// labelled like the store's object store metrics (`base`, and `dataset` in
+/// dataset mode). Tasks run concurrently, so the counter's rate is the number
+/// of batches decoding at once. Mirrors the scan node's `decode_time` plan
+/// metric, as a cumulative counter a scrape can read while the scan runs.
+pub const METRIC_SCAN_DECODE_TIME: &str = "lance_scan_decode_time_nanoseconds_total";
+/// Time scan partitions spent waiting for their next batch's I/O to be
+/// scheduled, in nanoseconds, labelled like [`METRIC_SCAN_DECODE_TIME`].
+/// Mirrors the scan node's `task_wait_time` plan metric.
+pub const METRIC_SCAN_TASK_WAIT_TIME: &str = "lance_scan_task_wait_time_nanoseconds_total";
+
+/// A cumulative counter on the `metrics` facade carrying a store's labels; see
+/// [`ObjectStore::counter`]. A no-op without the `metrics` feature.
+pub struct StoreCounter(#[cfg(feature = "metrics")] ::metrics::Counter);
+
+impl StoreCounter {
+    /// Add `value` to the counter. This is a no-op without the `metrics`
+    /// feature.
+    pub fn increment(&self, value: u64) {
+        #[cfg(feature = "metrics")]
+        self.0.increment(value);
+        #[cfg(not(feature = "metrics"))]
+        let _ = value;
+    }
+}
+
 /// Wrap `inner` so its operations publish metrics labelled by `store_prefix`,
 /// and label `io_tracker` with the same prefix so the local reads and writes
 /// that bypass `inner` publish under it too.
@@ -2353,6 +2427,27 @@ fn infer_block_size(scheme: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[test]
+    fn test_params_with_different_http_connectors_are_not_shared() {
+        use crate::object_store::test_utils::RecordingConnector;
+        use std::hash::{BuildHasher, RandomState};
+
+        let one: Arc<dyn object_store::client::HttpConnector> =
+            Arc::new(RecordingConnector::default());
+        let other: Arc<dyn object_store::client::HttpConnector> =
+            Arc::new(RecordingConnector::default());
+        let with = |connector: &Arc<dyn object_store::client::HttpConnector>| ObjectStoreParams {
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+        let hasher = RandomState::new();
+        assert_eq!(with(&one), with(&one));
+        assert_eq!(hasher.hash_one(with(&one)), hasher.hash_one(with(&one)));
+        assert_ne!(with(&one), with(&other));
+        assert_ne!(with(&one), ObjectStoreParams::default());
+    }
     use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;
