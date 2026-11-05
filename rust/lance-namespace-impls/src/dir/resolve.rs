@@ -346,15 +346,16 @@ impl DirectoryNamespace {
 
     /// Map lance-core ref errors from branch operations to namespace errors.
     ///
-    /// `RefConflict` is intentionally not handled here: create-time duplicates are rejected by
-    /// the existence pre-check before `create_branch` runs, and delete maps its own `RefConflict`
-    /// (branch still has dependents) inline.
     pub(super) fn map_branch_error(
         err: lance_core::Error,
         branch: &str,
         table_uri: &str,
     ) -> lance_core::Error {
         match err {
+            lance_core::Error::RefConflict { .. } => NamespaceError::TableBranchAlreadyExists {
+                message: format!("branch '{}' for table at '{}'", branch, table_uri),
+            }
+            .into(),
             lance_core::Error::RefNotFound { .. } => NamespaceError::TableBranchNotFound {
                 message: format!("branch '{}' for table at '{}'", branch, table_uri),
             }
@@ -432,6 +433,7 @@ impl DirectoryNamespace {
                     "Too many concurrent writes for {} on table at '{}', please retry later: {}",
                     operation, table_uri, detail
                 ),
+                retry_after: None,
             },
             // Semantic conflicts: a concurrent change is incompatible with this one and retrying
             // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
@@ -825,6 +827,7 @@ impl DirectoryNamespace {
                     message: format!(
                         "Storage request was throttled while resolving table: {detail}"
                     ),
+                    retry_after: None,
                 }
                 .into();
             }

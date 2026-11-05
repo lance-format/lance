@@ -8,18 +8,20 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, IntoIndexSegment,
+        frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        load_all_indices,
+        lifecycle::build_index_metadata_from_segments,
+        loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
+        memory_progress::{ObservedBuild, ObservedOperation, index_type_label},
         scalar::{build_bitmap_index_segment, build_scalar_index},
+        vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -85,6 +87,8 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<Uuid>,
     preprocessed_data: Option<(SendableRecordBatchStream, TrainingCriteria)>,
     progress: Arc<dyn IndexBuildProgress>,
+    /// `None` when the build is part of an operation it would misreport.
+    memory_operation: Option<ObservedOperation>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
@@ -108,6 +112,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_uuid: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
+            memory_operation: Some(ObservedOperation::CreateIndex),
             transaction_properties: None,
         }
     }
@@ -161,6 +166,25 @@ impl<'a> CreateIndexBuilder<'a> {
     pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = p;
         self
+    }
+
+    /// Leaves the build out of memory observation, for a build that is only one
+    /// step of another operation.
+    pub(crate) fn without_memory_observation(mut self) -> Self {
+        self.memory_operation = None;
+        self
+    }
+
+    /// Observes the memory of a build that trains, unless the caller opted out.
+    fn observe_build(&self, train: bool) -> Result<ObservedBuild> {
+        match self.memory_operation {
+            Some(operation) if train => {
+                ObservedBuild::start(self.progress.clone(), operation, || {
+                    index_type_label(self.index_type, self.params)
+                })
+            }
+            _ => Ok(ObservedBuild::unobserved(self.progress.clone())),
+        }
     }
 
     /// Set transaction properties to store with this commit.
@@ -404,6 +428,8 @@ impl<'a> CreateIndexBuilder<'a> {
 
         let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
         let mut output_index_uuid = index_id;
+        let observed = self.observe_build(train)?;
+        let progress = observed.progress();
         let created_index = match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
@@ -466,7 +492,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         column,
                         index_id,
                         fragments,
-                        self.progress.clone(),
+                        progress.clone(),
                     )
                     .await?
                 } else {
@@ -478,7 +504,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         train,
                         self.fragments.clone(),
                         preprocessed_data,
-                        self.progress.clone(),
+                        progress.clone(),
                     )
                     .await?
                 }
@@ -506,7 +532,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
-                    self.progress.clone(),
+                    progress.clone(),
                 )
                 .await?
             }
@@ -525,7 +551,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     train,
                     self.fragments.clone(),
                     None,
-                    self.progress.clone(),
+                    progress.clone(),
                 )
                 .await?
             }
@@ -537,7 +563,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq,
+                | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq,
                 LANCE_VECTOR_INDEX,
             ) => {
                 // Vector index params.
@@ -566,7 +593,7 @@ impl<'a> CreateIndexBuilder<'a> {
                                 vec_params,
                                 fri,
                                 fragments,
-                                self.progress.clone(),
+                                progress.clone(),
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
@@ -580,7 +607,7 @@ impl<'a> CreateIndexBuilder<'a> {
                                 vec_params,
                                 fri,
                                 fragments,
-                                self.progress.clone(),
+                                progress.clone(),
                             ))
                             .await?;
                             (built.files, built.target_partition_size)
@@ -594,7 +621,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             index_id,
                             vec_params,
                             fri,
-                            self.progress.clone(),
+                            progress.clone(),
                         ))
                         .await?;
                         (built.files, built.target_partition_size)
@@ -693,6 +720,7 @@ impl<'a> CreateIndexBuilder<'a> {
         };
         // A generic scalar request only resolves to an implementation here.
         ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
+        observed.finish();
         Ok(index_metadata)
         }
         .boxed()
@@ -735,13 +763,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Fetch the committed index metadata from the dataset.
-        // This ensures we return the version that may have been modified by the commit.
-        let indices = self.dataset.load_indices().await?;
-        indices
-            .iter()
-            .find(|idx| idx.uuid == index_uuid)
-            .cloned()
+        // Rebasing may withdraw all query coverage while keeping the committed
+        // segment's definition for rebuilding. Include that stored metadata.
+        self.dataset
+            .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
+            .await?
             .ok_or_else(|| {
                 Error::internal(format!(
                     "Index with UUID {} not found after commit",
@@ -893,6 +919,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            if let Some(index) = indices.into_iter().next() {
+                return Ok(index);
+            }
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
                     "FM-Index segments for '{}' not found after commit",
@@ -905,6 +937,8 @@ impl<'a> CreateIndexBuilder<'a> {
         let chunk_size = all_fragment_ids.len().div_ceil(num_segments);
 
         let mut segment_metadatas = Vec::with_capacity(num_segments);
+        let observed = self.observe_build(true)?;
+        let progress = observed.progress();
         for chunk in all_fragment_ids.chunks(chunk_size) {
             let fragment_ids = chunk.to_vec();
             let segment_uuid = Uuid::new_v4();
@@ -916,7 +950,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 true,
                 Some(fragment_ids.clone()),
                 None,
-                self.progress.clone(),
+                progress.clone(),
             )
             .await?;
 
@@ -938,6 +972,7 @@ impl<'a> CreateIndexBuilder<'a> {
             ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &segment)?;
             segment_metadatas.push(segment);
         }
+        observed.finish();
 
         // Convert to IndexSegments and build proper transaction metadata
         let segments = segment_metadatas
@@ -972,6 +1007,12 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
+        if let Some(index) = indices.into_iter().next() {
+            return Ok(index);
+        }
+        // A rebase can withdraw all query coverage and leave empty
+        // definitions, which tagged query listings omit.
+        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
         indices.into_iter().next().ok_or_else(|| {
             Error::internal(format!(
                 "FM-Index segments for '{}' not found after commit",
@@ -1018,6 +1059,7 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq
         )
         && params.as_any().is::<VectorIndexParams>()
 }
@@ -1133,7 +1175,7 @@ mod tests {
     mod staged_tagged;
 
     use super::*;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ColumnAlteration, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1154,6 +1196,7 @@ mod tests {
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
         SearchResult, TextQuery, TokenQuery, inverted::tokenizer::InvertedIndexParams,
     };
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -1562,6 +1605,118 @@ mod tests {
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
+    }
+
+    #[rstest]
+    #[case::drop_indexed("drop", "value", true)]
+    #[case::drop_unrelated("drop", "other", false)]
+    #[case::cast_indexed("cast", "value", true)]
+    #[case::cast_unrelated("cast", "other", false)]
+    #[case::rename_indexed("rename", "value", false)]
+    #[tokio::test]
+    async fn test_create_index_after_concurrent_schema_change(
+        #[case] change: &str,
+        #[case] column: &str,
+        #[case] expect_conflict: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            ("value", Int32, [Some(10), None, Some(20)]),
+            ("other", Int32, [Some(100), None, Some(200)])
+        )
+        .unwrap();
+        let reader =
+            RecordBatchIterator::new([Ok(batch.clone()), Ok(batch.clone())], batch.schema());
+        let mut writer = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.get_fragments().len(), 2);
+        let mut concurrent = writer.clone();
+        if change == "drop" {
+            concurrent.drop_columns(&[column]).await.unwrap();
+        } else {
+            let alteration = ColumnAlteration::new(column.to_string());
+            let alteration = match change {
+                "cast" => alteration.cast_to(DataType::Int64),
+                "rename" => alteration.rename("renamed".to_string()),
+                _ => panic!("unknown schema change: {change}"),
+            };
+            concurrent.alter_columns(&[alteration]).await.unwrap();
+        }
+        let schema_version = concurrent.manifest.version;
+        let expected = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
+            .name("value_idx".to_string())
+            .execute()
+            .await;
+        if expect_conflict {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            let operation = if change == "drop" { "Project" } else { "Merge" };
+            assert!(
+                error.to_string().contains(&format!(
+                    "CreateIndex transaction was preempted by concurrent transaction {operation}"
+                )),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+
+        concurrent.checkout_latest().await.unwrap();
+        assert_eq!(
+            concurrent.manifest.version,
+            schema_version + u64::from(!expect_conflict)
+        );
+        let indices = concurrent.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(indices.len(), usize::from(!expect_conflict));
+        let actual = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.num_rows(), 2);
+        if !expect_conflict {
+            let indexed_column = if change == "rename" {
+                "renamed"
+            } else {
+                "value"
+            };
+            let filter = format!("{indexed_column} = 10 OR {indexed_column} IS NULL");
+            let indexed = concurrent
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut scanner = concurrent.scan();
+            scanner.use_scalar_index(false);
+            scanner.filter(&filter).unwrap();
+            assert_eq!(indexed, scanner.try_into_batch().await.unwrap());
+            assert_eq!(indexed.num_rows(), 4);
+        }
     }
 
     #[tokio::test]
@@ -2747,7 +2902,7 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .join(crate::index::INDEX_FILE_NAME);
+                .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
                     .object_store
@@ -4899,8 +5054,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::ivf_rq(IndexType::IvfRq)]
+    #[case::ivf_hnsw_rq(IndexType::IvfHnswRq)]
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version() {
+    async fn test_create_index_ivf_rq_preserves_index_version(#[case] index_type: IndexType) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -4916,18 +5074,26 @@ mod tests {
             );
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+        let params = match index_type {
+            IndexType::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(4),
+                HnswBuildParams::default(),
+                RQBuildParams::new(1),
+            ),
+            _ => VectorIndexParams::ivf_rq(4, 1, DistanceType::L2),
+        };
 
         let committed = dataset
-            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+            .create_index(&["vector"], index_type, None, &params, false)
             .await
             .unwrap();
 
-        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+        assert_eq!(committed.index_version, index_type.version());
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+        assert_eq!(loaded[0].index_version, index_type.version());
     }
 
     #[tokio::test]

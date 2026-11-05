@@ -18,7 +18,8 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{
-    Dataset, Error, Result, dataset::index::LanceIndexStoreExt, index::DatasetIndexInternalExt,
+    Dataset, Error, Result, dataset::index::LanceIndexStoreExt,
+    index::loading::DatasetIndexInternalExt,
 };
 
 async fn collect_ngram_segment_stores(

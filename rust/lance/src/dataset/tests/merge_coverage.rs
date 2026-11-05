@@ -37,8 +37,8 @@ use crate::dataset::{
     WriteDestination, WriteParams,
 };
 use crate::index::{
-    DatasetIndexExt, IntoIndexSegment, fresh_fragments, prune_stale_segment_coverage,
-    vector_index_details_default,
+    DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
+    provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
 };
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]

@@ -15,13 +15,12 @@ use super::{
 };
 use crate::dataset::index::dataset_format_version;
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
     index::{
-        INDEX_FILE_NAME, pb,
         prefilter::PreFilter,
         vector::ivf::io::{write_pq_partition_payload, write_pq_partitions},
     },
@@ -71,6 +70,9 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{
+    RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
 use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
@@ -81,14 +83,15 @@ use lance_index::vector::kmeans::{KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
-use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::quantizer::{QuantizationType, QuantizerMetadata as _};
+use lance_index::vector::storage::{STORAGE_METADATA_KEY, VectorStore};
 use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
-    INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata, IndexType,
-    MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
+    INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, Index, IndexMetadata,
+    IndexType, MAX_PARTITION_SIZE_FACTOR, MIN_PARTITION_SIZE_PERCENT,
     optimize::OptimizeOptions,
+    pb,
     vector::{
         Query, VectorIndex,
         hnsw::{HNSW, HNSWIndex, builder::HnswBuildParams},
@@ -1061,6 +1064,27 @@ pub(crate) async fn optimize_vector_indices_v2(
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
+        // IVF_HNSW_RQ
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
@@ -2847,7 +2871,7 @@ async fn merge_segments_inner(
         })?;
         fragment_bitmap |= source_fragment_bitmap.clone();
     }
-    let mut index_details = crate::index::vector_index_details_default();
+    let mut index_details = crate::index::vector::details::vector_index_details_default();
     for segment in &segments {
         if let Some(details) = segment.index_details.as_deref() {
             let details = details.clone();
@@ -3290,6 +3314,11 @@ async fn write_hnsw_root_index_from_auxiliary(
     };
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
     let mut partition_index_metadata = Vec::with_capacity(aux_ivf.num_partitions());
+    // Read once: a dense rotation is a large global buffer.
+    let rq_metadata = match index_metadata.index_type.as_str() {
+        "IVF_HNSW_RQ" => Some(read_rq_storage_metadata(aux_reader).await?),
+        _ => None,
+    };
 
     progress
         .stage_start(
@@ -3317,6 +3346,7 @@ async fn write_hnsw_root_index_from_auxiliary(
             aux_reader,
             distance_type,
             hnsw_params,
+            rq_metadata.as_ref().zip(aux_ivf.centroid(partition_id)),
         )
         .await?;
         let index_batch = hnsw.to_batch()?;
@@ -3364,6 +3394,7 @@ async fn build_hnsw_from_storage_batch(
     aux_reader: &V2Reader,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
+    rq: Option<(&RabitQuantizationMetadata, ArrayRef)>,
 ) -> Result<HNSW> {
     match index_type {
         "IVF_HNSW_FLAT" => {
@@ -3398,6 +3429,14 @@ async fn build_hnsw_from_storage_batch(
                 read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
             let storage =
                 ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        "IVF_HNSW_RQ" => {
+            let (metadata, centroid) = rq
+                .ok_or_else(|| Error::index("IVF_HNSW_RQ graph rebuild needs the IVF centroids"))?;
+            let storage =
+                RabitQuantizationStorage::try_from_batch(batch, metadata, distance_type, None)?
+                    .with_centroid(centroid.as_ref())?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         other => Err(Error::index(format!(
@@ -3436,6 +3475,19 @@ async fn read_pq_storage_metadata(reader: &V2Reader) -> Result<ProductQuantizati
             .await?;
         let codebook_tensor: lance_index::pb::Tensor = Message::decode(tensor_bytes)?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
+    }
+    Ok(metadata)
+}
+
+/// An `IVF_HNSW_RQ` auxiliary file's RQ metadata, with the dense rotation loaded.
+async fn read_rq_storage_metadata(reader: &V2Reader) -> Result<RabitQuantizationMetadata> {
+    let mut metadata =
+        read_storage_metadata::<RabitQuantizationMetadata>(reader, RABIT_METADATA_KEY)?;
+    // A dense rotation lives in a global buffer, not in the JSON.
+    if metadata.rotate_mat.is_none()
+        && let Some(position) = metadata.buffer_index()
+    {
+        metadata.parse_buffer(reader.read_global_buffer(position).await?)?;
     }
     Ok(metadata)
 }
@@ -6012,8 +6064,10 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
-    use crate::index::vector_index_details_default;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+    use crate::index::vector::details::vector_index_details_default;
+    use crate::index::{
+        DatasetIndexExt, loading::DatasetIndexInternalExt, vector::VectorIndexParams,
+    };
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
@@ -10393,6 +10447,84 @@ mod tests {
         dataset.prewarm_index("my_idx").await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    /// Count this process's descriptors for index files under `prefix`.
+    ///
+    /// Deleted files still match: their `/proc` link keeps the old path with a
+    /// ` (deleted)` suffix.
+    #[cfg(target_os = "linux")]
+    fn count_open_index_fds(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.starts_with(prefix) && target.contains("_indices")
+            })
+            .count()
+    }
+
+    /// A cached legacy index must not keep a descriptor open for the file it
+    /// was loaded from. Creating indexes in a loop mints a new UUID each time;
+    /// before the fix the session index cache pinned one descriptor per UUID,
+    /// which is what let descriptor counts grow with every optimize/rewrite.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_legacy_index_cache_does_not_pin_file_descriptors() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = DIM as i32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        )]));
+        let vectors = generate_random_array(512 * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        )
+        .version(IndexFileVersion::Legacy)
+        .clone();
+        let query = Float32Array::from_iter_values(repeat_n(0.0, DIM));
+
+        for round in 0..4 {
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("my_idx".to_owned()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Querying opens the index, which caches it for the session.
+            dataset
+                .scan()
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .project(&["_rowid"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let open_fds = count_open_index_fds(test_dir.as_str());
+            assert_eq!(
+                open_fds, 0,
+                "round {round}: cached legacy index pinned {open_fds} descriptors"
+            );
+        }
     }
 
     #[tokio::test]
