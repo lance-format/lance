@@ -126,3 +126,27 @@ impl ::prost::Name for ReferenceBatch {
         "/lance.blob.reference.ReferenceBatch".into()
     }
 }
+/// Capture of one Blob V2 leaf below structs/lists. references is an encoded
+/// ReferenceBatch. indices_ipc contains one Arrow batch and one column preserving
+/// the selected container path, list offsets, and nulls, with uint64 leaves that
+/// index references. Null leaves denote SQL null; other struct fields are omitted.
+/// This execution envelope does not change any persisted descriptor or locator.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NestedReferenceBatch {
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub references: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub indices_ipc: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for NestedReferenceBatch {
+    const NAME: &'static str = "NestedReferenceBatch";
+    const PACKAGE: &'static str = "lance.blob.reference";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.blob.reference.NestedReferenceBatch".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.blob.reference.NestedReferenceBatch".into()
+    }
+}
