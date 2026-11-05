@@ -27,11 +27,11 @@ struct SignedBatch {
 
 fn sign_batch(mut generator: SignatureGenerator, batch: RecordBatch) -> Result<SignedBatch> {
     let row_ids = batch
-        .column_by_name(ROW_ID)
+        .column_by_name(ROW_ADDR)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
         .ok_or_else(|| {
             Error::invalid_input(format!(
-                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ID}"
+                "MinHash LSH training data must contain a non-null UInt64 column {ROW_ADDR}"
             ))
         })?;
     let values = batch.column_by_name(VALUE_COLUMN_NAME).ok_or_else(|| {
@@ -876,7 +876,7 @@ impl MinHashLshIndexBuilder {
     ) -> Result<Vec<IndexFile>> {
         let num_hashes = self.params.num_hashes as usize;
         let num_bands = self.params.num_bands as usize;
-        let schema = signatures_schema(self.params.num_hashes as i32);
+        let schema = signatures_schema(self.params.num_hashes as i32, true);
         let signature_write_rows = rows_per_batch(signature_row_bytes(num_hashes));
         let mut signatures_writer = store
             .new_index_file(SIGNATURES_FILENAME, schema.clone())

@@ -77,7 +77,7 @@ use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_encoding::constants::{
     COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
 };
@@ -105,9 +105,28 @@ use crate::vector::graph::OrderedFloat;
 use crate::{Index, IndexType};
 use crate::{pb, pbold};
 
-/// On-disk format version of the index files. The format is unstable; bump
-/// on any layout change instead of adding compatibility paths.
-pub const MINHASH_LSH_INDEX_VERSION: u32 = 0;
+/// A segment stores physical row addresses (`_rowaddr`) from this format
+/// version onward; a segment persisted before it stores row ids (`_rowid`)
+/// instead and is still read, never written.
+pub const MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
+/// Format version of a segment persisted before the row-address-domain move.
+pub const MINHASH_LSH_ROW_ID_DOMAIN_VERSION: u32 = 0;
+/// On-disk format version of the index files a writer produces. A reader
+/// rejects a segment newer than this; an older one (down to version 0) is
+/// still supported for reading.
+pub const MINHASH_LSH_INDEX_VERSION: u32 = MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION;
+
+/// The format version to stamp a created segment with: the one matching
+/// `results_are_row_addresses`, so remapping or merging new data onto an
+/// existing segment preserves its own domain instead of silently flipping a
+/// row-id-domain segment to address domain (or vice versa).
+fn minhash_lsh_index_version(results_are_row_addresses: bool) -> u32 {
+    if results_are_row_addresses {
+        MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION
+    } else {
+        MINHASH_LSH_ROW_ID_DOMAIN_VERSION
+    }
+}
 /// Version of the signature generation behavior (the token streams of the
 /// tokenizers that ship with Lance, shingle hashing, permutation family, the
 /// 16-bit compression and the band keys); bumped whenever a
@@ -224,9 +243,14 @@ static BANDS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-fn signatures_schema(num_hashes: i32) -> SchemaRef {
+/// The signature file's schema. `row_addr_domain` selects the row-identifier
+/// field's name: `_rowaddr` from [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`]
+/// onward, `_rowid` for a segment persisted before it. A writer always
+/// passes `true`; a reader passes the segment's own parsed format version.
+fn signatures_schema(num_hashes: i32, row_addr_domain: bool) -> SchemaRef {
+    let id_field_name = if row_addr_domain { ROW_ADDR } else { ROW_ID };
     Arc::new(Schema::new(vec![
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(id_field_name, DataType::UInt64, false),
         Field::new(
             SIGNATURE_COL,
             DataType::FixedSizeList(
@@ -708,11 +732,18 @@ impl QuerySignature {
 
 /// One search hit: its Jaccard distance (`1 - estimated Jaccard`) and row id,
 /// ordered by distance and then row id.
+///
+/// The row id is the stored physical row address unless the search
+/// translated it (see [`MinHashLshIndex::search_signature_as_row_ids`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MinHashHit {
     pub distance: OrderedFloat,
     pub row_id: u64,
 }
+
+/// Translates a stored physical row address into the row id a search filters
+/// and reports it by, or `None` when the address has no live row.
+pub type RowAddrToRowId = dyn Fn(u64) -> Option<u64> + Send + Sync;
 
 /// Bounded collection of the `limit` best (smallest distance) hits.
 pub struct TopHits {
@@ -780,7 +811,9 @@ impl MinHashLshTrainingRequest {
     pub fn new(params: MinHashLshIndexParams) -> Self {
         Self {
             params,
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            // MinHash LSH indexes store physical row addresses rather than row
+            // ids, so an FRI can repair them after a rewrite.
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }
