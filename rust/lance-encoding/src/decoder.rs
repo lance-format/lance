@@ -699,6 +699,8 @@ pub struct CoreFieldDecoderStrategy {
     pub validate_data: bool,
     pub decompressor_strategy: Arc<dyn DecompressionStrategy>,
     pub cache_repetition_index: bool,
+    /// Structural properties requested for list field IDs.
+    pub list_structure: Arc<std::collections::BTreeMap<i32, ListReadMode>>,
 }
 
 impl Default for CoreFieldDecoderStrategy {
@@ -707,6 +709,7 @@ impl Default for CoreFieldDecoderStrategy {
             validate_data: false,
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: false,
+            list_structure: Default::default(),
         }
     }
 }
@@ -724,6 +727,7 @@ impl CoreFieldDecoderStrategy {
             validate_data: config.validate_on_decode,
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: config.cache_repetition_index,
+            list_structure: config.list_structure.clone(),
         }
     }
 
@@ -923,16 +927,33 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
+        self.create_structural_field_scheduler_with_mode(field, column_infos, None)
+    }
+
+    fn create_structural_field_scheduler_with_mode(
+        &self,
+        field: &Field,
+        column_infos: &mut ColumnInfoIter,
+        inherited_mode: Option<ListReadMode>,
+    ) -> Result<Box<dyn StructuralFieldScheduler>> {
+        let mode = self
+            .list_structure
+            .get(&field.id)
+            .copied()
+            .or(inherited_mode);
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                column_info.clone(),
-                self.decompressor_strategy.clone(),
-                self.cache_repetition_index,
-                field,
-            )?);
+            let scheduler = Box::new(
+                StructuralPrimitiveFieldScheduler::try_new_lazy(
+                    column_info.clone(),
+                    self.decompressor_strategy.clone(),
+                    self.cache_repetition_index,
+                    field,
+                )?
+                .with_optional_list_read_mode(mode),
+            );
 
             // advance to the next top level column
             column_infos.next_top_level();
@@ -941,15 +962,20 @@ impl CoreFieldDecoderStrategy {
         }
         match &data_type {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() {
+                if field.is_packed_struct()
+                    || (fields.is_empty() && !field.metadata.contains_key("__lance_decoder_root"))
+                {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                        column_info.clone(),
-                        self.decompressor_strategy.clone(),
-                        self.cache_repetition_index,
-                        field,
-                    )?);
+                    let scheduler = Box::new(
+                        StructuralPrimitiveFieldScheduler::try_new_lazy(
+                            column_info.clone(),
+                            self.decompressor_strategy.clone(),
+                            self.cache_repetition_index,
+                            field,
+                        )?
+                        .with_optional_list_read_mode(mode),
+                    );
 
                     // advance to the next top level column
                     column_infos.next_top_level();
@@ -968,12 +994,15 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                            column_info.clone(),
-                            self.decompressor_strategy.clone(),
-                            self.cache_repetition_index,
-                            field,
-                        )?);
+                        let scheduler = Box::new(
+                            StructuralPrimitiveFieldScheduler::try_new_lazy(
+                                column_info.clone(),
+                                self.decompressor_strategy.clone(),
+                                self.cache_repetition_index,
+                                field,
+                            )?
+                            .with_optional_list_read_mode(mode),
+                        );
                         column_infos.next_top_level();
                         return Ok(scheduler);
                     }
@@ -981,8 +1010,11 @@ impl CoreFieldDecoderStrategy {
 
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
-                    let field_scheduler =
-                        self.create_structural_field_scheduler(field, column_infos)?;
+                    let field_scheduler = self.create_structural_field_scheduler_with_mode(
+                        field,
+                        column_infos,
+                        mode.map(|_| ListReadMode::Length),
+                    )?;
                     child_schedulers.push(field_scheduler);
                 }
 
@@ -994,8 +1026,26 @@ impl CoreFieldDecoderStrategy {
             }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_mode = mode.map(|mode| {
+                    if inherited_mode.is_none()
+                        && matches!(
+                            child.data_type(),
+                            DataType::Binary
+                                | DataType::LargeBinary
+                                | DataType::Utf8
+                                | DataType::LargeUtf8
+                        )
+                    {
+                        mode
+                    } else {
+                        ListReadMode::Length
+                    }
+                });
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    child,
+                    column_infos,
+                    child_mode,
+                )?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1003,8 +1053,11 @@ impl CoreFieldDecoderStrategy {
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    child,
+                    column_infos,
+                    mode.map(|_| ListReadMode::Length),
+                )?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
                     *dimension,
@@ -1018,8 +1071,11 @@ impl CoreFieldDecoderStrategy {
                     return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    entries_child,
+                    column_infos,
+                    mode.map(|_| ListReadMode::Length),
+                )?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -2350,9 +2406,26 @@ impl RequestedRows {
     }
 }
 
+/// Which properties of a list a consumer needs, without its element payloads.
+///
+/// Structural reads return empty placeholder values. They may only feed expressions
+/// that use the requested list property; they must never be exposed as stored values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListReadMode {
+    /// Preserve the exact outer list length and validity.
+    Length,
+    /// Preserve outer validity and emptiness; nonempty lengths may become one.
+    NonEmpty,
+}
+
 /// Configuration for decoder behavior
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    /// List field IDs whose consumers need only structural properties.
+    ///
+    /// This is a query-planning contract, not a hint: callers must not consume
+    /// the placeholder element values. Unsupported encodings retain normal reads.
+    pub list_structure: Arc<std::collections::BTreeMap<i32, ListReadMode>>,
     /// Whether to cache repetition indices for better performance.
     ///
     /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
@@ -2385,6 +2458,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
+            list_structure: Default::default(),
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
             inline_scheduling: None,
@@ -3262,6 +3336,10 @@ impl EncodingsIo for RequestBatch {
         stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
     ) -> Option<Arc<dyn EncodingsIo>> {
         self.shared.inner.with_io_stats(stats)
+    }
+
+    fn with_coalesce_gap(&self, gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        self.shared.inner.with_coalesce_gap(gap)
     }
 }
 

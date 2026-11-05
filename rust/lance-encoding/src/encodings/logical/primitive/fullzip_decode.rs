@@ -23,7 +23,7 @@ use crate::compression::{
     DecompressionStrategy, FixedPerValueDecompressor, VariablePerValueDecompressor,
 };
 use crate::data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, VariableWidthBlock};
-use crate::decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder};
+use crate::decoder::{DecodePageTask, DecodedPage, ListReadMode, StructuralPageDecoder};
 use crate::encodings::logical::primitive::fullzip::PerValueDataBlock;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{
@@ -31,10 +31,13 @@ use crate::repdef::{
 };
 use crate::utils::bytepack::ByteUnpacker;
 
+use super::structure::StructuralProjection;
 use super::{
     CachedPageData, NoCachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     StructuralPageScheduler,
 };
+
+mod structure;
 
 #[derive(Debug, Clone, Copy)]
 struct FullZipRepIndexDetails {
@@ -147,6 +150,7 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
+    pub(super) structural_projection: Option<StructuralProjection>,
 }
 
 impl FullZipScheduler {
@@ -282,6 +286,7 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
         })
     }
 
@@ -624,6 +629,9 @@ impl StructuralPageScheduler for FullZipScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
+        if let Some(projection) = &self.structural_projection {
+            return self.schedule_list_structure(ranges, io, projection.clone());
+        }
         if let Some(rep_index) = self.rep_index {
             self.schedule_ranges_rep(ranges, io, rep_index)
         } else {
@@ -1857,6 +1865,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1983,6 +1992,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            structural_projection: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -2108,6 +2118,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            structural_projection: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();

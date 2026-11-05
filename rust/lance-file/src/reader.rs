@@ -515,7 +515,8 @@ pub(crate) struct Footer {
     pub minor_version: u16,
 }
 
-const FOOTER_LEN: usize = 40;
+/// Size in bytes of the current-format file footer, excluding metadata tables.
+pub const FOOTER_LEN: usize = 40;
 
 // Count the V2.1 physical columns required to reconstruct a projected field.
 // This is the same DFS shape consumed by `ColumnInfoIter`: ordinary structural
@@ -725,11 +726,13 @@ impl FileReader {
                 "Invalid format: data file is empty",
             ));
         }
-        let begin = if file_size < scheduler.reader().block_size() as u64 {
-            0
-        } else {
-            file_size - scheduler.reader().block_size() as u64
-        };
+        let read_size = scheduler.metadata_read_size();
+        if read_size < FOOTER_LEN {
+            return Err(Error::invalid_input(format!(
+                "metadata read size {read_size} is smaller than the {FOOTER_LEN}-byte footer"
+            )));
+        }
+        let begin = file_size.saturating_sub(read_size as u64);
         let tail_bytes = scheduler.submit_single(begin..file_size, 0).await?;
         Ok((tail_bytes, file_size))
     }
@@ -2191,6 +2194,13 @@ impl FileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<versions::OpenedFileReader> {
+        let scheduler = if options.decoder_config.list_structure.is_empty() {
+            scheduler
+        } else {
+            scheduler
+                .with_block_size(0)
+                .with_metadata_read_size(FOOTER_LEN)?
+        };
         let metadata = match Self::read_raw_metadata_for_dispatch(&scheduler).await? {
             RawFileMetadataOpen::Legacy {
                 major_version,
@@ -2374,6 +2384,13 @@ impl ProjectedFileReader {
         cache: &LanceCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
+        let scheduler = if options.decoder_config.list_structure.is_empty() {
+            scheduler
+        } else {
+            scheduler
+                .with_block_size(0)
+                .with_metadata_read_size(FOOTER_LEN)?
+        };
         let base_projection = base_projection.ok_or_else(|| {
             Error::invalid_input("ProjectedReader requires an explicit base projection")
         })?;
@@ -2697,7 +2714,274 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fsl_struct_with_list_first_returns_not_supported(
+    async fn test_list_structure_multiple_pages_omit_payload(
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(
+            lance_encoding::decoder::ListReadMode::Length,
+            lance_encoding::decoder::ListReadMode::NonEmpty
+        )]
+        mode: lance_encoding::decoder::ListReadMode,
+    ) {
+        let payloads = (1..=3)
+            .map(|seed| {
+                let mut state = seed * 0x9E37_79B9_u64;
+                (0..4096)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let item = Arc::new(Field::new("item", DataType::LargeBinary, true));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "images",
+            DataType::List(item.clone()),
+            true,
+        )]));
+        let batches = payloads
+            .iter()
+            .map(|payload| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ListArray::new(
+                        item.clone(),
+                        OffsetBuffer::new(vec![0_i32, 1].into()),
+                        Arc::new(arrow_array::LargeBinaryArray::from_iter_values([payload])),
+                        None,
+                    )) as arrow_array::ArrayRef],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fs = FsFixture::default();
+        let written = write_lance_file(
+            RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            &fs,
+            version,
+            FileWriterOptions {
+                data_cache_bytes: Some(1),
+                max_page_bytes: Some(4096),
+                ..Default::default()
+            },
+        )
+        .await;
+        let raw = fs.object_store.read_one_all(&fs.tmp_path).await.unwrap();
+        let payload_ranges = payloads
+            .iter()
+            .map(|payload| {
+                let start = raw
+                    .windows(payload.len())
+                    .position(|bytes| bytes == payload)
+                    .expect("inline uncompressed fixture payload");
+                start as u64..(start + payload.len()) as u64
+            })
+            .collect::<Vec<_>>();
+        fs.object_store.io_stats_incremental();
+        let scheduler = fs
+            .scheduler
+            .open_reader(fs.object_store.open(&fs.tmp_path).await.unwrap().into());
+        let field_id = written.schema.field("images").unwrap().id;
+        let cache = test_cache();
+        let options = FileReaderOptions {
+            decoder_config: DecoderConfig {
+                list_structure: Arc::new(BTreeMap::from([(field_id, mode)])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            options,
+        )
+        .await
+        .unwrap();
+        assert!(
+            reader.metadata().column_infos[0].page_infos.len() >= 2,
+            "must exercise initialization across page gaps"
+        );
+        let batches = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1,
+                2,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        for batch in batches {
+            assert_eq!(batch.column(0).as_list::<i32>().value_length(0), 1);
+        }
+        let stats = fs.object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0);
+        for request in stats.requests {
+            if let Some(range) = request.range {
+                assert!(
+                    !payload_ranges
+                        .iter()
+                        .any(|payload| range.start < payload.end && payload.start < range.end),
+                    "metadata initialization or data read crossed a payload: {range:?}"
+                );
+            } else {
+                assert_eq!(request.method, "head");
+            }
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_list_structure_long_rows(
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] nested_struct: bool,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        // The middle list crosses chunk boundaries. Unique fixed-width payloads
+        // also exercise omission without relying on binary length headers.
+        let mut state = 0x9E37_79B9_u64;
+        let payloads = (0..3000)
+            .map(|_| {
+                (0..32)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let leaf_field = Arc::new(
+            Field::new("item", DataType::FixedSizeBinary(32), false).with_metadata(HashMap::from(
+                [(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    structural_encoding.to_string(),
+                )],
+            )),
+        );
+        let leaf: arrow_array::ArrayRef =
+            Arc::new(arrow_array::FixedSizeBinaryArray::try_from_iter(payloads.iter()).unwrap());
+        let (field, values): (_, arrow_array::ArrayRef) = if nested_struct {
+            let fields: Fields = vec![leaf_field].into();
+            (
+                Arc::new(Field::new("item", DataType::Struct(fields.clone()), false)),
+                Arc::new(arrow_array::StructArray::new(fields, vec![leaf], None)),
+            )
+        } else {
+            (leaf_field, leaf)
+        };
+        let lists = Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i32, 0, 1, 2050, 2050, 2700, 3000].into()),
+            values,
+            Some(NullBuffer::from(vec![false, true, true, true, true, true])),
+        ));
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "items",
+            lists.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![lists]).unwrap();
+        let fs = FsFixture::default();
+        let written = write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let raw = fs.object_store.read_one_all(&fs.tmp_path).await.unwrap();
+        let payload_ranges = [0, 1024, 2999].map(|index| {
+            let start = raw
+                .windows(32)
+                .position(|bytes| bytes == payloads[index])
+                .unwrap();
+            start as u64..(start + 32) as u64
+        });
+        fs.object_store.io_stats_incremental();
+        let scheduler = fs
+            .scheduler
+            .open_reader(fs.object_store.open(&fs.tmp_path).await.unwrap().into());
+        let options = FileReaderOptions {
+            decoder_config: DecoderConfig {
+                list_structure: Arc::new(BTreeMap::from([(
+                    written.schema.field("items").unwrap().id,
+                    lance_encoding::decoder::ListReadMode::Length,
+                )])),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            options,
+        )
+        .await
+        .unwrap();
+        for indices in [vec![0, 2, 3, 5], vec![1, 2, 4]] {
+            let batches = reader
+                .read_stream(
+                    lance_io::ReadBatchParams::Indices(UInt32Array::from(indices.clone())),
+                    1,
+                    2,
+                    FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual = batches
+                .iter()
+                .flat_map(|batch| {
+                    let lists = batch.column(0).as_list::<i32>();
+                    (0..lists.len())
+                        .map(|row| lists.is_valid(row).then(|| lists.value_length(row)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let lengths = [None, Some(1), Some(2049), Some(0), Some(650), Some(300)];
+            assert_eq!(
+                actual,
+                indices
+                    .iter()
+                    .map(|i| lengths[*i as usize])
+                    .collect::<Vec<_>>()
+            );
+        }
+        let stats = fs.object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0);
+        for request in stats.requests {
+            if let Some(range) = request.range {
+                assert!(
+                    !payload_ranges
+                        .iter()
+                        .any(|payload| { range.start < payload.end && payload.start < range.end }),
+                    "selected list read fixed-width payload: {range:?}"
+                );
+            } else {
+                assert_eq!(request.method, "head");
+            }
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fsl_struct_with_list_first_roundtrip(
         #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
         version: ConcreteFileVersion,
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
@@ -2727,7 +3011,7 @@ mod tests {
             )
             .into_reader_rows(RowCount::from(8), BatchCount::from(1));
         let fs = FsFixture::default();
-        write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let written = write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
 
         let file_scheduler = fs
             .scheduler
@@ -2743,7 +3027,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let err = reader
+        let actual = reader
             .read_stream(
                 lance_io::ReadBatchParams::RangeFull,
                 8,
@@ -2752,15 +3036,12 @@ mod tests {
             )
             .await
             .unwrap()
-            .try_next()
+            .try_collect::<Vec<_>>()
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, lance_core::Error::NotSupported { .. }),
-            "expected NotSupported, got: {err}"
-        );
-        assert!(err.to_string().contains("fixed-size-list"));
-        assert!(err.to_string().contains("repetition levels"));
+            .unwrap();
+        let actual = concat_batches(&actual[0].schema(), &actual).unwrap();
+        let expected = concat_batches(&written.data[0].schema(), &written.data).unwrap();
+        assert_eq!(actual.column(0).to_data(), expected.column(0).to_data());
     }
 
     #[rstest::rstest]
