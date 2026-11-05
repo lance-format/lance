@@ -148,12 +148,10 @@ impl QuantizedRefinementCache {
     }
 }
 
-pub(crate) struct QuantizedRefinementKey<'a> {
+pub(crate) struct QuantizedRefinementKey {
     pub identity: InternalCacheKey,
-    pub query: &'a Query,
-    pub metric: DistanceType,
     pub partition_id: usize,
-    pub factor: u32,
+    pub dist_q_c: f32,
 }
 
 fn write_query_vector(builder: &mut KeyBuilder, query: &Query) -> bool {
@@ -206,30 +204,21 @@ fn write_query_vector(builder: &mut KeyBuilder, query: &Query) -> bool {
     true
 }
 
-impl CacheKey for QuantizedRefinementKey<'_> {
-    type ValueType = QuantizedRefinementResult;
-
-    fn key(&self) -> Cow<'_, str> {
+impl QuantizedRefinementKey {
+    /// Bind resolved controls once per segment, after normalization and probe
+    /// policy resolution. Original vector bits are already bound by `identity`;
+    /// centroid distance varies per partition and belongs in `write_key`.
+    pub fn query_identity(
+        identity: InternalCacheKey,
+        query: &Query,
+        metric: DistanceType,
+        factor: u32,
+    ) -> InternalCacheKey {
         let mut builder =
             KeyBuilder::new(CacheNamespace::root(), Self::type_name(), Self::schema());
-        self.write_key(&mut builder);
-        Cow::Owned(format!("{:?}", builder.finish()))
-    }
-
-    fn type_name() -> &'static str {
-        "QuantizedRefinementResult"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.quantized-refinement-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_fixed_bytes(self.identity.as_bytes());
-        builder.write_u64(self.partition_id as u64);
-        builder.write_str(&self.query.column);
-        write_query_vector(builder, self.query);
-        builder.write_str(&self.metric.to_string());
+        builder.write_fixed_bytes(identity.as_bytes());
+        builder.write_str(&query.column);
+        builder.write_str(&metric.to_string());
         // Include every resolved control, including values overridden by this
         // stage, to make changes to the query contract conservatively miss.
         let Query {
@@ -244,13 +233,13 @@ impl CacheKey for QuantizedRefinementKey<'_> {
             metric_type,
             use_index,
             query_parallelism,
-            dist_q_c,
+            dist_q_c: _,
             approx_mode,
             column: _,
             key: _,
-        } = self.query;
+        } = query;
         builder.write_u64(*k as u64);
-        builder.write_u32(self.factor);
+        builder.write_u32(factor);
         builder.write_u64(*minimum_nprobes as u64);
         for value in [
             maximum_nprobes.map(|v| v as u64),
@@ -268,7 +257,6 @@ impl CacheKey for QuantizedRefinementKey<'_> {
             }
         }
         builder.write_u64(search_effort.to_bits());
-        builder.write_u32(dist_q_c.to_bits());
         builder.write_i32(*query_parallelism);
         builder.write_bool(*use_index);
         builder.write_str(&format!("{metric_type:?}"));
@@ -277,6 +265,32 @@ impl CacheKey for QuantizedRefinementKey<'_> {
             ApproxMode::Normal => 1,
             ApproxMode::Accurate => 2,
         });
+        builder.finish()
+    }
+}
+
+impl CacheKey for QuantizedRefinementKey {
+    type ValueType = QuantizedRefinementResult;
+
+    fn key(&self) -> Cow<'_, str> {
+        let mut builder =
+            KeyBuilder::new(CacheNamespace::root(), Self::type_name(), Self::schema());
+        self.write_key(&mut builder);
+        Cow::Owned(format!("{:?}", builder.finish()))
+    }
+
+    fn type_name() -> &'static str {
+        "QuantizedRefinementResult"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.quantized-refinement-key", 2)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.identity.as_bytes());
+        builder.write_u64(self.partition_id as u64);
+        builder.write_u32(self.dist_q_c.to_bits());
     }
 }
 
@@ -739,22 +753,26 @@ mod tests {
         }
     }
 
-    fn refinement_identity() -> InternalCacheKey {
-        KeyBuilder::new(
+    fn refinement_identity(query: &Query) -> InternalCacheKey {
+        let mut builder = KeyBuilder::new(
             CacheNamespace::root(),
             QuantizedRefinementKey::type_name(),
             QuantizedRefinementKey::schema(),
-        )
-        .finish()
+        );
+        assert!(write_query_vector(&mut builder, query));
+        builder.finish()
     }
 
-    fn refinement_key(query: &Query) -> QuantizedRefinementKey<'_> {
+    fn refinement_key(query: &Query) -> QuantizedRefinementKey {
         QuantizedRefinementKey {
-            identity: refinement_identity(),
-            query,
-            metric: DistanceType::L2,
+            identity: QuantizedRefinementKey::query_identity(
+                refinement_identity(query),
+                query,
+                DistanceType::L2,
+                4,
+            ),
             partition_id: 0,
-            factor: 4,
+            dist_q_c: query.dist_q_c,
         }
     }
 
@@ -804,17 +822,61 @@ mod tests {
                 ..refinement_key(&query)
             },
             QuantizedRefinementKey {
-                factor: 5,
+                identity: QuantizedRefinementKey::query_identity(
+                    refinement_identity(&query),
+                    &query,
+                    DistanceType::L2,
+                    5,
+                ),
                 ..refinement_key(&query)
             },
             QuantizedRefinementKey {
-                metric: DistanceType::Dot,
+                identity: QuantizedRefinementKey::query_identity(
+                    refinement_identity(&query),
+                    &query,
+                    DistanceType::Dot,
+                    4,
+                ),
                 ..refinement_key(&query)
             },
         ] {
             assert_ne!(original, key.key());
         }
         assert!(QuantizedRefinementKey::codec().is_none());
+    }
+
+    #[test]
+    fn refinement_query_identity_is_shared_across_partitions() {
+        let query = refinement_query();
+        let first = refinement_key(&query);
+        let mut other_partition = query;
+        other_partition.dist_q_c = -0.0;
+        let second = refinement_key(&other_partition);
+        assert_eq!(first.identity, second.identity);
+        assert_ne!(first.key(), second.key());
+    }
+
+    #[test]
+    fn refinement_query_identity_preserves_original_vectors_after_normalization() {
+        let original = refinement_query();
+        let mut scaled = original.clone();
+        scaled.key = Arc::new(Float32Array::from(vec![0.0, 2.0]));
+        // Both originals normalize to the same vector. They must still trigger
+        // independent candidate discovery under the identical-query contract.
+        let resolved = original.clone();
+        let first = QuantizedRefinementKey::query_identity(
+            refinement_identity(&original),
+            &resolved,
+            DistanceType::Cosine,
+            4,
+        );
+        let second = QuantizedRefinementKey::query_identity(
+            refinement_identity(&scaled),
+            &resolved,
+            DistanceType::Cosine,
+            4,
+        );
+        assert_ne!(first, second);
     }
 
     #[rstest]

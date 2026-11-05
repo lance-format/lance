@@ -2120,13 +2120,11 @@ impl ANNIvfSubIndexExec {
         quantized_refine_factor: Option<u32>,
         result_cache: Option<Arc<QuantizedRefinementCache>>,
     ) -> DataFusionResult<RecordBatch> {
-        let batch = if let (Some(cache), Some(factor)) = (&result_cache, quantized_refine_factor) {
+        let batch = if let (Some(cache), Some(_)) = (&result_cache, quantized_refine_factor) {
             let key = QuantizedRefinementKey {
                 identity: cache.identity,
-                query: &query,
-                metric: index.metric_type(),
                 partition_id: part_id,
-                factor,
+                dist_q_c: query.dist_q_c,
             };
             let result = cache
                 .cache
@@ -2771,11 +2769,17 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         let result_cache = if let Some(options) = cache_options.filter(|_| cache_eligible && raw_index.index_type() == IndexType::IvfRq) {
-                            QuantizedRefinementCache::for_segment(&ds, index_metadata, &query, options).await?.map(Arc::new)
+                            QuantizedRefinementCache::for_segment(&ds, index_metadata, &query, options).await?
                         } else { None };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
                         let policy = AutoProbePolicy::from_env(&query, raw_index.as_ref())?;
                         policy.apply(&mut query, q_c_dists.values(), raw_index.metric_type());
+                        let result_cache = result_cache.zip(quantized_refine_factor).map(|(mut cache, factor)| {
+                            cache.identity = QuantizedRefinementKey::query_identity(
+                                cache.identity, &query, raw_index.metric_type(), factor,
+                            );
+                            Arc::new(cache)
+                        });
 
                         // A segment's index file may still physically contain rows for
                         // fragments that were pruned from its fragment_bitmap (e.g. after an
