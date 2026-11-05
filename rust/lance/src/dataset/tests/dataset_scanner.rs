@@ -6,30 +6,35 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
+use crate::io::exec::fts::FlatMatchFilterExec;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::ExecutionPlan;
 use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
+use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
-use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_array::{Int64Array, UInt32Array, UInt64Array, record_batch};
+use arrow_array::{Decimal128Array, Float32Array, Int32Array, RecordBatch, RecordBatchIterator};
+use arrow_array::{Int64Array, StringArray, UInt32Array, UInt64Array, record_batch};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
+use lance_datafusion::exec::execute_plan;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
-use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
     query::{FtsQuery, MatchQuery, Operator, PhraseQuery},
     tokenizer::InvertedIndexParams,
 };
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
 use lance_index::{IndexType, vector::DIST_COL};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -348,13 +353,18 @@ async fn test_vector_filter_fts_search() {
         approx_mode: Default::default(),
     };
 
+    // Refine the approximate IVF-PQ distances so adjacent vectors have a
+    // deterministic distance order for the strict assertion below.
+    let mut case1_vector_query = vector_query.clone();
+    case1_vector_query.refine_factor = Some(1);
+
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
     let mut scanner = dataset.scan();
     let stream = scanner
         .full_text_search(FullTextSearchQuery::new("text".to_string()))
         .unwrap()
         .prefilter(true)
-        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .filter_query(QueryFilter::Vector(case1_vector_query))
         .unwrap()
         .try_into_stream()
         .await
@@ -659,7 +669,35 @@ async fn test_fts_list_postfilter_vector_search(#[case] is_large_list: bool) {
             post_filter_position < vector_search_position,
             "expected FTS to wrap the vector search as a post-filter, got:\n{plan}"
         );
-        let result = scanner.try_into_batch().await.unwrap();
+        let original = scanner.create_plan().await.unwrap();
+        let original_schema = original.schema();
+        let mut rebuilt_filters = 0;
+        let rebuilt = original
+            .transform_up(|plan| {
+                if let Some(filter) = plan.downcast_ref::<FlatMatchFilterExec>() {
+                    rebuilt_filters += 1;
+                    let filter = FlatMatchFilterExec::try_new(
+                        filter.children()[0].clone(),
+                        filter.dataset().clone(),
+                        filter.query().clone(),
+                        filter.params().clone(),
+                        filter.document_binding(),
+                        filter.preset_segments().map(|segments| segments.to_vec()),
+                    )?;
+                    return Ok(Transformed::yes(Arc::new(filter) as Arc<dyn ExecutionPlan>));
+                }
+                Ok(Transformed::no(plan))
+            })
+            .unwrap()
+            .data;
+        assert_eq!(rebuilt_filters, 1);
+        assert_eq!(rebuilt.schema(), original_schema);
+        let batches: Vec<RecordBatch> = execute_plan(rebuilt, Default::default())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let result = concat_batches(&original_schema, &batches).unwrap();
         let mut ids = result["id"]
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -1114,4 +1152,104 @@ async fn check_results(
         .downcast_ref::<Int32Array>()
         .unwrap();
     assert_eq!(ids.values(), expected_ids);
+}
+
+/// Filter strings compare a decimal column with fractional literals exactly, as
+/// TPC-H Q6 does, and a scalar index on the column answers them. Rows appended
+/// after the index was built are answered by the scan.
+#[tokio::test]
+async fn test_decimal_column_filters_with_fractional_literals() {
+    // Hundredths, NULL on every 7th row
+    let discount = |id: i32| (id % 7 != 0).then_some(i128::from(id % 10));
+    let batch = |ids: std::ops::Range<i32>| {
+        let discounts = Decimal128Array::from_iter(ids.clone().map(discount))
+            .with_precision_and_scale(15, 2)
+            .unwrap();
+        RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
+            ),
+            ("discount", Arc::new(discounts) as ArrayRef),
+            (
+                "quantity",
+                Arc::new(Int32Array::from_iter_values(ids)) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    };
+    let reader = |ids| {
+        let batch = batch(ids);
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema())
+    };
+    let params = WriteParams {
+        max_rows_per_file: 20,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(0..40), "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["discount"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.append(reader(40..60), None).await.unwrap();
+
+    // Whether a row with this discount (in hundredths) and quantity matches
+    type Matches = fn(Option<i128>, i32) -> bool;
+    let cases: [(&str, Matches); 6] = [
+        (
+            "discount BETWEEN 0.05 AND 0.07 AND quantity < 24",
+            |d, q| d.is_some_and(|d| (5..=7).contains(&d)) && q < 24,
+        ),
+        ("discount < 0.055", |d, _| d.is_some_and(|d| d <= 5)),
+        ("discount > 0.055", |d, _| d.is_some_and(|d| d >= 6)),
+        ("discount = 0.055", |_, _| false),
+        ("discount != 0.055", |d, _| d.is_some()),
+        ("discount IN (0.05, 0.070)", |d, _| {
+            d == Some(5) || d == Some(7)
+        }),
+    ];
+    for (filter, predicate) in cases {
+        let expected = (0..60)
+            .filter(|&id| predicate(discount(id), id))
+            .collect::<Vec<_>>();
+        let plan = dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "`{filter}` should use the scalar index, got plan:\n{plan}"
+        );
+        for use_scalar_index in [true, false] {
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["id"])
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .use_scalar_index(use_scalar_index);
+            let batch = scanner.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(ids, expected, "`{filter}`, index: {use_scalar_index}");
+        }
+    }
+
+    // Write predicates take the same literals
+    let deleted = (0..60)
+        .filter(|&id| discount(id).is_some_and(|d| d <= 5))
+        .count();
+    dataset.delete("discount < 0.055").await.unwrap();
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 60 - deleted);
 }

@@ -57,7 +57,7 @@ use crate::Dataset;
 use crate::dataset::CommitBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 
 use super::index::{
@@ -714,7 +714,7 @@ impl DatasetMemWalExt for Dataset {
     async fn mem_wal_index_details(&self) -> Result<Option<MemWalIndexDetails>> {
         // Stored list, not the derived listing: a history this writer cannot decode must
         // not block add_columns.
-        let Some(index_meta) = crate::index::load_all_indices(self)
+        let Some(index_meta) = crate::index::loading::load_all_indices(self)
             .await?
             .iter()
             .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -2030,6 +2030,10 @@ mod tests {
         base.prewarm_mem_wal(std::slice::from_ref(&snapshot), Some(&cache))
             .await
             .expect("prewarm must open the generation and warm its index");
+        let diagnostics = base.session().cache_diagnostics();
+        let warm_activity = &diagnostics.index.activity.warm;
+        assert!(warm_activity.attempts > 0);
+        assert!(warm_activity.loads_succeeded > 0);
 
         // The generation is resident in the cache (same session), with its
         // index loadable — a later lookup that opens this path is a pure hit.

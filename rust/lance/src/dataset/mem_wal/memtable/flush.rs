@@ -937,8 +937,9 @@ async fn build_scalar_index(
     }
     let columns: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
     let params = spec.plugin.flush_params(spec)?;
-    let mut builder =
-        CreateIndexBuilder::new(dataset, &columns, index_type, &params).name(spec.name.clone());
+    let mut builder = CreateIndexBuilder::new(dataset, &columns, index_type, &params)
+        .name(spec.name.clone())
+        .without_memory_observation();
     if let Some(stream) = training_data {
         // Memtable positions are the flushed file's row ids, so no remap.
         builder = builder.preprocessed_stream(stream, spec.plugin.training_criteria());
@@ -2675,7 +2676,7 @@ mod tests {
     #[tokio::test]
     async fn a_scalar_build_uses_the_plugin_flush_params(#[case] deviation: Deviation) {
         use crate::dataset::mem_wal::index::test_plugin::wrapped_with_flush_params;
-        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::btree::BTreeParameters;
         use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};

@@ -70,10 +70,12 @@ pub(crate) mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
+pub mod compaction_stats;
 mod data_file;
 mod data_file_part;
 pub mod deletions;
 pub mod delta;
+pub mod expire;
 pub mod files;
 pub mod fragment;
 pub(crate) mod fragment_slice;
@@ -121,6 +123,7 @@ pub mod update_join_bench;
 mod update_join_options;
 pub mod updater;
 mod utils;
+pub mod version_retention;
 pub(crate) mod versions;
 pub mod write;
 
@@ -142,6 +145,7 @@ use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuil
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
+use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
@@ -156,6 +160,7 @@ pub use blob::{
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
@@ -261,6 +266,8 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub refs: Refs,
+    // Keep the incarnation opened by this handle; the name may later be reused.
+    pub(crate) branch_identifier: Arc<BranchIdentifier>,
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
@@ -638,9 +645,12 @@ impl Dataset {
     /// A concurrent creator that cannot reserve the name returns a conflict without
     /// writing to the branch dataset.
     ///
-    /// If cloning fails or is interrupted, the name remains reserved, since the clone
-    /// commit may have succeeded even if its result is unknown. Use
-    /// [`Self::force_delete_branch`] to clean up the incomplete branch before retrying.
+    /// Destinations with leftover version data are rejected without reserving the name.
+    /// Use [`Self::force_delete_branch`] to explicitly clean up the leftover data before
+    /// retrying. If cloning fails or is interrupted, the name remains reserved: the
+    /// clone may have succeeded, and releasing the reservation cannot atomically
+    /// verify that it still belongs to this attempt. Use [`Self::force_delete_branch`]
+    /// to explicitly remove a failed creation before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
@@ -662,6 +672,21 @@ impl Dataset {
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
+        let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
+        if self.object_store.exists(&branch_file).await? {
+            return Err(Error::RefConflict {
+                message: format!("branch {branch} already exists"),
+            });
+        }
+        let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
+        if has_any_entry(&self.object_store, &versions_path).await? {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Cannot create branch {branch}: {versions_path} contains leftover version data. \
+                     Use force_delete_branch to clean up the unused branch before retrying"
+                ),
+            });
+        }
         let source_location = self
             .branch_location()
             .find_branch(source_branch.as_deref())?;
@@ -679,21 +704,27 @@ impl Dataset {
             .create(branch, version_number, source_branch.as_deref())
             .await?;
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+        CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .execute(transaction)
+            .await
     }
 
     /// Deletes a branch and removes its directory when safe.
     ///
+    /// The ref is removed before directory cleanup. If cleanup fails, this
+    /// returns the cleanup error even though the ref may already be gone. Use
+    /// [`Self::force_delete_branch`] to retry failed cleanup.
+    ///
     /// Legacy branches like `outer/data` may share a directory with another
-    /// branch. Their files are retained, so checkout by name may still work.
+    /// branch. Their files are intentionally retained, but checkout requires a
+    /// live branch ref.
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
     }
@@ -738,6 +769,20 @@ impl Dataset {
         {
             refs::check_valid_branch(branch_name)?;
         }
+        let branch_identifier = self
+            .branches()
+            .get_identifier(standardized_branch.as_deref())
+            .await?;
+        if standardized_branch == self.manifest.branch
+            && self.branch_identifier.as_ref() != &branch_identifier
+        {
+            return Err(Error::RefNotFound {
+                message: format!(
+                    "branch {} was deleted and recreated",
+                    refs::normalize_branch(branch)
+                ),
+            });
+        }
 
         let new_location = self
             .branch_location()
@@ -758,6 +803,7 @@ impl Dataset {
         };
 
         if self.already_checked_out(&manifest_location, standardized_branch.as_deref()) {
+            self.ensure_branch_exists().await?;
             return Ok(self.clone());
         }
 
@@ -782,7 +828,7 @@ impl Dataset {
             )));
         }
 
-        Self::checkout_manifest(
+        let dataset = Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
@@ -794,6 +840,16 @@ impl Dataset {
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
+        .await?;
+        if dataset.branch_identifier.as_ref() != &branch_identifier {
+            return Err(Error::RefNotFound {
+                message: format!(
+                    "branch {} was deleted and recreated during checkout",
+                    refs::normalize_branch(branch)
+                ),
+            });
+        }
+        Ok(dataset)
     }
 
     pub(crate) async fn load_manifest(
@@ -913,7 +969,7 @@ impl Dataset {
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            crate::index::warn_about_unsupported_indices(&indices);
+            crate::index::loading::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
@@ -983,7 +1039,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn checkout_manifest(
+    pub(crate) async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
@@ -1004,6 +1060,11 @@ impl Dataset {
                 branch: manifest.branch.clone(),
             },
         );
+        let branch_identifier = Arc::new(
+            refs.branches()
+                .get_identifier(manifest.branch.as_deref())
+                .await?,
+        );
         let metadata_cache = Arc::new(session.metadata_cache.for_dataset(&uri));
         let index_cache = Arc::new(session.index_cache.for_dataset(&uri));
         let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
@@ -1021,6 +1082,7 @@ impl Dataset {
             commit_handler,
             session,
             refs,
+            branch_identifier,
             fragment_bitmap,
             metadata_cache,
             index_cache,
@@ -1300,10 +1362,20 @@ impl Dataset {
     }
 
     pub async fn branch_identifier(&self) -> Result<BranchIdentifier> {
-        self.refs
-            .branches()
-            .get_identifier(self.manifest.branch.as_deref())
-            .await
+        self.ensure_branch_exists().await?;
+        Ok(self.branch_identifier.as_ref().clone())
+    }
+
+    pub(crate) async fn ensure_branch_exists(&self) -> Result<()> {
+        if let Some(branch) = self.manifest.branch.as_deref() {
+            let current = self.branches().get(branch).await?;
+            if &current.identifier != self.branch_identifier.as_ref() {
+                return Err(Error::RefNotFound {
+                    message: format!("branch {branch} was deleted and recreated"),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Get the full manifest of the dataset version.
@@ -1334,6 +1406,7 @@ impl Dataset {
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
+        self.ensure_branch_exists().await?;
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
@@ -1341,10 +1414,12 @@ impl Dataset {
 
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             ensure_can_read_manifest(&self.manifest)?;
+            self.ensure_branch_exists().await?;
             return Ok((self.manifest.clone(), self.manifest_location.clone()));
         }
         let manifest =
             Self::get_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
+        self.ensure_branch_exists().await?;
         Ok((manifest, location))
     }
 
@@ -2090,7 +2165,7 @@ impl Dataset {
         let mut scan = self.scan();
         scan.with_row_address();
         let batches = scan.try_into_stream().await?;
-        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+        let plan = Arc::new(blob::BlobV2BatchRewritePlan::try_new(
             self.schema(),
             lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
             false,
@@ -2537,6 +2612,34 @@ impl Dataset {
         self.data_file_dir_for_base(data_file.base_id)
     }
 
+    /// Resolve the object store and complete object key of a manifest data file.
+    ///
+    /// Uses the file's registered base when present, including dataset-root bases
+    /// used by shallow clones. Otherwise uses this dataset's `data/` directory.
+    /// This does not read the file, so it also works for missing objects.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn inspect(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.iter_fragments() {
+    ///     for file in &fragment.files {
+    ///         let (store, path) = dataset.resolve_data_file_location(file).await?;
+    ///         let exists = store.exists(&path).await?;
+    /// #       let _ = exists;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resolve_data_file_location(
+        &self,
+        data_file: &DataFile,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        let path = self.data_file_dir(data_file)?.join(data_file.path.as_str());
+        let store = self.object_store_for_data_file(data_file).await?;
+        Ok((store, path))
+    }
+
     /// Create a [`DataFile`] by reading metadata from an existing lance file.
     ///
     /// This reads the file's schema and version information, matches columns to
@@ -2751,7 +2854,7 @@ impl Dataset {
                 .base_paths
                 .get(&id)
                 .ok_or_else(|| {
-                    Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
                 })?
                 .extract_path(self.session.store_registry()),
             None => Ok(self.base.clone()),
@@ -3452,7 +3555,7 @@ impl Dataset {
         // uuids or overlapping coverage are no less corrupt for involving an
         // index this build has no reader for. `migrate_indices` already runs the
         // same overlap check over the complete list on every commit.
-        let indices = crate::index::load_all_indices(self).await?;
+        let indices = crate::index::loading::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())
@@ -3533,9 +3636,9 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them,
-    /// contiguously from `start`, and return the resulting `next_row_id`
-    /// high-water mark.
+    /// Assign a stable row ID sequence to every fragment, contiguously from
+    /// `start`, and return the resulting `next_row_id` high-water mark. Only
+    /// reached when the feature is off, so no fragment has a sequence yet.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
         let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
@@ -3557,9 +3660,14 @@ impl Dataset {
 
     /// Migrate a table to use stable row IDs.
     ///
-    /// Stable row IDs assign a persistent identifier to each row that remains
-    /// stable across compaction operations. This enables more efficient updates
-    /// to secondary indices.
+    /// Afterwards a row keeps the same id for its lifetime: compaction, update
+    /// and merge insert relocate or rewrite the row without changing its id.
+    ///
+    /// Migration assigns a fresh id to every physical row position, in fragment
+    /// order, starting from the dataset's `next_row_id` high-water mark. Before
+    /// migration `_rowid` is a row address, a different namespace from the ids
+    /// assigned here, so a `_rowid` recorded beforehand must not be reused as a
+    /// row id afterwards.
     ///
     /// A single Merge commit assigns row ID sequences to all fragments and
     /// activates the stable row ID feature flag atomically. Because `Merge`
@@ -4059,18 +4167,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
                     cached
                 } else {
-                    let dataset_version = Dataset::checkout_manifest(
-                        dataset.object_store.clone(),
-                        dataset.base.clone(),
-                        dataset.uri.clone(),
-                        manifest_copy.clone(),
-                        location,
-                        dataset.session(),
-                        dataset.commit_handler.clone(),
-                        dataset.file_reader_options.clone(),
-                        dataset.store_params.as_deref().cloned(),
-                        dataset.base_store_params.clone(),
-                    )?;
+                    let mut dataset_version = dataset.clone();
+                    dataset_version.set_manifest(manifest_copy.clone(), location);
                     let loaded =
                         Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
                             Error::internal(format!(
@@ -4090,19 +4188,10 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
 
     let dataset = async move {
         if let Ok((latest_manifest, location)) = latest_rx.await {
-            // If we got the latest manifest, we can checkout the dataset.
-            Dataset::checkout_manifest(
-                dataset.object_store.clone(),
-                dataset.base.clone(),
-                dataset.uri.clone(),
-                latest_manifest,
-                location,
-                dataset.session(),
-                dataset.commit_handler.clone(),
-                dataset.file_reader_options.clone(),
-                dataset.store_params.as_deref().cloned(),
-                dataset.base_store_params.clone(),
-            )
+            // Advancing a retry must preserve the handle's branch incarnation.
+            let mut latest = dataset.clone();
+            latest.set_manifest(latest_manifest, location);
+            Ok(latest)
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
             // with the current manifest.
@@ -4293,14 +4382,20 @@ impl Dataset {
         let index_dir = self.indices_dir().join(index_uuid.to_string());
         match index_type {
             IndexType::Inverted => {
-                // Call merge_index_files function for inverted index
+                let observed = ObservedBuild::start(
+                    progress,
+                    ObservedOperation::MergeIndexMetadata,
+                    || BuiltinIndexType::Inverted.as_str().to_string(),
+                )?;
                 lance_index::scalar::inverted::builder::merge_index_files(
                     self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
-                    progress,
+                    observed.progress(),
                 )
-                .await
+                .await?;
+                observed.finish();
+                Ok(())
             }
             IndexType::BTree => {
                 Err(Error::invalid_input(
@@ -4756,6 +4851,7 @@ pub(crate) async fn write_manifest_file(
         manifest,
         indices.as_deref().unwrap_or_default(),
     )?;
+    lance_table::feature_flags::validate_data_overlay_files(manifest)?;
 
     validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;

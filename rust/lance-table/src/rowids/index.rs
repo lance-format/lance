@@ -13,6 +13,8 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 
+mod batch;
+
 /// Fragments one lookup may have to probe before the merged map is worth its
 /// build, whatever that build costs. A compacted table interleaves its
 /// fragments, and one measured at 46.
@@ -152,12 +154,13 @@ impl RowIdIndex {
         self.probe(row_id)
     }
 
-    /// Get addresses for many row ids in one pass over the index.
+    /// Get addresses for many row ids, preserving input order and duplicates.
     ///
     /// Returns one entry per input id, in input order (`None` for missing).
-    /// Sorts a working copy of the input internally so the chunk iterator
-    /// is advanced at most once per chunk, amortizing the per-id tree walk
-    /// from O(N · log F) to O(F + N).
+    /// Sorts a working copy of the input internally. The merged representation
+    /// advances its chunk iterator at most once per chunk. The probe representation
+    /// prunes the interval tree for the batch and interleaves independent searches
+    /// within unsorted segments; small batches retain individual tree lookups.
     ///
     /// # Errors
     ///
@@ -174,9 +177,12 @@ impl RowIdIndex {
         sorted.sort_unstable_by_key(|&(id, _)| id);
 
         let Some(merged) = &self.merged else {
-            // Sorted ids keep one fragment and its segments warm across the run.
-            for (id, orig_idx) in sorted {
-                out[orig_idx] = self.probe(id)?;
+            if n < batch::LANES {
+                for (id, orig_idx) in sorted {
+                    out[orig_idx] = self.probe(id)?;
+                }
+            } else {
+                self.probe_many(&sorted, &mut out)?;
             }
             return Ok(out);
         };

@@ -38,7 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
-use super::blob::BlobPayloadInventory;
+use super::blob::{BlobPayloadInventory, SidecarRewrite};
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -122,7 +122,7 @@ fn create_current_file_writer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn write_fragments(
+pub(in crate::dataset) async fn write_fragments(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -136,6 +136,7 @@ pub async fn write_fragments(
     inherited_field_ids: bool,
     disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -186,6 +187,7 @@ pub async fn write_fragments(
         preassigned_data_file_name,
         created_blob_payloads,
         disable_dictionary_split,
+        sidecar_rewrite,
     )
     .await?;
     Ok((fragments, schema))
@@ -251,7 +253,7 @@ pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn write_fragments_direct(
+pub(in crate::dataset) async fn write_fragments_direct(
     version: ConcreteFileVersion,
     dataset: Option<&Dataset>,
     object_store: Arc<ObjectStore>,
@@ -265,6 +267,7 @@ pub async fn write_fragments_direct(
     preassigned_data_file_name: Option<Arc<String>>,
     created_blob_payloads: Option<BlobPayloadInventory>,
     disable_dictionary_split: bool,
+    sidecar_rewrite: Option<Arc<SidecarRewrite>>,
 ) -> Result<Vec<Fragment>> {
     validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
@@ -339,8 +342,13 @@ pub async fn write_fragments_direct(
         schema,
         buffered_reader,
         params,
-        move |object_store, schema, base_dir, options| async move {
-            open_writer(version, &object_store, &schema, &base_dir, options).await
+        move |object_store, schema, base_dir, options| {
+            let sidecar_rewrite = sidecar_rewrite.clone();
+            async move {
+                let mut options = options;
+                options.sidecar_rewrite = sidecar_rewrite;
+                open_writer(version, &object_store, &schema, &base_dir, options).await
+            }
         },
         external_base_resolver,
         target_bases_info,
@@ -379,7 +387,8 @@ pub async fn can_use_binary_copy(
             if !binary_copy_files_match(fragments, version)? {
                 return Ok(false);
             }
-            super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
+            super::optimize::execution::can_use_binary_copy_current(dataset, options, fragments)
+                .await
         }
     }
 }

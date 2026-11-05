@@ -3,11 +3,17 @@
 
 from typing import Literal, Optional, TypedDict
 
-# Re-exported from native module. See src/dataset/optimize.rs for implementation.
+# Re-exported from native module. See src/dataset/optimize.rs and
+# src/dataset/optimize_indices.rs for implementation.
 from .lance import Compaction as Compaction
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import CompactionPlan as CompactionPlan
 from .lance import CompactionTask as CompactionTask
+from .lance import IndexSegmentResult as IndexSegmentResult
+from .lance import OptimizeIndexMerge as OptimizeIndexMerge
+from .lance import OptimizeIndexTask as OptimizeIndexTask
+from .lance import OptimizeIndices as OptimizeIndices
+from .lance import OptimizeIndicesPlan as OptimizeIndicesPlan
 from .lance import RewriteResult as RewriteResult
 
 # from .lance import CompactionPlan as CompactionPlan

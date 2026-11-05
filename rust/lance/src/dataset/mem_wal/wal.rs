@@ -659,7 +659,7 @@ pub struct WalFlusher {
     /// Underlying WAL append primitive — owns object store, epoch, and
     /// position discovery.
     wal_appender: Arc<WalAppender>,
-    /// Shard ID (cached for tracing; same as `wal_appender.shard_id()`).
+    /// Shard ID cached for tracing.
     shard_id: Uuid,
     /// Channel to send flush messages.
     flush_tx: Option<mpsc::UnboundedSender<TriggerWalFlush>>,
@@ -766,25 +766,6 @@ impl WalFlusher {
     /// that replay will not reproduce. Recovery is to reopen and replay.
     pub fn check_poisoned(&self) -> Result<()> {
         self.cursors.check_poisoned()
-    }
-
-    /// Get the current durable watermark.
-    pub fn durable_watermark(&self) -> usize {
-        self.cursors.durable()
-    }
-
-    /// Get a watcher for WAL flush completion.
-    ///
-    /// Returns a watcher that resolves when the next WAL flush completes.
-    /// Used by backpressure to wait for WAL flushes when the buffer is full.
-    pub fn wal_flush_watcher(
-        &self,
-    ) -> Option<super::util::WatchableOnceCellReader<super::write::DurabilityResult>> {
-        self.wal_flush_cell
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|cell| cell.reader())
     }
 
     /// Signal that a WAL flush has completed and create a new cell for the next flush.
@@ -986,6 +967,25 @@ impl WalFlusher {
     /// underlying appender.
     pub fn next_wal_entry_position(&self) -> u64 {
         self.wal_appender.next_entry_position_hint()
+    }
+
+    /// Get the current durable watermark.
+    pub fn durable_watermark(&self) -> usize {
+        self.cursors.durable()
+    }
+
+    /// Get a watcher for WAL flush completion.
+    ///
+    /// Returns a watcher that resolves when the next WAL flush completes.
+    /// Used by backpressure to wait for WAL flushes when the buffer is full.
+    pub fn wal_flush_watcher(
+        &self,
+    ) -> Option<super::util::WatchableOnceCellReader<super::write::DurabilityResult>> {
+        self.wal_flush_cell
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|cell| cell.reader())
     }
 
     /// Get the shard ID.

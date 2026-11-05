@@ -49,6 +49,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+  protobuf:
+    name: Check protobuf sources and build without protoc
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PROTOC: /protoc-must-not-be-used
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@a0b538fa0b742a6aa35d6e2c169b4bd06d225a98 # v1
+        with:
+          components: rustfmt, clippy
+      - name: Check generator formatting
+        run: cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check generator lints
+        run: cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
+      - name: Check generated sources
+        run: cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
+      - name: Check Lance without protoc
+        run: cargo check --locked -p lance
+
   package:
     name: Check crates are publishable
     runs-on: ubuntu-24.04
@@ -345,8 +365,11 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
-    runs-on: warp-macos-14-arm64-6x
-    timeout-minutes: 45
+    # Standard macOS runners are free for public repos; Warp runners are billed.
+    # Only lance-io is tested here to keep PR feedback fast on 3 cores. The full
+    # workspace runs nightly in nightly_run.yml.
+    runs-on: macos-14
+    timeout-minutes: 60
     strategy:
       matrix:
         toolchain:
@@ -371,19 +394,17 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      # macOS runner capacity is the scarcest in CI, so this job is kept as short
-      # as it can be. nextest runs each test in its own process and schedules
-      # across all cores, rather than one test binary at a time. Benchmarks are
-      # only compile-checked here, which build-no-lock already does on Linux;
-      # nothing about bench compilation is macOS-specific.
       - name: Build tests
-        run: |
-          cargo nextest run --cargo-profile ci --locked --features fp16kernels,cli,dynamodb,substrait --no-run
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
       - name: Run tests
-        run: |
-          cargo nextest run --cargo-profile ci --features fp16kernels,cli,dynamodb,substrait
+        run: cargo nextest run --cargo-profile ci -p lance-io
   windows-build:
-    runs-on: windows-latest-4x
+    # Standard Windows runners are free for public repos; the larger ones are
+    # billed at a high per-minute rate. To keep PR feedback reasonably fast on
+    # 4 cores, only lance-io (local filesystem, paths, object store) is tested
+    # here. The full workspace runs nightly in nightly_run.yml.
+    runs-on: windows-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: rust
@@ -403,13 +424,32 @@ jobs:
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
         with:
           tool: nextest
-      # Same reasoning as mac-build: nextest schedules across all cores instead
-      # of running one test binary at a time, and build-no-lock already
-      # compile-checks the benchmarks on Linux.
       - name: Build tests
-        run: cargo nextest run --cargo-profile ci --locked --no-run
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
       - name: Run tests
-        run: cargo nextest run --cargo-profile ci
+        run: cargo nextest run --cargo-profile ci -p lance-io
+  windows-arm-build:
+    # Same scope as windows-build: lance-io on PRs, full suite nightly.
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # nextest
+        with:
+          tool: nextest
+      - name: Build tests
+        run: cargo nextest run --cargo-profile ci --locked -p lance-io --no-run
+      - name: Run tests
+        run: cargo nextest run --cargo-profile ci -p lance-io
 
   qemu-pre-haswell:
     # Builds lance-linalg's lib tests once in release mode and runs them twice: on
