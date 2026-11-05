@@ -1498,7 +1498,7 @@ mod tests {
     async fn release_validates_exact_source_and_token_protocol() {
         let (mut dataset, _) = maintenance_dataset().await;
         dataset
-            .update_config([("large-metadata", "x".repeat(128 * 1024))])
+            .update_config([("large-metadata".to_string(), "x".repeat(128 * 1024))])
             .await
             .unwrap();
         let source = dataset.snapshot_ref("catalog/token").await.unwrap();
