@@ -208,6 +208,9 @@ Deletion files use two extensions: `.arrow` for Arrow IPC format (sparse deletio
 
 Example: `_deletions/42-10-a1b2c3d4.arrow`
 
+A deletion vector may instead be stored in the manifest (`DeletionFile.inline`, see
+[fragment metadata](fragment_metadata.md)); such a fragment has no file under `_deletions/`.
+
 ### Transaction Files
 
 Pattern: `_transactions/{read_version}-{uuid}.txn`

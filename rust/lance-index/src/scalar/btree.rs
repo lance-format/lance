@@ -4,6 +4,7 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
+use lance_index_core::scalar::OrderedScalarIndex;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -32,8 +33,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, IndexOrderingCapability, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -66,6 +67,7 @@ use datafusion_physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use hashbrown::{HashTable, hash_table::Entry};
+use lance_core::cache::CacheLoadOrigin;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -94,6 +96,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
 mod flat;
+mod ordered;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -786,7 +789,7 @@ where
 ///   without a native fast path (struct-backed intervals, booleans) fall back to the
 ///   boxed [`make_comparator`] via `scan_fallback`.
 /// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
-#[derive(Debug, PartialEq, DeepSizeOf)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
     batch: RecordBatch,
@@ -797,6 +800,13 @@ pub struct BTreeLookup {
     /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
     /// the front (NULLs first) and are skipped when searching value ranges.
     search_start: usize,
+    page_order: ordered::PageOrderVerdict,
+}
+
+impl PartialEq for BTreeLookup {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch == other.batch
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -858,6 +868,7 @@ impl BTreeLookup {
             null_pages,
             all_null_pages,
             search_start,
+            page_order: Default::default(),
         })
     }
 
@@ -2660,7 +2671,10 @@ fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
 /// the merge skip reading the segment entirely.
 pub(super) fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(
+            OldIndexDataFilter::Fragments { to_keep, .. }
+            | OldIndexDataFilter::RowAddresses { to_keep, .. },
+        ) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
         None => false,
     }
@@ -2759,6 +2773,7 @@ impl Index for BTreeIndex {
         while let Some((page_idx, page)) = pages.try_next().await? {
             let inserted = self
                 .index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -3077,6 +3092,10 @@ impl ScalarIndex for BTreeIndex {
         Ok(SearchResult::Exact(NullableRowAddrSet::new(
             selected, nulls,
         )))
+    }
+
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        Some(self)
     }
 
     fn lookup<'a>(
@@ -4093,6 +4112,10 @@ impl BasicTrainer for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -4103,6 +4126,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
     fn provides_exact_answer(&self) -> bool {
         true
+    }
+
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::Bidirectional
     }
 
     fn version(&self) -> u32 {

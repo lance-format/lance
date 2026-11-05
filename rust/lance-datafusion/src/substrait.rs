@@ -2,24 +2,35 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::{DataType, Schema as ArrowSchema};
+use async_trait::async_trait;
 use datafusion::{
+    catalog::TableProvider,
     execution::SessionState,
-    logical_expr::{Expr, registry::FunctionRegistry},
+    logical_expr::{
+        Expr, ExprSchemable, LogicalPlan, ScalarUDF, expr::ScalarFunction,
+        registry::FunctionRegistry,
+    },
 };
 
 use crate::aggregate::Aggregate;
 use crate::signed_zero::COMPARE_FLOATS_UDF;
-use datafusion_common::DFSchema;
+use datafusion_common::{
+    Column, DFSchema, ScalarValue, TableReference, not_impl_err, plan_datafusion_err, plan_err,
+};
+use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_substrait::extensions::Extensions;
 use datafusion_substrait::logical_plan::consumer::{
-    DefaultSubstraitConsumer, from_substrait_agg_func, from_substrait_rex, from_substrait_sorts,
+    DefaultSubstraitConsumer, SubstraitConsumer, from_field_reference, from_substrait_agg_func,
+    from_substrait_named_struct, from_substrait_rex, from_substrait_sorts,
 };
 use datafusion_substrait::substrait::proto::{
-    AggregateRel, Expression, ExpressionReference, ExtendedExpression, NamedStruct, Plan, Type,
+    AggregateRel, Expression, ExpressionReference, ExtendedExpression, ExtensionLeafRel,
+    ExtensionMultiRel, ExtensionSingleRel, NamedStruct, Plan, Type,
     expression::{
-        Literal, RexType,
+        FieldReference, Literal, ReferenceSegment, RexType,
         field_reference::{ReferenceType, RootType},
         literal::{LiteralType, PrecisionTimestamp},
+        nested::NestedType,
         reference_segment,
     },
     expression_reference::ExprType,
@@ -391,8 +402,42 @@ fn normalize_expr(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Res
             normalize_deprecated_timestamp_literal(lit);
             Ok(())
         }
+        // List, struct and map constructors hold full expressions, so their elements can
+        // reference fields too.
+        RexType::Nested(nested) => {
+            match nested.nested_type.as_mut() {
+                Some(NestedType::List(list)) => {
+                    for value in &mut list.values {
+                        normalize_expr(value, mapping)?;
+                    }
+                }
+                Some(NestedType::Struct(fields)) => {
+                    for field in &mut fields.fields {
+                        normalize_expr(field, mapping)?;
+                    }
+                }
+                Some(NestedType::Map(map)) => {
+                    for entry in &mut map.key_values {
+                        normalize_expr(
+                            entry.key.as_mut().ok_or_else(|| missing_field("map key"))?,
+                            mapping,
+                        )?;
+                        normalize_expr(
+                            entry
+                                .value
+                                .as_mut()
+                                .ok_or_else(|| missing_field("map value"))?,
+                            mapping,
+                        )?;
+                    }
+                }
+                // DataFusion rejects a constructor without a type when decoding.
+                None => {}
+            }
+            Ok(())
+        }
         // Simple, no field references possible
-        RexType::Nested(_) | RexType::DynamicParameter(_) => Ok(()),
+        RexType::DynamicParameter(_) => Ok(()),
         // Enum literals are deprecated in Substrait and should only appear in older plans.
         #[allow(deprecated)]
         RexType::Enum(_) => Ok(()),
@@ -513,20 +558,18 @@ fn normalize_expr(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Res
                             "map/list nested references not supported in pushdown filters",
                         )),
                         reference_segment::ReferenceType::StructField(field) => {
-                            if field.child.is_some() {
-                                Err(Error::invalid_input(
-                                    "nested references in pushdown filters not yet supported",
-                                ))
+                            // A field inside a struct is the column followed by one segment
+                            // per level. Only the column moves: kept structs keep all their
+                            // fields, so the inner indices stay valid.
+                            reject_list_and_map_segments(field.child.as_deref())?;
+                            if let Some(new_index) = mapping.get(&(field.field as usize)) {
+                                field.field = *new_index as i32;
                             } else {
-                                if let Some(new_index) = mapping.get(&(field.field as usize)) {
-                                    field.field = *new_index as i32;
-                                } else {
-                                    return Err(Error::invalid_input(
-                                        "pushdown filter referenced a field that is not yet supported by Substrait conversion",
-                                    ));
-                                }
-                                Ok(())
+                                return Err(Error::invalid_input(
+                                    "pushdown filter referenced a field that is not yet supported by Substrait conversion",
+                                ));
                             }
+                            Ok(())
                         }
                     }
                 }
@@ -536,6 +579,206 @@ fn normalize_expr(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Res
             }
         }
     }
+}
+
+/// Struct-field segments decode to `get_field` calls; list and map segments do not decode.
+fn reject_list_and_map_segments(mut segment: Option<&ReferenceSegment>) -> Result<()> {
+    while let Some(current) = segment {
+        segment = match current
+            .reference_type
+            .as_ref()
+            .ok_or_else(|| missing_field("reference segment"))?
+        {
+            reference_segment::ReferenceType::StructField(field) => field.child.as_deref(),
+            reference_segment::ReferenceType::ListElement(_)
+            | reference_segment::ReferenceType::MapKey(_) => {
+                return Err(Error::invalid_input(
+                    "map/list nested references not supported in pushdown filters",
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
+/// Decodes like [`DefaultSubstraitConsumer`], and also decodes a reference to a field inside a
+/// struct column, which DataFusion rejects. PyArrow encodes `pc.field("s", "x")` that way, and
+/// DuckDB pushes `WHERE s.x = 1` down as that expression.
+struct FilterConsumer<'a> {
+    inner: DefaultSubstraitConsumer<'a>,
+}
+
+#[async_trait]
+impl SubstraitConsumer for FilterConsumer<'_> {
+    async fn resolve_table_ref(
+        &self,
+        table_ref: &TableReference,
+    ) -> datafusion_common::Result<Option<Arc<dyn TableProvider>>> {
+        self.inner.resolve_table_ref(table_ref).await
+    }
+
+    fn get_extensions(&self) -> &Extensions {
+        self.inner.get_extensions()
+    }
+
+    fn get_function_registry(&self) -> &impl FunctionRegistry {
+        self.inner.get_function_registry()
+    }
+
+    fn push_outer_schema(&self, schema: Arc<DFSchema>) {
+        self.inner.push_outer_schema(schema)
+    }
+
+    fn pop_outer_schema(&self) {
+        self.inner.pop_outer_schema()
+    }
+
+    fn get_outer_schema(&self, steps_out: usize) -> Option<Arc<DFSchema>> {
+        self.inner.get_outer_schema(steps_out)
+    }
+
+    async fn consume_extension_leaf(
+        &self,
+        rel: &ExtensionLeafRel,
+    ) -> datafusion_common::Result<LogicalPlan> {
+        self.inner.consume_extension_leaf(rel).await
+    }
+
+    async fn consume_extension_single(
+        &self,
+        rel: &ExtensionSingleRel,
+    ) -> datafusion_common::Result<LogicalPlan> {
+        self.inner.consume_extension_single(rel).await
+    }
+
+    async fn consume_extension_multi(
+        &self,
+        rel: &ExtensionMultiRel,
+    ) -> datafusion_common::Result<LogicalPlan> {
+        self.inner.consume_extension_multi(rel).await
+    }
+
+    fn push_lambda_parameters(
+        &self,
+        lambda_parameters: &[Type],
+        input_schema: &DFSchema,
+    ) -> datafusion_common::Result<Vec<String>> {
+        self.inner
+            .push_lambda_parameters(lambda_parameters, input_schema)
+    }
+
+    fn pop_lambda_parameters(&self) {
+        self.inner.pop_lambda_parameters()
+    }
+
+    fn lambda_variable(
+        &self,
+        steps_out: usize,
+        field_idx: usize,
+    ) -> datafusion_common::Result<Expr> {
+        self.inner.lambda_variable(steps_out, field_idx)
+    }
+
+    async fn consume_field_reference(
+        &self,
+        field_ref: &FieldReference,
+        input_schema: &DFSchema,
+    ) -> datafusion_common::Result<Expr> {
+        let column = match (&field_ref.reference_type, &field_ref.root_type) {
+            (
+                Some(ReferenceType::DirectReference(ReferenceSegment {
+                    reference_type: Some(reference_segment::ReferenceType::StructField(column)),
+                })),
+                None | Some(RootType::RootReference(_)),
+            ) if column.child.is_some() => column,
+            _ => return from_field_reference(self, field_ref, input_schema).await,
+        };
+        let index = usize::try_from(column.field)
+            .ok()
+            .filter(|index| *index < input_schema.fields().len())
+            .ok_or_else(|| {
+                plan_datafusion_err!(
+                    "field reference {} is out of range for {} input fields",
+                    column.field,
+                    input_schema.fields().len()
+                )
+            })?;
+        // Select the column as DataFusion would, then each struct field with the
+        // `get_field` call the SQL planner builds for `s.x`.
+        let (qualifier, field) = input_schema.qualified_field(index);
+        let mut expr = Expr::Column(Column::from((qualifier, field)));
+        let mut data_type = field.data_type();
+        let mut segment = column.child.as_deref();
+        while let Some(current) = segment {
+            let Some(reference_segment::ReferenceType::StructField(child)) =
+                &current.reference_type
+            else {
+                return not_impl_err!(
+                    "field reference into {expr} uses a segment other than a struct field"
+                );
+            };
+            let DataType::Struct(children) = data_type else {
+                return plan_err!(
+                    "field reference selects field {} of {expr}, which is {data_type}, not a struct",
+                    child.field
+                );
+            };
+            let child_field = usize::try_from(child.field)
+                .ok()
+                .and_then(|index| children.get(index))
+                .ok_or_else(|| {
+                    plan_datafusion_err!(
+                        "field reference selects field {} of {expr}, which has {} fields",
+                        child.field,
+                        children.len()
+                    )
+                })?;
+            expr = Expr::ScalarFunction(ScalarFunction {
+                args: vec![
+                    expr,
+                    Expr::Literal(ScalarValue::Utf8(Some(child_field.name().clone())), None),
+                ],
+                func: Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+            });
+            data_type = child_field.data_type();
+            segment = child.child.as_deref();
+        }
+        Ok(expr)
+    }
+}
+
+/// The single-expression case of `from_substrait_extended_expr`, decoded with
+/// [`FilterConsumer`].
+async fn decode_filter(
+    state: &SessionState,
+    extended_expr: &ExtendedExpression,
+) -> datafusion_common::Result<Expr> {
+    let extensions = Extensions::try_from(&extended_expr.extensions)?;
+    if !extensions.type_variations.is_empty() {
+        return not_impl_err!("Type variation extensions are not supported");
+    }
+    let consumer = FilterConsumer {
+        inner: DefaultSubstraitConsumer::new(&extensions, state),
+    };
+    let Some(base_schema) = &extended_expr.base_schema else {
+        return plan_err!(
+            "required property `base_schema` missing from Substrait ExtendedExpression message"
+        );
+    };
+    let input_schema = from_substrait_named_struct(&consumer, base_schema)?;
+    let [
+        ExpressionReference {
+            expr_type: Some(ExprType::Expression(expr)),
+            ..
+        },
+    ] = extended_expr.referred_expr.as_slice()
+    else {
+        return plan_err!("Substrait filter must contain exactly one scalar expression");
+    };
+    let expr = consumer.consume_expression(expr, &input_schema).await?;
+    // Type-check against the input, as `from_substrait_extended_expr` does.
+    expr.to_field(&input_schema)?;
+    Ok(expr)
 }
 
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
@@ -597,26 +840,7 @@ pub async fn parse_substrait(
         ..envelope
     };
 
-    let mut expr_container =
-        datafusion_substrait::logical_plan::consumer::from_substrait_extended_expr(
-            &decode_state(state)?,
-            &extended_expr,
-        )
-        .await?;
-
-    if expr_container.exprs.is_empty() {
-        return Err(Error::invalid_input(
-            "Substrait expression did not contain any expressions",
-        ));
-    }
-
-    if expr_container.exprs.len() > 1 {
-        return Err(Error::invalid_input(
-            "Substrait expression contained multiple expressions",
-        ));
-    }
-
-    Ok(expr_container.exprs.pop().unwrap().0)
+    Ok(decode_filter(&decode_state(state)?, &extended_expr).await?)
 }
 
 /// Parse Substrait Plan bytes containing an AggregateRel.
@@ -813,15 +1037,17 @@ mod tests {
         prelude::{Expr, SessionContext, col, lit},
     };
     use datafusion_common::{Column, ScalarValue};
+    use datafusion_functions::core::expr_ext::FieldAccessor;
     use datafusion_substrait::substrait::proto::{
         Expression, ExpressionReference, ExtendedExpression, FunctionArgument, NamedStruct, Type,
         Version,
         expression::{
-            FieldReference, IfThen, Literal, ReferenceSegment, RexType, ScalarFunction,
+            FieldReference, IfThen, Literal, Nested, ReferenceSegment, RexType, ScalarFunction,
             field_reference::{ReferenceType, RootReference, RootType},
             if_then::IfClause,
             literal::LiteralType,
-            reference_segment::{self, StructField},
+            nested::{self, NestedType},
+            reference_segment::{self, ListElement, StructField},
         },
         expression_reference::ExprType,
         extensions::{
@@ -829,7 +1055,7 @@ mod tests {
             simple_extension_declaration::{ExtensionFunction, MappingType},
         },
         function_argument::ArgType,
-        r#type::{Boolean, I32, Kind, Nullability, Struct},
+        r#type::{Boolean, I8, I32, Kind, Nullability, Struct},
     };
     use prost::Message;
     use rstest::rstest;
@@ -1014,6 +1240,187 @@ mod tests {
         .unwrap();
 
         assert_eq!(expr, Expr::Column(Column::new_unqualified("x")));
+    }
+
+    fn substrait_type(kind: Kind) -> Type {
+        Type { kind: Some(kind) }
+    }
+
+    fn i32_type() -> Type {
+        substrait_type(Kind::I32(I32 {
+            type_variation_reference: 0,
+            nullability: Nullability::Nullable as i32,
+        }))
+    }
+
+    fn struct_type(types: Vec<Type>) -> Type {
+        substrait_type(Kind::Struct(Struct {
+            types,
+            type_variation_reference: 0,
+            nullability: Nullability::Nullable as i32,
+        }))
+    }
+
+    /// `id: i32, meta: struct<x: i32, inner: struct<y: i32>>` as PyArrow encodes it, optionally
+    /// with the placeholder Python substitutes for an unsupported column before `meta`.
+    fn struct_schema(with_placeholder: bool) -> (NamedStruct, Arc<Schema>) {
+        let meta_type = struct_type(vec![i32_type(), struct_type(vec![i32_type()])]);
+        let inner = Fields::from(vec![Field::new("y", DataType::Int32, true)]);
+        let meta = Field::new(
+            "meta",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int32, true),
+                Field::new("inner", DataType::Struct(inner), true),
+            ])),
+            true,
+        );
+        let (mut names, mut types, mut fields) = (
+            vec!["id"],
+            vec![i32_type()],
+            vec![Field::new("id", DataType::Int32, true)],
+        );
+        if with_placeholder {
+            names.push("__unlikely_name_placeholder_1");
+            types.push(substrait_type(Kind::I8(I8 {
+                type_variation_reference: 0,
+                nullability: Nullability::Nullable as i32,
+            })));
+            fields.push(Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
+                true,
+            ));
+        }
+        names.extend(["meta", "x", "inner", "y"]);
+        types.push(meta_type);
+        fields.push(meta);
+        let base_schema = NamedStruct {
+            names: names.into_iter().map(String::from).collect(),
+            r#struct: Some(Struct {
+                types,
+                type_variation_reference: 0,
+                nullability: Nullability::Required as i32,
+            }),
+        };
+        (base_schema, Arc::new(Schema::new(fields)))
+    }
+
+    /// A reference to column `path[0]`, then to struct field `path[1]` of it, and so on.
+    fn struct_field_path(path: &[i32]) -> ReferenceSegment {
+        let (field, rest) = path.split_first().unwrap();
+        ReferenceSegment {
+            reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                StructField {
+                    field: *field,
+                    child: (!rest.is_empty()).then(|| Box::new(struct_field_path(rest))),
+                },
+            ))),
+        }
+    }
+
+    fn selection(segment: ReferenceSegment) -> Expression {
+        Expression {
+            rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                reference_type: Some(ReferenceType::DirectReference(segment)),
+                root_type: Some(RootType::RootReference(RootReference {})),
+            }))),
+        }
+    }
+
+    async fn parse_struct_schema_expr(
+        with_placeholder: bool,
+        filter: Expression,
+    ) -> lance_core::Result<Expr> {
+        let (base_schema, input_schema) = struct_schema(with_placeholder);
+        let expr = ExtendedExpression {
+            version: None,
+            extension_urns: vec![],
+            extensions: vec![],
+            referred_expr: vec![ExpressionReference {
+                output_names: vec!["filter_mask".to_string()],
+                expr_type: Some(ExprType::Expression(filter)),
+            }],
+            base_schema: Some(base_schema),
+            advanced_extensions: None,
+            expected_type_urls: vec![],
+        };
+        parse_substrait(
+            expr.encode_to_vec().as_slice(),
+            input_schema,
+            &session_state(),
+        )
+        .await
+    }
+
+    /// PyArrow encodes `pc.field("meta", "x")` as a reference to `meta` with a child segment.
+    /// It decodes to the `get_field` chain the SQL planner builds for `meta.x`.
+    #[rstest]
+    #[case::struct_field(false, vec![1, 0], col("meta").field("x"))]
+    #[case::nested_struct_field(false, vec![1, 1, 0], col("meta").field("inner").field("y"))]
+    #[case::after_placeholder(true, vec![2, 0], col("meta").field("x"))]
+    #[tokio::test]
+    async fn test_struct_field_reference(
+        #[case] with_placeholder: bool,
+        #[case] path: Vec<i32>,
+        #[case] expected: Expr,
+    ) {
+        let expr = parse_struct_schema_expr(with_placeholder, selection(struct_field_path(&path)))
+            .await
+            .unwrap();
+        assert_eq!(expr, expected);
+    }
+
+    /// A list constructor holds expressions, so a reference inside it must also be remapped
+    /// past the placeholder column.
+    #[rstest]
+    #[case::column(vec![2], col("meta"))]
+    #[case::struct_field(vec![2, 0], col("meta").field("x"))]
+    #[tokio::test]
+    async fn test_reference_in_list_constructor(#[case] path: Vec<i32>, #[case] element: Expr) {
+        let list = Expression {
+            rex_type: Some(RexType::Nested(Nested {
+                nullable: true,
+                type_variation_reference: 0,
+                nested_type: Some(NestedType::List(nested::List {
+                    values: vec![selection(struct_field_path(&path))],
+                })),
+            })),
+        };
+        let expr = parse_struct_schema_expr(true, list).await.unwrap();
+        let Expr::ScalarFunction(array) = &expr else {
+            panic!("expected make_array, got {expr}");
+        };
+        assert_eq!(array.name(), "make_array");
+        assert_eq!(array.args, vec![element]);
+    }
+
+    #[rstest]
+    #[case::list_element(
+        ReferenceSegment {
+            reference_type: Some(reference_segment::ReferenceType::StructField(Box::new(
+                StructField {
+                    field: 1,
+                    child: Some(Box::new(ReferenceSegment {
+                        reference_type: Some(reference_segment::ReferenceType::ListElement(
+                            Box::new(ListElement { offset: 0, child: None }),
+                        )),
+                    })),
+                },
+            ))),
+        },
+        "map/list nested references not supported in pushdown filters"
+    )]
+    #[case::missing_struct_field(struct_field_path(&[1, 2]), "field 2 of meta, which has 2 fields")]
+    #[case::field_of_non_struct(struct_field_path(&[0, 0]), "field 0 of id, which is Int32, not a struct")]
+    #[tokio::test]
+    async fn test_invalid_struct_field_reference(
+        #[case] segment: ReferenceSegment,
+        #[case] message: &str,
+    ) {
+        let err = parse_struct_schema_expr(false, selection(segment))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(message), "unexpected error: {err}");
     }
 
     /// The deprecated literal is always microseconds, but DataFusion reads the default

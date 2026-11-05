@@ -112,7 +112,9 @@ macro_rules! impl_call {
 }
 
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
+impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
+impl_call!(<A: ?Sized, D: ?Sized> fn(a: &A, b: f32, c: f32, d: &D));
 impl_call!(
     <A: ?Sized, B: ?Sized, D: ?Sized, E: ?Sized>
     fn(a: &A, b: &B, c: usize, d: &D, e: &mut E)
@@ -431,6 +433,39 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;
+    type DoublyScaledSumFn = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(SCALED_SUM: ScaledSumFn)]
+        fn scaled_sum(x: &[f32], scale: f32, y: &[f32]) -> f32 {
+            scale * portable_sum(x, y)
+        }
+    }
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(DOUBLY_SCALED_SUM: DoublyScaledSumFn)]
+        fn doubly_scaled_sum(x: &[f32], a: f32, b: f32, y: &[f32]) -> f32 {
+            a * b * portable_sum(x, y)
+        }
+    }
+
+    crate::dispatch! {
+        static SCALED: Dispatch<ScaledSumFn> = &[SCALED_SUM];
+    }
+
+    crate::dispatch! {
+        static DOUBLY_SCALED: Dispatch<DoublyScaledSumFn> = &[DOUBLY_SCALED_SUM];
+    }
+
+    #[test]
+    fn scalar_argument_kernels_are_callable() {
+        assert_eq!(SCALED.get().call(&[1.0], 2.0, &[3.0]), 8.0);
+        assert_eq!(DOUBLY_SCALED.get().call(&[1.0], 2.0, 3.0, &[3.0]), 24.0);
     }
 
     #[test]
