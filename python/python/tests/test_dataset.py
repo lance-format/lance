@@ -649,8 +649,9 @@ def test_asof_checkout(tmp_path: Path):
 @pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
 def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
     ds = lance.write_dataset(pa.table({"x": [1]}), tmp_path)
-    for value in [2, 3]:
-        ds = lance.write_dataset(pa.table({"x": [value]}), tmp_path, mode="append")
+    ds = lance.write_dataset(pa.table({"x": [2]}), tmp_path, mode="append")
+    time.sleep(0.1)
+    ds = lance.write_dataset(pa.table({"x": [3]}), tmp_path, mode="append")
 
     versions = ds.versions()
     ts_2, ts_3 = (v["timestamp"] for v in versions[1:])
