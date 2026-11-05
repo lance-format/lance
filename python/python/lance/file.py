@@ -101,6 +101,9 @@ class LanceFileReader:
         session : optional, lance.Session
             A session whose metadata cache is used to cache page metadata and file
             metadata for this reader. When omitted, no metadata cache is used.
+            Cache entries are reused across readers only when the store provides
+            an immutable version for the file; otherwise they are scoped to this
+            reader.
         """
         if _inner_reader is not None:
             self._reader = _inner_reader
@@ -272,8 +275,10 @@ class LanceFileSession:
             The table identifier within the namespace.
             Must be provided together with namespace_client.
         session : optional, lance.Session
-            A session whose metadata cache is shared by every reader opened from
-            this file session. When omitted, readers use no metadata cache.
+            A session whose metadata cache is used by every reader opened from
+            this file session. Entries are reused across readers only when the
+            store provides an immutable version for the file; otherwise they are
+            scoped to the reader. When omitted, readers use no metadata cache.
         """
         if isinstance(base_path, Path):
             base_path = str(base_path)
