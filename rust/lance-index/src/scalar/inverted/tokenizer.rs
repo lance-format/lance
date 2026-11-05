@@ -1080,6 +1080,18 @@ impl InvertedIndexParams {
     /// Checks settings that a new index cannot use but an existing one may
     /// carry. Indexes built this way by earlier releases must still load,
     /// optimize and remap, so this is not part of [`Self::build`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let params = InvertedIndexParams::default()
+    ///     .base_tokenizer("ngram".to_string())
+    ///     .with_position(true);
+    /// let error = params.validate_for_creation().unwrap_err();
+    /// assert!(error.to_string().contains("set with_position=false"));
+    /// ```
     pub fn validate_for_creation(&self) -> Result<()> {
         // The ngram tokenizer puts every token at position 0, so its positions
         // carry nothing a phrase query could use.
