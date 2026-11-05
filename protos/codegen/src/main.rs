@@ -205,8 +205,7 @@ fn generate_lance(
     config.extern_path(".lance.datafusion", "::lance_datafusion::pb");
     config.extern_path(".lance.snapshot", "::lance_table::snapshot::pb");
     config.enable_type_names();
-    config.bytes([".lance.blob.reference"]);
-    config.bytes([".lance.dataset.retention"]);
+    config.bytes([".lance.blob.reference", ".lance.dataset.retention"]);
     config.compile_protos(
         &[
             proto_dir.join("ann.proto"),

@@ -42,8 +42,8 @@ pub struct ObjectLocator {
     /// Includes the snapshot reference, access_context_key, and required capabilities.
     /// Distinct from the manifest digest and the separate snapshot identity fingerprint
     /// computed by the Rust SnapshotRef::snapshot_id() API, without worker bindings.
-    #[prost(bytes = "vec", tag = "2")]
-    pub source_id: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub source_id: ::prost::bytes::Bytes,
     #[prost(string, tag = "3")]
     pub object_uri: ::prost::alloc::string::String,
     #[prost(uint64, tag = "4")]
@@ -113,8 +113,8 @@ pub struct ReferenceBatch {
     pub protocol_version: u32,
     #[prost(message, repeated, tag = "2")]
     pub contexts: ::prost::alloc::vec::Vec<SourceContext>,
-    #[prost(bytes = "vec", tag = "3")]
-    pub arrow_ipc: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub arrow_ipc: ::prost::bytes::Bytes,
 }
 impl ::prost::Name for ReferenceBatch {
     const NAME: &'static str = "ReferenceBatch";
