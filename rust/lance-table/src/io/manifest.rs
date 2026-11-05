@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use futures::TryStreamExt;
 use lance_file::{
     version::ConcreteFileVersion,
