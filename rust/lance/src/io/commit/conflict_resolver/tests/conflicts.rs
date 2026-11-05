@@ -1554,25 +1554,39 @@ fn test_covering_dependency(#[case] site: CoveringConflictSite) {
     }
 }
 
-/// A restore rewinds schema and field metadata with the rest of the
+/// A restore rewinds table, schema and field metadata with the rest of the
 /// manifest, so a metadata update must not rebase over it; a plain config
 /// upsert carries no metadata and still rebases.
 #[rstest::rstest]
-#[case::field_metadata(Some(HashMap::from([(0, HashMap::from([("fresh".to_string(), "{}".to_string())]))])), None, true)]
-#[case::schema_metadata(None, Some(HashMap::from([("owner".to_string(), "refresh".to_string())])), true)]
-#[case::config_only(None, None, false)]
+#[case::field_metadata(Some(HashMap::from([(0, HashMap::from([("fresh".to_string(), "{}".to_string())]))])), None, None, true)]
+#[case::schema_metadata(None, Some(HashMap::from([("owner".to_string(), "refresh".to_string())])), None, true)]
+#[case::table_upsert(None, None, Some(UpdateMap { update_entries: vec![("provider.active", Some("2")).into()], replace: false }), true)]
+#[case::table_delete(None, None, Some(UpdateMap { update_entries: vec![("provider.active", None::<&str>).into()], replace: false }), true)]
+#[case::table_replace(None, None, Some(UpdateMap { update_entries: vec![("provider.active", Some("2")).into()], replace: true }), true)]
+#[case::table_clear(None, None, Some(UpdateMap { update_entries: vec![], replace: true }), true)]
+#[case::empty_table_update(None, None, Some(UpdateMap { update_entries: vec![], replace: false }), false)]
+#[case::config_only(None, None, None, false)]
 fn test_update_config_conflicts_with_restore(
     #[case] field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
     #[case] schema_metadata: Option<HashMap<String, String>>,
+    #[case] table_metadata: Option<UpdateMap>,
     #[case] conflicts: bool,
 ) {
     let restore = Transaction::new(0, Operation::Restore { version: 1 }, None);
-    let update = create_update_config_for_test(
+    let mut update = create_update_config_for_test(
         Some(HashMap::from([("key".to_string(), "value".to_string())])),
         None,
         schema_metadata,
         field_metadata,
     );
+    let Operation::UpdateConfig {
+        table_metadata_updates,
+        ..
+    } = &mut update
+    else {
+        unreachable!()
+    };
+    *table_metadata_updates = table_metadata;
     // Either commit order: the metadata the restore discarded must not
     // come back, whichever transaction rebases.
     for (ours, theirs) in [
@@ -1596,7 +1610,16 @@ fn test_update_config_conflicts_with_restore(
             staged_replay: false,
         };
         let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
-        assert_eq!(result.is_err(), conflicts, "{result:?}");
+        if conflicts {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::IncompatibleTransaction { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("Restore"), "{error}");
+        } else {
+            result.unwrap();
+        }
     }
 }
 

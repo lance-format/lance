@@ -336,37 +336,6 @@
   color: var(--text-muted);
   margin: 22px 0 8px;
 }
-.ld-sidenav__group--tracks { margin-bottom: 18px; }
-.ld-sidenav__tracks {
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--line-2);
-  background: var(--surface-overlay);
-}
-.ld-sidenav a.ld-sidenav__track {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 7px 12px;
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  border-left: 2px solid transparent;
-  border-bottom: 1px solid var(--line-2);
-  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
-}
-.ld-sidenav a.ld-sidenav__track:last-child { border-bottom: 0; }
-.ld-sidenav a.ld-sidenav__track:hover {
-  color: var(--fg-1);
-  background: var(--surface-card);
-}
-.ld-sidenav a.ld-sidenav__track.active {
-  color: var(--beam-600);
-  background: var(--surface-card);
-  border-left: 2px solid var(--beam-400);
-  padding-left: 12px;
-  font-weight: 600;
-}
 .ld-sidenav a {
   display: block;
   font-size: 13.5px;

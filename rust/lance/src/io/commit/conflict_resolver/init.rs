@@ -313,9 +313,9 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Refuse gaps in the transaction history required to safely rebase.
+    /// Handle gaps in the transaction history required to safely rebase.
     pub(crate) fn check_missing_versions(
-        &self,
+        &mut self,
         missing: &[u64],
         latest_version: u64,
     ) -> Result<()> {
@@ -345,6 +345,17 @@ impl<'a> TransactionRebase<'a> {
                 )
                 .into(),
             ));
+        }
+
+        // Lineage proves where retired rows moved, but not whether their
+        // indexed values changed in a missing transaction. Those fragments
+        // cannot be compared with the build snapshot once their IDs retire.
+        if let (Some(lineage), Some(live), Operation::CreateIndex { new_indices, .. }) = (
+            &self.current_lineage,
+            &self.current_live,
+            &mut self.transaction.operation,
+        ) {
+            Transaction::withdraw_unverified_retired_coverage(new_indices, lineage, live);
         }
 
         // Gaps can hide changes to the source fragments an index covers, or to

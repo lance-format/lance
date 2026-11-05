@@ -154,9 +154,9 @@ impl MergeInsertJob {
     ) -> Result<PatchedFragments> {
         let (current_version, write_version) = versions;
         // Fully stage the joined updates before starting the fragment sort. An
-        // indexed join can keep merge streams for both sorted inputs live while
+        // indexed join can keep the merge stream of its target sort live while
         // its output is pulled; draining a disk-backed replay first releases
-        // those upstream reservations before the downstream sort allocates. The
+        // that upstream reservation before the downstream sort allocates. The
         // zero memory limit is deliberate: the staging buffer holds plain
         // RecordBatches outside DataFusion's memory-pool accounting, so any
         // in-memory allowance would weaken the operation's bounded-memory

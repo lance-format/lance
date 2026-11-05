@@ -382,6 +382,23 @@ impl<'a> TransactionRebase<'a> {
                 }
             }
 
+            // Cleanup can hide in-place rewrites from the transaction checks.
+            // Compare the surviving fragments' field paths with the build
+            // snapshot; deletion files and added columns do not stale an index.
+            if dataset.manifest.version != self.transaction.read_version
+                && let Some(read_fragments) = &self.read_fragments
+            {
+                let rewrites =
+                    Transaction::merge_rewritten_fields(read_fragments, dataset.fragments());
+                Transaction::withdraw_in_place_rewrites(
+                    new_indices,
+                    rewrites,
+                    dataset.schema(),
+                    dataset.fragment_bitmap.as_ref(),
+                    self.current_lineage.as_ref(),
+                );
+            }
+
             // Handle MEM_WAL_INDEX rebasing
             let has_mem_wal = new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
 

@@ -68,8 +68,8 @@ pub struct TransactionRebase<'a> {
     /// child's id).
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
-    /// so a concurrent `Merge` can be told which columns it rewrote in place
-    /// and which fields it removed or retyped.
+    /// to detect in-place column rewrites even after transaction cleanup,
+    /// and fields a concurrent `Merge` removed or retyped.
     read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative

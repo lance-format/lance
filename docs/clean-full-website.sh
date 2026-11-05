@@ -50,33 +50,6 @@ mkdir -p "$docs_src/format/catalog/rest"
 mkdir -p "$docs_src/format/namespace/operations/models"
 mkdir -p "$docs_src/format/namespace/supported-catalogs"
 
-mkdir -p "$docs_src/guide/spark/operations/dql"
-
-cat > "$docs_src/guide/spark/operations/dql/.pages" <<'EOF'
-title: DQL
-EOF
-
-cat > "$docs_src/guide/spark/index.md" <<'EOF'
-# Apache Spark Integration
-
-This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
-Run `docs/make-full-website.sh` with `LANCE_SPARK_REPO` pointing at a local [lance-format/lance-spark](https://github.com/lance-format/lance-spark) checkout to populate the full documentation.
-EOF
-
-cat > "$docs_src/guide/spark/config.md" <<'EOF'
-# Apache Spark Configuration
-
-This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
-See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for configuration details.
-EOF
-
-cat > "$docs_src/guide/spark/operations/dql/vector-search.md" <<'EOF'
-# Spark Vector Search
-
-This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
-See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for `VECTOR_SEARCH` details.
-EOF
-
 cat > "$docs_src/format/catalog/.pages" <<'EOF'
 title: Catalog Specs
 nav:
@@ -208,10 +181,36 @@ cat > "$docs_src/format/namespace/supported-catalogs/template.md" <<'EOF'
 This placeholder page keeps the local website buildable when external namespace docs are not available.
 EOF
 
+mkdir -p "$docs_src/integrations/spark/operations/dql"
 mkdir -p "$docs_src/integrations/duckdb"
 mkdir -p "$docs_src/integrations/ray"
 mkdir -p "$docs_src/integrations/trino"
 mkdir -p "$docs_src/integrations/huggingface"
+
+cat > "$docs_src/integrations/spark/operations/dql/.pages" <<'EOF'
+title: DQL
+EOF
+
+cat > "$docs_src/integrations/spark/index.md" <<'EOF'
+# Apache Spark Integration
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+Run `docs/make-full-website.sh` with `LANCE_SPARK_REPO` pointing at a local [lance-format/lance-spark](https://github.com/lance-format/lance-spark) checkout to populate the full documentation.
+EOF
+
+cat > "$docs_src/integrations/spark/config.md" <<'EOF'
+# Apache Spark Configuration
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for configuration details.
+EOF
+
+cat > "$docs_src/integrations/spark/operations/dql/vector-search.md" <<'EOF'
+# Spark Vector Search
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for `VECTOR_SEARCH` details.
+EOF
 
 cat > "$docs_src/integrations/duckdb/index.md" <<'EOF'
 # DuckDB Integration

@@ -616,7 +616,8 @@ async fn do_commit_new_dataset(
                     None,
                     None,
                     None,
-                )?;
+                )
+                .await?;
                 crate::dataset::blob::clone::copy_blob_columns(
                     Arc::new(source),
                     Arc::new(object_store.clone()),
@@ -1452,6 +1453,7 @@ pub(crate) async fn do_commit_detached_transaction(
         }
 
         // Try to commit the manifest
+        dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -1577,7 +1579,8 @@ pub(crate) async fn commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
-    do_commit_detached_transaction(
+    dataset.ensure_branch_exists().await?;
+    let result = do_commit_detached_transaction(
         dataset,
         object_store,
         commit_handler,
@@ -1586,7 +1589,9 @@ pub(crate) async fn commit_detached_transaction(
         commit_config,
         retry_timeout,
     )
-    .await
+    .await;
+    dataset.ensure_branch_exists().await?;
+    result
 }
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
@@ -1695,7 +1700,8 @@ async fn record_successful_commit(
     location: &ManifestLocation,
     indices: Vec<IndexMetadata>,
     skip_auto_cleanup: bool,
-) {
+) -> Result<()> {
+    dataset.ensure_branch_exists().await?;
     let tx_key = crate::session::caches::TransactionKey {
         version: manifest.version,
     };
@@ -1734,6 +1740,7 @@ async fn record_successful_commit(
             _ => {}
         };
     }
+    dataset.ensure_branch_exists().await
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
@@ -1750,6 +1757,7 @@ pub(crate) async fn commit_transaction(
     affected_rows: Option<&RowAddrTreeMap>,
     expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_branch_exists().await?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -2036,6 +2044,7 @@ pub(crate) async fn commit_transaction(
         }
 
         // Try to commit the manifest
+        original_dataset.ensure_branch_exists().await?;
         let result = write_manifest_file(
             object_store,
             commit_handler,
@@ -2052,6 +2061,9 @@ pub(crate) async fn commit_transaction(
             may_change_schema,
         )
         .await;
+        // Deletion can race the manifest PUT. Never acknowledge an orphaned
+        // commit, including when the handler reports an ambiguous result.
+        original_dataset.ensure_branch_exists().await?;
 
         match result {
             Ok(manifest_location) => {
@@ -2063,7 +2075,7 @@ pub(crate) async fn commit_transaction(
                     indices,
                     commit_config.skip_auto_cleanup,
                 )
-                .await;
+                .await?;
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
@@ -2095,7 +2107,7 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         return Ok((committed_manifest, location));
                     }
                     // Confirmed loss: another writer owns the version (or,
@@ -2168,7 +2180,7 @@ pub(crate) async fn commit_transaction(
                             indices,
                             commit_config.skip_auto_cleanup,
                         )
-                        .await;
+                        .await?;
                         if commit_handler.propagate_commit_error_after_success() {
                             return Err(err);
                         }
@@ -2637,10 +2649,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::append(false)]
-    #[case::index(true)]
+    #[case::append(false, false)]
+    #[case::index_after_delete(true, false)]
+    #[case::index_after_add_columns(true, true)]
     #[tokio::test]
-    async fn test_safe_commit_survives_cleaned_history(#[case] is_index: bool) {
+    async fn test_safe_commit_survives_cleaned_history(
+        #[case] is_index: bool,
+        #[case] is_column_add: bool,
+    ) {
         let stale = Arc::new(
             gen_batch()
                 .col("id", array::step::<Int32Type>())
@@ -2682,7 +2698,21 @@ mod tests {
                 .unwrap()
         };
         let mut latest = stale.as_ref().clone();
-        latest.delete("id = 0").await.unwrap();
+        if is_column_add {
+            latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            latest.delete("id = 0").await.unwrap();
+        }
         let latest = CommitBuilder::new(Arc::new(latest))
             .execute(Transaction::new(
                 2,
@@ -2707,13 +2737,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.version().version, 4);
-        assert_eq!(result.count_rows(Some("id = 0".into())).await.unwrap(), 0);
+        assert_eq!(
+            result.count_rows(Some("id = 0".into())).await.unwrap(),
+            usize::from(is_column_add)
+        );
         assert_eq!(
             result.count_rows(None).await.unwrap(),
-            if is_index { 7 } else { 8 }
+            if is_index {
+                7 + usize::from(is_column_add)
+            } else {
+                8
+            }
         );
         if is_index {
-            assert_eq!(result.load_indices().await.unwrap().len(), 1);
+            let indices = result.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1])
+            );
             assert_eq!(result.count_rows(Some("id = 3".into())).await.unwrap(), 1);
         }
     }
@@ -5031,5 +5073,108 @@ mod tests {
         // The comparison `verify_commit_outcome` performs: read-back durable
         // form against the regenerated durable form of this attempt.
         assert_eq!(read_back, pb::Transaction::try_from(&transaction).unwrap());
+    }
+
+    /// The manifest message of the file `dataset` was committed to, without
+    /// its length prefix.
+    async fn committed_manifest_message(dataset: &Dataset) -> Vec<u8> {
+        let location = dataset.manifest_location();
+        let file = dataset
+            .object_store
+            .read_one_all(&location.path)
+            .await
+            .unwrap();
+        let footer = file.len() - 16;
+        let pos = i64::from_le_bytes(file[footer..footer + 8].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(pos + 4 + len, footer);
+        file[pos + 4..footer].to_vec()
+    }
+
+    /// The committed message is byte-identical to encoding the committed
+    /// manifest from scratch.
+    async fn assert_committed_manifest_matches(dataset: &Dataset) {
+        use prost::Message;
+
+        assert_eq!(
+            committed_manifest_message(dataset).await,
+            lance_table::format::pb::Manifest::from(dataset.manifest.as_ref()).encode_to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_manifests_match_fresh_encoding() {
+        let test_dir = TempStrDir::default();
+        let rows = |start: i32| {
+            gen_batch()
+                .col("i", array::step_custom::<Int32Type>(start, 1))
+                .into_reader_rows(RowCount::from(10), BatchCount::from(2))
+        };
+        let params = WriteParams {
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+
+        let mut dataset = Dataset::write(rows(0), &test_dir, Some(params.clone()))
+            .await
+            .unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Append.
+        dataset
+            .append(rows(20), Some(params.clone()))
+            .await
+            .unwrap();
+        assert_eq!(dataset.manifest.fragments.len(), 4);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Update: fragment 0 is rewritten entirely (removed), fragment 1 in
+        // part (updated with a deletion file), and the new rows are added.
+        let dataset = crate::dataset::UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i < 15")
+            .unwrap()
+            .set("i", "i + 1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert!(dataset.manifest.fragments[0].deletion_file.is_some());
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Delete: fragment 2 entirely, fragment 3 in part.
+        let mut dataset = dataset.as_ref().clone();
+        dataset.delete("i >= 20 AND i < 35").await.unwrap();
+        let ids: Vec<u64> = dataset.manifest.fragments.iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec![1, 3, 4]);
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Rewrite: compaction replaces the fragments with deletions.
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .manifest
+                .fragments
+                .iter()
+                .all(|fragment| fragment.deletion_file.is_none())
+        );
+        assert_committed_manifest_matches(&dataset).await;
+
+        // Cold start: commit after reopening the dataset.
+        let mut dataset = Dataset::open(&test_dir).await.unwrap();
+        dataset.delete("i = 1001").await.unwrap();
+        assert_committed_manifest_matches(&dataset).await;
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
     }
 }

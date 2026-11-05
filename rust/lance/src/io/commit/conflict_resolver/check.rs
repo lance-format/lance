@@ -26,13 +26,21 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
-        // A restore replaces the manifest with an older one, schema and field
-        // metadata included. Rebasing a metadata update over it reinstates
-        // metadata the restore discarded, and re-reading cannot help: the
-        // update was computed against a schema the table no longer has.
-        if (matches!(ours, Operation::Restore { .. }) && updates_schema_or_field_metadata(theirs))
-            || (updates_schema_or_field_metadata(ours)
-                && matches!(theirs, Operation::Restore { .. }))
+        // Restore replaces table metadata as well as schema/field metadata.
+        // A stale provider update could otherwise select a definition that
+        // restore discarded. Re-reading cannot repair the computed update.
+        let updates_restored_metadata = |operation: &Operation| {
+            updates_schema_or_field_metadata(operation)
+                || matches!(
+                    operation,
+                    Operation::UpdateConfig {
+                        table_metadata_updates: Some(update),
+                        ..
+                    } if update.replace || !update.update_entries.is_empty()
+                )
+        };
+        if (matches!(ours, Operation::Restore { .. }) && updates_restored_metadata(theirs))
+            || (updates_restored_metadata(ours) && matches!(theirs, Operation::Restore { .. }))
         {
             return Err(self.incompatible_conflict_err(other_transaction, other_version));
         }
