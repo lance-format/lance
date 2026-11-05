@@ -31,7 +31,7 @@ lance-index = { path = "../../rust/lance-index", features = ["tokenizer-jieba", 
 lance-io = { path = "../../rust/lance-io", features = ["metrics"] }
 lance-namespace = { path = "../../rust/lance-namespace" }
 lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
-lance-core = { path = "../../rust/lance-core" }
+lance-core = { path = "../../rust/lance-core", features = ["metrics"] }
 lance-file = { path = "../../rust/lance-file" }
 lance-table = { path = "../../rust/lance-table" }
 arrow = { version = "59.2.0", features = ["ffi"] }
