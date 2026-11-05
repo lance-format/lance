@@ -4346,6 +4346,137 @@ async fn test_create_ivf_hnsw_rq(
     test_remap(params, nlist, recall_requirement).await;
 }
 
+async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
+    const K: usize = 10;
+
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, K)
+        .unwrap()
+        .minimum_nprobes(nlist)
+        .maximum_nprobes(nlist);
+    scan.with_row_id();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
+    );
+
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), K);
+    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(
+        row_ids.iter().copied().collect::<HashSet<_>>().len(),
+        K,
+        "IVF_HNSW_RQ returned duplicate row ids"
+    );
+
+    let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
+    let recall = row_ids
+        .iter()
+        .filter(|row_id| ground_truth.contains(row_id))
+        .count() as f32
+        / K as f32;
+    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+}
+
+#[tokio::test]
+async fn test_ivf_hnsw_rq_stable_row_ids_lifecycle() {
+    const INDEX_NAME: &str = "ivf_hnsw_rq_stable";
+    const INITIAL_ROWS: usize = 256;
+    const APPEND_ROWS: usize = 32;
+    const NLIST: usize = 4;
+
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+    let (batch, schema) = make_seeded_vector_batch(INITIAL_ROWS + APPEND_ROWS);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let appended = batch.slice(INITIAL_ROWS, APPEND_ROWS);
+    let batches = RecordBatchIterator::new(vec![Ok(batch.slice(0, INITIAL_ROWS))], schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        test_uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert!(
+        dataset.get_fragments().len() >= 2,
+        "stable-row-id fixture should span multiple fragments"
+    );
+    let stable_row_id = row_ids_matching(&dataset, "id = 0").await;
+    assert_eq!(stable_row_id.len(), 1);
+
+    let ivf_params = IvfBuildParams {
+        max_iters: 2,
+        sample_rate: 32,
+        ..IvfBuildParams::new(NLIST)
+    };
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        ivf_params,
+        lightweight_hnsw_params(),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::IvfHnswRq,
+            Some(INDEX_NAME.to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
+
+    let appended = RecordBatchIterator::new(vec![Ok(appended)], schema);
+    dataset.append(appended, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "optimize should merge the appended stable-row-id data into one index"
+    );
+
+    drop(dataset);
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert_eq!(
+        row_ids_matching(&dataset, "id = 0").await,
+        stable_row_id,
+        "optimize and reopen should preserve the row's stable id"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
+}
+
 #[tokio::test]
 async fn test_create_ivf_hnsw_sq_dot_with_negative_values() {
     let nlist = 4;

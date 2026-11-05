@@ -16,6 +16,7 @@ package org.lance.index;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.TestVectorDataset;
+import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
@@ -473,9 +474,12 @@ public class VectorIndexTest {
     }
   }
 
-  @Test
-  public void testCreateIvfRqIndex(@TempDir Path tempDir) throws Exception {
-    Path datasetPath = tempDir.resolve("ivf_rq_index");
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"IVF_RQ", "IVF_HNSW_RQ"})
+  public void testCreateIvfRqIndex(IndexType indexType, @TempDir Path tempDir) throws Exception {
+    Path datasetPath = tempDir.resolve(indexType.name().toLowerCase());
 
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -487,14 +491,17 @@ public class VectorIndexTest {
                 .build();
 
         VectorIndexParams vectorIndexParams =
-            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
+            indexType == IndexType.IVF_HNSW_RQ
+                ? VectorIndexParams.withIvfHnswRqParams(
+                    DistanceType.L2, ivf, new HnswBuildParams.Builder().build(), rq)
+                : VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
         IndexParams indexParams =
             IndexParams.builder().setVectorIndexParams(vectorIndexParams).build();
 
         dataset.createIndex(
             IndexOptions.builder(
                     Collections.singletonList(TestVectorDataset.vectorColumnName),
-                    IndexType.IVF_RQ,
+                    indexType,
                     indexParams)
                 .withIndexName(TestVectorDataset.indexName)
                 .build());
@@ -506,21 +513,55 @@ public class VectorIndexTest {
                 .findFirst()
                 .orElse(null);
 
-        assertNotNull(rqIndex, "Expected IVF_RQ index to be present");
+        assertNotNull(rqIndex, "Expected " + indexType + " index to be present");
 
-        IndexType indexType = rqIndex.indexType();
-        assertNotNull(indexType, "IndexType should be set for IVF_RQ index");
+        IndexType actualIndexType = rqIndex.indexType();
+        assertNotNull(actualIndexType, "IndexType should be set for " + indexType + " index");
 
         // Today all vector indices share the same VectorIndexDetails type and map to VECTOR.
-        // This assertion allows both VECTOR and IVF_RQ so it remains valid if the mapping
+        // This assertion allows both VECTOR and the concrete type so it remains valid if the
+        // mapping
         // is refined in the future.
         assertTrue(
-            indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
-            "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+            actualIndexType == IndexType.VECTOR || actualIndexType == indexType,
+            "IndexType for "
+                + indexType
+                + " should be VECTOR or "
+                + indexType
+                + " but was "
+                + actualIndexType);
         Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
+        assertEquals(indexType.name(), stats.get("index_type"));
         List<?> segments = (List<?>) stats.get("segments");
         Map<?, ?> segment = (Map<?, ?>) segments.get(0);
         assertEquals("matrix", ((Map<?, ?>) segment.get("sub_index")).get("rotation_type"));
+
+        float[] key = new float[32];
+        for (int i = 0; i < key.length; i++) {
+          key[i] = 32 + i;
+        }
+        Query query =
+            new Query.Builder()
+                .setColumn(TestVectorDataset.vectorColumnName)
+                .setKey(key)
+                .setK(2)
+                .setNprobes(2)
+                .build();
+        try (LanceScanner scanner =
+                dataset.newScan(new ScanOptions.Builder().nearest(query).build());
+            ArrowReader reader = scanner.scanBatches()) {
+          Set<Integer> actual = new HashSet<>();
+          while (reader.loadNextBatch()) {
+            IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+            for (int row = 0; row < ids.getValueCount(); row++) {
+              actual.add(ids.get(row));
+            }
+          }
+          assertEquals(2, actual.size());
+          actual.retainAll(Set.of(1, 81, 161, 241, 321));
+          assertTrue(
+              actual.size() >= 1, "Expected Recall@2 >= 0.5 for " + indexType + ", got " + actual);
+        }
       }
     }
   }
