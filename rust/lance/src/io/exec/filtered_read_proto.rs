@@ -25,6 +25,7 @@ use lance_datafusion::pb;
 use lance_datafusion::substrait::{
     encode_substrait, parse_substrait, prune_schema_for_substrait, validate_substrait_expr,
 };
+use lance_encoding::decoder::ListReadMode;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
@@ -205,6 +206,20 @@ fn fr_options_to_proto(
             .as_ref()
             .and_then(|o| o.batch_size_bytes),
         physical_row_addr_allowlist,
+        list_structure: options
+            .file_reader_options
+            .iter()
+            .flat_map(|options| options.decoder_config.list_structure.iter())
+            .map(|(&field_id, mode)| {
+                let mode = match mode {
+                    ListReadMode::Length => pb::filtered_read_options_proto::ListReadMode::Length,
+                    ListReadMode::NonEmpty => {
+                        pb::filtered_read_options_proto::ListReadMode::NonEmpty
+                    }
+                };
+                (field_id, mode as i32)
+            })
+            .collect(),
     })
 }
 
@@ -263,16 +278,46 @@ async fn fr_options_from_proto(
     if let Some(materialization_readahead_bytes) = proto.materialization_readahead_bytes {
         options = options.with_materialization_readahead_bytes(materialization_readahead_bytes);
     }
-    if let Some(batch_size_bytes) = proto.batch_size_bytes {
-        // Merge the scanner-level byte budget into the dataset's existing
-        // file-reader options so that distributed execution preserves
-        // validation and I/O settings such as read_chunk_size.
+    if proto.batch_size_bytes.is_some()
+        || !proto.list_structure.is_empty()
+        || dataset
+            .file_reader_options
+            .as_ref()
+            .is_some_and(|options| !options.decoder_config.list_structure.is_empty())
+    {
+        // Preserve executor-side validation and I/O settings, but replace the
+        // structural demand: placeholder values are safe only for this plan.
         let mut file_reader_options = dataset
             .file_reader_options
             .as_deref()
             .cloned()
             .unwrap_or_default();
-        file_reader_options.batch_size_bytes = Some(batch_size_bytes);
+        if let Some(batch_size_bytes) = proto.batch_size_bytes {
+            file_reader_options.batch_size_bytes = Some(batch_size_bytes);
+        }
+        file_reader_options.decoder_config.list_structure = Arc::new(
+            proto
+                .list_structure
+                .into_iter()
+                .map(|(field_id, mode)| {
+                    let mode = match pb::filtered_read_options_proto::ListReadMode::try_from(mode) {
+                        Ok(pb::filtered_read_options_proto::ListReadMode::Length) => {
+                            ListReadMode::Length
+                        }
+                        Ok(pb::filtered_read_options_proto::ListReadMode::NonEmpty) => {
+                            ListReadMode::NonEmpty
+                        }
+                        _ => {
+                            return Err(Error::invalid_input_source(
+                                format!("invalid list_structure mode {mode} for field {field_id}")
+                                    .into(),
+                            ));
+                        }
+                    };
+                    Ok((field_id, mode))
+                })
+                .collect::<Result<_>>()?,
+        );
         options = options.with_file_reader_options(file_reader_options);
     }
     if let Some(mode) = proto.threading_mode {
@@ -574,13 +619,21 @@ fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt32Type};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator,
+    };
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field};
+    use datafusion::common::tree_node::{Transformed, TreeNode};
     use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
     use lance_datagen::{ArrayGeneratorExt, Dimension, array, gen_batch};
     use lance_select::RowAddrTreeMap;
+    use prost::Message;
     use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -589,6 +642,183 @@ mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use lance_encoding::decoder::DecoderConfig;
     use lance_file::reader::FileReaderOptions;
+
+    #[rstest]
+    #[case::length(false)]
+    #[case::nonempty(true)]
+    #[tokio::test]
+    async fn test_filtered_read_roundtrip_omits_list_payload(
+        #[case] nonempty: bool,
+        #[values(false, true)] preplanned: bool,
+    ) {
+        let payloads: Vec<Vec<u8>> = (1..=2)
+            .map(|seed| {
+                let mut state = seed * 0x9E37_79B9_u64;
+                (0..4096)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect()
+            })
+            .collect();
+        let values = LargeBinaryArray::from(vec![
+            Some(payloads[0].as_slice()),
+            None,
+            Some(b"".as_slice()),
+            Some(payloads[1].as_slice()),
+        ]);
+        let images = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::LargeBinary, true)),
+            OffsetBuffer::new(vec![0_i32, 0, 0, 2, 4].into()),
+            Arc::new(values),
+            Some(NullBuffer::from(vec![false, true, true, true])),
+        )) as ArrayRef;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("images", images.data_type().clone(), true).with_metadata(HashMap::from([
+                (
+                    lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                    "fullzip".to_owned(),
+                ),
+            ])),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2, 3])), images.clone()],
+        )
+        .unwrap();
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let written = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dir,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(written.fragments().len(), 2);
+        // Locate stored payloads independently of the decoder's structural headers.
+        let mut forbidden = HashMap::new();
+        let mut found = 0;
+        for fragment in written.get_fragments() {
+            for file in &fragment.metadata().files {
+                let path = written
+                    .data_file_dir(file)
+                    .unwrap()
+                    .join(file.path.as_str());
+                let bytes = written.object_store.read_one_all(&path).await.unwrap();
+                let spans: Vec<_> = payloads
+                    .iter()
+                    .filter_map(|payload| {
+                        bytes
+                            .windows(payload.len())
+                            .position(|window| window == payload)
+                            .map(|start| {
+                                found += 1;
+                                start as u64..(start + payload.len()) as u64
+                            })
+                    })
+                    .collect();
+                forbidden.insert(path, spans);
+            }
+        }
+        assert_eq!(found, payloads.len());
+        let dataset = Arc::new(Dataset::open(&dir).await.unwrap());
+        dataset.object_store.io_stats_incremental();
+        let mut scanner = dataset.scan();
+        if nonempty {
+            scanner
+                .project(&["id"])
+                .unwrap()
+                .filter("array_length(images) > 0")
+                .unwrap();
+        } else {
+            scanner
+                .project_with_transform(&[("length", "array_length(images)")])
+                .unwrap();
+        }
+        let plan = scanner.create_plan().await.unwrap();
+        let read =
+            crate::dataset::scanner::test_dataset::find_filtered_read(plan.as_ref()).unwrap();
+        let ctx = SessionContext::new();
+        if preplanned {
+            read.get_or_create_plan(ctx.task_ctx()).await.unwrap();
+        }
+        let proto = filtered_read_exec_to_proto(read, &ctx.state())
+            .await
+            .unwrap();
+        assert_eq!(proto.plan.is_some(), preplanned);
+        let decoded = filtered_read_exec_from_proto(
+            pb::FilteredReadExecProto::decode(proto.encode_to_vec().as_slice()).unwrap(),
+            Some(dataset.clone()),
+            None,
+            &ctx.state(),
+        )
+        .await
+        .unwrap();
+        let decoded = Arc::new(decoded) as Arc<dyn ExecutionPlan>;
+        let plan = plan
+            .transform_up(|node| {
+                Ok(if node.is::<FilteredReadExec>() {
+                    Transformed::yes(decoded.clone())
+                } else {
+                    Transformed::no(node)
+                })
+            })
+            .unwrap()
+            .data;
+        let batches = collect(plan.clone(), ctx.task_ctx()).await.unwrap();
+        let result = arrow_select::concat::concat_batches(&plan.schema(), &batches).unwrap();
+        if nonempty {
+            assert_eq!(
+                result
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .as_ref(),
+                &[2, 3]
+            );
+        } else {
+            assert_eq!(
+                result
+                    .column(0)
+                    .as_primitive::<arrow_array::types::UInt64Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![None, Some(0), Some(2), Some(2)]
+            );
+        }
+        let stats = dataset.object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0);
+        for request in &stats.requests {
+            if let Some(payloads) = forbidden.get(&request.path) {
+                if let Some(range) = &request.range {
+                    assert!(
+                        !payloads
+                            .iter()
+                            .any(|payload| range.start < payload.end && payload.start < range.end),
+                        "remote structural scan read an element payload: {request:?}"
+                    );
+                } else {
+                    assert_eq!(request.method, "head");
+                }
+            }
+        }
+        // Decoding a structural request must not mutate the cached dataset's ordinary reads.
+        let full = dataset
+            .scan()
+            .project(&["images"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(full.column(0).to_data(), images.to_data());
+    }
 
     #[test]
     fn test_range_roundtrip() {
@@ -757,6 +987,89 @@ mod tests {
         assert_eq!(
             options.projection.with_row_addr,
             back.projection.with_row_addr
+        );
+    }
+
+    #[rstest]
+    #[case::ordinary(vec![])]
+    #[case::length(vec![(1, ListReadMode::Length)])]
+    #[case::nonempty(vec![(2, ListReadMode::NonEmpty)])]
+    #[case::mixed(vec![(1, ListReadMode::Length), (2, ListReadMode::NonEmpty)])]
+    #[tokio::test]
+    async fn test_options_roundtrip_list_structure(
+        #[case] modes: Vec<(i32, ListReadMode)>,
+        #[values(None, Some(4096))] batch_size_bytes: Option<u64>,
+    ) {
+        let mut dataset = make_test_dataset_with_file_reader_options().await;
+        let defaults = Arc::make_mut(
+            Arc::get_mut(&mut dataset)
+                .unwrap()
+                .file_reader_options
+                .as_mut()
+                .unwrap(),
+        );
+        defaults.batch_size_bytes = Some(8192);
+        // A cached dataset's structural demand must never leak into another plan.
+        defaults.decoder_config.list_structure =
+            Arc::new([(99, ListReadMode::Length)].into_iter().collect());
+        let modes = Arc::new(modes.into_iter().collect());
+        let options = FilteredReadOptions::basic_full_read(&dataset).with_file_reader_options(
+            FileReaderOptions {
+                batch_size_bytes,
+                decoder_config: DecoderConfig {
+                    list_structure: Arc::clone(&modes),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = SessionContext::new().state();
+        let proto =
+            fr_options_to_proto(&options, &Arc::new(dataset.schema().into()), &state).unwrap();
+        let back = fr_options_from_proto(
+            pb::FilteredReadOptionsProto::decode(proto.encode_to_vec().as_slice()).unwrap(),
+            &dataset,
+            &state,
+        )
+        .await
+        .unwrap();
+        let effective = back.file_reader_options.unwrap();
+        assert_eq!(effective.decoder_config.list_structure, modes);
+        assert_eq!(effective.batch_size_bytes, batch_size_bytes.or(Some(8192)));
+        assert_eq!(effective.read_chunk_size, 1234);
+        assert!(effective.decoder_config.validate_on_decode);
+        assert_eq!(
+            dataset
+                .file_reader_options
+                .as_ref()
+                .unwrap()
+                .decoder_config
+                .list_structure
+                .as_ref(),
+            &[(99, ListReadMode::Length)].into_iter().collect()
+        );
+    }
+
+    #[rstest]
+    #[case::unspecified(0)]
+    #[case::unknown(99)]
+    #[case::negative(-1)]
+    #[tokio::test]
+    async fn test_options_reject_invalid_list_structure_mode(#[case] mode: i32) {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let options = FilteredReadOptions::basic_full_read(&dataset);
+        let mut proto =
+            fr_options_to_proto(&options, &Arc::new(dataset.schema().into()), &state).unwrap();
+        proto.list_structure.insert(1, mode);
+        let error = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("invalid list_structure mode {mode} for field 1"))
         );
     }
 
