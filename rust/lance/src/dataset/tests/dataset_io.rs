@@ -4634,11 +4634,14 @@ async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
     );
 }
 
-/// The repair path: drop the offending rows, then tighten the column. Both have
-/// to be reachable on a table that already carries the bad key, or the only
-/// remaining fix is a full overwrite.
+/// The repair path: drop the offending rows, compact them out of the data files,
+/// tighten the column, and read the surviving data back through `add_columns`.
+/// All of it has to stay reachable on a table that already carries the bad key,
+/// or the only remaining fix is a full overwrite.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use lance_core::utils::tempfile::TempStrDir;
 
     let test_dir = TempStrDir::default();
@@ -4651,10 +4654,38 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         .expect("removing the offending rows must not be blocked");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
+    // The deleted row still stores its NULL, which readers of physical rows
+    // reject once the column is non-nullable.
+    let not_null = [ColumnAlteration::new("id".into()).set_nullable(false)];
+    let err = dataset.alter_columns(&not_null).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deleted rows still store NULL values"),
+        "{err}"
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("compacting the deleted rows away must not be blocked");
+
     dataset
-        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .alter_columns(&not_null)
         .await
         .expect("tightening the column completes the repair");
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("doubled".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .expect("the repaired column reads back");
 
     let id_field = dataset
         .schema()
@@ -4666,6 +4697,18 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         !id_field.nullable,
         "the key column must end up non-nullable"
     );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"].as_ref(),
+        &Int32Array::from(vec![1]) as &dyn Array
+    );
+    assert_eq!(
+        batch["doubled"].as_ref(),
+        &Int32Array::from(vec![2]) as &dyn Array
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// The MemWAL variant of the repair path. This is the state the original report
