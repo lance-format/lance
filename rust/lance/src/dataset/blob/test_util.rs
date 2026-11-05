@@ -259,6 +259,7 @@ pub fn reject_empty_range_store() -> Arc<ObjectStore> {
 pub struct RecordingRangeObjectStore {
     pub data: Bytes,
     pub gate: Option<Arc<Semaphore>>,
+    pub head_gate: Option<Arc<Semaphore>>,
     pub head_requests: AtomicUsize,
     pub requested_ranges: std::sync::Mutex<Vec<Range<u64>>>,
     pub started_blob_requests: AtomicUsize,
@@ -272,6 +273,7 @@ impl RecordingRangeObjectStore {
         Self {
             data,
             gate: None,
+            head_gate: None,
             head_requests: AtomicUsize::new(0),
             requested_ranges: std::sync::Mutex::new(Vec::new()),
             started_blob_requests: AtomicUsize::new(0),
@@ -285,6 +287,7 @@ impl RecordingRangeObjectStore {
         Self {
             data,
             gate: Some(gate),
+            head_gate: None,
             head_requests: AtomicUsize::new(0),
             requested_ranges: std::sync::Mutex::new(Vec::new()),
             started_blob_requests: AtomicUsize::new(0),
@@ -363,6 +366,12 @@ impl object_store::ObjectStore for RecordingRangeObjectStore {
     ) -> object_store::Result<GetResult> {
         if options.head {
             self.head_requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.head_gate {
+                gate.acquire()
+                    .await
+                    .expect("test metadata gate should remain open")
+                    .forget();
+            }
         }
         let range = match options.range {
             Some(GetRange::Bounded(range)) => range,

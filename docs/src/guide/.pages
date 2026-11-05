@@ -4,9 +4,12 @@ nav:
     - Data Types: data_types.md
     - Stable Row IDs and Lineage: row_ids.md
     - Blob API: blob.md
+    - Lightweight Snapshot References: snapshot_references.md
+    - Portable Blob References: blob_references.md
     - JSON Support: json.md
     - Data Evolution: data_evolution.md
     - Tags and Branches: tags_and_branches.md
+    - Snapshot Retention: snapshot_retention.md
   - Indexing and Search:
     - Overview: indexing.md
     - Scalar Indexes: scalar_indexing.md

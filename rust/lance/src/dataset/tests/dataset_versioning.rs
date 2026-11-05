@@ -2290,7 +2290,7 @@ async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bo
         let barrier = barrier.clone();
         async move {
             barrier.wait().await;
-            dataset.delete_branch(&format!("b{i}")).await.unwrap();
+            (i, dataset.delete_branch(&format!("b{i}")).await)
         }
     });
     let list = async {
@@ -2300,7 +2300,16 @@ async fn test_concurrent_branch_deletes_and_listing(#[case] use_object_store: bo
             tokio::task::yield_now().await;
         }
     };
-    tokio::join!(futures::future::join_all(deletes), list);
+    let (results, ()) = tokio::join!(futures::future::join_all(deletes), list);
+    // Ordinary deletions share an exclusive maintenance lock, so competing
+    // calls may need a retry after the lock owner finishes.
+    for (i, result) in results {
+        if let Err(error) = result {
+            assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+            assert!(error.to_string().contains("maintenance lock"), "{error}");
+            dataset.delete_branch(&format!("b{i}")).await.unwrap();
+        }
+    }
     assert!(dataset.list_branches().await.unwrap().is_empty());
     let files = dataset
         .object_store

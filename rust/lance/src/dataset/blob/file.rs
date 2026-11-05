@@ -227,10 +227,10 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
 
 /// Cache key for sharing one [`BlobSource`] across multiple blob descriptors.
 ///
-/// We include the store prefix as well as the path so the same path string in
-/// different object stores is never conflated.
+/// Store identity keeps equal URIs with different authenticated bindings separate.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BlobSourceKey {
+    pub(super) store_id: usize,
     pub(super) store_prefix: String,
     pub(super) path: String,
 }
@@ -239,6 +239,7 @@ impl BlobSourceKey {
     /// Build the cache key for one shared [`BlobSource`].
     pub(super) fn new(source: &BlobSource) -> Self {
         Self {
+            store_id: Arc::as_ptr(&source.object_store) as usize,
             store_prefix: source.object_store.store_prefix.clone(),
             path: source.path.to_string(),
         }
@@ -255,6 +256,7 @@ pub(super) fn shared_blob_source(
     path: &Path,
 ) -> Arc<BlobSource> {
     let key = BlobSourceKey {
+        store_id: Arc::as_ptr(&object_store) as usize,
         store_prefix: object_store.store_prefix.clone(),
         path: path.to_string(),
     };

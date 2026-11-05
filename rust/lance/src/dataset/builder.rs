@@ -48,6 +48,7 @@ pub struct DatasetBuilder {
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
     version: Option<Ref>,
+    snapshot: Option<super::snapshot::SnapshotRef>,
     table_uri: String,
     file_reader_options: Option<FileReaderOptions>,
     /// Storage options that override user-provided options (e.g., from namespace client)
@@ -71,6 +72,7 @@ impl std::fmt::Debug for DatasetBuilder {
             .field("session", &self.session.is_some())
             .field("commit_handler", &self.commit_handler.is_some())
             .field("version", &self.version)
+            .field("snapshot", &self.snapshot)
             .field("table_uri", &self.table_uri)
             .field("file_reader_options", &self.file_reader_options)
             .field(
@@ -94,12 +96,32 @@ impl DatasetBuilder {
             commit_handler: None,
             session: None,
             version: None,
+            snapshot: None,
             manifest: None,
             file_reader_options: None,
             storage_options_override: None,
             base_store_params: HashMap::new(),
             namespace_managed: None,
         }
+    }
+
+    /// Reopen an exact snapshot using independently supplied storage settings.
+    ///
+    /// Resolution validates the manifest digest and commit identity. It never
+    /// falls back to the latest version. The reference does not supply credentials
+    /// or acquire retention.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::builder::DatasetBuilder;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
+    /// let worker = DatasetBuilder::from_snapshot(snapshot).load().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_snapshot(snapshot: super::snapshot::SnapshotRef) -> Self {
+        Self::from_uri(snapshot.table_uri()).with_snapshot_ref(snapshot)
     }
 
     /// Create a DatasetBuilder from a LanceNamespace client
@@ -118,7 +140,7 @@ impl DatasetBuilder {
     /// # Example
     /// ```ignore
     /// use lance_namespace_impls::ConnectBuilder;
-    /// use lance::dataset::DatasetBuilder;
+    /// use lance::dataset::builder::DatasetBuilder;
     ///
     /// // Connect to a REST namespace
     /// let namespace_client = ConnectBuilder::new("rest")
@@ -234,6 +256,27 @@ impl DatasetBuilder {
     /// Defaults to 4KB for local files and 64KB for others
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.options.block_size = Some(block_size);
+        self
+    }
+
+    /// Require this exact snapshot, including its original manifest digest.
+    ///
+    /// The builder URI must be the reference's table root. Combining a snapshot
+    /// reference with a version, branch, tag, or serialized manifest is an error.
+    /// Storage and per-base settings are resolved independently on the worker.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::builder::DatasetBuilder;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
+    /// let worker = DatasetBuilder::from_uri(snapshot.table_uri())
+    ///     .with_snapshot_ref(snapshot.clone()).load().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_snapshot_ref(mut self, snapshot: super::snapshot::SnapshotRef) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 
@@ -614,9 +657,9 @@ impl DatasetBuilder {
     /// supported because listing physical manifest objects may omit committed versions whose
     /// authoritative locations are held outside the object store.
     pub async fn list_manifest_locations(mut self) -> Result<Vec<ManifestLocation>> {
-        if self.version.is_some() {
+        if self.version.is_some() || self.snapshot.is_some() {
             return Err(Error::invalid_input(
-                "list_manifest_locations does not support an explicit version, branch, or tag",
+                "list_manifest_locations does not support an explicit version, branch, tag, or snapshot_ref",
             ));
         }
         let uses_external_or_custom_commit_handler = self.commit_handler.is_some()
@@ -690,6 +733,14 @@ impl DatasetBuilder {
     }
 
     async fn load_impl(mut self) -> Result<Dataset> {
+        if self.snapshot.is_some() && (self.version.is_some() || self.manifest.is_some()) {
+            return Err(Error::invalid_input(
+                "snapshot_ref cannot be combined with version, branch, tag, or serialized_manifest",
+            ));
+        }
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate_table_uri(&self.table_uri)?;
+        }
         // Apply storage_options_override to merge namespace client options with any existing accessor
         self.apply_storage_options_override();
 
@@ -728,7 +779,40 @@ impl DatasetBuilder {
         let managed_store_active =
             self.namespace_managed.is_some() && self.commit_handler.is_none();
 
+        let snapshot = self.snapshot.take();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+
+        if let Some(snapshot) = snapshot {
+            let location = BranchLocation {
+                path: base_path,
+                uri: table_uri,
+                branch: None,
+            }
+            .find_branch(snapshot.branch())?;
+            let manifest_location = commit_handler
+                .resolve_version_location(&location.path, snapshot.version(), &object_store.inner)
+                .await?;
+            let (manifest, digest) =
+                Dataset::get_manifest(&object_store, &manifest_location, &location.uri, &session)
+                    .await?;
+            let mut dataset = Dataset::checkout_manifest(
+                object_store,
+                location.path,
+                location.uri,
+                manifest,
+                manifest_location,
+                session,
+                commit_handler,
+                file_reader_options,
+                Some(store_params),
+                base_store_params,
+            )
+            .await?;
+            dataset.snapshot_digest = digest;
+            dataset.ensure_snapshot_digest().await?;
+            dataset.validate_snapshot(&snapshot)?;
+            return Ok(dataset);
+        }
 
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest
@@ -885,7 +969,7 @@ impl DatasetBuilder {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
-        let (manifest, location) = if let Some(mut manifest) = manifest {
+        let (manifest, location, digest) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
             versions::check_manifest_storage_version(&mut manifest)?;
             let location = commit_handler
@@ -895,7 +979,7 @@ impl DatasetBuilder {
                 let reader = object_store.open(&location.path).await?;
                 populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
-            (Arc::new(manifest), location)
+            (Arc::new(manifest), location, None)
         } else {
             let manifest_location = match version_number {
                 Some(version) => {
@@ -929,17 +1013,17 @@ impl DatasetBuilder {
                     })?,
             };
 
-            let manifest = Dataset::get_manifest(
+            let (manifest, digest) = Dataset::get_manifest(
                 &object_store,
                 &manifest_location,
                 &table_uri,
                 session.as_ref(),
             )
             .await?;
-            (manifest, manifest_location)
+            (manifest, manifest_location, Some(digest))
         };
 
-        Dataset::checkout_manifest(
+        let mut dataset = Dataset::checkout_manifest(
             object_store,
             base_path,
             table_uri,
@@ -951,7 +1035,11 @@ impl DatasetBuilder {
             store_params,
             base_store_params,
         )
-        .await
+        .await?;
+        if let Some(digest) = digest {
+            dataset.snapshot_digest = digest;
+        }
+        Ok(dataset)
     }
 }
 
