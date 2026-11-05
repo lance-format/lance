@@ -28,7 +28,7 @@ use crate::{
     scalar::btree::flat::{FlatIndex, PageMatches},
 };
 use crate::{
-    progress::{IndexBuildProgress, noop_progress},
+    progress::{IndexBuildProgress, noop_progress, stage_until_first_batch},
     scalar::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
@@ -4313,7 +4313,7 @@ impl BasicTrainer for BTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = request
             .as_any()
@@ -4333,6 +4333,10 @@ impl BasicTrainer for BTreeIndexPlugin {
                  The `range_id` field will be removed in a future release."
             );
         }
+        let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
+        progress
+            .stage_start("write_btree_index", None, "files")
+            .await?;
         let files = train_btree_index(
             data,
             index_store,
@@ -4344,6 +4348,7 @@ impl BasicTrainer for BTreeIndexPlugin {
             None,
         )
         .await?;
+        progress.stage_complete("write_btree_index").await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())
                 .unwrap(),

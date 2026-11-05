@@ -738,17 +738,23 @@ async fn train_label_list_index_with_plan(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
     mem_pool_size: Option<u64>,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<(IndexFile, Arc<dyn ExecutionPlan>)> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
     let data = track_list_nulls(data, list_nulls.clone());
     let data = unnest_chunks(data)?;
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
+    let sorted = crate::progress::stage_until_first_batch(progress, "sort_values", sorted).await?;
 
+    progress
+        .stage_start("write_label_list_index", None, "files")
+        .await?;
     let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
+    progress.stage_complete("write_label_list_index").await?;
     Ok((file, sort_plan))
 }
 
@@ -756,8 +762,9 @@ async fn train_label_list_index_with_plan(
 async fn train_label_list_index(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<IndexFile> {
-    train_label_list_index_with_plan(data, index_store, None)
+    train_label_list_index_with_plan(data, index_store, None, progress)
         .await
         .map(|(file, _sort_plan)| file)
 }
@@ -1089,7 +1096,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         // index covering exactly those rows is produced. Segments are recombined by
         // `merge_label_list_indices`.
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let schema = data.schema();
         let field = schema
@@ -1105,7 +1112,7 @@ impl BasicTrainer for LabelListIndexPlugin {
 
         validate_label_list_data_type(field.data_type())?;
 
-        let file = train_label_list_index(data, index_store).await?;
+        let file = train_label_list_index(data, index_store, progress.as_ref()).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
@@ -1255,6 +1262,7 @@ mod tests {
     use super::super::btree::OrderableScalarValue;
     use super::*;
     use crate::metrics::LocalMetricsCollector;
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
 
@@ -1390,9 +1398,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index_with_plan(stream, store.as_ref(), Some(32 * 1024 * 1024))
-            .await
-            .expect("the wide-list fixture must build with the selected pool");
+        train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(32 * 1024 * 1024),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("the wide-list fixture must build with the selected pool");
 
         // Every row carries every label, so each posting covers all rows.
         let expected = IndexContents {
@@ -1539,9 +1552,13 @@ mod tests {
 
     async fn build_label_list_index(rows: &[SampleRow]) -> IndexContents {
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         read_index_contents(store.as_ref()).await
     }
 
@@ -1593,6 +1610,7 @@ mod tests {
             sample_rows_to_stream(&rows),
             store.as_ref(),
             Some(SPILL_FORCING_POOL_BYTES),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1658,10 +1676,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        let (_file, sort_plan) =
-            train_label_list_index_with_plan(stream, store.as_ref(), Some(POOL_BYTES))
-                .await
-                .expect("wide labels must build when a large pool's sort spills");
+        let (_file, sort_plan) = train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(POOL_BYTES),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("wide labels must build when a large pool's sort spills");
 
         let metrics = sort_plan.metrics().expect("SortExec must report metrics");
         assert!(
@@ -1689,9 +1711,13 @@ mod tests {
 
     async fn build_label_list_segment(rows: &[SampleRow]) -> (TempObjDir, Arc<LabelListIndex>) {
         let (tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
@@ -1786,9 +1812,13 @@ mod tests {
         // Built here rather than via build_label_list_segment so the source
         // store stays reachable, to compare against after the remap.
         let (_src_dir, src_store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(&rows),
+            src_store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(src_store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
@@ -2333,9 +2363,13 @@ mod tests {
             }
             "remap" => {
                 let (_src_dir, src_store) = test_util::index_store();
-                train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-                    .await
-                    .unwrap();
+                train_label_list_index(
+                    sample_rows_to_stream(&rows),
+                    src_store.as_ref(),
+                    &NoopIndexBuildProgress,
+                )
+                .await
+                .unwrap();
                 let index = LabelListIndex::load(src_store, None, &LanceCache::no_cache(), true)
                     .await
                     .unwrap();
