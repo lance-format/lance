@@ -18,7 +18,7 @@ use prost::Name;
 use prost_types::Any;
 
 use super::scalar::IndexDetails;
-use super::{index_is_usable, unsupported_index_version};
+use super::{segment::index_is_usable, segment::unsupported_index_version};
 
 pub mod history;
 
@@ -338,7 +338,10 @@ mod tests {
     use crate::dataset::{CommitBuilder, WriteParams};
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, load_all_indices};
+    use crate::index::{
+        DatasetIndexExt,
+        loading::{DatasetIndexInternalExt, load_all_indices},
+    };
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     fn index_with(name: &str, details: Option<Any>, index_version: i32) -> IndexMetadata {

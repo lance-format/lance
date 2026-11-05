@@ -2104,6 +2104,39 @@ async fn test_per_value_zstd_round_trip_large_values_with_nulls() {
     }
 }
 
+/// A full-zip page above the fan-out threshold exercises the async chunk path
+/// through the real page encoder and preserves the page-level frame layout.
+#[tokio::test]
+async fn test_per_value_zstd_parallel_page_round_trip() {
+    use crate::constants::{
+        COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+    };
+
+    let values: Vec<String> = (0..40)
+        .map(|i| format!("{i:04}-{}", "0123456789abcdef".repeat(18_000)))
+        .collect();
+    let metadata = HashMap::from([
+        (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
+        (
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            STRUCTURAL_ENCODING_FULLZIP.to_string(),
+        ),
+    ]);
+    let test_cases = TestCases::default()
+        .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32])
+        .with_page_sizes(vec![64 * 1024 * 1024])
+        .with_batch_size(10)
+        .with_range(0..40)
+        .with_indices(vec![0, 1, 2, 30, 39])
+        .with_expected_encoding("zstd");
+    check_round_trip_encoding_of_data(
+        vec![Arc::new(StringArray::from(values)) as ArrayRef],
+        &test_cases,
+        metadata,
+    )
+    .await;
+}
+
 #[rstest::rstest]
 #[tokio::test]
 async fn test_axis_delta_per_value_compression(
