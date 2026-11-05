@@ -401,7 +401,7 @@ impl BlobLocator {
                 size,
             } => {
                 return context.reference(
-                    uri,
+                    uri.to_string(),
                     position,
                     (size > 0).then_some(size),
                     BlobKind::External,
@@ -464,7 +464,7 @@ impl BlobLocator {
             })?
             .pop_if_empty()
             .extend(relative.map(|part| part.as_ref().to_string()));
-        context.reference(url.as_str(), position, size, kind, base_id)
+        context.reference(url.into(), position, size, kind, base_id)
     }
 
     /// The base that a Managed blob's `uri` is relative to: the descriptor's
