@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! SIMD kernels for the RaBitQ top-k lower-bound pruning scan.
+//! SIMD kernels for classifying RaBitQ statistical confidence bounds.
 //!
-//! Multi-bit IVF_RQ search gates the exact ex-code rerank with a per-row
-//! distance lower bound: after the binary FastScan fills the per-row binary
-//! inner products, every row of the partition is classified against the query
-//! upper bound and the current top-k heap threshold, and only the survivors
-//! (typically well under 1%) are reranked. The classification is the per-row
-//! formula of `RabitDistCalculator::raw_query_lower_bound`:
+//! These bounds are probabilistic and can exceed the reported multi-bit
+//! distance. Multi-bit IVF_RQ scans therefore score every accepted candidate
+//! before applying distance ranges or heap thresholds. These public kernels
+//! remain available for callers that explicitly accept probabilistic pruning.
 //!
 //! ```text
 //! lower_bound = (binary_ip - 0.5 * sum_q) * scale_factor
@@ -18,8 +16,7 @@
 //!
 //! These kernels evaluate the formula and both comparisons for
 //! [`PRUNE_LANES`] rows at a time, returning bit masks instead of values so
-//! the caller can skip whole groups (the overwhelmingly common case) and run
-//! the existing scalar rerank only for the surviving lanes.
+//! the caller can identify surviving lanes.
 //!
 //! Correctness contract:
 //!
@@ -28,7 +25,7 @@
 //!   rounds differently, which could prune a row the scalar code would have
 //!   kept; with bit-identical lower bounds the masks reproduce the scalar
 //!   `>=` decisions exactly, keeping heap contents and prune-stats counters
-//!   unchanged.
+//!   unchanged. Matching scalar decisions does not make the bound strict.
 //! - Comparisons use ordered-quiet GE predicates (`_CMP_GE_OQ`), matching
 //!   scalar `>=`: a NaN lower bound is never pruned and falls through to the
 //!   exact rerank.
@@ -82,8 +79,7 @@ pub fn prune_mask_kernel() -> PruneMaskFn {
     }
 }
 
-/// Per-query constants of the lower-bound formula, mirroring
-/// `RabitDistCalculator::raw_query_lower_bound` term by term.
+/// Per-query constants of the statistical confidence-bound formula.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ScaledLowerBoundTerms {
     /// `0.5 * sum_q`, subtracted from the binary inner product.
@@ -383,8 +379,7 @@ mod tests {
         kernels
     }
 
-    /// Per-lane reference mirroring `raw_query_lower_bound` and the scalar
-    /// pruning checks of the top-k scan.
+    /// Per-lane reference for the statistical confidence-bound comparisons.
     fn reference_masks(
         dists: &[f32; PRUNE_LANES],
         scale_factors: &[f32; PRUNE_LANES],

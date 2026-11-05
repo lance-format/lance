@@ -344,8 +344,8 @@ impl Scan {
     }
 }
 
-/// Where stage 1 takes its heap threshold from. Every variant but the
-/// negative controls' `Fixed` is a legal (possibly stale) heap top.
+/// Where stage 1 takes its heap threshold from. None may exclude a candidate
+/// based on a probabilistic sign-only confidence interval.
 #[derive(Debug, Clone, Copy)]
 enum Threshold {
     Unbounded,
@@ -356,7 +356,7 @@ enum Threshold {
     NextUp,
     /// The top published when the heap first filled.
     FirstFull,
-    /// A caller-chosen threshold, used only to show illegal ones break parity.
+    /// A caller-chosen threshold, including a 1-bit estimate.
     Fixed(f32),
 }
 
@@ -734,11 +734,7 @@ fn sign_stage_matches_full_store(
                         to_bits(&expected_ips),
                         "binary inner products differ: rows={rows} mode={approx_mode:?}"
                     );
-                    let expected_bounds: Vec<f32> = expected_ips
-                        .iter()
-                        .enumerate()
-                        .map(|(row, &ip)| eager.raw_query_lower_bound(row, ip).unwrap())
-                        .collect();
+                    let expected_bounds = vec![f32::NEG_INFINITY; rows];
                     assert_eq!(
                         to_bits(&stage.lower_bounds),
                         to_bits(&expected_bounds),
@@ -846,8 +842,8 @@ fn lazy_replay_equals_dense_heap(
         }
     }
     assert!(
-        prunes.stage1 > 0 && prunes.stage2 > 0,
-        "the replays must prune in stage 1 and re-prune stale over-fetch in stage 2: {prunes:?}"
+        prunes.stage1 == 0 && prunes.stage2 == 0,
+        "confidence intervals must not prune full-score candidates: {prunes:?}"
     );
 }
 
@@ -902,11 +898,10 @@ fn ties_keep_incumbents_in_probe_order() {
     );
 }
 
-/// Negative controls: the parity above depends on carrying the original
-/// partition's binary inner products and on taking the threshold only from
-/// the full-score heap.
+/// Preserve original binary inner products, but do not use statistical bounds
+/// to exclude candidates, even when the caller provides a 1-bit threshold.
 #[test]
-fn illegal_inputs_break_parity() {
+fn binary_precision_and_confidence_thresholds() {
     let mut rng = SplitMix64(0x4e67);
     let fixture = Fixture::new(64, 7, DistanceType::L2, &mut rng);
 
@@ -949,56 +944,12 @@ fn illegal_inputs_break_parity() {
         "recomputed inner products must change some full-precision score"
     );
 
-    // A threshold below the live heap top prunes a row the eager scan keeps.
     let probes: Vec<Partition> = (0..4)
         .map(|part| fixture.random_partition(100, part * 1_000, &mut rng))
         .collect();
     let probes: Vec<&Partition> = probes.iter().collect();
-    let scan = Scan::top_k(10);
-    let (last, entrant_bound, live, eager_bits) = (1..probes.len())
-        .rev()
-        .find_map(|last| {
-            let prefix = &probes[..=last];
-            let (eager, _) = eager_scan(&fixture, prefix, scan, None);
-            let kept: HashSet<u64> = eager.iter().map(|node| node.id).collect();
-            let partition = prefix[last];
-            let stage = stage_one(
-                &fixture,
-                partition,
-                &fixture.sign_storage(partition),
-                scan.approx_mode,
-            )
-            .unwrap();
-            let entrant_bound = partition
-                .row_ids
-                .iter()
-                .zip(&stage.lower_bounds)
-                .filter(|(row_id, _)| kept.contains(row_id))
-                .map(|(_, &bound)| bound)
-                .min_by(f32::total_cmp)?;
-            let (before, _) = eager_scan(&fixture, &prefix[..last], scan, None);
-            let live = before.peek().unwrap().dist.0;
-            Some((last, entrant_bound, live, heap_bits(eager)))
-        })
-        .expect("some later probe must place a row in the final top-k");
-    assert!(
-        entrant_bound < live,
-        "an entrant was reranked below the live top"
-    );
-    let (tightened, _, _) = lazy_scan(
-        &fixture,
-        &probes[..=last],
-        scan,
-        None,
-        Lazy {
-            threshold: Threshold::Fixed(entrant_bound),
-            gather: Gather::Take,
-        },
-    );
-    assert_ne!(heap_bits(tightened), eager_bits);
 
     // The k-th best 1-bit estimate is not a full-score threshold.
-    let mut broke = 0;
     for k in 1..=30 {
         let scan = Scan::top_k(k);
         let (eager, _) = eager_scan(&fixture, &probes, scan, None);
@@ -1028,12 +979,8 @@ fn illegal_inputs_break_parity() {
                 gather: Gather::Take,
             },
         );
-        broke += usize::from(heap_bits(estimated) != heap_bits(eager));
+        assert_eq!(heap_bits(estimated), heap_bits(eager));
     }
-    assert!(
-        broke > 0,
-        "a 1-bit estimate threshold must lose some true top-k row"
-    );
 }
 
 /// The rows of `partition` at `rows`, re-materialized as their own partition.
@@ -1121,9 +1068,9 @@ fn filters_match_eager_filtered_scan(#[case] accept: fn(usize, usize) -> bool) {
     }
 }
 
-/// Query distance ranges, including an upper bound below every lower bound
-/// (no survivors), a lower bound above every score (every exact score is
-/// rejected) and a heap that never fills.
+/// Query distance ranges, including an upper bound below every score, a
+/// lower bound above every score, and a heap that never fills. Range checks
+/// must use the multi-bit score.
 #[test]
 fn range_bounds_match_eager() {
     let mut rng = SplitMix64(0x5A9E);
@@ -1135,19 +1082,8 @@ fn range_bounds_match_eager() {
         .collect();
     let probes: Vec<&Partition> = partitions.iter().collect();
     let total: usize = partitions.iter().map(Partition::len).sum();
-    let mut bounds = Vec::new();
     let mut scores = Vec::new();
     for partition in &partitions {
-        bounds.extend(
-            stage_one(
-                &fixture,
-                partition,
-                &fixture.sign_storage(partition),
-                ApproxMode::Normal,
-            )
-            .unwrap()
-            .lower_bounds,
-        );
         scores.extend(
             fixture
                 .full_storage(partition)
@@ -1161,7 +1097,7 @@ fn range_bounds_match_eager() {
                 .distance_all(partition.len()),
         );
     }
-    let min_bound = bounds.iter().copied().min_by(f32::total_cmp).unwrap();
+    let min_score = scores.iter().copied().min_by(f32::total_cmp).unwrap();
     let max_score = scores.iter().copied().max_by(f32::total_cmp).unwrap();
     let median = {
         let mut sorted = scores.clone();
@@ -1173,7 +1109,7 @@ fn range_bounds_match_eager() {
         (Some(median), None),
         (None, Some(median)),
         (Some(median - 1.0), Some(median + 1.0)),
-        (None, Some(min_bound.next_down())),
+        (None, Some(min_score.next_down())),
         (Some(max_score.next_up()), None),
     ];
     for (lower, upper) in ranges {
@@ -1203,7 +1139,7 @@ fn range_bounds_match_eager() {
         Scan {
             k: 10,
             lower: None,
-            upper: Some(min_bound.next_down()),
+            upper: Some(min_score.next_down()),
             approx_mode: ApproxMode::Normal,
         },
         None,
@@ -1212,7 +1148,7 @@ fn range_bounds_match_eager() {
     assert!(
         counters
             .iter()
-            .all(|c| c.pruned_upper_bound == c.candidates)
+            .all(|c| c.pruned_upper_bound == 0 && c.exact_rejected == c.candidates)
     );
     let (heap, counters) = eager_scan(
         &fixture,
@@ -1233,10 +1169,9 @@ fn range_bounds_match_eager() {
     );
 }
 
-/// NaN bounds are never pruned and infinite ones are pruned as upper-bound
-/// rows, in both scans.
+/// Non-finite confidence factors must not exclude full-score candidates.
 #[test]
-fn non_finite_bounds_match_eager() {
+fn non_finite_confidence_factors_match_eager() {
     let mut rng = SplitMix64(0x0A11);
     let fixture = Fixture::new(64, 7, DistanceType::L2, &mut rng);
     let partitions: Vec<Partition> = [70, 40]
@@ -1272,8 +1207,12 @@ fn non_finite_bounds_match_eager() {
         ApproxMode::Normal,
     )
     .unwrap();
-    assert!(stage.lower_bounds[3].is_nan());
-    assert_eq!(stage.lower_bounds[7], f32::INFINITY);
+    assert!(
+        stage
+            .lower_bounds
+            .iter()
+            .all(|bound| *bound == f32::NEG_INFINITY)
+    );
     for k in [1, 5, 50] {
         for gather in GATHERS {
             for threshold in [Threshold::Live, Threshold::Stale(1), Threshold::FirstFull] {

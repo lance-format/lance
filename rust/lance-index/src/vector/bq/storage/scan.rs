@@ -96,6 +96,8 @@ impl<'a> ExRows<'a> {
 #[derive(Debug, Default, Clone)]
 pub struct SignStage {
     pub binary_ips: Vec<f32>,
+    /// Negative infinity for every row: sign-only scores cannot bound the
+    /// reported multi-bit distances deterministically.
     pub lower_bounds: Vec<f32>,
 }
 
@@ -107,7 +109,8 @@ pub struct SurvivorRow {
     pub row_id: u64,
     /// Stage-1 binary inner product of the row's original sign-plane offset.
     pub binary_ip: f32,
-    /// Stage-1 lower bound of the row's original sign-plane offset.
+    /// Stage-1 bound at the original sign-plane offset; currently negative
+    /// infinity because the 1-bit confidence interval cannot safely prune.
     pub lower_bound: f32,
 }
 
@@ -304,11 +307,11 @@ impl<'a> RabitDistCalculator<'a> {
         dists
     }
 
-    /// Compute sign inner products and native lower bounds at physical offsets.
+    /// Compute sign inner products and unbounded candidate ranges at physical offsets.
     /// FRI tombstones retain their slots; surviving rows match the full scan's
     /// precision after those slots are removed.
-    /// Returns the full scan's gating reason without changing `out` when
-    /// Fast mode, the estimator or missing error factors prevent pruning.
+    /// Returns the full scan's fallback reason without changing `out` when
+    /// Fast mode, the estimator or missing error factors require the fallback scan.
     pub fn full_sign_stage_with_scratch(
         &self,
         out: &mut SignStage,
@@ -325,7 +328,7 @@ impl<'a> RabitDistCalculator<'a> {
         )
     }
 
-    /// Prepare bounds using the scalar LUT precision of filtered partition search.
+    /// Prepare inner products using the scalar LUT precision of filtered partition search.
     ///
     /// ```
     /// # use lance_index::vector::bq::storage::{RabitDistCalculator, SignStage};
@@ -361,12 +364,9 @@ impl<'a> RabitDistCalculator<'a> {
         hacc_quantized_dists: &mut Vec<u32>,
         scalar: bool,
     ) -> std::result::Result<(), &'static str> {
-        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+        if let Some(reason) = self.raw_query_multi_bit_topk_disabled_reason() {
             return Err(reason);
         }
-        let Some(error_factors) = self.error_factors else {
-            return Err("missing_error_factors");
-        };
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         out.lower_bounds.clear();
@@ -389,23 +389,18 @@ impl<'a> RabitDistCalculator<'a> {
                 hacc_quantized_dists,
             );
         }
-        // Same expression as `raw_query_lower_bound`, so the survivors'
-        // bounds match the eager scan's (and its prune masks) bit for bit.
-        out.lower_bounds
-            .extend(out.binary_ips.iter().enumerate().map(|(id, &binary_ip)| {
-                self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error
-            }));
+        // The stored 1-bit error is a confidence interval, not a guaranteed
+        // bound on the multi-bit score. Keep every accepted row for stage 2.
+        out.lower_bounds.resize(n, f32::NEG_INFINITY);
         Ok(())
     }
     fn raw_query_ex_context(
         &self,
-        n: usize,
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
     ) -> RawQueryTopkContext<'_> {
         RawQueryTopkContext {
-            n,
             k,
             ex_bits: self.num_bits - 1,
             ex_codes: self
@@ -462,7 +457,7 @@ impl<'a> RabitDistCalculator<'a> {
         if k == 0 || n == 0 {
             return counters;
         }
-        let ctx = self.raw_query_ex_context(n, k, lower_bound, upper_bound);
+        let ctx = self.raw_query_ex_context(k, lower_bound, upper_bound);
         let mut full = res.len() >= k;
         for row in rows {
             counters.exact += 1;
@@ -525,7 +520,7 @@ impl<'a> RabitDistCalculator<'a> {
         if k == 0 || n == 0 {
             return counters;
         }
-        let ctx = self.raw_query_ex_context(n, k, lower_bound, upper_bound);
+        let ctx = self.raw_query_ex_context(k, lower_bound, upper_bound);
         let mut max_dist = res.peek().map(|node| node.dist);
         let mut is_full = res.len() >= k;
         for row in rows {
@@ -534,7 +529,6 @@ impl<'a> RabitDistCalculator<'a> {
                 row.ex_index as usize,
                 row.row_id,
                 row.binary_ip,
-                row.lower_bound,
                 res,
                 &mut max_dist,
                 &mut counters,

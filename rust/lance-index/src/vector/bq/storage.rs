@@ -20,7 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use itertools::{Itertools, izip};
+use itertools::Itertools;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, RecordBatchExt};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -55,7 +55,6 @@ use crate::vector::bq::ex_dot::{
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
 use crate::vector::bq::pairwise::{RQKernel, RQPairScorer};
-use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_mask_kernel};
 use crate::vector::bq::rotation::{
     apply_fast_rotation, apply_fast_rotation_in_place, fast_rotation_signs_len,
 };
@@ -149,10 +148,12 @@ fn emit_rabit_prune_stats(message: &str) {
     );
 }
 
-/// Per-scan tallies of the raw-query lower-bound gating, reported through
+/// Per-scan tallies of raw-query multi-bit scoring, reported through
 /// `record_rabit_prune_stats`. Every candidate row lands in exactly one of
 /// `pruned_upper_bound`, `pruned_heap` or `exact`; `exact_rejected` counts
 /// the exactly scored rows that fell outside the query's distance range.
+/// Confidence intervals no longer prune candidates, so native scans score
+/// every accepted row and leave the prune counts at zero.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RabitPruneCounters {
     pub candidates: usize,
@@ -162,21 +163,21 @@ pub struct RabitPruneCounters {
     pub exact_rejected: usize,
 }
 
-/// Cumulative raw-query prune counters since process start. They advance only
+/// Cumulative raw-query scoring counters since process start. They advance only
 /// while `LANCE_RQ_PRUNE_STATS` is enabled (reported by `enabled`), so callers
 /// compare two snapshots instead of reading absolute values.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RabitPruneStatsSnapshot {
     pub enabled: bool,
-    /// Gated partition scans that reported counters.
+    /// Multi-bit partition scans that reported per-candidate counters.
     pub calls: u64,
     pub candidates: u64,
     pub pruned_upper_bound: u64,
     pub pruned_heap: u64,
     pub exact: u64,
     pub exact_rejected: u64,
-    /// Partition scans that could not gate on the lower bound (Fast mode,
-    /// residual estimator, or no error factors) and scored every row.
+    /// Partition scans using the bulk distance path (Fast mode, residual
+    /// estimator, or no error factors).
     pub bypass_calls: u64,
 }
 
@@ -985,11 +986,9 @@ struct RabitDistCalculatorParts<'a> {
     raw_query: Option<&'a RabitRawQueryContext>,
 }
 
-/// Loop-invariant inputs of the raw-query multi-bit top-k scans: the row
-/// count, the resolved ex-code state for exact reranking, and the query
-/// bounds.
+/// Loop-invariant inputs of the raw-query multi-bit top-k scans: the resolved
+/// ex-code state for exact reranking and the query bounds.
 struct RawQueryTopkContext<'a> {
-    n: usize,
     k: usize,
     ex_bits: u8,
     ex_codes: &'a [u8],
@@ -1527,12 +1526,6 @@ impl<'a> RabitDistCalculator<'a> {
     }
 
     #[inline]
-    pub(crate) fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
-        let error_factors = self.error_factors?;
-        Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
-    }
-
-    #[inline]
     #[allow(clippy::too_many_arguments)]
     fn raw_query_multi_bit_exact_distance(
         &self,
@@ -1584,7 +1577,6 @@ impl<'a> RabitDistCalculator<'a> {
         );
 
         Some(RawQueryTopkContext {
-            n,
             k,
             ex_bits: self.num_bits - 1,
             ex_codes: self
@@ -1601,9 +1593,9 @@ impl<'a> RabitDistCalculator<'a> {
         })
     }
 
-    /// Process one candidate row given its lower bound: the bound checks,
-    /// the exact rerank, and the heap update shared by the sparse scan and
-    /// the dense scan's surviving lanes and tail.
+    /// Score every accepted candidate before applying distance bounds or the
+    /// heap threshold. The 1-bit confidence interval is probabilistic and can
+    /// exclude a row whose multi-bit score would improve the heap.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn accumulate_raw_query_multi_bit_row(
@@ -1612,20 +1604,10 @@ impl<'a> RabitDistCalculator<'a> {
         id: usize,
         row_id: u64,
         binary_ip: f32,
-        raw_lower_bound: f32,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         max_dist: &mut Option<OrderedFloat>,
         counters: &mut RabitPruneCounters,
     ) {
-        if raw_lower_bound >= ctx.query_upper_bound {
-            counters.pruned_upper_bound += 1;
-            return;
-        }
-        if res.len() >= ctx.k && max_dist.is_some_and(|max_dist| raw_lower_bound >= max_dist.0) {
-            counters.pruned_heap += 1;
-            return;
-        }
-
         counters.exact += 1;
         let dist = self.raw_query_multi_bit_exact_distance(
             id,
@@ -1687,15 +1669,11 @@ impl<'a> RabitDistCalculator<'a> {
                 continue;
             };
             counters.candidates += 1;
-            let Some(raw_lower_bound) = self.raw_query_lower_bound(id, binary_ip) else {
-                continue;
-            };
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 id,
                 row_id,
                 binary_ip,
-                raw_lower_bound,
                 res,
                 &mut max_dist,
                 &mut counters,
@@ -1704,120 +1682,7 @@ impl<'a> RabitDistCalculator<'a> {
         record_rabit_prune_stats(&counters);
     }
 
-    /// Top-k scan over all rows `0..n` in order: classify [`PRUNE_LANES`]
-    /// rows at a time with the SIMD lower-bound kernel and run the scalar
-    /// rerank only for the surviving lanes.
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_raw_query_multi_bit_topk_dense_with_scratch(
-        &self,
-        k: usize,
-        lower_bound: Option<f32>,
-        upper_bound: Option<f32>,
-        row_id: impl Fn(u32) -> u64,
-        res: &mut BinaryHeap<OrderedNode<u64>>,
-        dists: &mut Vec<f32>,
-        quantized_dists: &mut Vec<u16>,
-        quantized_dists_table: &mut Vec<u8>,
-        hacc_quantized_dists: &mut Vec<u32>,
-    ) {
-        let Some(ctx) = self.raw_query_multi_bit_topk_context(
-            k,
-            lower_bound,
-            upper_bound,
-            dists,
-            quantized_dists,
-            quantized_dists_table,
-            hacc_quantized_dists,
-        ) else {
-            return;
-        };
-        let dists = dists.as_slice();
-        debug_assert_eq!(dists.len(), ctx.n);
-        let scale_factors = &self.scale_factors[..ctx.n];
-        let add_factors = &self.add_factors[..ctx.n];
-        let error_factors = &self
-            .error_factors
-            .expect("raw-query lower-bound gating requires error factors")[..ctx.n];
-        // Same expression as `raw_query_lower_bound` with `error_factors`
-        // already resolved; the masks below match it bit for bit.
-        let lower_bound_of = |id: usize, binary_ip: f32| {
-            self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error
-        };
-        let terms = ScaledLowerBoundTerms {
-            half_sum_q: 0.5 * self.sum_q,
-            add_factor_scale: self.add_factor_scale,
-            add_factor_offset: self.add_factor_offset,
-            query_factor: self.query_factor,
-            query_error: self.query_error,
-        };
-        let prune_masks = scaled_prune_mask_kernel();
-        let mut max_dist = res.peek().map(|node| node.dist);
-        let mut counters = RabitPruneCounters::default();
-
-        let (dist_groups, dist_tail) = dists.as_chunks::<PRUNE_LANES>();
-        let (scale_groups, _) = scale_factors.as_chunks::<PRUNE_LANES>();
-        let (add_groups, _) = add_factors.as_chunks::<PRUNE_LANES>();
-        let (error_groups, _) = error_factors.as_chunks::<PRUNE_LANES>();
-        for (group, (dist16, scale16, add16, error16)) in
-            izip!(dist_groups, scale_groups, add_groups, error_groups).enumerate()
-        {
-            counters.candidates += PRUNE_LANES;
-            // The heap threshold only ever tightens, so this group-start
-            // snapshot can only over-select survivors (which the per-row
-            // processing below re-checks against live values), never prune a
-            // row the scalar scan would have kept.
-            let heap_threshold = (res.len() >= ctx.k)
-                .then(|| max_dist.map(|max_dist| max_dist.0))
-                .flatten();
-            let (pruned_upper_bound, pruned_heap) = prune_masks(
-                dist16,
-                scale16,
-                add16,
-                error16,
-                terms,
-                ctx.query_upper_bound,
-                heap_threshold,
-            );
-            counters.pruned_upper_bound += pruned_upper_bound.count_ones() as usize;
-            counters.pruned_heap += pruned_heap.count_ones() as usize;
-            let mut survivors = !(pruned_upper_bound | pruned_heap);
-            while survivors != 0 {
-                let lane = survivors.trailing_zeros() as usize;
-                survivors &= survivors - 1;
-                let id = group * PRUNE_LANES + lane;
-                let binary_ip = dists[id];
-                self.accumulate_raw_query_multi_bit_row(
-                    &ctx,
-                    id,
-                    row_id(id as u32),
-                    binary_ip,
-                    lower_bound_of(id, binary_ip),
-                    res,
-                    &mut max_dist,
-                    &mut counters,
-                );
-            }
-        }
-
-        let tail_start = ctx.n - dist_tail.len();
-        for (offset, binary_ip) in dist_tail.iter().copied().enumerate() {
-            let id = tail_start + offset;
-            counters.candidates += 1;
-            self.accumulate_raw_query_multi_bit_row(
-                &ctx,
-                id,
-                row_id(id as u32),
-                binary_ip,
-                lower_bound_of(id, binary_ip),
-                res,
-                &mut max_dist,
-                &mut counters,
-            );
-        }
-        record_rabit_prune_stats(&counters);
-    }
-
-    fn raw_query_lower_bound_gating_disabled_reason(&self) -> Option<&'static str> {
+    fn raw_query_multi_bit_topk_disabled_reason(&self) -> Option<&'static str> {
         if self.approx_mode == ApproxMode::Fast {
             Some("approx_mode_fast")
         } else if self.query_estimator != RabitQueryEstimator::RawQuery {
@@ -1985,9 +1850,8 @@ fn ex_fastscan_dist_table_value(
     }
 }
 
-/// Transpose ex codes for the FastScan bulk path. That path is only reachable
-/// when lower-bound gating is disabled, i.e. for legacy indexes without error
-/// factors; gated indexes rerank per candidate with the ex-dot kernels and
+/// Transpose ex codes for the FastScan bulk path used by legacy indexes without
+/// error factors. Native indexes score per candidate with the ex-dot kernels and
 /// never touch this copy, so skip the transpose (and its resident memory).
 fn maybe_pack_ex_codes(
     ex_codes: Option<&FixedSizeListArray>,
@@ -2267,7 +2131,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         if k == 0 {
             return;
         }
-        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+        if let Some(reason) = self.raw_query_multi_bit_topk_disabled_reason() {
             record_rabit_prune_bypass(reason);
             self.distance_all_with_scratch(
                 k,
@@ -2280,11 +2144,12 @@ impl DistCalculator for RabitDistCalculator<'_> {
             return;
         }
 
-        self.accumulate_raw_query_multi_bit_topk_dense_with_scratch(
+        let n = self.codes.len() / rabit_binary_code_bytes(self.dim);
+        self.accumulate_raw_query_multi_bit_topk_with_scratch(
             k,
             lower_bound,
             upper_bound,
-            row_id,
+            (0..n).map(|id| (id, row_id(id as u32))),
             res,
             dists,
             quantized_dists,
@@ -2310,7 +2175,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         if k == 0 {
             return;
         }
-        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+        if let Some(reason) = self.raw_query_multi_bit_topk_disabled_reason() {
             record_rabit_prune_bypass(reason);
             self.distance_all_with_scratch(
                 k,
@@ -3249,6 +3114,7 @@ mod tests {
     use std::collections::{BinaryHeap, HashMap};
 
     use arrow_array::{ArrayRef, Float32Array, Float64Array, UInt64Array};
+    use itertools::izip;
     use lance_core::ROW_ID;
     use lance_linalg::distance::DistanceType;
     use rand::rngs::SmallRng;
@@ -4156,7 +4022,7 @@ mod tests {
         assert_ne!(normal, distances);
         assert_eq!(distances, expected_fast);
         assert_eq!(
-            calc.raw_query_lower_bound_gating_disabled_reason(),
+            calc.raw_query_multi_bit_topk_disabled_reason(),
             Some("approx_mode_fast")
         );
     }
@@ -4550,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_query_multi_bit_accumulate_topk_uses_lower_bound_gating() {
+    fn test_raw_query_multi_bit_accumulate_topk_matches_full_scores() {
         let code_dim = 8usize;
         let num_rows = BATCH_SIZE + 9;
         let num_bits = 3;
@@ -4595,10 +4461,7 @@ mod tests {
                 .unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
         let calc = storage.dist_calculator(query, 4.0);
-        assert!(
-            calc.raw_query_lower_bound_gating_disabled_reason()
-                .is_none()
-        );
+        assert!(calc.raw_query_multi_bit_topk_disabled_reason().is_none());
 
         let k = 5;
         let mut binary_ips = Vec::new();
@@ -4760,13 +4623,64 @@ mod tests {
         rows
     }
 
-    /// The dense (SIMD-pruned) scan must reproduce the sparse scalar scan
+    #[rstest]
+    fn test_raw_query_multi_bit_topk_is_consistent(
+        #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
+        #[values(false, true)] is_filtered: bool,
+        #[values(None, Some(2.5))] upper_bound: Option<f32>,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(10778);
+        let exact_dists = [3.0, 2.0, 1.0];
+        let data = CraftedTopkData::new(&exact_dists, &[-10.0; 3], vec![1.0; 3], &mut rng);
+        let calc = data.calculator(approx_mode);
+        for k in [1, 2] {
+            for order in [[0, 1, 2], [2, 1, 0]] {
+                let mut heap = BinaryHeap::new();
+                calc.accumulate_filtered_topk_with_scratch(
+                    k,
+                    None,
+                    upper_bound,
+                    order.into_iter().map(|id| (id, id as u64)),
+                    |row_id| !is_filtered || row_id != 1,
+                    &mut heap,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                let mut expected = exact_dists
+                    .iter()
+                    .enumerate()
+                    .filter(|(id, dist)| {
+                        (!is_filtered || *id != 1) && upper_bound.is_none_or(|upper| **dist < upper)
+                    })
+                    .map(|(id, dist)| (dist.to_bits(), id as u64))
+                    .collect::<Vec<_>>();
+                expected.sort_unstable();
+                expected.truncate(k);
+                assert_eq!(
+                    canonical_heap_rows(heap),
+                    expected,
+                    "k={k}, order={order:?}"
+                );
+            }
+        }
+    }
+
+    /// The dense scan must reproduce the sparse scan
     /// exactly: identical heap contents including row ids, and the k smallest
     /// in-bounds exact distances overall.
     #[rstest]
     fn test_raw_query_multi_bit_topk_dense_matches_sparse(
         #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
-        #[values("descending", "ascending", "random", "duplicates", "duplicate_ties")]
+        #[values(
+            "descending",
+            "ascending",
+            "random",
+            "duplicates",
+            "duplicate_ties",
+            "overestimated"
+        )]
         ordering: &str,
     ) {
         for n in [1usize, 15, 16, 17, 100, 4109] {
@@ -4774,8 +4688,9 @@ mod tests {
             let exact_dists: Vec<f32> = match ordering {
                 // Improving rows force constant heap updates.
                 "descending" => (0..n).map(|id| (n - id) as f32).collect(),
-                // Worsening rows force mass pruning, the common regime.
+                // Worsening rows leave the full heap unchanged.
                 "ascending" => (0..n).map(|id| id as f32).collect(),
+                "overestimated" => (0..n).map(|id| (n - id) as f32).collect(),
                 "random" => (0..n).map(|_| rng.random_range(0.0..n as f32)).collect(),
                 "duplicates" => (0..n).map(|id| (id % 7) as f32).collect(),
                 // Lower bound equals the distance, so heap-threshold and
@@ -4785,6 +4700,10 @@ mod tests {
             };
             let (margins, error_factors) = if ordering == "duplicate_ties" {
                 (vec![0.0; n], vec![0.0; n])
+            } else if ordering == "overestimated" {
+                // A probabilistic 1-bit bound can exceed the multi-bit score.
+                // Later rows must still displace the heap's current maximum.
+                (vec![-(n as f32); n], vec![1.0; n])
             } else if ordering == "random" {
                 (
                     (0..n).map(|_| rng.random_range(0.0f32..2.0)).collect(),
@@ -4798,10 +4717,7 @@ mod tests {
             };
             let data = CraftedTopkData::new(&exact_dists, &margins, error_factors, &mut rng);
             let calc = data.calculator(approx_mode);
-            assert!(
-                calc.raw_query_lower_bound_gating_disabled_reason()
-                    .is_none()
-            );
+            assert!(calc.raw_query_multi_bit_topk_disabled_reason().is_none());
 
             let max_dist = exact_dists.iter().fold(0.0f32, |acc, dist| acc.max(*dist));
             for k in [1usize, 10, n + 7] {
@@ -5143,7 +5059,7 @@ mod tests {
     #[rstest]
     #[case::near_parallel(1e-5)]
     #[case::parallel(0.0)]
-    fn test_dot_projection_residual_bound_near_parallel(#[case] perturbation: f32) {
+    fn test_dot_projection_residual_norm_near_parallel(#[case] perturbation: f32) {
         const DIM: usize = 64;
         let mut metadata = make_test_metadata(DIM);
         metadata.num_bits = 5;
@@ -5177,43 +5093,6 @@ mod tests {
             .sqrt();
         assert!(factors.error as f64 >= residual_norm);
         assert!((factors.error as f64 - residual_norm).abs() < 1e-10);
-        let calc = storage.distance_calculator_from_parts(RabitDistCalculatorParts {
-            dim: DIM,
-            dist_table: Cow::Owned(build_dist_table_direct::<Float32Type>(&query)),
-            ex_query: Cow::Borrowed(&query),
-            sum_q: query.iter().sum(),
-            query_factors: factors,
-            approx_mode: ApproxMode::Normal,
-            raw_query: None,
-        });
-        // The bound must retain the margin even when the two squared energies
-        // round to the same f32 value. A heap threshold inside it must not prune.
-        let binary_ip = 0.5 * calc.sum_q;
-        let binary_distance = calc.raw_query_binary_distance(0, binary_ip);
-        let bound = calc.raw_query_lower_bound(0, binary_ip).unwrap();
-        let margin = calc.error_factors.unwrap()[0] as f64 * residual_norm;
-        if perturbation > 0.0 {
-            let threshold = (binary_distance as f64 - margin * 0.5) as f32;
-            assert!(bound < threshold);
-            let masks = scaled_prune_mask_kernel()(
-                &[binary_ip; PRUNE_LANES],
-                &[calc.scale_factors[0]; PRUNE_LANES],
-                &[calc.add_factors[0]; PRUNE_LANES],
-                &[calc.error_factors.unwrap()[0]; PRUNE_LANES],
-                ScaledLowerBoundTerms {
-                    half_sum_q: 0.5 * calc.sum_q,
-                    add_factor_scale: calc.add_factor_scale,
-                    add_factor_offset: calc.add_factor_offset,
-                    query_factor: calc.query_factor,
-                    query_error: calc.query_error,
-                },
-                f32::INFINITY,
-                Some(threshold),
-            );
-            assert_eq!(masks, (0, 0), "the residual margin must keep every lane");
-        } else {
-            assert_eq!(bound, binary_distance);
-        }
     }
 
     #[rstest]
@@ -5409,7 +5288,7 @@ mod tests {
 
         assert!(storage.error_factors.is_none());
         assert_eq!(
-            calc.raw_query_lower_bound_gating_disabled_reason(),
+            calc.raw_query_multi_bit_topk_disabled_reason(),
             Some("missing_error_factors")
         );
     }
