@@ -1459,6 +1459,74 @@ async fn test_failed_branch_clone_can_be_deleted_and_recreated() {
     );
 }
 
+#[rstest]
+#[case::dot(".".to_string(), Some("'.' segment"))]
+#[case::leading_dot_segment("./feature".to_string(), Some("'.' segment"))]
+#[case::trailing_dot_segment("feature/.".to_string(), Some("'.' segment"))]
+#[case::middle_dot_segment("feature/./child".to_string(), Some("'.' segment"))]
+#[case::ascii_boundary("x".repeat(211), None)]
+#[case::ascii_too_long("x".repeat(212), Some("maximum is 211 bytes"))]
+#[case::reported_name("x".repeat(300), Some("maximum is 211 bytes"))]
+#[case::nested_boundary(format!("{}/{}", "x".repeat(101), "y".repeat(105)), None)]
+#[case::nested_too_long(format!("{}/{}", "x".repeat(102), "y".repeat(105)), Some("maximum is 211 bytes"))]
+#[case::unicode_boundary(format!("{}x", "é".repeat(21)), None)]
+#[case::unicode_too_long("é".repeat(22), Some("maximum is 211 bytes"))]
+#[tokio::test]
+async fn test_create_branch_name_storage_limits(
+    #[case] branch_name: String,
+    #[case] expected_error: Option<&str>,
+) {
+    let tempdir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        id_rows(0, 2),
+        &tempdir,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let result = dataset.create_branch(&branch_name, 1, None).await;
+
+    if let Some(expected_error) = expected_error {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert!(dataset.list_branches().await.unwrap().is_empty());
+        assert!(!std::path::Path::new(tempdir.as_str()).join("tree").exists());
+        assert!(
+            dataset
+                .object_store
+                .list(Some(base_branches_contents_path(&dataset.base)))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    } else {
+        let branch = result.unwrap();
+        assert_eq!(branch.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            dataset
+                .checkout_branch(&branch_name)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            dataset
+                .list_branches()
+                .await
+                .unwrap()
+                .contains_key(&branch_name)
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_list_hierarchical_branches() {
     let data = gen_batch()
