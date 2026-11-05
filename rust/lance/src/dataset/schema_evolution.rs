@@ -143,9 +143,7 @@ fn overlaid_fragments_without_overlays(dataset: &Dataset) -> Option<Dataset> {
     }
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.fragments = Arc::new(fragments);
-    let mut base = dataset.clone();
-    base.manifest = Arc::new(manifest);
-    Some(base)
+    Some(dataset.with_manifest_view(Arc::new(manifest)))
 }
 
 /// Scan `path`, deleted rows included, and hand each batch's column and row ids to `f`.
