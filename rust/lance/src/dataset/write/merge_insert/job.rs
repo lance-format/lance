@@ -1659,37 +1659,41 @@ impl MergeInsertJob {
             (operation, None, inserted_rows_filter)
         } else {
             let cleanup_bases = target_bases_info.clone();
-            let written = if let Some(scope) = analysis::scope(&self.spill_session_context) {
-                write_fragments_internal_impl(
-                    self.params.write_version(&self.dataset),
-                    Some(&self.dataset),
-                    self.dataset.object_store.clone(),
-                    &self.dataset.base,
-                    self.dataset.schema().clone(),
-                    stream,
-                    self.write_params.as_ref().clone(),
-                    target_bases_info,
-                    None,
-                    None,
-                    false,
-                    false,
-                    Some(scope.blobs.clone()),
-                    None,
-                )
-                .await?
-            } else {
-                write_fragments_internal(
-                    self.params.write_version(&self.dataset),
-                    Some(&self.dataset),
-                    self.dataset.object_store.clone(),
-                    &self.dataset.base,
-                    self.dataset.schema().clone(),
-                    stream,
-                    self.write_params.as_ref().clone(),
-                    target_bases_info,
-                )
-                .await?
-            };
+            // Bound the merge future's size as diagnostic writing adds another writer state.
+            let written = Box::pin(async {
+                if let Some(scope) = analysis::scope(&self.spill_session_context) {
+                    write_fragments_internal_impl(
+                        self.params.write_version(&self.dataset),
+                        Some(&self.dataset),
+                        self.dataset.object_store.clone(),
+                        &self.dataset.base,
+                        self.dataset.schema().clone(),
+                        stream,
+                        self.write_params.as_ref().clone(),
+                        target_bases_info,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Some(scope.blobs.clone()),
+                        None,
+                    )
+                    .await
+                } else {
+                    write_fragments_internal(
+                        self.params.write_version(&self.dataset),
+                        Some(&self.dataset),
+                        self.dataset.object_store.clone(),
+                        &self.dataset.base,
+                        self.dataset.schema().clone(),
+                        stream,
+                        self.write_params.as_ref().clone(),
+                        target_bases_info,
+                    )
+                    .await
+                }
+            })
+            .await?;
             let (mut new_fragments, _) = written;
 
             // The new data files exist but are not committed yet; clean them up
