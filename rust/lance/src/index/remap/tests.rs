@@ -268,6 +268,7 @@ async fn test_remap_index_rejects_malformed_covering_fields() {
             .any(|idx| idx.uuid == index_uuid && idx.covering_fields.len() > idx.fields.len()),
         "test setup should have produced a malformed entry"
     );
+    dataset.index_cache.clear().await;
     let metadata_key = crate::session::index_caches::IndexMetadataKey {
         version: dataset.version().version,
         store_identity: &dataset.object_store.store_prefix,

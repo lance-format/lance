@@ -260,13 +260,13 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 }
 
-/// Cache key for the query-time index listing DERIVED from a v1 (tagged) FRI:
+/// Legacy cache key for the query-time index listing derived from a v1 (tagged) FRI:
 /// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
-/// listing. This one caches the per-snapshot result of the coverage backtrack so
-/// `load_indices` does not recompute `segment_coverage` and the per-index bitmap
-/// rewrites on every query-planning / merge_insert call. Keyed by the same
+/// listing. Retained with its original value type for callers using this public
+/// key. Query loading now uses a separate internal key that also records whether
+/// incomplete legacy metadata needs another inference attempt. Keyed by the same
 /// snapshot identity: a different table (`store_identity`), a different snapshot
 /// (`version`), or any index add/replace (which commits a new manifest and bumps
 /// `version`/`e_tag`) yields a different key, so a stale derived listing is never
@@ -284,6 +284,19 @@ pub struct DerivedIndexListingKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
     pub e_tag: Option<&'a str>,
+}
+
+/// Query-visible metadata and whether a later call should retry legacy inference.
+#[derive(Debug)]
+pub(crate) struct QueryIndexListing {
+    pub(crate) indices: Arc<Vec<IndexMetadata>>,
+    pub(crate) retry_inference: bool,
+}
+
+impl DeepSizeOf for QueryIndexListing {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.indices.deep_size_of_children(context)
+    }
 }
 
 impl CacheKey for DerivedIndexListingKey<'_> {
@@ -321,6 +334,34 @@ impl CacheKey for DerivedIndexListingKey<'_> {
 
     // No `codec`: memory-only. See the type doc: the derived listing is
     // reader-capability dependent and must not be persisted across builds.
+}
+
+/// Cache the complete query listing using the same snapshot identity as the
+/// legacy derived listing. A separate key preserves its public value type and
+/// prevents cached values with different concrete types from sharing a namespace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QueryIndexListingKey<'a>(pub(crate) DerivedIndexListingKey<'a>);
+
+impl CacheKey for QueryIndexListingKey<'_> {
+    type ValueType = QueryIndexListing;
+
+    fn key(&self) -> Cow<'_, str> {
+        self.0.key()
+    }
+
+    fn type_name() -> &'static str {
+        "QueryIndexListing"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.query-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
+    }
+
+    // Reader compatibility depends on the current build, so keep this memory-only.
 }
 
 pub struct ProstAny(pub Arc<prost_types::Any>);
@@ -421,6 +462,18 @@ mod tests {
         assert_ne!(base.key(), other_table.key());
         assert_ne!(base.key(), other_version.key());
         assert_ne!(base.key(), other_generation.key());
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_table).key()
+        );
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_version).key()
+        );
+        assert_ne!(
+            QueryIndexListingKey(base).key(),
+            QueryIndexListingKey(other_generation).key()
+        );
     }
 
     #[test]
@@ -431,6 +484,14 @@ mod tests {
         assert_ne!(
             DerivedIndexListingKey::schema().id(),
             IndexMetadataKey::schema().id()
+        );
+        assert_ne!(
+            QueryIndexListingKey::schema().id(),
+            IndexMetadataKey::schema().id()
+        );
+        assert_ne!(
+            QueryIndexListingKey::schema().id(),
+            DerivedIndexListingKey::schema().id()
         );
     }
 }

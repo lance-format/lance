@@ -54,7 +54,10 @@ use crate::index::statistics::{
     index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
 };
 use crate::index::vector;
-use crate::session::index_caches::DerivedIndexListingKey;
+use crate::index::vector::details::needs_vector_details_inference;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, QueryIndexListing, QueryIndexListingKey,
+};
 use crate::{Dataset, Error, Result};
 
 pub(super) async fn build_index_metadata_from_segments(
@@ -525,64 +528,80 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = load_all_indices(self).await?;
-        // Readers apply the fragment reuse index to every index they open.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
-            && indices.iter().any(is_hidden_by_frag_reuse)
-        {
-            Arc::new(
+        let derived_key = QueryIndexListingKey(DerivedIndexListingKey {
+            version: self.manifest.version,
+            store_identity: &self.object_store.store_prefix,
+            e_tag: self.manifest_location.e_tag.as_deref(),
+        });
+        let derive = || async {
+            let indices = load_all_indices(self).await?;
+            // Failed legacy inference is best-effort. Preserve retries on later calls
+            // instead of treating an incomplete listing as final for this snapshot.
+            let retry_inference = indices
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, self.schema()));
+            // Readers apply the fragment reuse index to every index they open.
+            let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+                && indices.iter().any(is_hidden_by_frag_reuse)
+            {
+                Arc::new(
+                    indices
+                        .iter()
+                        .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
                 indices
-                    .iter()
-                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            indices
-        };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            match fri.index_version {
-                // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
-                1 => {
-                    // Cache the coverage-rewritten listing per snapshot identity:
-                    // load_indices sits on the query-planning and merge_insert
-                    // per-batch paths, and the derivation (segment_coverage plus
-                    // the per-index bitmap rewrites) is otherwise redone on every
-                    // call. The raw ledger and mapping readers are already cached
-                    // by frag_reuse_reader; this caches its derived output.
-                    let derived_key = DerivedIndexListingKey {
-                        version: self.manifest.version,
-                        store_identity: &self.object_store.store_prefix,
-                        e_tag: self.manifest_location.e_tag.as_deref(),
-                    };
-                    return self
-                        .index_cache
-                        .get_or_insert_with_key(derived_key, || async {
-                            let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                            Ok(derived.as_ref().clone())
-                        })
-                        .await;
-                }
-                version => {
-                    return Err(Error::not_supported(format!(
-                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
-                    )));
+            };
+            if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+                match fri.index_version {
+                    // Legacy FRI index version 0 already had its fragment coverage
+                    // remapped in load_all_indices().
+                    0 => {}
+                    1 => {
+                        let derived = frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                        return Ok(QueryIndexListing {
+                            indices: derived,
+                            retry_inference,
+                        });
+                    }
+                    version => {
+                        return Err(Error::not_supported(format!(
+                            "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                        )));
+                    }
                 }
             }
+            if indices.iter().all(index_is_usable) {
+                return Ok(QueryIndexListing {
+                    indices,
+                    retry_inference,
+                });
+            }
+            Ok(QueryIndexListing {
+                indices: Arc::new(
+                    indices
+                        .iter()
+                        .filter(|idx| index_is_usable(idx))
+                        .cloned()
+                        .collect(),
+                ),
+                retry_inference,
+            })
+        };
+        let (listing, was_cached) = self
+            .index_cache
+            .get_or_insert_with_key_hit(derived_key, derive)
+            .await?;
+        if was_cached && listing.retry_inference {
+            let refreshed = Arc::new(derive().await?);
+            self.index_cache
+                .insert_with_key(&derived_key, refreshed.clone())
+                .await;
+            return Ok(refreshed.indices.clone());
         }
-        if indices.iter().all(index_is_usable) {
-            return Ok(indices);
-        }
-        Ok(Arc::new(
-            indices
-                .iter()
-                .filter(|idx| index_is_usable(idx))
-                .cloned()
-                .collect(),
-        ))
+        Ok(listing.indices.clone())
     }
 
     async fn merge_existing_index_segments(
