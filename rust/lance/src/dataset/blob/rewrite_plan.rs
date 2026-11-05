@@ -22,6 +22,7 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
 };
 use lance_core::ROW_ADDR;
+use lance_core::datatypes::Field as LanceField;
 use lance_file::version::ConcreteFileVersion;
 use lance_table::feature_flags::managed_blobs_enabled;
 
@@ -150,12 +151,27 @@ impl BlobRewritePlan {
     /// row address column and this returns an error if it does not. A schema with
     /// nothing to rewrite has no such requirement, and `retain_row_addresses` then
     /// only decides whether an existing row address column is carried through.
+    ///
+    /// # Legacy (v1) blob columns must be scanned as binary
+    ///
+    /// A legacy blob column read with the default [`BlobHandling`] arrives as a
+    /// position/size description of bytes that live elsewhere in the source file,
+    /// which is not data a new fragment can republish. This plan has no way to
+    /// turn such a description back into its payload — only the scan can, and the
+    /// scan belongs to the caller — so a schema carrying one is refused here
+    /// rather than passed through as if it were final. Scan the column with
+    /// [`BlobHandling::AllBinary`] instead; the materialized binary column is
+    /// accepted and passes through unchanged.
+    ///
+    /// [`BlobHandling`]: lance_core::datatypes::BlobHandling
+    /// [`BlobHandling::AllBinary`]: lance_core::datatypes::BlobHandling::AllBinary
     pub fn try_new(
         dataset: Arc<Dataset>,
         input_schema: &ArrowSchema,
         retain_row_addresses: bool,
     ) -> Result<Self> {
         let input_schema = Arc::new(input_schema.clone());
+        Self::reject_legacy_blob_descriptions(&dataset, &input_schema)?;
         let preserve_managed = Self::can_preserve_managed(&dataset)?;
 
         // Only the plan itself knows which columns it would touch, and it refuses to
@@ -213,7 +229,7 @@ impl BlobRewritePlan {
             });
         }
 
-        if input_schema.column_with_name(ROW_ADDR).is_none() {
+        let Some((_, row_addr_field)) = input_schema.column_with_name(ROW_ADDR) else {
             return Err(Error::invalid_input(format!(
                 "rewriting a Blob v2 column needs the {ROW_ADDR} column in the input batch, \
                  because a blob descriptor is resolved to its payload by row address; \
@@ -223,6 +239,20 @@ impl BlobRewritePlan {
                     .iter()
                     .map(|field| field.name())
                     .collect::<Vec<_>>()
+            )));
+        };
+
+        // A row address is read as a `u64` when a descriptor is resolved, so a
+        // column of any other type is refused here instead of failing the downcast
+        // on the first batch. A nullable column is accepted, because the scanner's
+        // row address field is nullable; the values themselves are checked per
+        // batch in `transform`, where a null can actually be observed.
+        if row_addr_field.data_type() != &ArrowDataType::UInt64 {
+            return Err(Error::invalid_input(format!(
+                "the {ROW_ADDR} column must be {} to resolve a blob descriptor to its \
+                 payload, but this schema declares it as {}",
+                ArrowDataType::UInt64,
+                row_addr_field.data_type()
             )));
         }
 
@@ -298,6 +328,10 @@ impl BlobRewritePlan {
     /// the output carries the metadata of the schema the plan was built from. See the
     /// note on this type about the rows' origin, which this check cannot verify.
     ///
+    /// When the plan rewrites a Blob v2 column, every row must carry its source
+    /// row address: a batch with a null row address is rejected rather than
+    /// resolved, because a null names no row to resolve a descriptor against.
+    ///
     /// Batches may be transformed concurrently. Depending on the rewrite chosen,
     /// this may read payload bytes from storage, so it is not a cheap in-memory
     /// projection.
@@ -330,8 +364,112 @@ impl BlobRewritePlan {
                         .collect::<Vec<_>>(),
                 )?)
             }
-            Rewrite::BlobV2(inner) => inner.transform_batch(&self.dataset, batch).await,
+            Rewrite::BlobV2(inner) => {
+                Self::reject_null_row_addresses(&batch)?;
+                inner.transform_batch(&self.dataset, batch).await
+            }
         }
+    }
+
+    /// Refuse a batch whose row address column has a null value.
+    ///
+    /// A descriptor is resolved by row address, and a null address names no row.
+    /// The resolver reads the values buffer, where a null slot still holds some
+    /// `u64`, so letting one through would resolve another row's payload instead
+    /// of failing. Checked per batch rather than at construction because a
+    /// nullable column is a legitimate input as long as its values are present.
+    fn reject_null_row_addresses(batch: &RecordBatch) -> Result<()> {
+        let Some(row_addrs) = batch.column_by_name(ROW_ADDR) else {
+            return Ok(());
+        };
+        let null_count = row_addrs.null_count();
+        if null_count > 0 {
+            return Err(Error::invalid_input(format!(
+                "the {ROW_ADDR} column of this batch has {null_count} null value(s) out of \
+                 {}, and a null row address names no row to resolve a blob descriptor \
+                 against; supply the address of the source row for every row being \
+                 rewritten, or drop the rows that have none before transforming",
+                row_addrs.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse an input schema that projects a legacy (v1) blob column as its
+    /// position/size description.
+    ///
+    /// Whether a column *is* a legacy blob is a property of the dataset, so it is
+    /// read from the dataset schema rather than guessed from the Arrow type: an
+    /// ordinary struct of the same shape is data and passes through. The Arrow
+    /// type is then what distinguishes the two projections of such a field, a
+    /// description struct from the materialized binary this plan accepts.
+    ///
+    /// Only projected fields are examined. A legacy blob column the caller did not
+    /// select cannot reach the output, and the rows written for it come from the
+    /// dataset's own schema rather than from this batch.
+    fn reject_legacy_blob_descriptions(
+        dataset: &Arc<Dataset>,
+        input_schema: &ArrowSchema,
+    ) -> Result<()> {
+        fn find(
+            dataset_field: &LanceField,
+            input_field: &ArrowField,
+            path: &mut Vec<String>,
+        ) -> Option<String> {
+            path.push(input_field.name().clone());
+            if dataset_field.is_blob()
+                && !dataset_field.is_blob_v2()
+                && !matches!(
+                    input_field.data_type(),
+                    ArrowDataType::Binary | ArrowDataType::LargeBinary | ArrowDataType::BinaryView
+                )
+            {
+                return Some(path.join("."));
+            }
+            // A blob leaf has no children worth descending into, so only the
+            // nesting that can *contain* one is walked.
+            let found = match input_field.data_type() {
+                ArrowDataType::Struct(children) => children
+                    .iter()
+                    .filter_map(|child| {
+                        let dataset_child = dataset_field.child(child.name())?;
+                        find(dataset_child, child, path)
+                    })
+                    .next(),
+                // A map's entries struct is its only child in both
+                // representations, so it is walked like a list's item rather than
+                // looked up by name, whose Arrow and Lance spellings may differ.
+                ArrowDataType::List(child)
+                | ArrowDataType::LargeList(child)
+                | ArrowDataType::ListView(child)
+                | ArrowDataType::LargeListView(child)
+                | ArrowDataType::FixedSizeList(child, _)
+                | ArrowDataType::Map(child, _) => dataset_field
+                    .children
+                    .first()
+                    .and_then(|dataset_child| find(dataset_child, child, path)),
+                _ => None,
+            };
+            path.pop();
+            found
+        }
+
+        let schema = dataset.schema();
+        let offender = input_schema.fields().iter().find_map(|input_field| {
+            let dataset_field = schema.field(input_field.name())?;
+            find(dataset_field, input_field, &mut Vec::new())
+        });
+        if let Some(path) = offender {
+            return Err(Error::invalid_input(format!(
+                "column '{path}' is a legacy blob column of dataset '{}' projected as its \
+                 position/size description, which describes bytes in the source file rather \
+                 than carrying them, so rewriting it would publish the description in place \
+                 of the payload; scan it with BlobHandling::AllBinary so the payload is \
+                 materialized as binary",
+                dataset.uri()
+            )));
+        }
+        Ok(())
     }
 
     /// Managed descriptors may be preserved only when the dataset's own file format
@@ -435,6 +573,141 @@ mod tests {
         dataset
     }
 
+    /// A legacy (v1) blob field: the blob metadata key on a binary column, with no
+    /// Blob v2 extension name. Legacy blobs are only writable below file version
+    /// 2.2, which is why these fixtures write V2_1.
+    fn legacy_blob_field(name: &str) -> Field {
+        Field::new(name, DataType::LargeBinary, true)
+            .with_metadata([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())].into())
+    }
+
+    const LEGACY_PAYLOADS: [&[u8]; 3] = [b"abc", b"defgh", b"ijklmnop"];
+
+    fn legacy_blob_values() -> ArrayRef {
+        Arc::new(LargeBinaryArray::from_iter_values(LEGACY_PAYLOADS))
+    }
+
+    async fn write_legacy_at(
+        dir: &TempStrDir,
+        schema: Arc<Schema>,
+        blobs: ArrayRef,
+        version: LanceFileVersion,
+    ) -> Arc<Dataset> {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(
+                    0..LEGACY_PAYLOADS.len() as u32,
+                )),
+                blobs,
+            ],
+        )
+        .unwrap();
+        Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                dir,
+                Some(WriteParams {
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// Legacy blobs are only writable below file version 2.2.
+    async fn write_legacy(dir: &TempStrDir, schema: Arc<Schema>, blobs: ArrayRef) -> Arc<Dataset> {
+        write_legacy_at(dir, schema, blobs, LanceFileVersion::V2_1).await
+    }
+
+    async fn legacy_blob_dataset(dir: &TempStrDir) -> Arc<Dataset> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            legacy_blob_field("blob"),
+        ]));
+        write_legacy(dir, schema, legacy_blob_values()).await
+    }
+
+    /// The same payloads behind a legacy blob field nested in a plain struct.
+    async fn nested_legacy_blob_dataset(dir: &TempStrDir) -> Arc<Dataset> {
+        let inner = legacy_blob_field("blob");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new(
+                "wrapper",
+                DataType::Struct(vec![Arc::new(inner.clone())].into()),
+                true,
+            ),
+        ]));
+        let nested: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(inner)].into(),
+            vec![legacy_blob_values()],
+            None,
+        ));
+        write_legacy(dir, schema, nested).await
+    }
+
+    /// A map whose entry values are `value_field`, with one entry per row.
+    fn map_of(value_field: Field, values: ArrayRef) -> (Field, ArrayRef) {
+        let entry_fields =
+            Fields::from(vec![Field::new("key", DataType::Utf8, false), value_field]);
+        let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..values.len()).map(|row| format!("k{row}")),
+        ));
+        let entries = StructArray::new(entry_fields.clone(), vec![keys, values], None);
+        let entries_field = Arc::new(Field::new("entries", DataType::Struct(entry_fields), false));
+        let maps = arrow_array::MapArray::try_new(
+            entries_field.clone(),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(1, entries.len())),
+            entries,
+            None,
+            false,
+        )
+        .unwrap();
+        (
+            Field::new("props", DataType::Map(entries_field, false), true),
+            Arc::new(maps),
+        )
+    }
+
+    /// A dataset whose map entry value is marked as a legacy blob.
+    ///
+    /// No file version can hold this on disk: map encoding starts at 2.2, and at
+    /// 2.2 a legacy blob marker is rejected in favour of the Blob v2 extension,
+    /// while the versions that accept the marker have no map encoding. So the
+    /// marker is applied to the opened dataset's in-memory schema, which is the
+    /// schema the guard reads, over a map the writer does accept.
+    async fn map_legacy_blob_dataset(dir: &TempStrDir) -> Arc<Dataset> {
+        let (map_field, maps) = map_of(
+            Field::new("value", DataType::LargeBinary, true),
+            legacy_blob_values(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            map_field,
+        ]));
+        let dataset = write_legacy_at(dir, schema, maps, LanceFileVersion::V2_2).await;
+
+        let mut manifest = dataset.manifest.as_ref().clone();
+        let entry_value = &mut manifest.schema.fields[1].children[0].children[1];
+        assert_eq!(entry_value.name, "value");
+        entry_value
+            .metadata
+            .insert(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string());
+        assert!(entry_value.is_blob() && !entry_value.is_blob_v2());
+        let mut dataset = dataset.as_ref().clone();
+        dataset.manifest = Arc::new(manifest);
+        Arc::new(dataset)
+    }
+
+    async fn scan_all_binary(dataset: &Dataset) -> RecordBatch {
+        let mut scan = dataset.scan();
+        scan.blob_handling(lance_core::datatypes::BlobHandling::AllBinary);
+        scan.try_into_batch().await.unwrap()
+    }
+
     async fn scan_without_row_addresses(dataset: &Dataset) -> RecordBatch {
         let batch = dataset.scan().try_into_batch().await.unwrap();
         assert!(batch.schema().column_with_name(ROW_ADDR).is_none());
@@ -492,6 +765,301 @@ mod tests {
         let plain = plain_dataset(&plain_dir).await;
         let plain_input = scan_without_row_addresses(&plain).await;
         BlobRewritePlan::try_new(plain.clone(), plain_input.schema().as_ref(), false).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_legacy_blob_projected_as_a_description_is_refused_with_the_binary_scan_to_use() {
+        let dir = TempStrDir::default();
+        let dataset = legacy_blob_dataset(&dir).await;
+        let input = scan_without_row_addresses(&dataset).await;
+        // The default handling yields the description, which is what makes this
+        // schema unusable as rewrite input.
+        assert!(matches!(
+            input.schema().field_with_name("blob").unwrap().data_type(),
+            DataType::Struct(_)
+        ));
+
+        let error =
+            BlobRewritePlan::try_new(dataset.clone(), input.schema().as_ref(), false).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("BlobHandling::AllBinary"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("blob"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_blob_scanned_as_binary_passes_its_payload_through_to_a_written_dataset() {
+        let dir = TempStrDir::default();
+        let dataset = legacy_blob_dataset(&dir).await;
+        let input = scan_all_binary(&dataset).await;
+        assert_eq!(
+            input.schema().field_with_name("blob").unwrap().data_type(),
+            &DataType::LargeBinary
+        );
+
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), input.schema().as_ref(), false).unwrap();
+        let output_schema = plan.output_schema().clone();
+        assert_eq!(&output_schema, &input.schema());
+        let transformed = plan.transform(input.clone()).await.unwrap();
+        assert_eq!(transformed, input);
+
+        let destination = TempStrDir::default();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(transformed)], output_schema),
+            &destination,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let written = Dataset::open(&destination).await.unwrap();
+        // The materialized column keeps its blob marker, so the destination is a
+        // legacy blob dataset too and the payload is read back as binary.
+        let read_back = scan_all_binary(&written).await;
+        let blobs = read_back
+            .column_by_name("blob")
+            .unwrap()
+            .as_binary::<i64>()
+            .clone();
+        let payloads = (0..blobs.len())
+            .map(|row| blobs.value(row))
+            .collect::<Vec<_>>();
+        assert_eq!(payloads, LEGACY_PAYLOADS.to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_legacy_blob_nested_in_a_struct_is_refused_when_projected_as_a_description() {
+        let dir = TempStrDir::default();
+        let dataset = nested_legacy_blob_dataset(&dir).await;
+        let input = scan_without_row_addresses(&dataset).await;
+
+        let error =
+            BlobRewritePlan::try_new(dataset.clone(), input.schema().as_ref(), false).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains("wrapper.blob"), "{error}");
+        assert!(
+            error.to_string().contains("BlobHandling::AllBinary"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_blob_under_a_map_is_refused_when_projected_as_a_description() {
+        let dir = TempStrDir::default();
+        let dataset = map_legacy_blob_dataset(&dir).await;
+
+        // The input schema is the projection the dataset's own blob handling
+        // produces for that field tree. It is built from the schema rather than
+        // scanned because the patched field no longer matches the file on disk.
+        let projected = lance_core::datatypes::BlobHandling::BlobsDescriptions
+            .unload_if_needed(dataset.schema().fields[1].clone());
+        let input_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::from(&projected),
+        ]);
+        let DataType::Map(entries, _) = input_schema.field_with_name("props").unwrap().data_type()
+        else {
+            panic!("'props' should be a map");
+        };
+        let DataType::Struct(entry_fields) = entries.data_type() else {
+            panic!("map entries should be a struct");
+        };
+        assert!(
+            matches!(entry_fields[1].data_type(), DataType::Struct(_)),
+            "the entry value should be projected as a description struct"
+        );
+
+        let error = BlobRewritePlan::try_new(dataset, &input_schema, false).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains("props"), "{error}");
+        assert!(error.to_string().contains("value"), "{error}");
+        assert!(
+            error.to_string().contains("BlobHandling::AllBinary"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_map_with_no_blob_metadata_is_accepted() {
+        let dir = TempStrDir::default();
+        let (map_field, maps) = map_of(
+            Field::new("value", DataType::LargeBinary, true),
+            legacy_blob_values(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            map_field,
+        ]));
+        let dataset = write_legacy_at(&dir, schema, maps, LanceFileVersion::V2_2).await;
+
+        let input = scan_without_row_addresses(&dataset).await;
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), input.schema().as_ref(), false).unwrap();
+        assert_eq!(plan.transform(input.clone()).await.unwrap(), input);
+    }
+
+    /// A column is a legacy blob because the dataset says so, not because of its
+    /// shape, so an ordinary struct of position and size is ordinary data.
+    #[tokio::test]
+    async fn a_plain_struct_shaped_like_a_blob_description_is_accepted() {
+        let dir = TempStrDir::default();
+        let description_like = Fields::from(vec![
+            Field::new("position", DataType::UInt64, true),
+            Field::new("size", DataType::UInt64, true),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("blob", DataType::Struct(description_like.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..2)),
+                Arc::new(StructArray::new(
+                    description_like,
+                    vec![
+                        Arc::new(UInt64Array::from_iter_values(0..2)),
+                        Arc::new(UInt64Array::from_iter_values(10..12)),
+                    ],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                &dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let input = scan_without_row_addresses(&dataset).await;
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), input.schema().as_ref(), false).unwrap();
+        assert_eq!(plan.transform(input.clone()).await.unwrap(), input);
+    }
+
+    #[tokio::test]
+    async fn a_row_address_column_of_the_wrong_type_is_refused_when_the_plan_is_built() {
+        let dir = TempStrDir::default();
+        let dataset = blob_v2_dataset(&dir, 2).await;
+        let scanned = scan_with_row_addresses(&dataset).await[0].schema();
+
+        let retyped = Arc::new(ArrowSchema::new_with_metadata(
+            scanned
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == ROW_ADDR {
+                        Arc::new(ArrowField::new(ROW_ADDR, DataType::Int64, false))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+            scanned.metadata().clone(),
+        ));
+
+        let error = BlobRewritePlan::try_new(dataset.clone(), retyped.as_ref(), false).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains(ROW_ADDR), "{error}");
+        assert!(error.to_string().contains("Int64"), "{error}");
+
+        // The scanner's own column is still accepted.
+        BlobRewritePlan::try_new(dataset, scanned.as_ref(), false).unwrap();
+    }
+
+    /// Replace the row address column of `batch` with `addresses`, keeping the
+    /// nullable row address field the scanner declares.
+    fn with_row_addresses(batch: &RecordBatch, addresses: UInt64Array) -> RecordBatch {
+        let (index, _) = batch.schema().column_with_name(ROW_ADDR).unwrap();
+        let mut fields = batch.schema().fields().to_vec();
+        fields[index] = Arc::new(ArrowField::new(ROW_ADDR, DataType::UInt64, true));
+        let mut columns = batch.columns().to_vec();
+        columns[index] = Arc::new(addresses);
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            )),
+            columns,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_nullable_row_address_column_of_present_addresses_is_transformed() {
+        let dir = TempStrDir::default();
+        let dataset = blob_v2_dataset(&dir, 1).await;
+        let scanned = scan_with_row_addresses(&dataset).await[0].clone();
+        let addresses = scanned
+            .column_by_name(ROW_ADDR)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .clone();
+        let nullable = with_row_addresses(
+            &scanned,
+            UInt64Array::from_iter(addresses.values().iter().copied().map(Some)),
+        );
+
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), nullable.schema().as_ref(), false).unwrap();
+        let output = plan.transform(nullable).await.unwrap();
+        assert_eq!(&output.schema(), plan.output_schema());
+        let blob = output.column_by_name("blob").unwrap().as_struct();
+        let data = blob.column_by_name("data").unwrap().as_binary::<i64>();
+        assert_eq!(data.value(0), vec![0u8; 16]);
+    }
+
+    #[tokio::test]
+    async fn a_null_row_address_is_refused_instead_of_resolved_against_its_slot() {
+        let dir = TempStrDir::default();
+        let dataset = blob_v2_dataset(&dir, 1).await;
+        let scanned = scan_with_row_addresses(&dataset).await[0].clone();
+        // A null whose backing slot holds a real address: resolving the buffer
+        // instead of the validity would silently return that row's payload.
+        let addresses = scanned
+            .column_by_name(ROW_ADDR)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .clone();
+        let with_null = with_row_addresses(
+            &scanned,
+            UInt64Array::from_iter(addresses.values().iter().map(|_| None::<u64>)),
+        );
+
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), with_null.schema().as_ref(), false).unwrap();
+        let error = plan.transform(with_null).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains(ROW_ADDR), "{error}");
+        assert!(error.to_string().contains("1 null value(s)"), "{error}");
     }
 
     #[tokio::test]
