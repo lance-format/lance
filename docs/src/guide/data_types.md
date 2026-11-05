@@ -421,6 +421,67 @@ appends. This interoperability does not automatically select fields to shred,
 rewrite existing data, or add Variant-aware SQL functions. Existing
 [JSON columns](json.md) continue to use their separate JSONB representation.
 
+### Explicit Variant shredding on write (Rust)
+
+Enable Lance's optional `variant` Cargo feature to use
+`InsertBuilder::with_variant_shredding(column, as_type)`. Pass an unshredded
+`arrow.parquet.variant` column and the desired Arrow value type. A struct selects
+object fields; `List` and `LargeList` select array element types. Supported leaf
+types are Boolean, signed integers, Float32/Float64, and binary/string types,
+including their large and view variants. Call the method once for each top-level
+Variant column to transform.
+
+```rust
+use std::sync::Arc;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+use parquet_variant_compute::json_to_variant;
+
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"id":42,"extra":"preserved"}"#,
+        r#"{"id":1.5}"#,
+    ]));
+    let variant = json_to_variant(&json)?;
+    let schema = Arc::new(Schema::new(vec![variant.field("event")]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(variant.into_inner())])?;
+    let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+
+    let dataset = InsertBuilder::new("memory://")
+        .with_variant_shredding("event", target.clone())
+        .execute_stream(RecordBatchIterator::new([Ok(batch.clone())], schema.clone()))
+        .await?;
+    let dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams { mode: WriteMode::Append, ..Default::default() })
+        .with_variant_shredding("event", target)
+        .execute_stream(RecordBatchIterator::new([Ok(batch)], schema))
+        .await?;
+    assert_eq!(dataset.count_rows(None).await?, 4);
+    Ok(())
+}
+```
+
+Shredding runs one batch at a time and also works with the builder's batch and
+uncommitted write methods. The declared layout is fixed across all batches and
+appends; incompatible append layouts, duplicate column selections, unsupported
+target types, and already-shredded inputs are rejected. Write already-shredded
+arrays directly without this option. This API uses the current V2 writer.
+
+The API preserves values without coercion. In the example, `42` is stored in
+`event.typed_value.id.typed_value`, while the row containing `1.5` stays in the
+root residual `event.value`. If any selected value cannot fit without coercion,
+the entire row remains in residual storage, including other selected fields in
+that row. Integer widths may change when the value fits; floating-point values
+must match the requested width. SQL null, Variant null, missing fields, and
+unselected object fields are preserved. Raw typed-child projections therefore
+still require residual fallback for complete query results.
+
+Decimal, temporal, UUID, and fixed-size/list-view targets are not yet exposed by
+this API. Automatic field selection, layout evolution, and Variant SQL functions
+are separate capabilities; this option neither infers a layout nor rewrites
+existing data.
+
 ## Data Type Mapping for Integrations
 
 When integrating Lance with other systems (like Apache Flink, Spark, or Presto), the following type mappings apply:

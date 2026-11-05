@@ -71,6 +71,8 @@ pub mod merge_insert;
 mod retry;
 pub(crate) mod seeds;
 pub mod update;
+#[cfg(feature = "variant")]
+mod variant;
 
 pub use super::progress::{WriteProgressFn, WriteStats};
 pub use commit::{CommitBuilder, DEFAULT_COMMIT_TIMEOUT};

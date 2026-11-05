@@ -56,6 +56,8 @@ pub struct InsertBuilder<'a> {
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
     disable_dictionary_split: bool,
+    #[cfg(feature = "variant")]
+    variant_shredding: Vec<(String, arrow_schema::DataType)>,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -67,11 +69,54 @@ impl<'a> InsertBuilder<'a> {
             preassigned_data_file_name: None,
             inherited_field_ids: false,
             disable_dictionary_split: false,
+            #[cfg(feature = "variant")]
+            variant_shredding: Vec::new(),
         }
     }
 
     pub fn with_params(mut self, params: &'a WriteParams) -> Self {
         self.params = Some(params);
+        self
+    }
+
+    /// Shred an unshredded, top-level `arrow.parquet.variant` column while writing.
+    ///
+    /// Requires the `variant` Cargo feature. `as_type` describes the desired values,
+    /// not the physical `(value, typed_value)` layout. Use a struct to select object
+    /// fields, or a list to select array elements. Supported leaves are Boolean,
+    /// signed integers, Float32/Float64, and binary/string types (including views).
+    /// Call once per column; duplicate columns and unsupported types are errors.
+    ///
+    /// Batches are transformed incrementally. Values are never coerced: if any
+    /// selected value in a row does not fit its target type, the entire row stays
+    /// in residual binary storage. Unselected object fields are also preserved.
+    /// SQL null and Variant null remain distinct. Already-shredded input is rejected;
+    /// it can be written directly without this option.
+    ///
+    /// Appends must use the same physical layout as the existing dataset. Layout
+    /// inference/evolution, nested column selection, and legacy V1 writes are not
+    /// supported. Options are checked when executing the write.
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatch;
+    /// # use arrow_schema::{DataType, Field};
+    /// # use lance::dataset::InsertBuilder;
+    /// # async fn example(batches: Vec<RecordBatch>) -> lance::Result<()> {
+    /// let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+    /// let dataset = InsertBuilder::new("memory://")
+    ///     .with_variant_shredding("event", target)
+    ///     .execute(batches)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "variant")]
+    pub fn with_variant_shredding(
+        mut self,
+        column: impl Into<String>,
+        as_type: arrow_schema::DataType,
+    ) -> Self {
+        self.variant_shredding.push((column.into(), as_type));
         self
     }
 
@@ -237,6 +282,27 @@ impl<'a> InsertBuilder<'a> {
             uri=context.dest.uri(),
             mode=?context.params.mode
         );
+
+        #[cfg(feature = "variant")]
+        let (stream, schema) = if self.variant_shredding.is_empty() {
+            (stream, schema)
+        } else {
+            if context.storage_version == ConcreteFileVersion::V1 {
+                return Err(Error::not_supported(
+                    "Variant shredding requires the current V2 writer",
+                ));
+            }
+            let stream = super::variant::shred_stream(
+                stream,
+                &self.variant_shredding,
+                if matches!(context.params.mode, WriteMode::Append) {
+                    context.dest.dataset().map(|dataset| dataset.schema())
+                } else {
+                    None
+                },
+            )?;
+            stream.into_stream_and_schema().await?
+        };
 
         self.validate_write(&mut context, &schema)?;
 

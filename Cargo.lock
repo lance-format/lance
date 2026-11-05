@@ -4584,6 +4584,7 @@ dependencies = [
  "num-traits",
  "object_store 0.14.2",
  "parquet",
+ "parquet-variant",
  "parquet-variant-compute",
  "permutation",
  "pin-project",
