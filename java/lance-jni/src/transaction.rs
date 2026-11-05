@@ -4,7 +4,8 @@
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::block_on;
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::blocking_dataset::conversions::extract_namespace_info;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
@@ -423,10 +424,7 @@ fn key_existence_filter_from_java(
             FilterType::ExactSet(values.into_iter().map(|value| value as u64).collect())
         }
         "BLOOM" => {
-            let bitmap = env
-                .call_method(object, "getBloomBitmap", "()[B", &[])?
-                .l()?;
-            let bitmap = env.convert_byte_array(JByteArray::from(bitmap))?;
+            let bitmap = env.get_vec_u8_from_method(object, "getBloomBitmap")?;
             let num_bits = u32::try_from(
                 env.call_method(object, "getBloomNumBits", "()I", &[])?
                     .i()?,

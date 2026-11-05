@@ -93,8 +93,9 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    /// Whether to use stable row ids. This makes the `_rowid` column stable
-    /// after compaction, but not updates.
+    /// Whether to use stable row ids. A row then keeps the same `_rowid` for
+    /// its lifetime, even when compaction, an update or a merge insert
+    /// rewrites it.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.
@@ -546,6 +547,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    None,
                 )
                 .await?
             }
@@ -609,6 +611,16 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                let branch_identifier = if let Some(dataset) = dest.dataset() {
+                    dataset.ensure_branch_exists().await?;
+                    dataset.branch_identifier.clone()
+                } else {
+                    Arc::new(
+                        refs.branches()
+                            .get_identifier(manifest.branch.as_deref())
+                            .await?,
+                    )
+                };
 
                 Ok(Dataset {
                     object_store,
@@ -619,6 +631,7 @@ impl<'a> CommitBuilder<'a> {
                     session,
                     commit_handler,
                     refs,
+                    branch_identifier,
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,
