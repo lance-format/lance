@@ -54,7 +54,7 @@ use super::{
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
-        let file_reader_options = dataset.file_reader_options.clone();
+        let file_reader_options = dataset.file_reader_options.as_deref().cloned();
         let mut scanner = Self {
             dataset,
             projection_plan,
@@ -1270,7 +1270,7 @@ impl Scanner {
         let base = self
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.clone());
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
                 opts.batch_size_bytes = Some(bsb);

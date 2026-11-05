@@ -1374,7 +1374,7 @@ pub struct FileScheduler {
     /// through this handle is also recorded here, in addition to the
     /// scheduler's global totals.  Used to measure per-scope I/O.
     extra_stats: Option<Arc<dyn IoStatsRecorder>>,
-    metadata_read_size: Option<usize>,
+    metadata_read_size: Option<NonZero<usize>>,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -1558,11 +1558,8 @@ impl FileScheduler {
     /// # }
     /// ```
     pub fn with_metadata_read_size(&self, bytes: usize) -> Result<Self> {
-        if bytes == 0 {
-            return Err(Error::invalid_input(
-                "metadata read size must be greater than zero",
-            ));
-        }
+        let bytes = NonZero::new(bytes)
+            .ok_or_else(|| Error::invalid_input("metadata read size must be greater than zero"))?;
         Ok(Self {
             metadata_read_size: Some(bytes),
             ..self.clone()
@@ -1572,7 +1569,7 @@ impl FileScheduler {
     /// Initial metadata read size, or the underlying reader's preferred block size.
     pub fn metadata_read_size(&self) -> usize {
         self.metadata_read_size
-            .unwrap_or_else(|| self.reader.block_size())
+            .map_or_else(|| self.reader.block_size(), NonZero::get)
     }
 
     /// Returns a copy of this scheduler that additionally records the I/O it

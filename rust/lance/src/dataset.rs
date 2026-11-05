@@ -277,7 +277,7 @@ pub struct Dataset {
     pub(crate) metadata_cache: Arc<DSMetadataCache>,
 
     /// File reader options to use when reading data files.
-    pub(crate) file_reader_options: Option<FileReaderOptions>,
+    pub(crate) file_reader_options: Option<Arc<FileReaderOptions>>,
 
     /// Object store parameters used when opening this dataset.
     /// These are used when creating object stores for additional base paths.
@@ -836,7 +836,7 @@ impl Dataset {
             manifest_location,
             self.session.clone(),
             self.commit_handler.clone(),
-            self.file_reader_options.clone(),
+            self.file_reader_options.as_deref().cloned(),
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
         )
@@ -1086,7 +1086,7 @@ impl Dataset {
             fragment_bitmap,
             metadata_cache,
             index_cache,
-            file_reader_options,
+            file_reader_options: file_reader_options.map(Arc::new),
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),

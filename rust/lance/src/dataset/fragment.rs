@@ -1263,7 +1263,11 @@ impl FileFragment {
             None,
             Arc::<DecoderPlugins>::default(),
             &dataset.metadata_cache.file_metadata_cache(&filepath),
-            dataset.file_reader_options.clone().unwrap_or_default(),
+            dataset
+                .file_reader_options
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
         )
         .await?;
         // If the schemas are not compatible we can't calculate field id offsets
@@ -1675,7 +1679,7 @@ impl FileFragment {
         let file_reader_options = read_config
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.clone())
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned())
             .unwrap_or_default();
         let file_scheduler = if file_reader_options.decoder_config.list_structure.is_empty() {
             store_scheduler
