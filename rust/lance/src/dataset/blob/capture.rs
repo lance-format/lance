@@ -6,11 +6,11 @@ use std::sync::Arc;
 use arrow_array::{Array, StructArray};
 use arrow_schema::Field;
 use lance_arrow::FieldExt;
-use lance_core::datatypes::{BlobKind, BlobV2Layout};
+use lance_core::datatypes::BlobV2Layout;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 
-use super::locate::{BlobV2DescriptorColumns, BlobV2ReadContext};
+use super::locate::{BlobLocator, StoredBlob};
 use crate::Dataset;
 use crate::blob::reference::{BlobRefBatch, BlobSourceContext};
 
@@ -45,7 +45,7 @@ pub struct BlobRefCapture {
     dataset: Arc<Dataset>,
     context: BlobSourceContext,
     field_id: i32,
-    resolver: BlobV2ReadContext,
+    resolver: BlobLocator,
 }
 
 impl BlobRefCapture {
@@ -75,7 +75,7 @@ impl BlobRefCapture {
                 field.name,
             )));
         }
-        let resolver = BlobV2ReadContext::new(&dataset, field_id as u32);
+        let resolver = BlobLocator::new(&dataset, field_id as u32);
         Ok(Self {
             dataset,
             context,
@@ -136,10 +136,9 @@ impl BlobRefCapture {
                 self.field_id,
             )));
         }
-        let columns = BlobV2DescriptorColumns::new(descriptors);
         // Validate the entire batch before resolving stores or producing references.
         for (row, address) in row_addresses.iter().enumerate() {
-            if columns.is_null_blob(row) {
+            if StoredBlob::parse(descriptors, row)?.is_none() {
                 continue;
             }
             let fragment = self.dataset.get_fragment(address.fragment_id() as usize).ok_or_else(|| {
@@ -159,45 +158,15 @@ impl BlobRefCapture {
                     self.field_id,
                 )));
             }
-            if columns.positions.is_null(row)
-                || columns.sizes.is_null(row)
-                || columns.blob_ids.is_null(row)
-                || columns.blob_uris.is_null(row)
-            {
-                return Err(Error::invalid_input(format!(
-                    "Blob capture non-null descriptor row {row} contains null children"
-                )));
-            }
-            let kind = BlobKind::try_from(columns.kinds.value(row)).map_err(|error| {
-                Error::invalid_input(format!(
-                    "Blob capture field_id {} descriptor row {row}: {error}",
-                    self.field_id
-                ))
-            })?;
-            if kind == BlobKind::Dedicated && columns.positions.value(row) != 0 {
-                return Err(Error::invalid_input(format!(
-                    "Blob capture Dedicated descriptor row {row} has nonzero position {}",
-                    columns.positions.value(row)
-                )));
-            }
-            columns
-                .positions
-                .value(row)
-                .checked_add(columns.sizes.value(row))
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "Blob capture descriptor row {row} position {} + size {} overflows u64",
-                        columns.positions.value(row),
-                        columns.sizes.value(row)
-                    ))
-                })?;
         }
         let mut references = Vec::with_capacity(descriptors.len());
         for (row, address) in row_addresses.iter().enumerate() {
-            let reference = self
-                .resolver
-                .capture_reference(&columns, row, u64::from(*address), &self.context)
-                .await?;
+            let reference = StoredBlob::parse(descriptors, row)?
+                .map(|blob| {
+                    self.resolver
+                        .capture_reference(&blob, u64::from(*address), &self.context)
+                })
+                .transpose()?;
             references.push(reference);
         }
         BlobRefBatch::try_new(vec![self.context.clone()], references)

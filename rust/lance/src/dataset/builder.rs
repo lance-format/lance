@@ -806,7 +806,8 @@ impl DatasetBuilder {
                 file_reader_options,
                 Some(store_params),
                 base_store_params,
-            )?;
+            )
+            .await?;
             dataset.snapshot_digest = digest;
             dataset.ensure_snapshot_digest().await?;
             dataset.validate_snapshot(&snapshot)?;

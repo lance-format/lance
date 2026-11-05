@@ -28,7 +28,7 @@ pub(in crate::dataset) fn field_contains_blob(field: &LanceField) -> bool {
 struct ManagedReferenceScan<'a> {
     dataset: &'a Dataset,
     include_registered_sidecars: bool,
-    locators: HashMap<u32, BlobLocator<'a>>,
+    locators: HashMap<u32, BlobLocator>,
     references: HashSet<(Option<u32>, String)>,
 }
 
