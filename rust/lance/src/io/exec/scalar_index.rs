@@ -948,13 +948,20 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let mut metrics = IndexMetrics::new(&self.metrics, partition);
+        if let Some(scope) = context
+            .session_config()
+            .get_extension::<crate::dataset::write::merge_insert::analysis::AnalysisScope>(
+        ) {
+            metrics = metrics.with_segment_tracking(scope.segments.clone());
+        }
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -967,6 +974,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn supports_limit_pushdown(&self) -> bool {

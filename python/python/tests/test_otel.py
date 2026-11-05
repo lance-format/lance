@@ -54,6 +54,10 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
         assert catalog[name].kind == "gauge"
     assert catalog["lance_memory_stage_peak_bytes"].kind == "histogram"
     assert catalog["lance_memory_operation_peak_bytes"].kind == "histogram"
+    assert catalog["lance_spill_write_bytes_total"].kind == "counter"
+    assert catalog["lance_spill_write_bytes_total"].unit == "B"
+    assert catalog["lance_spill_charged_bytes"].kind == "gauge"
+    assert catalog["lance_spill_io_duration_seconds"].kind == "histogram"
 
     # Generate object store activity on the local filesystem (scheme "file").
     table = pa.table({"id": pa.array(range(256))})

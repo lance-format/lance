@@ -6,7 +6,10 @@
 use std::{
     collections::HashMap,
     num::NonZero,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use arrow_array::RecordBatch;
@@ -28,11 +31,12 @@ use datafusion_physical_plan::{
     coalesce_partitions::CoalescePartitionsExec,
     display::DisplayableExecutionPlan,
     execution_plan::{Boundedness, CardinalityEffect, EmissionType},
+    metrics::MetricValue,
     sorts::sort_preserving_merge::SortPreservingMergeExec,
     stream::RecordBatchStreamAdapter,
 };
 
-use futures::{StreamExt, stream};
+use futures::{Stream, StreamExt, stream};
 use lance_arrow::SchemaExt;
 use lance_core::{
     Error, Result,
@@ -197,6 +201,214 @@ impl ExecutionPlan for OneShotExec {
 
 /// Callback for reporting statistics after a scan
 pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
+
+/// Terminal state at the diagnostics finalization boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    /// The output stream was exhausted successfully.
+    Complete,
+    /// Execution returned an error; measurements describe partial work.
+    Failed,
+    /// The consumer dropped the stream before exhaustion; work may still be stopping.
+    Cancelled,
+}
+
+/// Measurements captured once when a diagnostic stream ends, fails, or is dropped.
+#[derive(Clone, Debug)]
+pub struct ExecutionDiagnostics {
+    /// First execution error, absent on successful exhaustion or early drop without error.
+    pub error: Option<String>,
+    /// Whether output was completely consumed.
+    pub outcome: ExecutionOutcome,
+    /// Independently measured wall time since starting execution.
+    pub elapsed: Duration,
+    /// Compatible count/time aggregation, possibly partial.
+    pub summary: ExecutionSummaryCounts,
+    /// Individual operator measurements, including unaggregated memory peaks.
+    pub operators: Vec<OperatorMetrics>,
+}
+
+/// Receives exactly one terminal report per successfully created diagnostic stream.
+pub type ExecutionDiagnosticsCallback = Arc<dyn Fn(&ExecutionDiagnostics) + Send + Sync>;
+
+struct DiagnosticStream {
+    error: Option<String>,
+    stream: SendableRecordBatchStream,
+    plan: Arc<dyn ExecutionPlan>,
+    started: Instant,
+    callback: Option<ExecutionDiagnosticsCallback>,
+}
+
+impl DiagnosticStream {
+    fn finish(&mut self, outcome: ExecutionOutcome) {
+        if let Some(callback) = self.callback.take() {
+            let mut summary = ExecutionSummaryCounts::default();
+            collect_execution_metrics(self.plan.as_ref(), &mut summary);
+            callback(&ExecutionDiagnostics {
+                error: self.error.clone(),
+                outcome,
+                elapsed: self.started.elapsed(),
+                summary,
+                operators: collect_operator_metrics(self.plan.as_ref()),
+            });
+        }
+    }
+}
+
+impl Stream for DiagnosticStream {
+    type Item = datafusion_common::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = this.stream.as_mut().poll_next(cx);
+        match &result {
+            Poll::Ready(None) => this.finish(ExecutionOutcome::Complete),
+            Poll::Ready(Some(Err(error))) => {
+                this.error = Some(error.to_string());
+                this.finish(ExecutionOutcome::Failed);
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+impl Drop for DiagnosticStream {
+    fn drop(&mut self) {
+        self.finish(ExecutionOutcome::Cancelled);
+    }
+}
+
+/// Execute with terminal diagnostics without changing the existing scan callback contract.
+///
+/// The callback runs once on exhaustion, the first stream error, or early drop.
+/// Failure/cancellation snapshots may precede background task shutdown and are
+/// explicitly partial. No callback is made when starting execution fails.
+/// The callback must not panic. This API adds no sampler or process metric labels.
+pub fn execute_plan_with_diagnostics(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    context: Arc<TaskContext>,
+    callback: ExecutionDiagnosticsCallback,
+) -> Result<SendableRecordBatchStream> {
+    let started = Instant::now();
+    let stream = execute_plan_with_context(plan.clone(), options, context)?;
+    let schema = stream.schema();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        DiagnosticStream {
+            error: None,
+            stream,
+            plan,
+            started,
+            callback: Some(callback),
+        },
+    )))
+}
+
+/// A numeric operator measurement, without aggregation across partitions or nodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionMetricValue {
+    /// Cumulative events, rows, or bytes, as identified by the metric name.
+    Count(usize),
+    /// A current value or high-water mark. Peaks must not be summed into a query peak.
+    Gauge(usize),
+    /// Operator peak accounted memory, in bytes. This is not a query-wide peak.
+    PeakMemoryBytes(usize),
+    /// Accumulated stage time; concurrent stages can overlap.
+    Time(Duration),
+}
+
+/// One measurement at its original operator and partition boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecutionMetric {
+    /// Producer-defined name, including the unit for byte measurements.
+    pub name: String,
+    /// Partition number, or `None` for an operator-wide measurement.
+    pub partition: Option<usize>,
+    /// Producer labels, retained independently of process metric export.
+    pub labels: Vec<(String, String)>,
+    /// Typed value. Missing measurements are omitted rather than filled with zero.
+    pub value: ExecutionMetricValue,
+}
+
+/// Metrics for a single node in a physical execution plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperatorMetrics {
+    /// Child indices from the root; distinguishes repeated instances of the same operator.
+    pub path: Vec<usize>,
+    /// [`ExecutionPlan::name`] of the producer.
+    pub name: String,
+    /// Numeric measurements. Unsupported custom metrics and timestamps are omitted.
+    pub metrics: Vec<ExecutionMetric>,
+}
+
+/// Snapshot numeric metrics while preserving operator identity, kind, and partition.
+///
+/// An empty metric list means the operator exposes no supported measurements.
+/// Gauge values are never aggregated. Use [`collect_execution_metrics`] for the
+/// compatible count/time summary.
+pub fn collect_operator_metrics(plan: &dyn ExecutionPlan) -> Vec<OperatorMetrics> {
+    fn visit(plan: &dyn ExecutionPlan, path: Vec<usize>, output: &mut Vec<OperatorMetrics>) {
+        let metrics = plan
+            .metrics()
+            .map(|metrics| {
+                metrics
+                    .iter()
+                    .filter_map(|metric| {
+                        let value = match metric.value() {
+                            MetricValue::OutputRows(count)
+                            | MetricValue::OutputBytes(count)
+                            | MetricValue::OutputBatches(count)
+                            | MetricValue::SpillCount(count)
+                            | MetricValue::SpilledBytes(count)
+                            | MetricValue::SpilledRows(count)
+                            | MetricValue::Count { count, .. } => {
+                                ExecutionMetricValue::Count(count.value())
+                            }
+                            MetricValue::PeakMemoryUsage { gauge, .. } => {
+                                ExecutionMetricValue::PeakMemoryBytes(gauge.value())
+                            }
+                            MetricValue::CurrentMemoryUsage(gauge)
+                            | MetricValue::Gauge { gauge, .. } => {
+                                ExecutionMetricValue::Gauge(gauge.value())
+                            }
+                            MetricValue::ElapsedCompute(time) | MetricValue::Time { time, .. } => {
+                                ExecutionMetricValue::Time(
+                                    Duration::from_nanos(time.value() as u64),
+                                )
+                            }
+                            _ => return None,
+                        };
+                        Some(ExecutionMetric {
+                            name: metric.value().name().to_owned(),
+                            partition: metric.partition(),
+                            labels: metric
+                                .labels()
+                                .iter()
+                                .map(|label| (label.name().to_owned(), label.value().to_owned()))
+                                .collect(),
+                            value,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        output.push(OperatorMetrics {
+            path: path.clone(),
+            name: plan.name().to_owned(),
+            metrics,
+        });
+        for (index, child) in plan.children().into_iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            visit(child.as_ref(), child_path, output);
+        }
+    }
+    let mut output = Vec::new();
+    visit(plan, Vec::new(), &mut output);
+    output
+}
 
 #[derive(Default, Clone)]
 pub struct LanceExecutionOptions {
@@ -421,6 +633,21 @@ pub struct ExecutionSummaryCounts {
 }
 
 impl ExecutionSummaryCounts {
+    /// Operator spill files produced, or `None` when no producer registered the metric.
+    pub fn spill_count(&self) -> Option<usize> {
+        self.all_counts.get("spill_count").copied()
+    }
+
+    /// Bytes written by DataFusion spill operators, excluding replay and scratch files.
+    /// `None` means unmeasured; `Some(0)` means a producer measured no spilling.
+    pub fn spilled_bytes(&self) -> Option<usize> {
+        self.all_counts.get("spilled_bytes").copied()
+    }
+
+    /// Rows written by DataFusion spill operators, or `None` when unmeasured.
+    pub fn spilled_rows(&self) -> Option<usize> {
+        self.all_counts.get("spilled_rows").copied()
+    }
     /// Number of index cache page lookups where the loader was not executed
     /// (per-page granularity).
     ///
@@ -494,6 +721,18 @@ impl ExecutionSummaryCounts {
 
 pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
     if let Some(metrics) = node.metrics() {
+        // These are specialized DataFusion variants, excluded by iter_counts().
+        for metric in metrics.iter() {
+            if let MetricValue::SpillCount(count)
+            | MetricValue::SpilledBytes(count)
+            | MetricValue::SpilledRows(count) = metric.value()
+            {
+                *counts
+                    .all_counts
+                    .entry(metric.value().name().to_owned())
+                    .or_default() += count.value();
+            }
+        }
         for (metric_name, count) in metrics.iter_counts() {
             match metric_name.as_ref() {
                 IOPS_METRIC => counts.iops += count.value(),
@@ -885,9 +1124,203 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit};
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
+    use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
     use datafusion_physical_plan::sorts::sort::SortExec;
     use futures::TryStreamExt;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::complete(ExecutionOutcome::Complete, true, true)]
+    #[case::error_then_drop(ExecutionOutcome::Failed, true, false)]
+    #[case::error_then_eof(ExecutionOutcome::Failed, true, true)]
+    #[case::cancelled(ExecutionOutcome::Cancelled, true, false)]
+    #[case::unpolled_drop(ExecutionOutcome::Cancelled, false, false)]
+    #[tokio::test]
+    async fn test_terminal_diagnostics(
+        #[case] expected: ExecutionOutcome,
+        #[case] poll: bool,
+        #[case] exhaust: bool,
+    ) {
+        let batch = record_batch!(("x", Int32, [1])).unwrap();
+        let schema = batch.schema();
+        let batches = if expected == ExecutionOutcome::Failed {
+            vec![
+                Ok(batch),
+                Err(DataFusionError::Execution("source failure".to_owned())),
+            ]
+        } else {
+            vec![Ok(batch)]
+        };
+        let plan = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches),
+        ))));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let output = reports.clone();
+        let exhausted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let original = exhausted.clone();
+        let options = LanceExecutionOptions {
+            execution_stats_callback: Some(Arc::new(move |_| {
+                original.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })),
+            ..Default::default()
+        };
+        let context = new_task_context(&options).unwrap();
+        let mut stream = execute_plan_with_diagnostics(
+            plan,
+            options,
+            context,
+            Arc::new(move |report| {
+                output.lock().unwrap().push(report.clone());
+            }),
+        )
+        .unwrap();
+        if poll {
+            assert!(stream.next().await.unwrap().is_ok());
+        }
+        if expected == ExecutionOutcome::Failed {
+            assert!(stream.next().await.unwrap().is_err());
+        }
+        if exhaust {
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        }
+        drop(stream);
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, expected);
+        assert_eq!(
+            exhausted.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(exhaust)
+        );
+        assert_eq!(
+            reports[0].error.is_some(),
+            expected == ExecutionOutcome::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_terminal_diagnostics_start_failure() {
+        let plan = Arc::new(OneShotExec::from_batch(
+            record_batch!(("x", Int32, [1])).unwrap(),
+        ));
+        drop(plan.execute(0, Arc::new(TaskContext::default())).unwrap());
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let output = reports.clone();
+        let result = execute_plan_with_diagnostics(
+            plan,
+            LanceExecutionOptions::default(),
+            Arc::new(TaskContext::default()),
+            Arc::new(move |report| output.lock().unwrap().push(report.clone())),
+        );
+        let error = result.err().unwrap();
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains("already been executed"));
+        assert!(reports.lock().unwrap().is_empty());
+    }
+
+    #[derive(Debug)]
+    struct MetricTestExec {
+        input: Arc<dyn ExecutionPlan>,
+        metrics: ExecutionPlanMetricsSet,
+    }
+
+    impl DisplayAs for MetricTestExec {
+        fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "MetricTestExec")
+        }
+    }
+
+    impl ExecutionPlan for MetricTestExec {
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+        fn name(&self) -> &str {
+            "MetricTestExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                input: children[0].clone(),
+                metrics: self.metrics.clone(),
+            }))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+        fn metrics(&self) -> Option<datafusion_physical_plan::metrics::MetricsSet> {
+            Some(self.metrics.clone_inner())
+        }
+    }
+
+    #[rstest]
+    #[case::no_spill(0, 0)]
+    #[case::spilled(2, 128)]
+    fn test_spill_metrics_preserve_availability_and_operator_peaks(
+        #[case] spill_count: usize,
+        #[case] spilled_bytes: usize,
+    ) {
+        let batch = record_batch!(("x", Int32, [2, 1])).unwrap();
+        let input = Arc::new(OneShotExec::from_batch(batch));
+        let metrics = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&metrics).spill_count(0).add(spill_count);
+        MetricBuilder::new(&metrics)
+            .spilled_bytes(0)
+            .add(spilled_bytes);
+        MetricBuilder::new(&metrics).spilled_rows(0).add(4);
+        MetricBuilder::new(&metrics)
+            .spilled_bytes(1)
+            .add(spilled_bytes / 2);
+        MetricBuilder::new(&metrics)
+            .peak_memory_usage("peak_mem_used", 0)
+            .set(1024);
+        MetricBuilder::new(&metrics)
+            .peak_memory_usage("peak_mem_used", 1)
+            .set(512);
+        let plan = MetricTestExec { input, metrics };
+        let mut counts = ExecutionSummaryCounts::default();
+        assert_eq!(counts.spill_count(), None);
+        collect_execution_metrics(&plan, &mut counts);
+        assert_eq!(counts.spill_count(), Some(spill_count));
+        assert_eq!(
+            counts.spilled_bytes(),
+            Some(spilled_bytes + spilled_bytes / 2)
+        );
+        assert_eq!(counts.spilled_rows(), Some(4));
+        assert!(!counts.all_counts.contains_key("peak_mem_used"));
+        let operators = collect_operator_metrics(&plan);
+        assert_eq!(operators[0].path, Vec::<usize>::new());
+        assert_eq!(operators[1].path, vec![0]);
+        let peaks: Vec<_> = operators[0]
+            .metrics
+            .iter()
+            .filter_map(|metric| {
+                if let ExecutionMetricValue::PeakMemoryBytes(bytes) = metric.value {
+                    Some((metric.partition, bytes))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(peaks, vec![(Some(0), 1024), (Some(1), 512)]);
+    }
 
     #[test]
     fn test_new_task_context() {
@@ -930,6 +1363,44 @@ mod tests {
             })
             .collect();
         assert_eq!(reservations.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_forced_sort_spill_is_collected() {
+        let batch = record_batch!(("x", Int32, (0..128).rev().collect::<Vec<i32>>())).unwrap();
+        let batches: Vec<_> = (0..128).map(|_| Ok(batch.clone())).collect();
+        let input = OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(batches),
+        )));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+            col("x", &batch.schema()).unwrap(),
+        )])
+        .unwrap();
+        let plan = Arc::new(SortExec::new(ordering, Arc::new(input)));
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(64 * 1024),
+            target_partition: Some(1),
+            batch_size: Some(128),
+            ..Default::default()
+        };
+        let mut output = execute_plan(plan.clone(), options).unwrap();
+        let mut rows = 0;
+        let mut previous = 0;
+        while let Some(batch) = output.try_next().await.unwrap() {
+            for value in batch["x"].as_primitive::<Int32Type>().values() {
+                assert!(*value >= previous);
+                previous = *value;
+            }
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 128 * 128);
+        let mut counts = ExecutionSummaryCounts::default();
+        collect_execution_metrics(plan.as_ref(), &mut counts);
+        assert!(counts.spill_count().unwrap() > 0);
+        assert!(counts.spilled_bytes().unwrap() > 0);
+        assert!(counts.spilled_rows().unwrap() > 0);
     }
 
     #[rstest]
