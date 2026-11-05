@@ -119,13 +119,16 @@ mod tests {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
             add_segment(name, vec![Ref::Local(0)]),
         ]
     }

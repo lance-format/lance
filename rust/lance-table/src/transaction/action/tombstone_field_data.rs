@@ -145,13 +145,16 @@ mod tests {
     }
 
     fn rebind_field_zero(data_change: bool) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment: Ref::Committed(0),
-            file: one_column_file("data/reencoded.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Committed(0),
+                one_column_file("data/reencoded.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                data_change,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -279,13 +282,16 @@ mod tests {
                     parent: None,
                     def: added_field("fresh"),
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(0),
                     field_ids: vec![FieldRef::Local(0)],

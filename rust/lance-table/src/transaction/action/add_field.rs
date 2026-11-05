@@ -171,13 +171,16 @@ mod tests {
                     parent: None,
                     def: added_field("added"),
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: one_column_file("data/added.lance"),
-                    field_ids: vec![FieldRef::Local(7)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        one_column_file("data/added.lance"),
+                        vec![FieldRef::Local(7)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();

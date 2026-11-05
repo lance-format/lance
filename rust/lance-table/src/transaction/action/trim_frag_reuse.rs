@@ -162,13 +162,16 @@ mod tests {
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: one_column_file("data/new.lance"),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        one_column_file("data/new.lance"),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
             vec![translating.clone(), entry],
         )

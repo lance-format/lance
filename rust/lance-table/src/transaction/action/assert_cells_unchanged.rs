@@ -178,13 +178,16 @@ mod tests {
                 field_ids: vec![FieldRef::Committed(field)],
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(field)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ]
     }
 

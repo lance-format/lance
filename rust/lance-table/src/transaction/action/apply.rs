@@ -1471,9 +1471,9 @@ mod tests {
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
-        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData,
+        UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -1544,16 +1544,19 @@ mod tests {
                         field_ids: vec![FieldRef::Committed(0)],
                         data_change: true,
                     }),
-                    Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Committed(0),
-                        file: DataFile {
-                            fields: Arc::from([]),
-                            ..replacement
-                        },
-                        field_ids: vec![FieldRef::Committed(0)],
-                        data_change: true,
-                        base: None,
-                    }),
+                    Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Committed(0),
+                            DataFile {
+                                fields: Arc::from([]),
+                                ..replacement
+                            },
+                            vec![FieldRef::Committed(0)],
+                            None,
+                            true,
+                        )
+                        .unwrap(),
+                    ),
                 ],
             )]))
         } else {
@@ -1614,13 +1617,16 @@ mod tests {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: one_column_file("data/new.lance"),
-                field_ids: vec![FieldRef::Local(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    one_column_file("data/new.lance"),
+                    vec![FieldRef::Local(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ];
 
         // Replaying the same actions against the manifest the first run
@@ -1703,20 +1709,23 @@ mod tests {
                     field_ids: vec![FieldRef::Committed(rewritten)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new(
-                        "data/0-new.lance",
-                        Vec::<i32>::new(),
-                        vec![0],
-                        ConcreteFileVersion::V2_0,
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new(
+                            "data/0-new.lance",
+                            Vec::<i32>::new(),
+                            vec![0],
+                            ConcreteFileVersion::V2_0,
+                            None,
+                            None,
+                        ),
+                        vec![FieldRef::Committed(rewritten)],
                         None,
-                        None,
-                    ),
-                    field_ids: vec![FieldRef::Committed(rewritten)],
-                    data_change: true,
-                    base: None,
-                }),
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
             vec![IndexMetadata {
                 fields: vec![indexed],
@@ -1753,20 +1762,23 @@ mod tests {
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new(
-                        "data/0-new.lance",
-                        vec![],
-                        vec![0],
-                        ConcreteFileVersion::V2_0,
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new(
+                            "data/0-new.lance",
+                            vec![],
+                            vec![0],
+                            ConcreteFileVersion::V2_0,
+                            None,
+                            None,
+                        ),
+                        vec![FieldRef::Committed(0)],
                         None,
-                        None,
-                    ),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
             vec![index],
         );
@@ -1817,13 +1829,16 @@ mod tests {
     }
 
     fn write_data(fragment: Ref, field: FieldRef) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: one_column_file("data/new.lance"),
-            field_ids: vec![field],
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                one_column_file("data/new.lance"),
+                vec![field],
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     fn mint_field(token: u32, name: &str, parent: Option<FieldRef>) -> Action {
@@ -1986,16 +2001,13 @@ mod tests {
         nullable: None,
     }))]
     #[case::parent(mint_field(0, "child", Some(FieldRef::Committed(ROW_ID_FIELD_ID))))]
-    #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate {
-        field_metadata: vec![FieldMetadataUpdate {
-            field: FieldRef::Committed(ROW_ID_FIELD_ID),
-            updates: UpdateMap {
-                update_entries: vec![],
-                replace: false,
-            },
-        }],
-        ..Default::default()
-    }))]
+    #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
+        FieldRef::Committed(ROW_ID_FIELD_ID),
+        UpdateMap {
+            update_entries: vec![],
+            replace: false,
+        },
+    )))]
     fn test_a_reserved_field_id_names_no_schema_field(#[case] action: Action) {
         let error = apply(&backed_manifest(), vec![action]).unwrap_err();
 
@@ -2070,13 +2082,10 @@ mod tests {
     }
 
     fn config_update() -> Action {
-        Action::ConfigUpdate(ConfigUpdate {
-            config: Some(UpdateMap {
-                update_entries: vec![("k", "v").into()],
-                replace: false,
-            }),
-            ..Default::default()
-        })
+        Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+            update_entries: vec![("k", "v").into()],
+            replace: false,
+        }))
     }
 
     fn fragment_counter_at_max() -> Manifest {
@@ -2218,13 +2227,16 @@ mod tests {
     }
 
     fn data_file_under_base(fragment: Ref, base: Ref) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: one_column_file("data/new.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-            base: Some(base),
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                one_column_file("data/new.lance"),
+                vec![FieldRef::Committed(0)],
+                Some(base),
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     /// A committed id above the read version's mark names nothing the writer

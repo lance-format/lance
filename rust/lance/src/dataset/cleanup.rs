@@ -8167,21 +8167,23 @@ mod tests {
                     data_change: false,
                 }));
                 for file in &destination.files {
-                    actions.push(Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Committed(destination.id),
-                        field_ids: file
-                            .fields
-                            .iter()
-                            .copied()
-                            .map(FieldRef::Committed)
-                            .collect(),
-                        file: lance_table::format::DataFile {
-                            fields: Arc::from([]),
-                            ..file.clone()
-                        },
-                        data_change: false,
-                        base: None,
-                    }));
+                    actions.push(Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Committed(destination.id),
+                            lance_table::format::DataFile {
+                                fields: Arc::from([]),
+                                ..file.clone()
+                            },
+                            file.fields
+                                .iter()
+                                .copied()
+                                .map(FieldRef::Committed)
+                                .collect(),
+                            None,
+                            false,
+                        )
+                        .unwrap(),
+                    ));
                 }
             }
             actions.push(Action::AppendFragReuseTransition(

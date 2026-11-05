@@ -129,13 +129,16 @@ mod tests {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: one_column_file("data/fresh.lance"),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        one_column_file("data/fresh.lance"),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -163,13 +166,16 @@ mod tests {
             })
         };
         let write = |token, path: &str| {
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(token),
-                file: one_column_file(path),
-                field_ids: vec![FieldRef::Local(token)],
-                data_change: true,
-                base: None,
-            })
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(token),
+                    one_column_file(path),
+                    vec![FieldRef::Local(token)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )
         };
         let next = apply(
             &backed_manifest(),
@@ -288,13 +294,16 @@ mod tests {
                 created_at_version_meta: None,
                 data_change: false,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: one_column_file("data/compacted.lance"),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    one_column_file("data/compacted.lance"),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
         ]);
         let records_nothing = footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds {
             count: 3,

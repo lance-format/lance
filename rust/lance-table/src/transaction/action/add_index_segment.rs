@@ -1009,13 +1009,16 @@ mod tests {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Local(0)]),
                     ..segment("fresh", vec![FieldRef::Local(0)])
@@ -1311,13 +1314,16 @@ mod tests {
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    data_change,
+                )
+                .unwrap(),
+            ),
         ];
         let build = Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)]));
         let actions = if segment_after_rewrite {
@@ -1399,13 +1405,16 @@ mod tests {
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: false,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
         ]);
 
         assert!(!build.conflicts_with(&reencode));

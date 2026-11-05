@@ -3109,13 +3109,16 @@ mod composite {
                         created_at_version_meta: None,
                         data_change: true,
                     }),
-                    Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Local(0),
-                        file: without_fields(borrowed_file),
-                        field_ids: vec![FieldRef::Local(0)],
-                        data_change: true,
-                        base: None,
-                    }),
+                    Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Local(0),
+                            without_fields(borrowed_file),
+                            vec![FieldRef::Local(0)],
+                            None,
+                            true,
+                        )
+                        .unwrap(),
+                    ),
                 ],
             ))
             .await
@@ -3269,18 +3272,15 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                config: Some(UpdateMap {
+            vec![Action::ConfigUpdate(ConfigUpdate::default().with_config(
+                UpdateMap {
                     update_entries: vec![UpdateMapEntry {
                         key: "owner".into(),
                         value: Some("analytics".into()),
                     }],
                     replace: false,
-                }),
-                table_metadata: None,
-                schema_metadata: None,
-                field_metadata: Vec::new(),
-            })],
+                },
+            ))],
         )
         .await;
 
@@ -3359,13 +3359,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: first_file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        first_file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 // The same commit then replaces the data it just added, naming the
                 // fragment by the token it was minted under.
                 Action::TombstoneFieldData(TombstoneFieldData {
@@ -3373,13 +3376,16 @@ mod composite {
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: second_file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        second_file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -3418,13 +3424,16 @@ mod composite {
                     ))
                     .unwrap(),
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(fragment_id),
-                    file: without_fields(file),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(fragment_id),
+                        without_fields(file),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -3462,13 +3471,16 @@ mod composite {
                     ))
                     .unwrap(),
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(fragment_id),
-                    file: without_fields(file),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(fragment_id),
+                        without_fields(file),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -3559,13 +3571,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(2),
-                    file: without_fields(file),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(2),
+                        without_fields(file),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -3726,13 +3741,16 @@ mod composite {
                 field_ids: vec![FieldRef::Committed(target_id)],
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment_id),
-                file: without_fields(file),
-                field_ids: vec![FieldRef::Committed(target_id)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment_id),
+                    without_fields(file),
+                    vec![FieldRef::Committed(target_id)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ];
         if declare_read {
             actions.push(Action::AssertCellsUnchanged(AssertCellsUnchanged {
@@ -3855,13 +3873,16 @@ mod composite {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: existing_data_file(dataset, 0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    existing_data_file(dataset, 0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ]
     }
 
@@ -3886,13 +3907,16 @@ mod composite {
             def: LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
         })];
         for (index, fragment) in dataset.fragments().iter().enumerate() {
-            actions.push(Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment.id),
-                file: existing_data_file(dataset, index),
-                field_ids: vec![FieldRef::Local(0)],
-                data_change: true,
-                base: None,
-            }));
+            actions.push(Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment.id),
+                    existing_data_file(dataset, index),
+                    vec![FieldRef::Local(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ));
         }
         actions
     }
@@ -3979,13 +4003,16 @@ mod composite {
             }),
         ];
         for (index, fragment) in original.fragments().iter().enumerate() {
-            add_and_tighten.push(Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment.id),
-                file: existing_data_file(&original, index),
-                field_ids: vec![FieldRef::Local(0)],
-                data_change: true,
-                base: None,
-            }));
+            add_and_tighten.push(Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment.id),
+                    existing_data_file(&original, index),
+                    vec![FieldRef::Local(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ));
         }
         let append = append_with_field_zero(&original);
         let (first, stale) = if append_first {
@@ -4027,13 +4054,16 @@ mod composite {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: existing_data_file(&with_b, 0),
-                field_ids: vec![FieldRef::Committed(b)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    existing_data_file(&with_b, 0),
+                    vec![FieldRef::Committed(b)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ];
         let (first, stale) = if append_first {
             (append_only_b, tighten_field_zero())
@@ -4137,13 +4167,16 @@ mod composite {
                     field_ids: fields.clone(),
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(fragment_id),
-                    file: without_fields(file),
-                    field_ids: fields,
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(fragment_id),
+                        without_fields(file),
+                        fields,
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -4297,13 +4330,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 // The index covers the fragment this same commit minted, which
                 // has no id until the commit lands.
                 Action::AddIndexSegment(index_segment(
@@ -4349,13 +4385,16 @@ mod composite {
         })];
         let mut covered = Vec::new();
         for (index, fragment) in dataset.fragments().iter().enumerate() {
-            actions.push(Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment.id),
-                file: existing_data_file(&dataset, index),
-                field_ids: vec![FieldRef::Local(0)],
-                data_change: true,
-                base: None,
-            }));
+            actions.push(Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment.id),
+                    existing_data_file(&dataset, index),
+                    vec![FieldRef::Local(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ));
             covered.push(Ref::Committed(fragment.id));
         }
         actions.push(Action::AddIndexSegment(AddIndexSegment {
@@ -4500,13 +4539,16 @@ mod composite {
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file,
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(0),
+                    file,
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ]
     }
 
@@ -4717,13 +4759,16 @@ mod composite {
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(1),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(1),
+                        file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -4792,13 +4837,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -4991,13 +5039,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 Action::AddOverlays(AddOverlays {
                     fragment: Ref::Committed(overlaid),
                     overlays: vec![DataOverlayFile {
@@ -5039,13 +5090,16 @@ mod composite {
                     field_ids: vec![FieldRef::Committed(0)],
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(rewritten),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(rewritten),
+                        file,
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
                     rows: vec![RowSelection {
                         fragment_id: u32::try_from(rewritten).unwrap(),
@@ -5131,13 +5185,16 @@ mod composite {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: existing_data_file(dataset, 0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    existing_data_file(dataset, 0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ];
         if let Some(key_hashes) = key_hashes {
             actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
@@ -5268,13 +5325,16 @@ mod composite {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: existing_data_file(dataset, 0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        existing_data_file(dataset, 0),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ]
         };
 
@@ -5320,13 +5380,16 @@ mod composite {
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: false,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment),
-                file: existing_data_file(&original, 0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment),
+                    existing_data_file(&original, 0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
         ];
         let (first, second) = if overlay_first {
             (overlay, reencode)
@@ -5385,13 +5448,16 @@ mod composite {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: existing_data_file(&dataset, 0),
-                field_ids: vec![FieldRef::Committed(1)],
-                data_change: true,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    existing_data_file(&dataset, 0),
+                    vec![FieldRef::Committed(1)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
             Action::AddOverlays(AddOverlays {
                 fragment: Ref::Local(0),
                 overlays: vec![DataOverlayFile {
@@ -5504,18 +5570,20 @@ mod composite {
                 data_change: false,
             }));
             for file in &written.files {
-                actions.push(Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    field_ids: file
-                        .fields
-                        .iter()
-                        .copied()
-                        .map(FieldRef::Committed)
-                        .collect(),
-                    file: without_fields(file.clone()),
-                    data_change: false,
-                    base: None,
-                }));
+                actions.push(Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        without_fields(file.clone()),
+                        file.fields
+                            .iter()
+                            .copied()
+                            .map(FieldRef::Committed)
+                            .collect(),
+                        None,
+                        false,
+                    )
+                    .unwrap(),
+                ));
             }
             if record_transition {
                 let mut survivors = RoaringTreemap::new();
@@ -5700,13 +5768,16 @@ mod composite {
                     parent: None,
                     def: int32_field("b"),
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: existing_data_file(&dataset, 0),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        existing_data_file(&dataset, 0),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ];
             let compacted = commit(dataset, compaction_without_files(&[0])).await;
 

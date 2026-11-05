@@ -1062,13 +1062,16 @@ mod tests {
                         created_at_version_meta: None,
                         data_change,
                     }),
-                    Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Local(token),
-                        file: wide_data_file(index, Vec::new()),
-                        field_ids: (0..WIDE_COLUMNS).map(FieldRef::Committed).collect(),
-                        data_change,
-                        base: None,
-                    }),
+                    Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Local(token),
+                            wide_data_file(index, Vec::new()),
+                            (0..WIDE_COLUMNS).map(FieldRef::Committed).collect(),
+                            None,
+                            data_change,
+                        )
+                        .unwrap(),
+                    ),
                 ]
             })
             .collect()

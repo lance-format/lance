@@ -519,13 +519,16 @@ mod tests {
                 data_change,
             }));
         }
-        actions.push(Action::AddDataFile(AddDataFile {
-            fragment,
-            file: one_column_file("data/rewritten.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change,
-            base: None,
-        }));
+        actions.push(Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                one_column_file("data/rewritten.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                data_change,
+            )
+            .unwrap(),
+        ));
         actions
     }
 

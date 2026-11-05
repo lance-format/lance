@@ -1165,13 +1165,16 @@ mod tests {
     }
 
     fn add_data_file_for(fragment: Ref, field_ids: Vec<FieldRef>) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-            field_ids,
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                field_ids,
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     /// Tombstone `field` in `fragment` and bind a new file for it, both
@@ -1183,13 +1186,16 @@ mod tests {
                 field_ids: vec![FieldRef::Committed(field)],
                 data_change,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment),
-                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change,
-                base: None,
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment),
+                    DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(field)],
+                    None,
+                    data_change,
+                )
+                .unwrap(),
+            ),
         ]
     }
 
@@ -1218,15 +1224,10 @@ mod tests {
     }
 
     fn config_entry(key: &str) -> Action {
-        Action::ConfigUpdate(ConfigUpdate {
-            config: Some(UpdateMap {
-                update_entries: vec![(key, Some("v")).into()],
-                replace: false,
-            }),
-            table_metadata: None,
-            schema_metadata: None,
-            field_metadata: Vec::new(),
-        })
+        Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+            update_entries: vec![(key, Some("v")).into()],
+            replace: false,
+        }))
     }
 
     fn tighten_local_field(local: u32) -> Action {

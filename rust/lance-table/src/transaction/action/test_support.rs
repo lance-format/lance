@@ -295,13 +295,16 @@ pub(super) mod frag_reuse {
             created_at_version_meta: stable_row_ids.then(versions),
             data_change: false,
         }));
-        actions.push(Action::AddDataFile(AddDataFile {
-            fragment: Ref::Local(token),
-            file: super::one_column_file(&format!("data/compacted-{token}.lance")),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: false,
-            base: None,
-        }));
+        actions.push(Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Local(token),
+                super::one_column_file(&format!("data/compacted-{token}.lance")),
+                vec![FieldRef::Committed(0)],
+                None,
+                false,
+            )
+            .unwrap(),
+        ));
         if let Some(mapping) = mapping {
             actions.push(transition(sources, &[Ref::Local(token)], mapping));
         }

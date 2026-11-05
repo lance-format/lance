@@ -316,19 +316,22 @@ impl std::fmt::Display for FieldId {
 ///     ),
 ///     UserStep::new(
 ///         "back its one column",
-///         vec![Action::AddDataFile(AddDataFile {
-///             fragment: Ref::Local(0),
-///             file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-///             field_ids: vec![FieldRef::Committed(0)],
-///             data_change: true,
-///             base: None,
-///         })],
+///         // A writer that just wrote this file would build the action and
+///         // certify its contract; this example only shows the shape.
+///         vec![Action::AddDataFile(AddDataFile::try_new_unchecked(
+///             Ref::Local(0),
+///             DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+///             vec![FieldRef::Committed(0)],
+///             None,
+///             true,
+///         )?)],
 ///     ),
 /// ]);
 ///
 /// // The steps are what a user did; the actions are the deltas they became.
 /// assert_eq!(operation.steps.len(), 2);
 /// assert_eq!(operation.iter_actions().count(), 2);
+/// # Ok::<(), lance_core::Error>(())
 /// ```
 ///
 /// Committing one goes through

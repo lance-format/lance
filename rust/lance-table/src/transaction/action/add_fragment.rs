@@ -283,13 +283,16 @@ mod tests {
                     created_at_version_meta: None,
                     data_change: true,
                 }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: one_column_file("data/new.lance"),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        one_column_file("data/new.lance"),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -437,15 +440,18 @@ mod tests {
             &reserved,
             vec![
                 add_fragment(Ref::Committed(1)),
-                Action::AddDataFile(AddDataFile {
+                Action::AddDataFile(
                     // The same reference the AddFragment carried, so a writer
                     // does not need a local token alongside the reserved id.
-                    fragment: Ref::Committed(1),
-                    file: one_column_file("data/new.lance"),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(1),
+                        one_column_file("data/new.lance"),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();

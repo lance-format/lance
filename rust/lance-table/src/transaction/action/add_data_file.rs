@@ -10,26 +10,131 @@ use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::hash::Hash;
 
 /// Add a data file to a fragment.
+///
+/// The action claims things about bytes in storage that it cannot check
+/// without reading them, so it can only be built with
+/// [`try_new_unchecked`](Self::try_new_unchecked), whose caller certifies those
+/// claims.
+/// Most code should not build one directly, and should instead go through a
+/// writer that produces the file and the action together.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddDataFile {
-    /// The fragment to add the file to: committed, or a fragment minted earlier
-    /// in the same operation.
-    pub fragment: Ref,
-    /// The file, with `fields` left empty: apply stamps them from `field_ids`,
-    /// the only field list the action carries.
-    pub file: DataFile,
-    /// One entry per column in `file`, in column order.
-    pub field_ids: Vec<FieldRef>,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
-    pub data_change: bool,
-    /// The base path the file lives under: committed, or one minted earlier in
-    /// the same operation. `None` for the dataset's own data directory.
-    pub base: Option<Ref>,
+    fragment: Ref,
+    file: DataFile,
+    field_ids: Vec<FieldRef>,
+    data_change: bool,
+    base: Option<Ref>,
 }
 
 impl AddDataFile {
+    /// Attach `file` to `fragment`, backing `field_ids`.
+    ///
+    /// * `fragment` is committed, or a fragment minted earlier in the same
+    ///   operation.
+    /// * `file` has `fields` and `base_id` unset: apply stamps both from the
+    ///   other arguments.
+    /// * `field_ids` has one entry per column in `file`, in column order, and is
+    ///   the file's only field list.
+    /// * `base` is the base path the file lives under: committed, or one minted
+    ///   earlier in the same operation. `None` for the dataset's own data
+    ///   directory.
+    /// * `data_change` says whether the file changes the values its fields
+    ///   hold. See [`AddFragment::data_change`](super::AddFragment::data_change).
+    ///
+    /// # Contract
+    ///
+    /// "Unchecked" refers to the claims below, which are about bytes in
+    /// storage. The caller certifies, and nothing downstream checks, that:
+    ///
+    /// * `file.path`, resolved against `base`, names a Lance file that exists
+    ///   and is readable at the file version `file` declares.
+    /// * The file holds exactly as many rows as the fragment's physical rows,
+    ///   in the same order.
+    /// * The file's columns are `field_ids`, in order, and each holds data of
+    ///   its field's type.
+    /// * If `data_change` is `false`, every row of the file holds the value the
+    ///   fragment already holds for that row and field.
+    ///
+    /// Breaking the contract is not undefined behavior, but it commits a table
+    /// whose reads fail or return the wrong rows.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a `file` whose `fields` or `base_id` is set, whose
+    /// `column_indices` disagree in length with `field_ids`, or that binds a
+    /// field or a column twice.
+    pub fn try_new_unchecked(
+        fragment: Ref,
+        file: DataFile,
+        field_ids: Vec<FieldRef>,
+        base: Option<Ref>,
+        data_change: bool,
+    ) -> Result<Self> {
+        if !file.fields.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment:?} carries file.fields {:?}; \
+                 file.fields must be empty, since field_ids is the file's field list",
+                file.fields
+            )));
+        }
+        if let Some(base_id) = file.base_id {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment:?} carries file.base_id {base_id}; \
+                 file.base_id must be unset, since the action's base names where the file lives"
+            )));
+        }
+        if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
+            return Err(Error::invalid_input(format!(
+                "AddDataFile for fragment {fragment:?} lists {} field ids but the file has {} \
+                 columns",
+                field_ids.len(),
+                file.column_indices.len()
+            )));
+        }
+        reject_repeat(fragment, "field", &field_ids, |_| true)?;
+        // -1 marks a field with no top-level column of its own, so it may repeat.
+        reject_repeat(fragment, "column", &file.column_indices, |column| {
+            *column >= 0
+        })?;
+        Ok(Self {
+            fragment,
+            file,
+            field_ids,
+            data_change,
+            base,
+        })
+    }
+
+    /// The fragment the file is added to.
+    pub fn fragment(&self) -> Ref {
+        self.fragment
+    }
+
+    /// The file, with `fields` and `base_id` unset.
+    pub fn file(&self) -> &DataFile {
+        &self.file
+    }
+
+    /// The fields the file backs, one per column, in column order.
+    pub fn field_ids(&self) -> &[FieldRef] {
+        &self.field_ids
+    }
+
+    /// Whether the file changes the values its fields hold.
+    pub fn data_change(&self) -> bool {
+        self.data_change
+    }
+
+    /// The base path the file lives under, or `None` for the dataset's own
+    /// data directory.
+    pub fn base(&self) -> Option<Ref> {
+        self.base
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if self.data_change {
@@ -74,34 +179,8 @@ impl AddDataFile {
             }
         }
 
-        if !self.file.fields.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} carries file.fields {:?}; \
-                 file.fields must be empty, since field_ids is the file's field list",
-                self.file.fields
-            )));
-        }
-        if let Some(base_id) = self.file.base_id {
-            return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} carries file.base_id {base_id}; \
-                 file.base_id must be unset, since the action's base names where the file lives"
-            )));
-        }
         let mut file = self.file.clone();
         file.base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
-        if !file.column_indices.is_empty() && file.column_indices.len() != field_ids.len() {
-            return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} lists {} field ids but the file has {} \
-                 columns",
-                field_ids.len(),
-                file.column_indices.len()
-            )));
-        }
-        reject_repeat(fragment_id, "field", &field_ids, |_| true)?;
-        // -1 marks a field with no top-level column of its own, so it may repeat.
-        reject_repeat(fragment_id, "column", &file.column_indices, |column| {
-            *column >= 0
-        })?;
         // A field's values live in exactly one file, so a second file for the
         // same field is ambiguous. A struct's own id is the exception: a file
         // adding a child under a committed struct lists the parent too, and the
@@ -162,11 +241,11 @@ impl AddDataFile {
 
 /// Reject a value that appears twice among the `values` that `counts`, naming
 /// both positions so the writer can find the pair.
-fn reject_repeat(
-    fragment_id: u64,
+fn reject_repeat<T: Copy + Eq + Hash + Debug>(
+    fragment: Ref,
     what: &str,
-    values: &[i32],
-    counts: impl Fn(&i32) -> bool,
+    values: &[T],
+    counts: impl Fn(&T) -> bool,
 ) -> Result<()> {
     let mut first_seen = HashMap::with_capacity(values.len());
     for (position, value) in values.iter().enumerate() {
@@ -175,8 +254,8 @@ fn reject_repeat(
         }
         if let Some(first) = first_seen.insert(*value, position) {
             return Err(Error::invalid_input(format!(
-                "AddDataFile for fragment {fragment_id} binds {what} {value} at positions {first} \
-                 and {position}; each {what} is bound at most once per file"
+                "AddDataFile for fragment {fragment:?} binds {what} {value:?} at positions \
+                 {first} and {position}; each {what} is bound at most once per file"
             )));
         }
     }
@@ -199,17 +278,19 @@ impl TryFrom<pb_actions::AddDataFile> for AddDataFile {
     type Error = Error;
 
     fn try_from(message: pb_actions::AddDataFile) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "AddDataFile.fragment")?.try_into()?,
-            file: DataFile::try_from(required(message.file, "AddDataFile.file")?)?,
-            field_ids: message
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(
+            required(message.fragment, "AddDataFile.fragment")?.try_into()?,
+            DataFile::try_from(required(message.file, "AddDataFile.file")?)?,
+            message
                 .field_ids
                 .into_iter()
                 .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
-            data_change: data_change_from_wire(message.data_change),
-            base: message.base.map(Ref::try_from).transpose()?,
-        })
+            message.base.map(Ref::try_from).transpose()?,
+            data_change_from_wire(message.data_change),
+        )
     }
 }
 
@@ -233,13 +314,16 @@ mod tests {
         let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
-            vec![Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(3),
-                file: one_column_file("data/x.lance"),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            })],
+            vec![Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(3),
+                    one_column_file("data/x.lance"),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )],
         )
         .unwrap_err();
         assert!(
@@ -256,25 +340,12 @@ mod tests {
         file.fields = vec![0].into();
         file.column_indices = vec![0].into();
 
-        let error = apply(
-            &unbacked_manifest(),
-            vec![
-                Action::AddFragment(AddFragment {
-                    id: Ref::Local(0),
-                    physical_rows: 10,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
-            ],
+        let error = AddDataFile::try_new_unchecked(
+            Ref::Local(0),
+            file,
+            vec![FieldRef::Committed(0)],
+            None,
+            true,
         )
         .unwrap_err();
 
@@ -327,15 +398,19 @@ mod tests {
             parent: None,
             def: added_field("added"),
         }));
-        actions.push(Action::AddDataFile(AddDataFile {
-            fragment: Ref::Committed(0),
+        // An embedded base_id is rejected when the action is built, the rest
+        // when it is applied.
+        let result = AddDataFile::try_new_unchecked(
+            Ref::Committed(0),
             file,
-            field_ids: vec![FieldRef::Local(0)],
-            data_change: true,
+            vec![FieldRef::Local(0)],
             base,
-        }));
-
-        let result = apply(&manifest_with_base(), actions);
+            true,
+        )
+        .and_then(|action| {
+            actions.push(Action::AddDataFile(action));
+            apply(&manifest_with_base(), actions)
+        });
 
         match expected {
             Ok(base_id) => {
@@ -365,16 +440,19 @@ mod tests {
     }
 
     fn file_binding(fragment: Ref, field_ids: &[i32]) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: DataFile {
-                column_indices: (0..).take(field_ids.len()).collect(),
-                ..DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0)
-            },
-            field_ids: field_ids.iter().copied().map(FieldRef::Committed).collect(),
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                DataFile {
+                    column_indices: (0..).take(field_ids.len()).collect(),
+                    ..DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0)
+                },
+                field_ids.iter().copied().map(FieldRef::Committed).collect(),
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     /// A file binds schema fields, plus the hidden lineage column of a
@@ -419,13 +497,6 @@ mod tests {
         ],
         None
     )]
-    #[case::lineage_bound_twice_in_one_file(
-        vec![
-            new_fragment(Some(RowIdMeta::Column)),
-            file_binding(Ref::Local(0), &[0, ROW_ID_FIELD_ID, ROW_ID_FIELD_ID]),
-        ],
-        Some("binds field -3 at positions 1 and 2")
-    )]
     #[case::spilled_lineage_no_file_carries(
         vec![new_fragment(Some(RowIdMeta::Column)), file_binding(Ref::Local(0), &[0])],
         Some("spills row lineage field -3 but no AddDataFile binds it")
@@ -469,7 +540,7 @@ mod tests {
     /// has no column indices at all.
     #[rstest]
     #[case::distinct(&[0, 1], &[0, 1], None)]
-    #[case::repeated_field(&[0, 0], &[0, 1], Some("binds field 0 at positions 0 and 1"))]
+    #[case::repeated_field(&[0, 0], &[0, 1], Some("binds field Committed(0) at positions 0 and 1"))]
     #[case::repeated_column(&[0, 1], &[2, 2], Some("binds column 2 at positions 0 and 1"))]
     #[case::repeated_unplaced_column(&[0, 1], &[-1, -1], None)]
     #[case::no_column_indices(&[0, 1], &[], None)]
@@ -488,19 +559,19 @@ mod tests {
         let mut file = one_column_file("data/x.lance");
         file.column_indices = column_indices.into();
 
-        let result = apply(
-            &manifest,
-            vec![
-                new_fragment(None),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file,
-                    field_ids: field_ids.iter().copied().map(FieldRef::Committed).collect(),
-                    data_change: true,
-                    base: None,
-                }),
-            ],
-        );
+        let result = AddDataFile::try_new_unchecked(
+            Ref::Local(0),
+            file,
+            field_ids.iter().copied().map(FieldRef::Committed).collect(),
+            None,
+            true,
+        )
+        .and_then(|action| {
+            apply(
+                &manifest,
+                vec![new_fragment(None), Action::AddDataFile(action)],
+            )
+        });
 
         match expected_error {
             None => {
@@ -519,19 +590,15 @@ mod tests {
 
     #[test]
     fn test_add_data_file_rejects_a_column_count_mismatch() {
-        let manifest = unbacked_manifest();
         let mut file = one_column_file("data/x.lance");
         file.column_indices = vec![0, 1].into();
 
-        let error = apply(
-            &manifest,
-            vec![Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file,
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            })],
+        let error = AddDataFile::try_new_unchecked(
+            Ref::Committed(0),
+            file,
+            vec![FieldRef::Committed(0)],
+            None,
+            true,
         )
         .unwrap_err();
 
@@ -547,13 +614,16 @@ mod tests {
         let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
-            vec![Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(7),
-                file: one_column_file("data/x.lance"),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            })],
+            vec![Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(7),
+                    one_column_file("data/x.lance"),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )],
         )
         .unwrap_err();
 
@@ -562,13 +632,16 @@ mod tests {
     }
 
     fn add_file_for_field_zero() -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment: Ref::Committed(0),
-            file: one_column_file("data/new.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Committed(0),
+                one_column_file("data/new.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]

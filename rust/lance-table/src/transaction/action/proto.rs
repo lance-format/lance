@@ -187,9 +187,9 @@ mod tests {
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
         AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
-        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
-        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        DropField, DropIndex, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment,
+        ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile,
+        TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -216,13 +216,16 @@ mod tests {
                 created_at_version_meta: None,
                 data_change: true,
             }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: sample_data_file(),
-                field_ids: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                data_change: false,
-                base: Some(Ref::Local(1)),
-            }),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    sample_data_file(),
+                    vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    Some(Ref::Local(1)),
+                    false,
+                )
+                .unwrap(),
+            ),
             Action::AddField(AddField {
                 local: 3,
                 parent: Some(FieldRef::Committed(1)),
@@ -351,24 +354,24 @@ mod tests {
             Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
             Action::ReserveRowIds(ReserveRowIds { count: 40 }),
             Action::ResetTable(ResetTable),
-            Action::ConfigUpdate(ConfigUpdate {
-                config: Some(UpdateMap {
-                    update_entries: vec![("a", "1").into(), ("b", None).into()],
-                    replace: false,
-                }),
-                table_metadata: None,
-                schema_metadata: Some(UpdateMap {
-                    update_entries: vec![("c", "2").into()],
-                    replace: true,
-                }),
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Local(3),
-                    updates: UpdateMap {
-                        update_entries: vec![("d", "3").into()],
+            Action::ConfigUpdate(
+                ConfigUpdate::default()
+                    .with_config(UpdateMap {
+                        update_entries: vec![("a", "1").into(), ("b", None).into()],
                         replace: false,
-                    },
-                }],
-            }),
+                    })
+                    .with_schema_metadata(UpdateMap {
+                        update_entries: vec![("c", "2").into()],
+                        replace: true,
+                    })
+                    .with_field_metadata(
+                        FieldRef::Local(3),
+                        UpdateMap {
+                            update_entries: vec![("d", "3").into()],
+                            replace: false,
+                        },
+                    ),
+            ),
         ]
     }
 

@@ -136,7 +136,7 @@ mod tests {
         survivors, table, transition,
     };
     use crate::transaction::action::test_support::{apply_with_indices, footprint};
-    use crate::transaction::action::{Action, RemoveFragment, SetDeletionFile};
+    use crate::transaction::action::{Action, AddDataFile, RemoveFragment, SetDeletionFile};
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
@@ -305,7 +305,7 @@ mod tests {
                 add.id = Ref::Committed(reserved);
             }
             if let Action::AddDataFile(file) = &mut actions[3] {
-                file.fragment = Ref::Committed(reserved);
+                *file = AddDataFile::try_new_unchecked(Ref::Committed(reserved), file.file().clone(), file.field_ids().to_vec(), file.base(), file.data_change()).unwrap();
             }
             if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
                 t.destinations = vec![Ref::Committed(reserved)];
