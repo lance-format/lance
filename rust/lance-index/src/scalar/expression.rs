@@ -52,10 +52,10 @@ const MAX_DEPTH: usize = 500;
 /// "z" column then we must fallback to an IndexedExpression with no scalar_query and
 /// only a refine.
 ///
-/// Two IndexedExpressions can be AND'd together.  Each part is AND'd together.
-/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query only
-///   or both are refine only
-/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query
+/// Two IndexedExpressions can be AND'd together. Each part is AND'd together.
+/// Two IndexedExpressions can be OR'd when both have a scalar query. If either side
+/// has a refine, the original OR expression refines the union of the index results.
+/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query.
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
