@@ -49,7 +49,6 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use crate::io::commit::{CommitOutcome, verify_commit_outcome};
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
@@ -646,9 +645,10 @@ impl Dataset {
     ///
     /// Destinations with leftover version data are rejected without reserving the name.
     /// Use [`Self::force_delete_branch`] to explicitly clean up the leftover data before
-    /// retrying. A definite clone failure releases the reservation. If cloning is
-    /// interrupted or its commit outcome is unknown, the name remains reserved since
-    /// the clone may have succeeded.
+    /// retrying. If cloning fails or is interrupted, the name remains reserved: the
+    /// clone may have succeeded, and releasing the reservation cannot atomically
+    /// verify that it still belongs to this attempt. Use [`Self::force_delete_branch`]
+    /// to explicitly remove a failed creation before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
@@ -698,54 +698,20 @@ impl Dataset {
         let transaction = Transaction::new(version_number, clone_op, None);
 
         // Claim the name before the clone can write into another creator's branch.
-        let branch_id = self
-            .branches()
+        self.branches()
             .create(branch, version_number, source_branch.as_deref())
             .await?;
 
-        let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+        CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
                 store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
             )
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        match builder.execute(transaction.clone()).await {
-            Err(error) if !error.is_commit_status_unknown() => {
-                // Custom handlers may return an error even after their commit landed.
-                // Release only the ref, preserving any foreign destination data.
-                if matches!(
-                    verify_commit_outcome(
-                        &self.object_store,
-                        self.commit_handler.as_ref(),
-                        &branch_location.path,
-                        version_number,
-                        &transaction,
-                    )
-                    .await,
-                    CommitOutcome::Absent | CommitOutcome::Foreign
-                ) {
-                    // A delete and recreate may have replaced our reservation during verification.
-                    match self.branches().get(branch).await {
-                        Ok(contents) if contents.identifier == branch_id => {
-                            if let Err(cleanup_error) = self.object_store.delete(&branch_file).await
-                            {
-                                warn!(
-                                    "Failed to release branch {branch} after clone failure: {cleanup_error}"
-                                );
-                            }
-                        }
-                        Ok(_) | Err(Error::RefNotFound { .. }) => {}
-                        Err(cleanup_error) => warn!(
-                            "Failed to verify branch {branch} reservation after clone failure: {cleanup_error}"
-                        ),
-                    }
-                }
-                Err(error)
-            }
-            result => result,
-        }
+            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+            .execute(transaction)
+            .await
     }
 
     /// Deletes a branch and removes its directory when safe.

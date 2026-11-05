@@ -1417,7 +1417,7 @@ async fn test_concurrent_branch_creation_preserves_winner() {
 }
 
 #[tokio::test]
-async fn test_failed_branch_clone_releases_reservation() {
+async fn test_failed_branch_clone_retains_reservation_until_explicit_cleanup() {
     let tempdir = TempStrDir::default();
     let handler = Arc::new(AmbiguousCommitHandler::default());
     let data = gen_batch()
@@ -1443,11 +1443,31 @@ async fn test_failed_branch_clone_releases_reservation() {
             .to_string()
             .contains("simulated outright commit failure")
     );
-    assert!(dataset.list_branches().await.unwrap().is_empty());
-    let branch = dataset.create_branch("retry", 1, None).await.unwrap();
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 1);
+    let reservation = branches.get("retry").unwrap();
+    assert_eq!(reservation.parent_version, 1);
+    let error = dataset.create_branch("retry", 1, None).await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("branch retry already exists"));
+
+    dataset.force_delete_branch("retry").await.unwrap();
+    let mut branch = dataset.create_branch("retry", 1, None).await.unwrap();
     assert_eq!(
         branch.scan().try_into_batch().await.unwrap(),
         dataset.scan().try_into_batch().await.unwrap()
+    );
+    let replacement = dataset.branches().get("retry").await.unwrap();
+    assert_ne!(replacement.identifier, reservation.identifier);
+    branch.append(id_rows(99, 1), None).await.unwrap();
+    assert_eq!(
+        dataset.branches().get("retry").await.unwrap().identifier,
+        replacement.identifier
+    );
+    let reopened = dataset.checkout_branch("retry").await.unwrap();
+    assert_eq!(
+        reopened.scan().try_into_batch().await.unwrap(),
+        branch.scan().try_into_batch().await.unwrap()
     );
 }
 
