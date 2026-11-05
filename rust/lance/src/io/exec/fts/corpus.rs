@@ -251,12 +251,13 @@ impl SharedFtsCorpus {
             if producer.query().terms != consumer.query().terms
                 || producer.query().column != consumer.query().column
                 || producer.query().operator != Operator::And
+                || producer.query().fuzziness != Some(0)
+                || producer.query().boost != 1.0
                 || producer.document_granularity() != consumer.document_granularity()
                 || producer.params().phrase_slop != consumer.params().phrase_slop
             {
                 return Err(DataFusionError::Plan(
-                    "FTS corpus phrase branches must use the same terms, column, slop, and document granularity"
-                        .to_string(),
+                    "FTS corpus phrase branches must use an exact AND match of the same terms and column with the same slop and document granularity".to_string(),
                 ));
             }
             return Ok(Self::Match(Arc::new(SharedFtsScorer::new())));
@@ -421,10 +422,11 @@ impl SharedFtsScorerExec {
     /// Reconnect the producer and consumer in a decoded native corpus plan.
     ///
     /// The binding refers to child paths in `input`. The selected leaves must be
-    /// a FlatMatch/Match or FlatCombinedFields/CombinedFields pair with the same
-    /// query and opened dataset snapshot. Resolve the dataset once and reuse it
-    /// (or a shallow clone) for both leaves. Candidate filters and limits may
-    /// differ; their separation from the statistics corpus is preserved.
+    /// a FlatMatch/Match, FlatMatch/Phrase, or FlatCombinedFields/CombinedFields
+    /// pair with the same query and opened dataset snapshot. Resolve the dataset
+    /// once and reuse it (or a shallow clone) for both leaves. Candidate filters
+    /// and limits may differ; their separation from the statistics corpus is
+    /// preserved.
     /// Native segment/fragment scopes and scorer overrides remain authoritative.
     ///
     /// The two branches must be separate and cannot cross another corpus owner.
