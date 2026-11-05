@@ -151,6 +151,17 @@ pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStorePar
     }
 }
 
+/// Returns whether `name` is a directory owned by a MemWAL index, including
+/// the `_{dir_id}_mem_wal` form that newer releases create.
+pub(crate) fn is_mem_wal_dir_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "_mem_wal"
+        || name
+            .strip_prefix('_')
+            .and_then(|name| name.strip_suffix("_mem_wal"))
+            .is_some_and(|dir_id| !dir_id.is_empty())
+}
+
 /// Path to the MemWAL root directory.
 ///
 /// Returns: `{base_path}/_mem_wal/`
