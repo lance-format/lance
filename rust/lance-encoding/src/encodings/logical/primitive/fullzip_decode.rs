@@ -2383,6 +2383,51 @@ mod tests {
         );
     }
 
+    /// Output batches must own their value buffers instead of aliasing the
+    /// full-zip page, for both pass-through and allocating decompressors.
+    #[test]
+    fn test_full_zip_batch_data_does_not_alias_page_buffer() {
+        use crate::decoder::StructuralPageDecoder;
+
+        let values = ["alpha-alpha", "beta-beta", "gamma-gamma"];
+        let expected: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.as_bytes().iter().copied())
+            .collect();
+        let compressors: [(&str, Box<dyn PerValueCompressor>); 2] = [
+            ("pass-through", Box::new(VariableEncoder::default())),
+            (
+                "fsst",
+                Box::new(FsstPerValueEncoder::new(Box::new(
+                    VariableEncoder::default(),
+                ))),
+            ),
+        ];
+
+        for (name, compressor) in compressors {
+            let mut decoder = compressed_variable_full_zip(compressor.as_ref(), &values);
+            let page_data = decoder.data.clone();
+            let page_start = page_data.as_ptr() as usize;
+            let page_end = page_start + page_data.len();
+
+            let decoded = decoder
+                .drain(values.len() as u64)
+                .unwrap()
+                .decode()
+                .unwrap();
+            let DataBlock::VariableWidth(block) = decoded.data else {
+                panic!("{name} full-zip decode did not produce variable-width data");
+            };
+            let out_start = block.data.as_ptr() as usize;
+            let out_end = out_start + block.data.len();
+            assert!(
+                out_end <= page_start || out_start >= page_end,
+                "{name} full-zip batch data aliases the page buffer"
+            );
+            assert_eq!(block.data.as_ref(), expected.as_slice());
+        }
+    }
+
     fn decode_variable_full_zip(
         buf: Vec<u8>,
         bits_per_offset: u8,
