@@ -1725,6 +1725,46 @@ impl ANNIvfEarlySearchResults {
     }
 }
 
+/// When late search stops for one query, given how many rows the prefilter allows.
+///
+/// Shared by the single-query and batch paths so both stop at the same row count
+/// and take the fewer-than-k shortcut under the same condition.
+struct LateSearchBudget {
+    k: usize,
+    /// Upper bound on the rows the prefilter allows, when the mask knows it.
+    prefilter_rows: Option<usize>,
+}
+
+impl LateSearchBudget {
+    fn new(prefilter_mask: &RowAddrMask, k: usize) -> Self {
+        Self {
+            k,
+            prefilter_rows: prefilter_mask.max_len().map(|len| len as usize),
+        }
+    }
+
+    /// Rows after which a query probes no further: `k`, or fewer when the
+    /// prefilter allows fewer.
+    fn stop_at(&self) -> usize {
+        self.prefilter_rows.unwrap_or(usize::MAX).min(self.k)
+    }
+
+    /// Whether fewer than `k` rows match the prefilter and the query has not yet
+    /// found them all, so the remaining allowed rows can be returned unscored
+    /// instead of probing further.
+    fn emits_unseen_rows(&self, found: usize) -> bool {
+        self.prefilter_rows
+            .is_some_and(|rows| found < rows && rows <= self.k)
+    }
+}
+
+/// Whether an index segment can still produce rows. A segment whose fragments all
+/// moved to newer deltas cannot, so late search skips it instead of probing it to
+/// `maximum_nprobes`.
+fn segment_owns_rows(seg_mask: Option<&RowAddrMask>) -> bool {
+    !seg_mask.is_some_and(|mask| mask.max_len() == Some(0))
+}
+
 struct LatePartitionSearchControl {
     state: Arc<ANNIvfEarlySearchResults>,
     max_results: usize,
@@ -2182,25 +2222,18 @@ impl ANNIvfSubIndexExec {
                 return futures::stream::empty().boxed();
             }
 
-            if seg_mask
-                .as_ref()
-                .is_some_and(|mask| mask.max_len() == Some(0))
-            {
-                // Every fragment this segment used to own now belongs to a newer delta,
-                // so probing it can neither produce a row nor move the shared budget that
-                // stops the late search. Skip it instead of scanning to maximum_nprobes.
+            if !segment_owns_rows(seg_mask.as_deref()) {
+                // Probing this segment can neither produce a row nor move the shared
+                // budget that stops the late search.
                 return futures::stream::empty().boxed();
             }
 
             // We know the prefilter should be ready at this point so we shouldn't
             // need to call wait_for_ready
             let prefilter_mask = global_prefilter.mask();
+            let budget = LateSearchBudget::new(&prefilter_mask, query.k);
 
-            let max_results = prefilter_mask.max_len().map(|x| x as usize);
-
-            if let Some(max_results) = max_results
-                && found_so_far < max_results
-                && max_results <= query.k
+            if budget.emits_unseen_rows(found_so_far)
                 // Quantized refinement must score every returned row and apply its
                 // distance bounds, so it cannot emit unscored rows from this shortcut.
                 && quantized_refine_factor.is_none()
@@ -2208,7 +2241,8 @@ impl ANNIvfSubIndexExec {
                 // In this case there are fewer than k results matching the prefilter so
                 // just return the prefilter ids and don't bother searching any further
 
-                // This next if check should be true, because we wouldn't get max_results otherwise
+                // This next if check should be true, because the mask only reports a
+                // row count when it lists its rows
                 if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
                     // Emit the prefilter rows that the partition search did not reach.
                     //
@@ -2251,7 +2285,7 @@ impl ANNIvfSubIndexExec {
 
             // Stop searching if we have k results or we've found all the results
             // that could possible match the prefilter
-            let max_results = max_results.unwrap_or(usize::MAX).min(query.k);
+            let max_results = budget.stop_at();
 
             let state_clone = state.clone();
 
@@ -3028,6 +3062,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
                 for (query_index, batch) in per_query.iter().enumerate() {
                     batch_probe::append_candidates(batch, &mut candidates[query_index])?;
                 }
+                // As in the single-query path, a delta whose own prefilter selects
+                // nothing is counted once and kept out of late search.
+                segment_pre_filter.wait_for_ready().await?;
+                if segment_pre_filter.selects_nothing() {
+                    metrics.segments_skipped.add(1);
+                }
                 let mut delta = batch_probe::BatchDelta {
                     index,
                     query: normalized,
@@ -3035,13 +3075,16 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     pre_filter: segment_pre_filter,
                     seg_mask,
                 };
-                if delta.retain_late_work(&candidates) {
+                if delta.retain_late_work(&candidates, query.k, query.k) {
                     deltas.push(delta);
                 }
             }
             // Later deltas' early rows can complete queries an earlier delta was
-            // retained for.
-            deltas.retain_mut(|delta| delta.retain_late_work(&candidates));
+            // retained for, and once the prefilter is ready a query that already
+            // holds every row it can match needs no ranking either.
+            pre_filter.wait_for_ready().await?;
+            let budget = LateSearchBudget::new(&pre_filter.mask(), query.k).stop_at();
+            deltas.retain_mut(|delta| delta.retain_late_work(&candidates, query.k, budget));
             batch_probe::late_search(
                 &deltas,
                 dim,
@@ -3052,9 +3095,10 @@ impl ExecutionPlan for ANNIvfBatchExec {
             )
             .await?;
             // Per-query top-k merge across deltas, tagged with query_index.
-            let mut query_index_builder = Int32Builder::new();
-            let mut distance_builder = Float32Builder::new();
-            let mut row_id_builder = UInt64Builder::new();
+            let capacity = candidates.iter().map(|hits| query.k - hits.missing()).sum();
+            let mut query_index_builder = Int32Builder::with_capacity(capacity);
+            let mut distance_builder = Float32Builder::with_capacity(capacity);
+            let mut row_id_builder = UInt64Builder::with_capacity(capacity);
             for (query_index, hits) in candidates.into_iter().enumerate() {
                 for MinHashHit { distance, row_id } in hits.into_sorted() {
                     query_index_builder.append_value(query_index as i32);
@@ -6040,6 +6084,64 @@ mod tests {
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
             self.0.selected_indices(row_ids)
         }
+    }
+
+    /// Late search stops at `k` rows, or at the prefilter's row count when it
+    /// allows fewer, and returns the unseen allowed rows unscored only while
+    /// fewer than `k` rows match and some are still missing. Masks that cannot
+    /// count their rows (block lists, whole fragments) leave the budget at `k`.
+    #[test]
+    fn late_search_budget_follows_the_prefilter_row_count() {
+        let k = 4;
+        let allow = |rows: &[u64]| RowAddrMask::from_allowed(rows.iter().collect());
+
+        let few = LateSearchBudget::new(&allow(&[1, 2]), k);
+        assert_eq!(few.stop_at(), 2);
+        assert!(few.emits_unseen_rows(0));
+        assert!(few.emits_unseen_rows(1));
+        assert!(
+            !few.emits_unseen_rows(2),
+            "every allowed row is already found"
+        );
+
+        let exactly_k = LateSearchBudget::new(&allow(&[1, 2, 3, 4]), k);
+        assert_eq!(exactly_k.stop_at(), k);
+        assert!(exactly_k.emits_unseen_rows(3));
+        assert!(!exactly_k.emits_unseen_rows(4));
+
+        let many = LateSearchBudget::new(&allow(&[1, 2, 3, 4, 5]), k);
+        assert_eq!(many.stop_at(), k);
+        assert!(
+            !many.emits_unseen_rows(0),
+            "more than k rows must be ranked"
+        );
+
+        let nothing = LateSearchBudget::new(&RowAddrMask::allow_nothing(), k);
+        assert_eq!(nothing.stop_at(), 0);
+        assert!(!nothing.emits_unseen_rows(0));
+
+        let mut whole_fragment = RowAddrTreeMap::new();
+        whole_fragment.insert_fragment(0);
+        for uncounted in [
+            RowAddrMask::all_rows(),
+            RowAddrMask::from_allowed(whole_fragment),
+        ] {
+            let budget = LateSearchBudget::new(&uncounted, k);
+            assert_eq!(budget.stop_at(), k);
+            assert!(!budget.emits_unseen_rows(0));
+        }
+    }
+
+    /// A segment restricted to no rows cannot produce any; an unrestricted
+    /// segment, or one that still owns a row, can.
+    #[test]
+    fn segment_owns_rows_only_with_a_nonempty_restriction() {
+        assert!(segment_owns_rows(None));
+        assert!(segment_owns_rows(Some(&RowAddrMask::all_rows())));
+        assert!(segment_owns_rows(Some(&RowAddrMask::from_allowed(
+            [7u64].iter().collect()
+        ))));
+        assert!(!segment_owns_rows(Some(&RowAddrMask::allow_nothing())));
     }
 
     /// A segment's prefilter selects nothing only once its own mask is

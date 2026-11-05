@@ -4,12 +4,15 @@
 //! Batch KNN with adaptive nprobes: the shared-scan path must match single-query search.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float32Type;
 use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_datafusion::exec::ExecutionSummaryCounts;
+use lance_datafusion::utils::INDEX_SEGMENTS_SKIPPED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
@@ -539,4 +542,68 @@ async fn test_batch_knn_adaptive_metrics(
     assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * 10);
     let recall = hits as f32 / (ADAPTIVE_QUERIES * 10) as f32;
     assert!(recall >= 0.5, "{metric:?} recall {recall} below 0.5");
+}
+
+/// The filter selects only rows of the appended delta, so the original delta's
+/// own prefilter selects nothing. Like single-query search, the batch must skip
+/// that delta's late search and count it in `segments_skipped`.
+#[tokio::test]
+async fn test_batch_knn_adaptive_skips_delta_whose_prefilter_selects_nothing() {
+    let dataset = adaptive_batch_dataset("IVF_FLAT", true, MetricType::L2).await;
+    let query_values = adaptive_batch_queries(&dataset).await;
+    let queries = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(query_values.clone()),
+        ADAPTIVE_DIM as i32,
+    )
+    .unwrap();
+    let filter = Some("i >= 2000 AND i % 7 = 0");
+    let segments_skipped = |summary: &Option<ExecutionSummaryCounts>| {
+        summary
+            .as_ref()
+            .and_then(|summary| {
+                summary
+                    .all_counts
+                    .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                    .copied()
+            })
+            .unwrap_or_default()
+    };
+
+    let batch_stats = Arc::new(Mutex::new(None));
+    let collected = batch_stats.clone();
+    let mut scan = dataset.scan();
+    configure_adaptive_scan(&mut scan, &queries, 10, filter, None, true);
+    scan.scan_stats_callback(Arc::new(move |summary| {
+        *collected.lock().unwrap() = Some(summary.clone());
+    }));
+    assert!(
+        scan.explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ANNIvfBatch")
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+
+    let single_stats = Arc::new(Mutex::new(None));
+    let collected = single_stats.clone();
+    let query = Float32Array::from(query_values[..ADAPTIVE_DIM].to_vec());
+    let mut single_scan = dataset.scan();
+    configure_adaptive_scan(&mut single_scan, &query, 10, filter, None, true);
+    single_scan.scan_stats_callback(Arc::new(move |summary| {
+        *collected.lock().unwrap() = Some(summary.clone());
+    }));
+    let single = single_scan.try_into_batch().await.unwrap();
+
+    let batch_skipped = segments_skipped(&batch_stats.lock().unwrap());
+    let single_skipped = segments_skipped(&single_stats.lock().unwrap());
+    assert!(
+        single_skipped > 0,
+        "fixture must leave a delta the filter cannot reach"
+    );
+    assert_eq!(batch_skipped, single_skipped);
+    let rows = rows_for_query(&batch, 0);
+    assert_eq!(
+        rows["i"].as_primitive::<Int32Type>().values(),
+        single["i"].as_primitive::<Int32Type>().values()
+    );
 }
