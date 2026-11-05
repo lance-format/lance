@@ -48,7 +48,7 @@ impl BlockingDataset {
     }
 
     pub fn delete_branch(&mut self, branch: &str) -> Result<()> {
-        block_on(self.inner.branches().delete(branch, true))?;
+        block_on(self.inner.branches().delete(branch, false))?;
         Ok(())
     }
 

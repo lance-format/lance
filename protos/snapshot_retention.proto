@@ -1,0 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.dataset.retention;
+
+// An explicit-release snapshot GC root. Decoding does not acquire protection.
+message SnapshotRetention {
+  uint32 protocol_version = 1;
+  // Encoded compact lance.snapshot.SnapshotRef, without manifest contents.
+  bytes snapshot = 2;
+  string tag_name = 3;
+}

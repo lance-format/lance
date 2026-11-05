@@ -40,6 +40,7 @@ macro_rules! ok_or_throw_with_return {
 }
 
 mod async_scanner;
+mod blob_reference;
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
@@ -61,6 +62,7 @@ mod otel;
 mod rq_model;
 mod schema;
 mod session;
+mod snapshot_retention;
 mod sql;
 mod storage_options;
 mod task_tracker;

@@ -1187,6 +1187,26 @@ async fn test_load_manifest_iops() {
     // The manifest body is served from the cache instead of being read from storage.
     let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 1);
+
+    let second = DatasetBuilder::from_uri("memory://test")
+        .with_session(_dataset.session())
+        .load()
+        .await
+        .unwrap();
+    _dataset.object_store.io_stats_incremental();
+    let snapshot = _dataset.snapshot_ref("catalog/table").await.unwrap();
+    let io_stats = _dataset.object_store.io_stats_incremental();
+    assert_io_eq!(io_stats, read_iops, 1);
+
+    // Both cached handles share verification, so binding or capturing again
+    // does not reread the original manifest.
+    second.validate_snapshot(&snapshot).unwrap();
+    assert_eq!(
+        second.snapshot_ref("catalog/table").await.unwrap(),
+        snapshot
+    );
+    let io_stats = second.object_store.io_stats_incremental();
+    assert_io_eq!(io_stats, read_iops, 0);
 }
 
 #[tokio::test]
