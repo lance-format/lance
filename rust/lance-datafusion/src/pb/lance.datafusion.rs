@@ -273,3 +273,37 @@ impl ::prost::Name for FilteredReadExecProto {
         "/lance.datafusion.FilteredReadExecProto".into()
     }
 }
+/// Visibility-aware execution envelope. The V1 messages remain unchanged so
+/// existing Rust callers can keep constructing them with exhaustive literals.
+/// Codecs must select this message using a distinct identifier or negotiated
+/// capability, for example its prost::Name type URL. Fields 1-3 are reserved to
+/// avoid overlap with FilteredReadExecProto: decoding with the wrong version
+/// leaves the required read/options absent and the conversion rejects it.
+/// The caller also transports index children and current-value replay branches.
+#[non_exhaustive]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FilteredReadExecV2Proto {
+    /// Required by conversion; absence is an invalid execution envelope.
+    #[prost(message, optional, tag = "4")]
+    pub read: ::core::option::Option<FilteredReadExecProto>,
+    /// If true, omit fragments outside the scalar index result's coverage.
+    /// False preserves the normal fallback scan of unindexed fragments.
+    #[prost(bool, tag = "5")]
+    pub only_indexed_fragments: bool,
+    /// If present, a serialized RowAddrTreeMap of stale index entries to exclude.
+    /// Entries use the index result's identifier domain: stable row IDs on stable-ID
+    /// datasets, physical addresses otherwise. This is not a physical allowlist.
+    /// If absent, no overlay exclusion is applied.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub overlay_block: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+impl ::prost::Name for FilteredReadExecV2Proto {
+    const NAME: &'static str = "FilteredReadExecV2Proto";
+    const PACKAGE: &'static str = "lance.datafusion";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.datafusion.FilteredReadExecV2Proto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.datafusion.FilteredReadExecV2Proto".into()
+    }
+}
