@@ -858,28 +858,6 @@ impl InvertedPartition {
         Ok((total_tokens, stale.len() as usize, row_freqs))
     }
 
-    #[deprecated(
-        since = "15.0.0",
-        note = "a fragment reuse history translates through a Remapper; use \
-                InvertedPartition::load_remapped"
-    )]
-    pub async fn load(
-        store: Arc<dyn IndexStore>,
-        id: u64,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        index_cache: &LanceCache,
-        token_set_format: TokenSetFormat,
-    ) -> Result<Self> {
-        Self::load_remapped(
-            store,
-            id,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            index_cache,
-            token_set_format,
-        )
-        .await
-    }
-
     pub async fn load_remapped(
         store: Arc<dyn IndexStore>,
         id: u64,

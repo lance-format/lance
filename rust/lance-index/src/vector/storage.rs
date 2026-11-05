@@ -30,9 +30,7 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, ReaderProjection};
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, DeprecatedRemapper, Remapper, translate_preserving_layout,
-};
+use lance_index_core::remapping::{Remapper, translate_preserving_layout};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
@@ -1371,36 +1369,6 @@ impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
 }
 
 impl<Q: Quantization> IvfQuantizationStorage<Q> {
-    /// Open a Loader.
-    #[deprecated(
-        since = "15.0.0",
-        note = "use IvfQuantizationStorage::open and IvfQuantizationStorage::with_remapper"
-    )]
-    pub async fn try_new(
-        reader: FileReader,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Self> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Ok(Self::open(reader)
-            .await?
-            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index)))
-    }
-
-    #[doc(hidden)]
-    #[deprecated(
-        since = "15.0.0",
-        note = "use IvfQuantizationStorage::open and IvfQuantizationStorage::with_remapper"
-    )]
-    pub async fn try_new_with_remapper(
-        reader: FileReader,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
-        Ok(Self::open(reader)
-            .await?
-            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index)))
-    }
-
     /// Open the partitioned storage in `reader`'s file, with row addresses
     /// as stored; see [`Self::with_remapper`] to translate them.
     pub async fn open(reader: FileReader) -> Result<Self> {
@@ -1478,41 +1446,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         })
     }
 
-    /// Construct from pre-parsed metadata, skipping global buffer reads.
-    /// Used when reconstructing from a disk cache.
-    #[deprecated(
-        since = "15.0.0",
-        note = "use IvfQuantizationStorage::from_cached_parts and IvfQuantizationStorage::with_remapper"
-    )]
-    pub fn from_cached(
-        reader: FileReader,
-        ivf: IvfModel,
-        metadata: Q::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    ) -> Self {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::from_cached_parts(reader, ivf, metadata, distance_type)
-            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index))
-    }
-
-    #[doc(hidden)]
-    #[deprecated(
-        since = "15.0.0",
-        note = "use IvfQuantizationStorage::from_cached_parts and IvfQuantizationStorage::with_remapper"
-    )]
-    pub fn from_cached_with_remapper(
-        reader: FileReader,
-        ivf: IvfModel,
-        metadata: Q::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Self {
-        Self::from_cached_parts(reader, ivf, metadata, distance_type)
-            .with_remapper(DeprecatedRemapper::sync(frag_reuse_index))
-    }
-
     /// Construct from pre-parsed metadata, skipping global buffer reads, with
     /// row addresses as stored; see [`Self::with_remapper`] to translate
     /// them. Used when reconstructing from a disk cache.
@@ -1542,12 +1475,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             resident_attach: ResidentAttach::default(),
             attach_schemas: AttachSchemas::default(),
         }
-    }
-
-    /// Set the batch row-ID remapper used when decoding each partition.
-    #[deprecated(since = "15.0.0", note = "use IvfQuantizationStorage::with_remapper")]
-    pub fn with_row_id_remapping(self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
-        self.with_remapper(DeprecatedRemapper::batch(Some(remapping)))
     }
 
     /// Translate each partition's row addresses through `remapper` as the

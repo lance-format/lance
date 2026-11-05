@@ -4,9 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, DeprecatedRemapper, Remapper, translate_treemap,
-};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper, translate_treemap};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -1946,28 +1944,6 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 
     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
         Some(self)
-    }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::batch(remapping),
-            cache,
-        )
-        .await
     }
 }
 

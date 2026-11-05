@@ -160,7 +160,7 @@ impl TestRemapper {
     }
 
     fn into_remapper(self) -> Remapper {
-        Remapper::from_backing(Arc::new(DeprecatedRemapper::Sync(Arc::new(self))))
+        Remapper::from_backing(Arc::new(DeprecatedRemapper(Arc::new(self))))
     }
 }
 

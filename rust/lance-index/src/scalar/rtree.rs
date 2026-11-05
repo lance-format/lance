@@ -43,9 +43,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, DeprecatedRemapper, Remapper, translate_record_batch,
-};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper, translate_record_batch};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -349,24 +347,6 @@ impl std::fmt::Debug for RTreeIndex {
 }
 
 impl RTreeIndex {
-    #[deprecated(
-        since = "15.0.0",
-        note = "a fragment reuse history translates through a Remapper; use \
-                RTreeIndex::load_remapped"
-    )]
-    pub async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
-        Self::load_remapped(
-            store,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            index_cache,
-        )
-        .await
-    }
-
     /// Load the index, translating every row address it reports through
     /// `remapper` (`None` when they are current).
     pub async fn load_remapped(
@@ -1282,24 +1262,6 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
         Some(self)
     }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            RTreeIndex::load_remapped(index_store, DeprecatedRemapper::batch(remapping), cache)
-                .await? as Arc<dyn ScalarIndex>,
-        )
-    }
 }
 
 #[async_trait]
@@ -1863,9 +1825,7 @@ mod tests {
                     ))),
                 )))
             }
-            "async" => {
-                first_index.remapper = DeprecatedRemapper::batch(Some(Arc::new(TestRemapper)))
-            }
+            "async" => first_index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}
         }
         let filter = match filter_kind {
@@ -2008,18 +1968,29 @@ mod tests {
     #[derive(Debug)]
     struct TestRemapper;
 
-    #[async_trait]
-    impl BatchRowIdRemapper for TestRemapper {
-        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-            Ok(row_ids
-                .iter()
-                .map(|id| {
-                    let address = RowAddress::from(*id);
+    impl lance_select::remapper::RemapperBacking for TestRemapper {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(async move {
+                for addr in addrs.iter_mut().flatten() {
+                    let address = RowAddress::from(*addr);
                     let fragment = address.fragment_id();
                     let offset = address.row_offset();
-                    Some(RowAddress::new_from_parts(2 + fragment + offset / 2, offset % 2).into())
-                })
-                .collect())
+                    *addr =
+                        RowAddress::new_from_parts(2 + fragment + offset / 2, offset % 2).into();
+                }
+                Ok(())
+            })
         }
     }
 
@@ -2063,7 +2034,7 @@ mod tests {
                     )),
                 ))))
             }
-            "async" => index.remapper = DeprecatedRemapper::batch(Some(Arc::new(TestRemapper))),
+            "async" => index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}
         }
         let retained_ids = old_ids[2..].iter().copied().collect::<RowAddrTreeMap>();

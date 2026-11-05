@@ -146,31 +146,22 @@ pub async fn translate_record_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-/// A [`Remapper`] that applies a remapper handed to a deprecated entry point
-/// (a [`RowIdRemapper`] or [`BatchRowIdRemapper`] passed to
-/// `ScalarIndexPlugin::load_index`, its cache hooks or
-/// `load_index_with_remapping`), so an index that translates through a
-/// [`Remapper`] serves those entry points with its one loader.
+/// A [`Remapper`] that applies a [`RowIdRemapper`] handed to a deprecated
+/// entry point (`ScalarIndexPlugin::load_index` or its cache hooks), so an
+/// index that translates through a [`Remapper`] serves those entry points
+/// with its one loader.
 ///
-/// Neither deprecated remapper says which fragments it moves: every fragment
+/// A [`RowIdRemapper`] does not say which fragments it moves: every fragment
 /// is treated as needing translation, and fragment bitmaps are returned
 /// unchanged. Transitional, like the entry points it serves.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
-pub enum DeprecatedRemapper {
-    Sync(Arc<dyn RowIdRemapper>),
-    Batch(Arc<dyn BatchRowIdRemapper>),
-}
+pub struct DeprecatedRemapper(pub Arc<dyn RowIdRemapper>);
 
 impl DeprecatedRemapper {
     /// The [`Remapper`] applying `sync`, if any.
     pub fn sync(sync: Option<Arc<dyn RowIdRemapper>>) -> Option<Remapper> {
-        sync.map(|sync| Remapper::from_backing(Arc::new(Self::Sync(sync))))
-    }
-
-    /// The [`Remapper`] applying `batch`, if any.
-    pub fn batch(batch: Option<Arc<dyn BatchRowIdRemapper>>) -> Option<Remapper> {
-        batch.map(|batch| Remapper::from_backing(Arc::new(Self::Batch(batch))))
+        sync.map(|sync| Remapper::from_backing(Arc::new(Self(sync))))
     }
 }
 
@@ -187,28 +178,10 @@ impl lance_select::remapper::RemapperBacking for DeprecatedRemapper {
         &'a self,
         addrs: &'a mut [Option<u64>],
     ) -> lance_select::remapper::TranslateFuture<'a> {
-        match self {
-            Self::Sync(sync) => {
-                for slot in addrs.iter_mut() {
-                    *slot = slot.and_then(|addr| sync.remap_row_id(addr));
-                }
-                Box::pin(std::future::ready(Ok(())))
-            }
-            Self::Batch(batch) => Box::pin(async move {
-                let positions: Vec<usize> = (0..addrs.len())
-                    .filter(|&position| addrs[position].is_some())
-                    .collect();
-                let inputs: Vec<u64> = positions
-                    .iter()
-                    .filter_map(|&position| addrs[position])
-                    .collect();
-                let translated = remap_row_ids_async(batch.as_ref(), &inputs).await?;
-                for (position, translated) in positions.into_iter().zip(translated) {
-                    addrs[position] = translated;
-                }
-                Ok(())
-            }),
+        for slot in addrs.iter_mut() {
+            *slot = slot.and_then(|addr| self.0.remap_row_id(addr));
         }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -919,9 +892,35 @@ mod tests {
     /// A [`Remapper`] following [`Sizing`]'s moves, and the calls it makes.
     fn sizing_remapper() -> (Remapper, Arc<Sizing>) {
         let sizing = Arc::new(Sizing::new(&[], u64::MAX));
-        let remapper =
-            DeprecatedRemapper::batch(Some(sizing.clone() as Arc<dyn BatchRowIdRemapper>)).unwrap();
+        let remapper = Remapper::from_backing(Arc::new(SizingBacking(sizing.clone())));
         (remapper, sizing)
+    }
+
+    #[derive(Debug)]
+    struct SizingBacking(Arc<Sizing>);
+
+    impl lance_select::remapper::RemapperBacking for SizingBacking {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(async move {
+                let inputs: Vec<u64> = addrs.iter().flatten().copied().collect();
+                let mut translated = self.0.remap_row_ids(&inputs).await?.into_iter();
+                for slot in addrs.iter_mut().filter(|slot| slot.is_some()) {
+                    *slot = translated.next().flatten();
+                }
+                Ok(())
+            })
+        }
     }
 
     #[test]

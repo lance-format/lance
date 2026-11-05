@@ -427,8 +427,8 @@ async fn test_modern_search_avoids_unrequested_postings(
 /// wraps the IndexStore so reads against the posting file are counted,
 /// then asserts:
 ///
-/// * `InvertedIndex::load` does not touch the posting file at all
-///   (`InvertedPartition::load` only needs the token file and docs file).
+/// * `InvertedIndex::load_remapped` does not touch the posting file at all
+///   (`InvertedPartition::load_remapped` only needs the token file and docs file).
 /// * `bm25_stats_for_terms(["t0"])` reads exactly one metadata row from
 ///   the posting file for token 0 regardless of how many unique tokens the
 ///   partition has.
@@ -456,7 +456,7 @@ async fn test_bm25_stats_for_terms_is_lazy(#[case] num_tokens: usize) {
     assert_eq!(
         counter.read_range_calls(),
         0,
-        "InvertedIndex::load must not read the posting file (was {} calls)",
+        "InvertedIndex::load_remapped must not read the posting file (was {} calls)",
         counter.read_range_calls(),
     );
     assert_eq!(counter.rows_read(), 0);

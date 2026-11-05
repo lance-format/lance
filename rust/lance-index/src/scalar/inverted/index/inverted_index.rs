@@ -509,27 +509,6 @@ impl InvertedIndex {
         }
     }
 
-    #[deprecated(
-        since = "15.0.0",
-        note = "a fragment reuse history translates through a Remapper; use \
-                InvertedIndex::load_remapped"
-    )]
-    pub async fn load(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>>
-    where
-        Self: Sized,
-    {
-        Self::load_remapped(
-            store,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            index_cache,
-        )
-        .await
-    }
-
     pub async fn load_remapped(
         store: Arc<dyn IndexStore>,
         remapper: Option<Remapper>,

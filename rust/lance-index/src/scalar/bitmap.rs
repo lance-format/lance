@@ -4,9 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, DeprecatedRemapper, Remapper, remap_row_addrs_tree_map_async,
-};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
     borrow::Cow,
@@ -2669,28 +2667,6 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         Some(self)
     }
 
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::batch(remapping),
-            cache,
-        )
-        .await
-    }
-
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
@@ -3887,7 +3863,7 @@ mod tests {
             sizings: AtomicUsize,
         }
         #[async_trait]
-        impl BatchRowIdRemapper for Hops {
+        impl lance_index_core::remapping::BatchRowIdRemapper for Hops {
             async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
                 self.translations.fetch_add(1, Ordering::Relaxed);
                 Ok(ids

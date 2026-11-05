@@ -255,26 +255,6 @@ fn check_index_file(
 }
 
 impl MinHashLshIndex {
-    #[deprecated(
-        since = "15.0.0",
-        note = "a fragment reuse history translates through a Remapper; use \
-                MinHashLshIndex::load_remapped"
-    )]
-    pub async fn load(
-        store: Arc<dyn IndexStore>,
-        details: &prost_types::Any,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
-        Self::load_remapped(
-            store,
-            details,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
-        )
-        .await
-    }
-
     /// Load the index, translating every row address it reports through
     /// `remapper` (`None` when they are current).
     pub async fn load_remapped(

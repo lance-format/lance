@@ -23,7 +23,7 @@ pub mod tokenizer;
 mod wand;
 
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_index_core::remapping::{BatchRowIdRemapper, DeprecatedRemapper, Remapper};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -750,28 +750,6 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
 
     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
         Some(self)
-    }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::batch(frag_reuse_index),
-            cache,
-        )
-        .await
     }
 
     async fn get_or_insert_in_cache(

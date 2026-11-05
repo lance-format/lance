@@ -476,24 +476,6 @@ impl DocSet {
         Ok(batch)
     }
 
-    #[deprecated(
-        since = "15.0.0",
-        note = "a fragment reuse history translates through a Remapper; use \
-                DocSet::load_remapped"
-    )]
-    pub async fn load(
-        reader: Arc<dyn IndexReader>,
-        is_legacy: bool,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
-        Self::load_remapped(
-            reader,
-            is_legacy,
-            DeprecatedRemapper::sync(frag_reuse_index).as_ref(),
-        )
-        .await
-    }
-
     /// Load the documents, translating their row addresses through
     /// `remapper` as a batch. A deleted row keeps its slot as a tombstone
     /// until the layout-aware decoding below, so documents stay aligned with

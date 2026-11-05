@@ -27,7 +27,7 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{BatchRowIdRemapper, DeprecatedRemapper, Remapper};
+use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -2209,28 +2209,6 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 
     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
         Some(self)
-    }
-
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
-    }
-
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::batch(frag_reuse_index),
-            cache,
-        )
-        .await
     }
 
     fn might_use_seeds(&self, index_details: &prost_types::Any) -> bool {

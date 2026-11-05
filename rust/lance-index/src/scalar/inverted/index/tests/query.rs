@@ -5,8 +5,8 @@ use super::*;
 use crate::scalar::inverted::InvertedIndexPlugin;
 use crate::scalar::registry::ScalarIndexPlugin;
 use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-use lance_index_core::remapping::BatchRowIdRemapper;
 use lance_io::object_store::WrappingObjectStore;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use object_store::list::PaginatedListStore;
 
 #[derive(Debug, Default)]
@@ -37,11 +37,21 @@ struct OffsetBatchRemapper {
     calls: AtomicU32,
 }
 
-#[async_trait]
-impl BatchRowIdRemapper for OffsetBatchRemapper {
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+impl RemapperBacking for OffsetBatchRemapper {
+    fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+        true
+    }
+
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        fragments.clone()
+    }
+
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(row_ids.iter().map(|row_id| Some(row_id + 1000)).collect())
+        for addr in addrs.iter_mut().flatten() {
+            *addr += 1000;
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -68,7 +78,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     let cache = LanceCache::with_capacity(1 << 20);
     let index = InvertedIndex::load_remapped(
         store,
-        DeprecatedRemapper::batch(Some(remapper.clone())),
+        Some(Remapper::from_backing(remapper.clone())),
         &cache,
     )
     .await
@@ -115,7 +125,7 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     let index = InvertedIndexPlugin::rebind(
         snapshot.as_ref(),
         store,
-        DeprecatedRemapper::batch(Some(remapper.clone())),
+        Some(Remapper::from_backing(remapper.clone())),
     )
     .unwrap()
     .unwrap();
