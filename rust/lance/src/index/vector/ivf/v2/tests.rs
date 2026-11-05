@@ -6960,7 +6960,7 @@ async fn test_prewarm_and_query_with_serializing_backend(
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     });
     assert!(
-        dataset.index_cache.peek_resident_with_key(&query_key).await,
+        dataset.index_cache.get_with_key(&query_key).await.is_some(),
         "the in-memory entry must be the query listing"
     );
 
