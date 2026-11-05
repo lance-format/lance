@@ -756,20 +756,22 @@ mod test {
         drop(index);
         assert!(weak.upgrade().is_some());
 
-        // Fill the shared index budget with other snapshots without touching
-        // this entry's recency or pinning its value.
-        for version in 100..356 {
+        // QuickCache resists scans of small cold entries. Compete with other
+        // loaded indices of the same size, without touching this one's recency.
+        for version in 100..132 {
+            let key = RowIdIndexKey {
+                version,
+                with_deletions: true,
+                e_tag: Some("pressure"),
+            };
             dataset
                 .index_cache
                 .insert_with_key(
-                    &RowIdIndexKey {
-                        version,
-                        with_deletions: true,
-                        e_tag: Some("pressure"),
-                    },
-                    Arc::new(RowIdIndex::new(&[]).unwrap()),
+                    &key,
+                    Arc::new(load_row_id_index(&dataset, true).await.unwrap()),
                 )
                 .await;
+            assert!(dataset.index_cache.get_with_key(&key).await.is_some());
         }
         assert!(weak.upgrade().is_none());
         let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();

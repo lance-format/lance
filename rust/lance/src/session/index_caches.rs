@@ -94,7 +94,7 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 /// Whole-dataset row-id lookup for one manifest and deletion mode.
 #[derive(Debug)]
-pub struct RowIdIndexKey<'a> {
+pub(crate) struct RowIdIndexKey<'a> {
     pub version: u64,
     /// Whether the index knows the deleted rows (it then maps them to `None`).
     /// An index built without deletion vectors reads no deletion file.

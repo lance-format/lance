@@ -28,9 +28,6 @@ use object_store::path::Path;
 
 use crate::dataset::transaction::Transaction;
 
-// Preserve the public key path while index-cache keys live together.
-pub use super::index_caches::RowIdIndexKey;
-
 /// A type-safe wrapper around a LanceCache that enforces namespaces for dataset metadata.
 pub struct GlobalMetadataCache(pub(super) LanceCache);
 
