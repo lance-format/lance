@@ -51,8 +51,10 @@ enum Rewrite {
 /// it. Preserving a managed reference is only sound when the destination file
 /// format can represent a prepared blob and the dataset has already opted in to
 /// managed blobs; otherwise the payload must be materialized. Both conditions are
-/// properties of the dataset, not preferences of the caller, so a caller that could
-/// override them could only use that power to corrupt its own output.
+/// properties of the dataset, which is why the choice is derived rather than
+/// offered. It is the safe default, not the only correct policy: a caller could
+/// legitimately prefer materializing a payload it could have preserved, at the
+/// cost of copying it, and that knob is simply not part of this surface.
 ///
 /// # The batches must come from this dataset
 ///
@@ -73,15 +75,21 @@ enum Rewrite {
 /// # A preserved reference does not own its payload
 ///
 /// When the managed payload is preserved rather than materialized, the output
-/// holds a reference to an object under the *source* dataset's blob storage. The
-/// plan does not retain that object. Until the destination's references are no
-/// longer needed, the caller must keep the source versions they name alive, which
-/// means not advancing [`cleanup_old_versions`] past them. A destination in
-/// another dataset must additionally register the source as a base, because with
-/// primary base-less storage the preserved reference is a plain `Managed` one that
-/// resolves only within the dataset that holds it. This is the lifetime contract
-/// [`preserve_managed_descriptors`] documents for same-dataset rewrites, stated
-/// here for callers outside this crate.
+/// holds a reference to an object under the *source* dataset's blob storage; the
+/// plan does not retain that object.
+///
+/// The supported destination is a fragment rewrite of the same dataset, writing
+/// either to its primary storage or to the registered base named by
+/// [`Self::with_target_base_id`]. The caller must keep the source snapshot alive
+/// until the new references are committed, as [`preserve_managed_descriptors`]
+/// requires; after that, [`cleanup_old_versions`] reads the committed fragments
+/// and keeps the payload objects they still reference, so replacing a fragment
+/// does not strand its payload.
+///
+/// A destination in *another* dataset is not supported. The reference names the
+/// source files' own base, which is no base at all for primary storage, so it
+/// resolves against whichever dataset holds the descriptor; registering a base at
+/// the destination does not convert one, and cleanup of the source then breaks it.
 ///
 /// [`cleanup_old_versions`]: crate::dataset::cleanup::cleanup_old_versions
 /// [`preserve_managed_descriptors`]: crate::dataset::preserve_managed_descriptors
@@ -154,6 +162,12 @@ impl BlobRewritePlan {
         // be built without a row address column. So ask it on a schema that is the
         // caller's with a row address column added when missing: one schema clone and
         // one plan construction, no I/O.
+        //
+        // The probe keeps the inner constructor's `Error::internal` for a missing row
+        // address column unreachable from this public type; the user-facing refusal is
+        // the `invalid_input` below. It cannot change which columns get a Blob plan
+        // either, because `_rowaddr` is never a field of a Lance schema, so
+        // `rewrites_anything` answers identically for the probe and the real schema.
         let probe_schema = if input_schema.column_with_name(ROW_ADDR).is_none() {
             let mut fields = input_schema.fields().to_vec();
             fields.push(Arc::new(ArrowField::new(
@@ -227,6 +241,46 @@ impl BlobRewritePlan {
         })
     }
 
+    /// Plan for output written into the dataset's registered base `base_id`
+    /// instead of into primary storage.
+    ///
+    /// A preserved reference that carries no explicit base is resolved against the
+    /// base of the data file holding it, so writing this plan's output to a base
+    /// other than the source objects' one would silently repoint every such
+    /// reference at the destination base. Naming the destination here is what makes
+    /// those references explicit instead.
+    ///
+    /// The caller must write the output only to this base, through the same base
+    /// registry. A plan describes one destination: use one plan per base rather
+    /// than one plan for a writer that spreads rows over several.
+    ///
+    /// `base_id` must already be registered on the plan's dataset. Preserving rows
+    /// that live in primary storage into another base additionally needs the
+    /// dataset's own URI to be registered as a base, so that the reference can name
+    /// where the payload actually is; without it [`Self::transform`] fails rather
+    /// than publishing a reference that resolves elsewhere.
+    pub fn with_target_base_id(mut self, base_id: u32) -> Result<Self> {
+        if !self.dataset.manifest.base_paths.contains_key(&base_id) {
+            return Err(Error::invalid_input(format!(
+                "base id {base_id} is not registered on dataset '{}'; a rewrite \
+                 destination must be one of its registered bases: {:?}",
+                self.dataset.uri(),
+                self.dataset
+                    .manifest
+                    .base_paths
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+            )));
+        }
+        self.rewrite = match self.rewrite {
+            Rewrite::BlobV2(inner) => Rewrite::BlobV2(inner.with_target_base_id(Some(base_id))),
+            // Nothing is preserved, so no descriptor can name a base.
+            passthrough => passthrough,
+        };
+        Ok(self)
+    }
+
     /// The schema every [`Self::transform`] output carries.
     ///
     /// This is known at construction because the rewrite each Blob v2 column takes
@@ -240,17 +294,18 @@ impl BlobRewritePlan {
     ///
     /// The batch must have the schema this plan was built for; the rewrite reads
     /// columns by position, so a batch of a different shape is rejected rather than
-    /// silently misread. See the note on this type about the rows' origin, which
-    /// this check cannot verify.
+    /// silently misread. The match covers schema metadata as well as fields, because
+    /// the output carries the metadata of the schema the plan was built from. See the
+    /// note on this type about the rows' origin, which this check cannot verify.
     ///
     /// Batches may be transformed concurrently. Depending on the rewrite chosen,
     /// this may read payload bytes from storage, so it is not a cheap in-memory
     /// projection.
     pub async fn transform(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        if batch.schema().fields() != self.input_schema.fields() {
+        if batch.schema().as_ref() != self.input_schema.as_ref() {
             return Err(Error::invalid_input(format!(
-                "this batch does not have the schema its plan was built for; expected \
-                 columns {:?} but got {:?}",
+                "this batch does not have the schema its plan was built for (fields and \
+                 schema metadata must both match); expected columns {:?} but got {:?}",
                 self.input_schema
                     .fields()
                     .iter()
@@ -297,7 +352,9 @@ mod tests {
     use crate::blob_field;
     use crate::dataset::blob::test_util::managed_blob_schema;
     use crate::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::optimize::execution::rechunk_row_lineage;
+    use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
     use arrow_array::{
@@ -311,6 +368,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_table::format::BasePath;
+    use lance_table::format::Fragment;
     use std::num::NonZeroUsize;
 
     /// A dataset with no Blob v2 column anywhere in its schema.
@@ -907,6 +965,24 @@ mod tests {
         )
     }
 
+    /// The backing object a blob row resolves to: its path, byte range and kind.
+    ///
+    /// A preserved reference and a fresh copy of the same payload both read back
+    /// equal bytes, so only the object identity distinguishes them.
+    async fn blob_object_identity(
+        dataset: &Arc<Dataset>,
+        column: &str,
+    ) -> (String, u64, u64, BlobKind) {
+        let blobs = dataset.take_blobs_by_indices(&[0], column).await.unwrap();
+        let blob = blobs[0].as_ref().unwrap();
+        (
+            blob.data_path().to_string(),
+            blob.position(),
+            blob.size(),
+            blob.kind(),
+        )
+    }
+
     /// Transform every row of `source` and write the result to a fresh dataset at
     /// `dir`, registering `bases` there. Returns the transformed batch so the
     /// caller can assert on the descriptor it committed.
@@ -1090,6 +1166,377 @@ mod tests {
                 .to_string()
                 .contains(dest_dir.as_str().trim_start_matches('/')),
             "the reference resolved somewhere other than the destination root: {error}"
+        );
+    }
+
+    /// The case this plan is for: the rewritten rows replace their own fragments
+    /// in the dataset they came from. Cleanup then sees the preserved references
+    /// in the latest manifest's fragments, so it keeps their payload objects even
+    /// though the fragments that first wrote them are gone.
+    #[tokio::test]
+    async fn a_same_dataset_rewrite_keeps_its_preserved_payload_through_cleanup() {
+        let dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let dataset = managed_blob_dataset(&dir, &payload, None).await;
+
+        let source_object = blob_object_identity(&dataset, "blob").await;
+        let old_fragments = dataset.fragments().to_vec();
+        let batches = scan_with_row_addresses(&dataset).await;
+        assert_eq!(batches.len(), 1);
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let transformed = plan.transform(batches[0].clone()).await.unwrap();
+        assert_eq!(transformed.schema(), *plan.output_schema());
+
+        // Write the rewritten rows as new fragments of this same dataset and swap
+        // them in, the way compaction does.
+        let written = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![transformed])
+            .await
+            .unwrap();
+        let Operation::Append {
+            fragments: mut new_fragments,
+        } = written.operation
+        else {
+            unreachable!("an uncommitted insert always carries Append");
+        };
+        if dataset.manifest.uses_stable_row_ids() {
+            rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &old_fragments)
+                .await
+                .unwrap();
+        }
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new_from_version(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: old_fragments.clone(),
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Drop the pre-rewrite snapshot: holding it open would protect the old
+        // files and hide what cleanup does.
+        drop(dataset);
+        let removed = cleanup_old_versions(
+            &committed,
+            CleanupPolicy {
+                before_version: Some(committed.version_id()),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            removed.data_files_removed > 0,
+            "the rewrite left every source file in use, so this test would not \
+             exercise cleanup at all"
+        );
+        assert!(
+            removed.old_versions > 0,
+            "the versions holding the source fragments are still readable, so \
+             nothing stops them from keeping the payload alive"
+        );
+
+        // The payload object survived, and the committed descriptor is still a
+        // reference to it rather than a fresh copy.
+        let reopened = Arc::new(Dataset::open(&dir).await.unwrap());
+        let read = reopened.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blob = read[0].as_ref().unwrap();
+        assert_eq!(blob.kind(), BlobKind::Managed);
+        assert_eq!(blob.read().await.unwrap().as_ref(), payload);
+        // Equal bytes alone would also hold for a fresh copy, so pin the object:
+        // the committed descriptor still points at the very bytes the source row
+        // did, at the same path, offset and length.
+        assert_eq!(
+            blob_object_identity(&reopened, "blob").await,
+            source_object,
+            "the rewrite published a different object instead of preserving the \
+             source reference"
+        );
+    }
+
+    /// A managed Blob v2 dataset whose rows live in primary storage, with
+    /// `bases` registered but not written to.
+    ///
+    /// Separate from `managed_blob_dataset`, which writes its data into the base
+    /// it registers: here the payload must start in primary storage so that the
+    /// destination base differs from the source objects' location.
+    async fn primary_managed_dataset_with_bases(
+        dir: &TempStrDir,
+        payload: &[u8],
+        bases: Vec<BasePath>,
+    ) -> Arc<Dataset> {
+        let schema = Arc::new(managed_blob_schema(vec![
+            Field::new("id", DataType::UInt32, false),
+            managed_blob_column(),
+        ]));
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(payload).unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..1)),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    initial_bases: Some(bases),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(managed_blobs_enabled(dataset.schema()).unwrap());
+        let stored = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            stored[0].as_ref().unwrap().kind(),
+            BlobKind::Managed,
+            "the source payload must be a managed object in primary storage for \
+             the destination base to differ from it"
+        );
+        dataset
+    }
+
+    /// Publish `transformed` as new fragments of `dataset`, written into
+    /// `target_base`, replacing `old_fragments`.
+    async fn publish_rewrite_into_base(
+        dataset: &Arc<Dataset>,
+        old_fragments: Vec<Fragment>,
+        transformed: RecordBatch,
+        target_base: Option<u32>,
+    ) -> Result<Dataset> {
+        let written = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                target_bases: target_base.map(|id| vec![id]),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![transformed])
+            .await?;
+        let Operation::Append {
+            fragments: mut new_fragments,
+        } = written.operation
+        else {
+            unreachable!("an uncommitted insert always carries Append");
+        };
+        if dataset.manifest.uses_stable_row_ids() {
+            rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &old_fragments).await?;
+        }
+        CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new_from_version(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+            ))
+            .await
+    }
+
+    /// A rewrite whose output goes to a registered base keeps naming the source
+    /// objects, because the destination base is declared on the plan.
+    ///
+    /// `payload` selects the source storage form through the column's size
+    /// thresholds (inline 4, dedicated 8): a payload under the dedicated
+    /// threshold is packed into a shared sidecar, one at or above it gets its own
+    /// object. Both reach `preserve_managed_descriptors` as descriptors whose base
+    /// must be made explicit.
+    async fn assert_rewrite_into_base_preserves_source_objects(payload: Vec<u8>) {
+        let dir = TempStrDir::default();
+        // Base 1 is the dataset's own URI: the identity a primary-storage
+        // reference needs to stay explicit. Base 2 is where the rewrite writes.
+        let identity = BasePath::new(1, dir.to_string(), Some("self".to_string()), true);
+        let target_dir = TempStrDir::default();
+        let target = BasePath::new(2, target_dir.to_string(), Some("target".to_string()), true);
+        let dataset =
+            primary_managed_dataset_with_bases(&dir, &payload, vec![identity, target.clone()])
+                .await;
+
+        let source_object = blob_object_identity(&dataset, "blob").await;
+        let old_fragments = dataset.fragments().to_vec();
+        let batches = scan_with_row_addresses(&dataset).await;
+        let plan = BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false)
+            .unwrap()
+            .with_target_base_id(target.id)
+            .unwrap();
+        let transformed = plan.transform(batches[0].clone()).await.unwrap();
+
+        // The descriptor names the SOURCE objects' base, not the destination.
+        let (kind, blob_id, _, size, inline_len) = preserved_descriptor(&transformed);
+        assert_eq!(kind, BlobKind::ManagedWithBase);
+        assert_eq!(
+            blob_id,
+            Some(1),
+            "a preserved reference must name the base the payload lives under"
+        );
+        assert_eq!(size, payload.len() as u64);
+        assert_eq!(
+            inline_len, 0,
+            "the payload was copied instead of referenced"
+        );
+
+        let committed =
+            publish_rewrite_into_base(&dataset, old_fragments, transformed, Some(target.id))
+                .await
+                .unwrap();
+
+        let reopened = Arc::new(Dataset::open(committed.uri()).await.unwrap());
+        let read = reopened.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            read[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            payload
+        );
+        // The destination resolves to the source's own object, not to a copy of
+        // it: same path, offset and length.
+        let destination_object = blob_object_identity(&reopened, "blob").await;
+        assert_eq!(
+            destination_object, source_object,
+            "the rewrite published a different object instead of preserving the \
+             source reference"
+        );
+        // And that object lives where the source payload does, not under the base
+        // the new fragments were written to.
+        assert!(
+            destination_object
+                .0
+                .starts_with(dir.as_str().trim_start_matches('/')),
+            "the preserved object should sit under the source base: {}",
+            destination_object.0
+        );
+        assert!(
+            !destination_object
+                .0
+                .starts_with(target_dir.as_str().trim_start_matches('/')),
+            "the preserved object resolved under the destination base: {}",
+            destination_object.0
+        );
+    }
+
+    /// T1, source payload in its own managed object.
+    #[tokio::test]
+    async fn a_rewrite_into_a_registered_base_preserves_a_dedicated_source_object() {
+        assert_rewrite_into_base_preserves_source_objects(vec![7u8; 64]).await;
+    }
+
+    /// T1, source payload packed into a shared managed object with others.
+    #[tokio::test]
+    async fn a_rewrite_into_a_registered_base_preserves_a_packed_source_object() {
+        assert_rewrite_into_base_preserves_source_objects(vec![9u8; 6]).await;
+    }
+
+    /// T2: without a registered base for the dataset's own URI there is no way to
+    /// say where a primary-storage payload lives, so the rewrite is refused
+    /// instead of publishing a reference that resolves at the destination base.
+    #[tokio::test]
+    async fn a_rewrite_into_a_base_is_refused_when_the_source_has_no_registered_identity() {
+        let dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let target_dir = TempStrDir::default();
+        let target = BasePath::new(2, target_dir.to_string(), Some("target".to_string()), true);
+        let dataset =
+            primary_managed_dataset_with_bases(&dir, &payload, vec![target.clone()]).await;
+        let version_before = dataset.version_id();
+
+        let batches = scan_with_row_addresses(&dataset).await;
+        let plan = BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false)
+            .unwrap()
+            .with_target_base_id(target.id)
+            .unwrap();
+        let error = plan.transform(batches[0].clone()).await.unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+
+        // Nothing was published: the refusal happens before any write.
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert_eq!(reopened.version_id(), version_before);
+        assert_eq!(reopened.fragments().len(), dataset.fragments().len());
+    }
+
+    /// T3: a destination the dataset does not know is refused at construction,
+    /// where the caller can still act on it.
+    #[tokio::test]
+    async fn an_unregistered_target_base_is_refused_when_the_plan_is_built() {
+        let dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let dataset = managed_blob_dataset(&dir, &payload, None).await;
+        let batches = scan_with_row_addresses(&dataset).await;
+
+        let error = BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false)
+            .unwrap()
+            .with_target_base_id(77)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains("77"), "{error}");
+    }
+
+    /// T4: the default destination is primary storage. Writing a plan's output
+    /// into a registered base without declaring it leaves every preserved
+    /// reference implicit, and an implicit reference is read relative to the file
+    /// holding it, so it resolves under the destination base where no payload is.
+    #[tokio::test]
+    async fn the_default_plan_is_for_primary_destinations_only() {
+        let dir = TempStrDir::default();
+        let payload = vec![7u8; 64];
+        let identity = BasePath::new(1, dir.to_string(), Some("self".to_string()), true);
+        let target_dir = TempStrDir::default();
+        let target = BasePath::new(2, target_dir.to_string(), Some("target".to_string()), true);
+        let dataset =
+            primary_managed_dataset_with_bases(&dir, &payload, vec![identity, target.clone()])
+                .await;
+
+        let old_fragments = dataset.fragments().to_vec();
+        let batches = scan_with_row_addresses(&dataset).await;
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let transformed = plan.transform(batches[0].clone()).await.unwrap();
+
+        // No base is named, which is correct for a primary-storage destination.
+        let (kind, blob_id, _, _, _) = preserved_descriptor(&transformed);
+        assert_eq!(kind, BlobKind::Managed);
+        assert_eq!(blob_id, None);
+
+        let committed =
+            publish_rewrite_into_base(&dataset, old_fragments, transformed, Some(target.id))
+                .await
+                .unwrap();
+
+        // Written into the target base, the implicit reference now resolves
+        // there, which is why such a destination must be declared on the plan.
+        let reopened = Arc::new(Dataset::open(committed.uri()).await.unwrap());
+        let read = reopened.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let error = read[0].as_ref().unwrap().read().await.unwrap_err();
+        assert!(
+            matches!(error, Error::NotFound { .. }),
+            "an undeclared destination base must not silently resolve: {error:?}"
         );
     }
 }

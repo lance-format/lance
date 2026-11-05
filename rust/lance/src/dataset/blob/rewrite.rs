@@ -533,11 +533,15 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
+    /// `target_base_id` is the base the rewritten rows will be written to, which a
+    /// preserved reference needs in order to keep naming the source objects: a
+    /// descriptor that stays implicit resolves against the *destination* file's base.
     fn transform<'a>(
         &'a self,
         dataset: &'a Arc<Dataset>,
         array: ArrayRef,
         row_addrs: Arc<[u64]>,
+        target_base_id: Option<u32>,
     ) -> BoxFuture<'a, Result<ArrayRef>> {
         async move {
             match self {
@@ -557,7 +561,7 @@ impl BlobV2FieldRewritePlan {
                                 if let Some(sidecars) = sidecars {
                                     return sidecars.prepare(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
                                 }
-                                return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, None).await;
+                                return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, target_base_id).await;
                             }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
@@ -606,7 +610,12 @@ impl BlobV2FieldRewritePlan {
                     for (child, child_array) in children.iter().zip(struct_arr.columns()) {
                         child_arrays.push(
                             child
-                                .transform(dataset, child_array.clone(), row_addrs.clone())
+                                .transform(
+                                    dataset,
+                                    child_array.clone(),
+                                    row_addrs.clone(),
+                                    target_base_id,
+                                )
                                 .await?,
                         );
                     }
@@ -632,6 +641,7 @@ impl BlobV2FieldRewritePlan {
                         child,
                         array.as_list::<i32>(),
                         row_addrs,
+                        target_base_id,
                     )
                     .await
                 }
@@ -644,6 +654,7 @@ impl BlobV2FieldRewritePlan {
                         child,
                         array.as_list::<i64>(),
                         row_addrs,
+                        target_base_id,
                     )
                     .await
                 }
@@ -659,6 +670,7 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     child: &BlobV2FieldRewritePlan,
     list_array: &GenericListArray<O>,
     row_addrs: Arc<[u64]>,
+    target_base_id: Option<u32>,
 ) -> Result<ArrayRef> {
     let list_array = if list_array.null_count() > 0 {
         list_array.filter_garbage_nulls()
@@ -702,7 +714,12 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
 
     let values = list_array.values().slice(values_start, values_len);
     let values = child
-        .transform(dataset, values, Arc::<[u64]>::from(child_row_addrs))
+        .transform(
+            dataset,
+            values,
+            Arc::<[u64]>::from(child_row_addrs),
+            target_base_id,
+        )
         .await?;
     let list_array = GenericListArray::<O>::try_new(
         child.output_field().clone(),
@@ -717,6 +734,9 @@ pub struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
     output_schema: SchemaRef,
+    /// The base the rewritten rows are written to. `None` is primary storage,
+    /// which is where every in-crate rewrite writes.
+    target_base_id: Option<u32>,
 }
 
 impl BlobV2BatchRewritePlan {
@@ -761,7 +781,20 @@ impl BlobV2BatchRewritePlan {
                 output_fields,
                 input_schema.metadata().clone(),
             )),
+            target_base_id: None,
         })
+    }
+
+    /// Write the rewritten rows to the registered base `base_id` instead of to
+    /// primary storage.
+    ///
+    /// A preserved managed reference that carries no explicit base resolves
+    /// against the base of the data file holding it, so a plan whose output goes
+    /// to a different base than the source objects must name that destination
+    /// here or the published references point at the wrong base.
+    pub(crate) fn with_target_base_id(mut self, base_id: Option<u32>) -> Self {
+        self.target_base_id = base_id;
+        self
     }
 
     /// Build the prepared rewrite used by ordinary sidecar compaction.
@@ -822,6 +855,7 @@ impl BlobV2BatchRewritePlan {
                         dataset,
                         batch.column(*column_idx).clone(),
                         row_addrs.clone(),
+                        self.target_base_id,
                     )
                     .await?,
             );
