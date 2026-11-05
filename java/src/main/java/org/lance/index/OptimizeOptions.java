@@ -31,18 +31,21 @@ public class OptimizeOptions {
   private final boolean retrain;
   private final Optional<Long> maxRowsPerTask;
   private final Optional<Long> maxRowsPerSegment;
+  private final Optional<Long> maxRowsToConsolidate;
 
   private OptimizeOptions(
       Optional<Integer> numIndicesToMerge,
       Optional<List<String>> indexNames,
       boolean retrain,
       Optional<Long> maxRowsPerTask,
-      Optional<Long> maxRowsPerSegment) {
+      Optional<Long> maxRowsPerSegment,
+      Optional<Long> maxRowsToConsolidate) {
     this.numIndicesToMerge = numIndicesToMerge;
     this.indexNames = indexNames;
     this.retrain = retrain;
     this.maxRowsPerTask = maxRowsPerTask;
     this.maxRowsPerSegment = maxRowsPerSegment;
+    this.maxRowsToConsolidate = maxRowsToConsolidate;
   }
 
   /** Number of indices to merge per index name. */
@@ -89,6 +92,17 @@ public class OptimizeOptions {
     return maxRowsPerSegment;
   }
 
+  /**
+   * Physical row budget per vector index for consolidating its newest segments. At least two whole
+   * segments must fit. Empty disables consolidation.
+   *
+   * <p>Each segment counts the greater of its physical index entries and its covered fragments'
+   * physical rows, including deleted rows. Consolidation reuses the newest selected model.
+   */
+  public Optional<Long> getMaxRowsToConsolidate() {
+    return maxRowsToConsolidate;
+  }
+
   /** Create a new builder for {@link OptimizeOptions}. */
   public static Builder builder() {
     return new Builder();
@@ -101,6 +115,7 @@ public class OptimizeOptions {
     private boolean retrain = false;
     private Optional<Long> maxRowsPerTask = Optional.empty();
     private Optional<Long> maxRowsPerSegment = Optional.empty();
+    private Optional<Long> maxRowsToConsolidate = Optional.empty();
 
     private Builder() {}
 
@@ -158,9 +173,31 @@ public class OptimizeOptions {
       return this;
     }
 
+    /**
+     * Enable {@linkplain OptimizeOptions#getMaxRowsToConsolidate() bounded vector consolidation}.
+     * This cannot be combined with retraining, an explicit merge count, or {@link
+     * #maxRowsPerSegment(long)}. An optional task limit must be positive and fit each fragment
+     * selected for re-encoding.
+     *
+     * <pre>{@code
+     * dataset.optimizeIndices(OptimizeOptions.builder().maxRowsToConsolidate(1_000_000).build());
+     * }</pre>
+     *
+     * @param maxRowsToConsolidate positive physical row budget per logical vector index
+     */
+    public Builder maxRowsToConsolidate(long maxRowsToConsolidate) {
+      this.maxRowsToConsolidate = Optional.of(maxRowsToConsolidate);
+      return this;
+    }
+
     public OptimizeOptions build() {
       return new OptimizeOptions(
-          numIndicesToMerge, indexNames, retrain, maxRowsPerTask, maxRowsPerSegment);
+          numIndicesToMerge,
+          indexNames,
+          retrain,
+          maxRowsPerTask,
+          maxRowsPerSegment,
+          maxRowsToConsolidate);
     }
   }
 }
