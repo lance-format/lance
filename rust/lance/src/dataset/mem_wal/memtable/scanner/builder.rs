@@ -3771,6 +3771,8 @@ mod tests {
                     "s LIKE 'ap%'",
                     "b",
                     "d = DATE '2022-01-08'",
+                    "(i = 7 AND rid > 3) OR s = 'b'",
+                    "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
                 ] {
                     let (batch_store, indexes, schema) = &memtable;
                     let mut scanner =
