@@ -11,9 +11,36 @@ use lance_index::{
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Error, Result};
+
+/// Statistics for one physical index segment, collected at a dataset read version.
+///
+/// The payload is opaque to the aggregation API: callers may serialize it, move it
+/// to another process, and aggregate it with
+/// [`DatasetIndexExt::index_statistics_from_segments`] without the payload being
+/// recomputed. Values produced by different index types are not portable between
+/// those types.
+///
+/// ```
+/// # use lance::index::IndexSegmentStatistics;
+/// # fn round_trip(statistics: &IndexSegmentStatistics) -> serde_json::Result<IndexSegmentStatistics> {
+/// let json = serde_json::to_string(statistics)?;
+/// serde_json::from_str(&json)
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexSegmentStatistics {
+    /// Manifest read version, not the segment's build version.
+    pub read_version: u64,
+    pub index_uuid: Uuid,
+    /// Empty for natively maintained segments with no fragment coverage.
+    pub index_type_uri: String,
+    /// Index-specific payload; `{}` for natively maintained segments with no fragment coverage.
+    pub statistics: serde_json::Value,
+}
 
 /// A single physical segment of a logical index.
 ///
@@ -405,6 +432,62 @@ pub trait DatasetIndexExt {
 
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    /// Collect statistics for physical segments of an index.
+    ///
+    /// Returns results in UUID request order at the current manifest version.
+    /// UUIDs must be nonempty, unique, and belong to `index_name`; system indices
+    /// are unsupported. The returned payloads can be aggregated by
+    /// [`Self::index_statistics_from_segments`] on another dataset instance that
+    /// reads the same version and index segments.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::DatasetIndexExt};
+    /// # async fn collect(dataset: &Dataset) -> Result<()> {
+    /// let segments = dataset.load_indices_by_name("vector_idx").await?;
+    /// let uuids: Vec<_> = segments.iter().map(|segment| segment.uuid).collect();
+    /// let statistics = dataset.index_segment_statistics("vector_idx", &uuids).await?;
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", statistics)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_segment_statistics(
+        &self,
+        _index_name: &str,
+        _index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>> {
+        Err(Error::not_supported(
+            "segment statistics are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Aggregate statistics collected from every physical segment of an index.
+    ///
+    /// Requires exactly one result per segment from this dataset and read version.
+    /// Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+    /// Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegmentStatistics}};
+    /// # async fn aggregate(dataset: &Dataset, stats: Vec<IndexSegmentStatistics>) -> Result<()> {
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", stats)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_statistics_from_segments(
+        &self,
+        _index_name: &str,
+        _segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String> {
+        Err(Error::not_supported(
+            "segment statistics aggregation is not supported by this dataset implementation"
+                .to_owned(),
+        ))
+    }
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(

@@ -178,6 +178,8 @@ impl ExternalManifestStore for LanceNamespaceExternalManifestStore {
             naming_scheme,
             e_tag: version_info.e_tag,
             identity: None,
+            // The namespace response carries no object write time.
+            last_modified: None,
         })
     }
 
@@ -282,6 +284,7 @@ mod tests {
             store_with(|| {
                 NamespaceError::Throttling {
                     message: "slow down".to_string(),
+                    retry_after: None,
                 }
                 .into()
             }),

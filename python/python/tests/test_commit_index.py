@@ -50,7 +50,7 @@ def _get_field_id_by_name(lance_schema, field_name):
 
 
 def test_commit_index(dataset_with_index, test_table, tmp_path):
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
 
@@ -111,7 +111,7 @@ def test_commit_index_round_trips_object_metadata(
     dataset_with_index, test_table, tmp_path
 ):
     """clustering_id and the generic metadata map survive Python -> Rust -> Python."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
     dataset = lance.write_dataset(test_table, tmp_path / "dataset_metadata")
@@ -164,7 +164,7 @@ def test_commit_index_round_trips_object_metadata(
 
 def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
     """Test that the files field on Index round-trips through commit."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     # Get info about the existing index created by the fixture
     original_desc = dataset_with_index.describe_indices()[0]
@@ -238,7 +238,7 @@ def test_commit_index_with_files(dataset_with_index, test_table, tmp_path):
 
 def test_commit_index_with_index_details(dataset_with_index, test_table, tmp_path):
     """Test that index_details round-trip through Python transaction bindings."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     original_txn = dataset_with_index.get_transactions(1)[0]
     original_index = original_txn.operation.new_indices[0]
@@ -285,7 +285,7 @@ def test_index_covering_fields_roundtrip(dataset_with_index, test_table, tmp_pat
     """A non-empty covering declaration must survive both the transaction
     round trip (transaction.rs) and the describe_indices round trip
     (indices.rs)."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
 
@@ -344,7 +344,7 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
     LanceOperation.CreateIndex is a plain dataclass; it only reaches Rust at
     commit(), so a construction-time gate would miss this path entirely.
     """
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     index_id = dataset_with_index.describe_indices()[0].segments[0].uuid
     field_id = _get_field_id_by_name(dataset_with_index.lance_schema, "meta")

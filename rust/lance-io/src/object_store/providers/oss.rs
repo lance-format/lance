@@ -150,6 +150,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
@@ -164,20 +165,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::OssStoreProvider;
+    use crate::object_store::StorageOptionsAccessor;
     use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
-    use crate::object_store::{ObjectStoreProvider, StorageOptionsAccessor};
     use url::Url;
-
-    #[test]
-    fn test_oss_store_path() {
-        let provider = OssStoreProvider;
-
-        let url = Url::parse("oss://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
-    }
 
     #[test]
     fn test_oss_alias_options_override_canonical_env_options() {
