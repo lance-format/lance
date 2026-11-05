@@ -428,10 +428,15 @@ impl Branches<'_> {
 
         futures::stream::iter(branches)
             .map(|(name, path)| async move {
-                let contents = BranchContents::from_path(&path, self.object_store(), &name).await?;
-                Ok((name, contents))
+                match BranchContents::from_path(&path, self.object_store(), &name).await {
+                    Ok(contents) => Ok(Some((name, contents))),
+                    // A concurrent delete can remove a ref between LIST and GET.
+                    Err(Error::NotFound { .. }) => Ok(None),
+                    Err(error) => Err(error),
+                }
             })
             .buffer_unordered(10)
+            .try_filter_map(futures::future::ok)
             .try_collect()
             .await
     }
@@ -448,16 +453,14 @@ impl Branches<'_> {
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch);
 
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
-        }
-
-        let branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-
-        Ok(branch_contents)
+        BranchContents::from_path(&branch_file, self.object_store(), branch)
+            .await
+            .map_err(|error| match error {
+                error if error.is_not_found() => Error::RefNotFound {
+                    message: format!("branch {branch} does not exist"),
+                },
+                error => error,
+            })
     }
 
     pub async fn get_identifier(&self, branch: Option<&str>) -> Result<BranchIdentifier> {
@@ -625,7 +628,8 @@ impl Branches<'_> {
             self.object_store().delete(&branch_file).await?;
         }
 
-        // Clean up branch directories
+        // Callers must finish failed cleanup before reusing the branch name,
+        // since branch creation can otherwise expose retained version history.
         self.cleanup_branch_directories(branch).await
     }
 
@@ -648,8 +652,9 @@ impl Branches<'_> {
 
     /// Remove branch files while preserving branches that share directories.
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
+        // Discover namespaces created during deletion before removing shared directories.
         let branches = self.list().await?;
-        let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
+        let remaining_branches = branches.keys().map(String::as_str).collect_vec();
         let mut cleanup =
             Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
         if matches!(cleanup, BranchCleanup::Skip) {
@@ -662,17 +667,24 @@ impl Branches<'_> {
         for remaining in &remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
             let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
-            if has_local_paths && canonical_path.is_none() {
-                log::warn!(
-                    "Keeping branch directories after deleting {branch}: cannot resolve surviving local branch at {path}"
-                );
-                return Ok(());
-            }
             let canonical_retained_dirs = if has_local_paths {
-                match self.collect_canonical_retained_dirs(&path, branch).await? {
-                    Some(dirs) => dirs,
-                    None => return Ok(()),
-                }
+                let retained_dirs = if canonical_path.is_some() {
+                    self.collect_canonical_retained_dirs(&path, branch).await?
+                } else {
+                    None
+                };
+                let Some(retained_dirs) = retained_dirs else {
+                    let remaining_ref = branch_contents_path(&self.refs.root()?.path, remaining);
+                    if !self.object_store().exists(&remaining_ref).await? {
+                        // Another delete finished after cleanup listed the refs.
+                        continue;
+                    }
+                    log::warn!(
+                        "Keeping branch directories after deleting {branch}: cannot resolve surviving local branch at {path}"
+                    );
+                    return Ok(());
+                };
+                retained_dirs
             } else {
                 Vec::new()
             };
@@ -696,6 +708,9 @@ impl Branches<'_> {
             let Some(canonical_retained_dirs) =
                 self.collect_canonical_retained_dirs(&path, branch).await?
             else {
+                log::warn!(
+                    "Keeping branch directories after deleting {branch}: cannot resolve retained main dataset storage at {path}"
+                );
                 return Ok(());
             };
             remaining_paths.push(RemainingBranchPath {
@@ -847,8 +862,8 @@ impl Branches<'_> {
             };
             let Some(owned_dirs) = Self::collect_local_owned_directories(canonical_dir).await?
             else {
-                log::warn!(
-                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained storage below {owned_path}"
+                log::debug!(
+                    "Retained storage below {owned_path} disappeared while deleting {deleted_branch}"
                 );
                 return Ok(None);
             };

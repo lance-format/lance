@@ -2084,8 +2084,32 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
-                  // Delete branch1 and verify listing
+                  // Delete branch2 and reject checkout and writes through its stale handle.
                   mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
+                  RuntimeException deletedBranch =
+                      assertThrows(
+                          RuntimeException.class, () -> mainV2.checkout(Ref.ofBranch("branch2")));
+                  assertTrue(
+                      deletedBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      deletedBranch.getMessage());
+                  RuntimeException staleCommit =
+                      assertThrows(
+                          RuntimeException.class,
+                          () ->
+                              branch2V4
+                                  .newTransactionBuilder()
+                                  .operation(appendC)
+                                  .build()
+                                  .commit());
+                  assertTrue(
+                      staleCommit
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      staleCommit.getMessage());
+                  assertEquals(4, branch2V4.version());
                   assertEquals(1, mainV2.branches().list().size());
 
                   // Step 6. use checkout_branch to checkout branch1
@@ -2145,11 +2169,15 @@ public class DatasetTest {
                     assertEquals(8, opened.countRows()); // A(5) + B(3)
                     assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
                   }
-                  IOException missing =
+                  RuntimeException missingBranch =
                       assertThrows(
-                          IOException.class,
+                          RuntimeException.class,
                           () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
-                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  assertTrue(
+                      missingBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch no_such_branch does not exist"),
+                      missingBranch.getMessage());
                   RuntimeException missingTag =
                       assertThrows(
                           RuntimeException.class,
