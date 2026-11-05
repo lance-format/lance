@@ -940,6 +940,16 @@ impl ObjectStore {
     /// dataset mode) so work on the store's data is attributed the way its IO
     /// is. Unlabelled for a store that is not metered (see `meter_store`); a
     /// no-op without the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn example(store: &ObjectStore) {
+    /// let counter = store.counter("lance_example_items_total");
+    /// counter.increment(1);
+    /// # }
+    /// ```
     #[cfg(feature = "metrics")]
     pub fn counter(&self, name: &'static str) -> StoreCounter {
         let labels = self
@@ -2364,6 +2374,8 @@ pub const METRIC_SCAN_TASK_WAIT_TIME: &str = "lance_scan_task_wait_time_nanoseco
 pub struct StoreCounter(#[cfg(feature = "metrics")] ::metrics::Counter);
 
 impl StoreCounter {
+    /// Add `value` to the counter. This is a no-op without the `metrics`
+    /// feature.
     pub fn increment(&self, value: u64) {
         #[cfg(feature = "metrics")]
         self.0.increment(value);

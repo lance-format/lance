@@ -7,7 +7,7 @@ use std::task::Poll;
 use std::{
     ops::{Range, RangeInclusive},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use arrow_array::cast::AsArray;
@@ -379,14 +379,38 @@ impl FilteredReadPartitionMetrics {
         }
     }
 
-    fn record_task_wait(&self, elapsed: Duration) {
-        self.task_wait_time.add_duration(elapsed);
-        self.task_wait_counter.increment(elapsed.as_nanos() as u64);
+    fn task_wait_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.task_wait_time, &self.task_wait_counter)
     }
 
-    fn record_decode(&self, elapsed: Duration) {
-        self.decode_time.add_duration(elapsed);
-        self.decode_counter.increment(elapsed.as_nanos() as u64);
+    fn decode_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.decode_time, &self.decode_counter)
+    }
+}
+
+/// Records the same elapsed duration to a plan timer and its facade counter when
+/// dropped, including when the future is cancelled or the stream ends early.
+struct ScanTimer<'a> {
+    time: &'a Time,
+    counter: &'a StoreCounter,
+    start: Instant,
+}
+
+impl<'a> ScanTimer<'a> {
+    fn new(time: &'a Time, counter: &'a StoreCounter) -> Self {
+        Self {
+            time,
+            counter,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ScanTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.time.add_duration(elapsed);
+        self.counter.increment(elapsed.as_nanos().max(1) as u64);
     }
 }
 
@@ -1444,16 +1468,15 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let wait_start = Instant::now();
-                            let maybe_task = task_stream.lock().await.next().await;
-                            partition_metrics.record_task_wait(wait_start.elapsed());
+                            let maybe_task = {
+                                let _timer = partition_metrics.task_wait_timer();
+                                task_stream.lock().await.next().await
+                            };
                             Result::Ok(maybe_task.transpose()?.map(|task| {
                                 let partition_metrics = partition_metrics.clone();
                                 let task = async move {
-                                    let decode_start = Instant::now();
-                                    let batches = task.await;
-                                    partition_metrics.record_decode(decode_start.elapsed());
-                                    batches
+                                    let _timer = partition_metrics.decode_timer();
+                                    task.await
                                 };
                                 (task, task_stream)
                             }))
@@ -1522,14 +1545,16 @@ impl FilteredReadStream {
                             // the 'wait' portion of the task is complete.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let wait_start = Instant::now();
-                            let maybe_task = task_stream.lock().await.next().await;
-                            partition_metrics.record_task_wait(wait_start.elapsed());
+                            let maybe_task = {
+                                let _timer = partition_metrics.task_wait_timer();
+                                task_stream.lock().await.next().await
+                            };
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let decode_start = Instant::now();
-                                let batches = task.await;
-                                partition_metrics.record_decode(decode_start.elapsed());
+                                let batches = {
+                                    let _timer = partition_metrics.decode_timer();
+                                    task.await
+                                };
                                 let batches = batches?;
                                 let batch_rows = batches
                                     .iter()
@@ -8284,22 +8309,70 @@ mod tests {
                         .unwrap();
                     let batch = dataset.scan().try_into_batch().await.unwrap();
                     assert_eq!(batch.num_rows(), 64);
+
+                    let counters = |name: &str| {
+                        snapshotter
+                            .snapshot()
+                            .into_vec()
+                            .into_iter()
+                            .filter_map(|(key, _, _, value)| {
+                                let DebugValue::Counter(value) = value else {
+                                    return None;
+                                };
+                                if key.key().name() != name {
+                                    return None;
+                                }
+                                let labels = key
+                                    .key()
+                                    .labels()
+                                    .map(|label| {
+                                        (label.key().to_string(), label.value().to_string())
+                                    })
+                                    .collect::<HashMap<_, _>>();
+                                Some((labels, value))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let total_counter = |name: &str| {
+                        counters(name)
+                            .into_iter()
+                            .map(|(_, value)| value)
+                            .sum::<u64>()
+                    };
+                    let wait_before = total_counter(METRIC_SCAN_TASK_WAIT_TIME);
+                    let decode_before = total_counter(METRIC_SCAN_DECODE_TIME);
+
+                    let timer_metrics = ExecutionPlanMetricsSet::new();
+                    let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+                        &timer_metrics,
+                        0,
+                        &dataset.object_store,
+                    ));
+                    let mut cancelled = Box::pin({
+                        let partition_metrics = partition_metrics.clone();
+                        async move {
+                            let _wait_timer = partition_metrics.task_wait_timer();
+                            let _decode_timer = partition_metrics.decode_timer();
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+                    drop(cancelled);
+
+                    assert!(partition_metrics.task_wait_time.value() > 0);
+                    assert!(partition_metrics.decode_time.value() > 0);
+                    assert!(total_counter(METRIC_SCAN_TASK_WAIT_TIME) > wait_before);
+                    assert!(total_counter(METRIC_SCAN_DECODE_TIME) > decode_before);
+
+                    for name in [METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME] {
+                        let recorded = counters(name);
+                        assert_eq!(recorded.len(), 1, "{name}: {recorded:?}");
+                        let (labels, value) = &recorded[0];
+                        assert_eq!(labels.get("base").map(String::as_str), Some("memory"));
+                        assert!(!labels.contains_key("dataset"), "{labels:?}");
+                        assert!(*value > 0, "{name}: {recorded:?}");
+                    }
                 });
         });
-        let counters: HashMap<String, u64> = snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .filter_map(|(key, _, _, value)| match value {
-                DebugValue::Counter(value) => Some((key.key().name().to_string(), value)),
-                _ => None,
-            })
-            .collect();
-        for name in [METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME] {
-            assert!(
-                counters.get(name).is_some_and(|&nanos| nanos > 0),
-                "{name}: {counters:?}"
-            );
-        }
     }
 }

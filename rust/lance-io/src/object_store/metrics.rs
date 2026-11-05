@@ -240,12 +240,12 @@ pub fn describe_metrics() {
     metrics::describe_counter!(
         crate::object_store::METRIC_SCAN_DECODE_TIME,
         metrics::Unit::Nanoseconds,
-        "Wall time of scan decode tasks, summed over concurrent tasks, by scheme."
+        "Wall time of scan decode tasks, summed over concurrent tasks. Scan metrics use the dataset's primary store labels."
     );
     metrics::describe_counter!(
         crate::object_store::METRIC_SCAN_TASK_WAIT_TIME,
         metrics::Unit::Nanoseconds,
-        "Time scan partitions spent waiting for scheduled I/O, by scheme."
+        "Time scan partitions spent waiting for scheduled I/O. Scan metrics use the dataset's primary store labels."
     );
 }
 

@@ -91,7 +91,9 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
         "lance_scan_task_wait_time_nanoseconds_total",
     ):
         assert catalog[name].kind == "counter"
-        assert sum(p.value for p in metrics[name].data.data_points) > 0
+        points = list(metrics[name].data.data_points)
+        assert sum(p.value for p in points) > 0
+        assert all(dict(p.attributes) == {"base": "file"} for p in points)
 
 
 _OBSERVED_BUILD = """
