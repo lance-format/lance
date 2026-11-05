@@ -3,17 +3,23 @@
 
 //! IVF - Inverted File index.
 
-use super::details::target_partition_size_from_details;
+use super::details::{
+    derive_vector_index_type, infer_vector_index_details, target_partition_size_from_details,
+};
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    utils::{filter_finite_training_data, maybe_sample_training_data, sample_unseen_training_data},
+    utils::{
+        filter_finite_training_data, infer_vector_dim, maybe_sample_training_data,
+        sample_unseen_training_data,
+    },
 };
 use super::{
     builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
     utils::PartitionLoadLock,
 };
 use crate::dataset::index::dataset_format_version;
+use crate::dataset::transaction::Operation;
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::vector::open_index_file;
@@ -131,7 +137,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     ops::Range,
     pin::Pin,
@@ -559,6 +565,104 @@ pub(crate) fn validate_vector_query_compatibility(
     }
 
     Ok(())
+}
+
+/// Refuses a `CreateIndex` that would leave the vector segments of one index
+/// name under different query contracts: metric, sub-index and quantization,
+/// which [`validate_vector_query_compatibility`] compares on opened segments
+/// for the index APIs. A raw transaction reaches the commit without those
+/// APIs, so each commit attempt compares the segments it is about to publish,
+/// retained ones included, by the `VectorIndexDetails` they state.
+///
+/// Runs before the commit fills in missing details, which copies one segment's
+/// inferred details onto every segment of the name. A segment whose details are
+/// missing or empty is read from its index file instead; one that cannot be
+/// read is not compared.
+pub(crate) async fn validate_committed_vector_segments(
+    dataset: &Dataset,
+    operation: &Operation,
+    proposed_indices: &[TableIndexMetadata],
+) -> Result<()> {
+    let Operation::CreateIndex { new_indices, .. } = operation else {
+        return Ok(());
+    };
+    let mut segments_by_name: BTreeMap<&str, Vec<&TableIndexMetadata>> = new_indices
+        .iter()
+        .map(|index| (index.name.as_str(), Vec::new()))
+        .collect();
+    for segment in proposed_indices {
+        let Some(segments) = segments_by_name.get_mut(segment.name.as_str()) else {
+            continue;
+        };
+        let is_vector_segment = match &segment.index_details {
+            Some(details) => details.type_url.ends_with("VectorIndexDetails"),
+            // A raw transaction may leave the details out, and legacy scalar
+            // segments never had any, so the indexed column decides.
+            None => segment
+                .fields
+                .first()
+                .and_then(|&field_id| dataset.schema().field_by_id(field_id))
+                .is_some_and(|field| infer_vector_dim(&field.data_type()).is_ok()),
+        };
+        if is_vector_segment {
+            segments.push(segment);
+        }
+    }
+
+    for (name, segments) in segments_by_name {
+        if segments.len() < 2 {
+            continue;
+        }
+        let mut reference: Option<(&TableIndexMetadata, (DistanceType, String))> = None;
+        for segment in segments {
+            let Some(contract) = vector_query_contract(dataset, segment).await else {
+                continue;
+            };
+            match &reference {
+                None => reference = Some((segment, contract)),
+                Some((first, expected)) if *expected != contract => {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: vector segments {} (metric {:?}, type {}) and {} (metric \
+                         {:?}, type {}) would both remain in index '{name}'; a search ranks every \
+                         segment of an index by one metric and index type, so replace all of its \
+                         segments in one commit",
+                        first.uuid, expected.0, expected.1, segment.uuid, contract.0, contract.1,
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The metric and index type (`IVF_HNSW_SQ`, ...) a vector segment's details
+/// state, read from its index file when the manifest carries none.
+async fn vector_query_contract(
+    dataset: &Dataset,
+    segment: &TableIndexMetadata,
+) -> Option<(DistanceType, String)> {
+    let details = match segment.index_details.as_deref() {
+        Some(details) if !details.value.is_empty() => details.clone(),
+        _ => match infer_vector_index_details(dataset, segment).await {
+            Ok(details) => details,
+            Err(error) => {
+                warn!(
+                    "Segment {} of index '{}' was not compared with the other segments of the \
+                     index: its vector index details could not be read: {error}",
+                    segment.uuid, segment.name
+                );
+                return None;
+            }
+        },
+    };
+    // Inference returns empty details for a file it cannot classify.
+    if details.value.is_empty() {
+        return None;
+    }
+    let metric = details.to_msg::<pb::VectorIndexDetails>().ok()?.metric_type;
+    let metric = DistanceType::from(pb::VectorMetricType::try_from(metric).ok()?);
+    Some((metric, derive_vector_index_type(&details)))
 }
 
 fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModelMismatch> {

@@ -1410,6 +1410,19 @@ pub(crate) async fn do_commit_detached_transaction(
             }
         };
 
+        // Before `migrate_indices`, which fills in missing vector details from
+        // one segment per name and would hide a mismatch.
+        if let Err(error) = crate::index::vector::ivf::validate_committed_vector_segments(
+            dataset,
+            &transaction.operation,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            return Err(error);
+        }
+
         manifest.version = random_version;
 
         // recompute_stats is always false so far because detached manifests are newer than
@@ -2003,6 +2016,19 @@ pub(crate) async fn commit_transaction(
                 (manifest, indices)
             }
         };
+
+        // Before `migrate_indices`, which fills in missing vector details from
+        // one segment per name and would hide a mismatch.
+        if let Err(error) = crate::index::vector::ivf::validate_committed_vector_segments(
+            &dataset,
+            &attempt_transaction.operation,
+            &indices,
+        )
+        .await
+        {
+            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+            return Err(error);
+        }
 
         manifest.version = target_version;
 
