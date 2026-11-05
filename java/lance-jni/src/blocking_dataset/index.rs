@@ -655,6 +655,8 @@ pub(crate) fn optimize_options_from_java(
             env.get_optional_u64_from_method(java_options, "getMaxRowsPerTask")?;
         options.max_rows_per_segment =
             env.get_optional_u64_from_method(java_options, "getMaxRowsPerSegment")?;
+        options.max_rows_to_consolidate =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsToConsolidate")?;
     }
 
     Ok(options)
