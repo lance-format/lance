@@ -667,7 +667,11 @@ impl Branches<'_> {
 
         // Callers must finish failed cleanup before reusing the branch name,
         // since branch creation can otherwise expose retained version history.
-        self.cleanup_branch_directories(branch, fence).await
+        self.cleanup_branch_directories(branch, fence).await?;
+        if let Some(fence) = fence {
+            fence.check_valid()?;
+        }
+        Ok(())
     }
 
     pub async fn list_ordered(
