@@ -33,9 +33,10 @@ use futures::stream::{self, StreamExt};
 use lance_core::Result;
 use lance_index::scalar::expression::ScalarIndexExpr;
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// An index may decline a search matching more than the visible rows divided
 /// by this; reading them all is then expected to be cheaper.

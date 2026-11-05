@@ -45,6 +45,7 @@ public class MergeInsertParams {
   private MergeWriteMode writeMode = MergeWriteMode.Auto;
   private List<CompactedSsTable> compactedSstables = Collections.emptyList();
   private Optional<String> memWalDirId = Optional.empty();
+  private SourceDedupeBehavior sourceDedupeBehavior = SourceDedupeBehavior.Fail;
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -282,6 +283,31 @@ public class MergeInsertParams {
   }
 
   /**
+   * Control how duplicate source rows are handled.
+   *
+   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors only when multiple source rows
+   * match the <em>same target row</em> (an ambiguous update or delete). It does <b>not</b> reject
+   * duplicate join keys among unmatched rows — those are all inserted. Use {@link
+   * SourceDedupeBehavior#FirstSeen} to keep the first row for each join key and skip subsequent
+   * duplicates, including unmatched rows that would otherwise insert the same non-null key more
+   * than once.
+   *
+   * <p>Rows whose join keys contain NULL are never duplicates, because merge insert uses SQL
+   * equality where NULL does not equal NULL.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation.
+   *
+   * @param sourceDedupeBehavior The behavior to apply when duplicate source rows are found
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withSourceDedupeBehavior(SourceDedupeBehavior sourceDedupeBehavior) {
+    Preconditions.checkNotNull(sourceDedupeBehavior);
+    this.sourceDedupeBehavior = sourceDedupeBehavior;
+    return this;
+  }
+
+  /**
    * Mark MemWAL SSTables as compacted into the base table.
    *
    * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
@@ -384,6 +410,14 @@ public class MergeInsertParams {
     return useIndex;
   }
 
+  public SourceDedupeBehavior getSourceDedupeBehavior() {
+    return sourceDedupeBehavior;
+  }
+
+  public String sourceDedupeBehaviorValue() {
+    return sourceDedupeBehavior.toRustString();
+  }
+
   /** Returns the version selector as its string value for the native layer. */
   public Optional<String> getDataStorageVersion() {
     return dataStorageVersion.map(DataStorageVersion::toRustString);
@@ -415,6 +449,7 @@ public class MergeInsertParams {
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
+        .add("sourceDedupeBehavior", sourceDedupeBehavior)
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .add("writeMode", writeMode)
         .toString();
@@ -511,5 +546,37 @@ public class MergeInsertParams {
      * This can be used to replace a region of data with new data
      */
     DeleteIf,
+  }
+
+  /**
+   * Describes how to handle duplicate source rows.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation. Rows whose join keys
+   * contain NULL are not duplicates because merge insert uses SQL equality, where NULL does not
+   * equal NULL.
+   */
+  public enum SourceDedupeBehavior {
+    /** Fail if multiple source rows match the same target row (default). */
+    Fail("Fail"),
+
+    /**
+     * Keep the first row for each join key and skip subsequent rows.
+     *
+     * <p>This applies both to rows that match a target row and to unmatched rows that would
+     * otherwise insert the same non-null join key more than once.
+     */
+    FirstSeen("FirstSeen");
+
+    private final String rustValue;
+
+    SourceDedupeBehavior(String rustValue) {
+      this.rustValue = rustValue;
+    }
+
+    /** Returns the canonical string used by the native layer. */
+    public String toRustString() {
+      return rustValue;
+    }
   }
 }

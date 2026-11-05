@@ -41,6 +41,7 @@ use crate::vector::graph::{
 };
 use crate::vector::graph::{
     Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
+    range_filter,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
@@ -349,7 +350,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -542,7 +543,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -641,12 +642,11 @@ impl HNSW {
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> (Vec<OrderedNode>, usize) {
-        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
         // every set bit gets exactly one distance on both branches below
         let comparisons = prefilter_bitset.count_ones();
 
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = storage.graph_dist_calculator(query, params.dist_q_c);
+        let in_range = range_filter(params, &dist_calc);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
 
         match self.inner.params.prefetch_distance {
@@ -670,7 +670,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -684,7 +684,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -1498,12 +1498,18 @@ pub struct HnswQueryParams {
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
+        Self::from_query(query, query.dist_q_c)
+    }
+}
+
+impl HnswQueryParams {
+    pub(crate) fn from_query(query: &Query, dist_q_c: f32) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-            dist_q_c: query.dist_q_c,
+            dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
         }
     }
@@ -1512,6 +1518,10 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
         let params = build_params.cloned().unwrap_or_default();
@@ -1721,7 +1731,10 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let (results, comparisons) = if prefilter.is_empty() {
+        let rerank_query = query.clone();
+        // Every path keeps `ef` candidates for `VectorStore::rerank`.
+        let (top_k, k) = (k, params.ef);
+        let (mut results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
@@ -1746,7 +1759,7 @@ impl IvfSubIndex for HNSW {
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
-                if !bounded && acorn_results.len() < k.min(remained) {
+                if !bounded && acorn_results.len() < top_k.min(remained) {
                     // the abandoned ACORN traversal still cost its distances
                     let (results, basic_comparisons) =
                         self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
@@ -1762,6 +1775,13 @@ impl IvfSubIndex for HNSW {
         metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+        if storage.rerank(rerank_query, params.dist_q_c, &mut results) {
+            // The search applied the bounds to the scores rerank replaced.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(top_k);
 
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results
@@ -2473,9 +2493,12 @@ mod tests {
         #[case] total: usize,
     ) {
         const DIM: usize = 32;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(total * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(total * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
         let builder = HNSW::index_vectors(
             store.as_ref(),
@@ -2677,9 +2700,12 @@ mod tests {
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),

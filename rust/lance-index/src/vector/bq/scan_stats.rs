@@ -7,7 +7,8 @@
 //! bodies, repack codes or read plane-row files. Scan-extension counters advance
 //! only when an installed executor updates them; these diagnostics do not install
 //! or configure an executor. Ordinary Lance sessions use the Full scan.
-//! Readers take deltas with [`snapshot_and_reset`].
+//! Telemetry readers use [`snapshot`] without consuming diagnostic counters.
+//! Isolated diagnostic runs can take deltas with [`snapshot_and_reset`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,9 +52,7 @@ impl Counter {
         self.0.swap(0, Ordering::Relaxed)
     }
 
-    /// The count so far, without resetting it: tests that run beside others
-    /// can only bound the growth of a process-wide counter from below.
-    #[cfg(test)]
+    /// The count so far, without resetting it.
     pub(crate) fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -79,9 +78,13 @@ impl RankCounter {
     fn take(&self) -> [u64; RANK_BUCKETS] {
         std::array::from_fn(|bucket| self.0[bucket].swap(0, Ordering::Relaxed))
     }
+
+    fn get(&self) -> [u64; RANK_BUCKETS] {
+        std::array::from_fn(|bucket| self.0[bucket].load(Ordering::Relaxed))
+    }
 }
 
-/// The largest value observed since the last snapshot.
+/// The largest value observed since the last diagnostic reset.
 #[derive(Debug)]
 pub struct MaxCounter(AtomicU64);
 
@@ -96,6 +99,10 @@ impl MaxCounter {
 
     fn take(&self) -> u64 {
         self.0.swap(0, Ordering::Relaxed)
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -129,6 +136,14 @@ macro_rules! rabit_scan_counters {
                     $($max: self.$max.take(),)*
                 }
             }
+
+            fn get(&self) -> RabitScanStats {
+                RabitScanStats {
+                    $($counter: self.$counter.get(),)*
+                    $($ranked: self.$ranked.get(),)*
+                    $($max: self.$max.get(),)*
+                }
+            }
         }
 
         /// Counters accumulated since the previous [`snapshot_and_reset`].
@@ -145,14 +160,16 @@ macro_rules! rabit_scan_counters {
 
 rabit_scan_counters! {
     counters {
-        /// Queries that ran the lazy scan.
+        /// Lazy scan invocations, including separately executed ranges of a
+        /// partition-controlled query. This is not an end-user query count.
         lazy_queries,
         /// Eligible queries whose probed ex planes were all resident, so the
         /// eager scan ran unchanged.
         lazy_all_resident_skips,
         /// RaBitQ queries checked while the lazy scan is disabled.
         ineligible_disabled,
-        /// RaBitQ queries on an index with a row-id remapper.
+        /// Scan attempts whose storage does not support candidate reads.
+        /// The historical name does not imply that FRI is ineligible.
         ineligible_remapper,
         /// RaBitQ queries below full precision.
         ineligible_precision,
@@ -354,6 +371,15 @@ rabit_scan_counters! {
         /// Time those builds took: the attach of the resident rows and the
         /// storage's construction, without a fallback load of the store.
         code_only_partition_build_ns,
+        /// Candidate address lookups served without running a translation
+        /// loader, including coalesced loads.
+        row_address_cache_hits,
+        /// Candidate address lookups that ran a translation loader.
+        row_address_cache_misses,
+        /// Physical address slots translated by candidate-view loaders.
+        row_address_translation_rows,
+        /// Elapsed time in those loaders, including mapping reads.
+        row_address_translation_ns,
         /// Bytes of packed row columns that reads of plane-row IVF_RQ files
         /// unpacked into the column layout's fields.
         plane_rows_unpack_bytes,
@@ -444,8 +470,28 @@ pub fn counters() -> &'static RabitScanCounters {
 }
 
 /// Read and zero every counter.
+///
+/// Intended for isolated diagnostics. Resets affect all readers in the process,
+/// including non-destructive snapshots; do not reset during service telemetry.
 pub fn snapshot_and_reset() -> RabitScanStats {
     COUNTERS.take()
+}
+
+/// Read the current counters without resetting them.
+///
+/// Values accumulate since process start or the last [`snapshot_and_reset`].
+/// Each field is atomic, but the snapshot is not transactional across fields;
+/// concurrent scans can advance between reads. Multiple readers do not consume
+/// one another's observations.
+///
+/// ```
+/// use lance_index::vector::bq::scan_stats;
+/// let stats = scan_stats::snapshot();
+/// let translation_seconds = stats.row_address_translation_ns as f64 / 1e9;
+/// # let _ = translation_seconds;
+/// ```
+pub fn snapshot() -> RabitScanStats {
+    COUNTERS.get()
 }
 
 #[cfg(test)]
@@ -465,10 +511,19 @@ mod tests {
         counters.rows_fetched.add(5, 7);
         counters.staleness_max.observe(4);
         counters.staleness_max.observe(2);
+        let first = counters.get();
+        assert_eq!(first.lazy_queries, 3);
+        assert_eq!(first.rows_fetched, [0, 0, 7, 0, 0]);
+        assert_eq!(first.staleness_max, 4);
+        assert_eq!(counters.get(), first);
+        counters.lazy_queries.incr();
+        counters.rows_fetched.incr(64);
+        counters.staleness_max.observe(6);
         let stats = counters.take();
-        assert_eq!(stats.lazy_queries, 3);
-        assert_eq!(stats.rows_fetched, [0, 0, 7, 0, 0]);
-        assert_eq!(stats.staleness_max, 4);
+        assert_eq!(stats.lazy_queries, 4);
+        assert_eq!(stats.rows_fetched, [0, 0, 7, 0, 1]);
+        assert_eq!(stats.staleness_max, 6);
+        assert_eq!(counters.get(), RabitScanStats::default());
         assert_eq!(counters.take(), RabitScanStats::default());
     }
 }

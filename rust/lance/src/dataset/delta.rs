@@ -2866,6 +2866,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         let dv_version = |f: &Fragment| f.deletion_file.as_ref().unwrap().read_version;
         let unchanged = Fragment::new(1);

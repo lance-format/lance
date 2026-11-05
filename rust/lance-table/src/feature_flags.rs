@@ -132,8 +132,12 @@ pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// Readers can still skip an unsupported index version and scan the data.
 /// This writer-only flag is cleared when the last row-address index is removed.
 pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
+/// Some fragment stores its deletion vector in the manifest
+/// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
+/// without this flag would look for a file that does not exist.
+pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 19;
+pub const FLAG_UNKNOWN: u64 = 1 << 20;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -153,6 +157,7 @@ const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -264,6 +269,14 @@ pub fn apply_feature_flags(
         // Both readers and writers need to be able to read deletion files
         manifest.reader_feature_flags |= FLAG_DELETION_FILES;
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
+    }
+    let has_inline_deletions = manifest
+        .fragments
+        .iter()
+        .any(|frag| frag.deletion_file.as_ref().is_some_and(|f| f.is_inline()));
+    if has_inline_deletions {
+        manifest.reader_feature_flags |= FLAG_INLINE_DELETIONS;
+        manifest.writer_feature_flags |= FLAG_INLINE_DELETIONS;
     }
 
     // If any fragment has row ids, they must all have row ids.
@@ -433,6 +446,44 @@ pub fn managed_blobs_enabled(schema: &Schema) -> Result<bool> {
 /// and in release builds only when [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set.
 fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
+}
+
+/// Refuse to publish a manifest that carries data overlay files from a build that
+/// does not understand them: every later open of the dataset by this build would
+/// be refused.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_table::feature_flags::validate_data_overlay_files;
+/// # use lance_table::format::Manifest;
+/// # fn publish(manifest: &Manifest) -> Result<()> {
+/// validate_data_overlay_files(manifest)?;
+/// // Publish the manifest only after this check succeeds.
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_data_overlay_files(manifest: &Manifest) -> Result<()> {
+    validate_data_overlay_files_when(manifest, data_overlay_files_enabled())
+}
+
+/// Split out so the release-build refusal is testable from a debug build.
+fn validate_data_overlay_files_when(manifest: &Manifest, enabled: bool) -> Result<()> {
+    if enabled
+        || manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+    {
+        return Ok(());
+    }
+    Err(Error::not_supported(format!(
+        "Cannot commit version {}: it carries data overlay files, an unreleased format that \
+         may still change; set {ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV} to read and write \
+         them with this build of Lance",
+        manifest.version
+    )))
 }
 
 /// Debug builds only, with no environment override, until continuous recording
@@ -757,7 +808,10 @@ mod tests {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
         assert!(can_write_dataset(FLAG_OBJECT_METADATA));
-        assert_eq!(FLAG_UNKNOWN, 1 << 19);
+        assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
+        assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
+        assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 20);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -995,6 +1049,17 @@ mod tests {
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
         );
+
+        // A build that does not understand overlays refuses to publish them.
+        let err = validate_data_overlay_files_when(&manifest, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV),
+            "{err}"
+        );
+        validate_data_overlay_files_when(&manifest, true).unwrap();
+        manifest.fragments = Arc::new(vec![Fragment::new(0)]);
+        validate_data_overlay_files_when(&manifest, false).unwrap();
     }
 
     #[test]
