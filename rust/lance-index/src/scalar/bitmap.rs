@@ -4,7 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{Remapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::Remapper;
 use std::{
     any::Any,
     borrow::Cow,
@@ -2234,9 +2234,9 @@ pub(crate) async fn remap_index_map(
 }
 
 /// [`remap_row_addrs`] through a [`RowAddrTranslator`]: a synchronous map
-/// remaps directly; a batch translator translates the posting in bounded
-/// batches (`remap_row_addrs_tree_map_async`) and never resolves it into a
-/// map, so one posting list is the unit of work here.
+/// remaps directly; any other translator translates the posting's
+/// addresses as one batch and never resolves them into a map, so one
+/// posting list is the unit of work here.
 #[allow(deprecated)]
 pub(crate) async fn remap_row_addrs_with(
     bitmap: &RowAddrTreeMap,
@@ -2244,8 +2244,19 @@ pub(crate) async fn remap_row_addrs_with(
 ) -> Result<RowAddrTreeMap> {
     match translator {
         RowAddrTranslatorRef::Sync(mapping) => remap_row_addrs(bitmap, mapping),
-        RowAddrTranslatorRef::Batch(remapper) => {
-            remap_row_addrs_tree_map_async(remapper, bitmap).await
+        RowAddrTranslatorRef::Batch(_) => {
+            let addrs: Vec<u64> = bitmap
+                .row_addrs()
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "batch row-ID remapping requires explicit row addresses, not \
+                         whole-fragment selections",
+                    )
+                })?
+                .map(u64::from)
+                .collect();
+            let translated = translator.remap_row_addrs(&addrs).await?;
+            Ok(translated.into_iter().flatten().collect())
         }
         RowAddrTranslatorRef::Remapper(remapper) => {
             lance_index_core::remapping::check_batch_remapping_entry()?;

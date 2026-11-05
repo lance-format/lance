@@ -3,8 +3,7 @@
 
 //! Abstract scalar index traits and types for Lance index plugins
 
-#[allow(deprecated)]
-use crate::remapping::{RowAddrTranslator, materialize_remap};
+use crate::remapping::RowAddrTranslator;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -838,35 +837,26 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// The default implementation keeps existing indices working: a
     /// synchronous translator is handed to [`Self::remap`] as it is, and any
     /// other translator is first materialized into a complete in-memory
-    /// mapping ([`Remapper::materialize`](crate::remapping::Remapper::materialize)
-    /// or the deprecated [`materialize_remap`], bounded by the translator and
-    /// requiring [`Self::stored_fragments`]) before one call to
+    /// mapping ([`RowAddrTranslator::materialize`], bounded by the translator
+    /// and requiring [`Self::stored_fragments`]) before one call to
     /// [`Self::remap`]. That fallback costs the mapping's memory and reads the
     /// index once more; it declines with a
     /// [`RemapUnavailable`](crate::remapping::RemapUnavailable) it cannot
     /// prove a complete mapping within budget. Built-in indices override this
     /// to translate one unit of work at a time (a page, a partition, a spill
     /// batch) without any map sized to the source rows.
-    #[allow(deprecated)]
     async fn remap_streaming(
         &self,
         translator: &RowAddrTranslator,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        match translator {
-            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref(), dest_store).await,
-            RowAddrTranslator::Batch(remapper) => {
-                let mapping =
-                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
-                self.remap(&mapping, dest_store).await
-            }
-            RowAddrTranslator::Remapper(remapper) => {
-                let mapping = remapper
-                    .materialize(self.stored_fragments().as_ref())
-                    .await?;
-                self.remap(&mapping, dest_store).await
-            }
+        if let RowAddrTranslator::Sync(mapping) = translator {
+            return self.remap(mapping.as_ref(), dest_store).await;
         }
+        let mapping = translator
+            .materialize(self.stored_fragments().as_ref())
+            .await?;
+        self.remap(&mapping, dest_store).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`

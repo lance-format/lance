@@ -2753,7 +2753,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_remap_then_keep_relocates_and_filters() {
         use arrow_array::UInt32Array;
         use roaring::{RoaringBitmap, RoaringTreemap};

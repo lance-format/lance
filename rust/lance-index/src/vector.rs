@@ -4,8 +4,7 @@
 //! Vector Index
 //!
 
-#[allow(deprecated)]
-use crate::scalar::{RowAddrTranslator, materialize_remap};
+use crate::scalar::RowAddrTranslator;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
 use std::fmt::Debug;
@@ -640,32 +639,20 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// The default implementation hands a synchronous translator to
     /// [`Self::remap`] as it is, and materializes any other translator into a
     /// complete in-memory mapping first
-    /// ([`Remapper::materialize`](crate::scalar::Remapper::materialize),
-    /// bounded by the translator and requiring [`Self::stored_fragments`]),
+    /// ([`RowAddrTranslator::materialize`], bounded by the translator and
+    /// requiring [`Self::stored_fragments`]),
     /// then calls [`Self::remap`] once. It declines with a
     /// [`RemapUnavailable`](crate::scalar::RemapUnavailable) when it cannot
     /// prove a complete mapping within budget. Built-in indices translate one
     /// unit of work at a time instead.
-    #[allow(deprecated)]
     async fn remap_streaming(&mut self, translator: &RowAddrTranslator) -> Result<()> {
-        match translator {
-            RowAddrTranslator::Sync(mapping) => self.remap(mapping.as_ref()).await,
-            RowAddrTranslator::Batch(remapper) => {
-                let mapping =
-                    materialize_remap(remapper.as_ref(), self.stored_fragments().as_ref()).await?;
-                self.remap(&mapping).await
-            }
-            RowAddrTranslator::Remapper(remapper) => {
-                let mapping = remapper
-                    .materialize(self.stored_fragments().as_ref())
-                    .await?;
-                self.remap(&mapping).await
-            }
-            #[allow(unreachable_patterns)]
-            _ => Err(Error::not_supported(
-                "this build does not know how to translate through this row address translator",
-            )),
+        if let RowAddrTranslator::Sync(mapping) = translator {
+            return self.remap(mapping.as_ref()).await;
         }
+        let mapping = translator
+            .materialize(self.stored_fragments().as_ref())
+            .await?;
+        self.remap(&mapping).await
     }
 
     /// The metric type of this vector index.

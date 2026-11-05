@@ -28,7 +28,7 @@ pub use crate::metrics::MetricsCollector;
 pub use lance_index_core::remapping::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, LEGACY_TRAFFIC_ONLY,
     RemapUnavailable, Remapper, RowAddrTranslator, RowAddrTranslatorRef,
-    check_batch_remapping_entry, materialize_remap,
+    check_batch_remapping_entry,
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,

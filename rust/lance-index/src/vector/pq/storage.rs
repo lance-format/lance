@@ -2164,26 +2164,39 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
     async fn test_async_remap_preserves_transposed_codes() {
         #[derive(Debug)]
         struct Mapping(RowAddrRemap);
-        #[async_trait::async_trait]
-        impl lance_index_core::remapping::BatchRowIdRemapper for Mapping {
-            async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-                Ok(ids
-                    .iter()
-                    .map(|id| self.0.get(*id).unwrap_or(Some(*id)))
-                    .collect())
+        impl lance_select::remapper::RemapperBacking for Mapping {
+            fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+                true
+            }
+
+            fn translate_fragments(
+                &self,
+                fragments: &roaring::RoaringBitmap,
+            ) -> roaring::RoaringBitmap {
+                fragments.clone()
+            }
+
+            fn translate_in_place<'a>(
+                &'a self,
+                addrs: &'a mut [Option<u64>],
+            ) -> lance_select::remapper::TranslateFuture<'a> {
+                for slot in addrs.iter_mut() {
+                    *slot = slot.and_then(|id| self.0.get(id).unwrap_or(Some(id)));
+                }
+                Box::pin(std::future::ready(Ok(())))
             }
         }
         let storage = create_pq_storage().await;
         let mapping = pq_remap_compact();
         let expected = storage.remap(&mapping).unwrap();
-        let remapping = Mapping(mapping);
+        let remapper =
+            lance_index_core::remapping::Remapper::from_backing(Arc::new(Mapping(mapping)));
         let row_id_idx = storage.batch.schema().index_of(ROW_ID).unwrap();
-        let (batch, remapper) = lance_index_core::remapping::remap_row_ids_preserving_layout_async(
-            &remapping,
+        let (batch, remapper) = lance_index_core::remapping::translate_preserving_layout(
+            &remapper,
             storage.batch.clone(),
             row_id_idx,
         )
