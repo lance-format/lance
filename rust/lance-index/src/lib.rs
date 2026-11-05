@@ -105,7 +105,11 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        assert!(IndexType::IvfHnswRq.version() as u32 > IVF_RQ_INDEX_VERSION);
+        assert_eq!(
+            IndexType::max_vector_version(),
+            IndexType::IvfHnswRq.version() as u32
+        );
     }
 
     #[test]
@@ -137,6 +141,7 @@ mod tests {
             IndexType::IvfHnswPq,
             IndexType::IvfHnswFlat,
             IndexType::IvfRq,
+            IndexType::IvfHnswRq,
         ];
 
         for index_type in all {
@@ -184,6 +189,7 @@ mod tests {
             ("IVF_HNSW_FLAT", IndexType::IvfHnswFlat),
             ("IVF_HNSW_SQ", IndexType::IvfHnswSq),
             ("IVF_HNSW_PQ", IndexType::IvfHnswPq),
+            ("IVF_HNSW_RQ", IndexType::IvfHnswRq),
             ("FragmentReuse", IndexType::FragmentReuse),
             ("MemWal", IndexType::MemWal),
         ];

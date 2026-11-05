@@ -3704,6 +3704,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
+            "IVF_HNSW_RQ",
             "IVF_RQ",
         ]
         if index_type not in valid_index_types:
@@ -4171,7 +4172,7 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
@@ -4351,7 +4352,7 @@ class LanceDataset(pa.dataset.Dataset):
           interprets partition ids within that segment. Keep independently
           trained segments as separate physical segments unless the merge
           workflow can preserve or reconcile the model state.
-        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+        - ``rabitq_model`` (``IVF_RQ`` and ``IVF_HNSW_RQ``): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
           rotation so every segment rotates vectors the same way. If omitted, each
