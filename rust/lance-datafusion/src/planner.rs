@@ -1635,7 +1635,19 @@ mod tests {
                 vec![Some(true), Some(false), Some(false), None],
             ),
             (
+                "substring(text FROM 2) = 'ello'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substring(text FOR 3) = 'wor'",
+                vec![Some(false), Some(true), Some(false), None],
+            ),
+            (
                 "substring(text, 2, 3) = 'ell'",
+                vec![Some(true), Some(false), Some(false), None],
+            ),
+            (
+                "substr(text, 2, 3) = 'ell'",
                 vec![Some(true), Some(false), Some(false), None],
             ),
         ];
@@ -1689,6 +1701,20 @@ mod tests {
             .into_array(batch.num_rows())
             .unwrap();
         assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
+    }
+
+    #[rstest::rstest]
+    #[case("floor(value TO DAY)", "FLOOR with datetime or scale is not supported")]
+    #[case("ceil(value, 2)", "CEIL with datetime or scale is not supported")]
+    #[case("substring(text)", "SUBSTRING requires a FROM or FOR clause")]
+    fn test_unsupported_scalar_expression_forms(#[case] filter: &str, #[case] message: &str) {
+        let planner = Planner::new(Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, true),
+            Field::new("text", DataType::Utf8, true),
+        ])));
+        let error = planner.parse_filter(filter).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     #[test]
