@@ -338,11 +338,14 @@ fn inner_execute_task<'local>(
         read_version: read_version as u64,
         options: compaction_options,
     };
-    let rewrite_result = {
+    // Executing a task only reads the snapshot, so clone it and release the native field guard;
+    // holding the guard would serialize every task sharing this Java Dataset.
+    let dataset = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(compaction_task.execute(&dataset.inner))?
+        dataset.inner.clone()
     };
+    let rewrite_result = block_on(compaction_task.execute(&dataset))?;
     rewrite_result.into_java(env)
 }
 
