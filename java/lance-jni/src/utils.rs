@@ -15,7 +15,6 @@ use lance::io::ObjectStoreParams;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
-use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -24,6 +23,7 @@ use lance_linalg::distance::DistanceType;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use crate::rq_model::extract_rq_build_params;
 
 use crate::traits::FromJObjectWithEnv;
 use lance_index::vector::{ApproxMode, Query};
@@ -205,6 +205,7 @@ pub fn build_compaction_options(
     target_rows_per_fragment: &JObject,        // Optional<Long>
     max_rows_per_group: &JObject,              // Optional<Long>
     max_bytes_per_file: &JObject,              // Optional<Long>
+    min_bytes_per_file: &JObject,              // Optional<Long>
     materialize_deletions: &JObject,           // Optional<Boolean>
     materialize_deletions_threshold: &JObject, // Optional<Float>
     num_threads: &JObject,                     // Optional<Long>
@@ -229,6 +230,13 @@ pub fn build_compaction_options(
     }
     if let Some(max_bytes_per_file_val) = env.get_long_opt(max_bytes_per_file)? {
         compaction_options.max_bytes_per_file = Some(max_bytes_per_file_val as usize);
+    }
+    if let Some(bytes) = env.get_long_opt(min_bytes_per_file)? {
+        compaction_options.min_bytes_per_file = Some(usize::try_from(bytes).map_err(|_| {
+            lance::Error::invalid_input(format!(
+                "min_bytes_per_file must be a positive integer, got {bytes}"
+            ))
+        })?);
     }
     if let Some(materialize_deletions_val) = env.get_boolean_opt(materialize_deletions)? {
         compaction_options.materialize_deletions = materialize_deletions_val;
@@ -543,10 +551,7 @@ pub fn get_vector_index_params(
             let rq_params = env.get_optional_from_method(
                 &vector_index_params_obj,
                 "getRqParams",
-                |env, rq_obj| {
-                    let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
-                    Ok(RQBuildParams::new(num_bits))
-                },
+                extract_rq_build_params,
             )?;
 
             if let Some(rq_params) = rq_params {

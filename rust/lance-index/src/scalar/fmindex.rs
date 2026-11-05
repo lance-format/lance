@@ -33,6 +33,7 @@ use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
@@ -1139,6 +1140,7 @@ impl FMIndex {
 #[derive(Debug)]
 struct LazyFMIndex {
     wavelet: LazyHuffmanWaveletTree,
+    // Document positions must stay aligned even when remapping deletes a row.
     row_ids: Vec<u64>,
     sa_samples: Vec<u64>,
     doc_start_positions: Vec<u64>,
@@ -1247,7 +1249,10 @@ impl LazyFMIndex {
         for i in lo..hi {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
-            result.insert(self.row_ids[doc_idx] as u32);
+            let row_addr = self.row_ids[doc_idx];
+            if row_addr != RowAddress::TOMBSTONE_ROW {
+                result.insert(row_addr as u32);
+            }
         }
         result
     }
@@ -1264,7 +1269,7 @@ impl LazyFMIndex {
             let text_pos = self.locate(i);
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1282,7 +1287,7 @@ impl LazyFMIndex {
             let text_pos = self.locate_async(i).await?;
             let doc_idx = self.doc_for_position(text_pos);
             let row_addr = self.row_ids[doc_idx];
-            if seen.insert(row_addr) {
+            if row_addr != RowAddress::TOMBSTONE_ROW && seen.insert(row_addr) {
                 result.push(row_addr);
             }
         }
@@ -1511,7 +1516,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        _fri: Option<Arc<dyn RowIdRemapper>>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1529,8 +1534,16 @@ impl FMIndexScalarIndex {
         let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
+                let fri = fri.clone();
                 async move {
-                    let partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    let mut partition = Self::load_partition(store.as_ref(), &name, id).await?;
+                    if let Some(fri) = fri {
+                        for row_id in &mut partition.fm.row_ids {
+                            *row_id = fri
+                                .remap_row_id(*row_id)
+                                .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                        }
+                    }
                     Result::<_>::Ok((id, Arc::new(partition)))
                 }
             })
@@ -1621,7 +1634,9 @@ impl Index for FMIndexScalarIndex {
         let mut frags = RoaringBitmap::new();
         for p in &self.partitions {
             for &rid in &p.fm.row_ids {
-                frags.insert((rid >> 32) as u32);
+                if rid != RowAddress::TOMBSTONE_ROW {
+                    frags.insert(RowAddress::from(rid).fragment_id());
+                }
             }
         }
         Ok(frags)
@@ -2371,6 +2386,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::scalar::lance_format::LanceIndexStore;
+    use crate::scalar::lookup_test_util::CompactedToFragmentOne;
     use crate::scalar::registry::BasicTrainer;
 
     #[derive(Debug, Clone)]
@@ -2675,6 +2691,77 @@ mod tests {
             }
             _ => panic!("expected exact result"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::no_deletions(vec![])]
+    #[case::middle_deleted(vec![1])]
+    #[case::all_deleted(vec![0, 1, 2, 3])]
+    #[tokio::test]
+    async fn test_load_remaps_positional_row_addresses(
+        #[case] deleted: Vec<u64>,
+        #[values(false, true)] is_prewarmed: bool,
+    ) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            Path::from_filesystem_path(tempdir.path()).unwrap(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let texts: Vec<(u64, &[u8])> = vec![
+            (0, b"alpha needle"),
+            (1, b"beta needle"),
+            (2, b"gamma needle needle"),
+            (3, b"delta needle"),
+        ];
+        for (id, texts) in texts.chunks(3).enumerate() {
+            write_fmindex(
+                &FMIndex::build(texts).unwrap(),
+                store.as_ref(),
+                &fmindex_partition_path(id as u64),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let remapper = Arc::new(CompactedToFragmentOne {
+            deleted: deleted.into_iter().collect(),
+        });
+        let index =
+            FMIndexScalarIndex::load(store, Some(remapper.clone()), &LanceCache::no_cache())
+                .await
+                .unwrap();
+        if is_prewarmed {
+            index.prewarm().await.unwrap();
+        }
+
+        for pattern in ["needle", "alpha", "beta", "gamma", "delta", "absent"] {
+            let expected: lance_select::RowAddrTreeMap = texts
+                .iter()
+                .filter(|(_, text)| text.windows(pattern.len()).any(|w| w == pattern.as_bytes()))
+                .filter_map(|(row_id, _)| remapper.remap_row_id(*row_id))
+                .collect();
+            let result = index
+                .search(
+                    &TextQuery::StringContains(pattern.to_string()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let SearchResult::Exact(rows) = result else {
+                panic!("expected exact result");
+            };
+            assert_eq!(rows.selected_rows(), &expected, "{pattern}");
+        }
+        let expected_fragments: RoaringBitmap = if remapper.deleted.len() == texts.len() {
+            RoaringBitmap::new()
+        } else {
+            [1].into_iter().collect()
+        };
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            expected_fragments
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

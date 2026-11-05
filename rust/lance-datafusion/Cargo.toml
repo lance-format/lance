@@ -37,10 +37,6 @@ prost.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [dev-dependencies]
 geo-types.workspace = true
 geoarrow-array.workspace = true
@@ -52,7 +48,7 @@ rstest.workspace = true
 datagen = ["lance-datafusion-exec/datagen"]
 geo = ["dep:geodatafusion"]
 substrait = ["dep:datafusion-substrait"]
-protoc = ["dep:protobuf-src"]
+protoc = ["datafusion-substrait?/protoc"]
 
 [lints]
 workspace = true

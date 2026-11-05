@@ -1174,6 +1174,15 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 
+    /// Whether every buffer returned by `decompress` is newly allocated, never a
+    /// view of the input, on all paths.
+    ///
+    /// Full-zip decoding copies a batch's input out of the page buffer unless this
+    /// is true, so that output batches never keep the whole page alive.
+    fn allocates_output(&self) -> bool {
+        false
+    }
+
     /// Returns an exact count or conservative upper bound on the total decompressed
     /// size for a slice of `num_values` compressed values.
     ///
@@ -1376,6 +1385,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             Compression::Alp(description) => Ok(Box::new(
                 AlpMiniBlockDecompressor::from_description(description)?,
+            )),
+            Compression::Pcodec(_) => Err(Error::not_supported_source(
+                "pcodec decoding is not yet implemented".into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor
@@ -2196,6 +2208,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Range(_) => "range",
         Compression::Delta(_) => "delta",
         Compression::Alp(_) => "alp",
+        Compression::Pcodec(_) => "pcodec",
     }
 }
 

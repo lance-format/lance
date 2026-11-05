@@ -295,7 +295,6 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
         Ok(Box::new(StructuralFixedSizeListDecodeTask::new(
             child_task,
             self.data_type.clone(),
-            num_rows,
         )))
     }
 
@@ -308,19 +307,13 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
 struct StructuralFixedSizeListDecodeTask {
     child_task: Box<dyn StructuralDecodeArrayTask>,
     data_type: DataType,
-    num_rows: u64,
 }
 
 impl StructuralFixedSizeListDecodeTask {
-    fn new(
-        child_task: Box<dyn StructuralDecodeArrayTask>,
-        data_type: DataType,
-        num_rows: u64,
-    ) -> Self {
+    fn new(child_task: Box<dyn StructuralDecodeArrayTask>, data_type: DataType) -> Self {
         Self {
             child_task,
             data_type,
-            num_rows,
         }
     }
 }
@@ -334,11 +327,21 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
         } = self.child_task.decode()?;
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
-                let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
+                let dimension = usize::try_from(*dimension).map_err(|_| {
+                    Error::invalid_input("Fixed-size-list dimension must be positive")
+                })?;
+                if dimension == 0 || !array.len().is_multiple_of(dimension) {
+                    return Err(Error::invalid_input(
+                        "Fixed-size-list child count is not a whole number of slots",
+                    ));
+                }
+                // A surrounding variable list can contain a different number
+                // of FSL values than the top-level rows requested by the scan.
+                let num_rows = array.len() / dimension;
+                let validity = repdef.unravel_fsl_validity(num_rows, dimension)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
-                    *dimension,
+                    dimension as i32,
                     array,
                     validity,
                 )?;
