@@ -231,6 +231,10 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "list_structure"
+harness = false
+
+[[bench]]
 name = "stable_row_id_limit"
 harness = false
 

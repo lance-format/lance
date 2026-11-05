@@ -4057,7 +4057,6 @@ async fn load_compound_partition(
                         operator,
                         scorer.as_ref(),
                         metrics.as_ref(),
-                        true,
                     )
                     .await?
                     .postings
