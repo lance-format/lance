@@ -51,13 +51,14 @@ use crate::index::vector::utils::{
 };
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
-    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
+    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec, new_knn_exec_with_refinement_cache,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{
     FilterPlan as ExprFilterPlan, KNNVectorDistanceExec, LanceFilterExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, project,
 };
+use crate::session::index_caches::QuantizedRefinementOptions;
 use crate::{Error, Result};
 
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
@@ -1294,7 +1295,7 @@ impl Scanner {
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
-        let inner_fanout_search = new_knn_exec(
+        let inner_fanout_search = new_knn_exec_with_refinement_cache(
             self.dataset.clone(),
             index,
             q,
@@ -1302,6 +1303,21 @@ impl Scanner {
             overlay_block,
             self.external_row_mask.clone(),
             self.quantized_refine_factor,
+            self.nearest
+                .as_ref()
+                .filter(|_| {
+                    self.quantized_refine_factor.is_some()
+                        && self.filter.is_none()
+                        && filter_plan.is_empty()
+                        && self.fragments.is_none()
+                        && self.index_segments.is_none()
+                        && self.physical_row_addr_prefilter.is_none()
+                        && self.get_indexed_frags(index) == *self.dataset.fragment_bitmap
+                })
+                .map(|query| QuantizedRefinementOptions {
+                    result_count: query.k,
+                    exact_factor: query.refine_factor,
+                }),
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,

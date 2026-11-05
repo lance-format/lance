@@ -12,12 +12,273 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
+use arrow_array::{
+    Array, Float32Array, RecordBatch, UInt64Array,
+    cast::AsArray,
+    types::{Float32Type, UInt64Type},
+};
+use arrow_schema::DataType;
+use lance_core::ROW_ID;
+use lance_core::cache::{
+    CacheKey, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder, LanceCache,
+};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
+use lance_index::vector::{ApproxMode, DIST_COL, Query, VECTOR_RESULT_SCHEMA};
+use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
 use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
 use uuid::Uuid;
+
+/// Owned partition results only: no resident buffers, prefilters or dataset handles.
+/// No codec is provided, so persistent backends keep these entries in memory.
+pub(crate) struct QuantizedRefinementResult(pub RecordBatch);
+
+impl QuantizedRefinementResult {
+    pub fn copy_from(batch: &RecordBatch) -> crate::Result<Self> {
+        // Accurate range search can return a tiny slice of a whole partition.
+        // Rebuild only these two columns so admission charges everything retained.
+        let distances = batch
+            .column_by_name(DIST_COL)
+            .and_then(|column| column.as_primitive_opt::<Float32Type>())
+            .ok_or_else(|| {
+                crate::Error::internal("quantized refinement result requires Float32 _distance")
+            })?
+            .iter()
+            .collect::<Float32Array>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| {
+                crate::Error::internal("quantized refinement result requires UInt64 _rowid")
+            })?
+            .iter()
+            .collect::<UInt64Array>();
+        Ok(Self(RecordBatch::try_new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            vec![Arc::new(distances), Arc::new(row_ids)],
+        )?))
+    }
+}
+
+impl DeepSizeOf for QuantizedRefinementResult {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        self.0.get_array_memory_size()
+    }
+}
+
+/// The original result contract, before the planner expands k for exact refinement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QuantizedRefinementOptions {
+    pub result_count: usize,
+    pub exact_factor: Option<u32>,
+}
+
+/// Snapshot and physical segment identity, shared by one query's partition keys.
+#[derive(Clone, Debug)]
+pub(crate) struct QuantizedRefinementCache {
+    pub cache: LanceCache,
+    pub identity: InternalCacheKey,
+}
+
+impl QuantizedRefinementCache {
+    pub async fn for_segment(
+        dataset: &crate::Dataset,
+        index: &IndexMetadata,
+        original_query: &Query,
+        options: QuantizedRefinementOptions,
+    ) -> crate::Result<Option<Self>> {
+        let location = dataset.manifest_location();
+        let manifest = dataset.manifest();
+        // Transactions have unique names even after overwrite/recreation. A
+        // manifest path/version alone cannot establish the dataset incarnation.
+        if dataset.index_cache.capacity_bytes() == Some(0)
+            || (manifest
+                .transaction_file
+                .as_deref()
+                .is_none_or(str::is_empty)
+                && location.e_tag.as_deref().is_none_or(str::is_empty))
+        {
+            return Ok(None);
+        }
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root(),
+            QuantizedRefinementKey::type_name(),
+            QuantizedRefinementKey::schema(),
+        );
+        builder.write_str(dataset.uri());
+        builder.write_str(&dataset.object_store(None).await?.store_prefix);
+        builder.write_str(location.path.as_ref());
+        builder.write_u64(manifest.version);
+        builder.write_u64(options.result_count as u64);
+        match options.exact_factor {
+            Some(factor) => {
+                builder.write_some();
+                builder.write_u32(factor);
+            }
+            None => builder.write_none(),
+        }
+        for value in [
+            manifest.branch.as_deref(),
+            manifest.transaction_file.as_deref(),
+            location.e_tag.as_deref(),
+        ] {
+            match value {
+                Some(value) => {
+                    builder.write_some();
+                    builder.write_str(value);
+                }
+                None => builder.write_none(),
+            }
+        }
+        let store = dataset.object_store_for_index(index).await?;
+        builder.write_str(&store.store_prefix);
+        builder.write_str(dataset.indice_files_dir(index)?.as_ref());
+        write_index_identity(&mut builder, &index.uuid, None);
+        // The authoritative manifest generation binds both FRI contents and
+        // the segment's effective coverage. Never reuse rankings across snapshots,
+        // even when the native immutable-data/translation caches remain reusable.
+        if !write_query_vector(&mut builder, original_query) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            cache: dataset.index_cache.0.clone(),
+            identity: builder.finish(),
+        }))
+    }
+}
+
+pub(crate) struct QuantizedRefinementKey<'a> {
+    pub identity: InternalCacheKey,
+    pub query: &'a Query,
+    pub metric: DistanceType,
+    pub partition_id: usize,
+    pub factor: u32,
+}
+
+fn write_query_vector(builder: &mut KeyBuilder, query: &Query) -> bool {
+    if query.key.null_count() != 0 {
+        return false;
+    }
+    builder.write_u64(query.key.len() as u64);
+    match query.key.data_type() {
+        DataType::Float16 => {
+            builder.write_u8(16);
+            for value in query
+                .key
+                .as_primitive::<arrow_array::types::Float16Type>()
+                .values()
+            {
+                if !value.is_finite() {
+                    return false;
+                }
+                builder.write_u16(value.to_bits());
+            }
+        }
+        DataType::Float32 => {
+            builder.write_u8(32);
+            for value in query
+                .key
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .values()
+            {
+                if !value.is_finite() {
+                    return false;
+                }
+                builder.write_u32(value.to_bits());
+            }
+        }
+        DataType::Float64 => {
+            builder.write_u8(64);
+            for value in query
+                .key
+                .as_primitive::<arrow_array::types::Float64Type>()
+                .values()
+            {
+                if !value.is_finite() {
+                    return false;
+                }
+                builder.write_u64(value.to_bits());
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+impl CacheKey for QuantizedRefinementKey<'_> {
+    type ValueType = QuantizedRefinementResult;
+
+    fn key(&self) -> Cow<'_, str> {
+        let mut builder =
+            KeyBuilder::new(CacheNamespace::root(), Self::type_name(), Self::schema());
+        self.write_key(&mut builder);
+        Cow::Owned(format!("{:?}", builder.finish()))
+    }
+
+    fn type_name() -> &'static str {
+        "QuantizedRefinementResult"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.quantized-refinement-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.identity.as_bytes());
+        builder.write_u64(self.partition_id as u64);
+        builder.write_str(&self.query.column);
+        write_query_vector(builder, self.query);
+        builder.write_str(&self.metric.to_string());
+        // Include every resolved control, including values overridden by this
+        // stage, to make changes to the query contract conservatively miss.
+        let Query {
+            k,
+            lower_bound,
+            upper_bound,
+            minimum_nprobes,
+            maximum_nprobes,
+            search_effort,
+            ef,
+            refine_factor,
+            metric_type,
+            use_index,
+            query_parallelism,
+            dist_q_c,
+            approx_mode,
+            column: _,
+            key: _,
+        } = self.query;
+        builder.write_u64(*k as u64);
+        builder.write_u32(self.factor);
+        builder.write_u64(*minimum_nprobes as u64);
+        for value in [
+            maximum_nprobes.map(|v| v as u64),
+            ef.map(|v| v as u64),
+            refine_factor.map(u64::from),
+            lower_bound.map(|v| u64::from(v.to_bits())),
+            upper_bound.map(|v| u64::from(v.to_bits())),
+        ] {
+            match value {
+                Some(value) => {
+                    builder.write_some();
+                    builder.write_u64(value);
+                }
+                None => builder.write_none(),
+            }
+        }
+        builder.write_u64(search_effort.to_bits());
+        builder.write_u32(dist_q_c.to_bits());
+        builder.write_i32(*query_parallelism);
+        builder.write_bool(*use_index);
+        builder.write_str(&format!("{metric_type:?}"));
+        builder.write_u8(match approx_mode {
+            ApproxMode::Fast => 0,
+            ApproxMode::Normal => 1,
+            ApproxMode::Accurate => 2,
+        });
+    }
+}
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
 pub struct GlobalIndexCache(pub(super) LanceCache);
@@ -413,6 +674,10 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 mod tests {
     use super::*;
 
+    use arrow_array::record_batch;
+    use lance_core::cache::{MokaCacheBackend, QuickCacheBackend};
+    use rstest::rstest;
+
     #[rstest::rstest]
     #[case::generation(5, true, "second-etag")]
     #[case::version(6, true, "first-etag")]
@@ -452,6 +717,292 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    fn refinement_query() -> Query {
+        Query {
+            column: "vec".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0, 1.0])),
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
+        }
+    }
+
+    fn refinement_identity() -> InternalCacheKey {
+        KeyBuilder::new(
+            CacheNamespace::root(),
+            QuantizedRefinementKey::type_name(),
+            QuantizedRefinementKey::schema(),
+        )
+        .finish()
+    }
+
+    fn refinement_key(query: &Query) -> QuantizedRefinementKey<'_> {
+        QuantizedRefinementKey {
+            identity: refinement_identity(),
+            query,
+            metric: DistanceType::L2,
+            partition_id: 0,
+            factor: 4,
+        }
+    }
+
+    #[rstest]
+    #[case::values(|q: &mut Query| q.key = Arc::new(Float32Array::from(vec![0.0, 2.0])))]
+    #[case::signed_zero(|q: &mut Query| q.key = Arc::new(Float32Array::from(vec![-0.0, 1.0])))]
+    #[case::element_type(|q: &mut Query| q.key = Arc::new(arrow_array::Float64Array::from(vec![0.0, 1.0])))]
+    #[case::dimension(|q: &mut Query| q.key = Arc::new(Float32Array::from(vec![0.0, 1.0, 2.0])))]
+    #[case::column(|q: &mut Query| q.column = "other".to_string())]
+    #[case::k(|q: &mut Query| q.k = 11)]
+    #[case::lower_bound(|q: &mut Query| q.lower_bound = Some(-0.0))]
+    #[case::upper_bound(|q: &mut Query| q.upper_bound = Some(1.0))]
+    #[case::minimum_probes(|q: &mut Query| q.minimum_nprobes = 2)]
+    #[case::maximum_probes(|q: &mut Query| q.maximum_nprobes = Some(2))]
+    #[case::effort(|q: &mut Query| q.search_effort = 1.0)]
+    #[case::ef(|q: &mut Query| q.ef = Some(20))]
+    #[case::exact_factor(|q: &mut Query| q.refine_factor = Some(2))]
+    #[case::metric(|q: &mut Query| q.metric_type = Some(DistanceType::Cosine))]
+    #[case::parallelism(|q: &mut Query| q.query_parallelism = 2)]
+    #[case::centroid_distance(|q: &mut Query| q.dist_q_c = -0.0)]
+    #[case::scoring_mode(|q: &mut Query| q.approx_mode = ApproxMode::Accurate)]
+    #[test]
+    fn refinement_key_binds_query_controls(#[case] change: fn(&mut Query)) {
+        let original = refinement_query();
+        let mut changed = original.clone();
+        change(&mut changed);
+        assert_ne!(
+            refinement_key(&original).key(),
+            refinement_key(&changed).key()
+        );
+        // Arrow slices are keyed by their logical values, without buffer padding.
+        let mut sliced = original.clone();
+        sliced.key = Arc::new(Float32Array::from(vec![99.0, 0.0, 1.0, 99.0]).slice(1, 2));
+        assert_eq!(
+            refinement_key(&original).key(),
+            refinement_key(&sliced).key()
+        );
+    }
+
+    #[test]
+    fn refinement_key_binds_partition_metric_and_factor() {
+        let query = refinement_query();
+        let original = refinement_key(&query).key().into_owned();
+        for key in [
+            QuantizedRefinementKey {
+                partition_id: 1,
+                ..refinement_key(&query)
+            },
+            QuantizedRefinementKey {
+                factor: 5,
+                ..refinement_key(&query)
+            },
+            QuantizedRefinementKey {
+                metric: DistanceType::Dot,
+                ..refinement_key(&query)
+            },
+        ] {
+            assert_ne!(original, key.key());
+        }
+        assert!(QuantizedRefinementKey::codec().is_none());
+    }
+
+    #[rstest]
+    #[case::null(vec![Some(1.0), None])]
+    #[case::nan(vec![Some(f32::NAN)])]
+    #[case::infinite(vec![Some(f32::INFINITY)])]
+    #[test]
+    fn refinement_key_rejects_unsupported_vectors(#[case] values: Vec<Option<f32>>) {
+        let mut query = refinement_query();
+        query.key = Arc::new(Float32Array::from(values));
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root(),
+            QuantizedRefinementKey::type_name(),
+            QuantizedRefinementKey::schema(),
+        );
+        assert!(!write_query_vector(&mut builder, &query));
+    }
+
+    #[test]
+    fn refinement_result_does_not_pin_partition_slices_or_resident_columns() {
+        let batch = record_batch!(
+            ("_distance", Float32, vec![Some(1.0); 4096]),
+            ("_rowid", UInt64, vec![Some(7u64); 4096]),
+            ("resident", UInt64, vec![Some(99u64); 4096])
+        )
+        .unwrap();
+        let slice = batch.slice(123, 1);
+        let owned = QuantizedRefinementResult::copy_from(&slice).unwrap();
+        assert_eq!(owned.0.num_columns(), 2);
+        assert_eq!(owned.0["_rowid"].as_primitive::<UInt64Type>().value(0), 7);
+        assert!(slice.get_array_memory_size() > 4096 * 12);
+        assert!(owned.deep_size_of() < 1024);
+        assert_ne!(
+            owned.0["_rowid"]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ptr(),
+            slice["_rowid"]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .as_ptr()
+        );
+    }
+
+    fn owned_refinement_result() -> QuantizedRefinementResult {
+        QuantizedRefinementResult(
+            record_batch!(("_distance", Float32, [1.0]), ("_rowid", UInt64, [7u64])).unwrap(),
+        )
+    }
+
+    #[rstest]
+    #[case::moka(false)]
+    #[case::quick(true)]
+    #[tokio::test]
+    async fn refinement_cache_load_lifecycle(#[case] is_quick: bool) {
+        let cache = if is_quick {
+            LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(4096)))
+        } else {
+            LanceCache::with_backend(Arc::new(MokaCacheBackend::with_capacity(4096)))
+        };
+        let query = refinement_query();
+        // Dropped and failed computations never publish a completed result.
+        let mut pending = Box::pin(cache.get_or_insert_with_key(
+            refinement_key(&query),
+            || async {
+                futures::future::pending::<crate::Result<QuantizedRefinementResult>>().await
+            },
+        ));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(cache.get_with_key(&refinement_key(&query)).await.is_none());
+        let error = cache
+            .get_or_insert_with_key(refinement_key(&query), || async {
+                Err(crate::Error::invalid_input("controlled scoring failure"))
+            })
+            .await
+            .err()
+            .unwrap();
+        let mut source = &error;
+        while let crate::Error::Shared { source: inner } = source {
+            source = inner;
+        }
+        assert!(matches!(source, crate::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("controlled scoring failure"));
+        assert!(cache.get_with_key(&refinement_key(&query)).await.is_none());
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(
+            cache.get_or_insert_with_key(refinement_key(&query), || async {
+                receiver.await.unwrap();
+                Ok(owned_refinement_result())
+            }),
+        );
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        let mut second = Box::pin(
+            cache.get_or_insert_with_key(refinement_key(&query), || async {
+                panic!("identical concurrent result loads must coalesce")
+            }),
+        );
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        sender.send(()).unwrap();
+        let (first, second) = futures::join!(first, second);
+        assert!(Arc::ptr_eq(&first.unwrap(), &second.unwrap()));
+        let warm = cache
+            .get_or_insert_with_key(refinement_key(&query), || async {
+                panic!("resident result should skip scoring")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            warm.0["_rowid"]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .value(0),
+            7
+        );
+        cache.clear().await;
+        assert!(cache.get_with_key(&refinement_key(&query)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refinement_cache_reloads_owned_results_under_pressure() {
+        let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_shard_policy(
+            4096,
+            lance_core::cache::QuickCacheShardPolicy::Single,
+        )));
+        let query = refinement_query();
+        for partition_id in 0..64 {
+            let key = QuantizedRefinementKey {
+                partition_id,
+                ..refinement_key(&query)
+            };
+            cache
+                .get_or_insert_with_key(key, || async { Ok(owned_refinement_result()) })
+                .await
+                .unwrap();
+        }
+        // Admission may protect the oldest entry and reject a newer one.
+        // Check a nonresident partition rather than assuming a particular victim.
+        let mut missing = None;
+        for partition_id in 0..64 {
+            let key = QuantizedRefinementKey {
+                partition_id,
+                ..refinement_key(&query)
+            };
+            if cache.get_with_key(&key).await.is_none() {
+                missing = Some(partition_id);
+                break;
+            }
+        }
+        let key = QuantizedRefinementKey {
+            partition_id: missing.expect("cache pressure must leave some results nonresident"),
+            ..refinement_key(&query)
+        };
+        let before = cache.diagnostics().activity.loads_started;
+        let result = cache
+            .get_or_insert_with_key(key, || async { Ok(owned_refinement_result()) })
+            .await
+            .unwrap();
+        assert_eq!(result.0, owned_refinement_result().0);
+        assert_eq!(cache.diagnostics().activity.loads_started, before + 1);
+        let snapshot = cache
+            .diagnostics_with_mode(lance_core::cache::CacheSnapshotMode::Refreshed)
+            .await;
+        assert!(snapshot.backend.size_bytes.unwrap() <= 4096);
+    }
+
+    #[rstest]
+    #[case::disabled(0)]
+    #[case::oversized(1)]
+    #[tokio::test]
+    async fn refinement_cache_respects_budget(#[case] capacity: usize) {
+        let cache = LanceCache::with_capacity(capacity);
+        let query = refinement_query();
+        for _ in 0..2 {
+            let result = cache
+                .get_or_insert_with_key(refinement_key(&query), || async {
+                    Ok(owned_refinement_result())
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.0.num_rows(), 1);
+            // Moka applies its weighted admission policy in deferred maintenance.
+            let snapshot = cache
+                .diagnostics_with_mode(lance_core::cache::CacheSnapshotMode::Refreshed)
+                .await;
+            assert!(snapshot.backend.size_bytes.unwrap() <= capacity as u64);
+            assert!(cache.get_with_key(&refinement_key(&query)).await.is_none());
+        }
     }
 
     #[test]
