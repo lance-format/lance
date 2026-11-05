@@ -81,7 +81,10 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     ///
     /// Returning `false` also gives up per-entry size reporting, since the
     /// traversal that registers a type's deep-size accessor is what gets
-    /// skipped. Only return `false` from a backend that retains nothing.
+    /// skipped. Only return `false` from a backend that retains nothing and
+    /// whose capacity can never become positive; a resizable backend must
+    /// keep returning `true` so entries admitted during a concurrent resize
+    /// are accounted for.
     fn uses_entry_sizes(&self) -> bool {
         true
     }

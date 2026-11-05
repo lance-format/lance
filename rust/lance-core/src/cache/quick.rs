@@ -474,7 +474,12 @@ impl QuickCacheBackend {
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
     fn uses_entry_sizes(&self) -> bool {
-        self.capacity.load(Ordering::Acquire) > 0
+        // Capacity can be raised at runtime. An insertion that starts while
+        // the cache is disabled can reach admission after it was re-enabled,
+        // so the backend must always account for entry sizes; otherwise the
+        // entry is admitted at zero weight and the grown budget can never
+        // reclaim its memory.
+        true
     }
 
     async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
@@ -1461,5 +1466,74 @@ mod tests {
         assert_eq!(snapshot.size_removed_bytes, Some(u64::MAX));
         backend.insert(&key, Arc::new(()), 8, None).await;
         assert_eq!(backend.diagnostics().write_bytes, Some(u64::MAX));
+    }
+
+    struct ResizePausedKey {
+        pause: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+        priority: bool,
+    }
+
+    impl CacheKey for ResizePausedKey {
+        type ValueType = Vec<u8>;
+
+        fn key(&self) -> std::borrow::Cow<'_, str> {
+            if let Some((sized, resume)) = &self.pause {
+                sized.wait();
+                resume.wait();
+            }
+            std::borrow::Cow::Borrowed("oversized")
+        }
+
+        fn type_name() -> &'static str {
+            "test.resize.vec"
+        }
+
+        fn codec_for_key(&self) -> Option<CacheCodec> {
+            self.priority.then(|| {
+                CacheCodec::new("test.resize", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+                    .with_memory_priority(1)
+            })
+        }
+    }
+
+    #[test]
+    fn growing_disabled_cache_does_not_retain_unmeasured_entry() {
+        for priority in [false, true] {
+            let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(0)));
+            let sized = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let loading_cache = cache.clone();
+            let paused_key = ResizePausedKey {
+                pause: Some((sized.clone(), resume.clone())),
+                priority,
+            };
+            let insertion = std::thread::spawn(move || {
+                futures::executor::block_on(
+                    loading_cache.insert_with_key(&paused_key, Arc::new(vec![1u8; 1 << 20])),
+                );
+            });
+
+            sized.wait();
+            cache.set_capacity(1024).unwrap();
+            resume.wait();
+            insertion.join().unwrap();
+
+            futures::executor::block_on(async {
+                cache.set_capacity(128).unwrap();
+                let retained = cache
+                    .get_resident_with_key(&ResizePausedKey {
+                        pause: None,
+                        priority,
+                    })
+                    .await;
+                let reported = cache.size_bytes().await;
+                assert!(
+                    retained.is_none(),
+                    "priority={priority}: retained {} payload bytes after growing to 1024 \
+                     and shrinking to 128, reported weight {reported}",
+                    retained.as_ref().map_or(0, |value| value.len())
+                );
+            });
+        }
     }
 }
