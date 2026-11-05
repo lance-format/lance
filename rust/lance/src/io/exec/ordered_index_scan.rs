@@ -3,9 +3,10 @@
 
 //! Read one B-tree index segment in key order.
 //!
-//! [`OrderedIndexScanExec`] streams [`ScalarIndex::search_ordered`] and keeps
-//! only the rows the dataset still serves. Each index row falls in one of
-//! three groups, and only live rows count toward `fetch`:
+//! [`OrderedIndexScanExec`] streams
+//! [`OrderedScalarIndex::search_ordered`](lance_index::scalar::OrderedScalarIndex::search_ordered)
+//! and keeps only the rows the dataset still serves. Each index row falls in
+//! one of three groups, and only live rows count toward `fetch`:
 //!
 //! ```text
 //! index row      fragment            offset         result
@@ -213,10 +214,17 @@ impl OrderedIndexScanExec {
         &self,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        let batches = self
-            .index
-            .search_ordered(self.query.as_deref(), self.options, metrics)
-            .await?;
+        let Some(index) = self.index.as_ordered() else {
+            return Err(Error::not_supported(format!(
+                "ordered index scan cannot read segment {} of index '{}' in key order: its {} \
+                 index on column '{}' cannot stream rows in key order",
+                self.segment.uuid,
+                self.segment.name,
+                self.index.index_type(),
+                self.column
+            )));
+        };
+        let batches = index.search_ordered(self.query.as_deref(), self.options, metrics)?;
         let schema = self.schema();
         let key_type = schema.field(0).data_type();
         let returned = batches.schema();
@@ -1015,6 +1023,48 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("index 'value_idx'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn unordered_index_segment_is_rejected() {
+        let batch = key_column("key", Int32Array::from_iter_values(0..ROWS));
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Bitmap,
+                Some(INDEX_NAME.into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                false,
+            )
+            .await
+            .unwrap();
+        let segment = key_segment(&dataset).await;
+
+        let error = OrderedIndexScanExec::try_new(
+            Arc::new(dataset),
+            segment.clone(),
+            None,
+            ASC_NULLS_FIRST,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        for expected in [
+            "index 'key_idx'",
+            &segment.uuid.to_string(),
+            "Bitmap index on column 'key'",
+        ] {
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
     }
 
     #[tokio::test]
