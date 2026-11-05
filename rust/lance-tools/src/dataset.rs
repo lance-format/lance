@@ -247,12 +247,22 @@ pub(crate) async fn locate_data_file(
     )))
 }
 
-pub(crate) async fn restore(mut writer: impl Write, args: &LanceDatasetRestoreArgs) -> Result<()> {
-    let mut dataset = open_dataset(&args.dataset, Some(args.version)).await?;
-    dataset.restore().await?;
-    writeln!(writer, "restored_version: {}", args.version)?;
-    writeln!(writer, "new_version: {}", dataset.version_id())?;
+async fn restore_from_observed_latest(
+    latest: Dataset,
+    target_version: u64,
+    mut writer: impl Write,
+) -> Result<()> {
+    let expected_latest_version = latest.version_id();
+    let mut target = latest.checkout_version(target_version).await?;
+    target.restore_from(expected_latest_version).await?;
+    writeln!(writer, "restored_version: {target_version}")?;
+    writeln!(writer, "new_version: {}", target.version_id())?;
     Ok(())
+}
+
+pub(crate) async fn restore(writer: impl Write, args: &LanceDatasetRestoreArgs) -> Result<()> {
+    let latest = open_dataset(&args.dataset, None).await?;
+    restore_from_observed_latest(latest, args.version, writer).await
 }
 
 #[cfg(test)]
@@ -559,6 +569,36 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(located_again, located);
+    }
+
+    #[tokio::test]
+    async fn test_restore_rejects_concurrent_append_after_reading_latest() {
+        let (_dir, mut dataset) = two_version_dataset().await;
+        let latest = Dataset::open(dataset.uri()).await.unwrap();
+        let reader = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(4, 1))
+            .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+        dataset.append(reader, None).await.unwrap();
+        assert_eq!(dataset.version_id(), 3);
+
+        let mut output = Vec::new();
+        let error = restore_from_observed_latest(latest, 1, &mut output)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { version: 2, .. }),
+            "restore must not rebase over the append: {error:?}"
+        );
+        assert!(error.to_string().contains("latest version advanced"));
+        assert!(output.is_empty());
+
+        let latest = Dataset::open(dataset.uri()).await.unwrap();
+        assert_eq!(latest.version_id(), 3);
+        let batch = latest.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            &[0, 1, 2, 3, 4]
+        );
     }
 
     #[tokio::test]

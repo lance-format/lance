@@ -77,4 +77,6 @@ lance-tools dataset restore -s /path/to/table.lance --version 10
 ```
 
 Restore publishes that snapshot as a new latest version. Its referenced files
-must still be available; restore does not reconstruct missing objects.
+must still be available; restore does not reconstruct missing objects. If
+another commit lands after the command reads the latest version, restore fails
+without rebasing over that commit.
