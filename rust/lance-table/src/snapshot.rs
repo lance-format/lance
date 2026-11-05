@@ -13,7 +13,7 @@ use crate::io::commit::ManifestLocation;
 
 #[doc(hidden)]
 pub mod pb {
-    include!(concat!(env!("OUT_DIR"), "/lance.snapshot.rs"));
+    include!("pb/lance.snapshot.rs");
 }
 
 /// A portable snapshot identity whose size does not depend on the manifest size.

@@ -41,7 +41,7 @@ pub use crate::dataset::blob::{
 };
 
 pub(crate) mod pb {
-    include!(concat!(env!("OUT_DIR"), "/lance.blob.reference.rs"));
+    include!("../pb/lance.blob.reference.rs");
 }
 
 const VERSION: u32 = 1;
