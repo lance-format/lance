@@ -138,6 +138,75 @@ def test_instrument_lance_metrics_exports_memory_while_observed(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+_NATIVE_MEMORY_SNAPSHOT_BUILD = """
+import sys
+
+import lance
+import pyarrow as pa
+from lance.lance import register_lance_metrics_recorder, snapshot_lance_metrics
+
+assert register_lance_metrics_recorder()
+dataset = lance.write_dataset(pa.table({"id": pa.array(range(256))}), sys.argv[1])
+dataset.create_scalar_index("id", "BTREE")
+
+points = snapshot_lance_metrics()
+by_name = {}
+for point in points:
+    by_name.setdefault(point.name, []).append(point)
+
+rss = by_name["lance_memory_rss_bytes"]
+assert len(rss) == 1 and rss[0].value > 0, rss
+peak = by_name["lance_memory_rss_peak_bytes"]
+assert len(peak) == 1 and peak[0].value >= rss[0].value, peak
+
+build = {"operation": "create_index", "index_type": "btree"}
+builds = [
+    point
+    for point in by_name["lance_memory_operation_peak_bytes"]
+    if point.attributes == build
+]
+assert len(builds) == 1, builds
+build_peak = builds[0]
+assert build_peak.count == 1, build_peak.count
+assert build_peak.sum > 0, build_peak.sum
+buckets = dict(build_peak.buckets)
+assert "16777216" in buckets, buckets
+assert buckets["+Inf"] == 1, buckets
+
+stages = [
+    point
+    for point in by_name["lance_memory_stage_peak_bytes"]
+    if point.attributes.get("operation") == "create_index"
+    and point.attributes.get("index_type") == "btree"
+]
+assert stages, "expected at least one completed stage peak"
+for stage in stages:
+    assert "stage" in stage.attributes, stage.attributes
+    assert stage.count > 0, stage.count
+    assert dict(stage.buckets)["+Inf"] == stage.count, stage.buckets
+"""
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="process memory is only read on Linux"
+)
+def test_native_snapshot_reports_memory_while_observed(tmp_path):
+    # This exercises the recorder and snapshot directly, without the optional
+    # OpenTelemetry SDK used by the export test above.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _NATIVE_MEMORY_SNAPSHOT_BUILD,
+            str(tmp_path / "ds.lance"),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
 _INVALID_SWITCH_BUILD = """
 import sys
 
@@ -154,11 +223,10 @@ else:
 """
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="subprocess does not work correctly in CI on Windows",
-)
 def test_invalid_memory_switch_fails_index_builds(tmp_path):
+    # LANCE_MEMORY_OBSERVE is read once per process, so the failure is
+    # exercised in a child. Invalid values are rejected before the
+    # Linux-only observation support is checked.
     result = subprocess.run(
         [sys.executable, "-c", _INVALID_SWITCH_BUILD, str(tmp_path / "ds.lance")],
         capture_output=True,
