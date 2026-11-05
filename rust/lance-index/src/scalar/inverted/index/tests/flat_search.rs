@@ -4,6 +4,265 @@
 use super::*;
 
 #[rstest::rstest]
+#[case::bigrams(2, 2, 0)]
+#[case::mixed_lengths(1, 3, 0)]
+#[case::fuzzy_bigrams(2, 2, 1)]
+#[tokio::test]
+async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
+    #[case] min_length: u32,
+    #[case] max_length: u32,
+    #[case] fuzziness: u32,
+    #[values(false, true)] is_prepared: bool,
+) {
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".into())
+        .ngram_min_length(min_length)
+        .ngram_max_length(max_length)
+        .with_position(true)
+        .num_workers(1);
+    let batch = arrow_array::record_batch!(
+        ("doc", Utf8, vec![Some("abcd"), Some("zz"), None, Some("")]),
+        ("_rowid", UInt64, vec![1_u64, 2, 3, 4])
+    )
+    .unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    InvertedIndexBuilder::new(params.clone())
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    let tokens = try_collect_query_tokens("abcd", &mut params.build().unwrap()).unwrap();
+    let search_params = Arc::new(
+        FtsSearchParams::new()
+            .with_phrase_slop(Some(0))
+            .with_fuzziness(Some(fuzziness)),
+    );
+    let (indexed_rows, _) = if is_prepared {
+        let prepared = crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens,
+            &search_params,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        index
+            .bm25_search_prepared(
+                Arc::new(prepared),
+                search_params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+    } else {
+        index
+            .bm25_search(
+                Arc::new(tokens),
+                search_params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap()
+    };
+    let flat_rows =
+        flat_full_text_search(&[&batch], "doc", "\"abcd\"", Some(params.build().unwrap())).unwrap();
+    let (result, _) = flat_bm25_search_stream_with_options_and_scorer(
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(vec![Ok(batch.clone())]),
+        )),
+        "doc".into(),
+        "abcd".into(),
+        params.build().unwrap(),
+        None,
+        FlatBm25SearchOptions {
+            target_batch_size: 10,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::And,
+            boost: 1.0,
+            phrase_slop: Some(0),
+        },
+    )
+    .await
+    .unwrap();
+    let batches: Vec<_> = result.try_collect().await.unwrap();
+    let scored_flat_rows = batches
+        .iter()
+        .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (indexed_rows, flat_rows, scored_flat_rows),
+        (vec![1], vec![1], vec![1])
+    );
+}
+
+#[rstest::rstest]
+#[case::bigrams((2, 2), "abcd", 0, &[1, 6], &[1, 2, 3, 4, 6, 7])]
+#[case::mixed_lengths((1, 3), "abcd", 0, &[1], &[1, 2, 3, 4, 6, 7])]
+#[case::missing_ngram((2, 2), "abcde", 0, &[], &[1, 2, 3, 4, 6, 7])]
+#[case::repeated_ngram((2, 2), "abab", 0, &[7], &[1, 2, 6, 7])]
+#[case::fuzzy_bigrams((2, 2), "abxd", 1, &[1, 6], &[1, 2, 3, 4, 6, 7])]
+#[tokio::test]
+async fn test_ngram_match_requires_all_terms_indexed_and_flat(
+    #[case] ngram_lengths: (u32, u32),
+    #[case] query: &str,
+    #[case] fuzziness: u32,
+    #[case] expected_and: &[u64],
+    #[case] expected_or: &[u64],
+    #[values(false, true)] with_position: bool,
+    #[values(false, true)] is_prepared: bool,
+) {
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".into())
+        .ngram_min_length(ngram_lengths.0)
+        .ngram_max_length(ngram_lengths.1)
+        .with_position(with_position)
+        .num_workers(1);
+    let batch = arrow_array::record_batch!(
+        (
+            "doc",
+            Utf8,
+            vec![
+                Some("abcd"),
+                Some("ab"),
+                Some("bc"),
+                Some("cd"),
+                Some("zz"),
+                Some("ab bc cd"),
+                Some("abab"),
+                None,
+                Some("")
+            ]
+        ),
+        ("_rowid", UInt64, (1..=9).collect::<Vec<u64>>())
+    )
+    .unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    InvertedIndexBuilder::new(params.clone())
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    for (operator, expected) in [(Operator::And, expected_and), (Operator::Or, expected_or)] {
+        let tokens =
+            Arc::new(try_collect_query_tokens(query, &mut params.build().unwrap()).unwrap());
+        let search_params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(fuzziness)),
+        );
+        let (mut indexed_row_ids, _) = if is_prepared {
+            let prepared = crate::scalar::inverted::prepare_bm25_query(
+                std::slice::from_ref(&index),
+                tokens.as_ref().clone(),
+                &search_params,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            index
+                .bm25_search_prepared(
+                    Arc::new(prepared),
+                    search_params.clone(),
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await
+                .unwrap()
+        } else {
+            index
+                .bm25_search(
+                    tokens.clone(),
+                    search_params.clone(),
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap()
+        };
+        indexed_row_ids.sort_unstable();
+
+        let tokens = if fuzziness > 0 {
+            Arc::new(index.expand_fuzzy_tokens(&tokens, &search_params).unwrap())
+        } else {
+            tokens
+        };
+        let counted = tokenize_and_count(
+            stream::iter(vec![Ok(batch.clone())]),
+            params.build().unwrap(),
+            tokens.clone(),
+            0,
+            None,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let scorer = initialize_scorer(None, &tokens, &counted);
+        let result = flat_bm25_score(
+            &tokens,
+            &counted,
+            &scorer,
+            DocumentGranularity::Row,
+            operator,
+            1.0,
+            None,
+        )
+        .unwrap();
+        let mut flat_row_ids = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        flat_row_ids.sort_unstable();
+        assert_eq!(
+            (indexed_row_ids.as_slice(), flat_row_ids.as_slice()),
+            (expected, expected),
+            "indexed and flat {operator:?}"
+        );
+    }
+}
+
+#[rstest::rstest]
 #[case::identifiers(
     InvertedIndexParams::code().split_identifiers(true),
     &["getUserName", "get_user_name", "get user name", "user name get", "getUserName getUserName"],

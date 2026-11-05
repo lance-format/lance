@@ -34,7 +34,7 @@ use std::sync::LazyLock;
 use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
 use datafusion_execution::SendableRecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -49,7 +49,7 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, search_zones};
+use super::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor, search_zones};
 use std::collections::HashSet;
 
 /// `rows` without the positions of `fragments`.
@@ -266,10 +266,94 @@ impl DeepSizeOf for ZoneMapIndex {
     }
 }
 
+fn zone_scalar_column(
+    data_type: &DataType,
+    values: impl IntoIterator<Item = ScalarValue>,
+) -> lance_core::Result<ArrayRef> {
+    let values: Vec<ScalarValue> = values.into_iter().collect();
+    if values.is_empty() {
+        return Ok(new_empty_array(data_type));
+    }
+    ScalarValue::iter_to_array(values).map_err(|err| {
+        lance_core::Error::invalid_input(format!("failed to build zone statistic column: {err}"))
+    })
+}
+
 impl ZoneMapIndex {
     /// Returns the rows-per-zone parameter for this index.
     pub fn rows_per_zone(&self) -> u64 {
         self.rows_per_zone
+    }
+
+    /// Returns this segment's persisted ZoneMap entries as a stable record batch.
+    ///
+    /// This is a raw view of the persisted index, not a snapshot of the current
+    /// dataset rows. `fragment_id` and `zone_start` are in the index's original
+    /// address domain: fragment-reuse remapping is not applied, and appended
+    /// fragments or data overlays are not represented. `zone_length` is the
+    /// offset span recorded for the zone, not its physical row count after
+    /// deletions. The counts are the statistics recorded when the zone was
+    /// built.
+    ///
+    /// The columns are `min`, `max`, `null_count`, `nan_count`,
+    /// `negative_nan_count`, `fragment_id`, `zone_start`, and `zone_length`.
+    /// `negative_nan_count` is null when a legacy zone contains NaNs but did
+    /// not persist their sign split; callers must not interpret that null as
+    /// zero. Schema metadata carries this segment's `rows_per_zone`.
+    pub fn zones_as_batch(&self) -> lance_core::Result<RecordBatch> {
+        let min_array = zone_scalar_column(
+            &self.data_type,
+            self.zones.iter().map(|zone| zone.min.clone()),
+        )?;
+        let max_array = zone_scalar_column(
+            &self.data_type,
+            self.zones.iter().map(|zone| zone.max.clone()),
+        )?;
+        let null_count =
+            UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.null_count));
+        let nan_count = UInt32Array::from_iter_values(self.zones.iter().map(|zone| zone.nan_count));
+        let negative_nan_count =
+            UInt32Array::from_iter(self.zones.iter().map(|zone| zone.negative_nan_count));
+        let fragment_id =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.fragment_id));
+        let zone_start =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.start));
+        let zone_length =
+            UInt64Array::from_iter_values(self.zones.iter().map(|zone| zone.bound.length as u64));
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("rows_per_zone".to_string(), self.rows_per_zone.to_string());
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("min", min_array.data_type().clone(), true),
+                Field::new("max", max_array.data_type().clone(), true),
+                Field::new("null_count", DataType::UInt32, false),
+                Field::new("nan_count", DataType::UInt32, false),
+                Field::new("negative_nan_count", DataType::UInt32, true),
+                Field::new("fragment_id", DataType::UInt64, false),
+                Field::new("zone_start", DataType::UInt64, false),
+                Field::new("zone_length", DataType::UInt64, false),
+            ])
+            .with_metadata(metadata),
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![
+                min_array,
+                max_array,
+                Arc::new(null_count),
+                Arc::new(nan_count),
+                Arc::new(negative_nan_count),
+                Arc::new(fragment_id),
+                Arc::new(zone_start),
+                Arc::new(zone_length),
+            ],
+        )
+        .map_err(|err| {
+            lance_core::Error::invalid_input(format!(
+                "failed to build zone statistics batch: {err}"
+            ))
+        })
     }
 
     /// The file version this segment was loaded from.
@@ -712,6 +796,12 @@ impl ZoneMapIndex {
                     return Ok(true);
                 }
 
+                // A zone without extrema, such as one over a dictionary column,
+                // cannot be compared with the prefix.
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
+                }
+
                 // Check zone.max >= prefix
                 let max_check = &zone.max >= prefix;
                 if !max_check {
@@ -1110,10 +1200,12 @@ impl ScalarIndex for ZoneMapIndex {
         let value_type = schema.field(0).data_type().clone();
 
         let options = self.builder_params();
-        let processor = ZoneMapProcessor::new(value_type.clone())?;
         // Positions are only worth collecting when the index keeps them.
-        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?
-            .with_null_tracking(self.null_rows.is_some());
+        let trainer = ParallelZoneTrainer::new(
+            move || ZoneMapProcessor::new(value_type.clone()),
+            self.rows_per_zone,
+        )?
+        .with_null_tracking(self.null_rows.is_some());
         let (new_zones, new_null_rows) = trainer.train(new_data).await?;
 
         // Additive: the stream is "the new data", with no claim about the
@@ -1602,9 +1694,12 @@ impl ZoneMapIndexBuilder {
     /// the value column followed by `_rowaddr`, matching the dataset scan order enforced
     /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = ZoneMapProcessor::new(self.items_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?
-            .with_null_tracking(self.options.store_null_bitmap);
+        let items_type = self.items_type.clone();
+        let trainer = ParallelZoneTrainer::new(
+            move || ZoneMapProcessor::new(items_type.clone()),
+            self.options.rows_per_zone,
+        )?
+        .with_null_tracking(self.options.store_null_bitmap);
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
         self.set_null_rows(Some(null_rows));
@@ -2065,6 +2160,10 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -3481,10 +3580,13 @@ pub async fn train_zonemap_scan(
     physical_rows: HashMap<u64, u64>,
     scan: SendableRecordBatchStream,
 ) -> Result<ScannedZones> {
-    let processor = ZoneMapProcessor::new(data_type.clone())?;
-    let trainer = ZoneTrainer::new(processor, rows_per_zone)?
-        .with_null_tracking(keep_positions)
-        .aligned_to(physical_rows);
+    let data_type = data_type.clone();
+    let trainer = ParallelZoneTrainer::new(
+        move || ZoneMapProcessor::new(data_type.clone()),
+        rows_per_zone,
+    )?
+    .with_null_tracking(keep_positions)
+    .aligned_to(physical_rows);
     let (zones, null_rows) = trainer.train(scan).await?;
     Ok(ScannedZones { zones, null_rows })
 }
