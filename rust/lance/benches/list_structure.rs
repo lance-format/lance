@@ -14,7 +14,8 @@
 #![allow(clippy::print_stdout)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 #[cfg(unix)]
 use std::mem::MaybeUninit;
@@ -32,8 +33,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures::{StreamExt, TryStreamExt, stream};
 use lance::Dataset;
 use lance::dataset::WriteParams;
+use lance_core::cache::LanceCache;
 use lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY;
+use lance_encoding::decoder::{DecoderPlugins, PageEncoding};
+use lance_encoding::format::metadata::page_layout::Layout as PageLayout;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use serde_json::json;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -98,6 +104,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    Inspect {
+        #[arg(long)]
+        uri: String,
+    },
     Write {
         #[arg(long)]
         uri: String,
@@ -143,6 +153,7 @@ enum Kind {
 enum Query {
     Length,
     Nonempty,
+    Count,
     Mixed,
     Full,
     Scalar,
@@ -234,12 +245,7 @@ fn fixture_batch(
             Arc::new(builder.finish())
         }
     };
-    let item = Arc::new(
-        Field::new("item", values.data_type().clone(), true).with_metadata(HashMap::from([(
-            STRUCTURAL_ENCODING_META_KEY.to_string(),
-            layout.to_string(),
-        )])),
-    );
+    let item = Arc::new(Field::new("item", values.data_type().clone(), true));
     let items = Arc::new(ListArray::new(
         item,
         OffsetBuffer::new(offsets.into()),
@@ -260,7 +266,10 @@ fn fixture_batch(
     let other: ArrayRef = Arc::new(other.finish());
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", ids.data_type().clone(), false),
-        Field::new("items", items.data_type().clone(), true),
+        Field::new("items", items.data_type().clone(), true).with_metadata(HashMap::from([(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            layout.to_string(),
+        )])),
         Field::new("other", other.data_type().clone(), false),
     ]));
     Ok(RecordBatch::try_new(schema, vec![ids, items, other])?)
@@ -286,6 +295,9 @@ async fn scan_once(
         Query::Nonempty => {
             scanner.project(&["id"])?;
         }
+        Query::Count => {
+            scanner.project::<String>(&[])?.with_row_id();
+        }
         Query::Mixed => {
             scanner
                 .project_with_transform(&[("other", "other"), ("length", "array_length(items)")])?;
@@ -298,7 +310,7 @@ async fn scan_once(
         }
     }
     let mut predicates = Vec::new();
-    if matches!(query, Query::Nonempty) {
+    if matches!(query, Query::Nonempty | Query::Count) {
         predicates.push("array_length(items) > 0".to_string());
     }
     if selectivity_percent < 100 {
@@ -308,6 +320,11 @@ async fn scan_once(
         scanner.filter(&predicates.join(" AND "))?;
     }
     let start = Instant::now();
+    if matches!(query, Query::Count) {
+        let rows = scanner.count_rows().await?;
+        return Ok(json!({"elapsed_ms": start.elapsed().as_secs_f64()*1000.0,
+            "rows":rows, "length_sum":0,"returned_array_bytes":0}));
+    }
     let mut batches = scanner.try_into_stream().await?;
     let mut rows = 0_u64;
     let mut length_sum = 0_u64;
@@ -331,6 +348,42 @@ async fn scan_once(
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
+        Command::Inspect { uri } => {
+            let dataset = Dataset::open(&uri).await?;
+            let store = dataset.object_store(None).await?;
+            let scheduler =
+                ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
+            let mut files = Vec::new();
+            for fragment in dataset.get_fragments() {
+                for file in &fragment.metadata().files {
+                    if file.base_id.is_some() {
+                        return Err("fixture inspection requires the primary data location".into());
+                    }
+                    let path = dataset.data_dir().join(file.path.as_str());
+                    let reader = FileReader::try_open(
+                        scheduler.open_file(&path, &file.file_size_bytes).await?,
+                        None,
+                        Arc::<DecoderPlugins>::default(),
+                        &LanceCache::no_cache(),
+                        FileReaderOptions::default(),
+                    )
+                    .await?;
+                    let mut columns = Vec::new();
+                    for (index, column) in reader.metadata().column_infos.iter().enumerate() {
+                        let mut layouts = BTreeMap::<&str, usize>::new();
+                        let mut rows = Vec::new();
+                        for page in column.page_infos.iter() {
+                            *layouts.entry(layout_name(&page.encoding)?).or_default() += 1;
+                            rows.push(page.num_rows);
+                        }
+                        columns
+                            .push(json!({"column_index":index,"layouts":layouts,"page_rows":rows}));
+                    }
+                    files.push(json!({"path":file.path,"columns":columns}));
+                }
+            }
+            println!("{}", json!({"uri":uri,"files":files}));
+        }
         Command::Write {
             uri,
             kind,
@@ -425,6 +478,7 @@ async fn main() -> Result<()> {
                     "io_buffer_bytes":io_buffer_bytes,"selectivity_percent":selectivity_percent,"elapsed_ms":elapsed*1000.0,
                     "queries_per_second":concurrency as f64/elapsed,"read_bytes":stats.read_bytes,
                     "read_iops":stats.read_iops,"peak_rss_bytes":peak_rss_bytes()?,
+                    "io_stages":stats.num_stages,
                     "rust_live_bytes_before":live_before,"rust_live_bytes_after":LIVE_BYTES.load(Ordering::Relaxed),
                     "rust_peak_live_bytes":PEAK_BYTES.load(Ordering::Relaxed),
                     "peak_rss_after_open_bytes":peak_after_open,"queries":results})
@@ -433,4 +487,19 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn layout_name(encoding: &PageEncoding) -> Result<&'static str> {
+    let layout = match encoding {
+        PageEncoding::Legacy(_) => return Ok("array"),
+        PageEncoding::Structural(layout) => Cow::Borrowed(layout),
+        PageEncoding::Planar(layout) if layout.sparse().is_some() => return Ok("sparse"),
+        PageEncoding::Planar(layout) => Cow::Owned(layout.dense_execution_layout()?),
+    };
+    Ok(match layout.layout.as_ref().ok_or("Missing page layout")? {
+        PageLayout::FullZipLayout(_) => "fullzip",
+        PageLayout::MiniBlockLayout(_) => "miniblock",
+        PageLayout::ConstantLayout(_) => "constant",
+        PageLayout::BlobLayout(_) => "blob",
+    })
 }

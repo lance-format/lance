@@ -2789,6 +2789,7 @@ mod tests {
         let options = FileReaderOptions {
             decoder_config: DecoderConfig {
                 list_structure: Arc::new(BTreeMap::from([(field_id, mode)])),
+                cache_repetition_index: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -2836,6 +2837,30 @@ mod tests {
                 assert_eq!(request.method, "head");
             }
         }
+        let cached_batches = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1,
+                2,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            cached_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            fs.object_store.io_stats_incremental().read_iops,
+            0,
+            "repeated structural reads should reuse cached metadata without retaining payloads"
+        );
     }
 
     #[rstest]
@@ -2862,14 +2887,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let leaf_field = Arc::new(
-            Field::new("item", DataType::FixedSizeBinary(32), false).with_metadata(HashMap::from(
-                [(
-                    STRUCTURAL_ENCODING_META_KEY.to_string(),
-                    structural_encoding.to_string(),
-                )],
-            )),
-        );
+        let leaf_field = Arc::new(Field::new("item", DataType::FixedSizeBinary(32), false));
         let leaf: arrow_array::ArrayRef =
             Arc::new(arrow_array::FixedSizeBinaryArray::try_from_iter(payloads.iter()).unwrap());
         let (field, values): (_, arrow_array::ArrayRef) = if nested_struct {
@@ -2887,11 +2905,12 @@ mod tests {
             values,
             Some(NullBuffer::from(vec![false, true, true, true, true, true])),
         ));
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
-            "items",
-            lists.data_type().clone(),
-            true,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("items", lists.data_type().clone(), true).with_metadata(HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                structural_encoding.to_string(),
+            )])),
+        ]));
         let batch = RecordBatch::try_new(schema.clone(), vec![lists]).unwrap();
         let fs = FsFixture::default();
         let written = write_lance_file(
@@ -2932,6 +2951,26 @@ mod tests {
         )
         .await
         .unwrap();
+        for page in reader.metadata().column_infos[0].page_infos.iter() {
+            let layout = match &page.encoding {
+                PageEncoding::Structural(layout) => layout.clone(),
+                PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+                PageEncoding::Legacy(_) => panic!("expected current-format fixture"),
+            };
+            assert!(
+                matches!(
+                    (structural_encoding, layout.layout),
+                    (
+                        STRUCTURAL_ENCODING_FULLZIP,
+                        Some(metadata::page_layout::Layout::FullZipLayout(_))
+                    ) | (
+                        STRUCTURAL_ENCODING_MINIBLOCK,
+                        Some(metadata::page_layout::Layout::MiniBlockLayout(_))
+                    )
+                ),
+                "fixture must exercise the requested page encoding"
+            );
+        }
         for indices in [vec![0, 2, 3, 5], vec![1, 2, 4]] {
             let batches = reader
                 .read_stream(

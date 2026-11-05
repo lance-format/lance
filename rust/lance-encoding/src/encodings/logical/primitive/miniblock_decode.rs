@@ -20,11 +20,11 @@ use itertools::Itertools;
 #[cfg(feature = "bitpacking")]
 use lance_bitpacking::BitPackingUninit;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 use lance_core::utils::bit::pad_bytes;
 
-use super::structure::StructuralProjection;
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use crate::EncodingsIo;
 use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
@@ -1204,6 +1204,7 @@ impl CachedPageData for MiniBlockCacheableState {
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
     // These come from the protobuf
     pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
@@ -1306,6 +1307,7 @@ impl MiniBlockScheduler {
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             structural_projection: None,
+            structural_cache: None,
             rep_decompressor,
             def_decompressor,
             value_decompressor: value_decompressor.into(),
@@ -1904,6 +1906,9 @@ fn build_chunk_index(
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn init_layout(&self) -> Result<PageInitialization> {
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
@@ -2034,7 +2039,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .collect::<Vec<_>>();
         let loaded_chunk_data = if self.structural_projection.is_some() {
             structure::read_chunks(
-                io.clone(),
+                StructuralMetadataIo::wrap(io.clone(), self.structural_cache.clone()),
                 chunk_ranges,
                 self.num_buffers,
                 self.rep_decompressor.is_some(),

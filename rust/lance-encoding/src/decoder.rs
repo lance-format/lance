@@ -1027,15 +1027,7 @@ impl CoreFieldDecoderStrategy {
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field.children.first().expect_ok()?;
                 let child_mode = mode.map(|mode| {
-                    if inherited_mode.is_none()
-                        && matches!(
-                            child.data_type(),
-                            DataType::Binary
-                                | DataType::LargeBinary
-                                | DataType::Utf8
-                                | DataType::LargeUtf8
-                        )
-                    {
+                    if inherited_mode.is_none() {
                         mode
                     } else {
                         ListReadMode::Length
@@ -2106,6 +2098,10 @@ fn has_variable_width(data_type: &DataType) -> bool {
 // be scheduled before the first decode completes.
 const INITIAL_BYTE_ESTIMATE_ROWS: u64 = 128;
 
+// Header-driven pages issue follow-up I/O only when polled. Overlap those
+// requests within the current batch without starting later batches eagerly.
+const PAGE_LOAD_CONCURRENCY: usize = 16;
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
@@ -2184,28 +2180,44 @@ impl StructuralBatchDecodeStream {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
         }
+        let mut pages = Vec::new();
+        let mut scheduling_error = None;
         while self.rows_scheduled < scheduled_need {
             let next_message = self.context.source.recv().await;
             match next_message {
-                Some(scan_line) => {
-                    let scan_line = scan_line?;
+                Some(Ok(scan_line)) => {
                     self.rows_scheduled = scan_line.scheduled_so_far;
-                    for message in scan_line.decoders {
-                        let unloaded_page = message.into_structural();
-                        let loaded_page = unloaded_page.0.await?;
-                        self.root_decoder.accept_page(loaded_page)?;
-                    }
+                    pages.extend(
+                        scan_line
+                            .decoders
+                            .into_iter()
+                            .map(MessageType::into_structural),
+                    );
+                }
+                Some(Err(error)) => {
+                    scheduling_error = Some(error);
+                    break;
                 }
                 None => {
                     // Schedule ended before we got all the data we expected.  This probably
                     // means some kind of pushdown filter was applied and we didn't load as
                     // much data as we thought we would.
                     self.scheduler_exhausted = true;
-                    return Ok(self.rows_scheduled);
+                    break;
                 }
             }
         }
-        Ok(scheduled_need)
+        let mut loaded = stream::iter(pages)
+            .map(|page| page.0)
+            .buffered(PAGE_LOAD_CONCURRENCY);
+        while let Some(page) = loaded.next().await {
+            self.root_decoder.accept_page(page?)?;
+        }
+        // Preserve the earlier page-load error if scheduling also failed later.
+        if let Some(error) = scheduling_error {
+            return Err(error);
+        }
+        Ok(scheduled_need.min(self.rows_scheduled))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -3771,9 +3783,41 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use crate::repdef::DefinitionInterpretation;
+    use arrow_array::{StringArray, UInt32Array, types::UInt32Type};
     use futures::TryStreamExt;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
+    use tokio::sync::Barrier;
+
+    #[derive(Debug)]
+    struct LiteralPage(u32);
+
+    #[derive(Debug)]
+    struct LiteralPageTask(u32);
+
+    impl StructuralPageDecoder for LiteralPage {
+        fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            assert_eq!(num_rows, 1);
+            Ok(Box::new(LiteralPageTask(self.0)))
+        }
+        fn num_rows(&self) -> u64 {
+            1
+        }
+    }
+
+    impl DecodePageTask for LiteralPageTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            Ok(DecodedPage {
+                data: DataBlock::from_decoded_array(Arc::new(UInt32Array::from(vec![self.0]))),
+                repdef: RepDefUnraveler::new(
+                    None,
+                    None,
+                    Arc::new([DefinitionInterpretation::AllValidItem]),
+                    1,
+                ),
+            })
+        }
+    }
 
     struct StaticArrayDecodeTask(ArrayRef);
 
@@ -4276,9 +4320,14 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::load_only(1, false)]
+    #[case::load_before_scheduler(2, true)]
     #[tokio::test]
-    async fn test_structural_stream_stops_on_load_error() {
-        let rows_per_batch = 1;
+    async fn test_structural_stream_stops_on_load_error(
+        #[case] rows_per_batch: u32,
+        #[case] later_error: bool,
+    ) {
         let total_rows = 2;
         let scheduled_rows = 1;
         let batch_readahead = 2;
@@ -4296,6 +4345,9 @@ mod tests {
             decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(failed_page))],
         }))
         .unwrap();
+        if later_error {
+            tx.send(Err(Error::io("later scheduling failure"))).unwrap();
+        }
         drop(tx);
 
         let stream = StructuralBatchDecodeStream::new(
@@ -4323,6 +4375,72 @@ mod tests {
             batches.next().await.is_none(),
             "stream should stop after the page-load error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_structural_stream_overlaps_pages_within_batch() {
+        let count = PAGE_LOAD_CONCURRENCY;
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::UInt32, false)]);
+        let root = StructuralStructDecoder::new(fields, true, true, false).unwrap();
+        let (tx, rx) = unbounded_channel();
+        let barrier = Arc::new(Barrier::new(count));
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        for value in 0..count * 2 {
+            let (barrier, started, active, peak) = (
+                barrier.clone(),
+                started.clone(),
+                active.clone(),
+                peak.clone(),
+            );
+            let page = async move {
+                started.fetch_add(1, Ordering::Relaxed);
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(current, Ordering::Relaxed);
+                barrier.wait().await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok(LoadedPageShard {
+                    decoder: Box::new(LiteralPage(value as u32)),
+                    path: VecDeque::from([0]),
+                })
+            }
+            .boxed();
+            tx.send(Ok(DecoderMessage {
+                scheduled_so_far: value as u64 + 1,
+                decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(page))],
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            count as u32,
+            (count * 2) as u64,
+            root,
+            false,
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for batch_index in 0..2 {
+                let task = stream.next_batch_task().await.unwrap().unwrap();
+                let (batch, _) = task.into_batch(Arc::new(Once::new())).unwrap();
+                assert_eq!(
+                    batch
+                        .column(0)
+                        .as_primitive::<UInt32Type>()
+                        .values()
+                        .as_ref(),
+                    &(batch_index * count..(batch_index + 1) * count)
+                        .map(|v| v as u32)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(started.load(Ordering::Relaxed), (batch_index + 1) * count);
+            }
+        })
+        .await
+        .expect("page loads must overlap to release the barrier");
+        assert_eq!(peak.load(Ordering::Relaxed), count);
     }
 
     #[tokio::test]

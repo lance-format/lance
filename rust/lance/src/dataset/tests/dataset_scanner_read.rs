@@ -24,12 +24,16 @@ use futures::stream::StreamExt;
 use half::f16;
 use lance_arrow::SchemaExt;
 use lance_core::ROW_ID;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datagen::{
     ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
 };
 use lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY;
+use lance_encoding::decoder::{DecoderPlugins, PageEncoding};
+use lance_encoding::format::metadata::page_layout::Layout as PageLayout;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::query::MatchQuery;
@@ -40,6 +44,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::ObjectStoreParams;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
 use object_store::throttle::ThrottleConfig;
@@ -400,14 +405,7 @@ async fn test_list_structure_omits_image_payload(
     } else {
         Arc::new(BinaryArray::from(values))
     };
-    let item = Arc::new(
-        ArrowField::new("item", values.data_type().clone(), true).with_metadata(
-            std::collections::HashMap::from([(
-                STRUCTURAL_ENCODING_META_KEY.to_string(),
-                layout.to_string(),
-            )]),
-        ),
-    );
+    let item = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
     let mut offsets = vec![
         base,
         base,
@@ -464,6 +462,10 @@ async fn test_list_structure_omits_image_payload(
             images,
         )
     };
+    let field = field.with_metadata(std::collections::HashMap::from([(
+        STRUCTURAL_ENCODING_META_KEY.to_string(),
+        layout.to_string(),
+    )]));
     let schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("id", DataType::Int32, false),
         field,
@@ -491,6 +493,11 @@ async fn test_list_structure_omits_image_payload(
     // This oracle does not use the new reader's offset/header parsing.
     let mut forbidden = std::collections::HashMap::new();
     let mut found = 0;
+    let mut actual_layouts = BTreeSet::new();
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
     for fragment in dataset.get_fragments() {
         for file in &fragment.metadata().files {
             let path = dataset
@@ -498,6 +505,35 @@ async fn test_list_structure_omits_image_payload(
                 .unwrap()
                 .join(file.path.as_str());
             let bytes = dataset.object_store.read_one_all(&path).await.unwrap();
+            let reader = FileReader::try_open(
+                scheduler
+                    .open_file(&path, &file.file_size_bytes)
+                    .await
+                    .unwrap(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            for page in reader.metadata().column_infos[1].page_infos.iter() {
+                let page_layout = match &page.encoding {
+                    PageEncoding::Structural(layout) => layout.clone(),
+                    PageEncoding::Planar(layout) if layout.sparse().is_some() => {
+                        actual_layouts.insert("sparse");
+                        continue;
+                    }
+                    PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+                    PageEncoding::Legacy(_) => panic!("expected current-format fixture"),
+                };
+                actual_layouts.insert(match page_layout.layout.unwrap() {
+                    PageLayout::FullZipLayout(_) => "fullzip",
+                    PageLayout::MiniBlockLayout(_) => "miniblock",
+                    PageLayout::ConstantLayout(_) => "constant",
+                    PageLayout::BlobLayout(_) => "blob",
+                });
+            }
             let spans = payloads
                 .iter()
                 .filter_map(|payload| {
@@ -513,6 +549,10 @@ async fn test_list_structure_omits_image_payload(
             forbidden.insert(path, spans);
         }
     }
+    assert!(
+        actual_layouts.contains(layout),
+        "requested {layout}, actual layouts: {actual_layouts:?}"
+    );
     assert_eq!(
         found,
         payloads.len(),

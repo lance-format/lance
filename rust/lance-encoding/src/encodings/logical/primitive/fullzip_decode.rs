@@ -14,7 +14,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use itertools::Itertools;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 
 use crate::EncodingsIo;
@@ -31,7 +31,7 @@ use crate::repdef::{
 };
 use crate::utils::bytepack::ByteUnpacker;
 
-use super::structure::StructuralProjection;
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use super::{
     CachedPageData, NoCachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     StructuralPageScheduler,
@@ -151,6 +151,7 @@ pub struct FullZipScheduler {
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
     pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
 }
 
 impl FullZipScheduler {
@@ -287,6 +288,7 @@ impl FullZipScheduler {
             cached_state: None,
             enable_cache: false,
             structural_projection: None,
+            structural_cache: None,
         })
     }
 
@@ -579,6 +581,9 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn needs_initialization(&self) -> bool {
         self.enable_cache && self.rep_index.is_some()
     }
@@ -1866,6 +1871,7 @@ mod tests {
             cached_state: None,
             enable_cache: false,
             structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1993,6 +1999,7 @@ mod tests {
             cached_state: None,
             enable_cache: true,
             structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -2119,6 +2126,7 @@ mod tests {
             cached_state: None,
             enable_cache: false,
             structural_projection: None,
+            structural_cache: None,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
