@@ -43,6 +43,11 @@ fn parse_compaction_options(
             "max_bytes_per_file" => {
                 opts.max_bytes_per_file = value.extract()?;
             }
+            "min_bytes_per_file" => {
+                if let Some(bytes) = value.extract::<Option<usize>>()? {
+                    opts.min_bytes_per_file = Some(bytes);
+                }
+            }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
             }
