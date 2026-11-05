@@ -156,7 +156,7 @@ pub struct CompactionOptions {
     ///
     /// With stable row IDs, every rewritten group's row-address moves are recorded,
     /// indexed or not. Every index must store row addresses and apply the fragment reuse
-    /// index, and keeps its coverage through it. Not yet supported in release builds.
+    /// index, and keeps its coverage through it.
     ///
     /// When this is false (eager, the default) and the dataset uses stable row ids then
     /// the behavior depends on the index.  Some legacy indexes store row ids.  These

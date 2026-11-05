@@ -52,8 +52,7 @@ impl Dataset {
     ///   stale, for example after every row of the destination fragment is deleted.
     /// * Not every compaction records an FRI: it requires `defer_index_remap`,
     ///   and fresh index-free tables without stable row ids do not receive one
-    ///   automatically. Release builds reject the option on datasets with stable
-    ///   row ids.
+    ///   automatically.
     /// * Says nothing about deletion files, source-value changes, or whether an
     ///   address belongs to this table or branch.
     ///
