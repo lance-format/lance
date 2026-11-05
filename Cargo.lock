@@ -4845,7 +4845,6 @@ dependencies = [
  "prost",
  "rand 0.9.5",
  "rand_xoshiro",
- "rayon",
  "rstest",
  "serde_json",
  "serial_test",

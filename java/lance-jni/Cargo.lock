@@ -4126,7 +4126,6 @@ dependencies = [
  "lz4",
  "num-traits",
  "prost",
- "rayon",
  "serde_json",
  "tokio",
  "tracing",
