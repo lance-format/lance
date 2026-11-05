@@ -310,7 +310,7 @@ impl CachedFileMetadata {
 ///
 /// If users are not using the table format then they will need to figure
 /// out some way to do this themselves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
     /// of the schema are arbitrary and ignored.
