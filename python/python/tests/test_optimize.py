@@ -315,7 +315,7 @@ def test_optimize_max_bytes(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     arr = pa.array(range(4 * 1024 * 1024))
     arr = pa.FixedSizeListArray.from_arrays(arr, 1024)
-    data = pa.table({"a": arr})
+    data = pa.table({"id": range(len(arr)), "a": arr})
 
     # Write out 4K rows and 32MB of data
     dataset = lance.write_dataset(
@@ -324,19 +324,24 @@ def test_optimize_max_bytes(tmp_path: Path):
     # We get 2 fragments
     assert len(dataset.get_fragments()) == 2
 
+    # Deletions trigger rewriting files that already exceed the byte threshold.
+    dataset.delete("id % 1024 = 0")
+
     # Now run compaction with a small max_bytes_per_file (1000 bytes) to get more
     # fragments.  The exact number is a bit tricky to calculate because we don't
     # split into a new fragment until we've actually written data and that depends
     # on how much the file format chooses to accumulate, but it should be more than 2
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
-        materialize_deletions=False,
+        materialize_deletions=True,
+        materialize_deletions_threshold=0.0,
         max_bytes_per_file=1000,
         batch_size=128,
     )
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added > 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added > 2
 
     num_frags = len(dataset.get_fragments())
@@ -350,18 +355,24 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
-    # Same test but use Compaction.plan
+    dataset.delete("id % 1024 = 0")
+
+    # Same writer test but use Compaction.plan
     plan = Compaction.plan(
         dataset,
         options=dict(
-            target_rows_per_fragment=100 * 1024, max_bytes_per_file=1000, batch_size=128
+            target_rows_per_fragment=100 * 1024,
+            max_bytes_per_file=1000,
+            batch_size=128,
+            materialize_deletions_threshold=0.0,
         ),
     )
     results = [task.execute(dataset) for task in plan.tasks]
     metrics = Compaction.commit(dataset, results)
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added > 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added > 2
 
     dataset = lance.write_dataset(
@@ -372,18 +383,22 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
+    dataset.delete("id % 1024 = 0")
+
     # In this test max_bytes_per_file is still too small but the batch size
     # is so large we read the entire input in a single batch
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
-        materialize_deletions=False,
+        materialize_deletions=True,
+        materialize_deletions_threshold=0.0,
         max_bytes_per_file=1000,
         batch_size=2 * 1024,
     )
 
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added == 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added == 2
 
     num_frags = len(dataset.get_fragments())
@@ -1227,6 +1242,36 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+
+
+@pytest.mark.parametrize("min_bytes", [None, 1024 * 1024, 0, -1, 1024 * 1024 + 1])
+def test_min_bytes_per_file(tmp_path: Path, min_bytes):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}), tmp_path / "dataset", max_rows_per_file=2
+    )
+    dataset.update_config({"lance.compaction.min_bytes_per_file": "1"})
+    options = dict(max_bytes_per_file=1024 * 1024, min_bytes_per_file=min_bytes)
+    if min_bytes is not None and (min_bytes <= 0 or min_bytes > 1024 * 1024):
+        error = OverflowError if min_bytes < 0 else OSError
+        with pytest.raises(error):
+            Compaction.plan(dataset, options)
+        with pytest.raises(error):
+            dataset.optimize.compact_files(**options)
+        return
+
+    plan = Compaction.plan(dataset, options)
+    assert json.loads(plan.json())["options"]["min_bytes_per_file"] == (
+        1 if min_bytes is None else min_bytes
+    )
+    version = dataset.version
+    metrics = dataset.optimize.compact_files(**options)
+    if min_bytes is None:
+        assert not plan.tasks
+        assert metrics.fragments_removed == 0
+        assert dataset.version == version
+    else:
+        assert plan.tasks
+        assert metrics.fragments_removed == 2
 
 
 def test_optimize_indices_distributed(tmp_path: Path):

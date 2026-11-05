@@ -54,7 +54,7 @@ use super::{
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
-        let file_reader_options = dataset.file_reader_options.clone();
+        let file_reader_options = dataset.file_reader_options.as_deref().cloned();
         let mut scanner = Self {
             dataset,
             projection_plan,
@@ -254,6 +254,22 @@ impl Scanner {
     /// Projection with transform
     ///
     /// Only select the specified columns with the given transform.
+    ///
+    /// When a list is only used by `array_length` (`list_length`), nonempty
+    /// comparisons, or NULL checks, structural-format readers omit element
+    /// payloads. This applies to nested element types and struct field paths.
+    /// Selecting the list itself or otherwise inspecting its elements keeps the
+    /// ordinary value read. Legacy array-format files keep their normal reader.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let counts = dataset.scan()
+    ///     .project_with_transform(&[("image_count", "array_length(images)")])?
+    ///     .try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn project_with_transform(
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
@@ -966,6 +982,9 @@ impl Scanner {
     /// increase it toward all available partitions, subject to
     /// [`Self::maximum_nprobes`]. At 0, at least one available partition is
     /// searched. Later expansion to find enough candidates remains unchanged.
+    /// For L2, cosine and dot with k <= 100000, effort 0.1, 0.25 and 0.5 target
+    /// 80%, 90% and 95% mean partition-routing recall, respectively. These are
+    /// empirical calibration objectives, not guaranteed end-to-end Recall@k.
     /// This is independent of refinement, HNSW ef and approximation mode, and
     /// is not a recall guarantee. Setting any effort, including 0.5, ignores
     /// [`Self::nprobes`] regardless of setter order. Explicit minimum and maximum
@@ -976,7 +995,7 @@ impl Scanner {
     /// # use lance::{Dataset, Result};
     /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
     /// let mut scanner = dataset.scan();
-    /// scanner.nearest("vector", vector, 10)?.search_effort(0.75)?;
+    /// scanner.nearest("vector", vector, 10)?.search_effort(0.25)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1254,7 +1273,7 @@ impl Scanner {
         let base = self
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.clone());
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
                 opts.batch_size_bytes = Some(bsb);

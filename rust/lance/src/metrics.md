@@ -46,6 +46,25 @@ cloud stores (S3, GCS, Azure); Opendal-backed stores bypass the HTTP client
 where the counters are installed, so they report the other object store metrics
 but not throttle/retryable counts.
 
+## Scan metrics
+
+The scan node mirrors its `decode_time` and `task_wait_time` plan timers as
+cumulative counters so an exporter can read the elapsed time while a scan is
+still running. The counters hold nanoseconds, and intervals are recorded when
+they complete or are dropped. Consequently, `rate() / 1e9` estimates the
+average number of measured decode or task-wait intervals in progress per
+second; in-flight intervals contribute only after they are recorded.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lance_scan_decode_time_nanoseconds_total` | counter | `base` (+ `dataset` in dataset mode) | Wall time spent decoding scan tasks, summed over concurrent tasks. |
+| `lance_scan_task_wait_time_nanoseconds_total` | counter | `base` (+ `dataset` in dataset mode) | Time scan partitions spent waiting for scheduled I/O. |
+
+The labels follow `LANCE_OBJECT_STORE_METRICS_LABEL`; `dataset` is also present
+in dataset mode. Both counters use the primary dataset store's labels even when
+fragments are read through additional bases, so they cannot be joined
+one-for-one with secondary-base I/O metrics.
+
 ## Cache metrics
 
 Cache activity metrics use bounded labels. `cache` is `index`, `metadata`, or

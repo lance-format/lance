@@ -4241,16 +4241,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[rstest]
+#[case::empty(|_: &[u8]| Vec::new(), "only 0 bytes")]
+#[case::cut_to_half(|m: &[u8]| m[..m.len() / 2].to_vec(), "magic number")]
+#[case::cut_off_footer(|m: &[u8]| m[..m.len() - 16].to_vec(), "magic number")]
+#[case::cut_off_last_byte(|m: &[u8]| m[..m.len() - 1].to_vec(), "magic number")]
+#[case::all_zeros(|m: &[u8]| vec![0; m.len()], "magic number")]
+#[case::all_ones(|m: &[u8]| vec![0xff; m.len()], "magic number")]
+#[case::zeros_after_half(
+    |m: &[u8]| [&m[..m.len() / 2], vec![0; m.len() - m.len() / 2].as_slice()].concat(),
+    "magic number"
+)]
+#[case::zeros_before_footer(
+    |m: &[u8]| [vec![0; m.len() - 16].as_slice(), &m[m.len() - 16..]].concat(),
+    "version 0"
+)]
 #[tokio::test]
-async fn test_open_empty_latest_manifest_reports_path() {
+async fn test_open_damaged_latest_manifest_reports_path(
+    #[case] damage: fn(&[u8]) -> Vec<u8>,
+    #[case] expected_message: &str,
+    #[values(1, 8192)] column_name_len: usize,
+) {
     let test_dir = TempStdDir::default();
     let uri = test_dir.to_str().unwrap();
-    let mut dataset = write_tiny_dataset(uri).await;
-    dataset.truncate_table().await.unwrap();
+    let batch =
+        arrow_array::record_batch!(("i".repeat(column_name_len), Int32, [1, 2, 3])).unwrap();
+    let rows = || RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(rows(), uri, Some(params)).await.unwrap();
+    dataset.append(rows(), None).await.unwrap();
     assert_eq!(dataset.version().version, 2);
+    assert_eq!(dataset.get_fragments().len(), 3);
 
     let manifest_path = dataset.manifest_location.path.clone();
-    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+    let local_path = lance_io::local::to_local_path(&manifest_path);
+    let manifest = std::fs::read(&local_path).unwrap();
+    // Past one block the manifest takes another request than the block with the footer.
+    let block_size = dataset.object_store.block_size();
+    assert_eq!(manifest.len() > block_size, column_name_len > block_size);
+    std::fs::write(&local_path, damage(&manifest)).unwrap();
 
     let error = Dataset::open(uri).await.unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
@@ -4258,7 +4290,7 @@ async fn test_open_empty_latest_manifest_reports_path() {
         error.to_string().contains(manifest_path.as_ref()),
         "{error}"
     );
-    assert!(error.to_string().contains("0 bytes"), "{error}");
+    assert!(error.to_string().contains(expected_message), "{error}");
 }
 
 #[tokio::test]
@@ -4634,11 +4666,14 @@ async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
     );
 }
 
-/// The repair path: drop the offending rows, then tighten the column. Both have
-/// to be reachable on a table that already carries the bad key, or the only
-/// remaining fix is a full overwrite.
+/// The repair path: drop the offending rows, compact them out of the data files,
+/// tighten the column, and read the surviving data back through `add_columns`.
+/// All of it has to stay reachable on a table that already carries the bad key,
+/// or the only remaining fix is a full overwrite.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use lance_core::utils::tempfile::TempStrDir;
 
     let test_dir = TempStrDir::default();
@@ -4651,10 +4686,38 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         .expect("removing the offending rows must not be blocked");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
+    // The deleted row still stores its NULL, which readers of physical rows
+    // reject once the column is non-nullable.
+    let not_null = [ColumnAlteration::new("id".into()).set_nullable(false)];
+    let err = dataset.alter_columns(&not_null).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deleted rows still store NULL values"),
+        "{err}"
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("compacting the deleted rows away must not be blocked");
+
     dataset
-        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .alter_columns(&not_null)
         .await
         .expect("tightening the column completes the repair");
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("doubled".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .expect("the repaired column reads back");
 
     let id_field = dataset
         .schema()
@@ -4666,6 +4729,18 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         !id_field.nullable,
         "the key column must end up non-nullable"
     );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"].as_ref(),
+        &Int32Array::from(vec![1]) as &dyn Array
+    );
+    assert_eq!(
+        batch["doubled"].as_ref(),
+        &Int32Array::from(vec![2]) as &dyn Array
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// The MemWAL variant of the repair path. This is the state the original report

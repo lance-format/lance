@@ -370,6 +370,15 @@ impl Scanner {
             read_options = read_options.with_file_reader_options(file_reader_options);
         }
 
+        let list_structure = self.list_structure_modes()?;
+        if !list_structure.is_empty() {
+            read_options
+                .file_reader_options
+                .get_or_insert_default()
+                .decoder_config
+                .list_structure = Arc::new(list_structure);
+        }
+
         if let Some(fragment_readahead) = self.fragment_readahead {
             read_options = read_options.with_fragment_readahead(fragment_readahead);
         }
