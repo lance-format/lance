@@ -4700,6 +4700,174 @@ def test_merge_insert_empty_index():
     empty_ds.merge_insert("id").when_not_matched_insert_all().execute(df)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_merge_insert_structured_analysis(streaming):
+    data = pa.table({"id": list(range(64)), "value": list(range(64))})
+    ds = lance.write_dataset(
+        data, "memory://", max_rows_per_file=32, max_rows_per_group=32
+    )
+    source = pa.table({"id": [1, 100], "value": [999, 999]})
+    if streaming:
+        source = source.to_reader()
+    report = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .analyze_plan_report(source)
+    )
+    assert report["outcome"] == "complete"
+    assert report["error"] is None
+    assert report["write_mode"] == "rewrite_rows"
+    assert report["elapsed_ns"] >= 0
+    assert report["stats"]["num_updated_rows"] == 1
+    assert report["stats"]["num_inserted_rows"] == 1
+    assert report["stats"]["bytes_written"] > 0
+    assert report["fragments_touched"] == 1
+    assert report["target_rows_read"] == 64
+    assert report["fragments_read"] == 2
+    assert report["index_used"] is False
+    assert report["join_index_segments"] == 0
+    assert report["replay_spills"]["bytes_written"] == 0
+    assert len(report["joins"]) == 1
+    join = report["joins"][0]
+    assert join["strategy"] == "hash"
+    assert join["join_type"] == ("Right" if streaming else "Left")
+    expected_source = "StreamingTableExec" if streaming else "DataSourceExec"
+    assert expected_source in report["plan"]
+    assert any(operator["path"] == join["path"] for operator in report["operators"])
+    assert report["counts"]["bytes_read"] >= 0
+    assert ds.version == 1
+    assert ds.to_table() == data
+
+
+@pytest.mark.parametrize("ids", [[], [None]])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_empty_and_null(ids, indexed):
+    data = pa.table({"id": [1, 2, 3, 4]})
+    ds = lance.write_dataset(
+        data, "memory://", max_rows_per_file=2, max_rows_per_group=2
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    source = pa.table({"id": pa.array(ids, type=pa.int64())})
+    report = (
+        ds.merge_insert("id").when_not_matched_insert_all().analyze_plan_report(source)
+    )
+    assert report["outcome"] == "complete"
+    if not indexed:
+        assert report["stats"]["num_inserted_rows"] == len(ids)
+    assert report["stats"]["num_updated_rows"] == 0
+    assert report["fragments_touched"] == 0
+    assert report["index_used"] == indexed
+    assert ds.version == version
+    assert ds.to_table() == data
+    # The current indexed writer discards null source keys. Report that same behavior.
+    result = ds.merge_insert("id").when_not_matched_insert_all().execute(source)
+    assert report["stats"]["num_inserted_rows"] == result["num_inserted_rows"]
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_merge_insert_structured_analysis_source_failure(indexed):
+    data = pa.table({"id": [1, 2, 3, 4]})
+    ds = lance.write_dataset(data, "memory://")
+
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+
+    def batches():
+        yield pa.record_batch({"id": [10]})
+        raise ValueError("analysis source failed")
+
+    reader = pa.RecordBatchReader.from_batches(data.schema, batches())
+    report = (
+        ds.merge_insert("id").when_not_matched_insert_all().analyze_plan_report(reader)
+    )
+    assert report["outcome"] == "failed"
+    assert "analysis source failed" in report["error"]
+    assert report["stats"] is None
+    assert report["fragments_touched"] is None
+    assert ds.version == version
+    assert ds.to_table() == data
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_merge_analysis_spills_and_subplans(indexed, streaming, tmp_path):
+    data = pa.table(
+        {"id": [0, 1, 2, 3, 4, 5], "value": [0, 1, 2, 3, 4, 5], "other": [0] * 6}
+    )
+    ds = lance.write_dataset(
+        data, tmp_path / "analysis", max_rows_per_file=3, max_rows_per_group=3
+    )
+    if indexed:
+        ds.create_scalar_index("id", "BTREE")
+    version = ds.version
+    files = sorted(
+        path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()
+    )
+    source = pa.table({"id": [1, 4], "value": [99, 44]})
+    if streaming:
+        source = source.to_reader()
+    report = ds.merge_insert("id").when_matched_update_all().analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] == indexed
+    assert report["join_index_segments"] == int(indexed)
+    assert report["write_mode"] == ("rewrite_columns" if indexed else "rewrite_rows")
+    assert report["stats"]["num_updated_rows"] == 2
+    assert report["stats"]["bytes_written"] > 0
+    assert report["join_duration_ns"] is not None
+    assert report["merge_write_duration_ns"] is not None
+    assert report["joined_rows"] is not None
+    assert report["scratch_spills"] is None
+    assert report["operator_spills"]["bytes_read"] is None
+    if indexed:
+        assert report["mapped_target_rows"] == 2
+        assert report["replay_spills"]["bytes_written"] > 0
+        assert report["replay_spills"]["bytes_read"] > 0
+        assert any(
+            plan["purpose"] == "fragment_update_sort" for plan in report["subplans"]
+        )
+        ids = {plan["id"] for plan in report["subplans"]}
+        assert len(ids) == len(report["subplans"])
+        assert all(join["subplan_id"] in ids for join in report["joins"])
+    assert ds.version == version
+    assert ds.to_table() == data
+    assert (
+        sorted(
+            path.relative_to(tmp_path) for path in tmp_path.rglob("*") if path.is_file()
+        )
+        == files
+    )
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+def test_merge_analysis_partial_index_coverage(filtered, tmp_path):
+    data = pa.table({"id": [0, 1], "value": [0, 1]})
+    ds = lance.write_dataset(data, tmp_path / "partial")
+    ds.create_scalar_index("id", "BTREE")
+    ds = lance.write_dataset(
+        pa.table({"id": [2, 3], "value": [2, 3]}), ds.uri, mode="append"
+    )
+    before = ds.to_table()
+    version = ds.version
+    builder = ds.merge_insert("id").when_matched_update_all(
+        "source.value < 0" if filtered else None
+    )
+    source = pa.table({"id": [1, 3], "value": [11, 33]})
+    report = builder.analyze_plan_report(source)
+    assert report["outcome"] == "complete", report["error"]
+    assert report["index_used"] is True
+    assert report["join_index_segments"] == 1
+    assert report["stats"]["num_updated_rows"] == (0 if filtered else 2)
+    assert report["stats"]["num_inserted_rows"] == 0
+    assert ds.version == version
+    assert ds.to_table() == before
+    result = builder.execute(source)
+    assert result["num_updated_rows"] == (0 if filtered else 2)
+
+
 def test_merge_insert_explain_analyze_plan():
     """Test that explain_plan and analyze_plan work on merge insert operations."""
     # Create a simple test dataset
@@ -4861,6 +5029,46 @@ def test_native_dataset_falls_back_for_blob_v2(tmp_path, monkeypatch):
             "id"
         ).when_matched_update_all().when_not_matched_insert_all().execute(source)
     assert calls == [True]
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("same_dataset", [False, True])
+def test_merge_report_preserves_dataset_source_routing(
+    tmp_path, monkeypatch, native, same_dataset
+):
+    data = pa.table({"id": [0, 1, 2, 3], "value": [0, 1, 2, 3]})
+    target = lance.write_dataset(data, tmp_path / "target", max_rows_per_file=2)
+    source = (
+        target
+        if same_dataset
+        else lance.write_dataset(
+            pa.table({"id": [1, 9], "value": [11, 99]}), tmp_path / "source"
+        )
+    )
+    input_source = source if native else source.scanner()
+    if native:
+
+        def reject_scanner(*args, **kwargs):
+            raise AssertionError("native analysis must not create a Python scanner")
+
+        monkeypatch.setattr(source, "scanner", reject_scanner)
+    report = (
+        target.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .analyze_plan_report(input_source)
+    )
+    assert report["outcome"] == "complete", report["error"]
+    assert report["stats"]["num_updated_rows"] == (4 if same_dataset else 1)
+    assert report["stats"]["num_inserted_rows"] == (0 if same_dataset else 1)
+    assert report["target_rows_read"] == 4
+    assert report["fragments_read"] == 2
+    if native:
+        assert "StreamingTableExec" not in report["plan"]
+        # Restore target scanning before checking a native self-merge's contents.
+        monkeypatch.undo()
+    assert target.version == 1
+    assert target.to_table() == data
 
 
 def test_merge_insert_native_dataset_build_side(tmp_path):
