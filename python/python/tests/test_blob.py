@@ -12,6 +12,7 @@ import sys
 import tarfile
 import textwrap
 import threading
+import time
 import uuid
 import zipfile
 from datetime import timedelta
@@ -3472,6 +3473,17 @@ def _read_in_8k_chunks(blob: BlobFile) -> bytes:
     return b"".join(chunks)
 
 
+def _wait_for_blob_ref_budget_release(reader):
+    # Submitted backend I/O may finish after stream completion or cancellation.
+    deadline = time.monotonic() + 1
+    while reader.reserved_bytes != 0 or reader.io_reserved_bytes != 0:
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.001)
+    assert reader.reserved_bytes == 0
+    assert reader.io_reserved_bytes == 0
+
+
 @pytest.fixture
 def portable_blob_references(tmp_path):
     values = [b"abc", b"abcde", b"abcdefghij", None, b"", b"uv"]
@@ -3561,8 +3573,7 @@ def test_portable_blob_reference_requests(portable_blob_references):
             3: b"",
             4: b"cdef",
         }
-        assert reader.reserved_bytes == 0
-        assert reader.io_reserved_bytes == 0
+        _wait_for_blob_ref_budget_release(reader)
 
 
 @pytest.mark.parametrize(
@@ -3614,7 +3625,7 @@ def test_portable_blob_reference_cancel_and_buffer_ownership(portable_blob_refer
         assert array[0].as_py() == b"abc"
         assert reader.reserved_bytes >= 3
         del array
-        assert reader.reserved_bytes == 0
+        _wait_for_blob_ref_budget_release(reader)
         assert next(stream, None) is None
 
 
