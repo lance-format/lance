@@ -39,6 +39,7 @@ pub enum SupportedIvfIndexType {
     IvfHnswFlat,
     IvfHnswPq,
     IvfHnswSq,
+    IvfHnswRq,
 }
 
 impl SupportedIvfIndexType {
@@ -52,6 +53,7 @@ impl SupportedIvfIndexType {
             Self::IvfHnswFlat => "IVF_HNSW_FLAT",
             Self::IvfHnswPq => "IVF_HNSW_PQ",
             Self::IvfHnswSq => "IVF_HNSW_SQ",
+            Self::IvfHnswRq => "IVF_HNSW_RQ",
         }
     }
 
@@ -67,6 +69,7 @@ impl SupportedIvfIndexType {
             "IVF_HNSW_FLAT" => Some(Self::IvfHnswFlat),
             "IVF_HNSW_PQ" => Some(Self::IvfHnswPq),
             "IVF_HNSW_SQ" => Some(Self::IvfHnswSq),
+            "IVF_HNSW_RQ" => Some(Self::IvfHnswRq),
             _ => None,
         }
     }
@@ -115,6 +118,7 @@ impl SupportedIvfIndexType {
             (true, false, false, false) => Self::IvfHnswFlat,
             (true, true, false, false) => Self::IvfHnswPq,
             (true, false, true, false) => Self::IvfHnswSq,
+            (true, false, false, true) => Self::IvfHnswRq,
             _ => {
                 return Err(Error::not_supported_source(
                     "Unsupported index type combination detected".into(),
