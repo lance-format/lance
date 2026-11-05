@@ -19,7 +19,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::stream::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
 #[cfg(target_os = "linux")]
@@ -49,6 +49,60 @@ fn bench_scan(c: &mut Criterion) {
             assert!(!count.is_empty());
         })
     });
+}
+
+/// A one-column scan of a wide table with many small fragments, so per-file open
+/// work dominates the scan.
+fn bench_narrow_scan_of_wide_table(c: &mut Criterion) {
+    const NUM_FRAGMENTS: usize = 64;
+    const ROWS_PER_FRAGMENT: usize = 16;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("Narrow scan of wide table");
+    for num_columns in [10, 100, 1000] {
+        let schema = Arc::new(ArrowSchema::new(
+            (0..num_columns)
+                .map(|i| Field::new(format!("c{i}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            (0..num_columns)
+                .map(|_| Arc::new(Int32Array::from_iter_values(0..ROWS_PER_FRAGMENT as i32)) as _)
+                .collect(),
+        )
+        .unwrap();
+        let dataset = rt.block_on(async {
+            let reader = RecordBatchIterator::new(
+                std::iter::repeat_n(batch, NUM_FRAGMENTS).map(Ok),
+                schema.clone(),
+            );
+            let write_params = WriteParams {
+                max_rows_per_file: ROWS_PER_FRAGMENT,
+                ..Default::default()
+            };
+            Dataset::write(reader, "memory://", Some(write_params))
+                .await
+                .unwrap()
+        });
+        assert_eq!(dataset.get_fragments().len(), NUM_FRAGMENTS);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_columns),
+            &dataset,
+            |b, dataset| {
+                b.to_async(&rt).iter(|| async {
+                    let batch = dataset
+                        .scan()
+                        .project(&["c0"])
+                        .unwrap()
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                    assert_eq!(batch.num_rows(), NUM_FRAGMENTS * ROWS_PER_FRAGMENT);
+                })
+            },
+        );
+    }
+    group.finish();
 }
 
 async fn create_file(path: &std::path::Path, mode: WriteMode) {
@@ -125,10 +179,10 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_scan);
+    targets = bench_scan, bench_narrow_scan_of_wide_table);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_scan);
+    targets = bench_scan, bench_narrow_scan_of_wide_table);
 criterion_main!(benches);
