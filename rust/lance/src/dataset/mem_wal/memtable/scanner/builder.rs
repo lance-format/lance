@@ -27,10 +27,11 @@ use super::exec::{
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
 };
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// Vector search query parameters.
 #[derive(Debug, Clone)]

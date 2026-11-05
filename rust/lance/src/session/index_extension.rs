@@ -56,7 +56,7 @@ pub trait VectorIndexExtension: IndexExtension {
 mod test {
     use crate::{
         dataset::{builder::DatasetBuilder, scanner::test_dataset::TestVectorDataset},
-        index::{DatasetIndexInternalExt, PreFilter},
+        index::{PreFilter, loading::DatasetIndexInternalExt},
         session::Session,
     };
 

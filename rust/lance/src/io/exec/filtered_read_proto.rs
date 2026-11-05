@@ -267,7 +267,11 @@ async fn fr_options_from_proto(
         // Merge the scanner-level byte budget into the dataset's existing
         // file-reader options so that distributed execution preserves
         // validation and I/O settings such as read_chunk_size.
-        let mut file_reader_options = dataset.file_reader_options.clone().unwrap_or_default();
+        let mut file_reader_options = dataset
+            .file_reader_options
+            .as_deref()
+            .cloned()
+            .unwrap_or_default();
         file_reader_options.batch_size_bytes = Some(batch_size_bytes);
         options = options.with_file_reader_options(file_reader_options);
     }
@@ -685,14 +689,14 @@ mod tests {
     async fn make_test_dataset_with_file_reader_options() -> Arc<Dataset> {
         let mut dataset = make_test_dataset().await;
         if let Some(ds) = Arc::get_mut(&mut dataset) {
-            ds.file_reader_options = Some(FileReaderOptions {
+            ds.file_reader_options = Some(Arc::new(FileReaderOptions {
                 read_chunk_size: 1234,
                 decoder_config: DecoderConfig {
                     validate_on_decode: true,
                     ..Default::default()
                 },
                 batch_size_bytes: None,
-            });
+            }));
         }
         dataset
     }

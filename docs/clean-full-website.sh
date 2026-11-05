@@ -8,6 +8,7 @@ docs_src="$script_dir/src"
 rm -rf "$docs_src/format/catalog"
 rm -rf "$docs_src/format/namespace"
 rm -f "$docs_src/format/layout.png"
+rm -rf "$docs_src/guide/spark"
 rm -rf "$docs_src/integrations/huggingface"
 rm -rf "$docs_src/integrations/duckdb"
 rm -rf "$docs_src/integrations/spark"
@@ -185,6 +186,10 @@ mkdir -p "$docs_src/integrations/duckdb"
 mkdir -p "$docs_src/integrations/ray"
 mkdir -p "$docs_src/integrations/trino"
 mkdir -p "$docs_src/integrations/huggingface"
+
+cat > "$docs_src/integrations/spark/operations/dql/.pages" <<'EOF'
+title: DQL
+EOF
 
 cat > "$docs_src/integrations/spark/index.md" <<'EOF'
 # Apache Spark Integration
