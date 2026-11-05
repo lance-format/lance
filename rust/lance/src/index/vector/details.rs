@@ -34,7 +34,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
-use crate::index::open_index_proto;
+use crate::index::loading::open_index_proto;
 use crate::{Error, Result};
 
 // Private structs for JSON serialization of VectorIndexDetails.
@@ -292,17 +292,17 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
                 ..Default::default()
             },
         ),
-        (None, Some(Compression::Rq(rq))) => {
+        (hnsw, Some(Compression::Rq(rq))) => {
             let rotation_type =
                 match rabit_quantization::RotationType::try_from(rq.rotation_type).ok()? {
                     rabit_quantization::RotationType::Matrix => RQRotationType::Matrix,
                     rabit_quantization::RotationType::Fast => RQRotationType::Fast,
                 };
-            VectorIndexParams::with_ivf_rq_params(
-                metric,
-                ivf,
-                RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type),
-            )
+            let rq = RQBuildParams::with_rotation_type(rq.num_bits as u8, rotation_type);
+            match hnsw {
+                Some(hnsw) => VectorIndexParams::with_ivf_hnsw_rq_params(metric, ivf, hnsw, rq),
+                None => VectorIndexParams::with_ivf_rq_params(metric, ivf, rq),
+            }
         }
         (Some(hnsw), Some(Compression::Pq(pq))) => VectorIndexParams::with_ivf_hnsw_pq_params(
             metric,
@@ -626,6 +626,7 @@ async fn convert_v3_metadata_to_details(
         SupportedIvfIndexType::IvfHnswFlat => (true, CompressionKind::Flat),
         SupportedIvfIndexType::IvfHnswPq => (true, CompressionKind::Pq),
         SupportedIvfIndexType::IvfHnswSq => (true, CompressionKind::Sq),
+        SupportedIvfIndexType::IvfHnswRq => (true, CompressionKind::Rq),
     };
 
     let hnsw_index_config = if has_hnsw {
@@ -1386,6 +1387,7 @@ mod tests {
         IvfHnswFlat,
         IvfHnswPq,
         IvfHnswSq,
+        IvfHnswRq,
     }
 
     fn build_roundtrip_params(combo: Combo, metric: DistanceType) -> VectorIndexParams {
@@ -1442,6 +1444,12 @@ mod tests {
             Combo::IvfHnswFlat => VectorIndexParams::ivf_hnsw(metric, ivf, hnsw),
             Combo::IvfHnswPq => VectorIndexParams::with_ivf_hnsw_pq_params(metric, ivf, hnsw, pq),
             Combo::IvfHnswSq => VectorIndexParams::with_ivf_hnsw_sq_params(metric, ivf, hnsw, sq),
+            Combo::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
+                metric,
+                ivf,
+                hnsw,
+                RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+            ),
         }
     }
 
@@ -1454,6 +1462,7 @@ mod tests {
     #[case::ivf_hnsw_flat(Combo::IvfHnswFlat)]
     #[case::ivf_hnsw_pq(Combo::IvfHnswPq)]
     #[case::ivf_hnsw_sq(Combo::IvfHnswSq)]
+    #[case::ivf_hnsw_rq(Combo::IvfHnswRq)]
     fn test_vector_index_details_roundtrip(
         #[case] combo: Combo,
         #[values(DistanceType::L2, DistanceType::Cosine)] metric: DistanceType,
@@ -1544,6 +1553,14 @@ mod tests {
                     panic!("expected SQ stage");
                 };
                 assert_eq!(sq.num_bits, 8);
+            }
+            Combo::IvfHnswRq => {
+                let [_, StageParams::Hnsw(hnsw), StageParams::RQ(rq)] = restored.stages.as_slice()
+                else {
+                    panic!("expected IVF, HNSW and RQ stages");
+                };
+                assert_eq!((hnsw.m, hnsw.ef_construction, hnsw.max_level), (30, 200, 5));
+                assert_eq!((rq.num_bits, rq.rotation_type), (5, RQRotationType::Fast));
             }
         }
     }

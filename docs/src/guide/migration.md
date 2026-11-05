@@ -1,10 +1,14 @@
 # Migration Guides
 
-Lance aims to avoid breaking changes when possible.  Currently, we are refining the Rust public API so that we can move
-it out of experimental status and make stronger commitments to backwards compatibility.  The python API is considered
-stable and breaking changes should generally be communicated (via warnings) for 1-2 months prior to being finalized to
-give users a chance to migrate.  This page documents the breaking changes between releases and gives advice on how to
-migrate.
+Lance aims to avoid breaking changes when possible. The Python API is stable, and breaking changes are generally
+communicated via deprecation warnings for 1–2 months before removal. The Rust public API is still evolving, and any
+breaking change across the Rust crates (`lance*`), Python package (`pylance`), or Java SDK (`org.lance:lance-core`)
+increments the shared major version number.
+
+### Release and Format Versioning
+
+- **Shared package versions (`1.0.0` and later)**: Following `0.39`, Lance adopted strict [semantic versioning](../community/release.md#release-versioning) starting at `1.0.0`. All language SDKs share the same release version. Major versions not listed on this page contained breaking changes limited to narrow or internal Rust traits that do not require migration steps for standard SDK callers (see the [GitHub Releases](https://github.com/lance-format/lance/releases) for full changelogs).
+- **On-disk format versions (`2.0`, `2.1`, `2.2`, `2.3`)**: Package release versions are independent of the dataset `data_storage_version`. Upgrading the SDK does not rewrite existing tables or force a file format upgrade. See [Choosing a data file version](read_and_write.md#choosing-a-data-file-version) for format compatibility details.
 
 ## 11.0.0
 
@@ -105,7 +109,7 @@ API and do not plan on reintroducing these.
 which returns a `DatasetDelta` that offers both metadata diff through `list_transactions` and data diff 
 through `get_inserted_rows` and `get_updated_rows`.
 
-* Some other minor utilities which had previously been public are now private.  It is unlikely anyone was utilizing'
+* Some other minor utilities which had previously been public are now private.  It is unlikely anyone was utilizing
 these.  Please open an issue if you were relying on any of these.
 
 * The `lance-namespace` Rust crate now splits into `lance-namespace` that contains the main `LanceNamespace` trait 

@@ -686,13 +686,13 @@ fn sign_stage_matches_full_store(
             )
         })
         .find(|fixture| {
-            let dist_table = &fixture.raw_query.dist_table;
+            let dist_table = fixture.raw_query.dist_table();
             dist_table.iter().all(|value| value.is_finite())
                 && quantize_dist_table_into(dist_table, &mut Vec::new()) == DistTableDequant::Exact
         })
         .expect("some query scale must force the exact dequantization fallback");
     assert_eq!(
-        quantize_dist_table_u16_into(&exact_fixture.raw_query.dist_table, &mut Vec::new()),
+        quantize_dist_table_u16_into(exact_fixture.raw_query.dist_table(), &mut Vec::new()),
         DistTableDequant::Exact
     );
 

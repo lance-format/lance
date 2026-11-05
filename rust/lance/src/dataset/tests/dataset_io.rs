@@ -27,6 +27,7 @@ use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
@@ -3333,6 +3334,140 @@ async fn scan_dictionary_batches_spanning_pages(
     );
 }
 
+/// Int8 dictionary batches of 100 values starting at 0, 28 and 128: the first two hold
+/// exactly the 128 values Int8 keys address, so the writer starts a new file for the third.
+#[rstest]
+#[tokio::test]
+async fn write_splits_files_before_dictionary_outgrows_key_type(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    #[values(false, true)] is_compaction: bool,
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batches = [0, 28, 128]
+        .into_iter()
+        .map(|start| {
+            let values =
+                StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(1000));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let params = || {
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            enable_stable_row_ids,
+            ..Default::default()
+        })
+    };
+    let reader = |batches: Vec<RecordBatch>| {
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone())
+    };
+
+    let dataset = if is_compaction {
+        let mut dataset = Dataset::write(reader(vec![batches[0].clone()]), "memory://", params())
+            .await
+            .unwrap();
+        for batch in &batches[1..] {
+            dataset
+                .append(reader(vec![batch.clone()]), None)
+                .await
+                .unwrap();
+        }
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (3, 2));
+        dataset
+    } else {
+        Dataset::write(reader(batches.clone()), "memory://", params())
+            .await
+            .unwrap()
+    };
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(2000), Some(1000)]);
+    // The files' dictionaries cannot share one Int8 array, so compare the values as strings.
+    let as_utf8 = |batch: &RecordBatch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        actual
+            .iter()
+            .all(|batch| batch["d"].data_type() == schema.field(0).data_type())
+    );
+    let concat_utf8 = |batches: &[RecordBatch]| {
+        let arrays = batches.iter().map(as_utf8).collect::<Vec<_>>();
+        let arrays = arrays
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>();
+        arrow_select::concat::concat(&arrays).unwrap()
+    };
+    assert_eq!(
+        concat_utf8(&actual).as_ref(),
+        concat_utf8(&batches).as_ref()
+    );
+    dataset.validate().await.unwrap();
+}
+
+/// A file finished early for its dictionary leaves the input's row-limit cuts out of line
+/// with the files. The next file must still stop at `max_rows_per_file` rows.
+#[rstest]
+#[tokio::test]
+async fn write_keeps_max_rows_per_file_after_dictionary_close(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    // 150-row batches over 100 values each; the second and third share theirs, so the
+    // first file closes at 150 rows and the second holds no more than 128 values.
+    let batches = ["a", "b", "b"]
+        .into_iter()
+        .map(|prefix| {
+            let values = StringArray::from_iter_values((0..100).map(|i| format!("{prefix}{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(150));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        max_rows_per_file: 200,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, "memory://", Some(params))
+        .await
+        .unwrap();
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(150), Some(200), Some(100)]);
+    dataset.validate().await.unwrap();
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.
@@ -4499,11 +4634,14 @@ async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
     );
 }
 
-/// The repair path: drop the offending rows, then tighten the column. Both have
-/// to be reachable on a table that already carries the bad key, or the only
-/// remaining fix is a full overwrite.
+/// The repair path: drop the offending rows, compact them out of the data files,
+/// tighten the column, and read the surviving data back through `add_columns`.
+/// All of it has to stay reachable on a table that already carries the bad key,
+/// or the only remaining fix is a full overwrite.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use lance_core::utils::tempfile::TempStrDir;
 
     let test_dir = TempStrDir::default();
@@ -4516,10 +4654,38 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         .expect("removing the offending rows must not be blocked");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
+    // The deleted row still stores its NULL, which readers of physical rows
+    // reject once the column is non-nullable.
+    let not_null = [ColumnAlteration::new("id".into()).set_nullable(false)];
+    let err = dataset.alter_columns(&not_null).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deleted rows still store NULL values"),
+        "{err}"
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("compacting the deleted rows away must not be blocked");
+
     dataset
-        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .alter_columns(&not_null)
         .await
         .expect("tightening the column completes the repair");
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("doubled".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .expect("the repaired column reads back");
 
     let id_field = dataset
         .schema()
@@ -4531,6 +4697,18 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         !id_field.nullable,
         "the key column must end up non-nullable"
     );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"].as_ref(),
+        &Int32Array::from(vec![1]) as &dyn Array
+    );
+    assert_eq!(
+        batch["doubled"].as_ref(),
+        &Int32Array::from(vec![2]) as &dyn Array
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// The MemWAL variant of the repair path. This is the state the original report
