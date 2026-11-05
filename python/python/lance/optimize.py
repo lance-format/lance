@@ -35,12 +35,17 @@ class CompactionOptions(TypedDict, total=False):
     """
     max_bytes_per_file: Optional[int]
     """
-    Max number of bytes in a single file.  This does not affect which
-    fragments need compaction, but does affect how they are re-written if
-    selected.  If this value is too small you may end up with fragments
-    that are smaller than `target_rows_per_fragment`.
-
-    The default will use the default from ``write_dataset``.
+    Maximum bytes per output file. Defaults to the dataset config value, or the
+    `writer's default <https://docs.rs/lance/latest/lance/dataset/write/struct.WriteParams.html#structfield.max_bytes_per_file>`_.
+    """
+    min_bytes_per_file: Optional[int]
+    """
+    Files at or above this size are excluded from small-file compaction.
+    When omitted or None, defaults to the dataset config value, or 95% of
+    :attr:`max_bytes_per_file`.
+    Must be greater than zero and no greater than that limit.
+    Files needing cleanup may still be compacted.
+    Example: ``Compaction.plan(ds, {"min_bytes_per_file": 512 * 1024 * 1024})``.
     """
     materialize_deletions: Optional[bool]
     """
