@@ -34,7 +34,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::write::{CacheConfig, IndexStore, MemIndexSpec, MemTable};
+use lance::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+use lance::dataset::mem_wal::memtable::{CacheConfig, MemTable};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;

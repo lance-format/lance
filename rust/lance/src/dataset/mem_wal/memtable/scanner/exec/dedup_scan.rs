@@ -39,9 +39,9 @@ use datafusion::prelude::Expr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::scanner::exec::compute_pk_hash;
-use crate::dataset::mem_wal::write::BatchStore;
 
 /// Scans the active memtable newest-first and emits the newest-per-PK rows
 /// that satisfy the (optional) predicate. See the module doc.

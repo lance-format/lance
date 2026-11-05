@@ -91,10 +91,16 @@ pub struct FlatQueryParams {
 
 impl From<&Query> for FlatQueryParams {
     fn from(q: &Query) -> Self {
+        Self::from_query(q, q.dist_q_c)
+    }
+}
+
+impl FlatQueryParams {
+    pub(crate) fn from_query(q: &Query, dist_q_c: f32) -> Self {
         Self {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
-            dist_q_c: q.dist_q_c,
+            dist_q_c,
             approx_mode: q.approx_mode,
         }
     }
@@ -207,6 +213,10 @@ fn search_candidates_with_scratch(
 impl IvfSubIndex for FlatIndex {
     type QueryParams = FlatQueryParams;
     type BuildParams = ();
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn name() -> &'static str {
         "FLAT"

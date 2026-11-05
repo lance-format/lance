@@ -114,6 +114,12 @@ impl IOTracker {
         self.metrics_base = Some(base.into());
     }
 
+    /// The `base` this store's metrics are labelled with, if it is metered.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn metrics_base(&self) -> Option<&str> {
+        self.metrics_base.as_deref()
+    }
+
     /// Begin an operation that talks to storage without going through the
     /// `object_store` layer, and so is invisible to the `MeteredObjectStore`
     /// wrapper: the optimized local reads and writes go straight to the
