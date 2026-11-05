@@ -364,8 +364,22 @@ pub(crate) async fn load_fts_training_data(
     }
 }
 
+// The R-tree plugin is added here because `register_scalar_index_plugin` only works before the
+// first default registry is built, and code outside `lance` can build one at any time.
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| {
+        #[cfg(feature = "geo")]
+        {
+            IndexPluginRegistry::with_default_plugins_and(|registry| {
+                registry.add_plugin::<
+                    lance_index::pb::RTreeIndexDetails,
+                    lance_geo::rtree::RTreeIndexPlugin,
+                >();
+            })
+        }
+        #[cfg(not(feature = "geo"))]
+        IndexPluginRegistry::with_default_plugins()
+    });
 
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 

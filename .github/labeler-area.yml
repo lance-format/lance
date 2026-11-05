@@ -19,6 +19,7 @@ A-index:
   - changed-files:
       - any-glob-to-any-file:
           - "rust/lance-index/**"
+          - "rust/lance-geo/**"
           - "rust/lance-linalg/**"
           - "rust/lance-tokenizer/**"
 

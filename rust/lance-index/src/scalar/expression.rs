@@ -22,8 +22,6 @@ use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
-#[cfg(feature = "geo")]
-use super::{GeoQuery, RelationQuery};
 use crate::scalar::inverted::InvertedIndexParams;
 use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
@@ -1225,123 +1223,6 @@ impl ScalarQueryParser for FtsQueryParser {
     }
 }
 
-/// A parser for geo indices that handles spatial queries
-#[cfg(feature = "geo")]
-#[derive(Debug, Clone)]
-pub struct GeoQueryParser {
-    index_name: String,
-    index_type: String,
-}
-
-#[cfg(feature = "geo")]
-impl GeoQueryParser {
-    pub fn new(index_name: String, index_type: String) -> Self {
-        Self {
-            index_name,
-            index_type,
-        }
-    }
-}
-
-#[cfg(feature = "geo")]
-impl ScalarQueryParser for GeoQueryParser {
-    fn visit_between(
-        &self,
-        _: &str,
-        _: &Bound<ScalarValue>,
-        _: &Bound<ScalarValue>,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        Some(IndexedExpression::index_query_with_recheck(
-            column.to_string(),
-            self.index_name.clone(),
-            self.index_type.clone(),
-            Arc::new(GeoQuery::IsNull),
-            true,
-        ))
-    }
-
-    fn visit_comparison(
-        &self,
-        _: &str,
-        _: &ScalarValue,
-        _: &Operator,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_scalar_function(
-        &self,
-        column: &str,
-        _data_type: &DataType,
-        func: &ScalarUDF,
-        args: &[Expr],
-    ) -> Option<IndexedExpression> {
-        if (func.name() == "st_intersects"
-            || func.name() == "st_contains"
-            || func.name() == "st_within"
-            || func.name() == "st_touches"
-            || func.name() == "st_crosses"
-            || func.name() == "st_overlaps"
-            || func.name() == "st_covers"
-            || func.name() == "st_coveredby")
-            && args.len() == 2
-        {
-            let left_arg = &args[0];
-            let right_arg = &args[1];
-            return match (left_arg, right_arg) {
-                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
-                    let mut field = Field::new("_geo", left_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: left_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
-                    let mut field = Field::new("_geo", right_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: right_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                _ => None,
-            };
-        }
-        None
-    }
-}
-
 impl IndexedExpression {
     /// Create an expression that only does refine
     fn refine_only(refine_expr: Expr) -> Self {
@@ -1372,7 +1253,25 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
+    ///
+    /// Set `needs_recheck` when the results of the index are inexact and have to be
+    /// filtered again. A [`ScalarQueryParser`] outside this crate builds its answer here.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_index::scalar::AnyQuery;
+    /// # use lance_index::scalar::expression::IndexedExpression;
+    /// # fn parse(query: Arc<dyn AnyQuery>) -> IndexedExpression {
+    /// IndexedExpression::index_query_with_recheck(
+    ///     "column".to_string(),
+    ///     "column_idx".to_string(),
+    ///     "MyIndex".to_string(),
+    ///     query,
+    ///     true,
+    /// )
+    /// # }
+    /// ```
+    pub fn index_query_with_recheck(
         column: String,
         index_name: String,
         index_type: String,
