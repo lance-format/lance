@@ -91,7 +91,8 @@ impl ObservedBuild {
     }
 
     /// Records the peak memory of the whole build, once it has succeeded. A
-    /// build dropped without this records nothing.
+    /// build dropped without this records no operation peak; stages that
+    /// completed before the drop keep their stage peaks.
     pub fn finish(self) {
         if let Some((window, operation, index_type)) = self.build
             && let Some(peak_bytes) = window.close()

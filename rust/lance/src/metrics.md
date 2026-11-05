@@ -129,7 +129,11 @@ The gauges are read when the recorder collects. The Python and Java OpenTelemetr
 
 The peak histograms cover index builds started through `create_index` (or `CreateIndexBuilder`) and the inverted index branch of `merge_index_metadata`. While a build runs, a background thread samples the resident set size (RSS) every 100 ms, and every stage of the build, as well as the build as a whole, reports the largest value seen. The readings taken when a stage starts and ends count for every stage open at the time, so a build's peak is never below the peaks of its stages. A spike between two readings is only caught when it raises the peak RSS the kernel keeps for the process (`VmHWM`), so the values are lower bounds. Index builds that run as part of `optimize_indices` or of a MemWAL flush are not reported yet.
 
+An operation peak is recorded only when the build completes successfully. A build that fails or is cancelled before that records no operation peak, and a stage that never completes records no stage peak. Stages that completed earlier in the same build keep their samples.
+
 Peaks describe the whole process, so work running at the same time, including other index builds, counts towards them. For most scalar indices the `load_data` stage only prepares the scan: reading, sorting and training happen after it and show up in the operation peak. `operation` is `create_index` or `merge_index_metadata`, and `index_type` is the lowercase type name (`btree`, `inverted`, `ivf_pq`, ...). The `index_type` and `stage` labels each keep at most 64 distinct values per process; later values are reported as `other`.
+
+The process gauges are best-effort readings of the live process. They cannot be exported after the process exits or is killed, so they do not provide a postmortem for a hard out-of-memory kill.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
