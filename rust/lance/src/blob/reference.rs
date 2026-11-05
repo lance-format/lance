@@ -1897,7 +1897,7 @@ mod tests {
     #[case::cardinality("cardinality", "descriptor count")]
     #[case::missing_fragment("fragment", "missing fragment")]
     #[case::bad_offset("offset", "invalid address")]
-    #[case::null_child("null_child", "null children")]
+    #[case::null_child("null_child", "null position")]
     #[case::unknown_kind("kind", "Unknown blob kind")]
     #[case::overflow("overflow", "overflows u64")]
     #[case::dedicated_offset("dedicated", "nonzero position")]
