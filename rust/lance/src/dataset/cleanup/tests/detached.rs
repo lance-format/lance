@@ -223,14 +223,19 @@ async fn managed_cleanup_with_missing_files(#[case] detached: bool, #[case] shar
 }
 
 /// A detached version's fragment whose blob columns sit in two data files, after
-/// an earlier release removed some of them: cleanup runs once both are gone, and
-/// fails naming the detached version while one of them can still be read.
+/// an earlier release removed some of its files: cleanup runs once both data files
+/// are gone, and fails naming the detached version while one of them can still be
+/// read, including when only the deletion file is gone.
 #[rstest]
-#[case::added_column(&[1])]
-#[case::first_column(&[0])]
-#[case::both(&[0, 1])]
+#[case::added_column(&[1], false)]
+#[case::first_column(&[0], false)]
+#[case::both(&[0, 1], false)]
+#[case::deletion_file(&[], true)]
 #[tokio::test]
-async fn managed_cleanup_with_split_blob_files(#[case] removed: &[usize]) {
+async fn managed_cleanup_with_split_blob_files(
+    #[case] removed: &[usize],
+    #[case] removes_deletion_file: bool,
+) {
     MockClock::set_system_time(std::time::Duration::ZERO);
     let fixture = MockDatasetFixture::try_new().unwrap();
     let batch = managed_blob_batch();
@@ -269,6 +274,18 @@ async fn managed_cleanup_with_split_blob_files(#[case] removed: &[usize]) {
     let files = dataset.manifest.fragments[0].files.clone();
     assert_eq!(files.len(), 2);
     let detached = commit_detached_delete(&Arc::new(dataset.clone()), "id = 1").await;
+    let detached_dataset = Arc::new(dataset.checkout_version(detached).await.unwrap());
+    let fragment = &detached_dataset.manifest.fragments[0];
+    let deletion_file = deletion_file_path(
+        &dataset.base,
+        fragment.id,
+        fragment.deletion_file.as_ref().unwrap(),
+    );
+    let deletion = dataset
+        .object_store
+        .read_one_all(&deletion_file)
+        .await
+        .unwrap();
     // From here on only the detached version references the fragment.
     dataset.delete("id >= 0").await.unwrap();
     assert!(dataset.manifest.fragments.is_empty());
@@ -278,6 +295,9 @@ async fn managed_cleanup_with_split_blob_files(#[case] removed: &[usize]) {
             .delete(&dataset.data_dir().join(files[*index].path.as_str()))
             .await
             .unwrap();
+    }
+    if removes_deletion_file {
+        dataset.object_store.delete(&deletion_file).await.unwrap();
     }
 
     // Every attached version but the latest expires.
@@ -290,6 +310,22 @@ async fn managed_cleanup_with_split_blob_files(#[case] removed: &[usize]) {
         assert!(error.is_not_found(), "{error}");
         assert!(matches!(error, Error::IO { .. }), "{error}");
         assert_contains!(error.to_string(), format!("detached version {detached}"));
+    }
+    if removes_deletion_file {
+        // The blobs are kept, so restoring the deletion file restores the version.
+        dataset
+            .object_store
+            .put(&deletion_file, &deletion)
+            .await
+            .unwrap();
+        let values = detached_dataset
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"first"
+        );
     }
     assert_eq!(dataset.list_detached_manifests().await.unwrap().len(), 1);
 }
@@ -338,14 +374,13 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
     assert!(!removed(&dataset, &external).await);
     assert!(removed(&dataset, &fragment).await);
 
-    // A missing deletion file makes the fragment unreadable on its own.
+    // A missing deletion file does not count while a data file remains.
     let mut deleted = Fragment::new(10);
     deleted.files.push(DataFile::new_legacy_from_fields(
         "other.lance",
         vec![1],
         None,
     ));
-    assert!(!removed(&dataset, &deleted).await);
     deleted.deletion_file = Some(DeletionFile {
         read_version: 1,
         id: 1,
@@ -354,6 +389,12 @@ async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
         base_id: None,
         inline: None,
     });
+    assert!(!removed(&dataset, &deleted).await);
+    dataset
+        .object_store
+        .delete(&data_path("other.lance"))
+        .await
+        .unwrap();
     assert!(removed(&dataset, &deleted).await);
 }
 
@@ -375,6 +416,97 @@ async fn cleanup_skips_staging_detached_manifests() {
 
     fixture.run_cleanup(utc_now()).await.unwrap();
     assert!(dataset.object_store.exists(&partial).await.unwrap());
+}
+
+/// A detached version whose external store record names its staging copy, as
+/// when the copy to the canonical path failed, keeps its files on a store that
+/// cannot list its records, also when its owner finalizes it between the listing
+/// and the record lookup.
+#[rstest]
+#[tokio::test]
+async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
+    #[values(false, true)] finalized_during_cleanup: bool,
+) {
+    use lance_table::io::commit::CommitHandler;
+    use lance_table::io::commit::external_manifest::{
+        ExternalManifestCommitHandler, ExternalManifestStore,
+    };
+
+    let store = Arc::new(IdentifiedStore {
+        is_unlisted: true,
+        ..Default::default()
+    });
+    let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+        external_manifest_store: store.clone(),
+    });
+    let params = |mode| WriteParams {
+        mode,
+        commit_handler: Some(handler.clone()),
+        ..Default::default()
+    };
+    let uri = TempStrDir::default();
+    let dataset = Arc::new(
+        InsertBuilder::new(uri.as_str())
+            .with_params(&params(WriteMode::Create))
+            .execute(vec![id_batch(0)])
+            .await
+            .unwrap(),
+    );
+    let append = InsertBuilder::new(dataset.clone())
+        .with_params(&params(WriteMode::Append))
+        .execute_uncommitted(vec![id_batch(100)])
+        .await
+        .unwrap();
+    let detached = CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(append)
+        .await
+        .unwrap()
+        .version_id();
+
+    let canonical = ManifestNamingScheme::V2.manifest_path(&dataset.base, detached);
+    let staging = Path::parse(format!("{canonical}-{}", Uuid::new_v4())).unwrap();
+    dataset
+        .object_store
+        .copy(&canonical, &staging)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&canonical).await.unwrap();
+    let size = dataset.object_store.size(&staging).await.unwrap();
+    store
+        .put_if_exists("", detached, staging.as_ref(), size, None)
+        .await
+        .unwrap();
+
+    // The first version expires, so only the detached version references its
+    // data file.
+    let latest = InsertBuilder::new(dataset.clone())
+        .with_params(&params(WriteMode::Overwrite))
+        .execute(vec![id_batch(200)])
+        .await
+        .unwrap();
+    if finalized_during_cleanup {
+        *store.finalize_on_lookup.lock().unwrap() =
+            Some((detached, dataset.object_store.clone(), canonical.clone()));
+    }
+    cleanup_old_versions(
+        &latest,
+        CleanupPolicyBuilder::default()
+            .before_timestamp(chrono::Utc::now())
+            .delete_unverified(true)
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let kept = if finalized_during_cleanup {
+        assert!(store.finalize_on_lookup.lock().unwrap().is_none());
+        &canonical
+    } else {
+        &staging
+    };
+    assert!(dataset.object_store.exists(kept).await.unwrap());
+    assert_eq!(scanned_rows(&latest, detached).await, 200);
 }
 
 #[tokio::test]

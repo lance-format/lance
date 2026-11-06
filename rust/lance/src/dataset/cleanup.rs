@@ -539,21 +539,14 @@ fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: 
         && error.is_not_found()
 }
 
-/// The files a scan of a fragment's blob descriptors reads from the dataset's own
-/// base: its deletion file and every data file holding a blob field. A file in
-/// another base is `None`.
+/// The data files of a fragment that hold its blob descriptors: every data file
+/// holding a blob field, `None` for one in another base.
 struct BlobDescriptorFiles {
-    deletion: Option<Path>,
     data: Vec<Option<Path>>,
 }
 
 impl BlobDescriptorFiles {
     fn new(dataset: &Dataset, fragment: &Fragment, blob_field_ids: &[i32]) -> Self {
-        let deletion = fragment
-            .deletion_file
-            .as_ref()
-            .filter(|deletion| deletion.base_id.is_none() && deletion.inline.is_none())
-            .map(|deletion| deletion_file_path(&dataset.base, fragment.id, deletion));
         let data = fragment
             .files
             .iter()
@@ -564,18 +557,13 @@ impl BlobDescriptorFiles {
                     .then(|| dataset.data_dir().join(file.path.as_str()))
             })
             .collect();
-        Self { deletion, data }
+        Self { data }
     }
 
-    /// Whether the descriptors can no longer be read: the deletion file is gone, or
-    /// so is every data file holding a blob field. A file in another base counts
-    /// as present.
+    /// Whether the descriptors are gone: every data file holding a blob field is
+    /// missing. A file in another base counts as present. A missing deletion file
+    /// does not count, since the data files still hold the descriptors.
     async fn removed(&self, store: &ObjectStore) -> Result<bool> {
-        if let Some(deletion) = &self.deletion
-            && !store.exists(deletion).await?
-        {
-            return Ok(true);
-        }
         if self.data.is_empty() {
             return Ok(false);
         }
@@ -1116,15 +1104,36 @@ impl<'a> CleanupTask<'a> {
         let commit_handler = &self.dataset.commit_handler;
         let object_store = &self.dataset.object_store;
         // A staging copy of a detached manifest shares its name prefix and is deleted
-        // once the commit is finalized, so only the canonical path is read. A version
-        // that exists only as a staging copy named by its external store record is
-        // protected only if the store lists it with the attached manifests.
+        // once the commit is finalized. It is the version's manifest only while the
+        // commit handler names it, as when the copy to the canonical path failed.
+        // If the handler no longer names a listed copy, the version may have been
+        // finalized after the listing passed its canonical path, so that path is
+        // read if it exists.
         let detached = commit_handler
             .list_detached_manifest_locations(base, object_store)
-            .try_filter(move |location| {
-                future::ready(
-                    location.path == ManifestNamingScheme::V2.manifest_path(base, location.version),
-                )
+            .try_filter_map(move |location| async move {
+                let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
+                if location.path == canonical
+                    || commit_handler
+                        .is_manifest_path_authoritative(
+                            base,
+                            location.version,
+                            &location.path,
+                            object_store.inner.as_ref(),
+                        )
+                        .await?
+                {
+                    return Ok(Some(location));
+                }
+                Ok(object_store
+                    .exists(&canonical)
+                    .await?
+                    .then_some(ManifestLocation {
+                        path: canonical,
+                        size: None,
+                        e_tag: None,
+                        ..location
+                    }))
             });
         commit_handler
             .list_manifest_locations(base, object_store, false)
@@ -1164,8 +1173,9 @@ impl<'a> CleanupTask<'a> {
         bases.sort_unstable();
         let owner_base_ids = self.parent_base_ids(&dataset.manifest);
         // Earlier releases removed files that only detached versions referenced. When
-        // a detached fragment's blob descriptors cannot be read, this version stops
-        // protecting that fragment's managed blobs instead of failing every cleanup.
+        // every data file holding a detached fragment's blob fields is gone, this
+        // version stops protecting that fragment's managed blobs; any other missing
+        // file fails cleanup naming the version.
         let detached_manifest = is_detached_version(dataset.manifest.version)
             .then(|| dataset.manifest_location().path.clone());
         stream::iter(dataset.get_fragments())
@@ -1259,7 +1269,7 @@ impl<'a> CleanupTask<'a> {
                                         fragment_id,
                                         error = %error,
                                         "Not protecting the managed blobs of a detached version's \
-                                         fragment whose blob descriptors cannot be read"
+                                         fragment whose blob data files are gone"
                                     );
                                     Ok(false)
                                 }
@@ -7675,6 +7685,12 @@ mod tests {
     struct IdentifiedStore {
         rows: Mutex<HashMap<u64, (String, u64, String)>>,
         next_identity: std::sync::atomic::AtomicU64,
+        /// Whether `list_versions` reports that the store cannot list its records,
+        /// so the manifests are listed from the object store.
+        is_unlisted: bool,
+        /// A version whose first lookup finalizes it first, as a checkout by its
+        /// owner would: the recorded copy moves to the given canonical path.
+        finalize_on_lookup: Mutex<Option<(u64, Arc<ObjectStore>, Path)>>,
     }
 
     #[async_trait::async_trait]
@@ -7693,6 +7709,20 @@ mod tests {
             _base_uri: &str,
             version: u64,
         ) -> Result<ManifestLocation> {
+            let finalize = {
+                let mut finalize = self.finalize_on_lookup.lock().unwrap();
+                finalize
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| *pending == version)
+                    .then(|| finalize.take())
+                    .flatten()
+            };
+            if let Some((_, object_store, canonical)) = finalize {
+                let staging = Path::parse(&self.rows.lock().unwrap()[&version].0).unwrap();
+                object_store.copy(&staging, &canonical).await?;
+                self.rows.lock().unwrap().get_mut(&version).unwrap().0 = canonical.to_string();
+                object_store.delete(&staging).await?;
+            }
             let row = self
                 .rows
                 .lock()
@@ -7717,6 +7747,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
+                .filter(|(version, _)| !is_detached_version(**version))
                 .max_by_key(|(version, _)| **version)
                 .map(|(version, row)| (*version, row.0.clone())))
         }
@@ -7790,6 +7821,9 @@ mod tests {
             base_uri: &str,
             since: Option<u64>,
         ) -> Result<Option<Vec<ManifestLocation>>> {
+            if self.is_unlisted {
+                return Ok(None);
+            }
             let versions: Vec<u64> = self.rows.lock().unwrap().keys().copied().collect();
             let mut locations = Vec::new();
             for version in versions {
