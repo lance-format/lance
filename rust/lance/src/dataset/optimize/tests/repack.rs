@@ -215,14 +215,18 @@ async fn repack_keeps_scalar_index() {
 }
 
 /// An index built before a repack and committed after it keeps its coverage,
-/// since the repack only moved the values the index read. When the repack's
-/// version has been cleaned up the rebase cannot tell, so the coverage of the
-/// files it replaced is withdrawn.
+/// since the repack only moved the values the index read. When a version
+/// before the repack has been cleaned up, it may have changed those values, so
+/// the coverage of the files the repack wrote is withdrawn.
 #[rstest]
-#[case::complete_history(false, vec![0, 1])]
-#[case::cleaned_history(true, vec![])]
+#[case::complete_history(false, vec![0, 1], "d = 6")]
+#[case::update_cleaned_up(true, vec![], "d = 100")]
 #[tokio::test]
-async fn index_built_across_a_repack(#[case] clean_history: bool, #[case] coverage: Vec<u32>) {
+async fn index_built_across_a_repack(
+    #[case] update_cleaned_up: bool,
+    #[case] coverage: Vec<u32>,
+    #[case] filter: &str,
+) {
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::write::CommitBuilder;
 
@@ -246,14 +250,17 @@ async fn index_built_across_a_repack(#[case] clean_history: bool, #[case] covera
     );
 
     let mut latest = stale.clone();
+    if update_cleaned_up {
+        write_new_value_of_d(&mut latest, NewValueOfD::InPlaceUpdate).await;
+    }
+    let updated = latest.manifest.version;
     compact_files(&mut latest, repack_options(Some(1)), None)
         .await
         .unwrap();
-    if clean_history {
-        let repacked = latest.manifest.version;
-        let latest = CommitBuilder::new(Arc::new(latest))
+    if update_cleaned_up {
+        let latest = CommitBuilder::new(Arc::new(latest.clone()))
             .execute(Transaction::new(
-                repacked,
+                latest.manifest.version,
                 Operation::ReserveFragments { num_fragments: 1 },
                 None,
             ))
@@ -262,7 +269,7 @@ async fn index_built_across_a_repack(#[case] clean_history: bool, #[case] covera
         latest
             .cleanup(
                 CleanupPolicyBuilder::default()
-                    .versions(vec![stale.manifest.version, repacked])
+                    .versions(vec![stale.manifest.version, updated])
                     .unwrap()
                     .build(),
             )
@@ -280,7 +287,7 @@ async fn index_built_across_a_repack(#[case] clean_history: bool, #[case] covera
         index.fragment_bitmap.unwrap(),
         RoaringBitmap::from_iter(coverage)
     );
-    assert_eq!(dataset.count_rows(Some("d = 6".into())).await.unwrap(), 1);
+    assert_eq!(dataset.count_rows(Some(filter.into())).await.unwrap(), 1);
 }
 
 /// `drop_columns` leaves a dropped column's id in its file. A repack that
