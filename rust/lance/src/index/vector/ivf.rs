@@ -3537,7 +3537,7 @@ where
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5483,7 +5483,7 @@ async fn finish_streaming_ivf_training<T>(
     training_result: Result<T>,
     progress_tx: mpsc::UnboundedSender<u64>,
     on_progress: KMeansProgressCallback,
-    progress_worker: tokio::task::JoinHandle<Result<()>>,
+    progress_worker: lance_core::utils::tokio::JoinHandle<Result<()>>,
     trainer_name: &str,
 ) -> Result<T> {
     drop(progress_tx);
@@ -5616,7 +5616,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
@@ -5841,7 +5841,7 @@ async fn train_streaming_ivf_model(
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
         let progress = progress.clone();
-        tokio::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             while let Some(iter) = progress_rx.recv().await {
                 progress.stage_progress("train_ivf", iter).await?;
             }
