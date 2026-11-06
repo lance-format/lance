@@ -235,15 +235,11 @@ mod tests {
                 local: 1,
                 base: BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
             }),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(4),
-                field_ids: vec![FieldRef::Committed(7), FieldRef::Committed(8)],
-                data_change: true,
-            }),
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(5),
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(4),
+                vec![FieldRef::Committed(7), FieldRef::Committed(8)],
+            )),
+            Action::RemoveFragment(RemoveFragment::new(Ref::Committed(5))),
             Action::SetDeletionFile(SetDeletionFile {
                 fragment: 6,
                 deletion_file: Some(DeletionFile {
@@ -309,11 +305,9 @@ mod tests {
                 dataset_version: Some(3),
                 data_change: false,
             }),
-            Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: Uuid::from_u128(8),
-                name: "by_a".into(),
-                data_change: true,
-            }),
+            Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new(Uuid::from_u128(8), "by_a").unwrap(),
+            ),
             Action::DropIndex(DropIndex {
                 name: "by_c".into(),
             }),
@@ -392,12 +386,9 @@ mod tests {
     fn test_data_change_is_absent_when_true() {
         // Absent means "real change" on the wire, so the common case costs no
         // bytes and an old field-less writer is read correctly.
-        let message = pb_actions::RemoveFragment::from(&RemoveFragment {
-            fragment: Ref::Committed(1),
-            data_change: true,
-        });
+        let message = pb_actions::RemoveFragment::from(&RemoveFragment::new(Ref::Committed(1)));
         assert_eq!(message.data_change, None);
-        assert!(RemoveFragment::try_from(message).unwrap().data_change);
+        assert!(RemoveFragment::try_from(message).unwrap().is_data_change());
     }
 
     #[test]

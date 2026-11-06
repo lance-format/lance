@@ -124,11 +124,6 @@ impl AddDataFile {
         &self.field_ids
     }
 
-    /// Whether the file changes the values its fields hold.
-    pub fn data_change(&self) -> bool {
-        self.data_change
-    }
-
     /// The base path the file lives under, or `None` for the dataset's own
     /// data directory.
     pub fn base(&self) -> Option<Ref> {
@@ -224,7 +219,8 @@ impl AddDataFile {
         Ok(())
     }
 
-    pub(super) fn is_data_change(&self) -> bool {
+    /// Whether the file changes the values its fields hold.
+    pub fn is_data_change(&self) -> bool {
         self.data_change
     }
 
@@ -662,11 +658,10 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(0)],
+                )),
                 add_file_for_field_zero(),
             ],
         )

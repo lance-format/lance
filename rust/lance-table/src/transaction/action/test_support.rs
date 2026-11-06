@@ -270,10 +270,7 @@ pub(super) mod frag_reuse {
         let mut actions: Vec<Action> = sources
             .iter()
             .map(|&source| {
-                Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(source),
-                    data_change: false,
-                })
+                Action::RemoveFragment(RemoveFragment::new_unchecked(Ref::Committed(source), false))
             })
             .collect();
         let versions = || {

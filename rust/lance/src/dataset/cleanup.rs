@@ -8151,10 +8151,10 @@ mod tests {
             let mut actions = Vec::new();
             if remove_sources {
                 actions.extend(transition.sources.iter().map(|source| {
-                    Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(source.id),
-                        data_change: false,
-                    })
+                    Action::RemoveFragment(RemoveFragment::new_unchecked(
+                        Ref::Committed(source.id),
+                        false,
+                    ))
                 }));
             }
             for destination in destinations {

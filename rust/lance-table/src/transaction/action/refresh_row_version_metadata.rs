@@ -498,10 +498,9 @@ mod tests {
     fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
         let ours = footprint(vec![refresh_rows(0, &[1])]);
         let removal = |fragment: u64| {
-            footprint(vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(fragment),
-                data_change: true,
-            })])
+            footprint(vec![Action::RemoveFragment(RemoveFragment::new(
+                Ref::Committed(fragment),
+            ))])
         };
 
         assert!(ours.conflicts_with(&removal(0)));
@@ -513,11 +512,13 @@ mod tests {
     fn rewrite_field_zero(fragment: Ref, data_change: bool) -> Vec<Action> {
         let mut actions = Vec::new();
         if fragment.committed().is_some() {
-            actions.push(Action::TombstoneFieldData(TombstoneFieldData {
-                fragment,
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change,
-            }));
+            actions.push(Action::TombstoneFieldData(
+                TombstoneFieldData::new_unchecked(
+                    fragment,
+                    vec![FieldRef::Committed(0)],
+                    data_change,
+                ),
+            ));
         }
         actions.push(Action::AddDataFile(
             AddDataFile::try_new_unchecked(

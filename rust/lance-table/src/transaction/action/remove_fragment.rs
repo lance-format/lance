@@ -14,12 +14,41 @@ use lance_core::{Error, Result};
 /// compaction.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct RemoveFragment {
-    pub fragment: Ref,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
-    pub data_change: bool,
+    fragment: Ref,
+    data_change: bool,
 }
 
 impl RemoveFragment {
+    /// Remove `fragment` and every row in it.
+    pub fn new(fragment: Ref) -> Self {
+        Self {
+            fragment,
+            data_change: true,
+        }
+    }
+
+    /// Remove `fragment`, saying whether its rows leave the dataset.
+    ///
+    /// `data_change = true` is the same as [`new`](Self::new).
+    ///
+    /// # Contract
+    ///
+    /// With `data_change = false` the caller certifies, and nothing downstream
+    /// checks, that every row of the fragment is added back by an
+    /// [`AddFragment`](super::AddFragment) in the same operation, unchanged and
+    /// with its lineage, as a compaction does.
+    pub fn new_unchecked(fragment: Ref, data_change: bool) -> Self {
+        Self {
+            fragment,
+            data_change,
+        }
+    }
+
+    /// The fragment removed.
+    pub fn fragment(&self) -> Ref {
+        self.fragment
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if !state.remove_fragment(fragment_id, self.data_change) {
@@ -30,7 +59,9 @@ impl RemoveFragment {
         Ok(())
     }
 
-    pub(super) fn is_data_change(&self) -> bool {
+    /// Whether the fragment's rows leave the dataset. See
+    /// [`new_unchecked`](Self::new_unchecked).
+    pub fn is_data_change(&self) -> bool {
         self.data_change
     }
 
@@ -56,10 +87,10 @@ impl TryFrom<pb_actions::RemoveFragment> for RemoveFragment {
     type Error = Error;
 
     fn try_from(message: pb_actions::RemoveFragment) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "RemoveFragment.fragment")?.try_into()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
+        Ok(Self::new_unchecked(
+            required(message.fragment, "RemoveFragment.fragment")?.try_into()?,
+            data_change_from_wire(message.data_change),
+        ))
     }
 }
 
@@ -73,10 +104,9 @@ mod tests {
     fn test_remove_fragment() {
         let next = apply(
             &backed_manifest(),
-            vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(0),
-                data_change: true,
-            })],
+            vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                0,
+            )))],
         )
         .unwrap();
 
@@ -96,10 +126,7 @@ mod tests {
                     created_at_version_meta: None,
                     data_change: true,
                 })),
-                Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Local(0),
-                    data_change: true,
-                }),
+                Action::RemoveFragment(RemoveFragment::new(Ref::Local(0))),
             ],
         )
         .unwrap();
@@ -114,10 +141,9 @@ mod tests {
     fn test_remove_fragment_rejects_a_missing_fragment() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(7),
-                data_change: true,
-            })],
+            vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                7,
+            )))],
         )
         .unwrap_err();
 

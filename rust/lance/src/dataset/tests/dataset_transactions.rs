@@ -3023,10 +3023,9 @@ mod composite {
         let error = CommitBuilder::new(Arc::new(dataset))
             .execute(composite_txn(
                 read_version,
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(0),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    0,
+                )))],
             ))
             .await
             .unwrap_err();
@@ -3192,10 +3191,9 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(removed),
-                data_change: true,
-            })],
+            vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                removed,
+            )))],
         )
         .await;
 
@@ -3371,11 +3369,10 @@ mod composite {
                 ),
                 // The same commit then replaces the data it just added, naming the
                 // fragment by the token it was minted under.
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Local(0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Local(0),
+                    vec![FieldRef::Committed(0)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -3658,11 +3655,10 @@ mod composite {
                 read_version,
                 Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                     "step",
-                    vec![Action::TombstoneFieldData(TombstoneFieldData {
-                        fragment: Ref::Committed(fragment_id),
-                        field_ids: vec![FieldRef::Committed(0)],
-                        data_change: true,
-                    })],
+                    vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                        Ref::Committed(fragment_id),
+                        vec![FieldRef::Committed(0)],
+                    ))],
                 )])),
                 None,
             )
@@ -3738,11 +3734,10 @@ mod composite {
         let source_id = dataset.schema().field(source).unwrap().id;
 
         let mut actions = vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment_id),
-                field_ids: vec![FieldRef::Committed(target_id)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(fragment_id),
+                vec![FieldRef::Committed(target_id)],
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(fragment_id),
@@ -4164,11 +4159,10 @@ mod composite {
         let updated = commit(
             original,
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(fragment_id),
-                    field_ids: fields.clone(),
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(fragment_id),
+                    fields.clone(),
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(fragment_id),
@@ -4435,11 +4429,9 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::RemoveIndexSegment(RemoveIndexSegment {
-                    uuid: old_uuid,
-                    name: "by_a".into(),
-                    data_change: false,
-                }),
+                Action::RemoveIndexSegment(
+                    RemoveIndexSegment::try_new_unchecked(old_uuid, "by_a", false).unwrap(),
+                ),
                 Action::AddIndexSegment(new),
             ],
         )
@@ -4536,11 +4528,10 @@ mod composite {
     /// rewrite does.
     fn rewrite_field_zero(file: DataFile) -> Vec<Action> {
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(0),
@@ -4756,11 +4747,10 @@ mod composite {
         let rewritten = commit(
             dataset,
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(1),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(1),
+                    vec![FieldRef::Committed(0)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(1),
@@ -5087,11 +5077,10 @@ mod composite {
             vec![
                 // Rewriting a column in place leaves the rows where they are, so
                 // nothing else in the commit says when they last changed.
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(rewritten),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(rewritten),
+                    vec![FieldRef::Committed(0)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(rewritten),
@@ -5377,11 +5366,11 @@ mod composite {
         let read_version = original.version().version;
         let overlay = vec![overlay_action(&original, fragment)];
         let reencode = vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(fragment),
+                vec![FieldRef::Committed(0)],
+                false,
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(fragment),
@@ -5557,10 +5546,10 @@ mod composite {
             let mut actions: Vec<Action> = sources
                 .iter()
                 .map(|source| {
-                    Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(*source),
-                        data_change: false,
-                    })
+                    Action::RemoveFragment(RemoveFragment::new_unchecked(
+                        Ref::Committed(*source),
+                        false,
+                    ))
                 })
                 .collect();
             actions.push(Action::AddFragment(AddFragment::new_unchecked(
@@ -5744,10 +5733,9 @@ mod composite {
             let segment = build_segment(&dataset, vec![0, 1]).await;
             let deleted = commit(
                 dataset,
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(0),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    0,
+                )))],
             )
             .await;
             drop(deleted);
@@ -5794,10 +5782,10 @@ mod composite {
             sources
                 .iter()
                 .map(|source| {
-                    Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(*source),
-                        data_change: false,
-                    })
+                    Action::RemoveFragment(RemoveFragment::new_unchecked(
+                        Ref::Committed(*source),
+                        false,
+                    ))
                 })
                 .collect()
         }

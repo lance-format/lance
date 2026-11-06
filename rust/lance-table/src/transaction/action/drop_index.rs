@@ -236,11 +236,9 @@ mod tests {
     #[test]
     fn test_an_optimize_and_a_concurrent_append_and_index_do_not_conflict() {
         let optimize = footprint(vec![
-            Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: Uuid::from_u128(1),
-                name: "by_a".into(),
-                data_change: false,
-            }),
+            Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new_unchecked(Uuid::from_u128(1), "by_a", false).unwrap(),
+            ),
             add_segment("by_a", vec![Ref::Committed(0)]),
         ]);
         let append = footprint(append_and_index("by_a"));

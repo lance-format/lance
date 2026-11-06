@@ -157,11 +157,10 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &table(3, false),
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(0)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),

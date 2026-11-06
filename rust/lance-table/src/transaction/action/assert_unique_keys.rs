@@ -401,11 +401,10 @@ mod tests {
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
         let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-            })])
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(field)],
+            ))])
         };
 
         assert!(ours.conflicts_with(&rewrite(0)));
@@ -494,10 +493,9 @@ mod tests {
             append(0),
             assertion(vec![FieldRef::Committed(0)], &[1]),
         ]);
-        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(3),
-            data_change: true,
-        })]);
+        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment::new(
+            Ref::Committed(3),
+        ))]);
 
         assert!(!ours.conflicts_with(&removal));
     }

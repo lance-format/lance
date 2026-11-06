@@ -1539,11 +1539,10 @@ mod tests {
             Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "replace field 0",
                 vec![
-                    Action::TombstoneFieldData(TombstoneFieldData {
-                        fragment: Ref::Committed(0),
-                        field_ids: vec![FieldRef::Committed(0)],
-                        data_change: true,
-                    }),
+                    Action::TombstoneFieldData(TombstoneFieldData::new(
+                        Ref::Committed(0),
+                        vec![FieldRef::Committed(0)],
+                    )),
                     Action::AddDataFile(
                         AddDataFile::try_new_unchecked(
                             Ref::Committed(0),
@@ -1704,11 +1703,10 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(rewritten)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(rewritten)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),
@@ -1757,11 +1755,10 @@ mod tests {
         let result = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(0)],
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),
@@ -1850,10 +1847,7 @@ mod tests {
     }
 
     fn remove_fragment_zero() -> Action {
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
-            data_change: true,
-        })
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))
     }
 
     fn drop_field_zero() -> Action {
@@ -1893,11 +1887,10 @@ mod tests {
     #[case::tombstone_after_remove(
         vec![vec![
             remove_fragment_zero(),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
         ]],
         Some("TombstoneFieldData targets fragment 0, which does not exist"),
     )]
@@ -1987,11 +1980,10 @@ mod tests {
     /// A reserved id names a column of one data file, never a field of the
     /// schema, so only the action that binds a file's columns accepts one.
     #[rstest]
-    #[case::tombstone(Action::TombstoneFieldData(TombstoneFieldData {
-        fragment: Ref::Committed(0),
-        field_ids: vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
-        data_change: true,
-    }))]
+    #[case::tombstone(Action::TombstoneFieldData(TombstoneFieldData::new(
+        Ref::Committed(0),
+        vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
+    )))]
     #[case::drop(Action::DropField(DropField {
         field: FieldRef::Committed(ROW_ID_FIELD_ID),
     }))]
@@ -2298,11 +2290,8 @@ mod tests {
         "fragment 1",
     )]
     #[case::remove_fragment(
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(1),
-            data_change: true,
-        }),
-        "fragment 1",
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
+        "fragment 1"
     )]
     #[case::data_file_for_a_field(write_data(Ref::Committed(0), FieldRef::Committed(1)), "field 1")]
     #[case::data_file_under_a_base(
@@ -2501,11 +2490,9 @@ mod tests {
         dataset_version: None,
         data_change: false,
     }))]
-    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
-        uuid,
-        name: FRAG_REUSE_INDEX_NAME.into(),
-        data_change: false,
-    }))]
+    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(
+        RemoveIndexSegment::try_new_unchecked(uuid, FRAG_REUSE_INDEX_NAME, false).unwrap(),
+    ))]
     #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(AdjustIndexCoverage {
         uuid,
         name: FRAG_REUSE_INDEX_NAME.into(),

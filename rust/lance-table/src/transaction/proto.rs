@@ -1116,10 +1116,7 @@ mod tests {
         composite(
             (0..100)
                 .map(|id| {
-                    Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(id),
-                        data_change: false,
-                    })
+                    Action::RemoveFragment(RemoveFragment::new_unchecked(Ref::Committed(id), false))
                 })
                 .chain(mint_wide_fragments(10, false))
                 .collect(),

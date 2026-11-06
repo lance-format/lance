@@ -173,11 +173,10 @@ mod tests {
 
     fn rewrite(fragment: u64, field: i32) -> Vec<Action> {
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(fragment),
+                vec![FieldRef::Committed(field)],
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(fragment),
@@ -236,7 +235,7 @@ mod tests {
     #[case::rewrote_the_field_there(rewrite(0, 1), true)]
     #[case::overlaid_the_field_there(vec![overlay(0, 1)], true)]
     #[case::removed_the_fragment(
-        vec![Action::RemoveFragment(RemoveFragment { fragment: Ref::Committed(0), data_change: true })],
+        vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))],
         true
     )]
     #[case::dropped_the_field(vec![Action::DropField(DropField { field: FieldRef::Committed(1) })], true)]

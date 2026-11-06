@@ -286,10 +286,7 @@ mod tests {
     )]
     #[case::source_removed_as_a_data_change(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
-            actions[1] = Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(1),
-                data_change: true,
-            });
+            actions[1] = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1)));
         },
         "data_change true"
     )]
@@ -318,7 +315,7 @@ mod tests {
                     file.file().clone(),
                     file.field_ids().to_vec(),
                     file.base(),
-                    file.data_change(),
+                    file.is_data_change(),
                 )
                 .unwrap();
             }

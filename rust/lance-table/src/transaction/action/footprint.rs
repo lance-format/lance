@@ -1181,11 +1181,11 @@ mod tests {
     /// carrying `data_change`.
     fn reencode(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment),
-                field_ids: vec![FieldRef::Committed(field)],
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(fragment),
+                vec![FieldRef::Committed(field)],
                 data_change,
-            }),
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(fragment),
@@ -1268,18 +1268,14 @@ mod tests {
     }
 
     fn tombstone(fragment: u64, fields: &[i32]) -> Action {
-        Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(fragment),
-            field_ids: fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
-            data_change: true,
-        })
+        Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(fragment),
+            fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
+        ))
     }
 
     fn remove_fragment(fragment: u64) -> Action {
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(fragment),
-            data_change: true,
-        })
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(fragment)))
     }
 
     fn set_deletion_file(fragment: u64) -> Action {

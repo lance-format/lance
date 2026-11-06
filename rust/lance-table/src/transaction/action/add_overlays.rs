@@ -393,11 +393,13 @@ mod tests {
     ) {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
         let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change,
-            })])
+            footprint(vec![Action::TombstoneFieldData(
+                TombstoneFieldData::new_unchecked(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(field)],
+                    data_change,
+                ),
+            )])
         };
 
         assert_eq!(overlaid.conflicts_with(&rewrite(0)), data_change);
@@ -466,18 +468,16 @@ mod tests {
     fn test_a_full_write_in_the_same_set_dominates_a_partial_one() {
         let materialize = footprint(vec![
             add(Ref::Committed(0), vec![overlay("a.lance", &[0])]),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
         ]);
         let other_overlay = footprint(vec![add(Ref::Committed(0), vec![overlay("b.lance", &[0])])]);
-        let other_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(1)],
-            data_change: true,
-        })]);
+        let other_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(1)],
+        ))]);
 
         assert!(materialize.conflicts_with(&other_overlay));
         assert!(other_overlay.conflicts_with(&materialize));
@@ -638,11 +638,10 @@ mod tests {
         partly_tombstoned.data_file.column_indices = vec![0, 1].into();
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![partly_tombstoned])]);
         let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-            })])
+            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(field)],
+            ))])
         };
         let drop_field_zero = footprint(vec![Action::DropField(DropField {
             field: FieldRef::Committed(0),
@@ -829,10 +828,9 @@ mod tests {
     #[test]
     fn test_overlaying_a_fragment_a_concurrent_writer_removes_conflicts() {
         let ours = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let theirs = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
-            data_change: true,
-        })]);
+        let theirs = footprint(vec![Action::RemoveFragment(RemoveFragment::new(
+            Ref::Committed(0),
+        ))]);
 
         assert!(ours.conflicts_with(&theirs));
         assert!(theirs.conflicts_with(&ours));

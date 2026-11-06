@@ -959,11 +959,9 @@ mod tests {
             &manifest,
             vec![
                 Action::AddIndexSegment(segment("other", vec![FieldRef::Committed(0)])),
-                Action::RemoveIndexSegment(RemoveIndexSegment {
-                    uuid: removed,
-                    name: "mixed".into(),
-                    data_change: false,
-                }),
+                Action::RemoveIndexSegment(
+                    RemoveIndexSegment::try_new_unchecked(removed, "mixed", false).unwrap(),
+                ),
             ],
             existing.clone(),
         )
@@ -1309,11 +1307,11 @@ mod tests {
         #[case] expected_bitmap: Option<RoaringBitmap>,
     ) {
         let rewrite = vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
                 data_change,
-            }),
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(0),
@@ -1377,11 +1375,10 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-        })]);
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(0)],
+        ))]);
 
         assert!(
             build.conflicts_with(&rewrite),
@@ -1400,11 +1397,11 @@ mod tests {
     fn test_a_build_does_not_conflict_with_a_reencode() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let reencode = footprint(vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+                false,
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(0),
@@ -1431,11 +1428,10 @@ mod tests {
         segment.covering_fields = vec![FieldRef::Committed(1)];
         let build = index_footprint(segment);
 
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(1)],
-            data_change: true,
-        })]);
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(1)],
+        ))]);
 
         assert!(build.conflicts_with(&rewrite));
     }
@@ -1529,10 +1525,10 @@ mod tests {
     #[case::whole_fragment_deletion(true)]
     fn test_a_build_does_not_conflict_with_removing_a_covered_fragment(#[case] data_change: bool) {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
+        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
+            Ref::Committed(0),
             data_change,
-        })]);
+        ))]);
 
         assert!(!build.conflicts_with(&removal));
         assert!(!removal.conflicts_with(&build));
@@ -1545,15 +1541,11 @@ mod tests {
     fn test_a_build_still_conflicts_with_an_in_place_write_beside_a_removal() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let write = footprint(vec![
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(1),
-                data_change: true,
-            }),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
         ]);
 
         assert!(build.conflicts_with(&write));

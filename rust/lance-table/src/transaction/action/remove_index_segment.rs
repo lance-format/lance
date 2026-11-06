@@ -18,26 +18,71 @@ use uuid::Uuid;
 /// also removes any segment a concurrent writer added under the name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoveIndexSegment {
-    /// The segment to remove.
-    pub uuid: Uuid,
-    /// The logical index the segment belongs to. Not needed to find the
-    /// segment, which the uuid names outright; carried so apply can reject a
-    /// removal that was planned against a different set of segments.
-    pub name: String,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
-    pub data_change: bool,
+    uuid: Uuid,
+    name: String,
+    data_change: bool,
 }
 
 impl RemoveIndexSegment {
+    /// Remove segment `uuid` of the logical index `name`, as a data change.
+    ///
+    /// `name` is not needed to find the segment, which the uuid names
+    /// outright; it is carried so apply can reject a removal that was planned
+    /// against a different set of segments.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`.
+    pub fn try_new(uuid: Uuid, name: impl Into<String>) -> Result<Self> {
+        Self::try_new_unchecked(uuid, name, true)
+    }
+
+    /// Remove segment `uuid` of the logical index `name`, saying whether a
+    /// reader sees rows leave. `data_change = true` is the same as
+    /// [`try_new`](Self::try_new).
+    ///
+    /// # Contract
+    ///
+    /// With `data_change = false` the caller certifies, and nothing downstream
+    /// checks, that the segment holds no rows a reader can see. That is true
+    /// of an ordinary index, which is derived state, and not of the MemWAL
+    /// index.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`.
+    pub fn try_new_unchecked(
+        uuid: Uuid,
+        name: impl Into<String>,
+        data_change: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            uuid,
+            name: non_empty(name.into(), "RemoveIndexSegment.name")?,
+            data_change,
+        })
+    }
+
+    /// The segment removed.
+    pub fn uuid(&self) -> Uuid {
+        self.uuid
+    }
+
+    /// The logical index the segment belongs to.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         reject_frag_reuse_history("RemoveIndexSegment", &self.name)?;
         state.remove_index_segment(self.uuid, &self.name)
     }
 
-    /// Left to the writer, for the same reason as
-    /// [`AddIndexSegment`](super::AddIndexSegment): an index is normally derived
-    /// state, but the MemWAL index holds rows a reader can see.
-    pub(super) fn is_data_change(&self) -> bool {
+    /// Whether a reader sees rows leave. Left to the writer, for the same
+    /// reason as [`AddIndexSegment`](super::AddIndexSegment): an index is
+    /// normally derived state, but the MemWAL index holds rows a reader can
+    /// see.
+    pub fn is_data_change(&self) -> bool {
         self.data_change
     }
 
@@ -71,11 +116,11 @@ impl TryFrom<pb_actions::RemoveIndexSegment> for RemoveIndexSegment {
     type Error = Error;
 
     fn try_from(message: pb_actions::RemoveIndexSegment) -> Result<Self> {
-        Ok(Self {
-            uuid: Uuid::try_from(&required(message.uuid, "RemoveIndexSegment.uuid")?)?,
-            name: non_empty(message.name, "RemoveIndexSegment.name")?,
-            data_change: data_change_from_wire(message.data_change),
-        })
+        Self::try_new_unchecked(
+            Uuid::try_from(&required(message.uuid, "RemoveIndexSegment.uuid")?)?,
+            message.name,
+            data_change_from_wire(message.data_change),
+        )
     }
 }
 
@@ -89,11 +134,9 @@ mod tests {
     use crate::transaction::test_support::sample_index_metadata;
 
     fn remove(uuid: Uuid, name: &str) -> Action {
-        Action::RemoveIndexSegment(RemoveIndexSegment {
-            uuid,
-            name: name.into(),
-            data_change: false,
-        })
+        Action::RemoveIndexSegment(
+            RemoveIndexSegment::try_new_unchecked(uuid, name, false).unwrap(),
+        )
     }
 
     #[test]

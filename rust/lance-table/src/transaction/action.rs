@@ -476,10 +476,7 @@ mod tests {
         });
         assert!(!alter.is_data_change(), "a rename changes no row values");
 
-        let remove = Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(3),
-            data_change: true,
-        });
+        let remove = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(3)));
         assert!(remove.is_data_change());
 
         // An index segment is derived state unless the writer says otherwise,
@@ -500,11 +497,14 @@ mod tests {
                 data_change,
             });
             assert_eq!(add.is_data_change(), data_change);
-            let remove = Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                data_change,
-            });
+            let remove = Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new_unchecked(
+                    uuid::Uuid::from_u128(1),
+                    "by_a",
+                    data_change,
+                )
+                .unwrap(),
+            );
             assert_eq!(remove.is_data_change(), data_change);
         }
 
@@ -527,23 +527,21 @@ mod tests {
         let operation = CompositeOperation::new(vec![
             UserStep::new(
                 "first",
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(1),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    1,
+                )))],
             ),
             UserStep::new(
                 "second",
-                vec![Action::RemoveFragment(RemoveFragment {
-                    fragment: Ref::Committed(2),
-                    data_change: true,
-                })],
+                vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(
+                    2,
+                )))],
             ),
         ]);
         let fragments = operation
             .iter_actions()
             .map(|action| match action {
-                Action::RemoveFragment(remove) => remove.fragment,
+                Action::RemoveFragment(remove) => remove.fragment(),
                 other => panic!("unexpected action {other}"),
             })
             .collect::<Vec<_>>();

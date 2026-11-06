@@ -498,10 +498,10 @@ mod tests {
             vec![],
         )]);
         let remove = |fragment: u64| {
-            footprint(vec![Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(fragment),
-                data_change: false,
-            })])
+            footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
+                Ref::Committed(fragment),
+                false,
+            ))])
         };
 
         // Either order: coverage of a fragment that is gone describes rows the
@@ -536,11 +536,10 @@ mod tests {
 
     fn rewrite(fragment: u64, field: i32) -> Vec<Action> {
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(fragment),
+                vec![FieldRef::Committed(field)],
+            )),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Committed(fragment),
