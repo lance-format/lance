@@ -6,10 +6,10 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField, Fields};
 use async_trait::async_trait;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::datatypes::{Field, Schema as LanceSchema};
@@ -19,7 +19,10 @@ use lance_core::utils::tracing::{
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::scalar::ScalarIndex;
-use lance_index::scalar::expression::{IndexInformationProvider, MultiQueryParser};
+use lance_index::scalar::expression::{
+    IndexInformationProvider, MultiQueryParser, ScalarIndexPlanner,
+};
+use lance_index::scalar::registry::ScalarIndexPlugin;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -262,6 +265,8 @@ pub struct ScalarIndexInfo {
     /// Indices that omit `fragment_bitmap` (legacy or unsupported) simply
     /// don't appear here and so report coverage as unknown.
     fragment_bitmaps: HashMap<(String, String), RoaringBitmap>,
+    /// One planner per index keyed on more than one column.
+    planners: Vec<Box<dyn ScalarIndexPlanner>>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
@@ -275,6 +280,10 @@ impl IndexInformationProvider for ScalarIndexInfo {
         self.fragment_bitmaps
             .get(&(column.to_string(), index_name.to_string()))
             .cloned()
+    }
+
+    fn planners(&self) -> &[Box<dyn ScalarIndexPlanner>] {
+        &self.planners
     }
 }
 
@@ -620,8 +629,26 @@ impl Dataset {
         indices: &[IndexMetadata],
         ignored_index_names: &HashSet<String>,
     ) -> Result<ScalarIndexInfo> {
+        self.scalar_index_info_with_plugins(indices, ignored_index_names, IndexDetails::get_plugin)
+            .await
+    }
+
+    // Production passes `IndexDetails::get_plugin`. Tests pass a lookup that
+    // adds plugins the process-wide registry lacks, so `plugin_for` stays until
+    // a registration API replaces `SCALAR_INDEX_PLUGIN_REGISTRY`.
+    pub(crate) async fn scalar_index_info_with_plugins(
+        &self,
+        indices: &[IndexMetadata],
+        ignored_index_names: &HashSet<String>,
+        plugin_for: impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    ) -> Result<ScalarIndexInfo> {
         let schema = self.schema();
+        // Legacy V1 scans materialize index results in `MaterializeIndexExec`,
+        // which panics on the `AtLeast` result a planner's search may return.
+        let registers_planners = self.manifest.data_storage_format.lance_file_format()
+            != lance_file::version::ConcreteFileVersion::V1;
         let mut indexed_fields = Vec::new();
+        let mut planners = BTreeMap::new();
         // (column, index_name) → union of every contributing IndexMetadata's
         // fragment_bitmap. Multiple entries can land here for delta-merged
         // indices that share a name. We only insert when every contributing
@@ -630,6 +657,9 @@ impl Dataset {
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
         for index in indices.iter().filter(|idx| {
             if ignored_index_names.contains(&idx.name) {
+                return false;
+            }
+            if idx.keyed_fields().len() > 1 && !registers_planners {
                 return false;
             }
 
@@ -649,29 +679,42 @@ impl Dataset {
             // Same name-collision rationale as `CreateIndexBuilder`'s
             // default-name loop in create.rs: only the keyed prefix decides
             // which column this index answers for.
-            idx.keyed_field().is_some() && (has_non_empty_bitmap || is_fts_index)
+            !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
         }) {
-            let field = index.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| {
-                Error::internal(format!(
-                    "Index referenced a field with id {field} which did not exist in the schema"
-                ))
-            })?;
+            let keys = index
+                .keyed_fields()
+                .iter()
+                .map(|&field| {
+                    let field = schema.field_by_id(field).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Index referenced a field with id {field} which did not exist in the schema"
+                        ))
+                    })?;
 
-            // Build the full field path for nested fields
-            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-                lance_core::datatypes::format_field_path(&field_refs)
-            } else {
-                field.name.clone()
-            };
+                    // Build the full field path for nested fields
+                    let field_path =
+                        if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+                            let field_refs: Vec<&str> =
+                                ancestors.iter().map(|f| f.name.as_str()).collect();
+                            lance_core::datatypes::format_field_path(&field_refs)
+                        } else {
+                            field.name.clone()
+                        };
+                    Ok(ArrowField::new(
+                        field_path,
+                        field.data_type(),
+                        field.nullable,
+                    ))
+                })
+                .collect::<Result<Fields>>()?;
+            let field_path = keys[0].name().clone();
 
             let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
             if index_details.is_vector() {
                 continue;
             }
 
-            let plugin = match index_details.get_plugin() {
+            let plugin = match plugin_for(&index_details) {
                 Ok(plugin) => plugin,
                 Err(e) => {
                     log::warn!(
@@ -684,28 +727,41 @@ impl Dataset {
                     continue;
                 }
             };
-            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
-
-            if let Some(query_parser) = query_parser {
-                // Union the per-segment fragment bitmap into this
-                // (column, index_name) entry. If any segment is missing a
-                // bitmap, downgrade the entry to None so callers know
-                // coverage is partial/unknown.
-                let key = (field_path.clone(), index.name.clone());
-                fragment_bitmaps
-                    .entry(key)
-                    .and_modify(|entry| {
-                        if let (Some(acc), Some(seg)) =
-                            (entry.as_mut(), index.fragment_bitmap.as_ref())
-                        {
-                            *acc |= seg;
-                        } else {
-                            *entry = None;
-                        }
-                    })
-                    .or_insert_with(|| index.fragment_bitmap.clone());
-                indexed_fields.push((field_path, (field.data_type(), query_parser)));
+            if keys.len() > 1 {
+                if !planners.contains_key(&index.name) {
+                    let planner = plugin.new_planner(index.name.clone(), &index_details.0, &keys);
+                    let Some(planner) = planner else {
+                        continue;
+                    };
+                    planners.insert(index.name.clone(), planner);
+                }
+            } else {
+                let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
+                let Some(query_parser) = query_parser else {
+                    continue;
+                };
+                indexed_fields.push((
+                    field_path.clone(),
+                    (keys[0].data_type().clone(), query_parser),
+                ));
             }
+
+            // Union the per-segment fragment bitmap into this
+            // (column, index_name) entry. If any segment is missing a
+            // bitmap, downgrade the entry to None so callers know
+            // coverage is partial/unknown.
+            let key = (field_path, index.name.clone());
+            fragment_bitmaps
+                .entry(key)
+                .and_modify(|entry| {
+                    if let (Some(acc), Some(seg)) = (entry.as_mut(), index.fragment_bitmap.as_ref())
+                    {
+                        *acc |= seg;
+                    } else {
+                        *entry = None;
+                    }
+                })
+                .or_insert_with(|| index.fragment_bitmap.clone());
         }
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {
@@ -736,6 +792,7 @@ impl Dataset {
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
             fragment_bitmaps,
+            planners: planners.into_values().collect(),
         })
     }
 
