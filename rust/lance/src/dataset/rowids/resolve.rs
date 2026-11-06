@@ -37,7 +37,8 @@ pub struct CachedPointHistory {
 
 /// Preserve the complete-index contract for bulk and ignore-deletions callers.
 /// A first live point can scan encoded sources directly; exact repeats cache
-/// their answer, and another distinct point promotes to the normal full map.
+/// their answer. While the generation's history remains cached, another distinct
+/// point promotes to the normal full map. Uncacheable sources stay uncached.
 pub async fn resolve_row_ids(
     dataset: &Dataset,
     row_ids: &[u64],
@@ -179,12 +180,12 @@ async fn resolve_point(dataset: &Dataset, row_id: u64) -> Result<Option<RowAddre
     let mut loaded_fragments = 0;
     while let Some(address) = addresses.try_next().await? {
         loaded_fragments += 1;
-        if let Some(address) = address {
-            if found.replace(address).is_some() {
-                return Err(Error::internal(format!(
-                    "row id index corrupt: stable row id {row_id} is live in multiple fragments"
-                )));
-            }
+        if let Some(address) = address
+            && found.replace(address).is_some()
+        {
+            return Err(Error::internal(format!(
+                "row id index corrupt: stable row id {row_id} is live in multiple fragments"
+            )));
         }
     }
     tracing::debug!(
@@ -208,6 +209,9 @@ async fn resolve_point(dataset: &Dataset, row_id: u64) -> Result<Option<RowAddre
 mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
+    use lance_table::format::{
+        ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    };
     use lance_table::rowids::RowIdSequence;
     use lance_table::rowids::version::RowDatasetVersionSequence;
     use lance_table::transaction::{Operation, Transaction};
@@ -215,8 +219,19 @@ mod tests {
 
     use super::*;
     use crate::dataset::ProjectionRequest;
-    use crate::dataset::rowids::{RowLineage, get_row_id_index, place_row_lineage};
+    use crate::dataset::rowids::{
+        RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index, place_row_lineage,
+    };
     use crate::dataset::write::CommitBuilder;
+    use crate::session::Session;
+
+    fn cold_dataset(mut dataset: Dataset) -> Dataset {
+        let session = Arc::new(Session::new(1 << 20, 0, dataset.session().store_registry()));
+        dataset.index_cache = Arc::new(session.index_cache.for_dataset(&dataset.uri));
+        dataset.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&dataset.uri));
+        dataset.session = session;
+        dataset
+    }
 
     async fn scan_address(dataset: &Dataset, value: i32) -> RowAddress {
         let mut scan = dataset.scan();
@@ -386,7 +401,34 @@ mod tests {
     async fn deleted_segment_copy_is_filtered_before_duplicate_validation() {
         let mut dataset = super::super::cache::tests::dataset(true).await;
         dataset.delete("i < 10").await.unwrap();
+        // Inline encoding preserves the two explicit segments. A spilled
+        // sequence is re-encoded and can combine them into an unsorted array.
+        dataset
+            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
+            .await
+            .unwrap();
         let mut fragments = dataset.manifest.fragments.as_ref().clone();
+        // Keep user columns in their existing file, but replace every old
+        // lineage reference before installing the new inline lineage.
+        for file in &mut fragments[0].files {
+            let (fields, columns): (Vec<_>, Vec<_>) = file
+                .fields
+                .iter()
+                .zip(file.column_indices.iter())
+                .filter(|(field, _)| {
+                    !matches!(
+                        **field,
+                        ROW_ID_FIELD_ID
+                            | ROW_CREATED_AT_VERSION_FIELD_ID
+                            | ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
+                    )
+                })
+                .map(|(field, column)| (*field, *column))
+                .unzip();
+            file.fields = fields.into();
+            file.column_indices = columns.into();
+        }
+        fragments[0].files.retain(|file| !file.fields.is_empty());
         let mut sequence = RowIdSequence::from(0..10);
         sequence.extend(RowIdSequence::from(0..10));
         let fragment_id = fragments[0].id as u32;
@@ -411,6 +453,7 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
+        dataset = cold_dataset(dataset);
         assert!(
             dataset
                 .index_cache
@@ -472,6 +515,7 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
+        dataset = cold_dataset(dataset);
         assert!(
             dataset
                 .index_cache
