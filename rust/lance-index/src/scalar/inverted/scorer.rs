@@ -10,6 +10,11 @@ use std::sync::Arc;
 // sum over all query_weight(query_token) * doc_weight(freq, doc_tokens)
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
+    /// Score contribution of one term hit. Implementations must be
+    /// non-increasing in `doc_tokens`: a zero-length document is the
+    /// upper-bound case, and bound-evaluation hot paths call this with a
+    /// placeholder length of zero. A scorer that rewarded longer documents
+    /// would understate those bounds and silently lose recall.
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
 
     /// Finite upper bound for every non-negative value returned by
