@@ -28,19 +28,15 @@ pub struct RowIdIndexBuildLocks {
     locks: Mutex<DatasetBuildLocks>,
 }
 
-type DatasetBuildLocks = HashMap<(String, bool), Weak<tokio::sync::Mutex<()>>>;
+type DatasetBuildLocks = HashMap<String, Weak<tokio::sync::Mutex<()>>>;
 
 impl RowIdIndexBuildLocks {
-    pub(super) fn for_dataset(
-        &self,
-        uri: &str,
-        with_deletions: bool,
-    ) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    pub(super) fn for_dataset(&self, uri: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.locks.lock().map_err(|error| {
             Error::internal(format!("row id index build lock poisoned: {error}"))
         })?;
         locks.retain(|_, lock| lock.strong_count() > 0);
-        let slot = locks.entry((uri.to_owned(), with_deletions)).or_default();
+        let slot = locks.entry(uri.to_owned()).or_default();
         if let Some(lock) = slot.upgrade() {
             return Ok(lock);
         }
@@ -55,19 +51,18 @@ impl DeepSizeOf for RowIdIndexBuildLocks {
         self.locks
             .lock()
             .map(|locks| {
-                locks.capacity()
-                    * std::mem::size_of::<((String, bool), Weak<tokio::sync::Mutex<()>>)>()
-                    + locks.keys().map(|(uri, _)| uri.capacity()).sum::<usize>()
+                locks.capacity() * std::mem::size_of::<(String, Weak<tokio::sync::Mutex<()>>)>()
+                    + locks.keys().map(|uri| uri.capacity()).sum::<usize>()
             })
             .unwrap_or(0)
     }
 }
 
 #[derive(Debug)]
-struct CachedFragment {
-    identity: InternalCacheKey,
-    span: Option<RangeInclusive<u64>>,
-    deletion_identity: Option<InternalCacheKey>,
+pub(super) struct CachedFragment {
+    pub(super) identity: InternalCacheKey,
+    pub(super) span: Option<RangeInclusive<u64>>,
+    pub(super) deletion_identity: Option<InternalCacheKey>,
 }
 
 /// Replacing this entry drops the cache's ownership of the previous view. Active
@@ -106,16 +101,48 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<R
     let lock = dataset
         .session()
         .row_id_index_builds
-        .for_dataset(&dataset.uri, with_deletions)?;
+        .for_dataset(&dataset.uri)?;
     let _guard = lock.lock().await;
     // Recheck after waiting: another dataset handle may have built this version.
-    let previous = dataset.index_cache.get_with_key(&key).await;
+    let mut previous = dataset.index_cache.get_with_key(&key).await;
     if let Some(cached) = &previous
         && cached.matches(dataset)
     {
         return Ok(cached.index.clone());
     }
-    let cached = Arc::new(build(dataset, with_deletions, previous.as_deref()).await?);
+    if previous.is_none() {
+        // Effective deletion fingerprints decide which prepared units are valid
+        // across modes; a mode change need not duplicate every unchanged unit.
+        previous = dataset
+            .index_cache
+            .get_with_key(&RowIdIndexKey {
+                with_deletions: !with_deletions,
+            })
+            .await;
+    }
+    let cached = if let Some((index, fragments)) =
+        super::resolve::promote_fragments(dataset, with_deletions).await?
+    {
+        tracing::debug!(
+            event = "row_id_index_build",
+            total_fragments = fragments.len(),
+            retained_fragments = fragments.len(),
+            loaded_fragments = 0,
+            prepared_fragments = 0,
+            "combined prepared row id fragments"
+        );
+        CachedRowIdIndex {
+            version: dataset.manifest.version,
+            e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
+                Error::internal("cached row id index requires a manifest generation token")
+            })?,
+            index: Arc::new(index),
+            fragments,
+        }
+    } else {
+        build(dataset, with_deletions, previous.as_deref()).await?
+    };
+    let cached = Arc::new(cached);
     let index = cached.index.clone();
     dataset.index_cache.insert_with_key(&key, cached).await;
     Ok(index)
@@ -264,7 +291,7 @@ pub(super) async fn build(
     })
 }
 
-fn deletion_identity(
+pub(super) fn deletion_identity(
     dataset: &Dataset,
     fragment: &Fragment,
     needs_deletions: bool,
@@ -341,7 +368,10 @@ fn write_base_identity(
     Ok(())
 }
 
-fn sequence_identity(dataset: &Dataset, fragment: &Fragment) -> Result<InternalCacheKey> {
+pub(super) fn sequence_identity(
+    dataset: &Dataset,
+    fragment: &Fragment,
+) -> Result<InternalCacheKey> {
     let row_id_meta = fragment.row_id_meta.as_ref().ok_or_else(|| {
         Error::internal(format!("fragment {} has no row id metadata", fragment.id))
     })?;
