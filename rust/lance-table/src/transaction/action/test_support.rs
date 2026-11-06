@@ -138,18 +138,21 @@ pub(super) fn nested_schema() -> Schema {
 pub(super) fn replace_field_data(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
     let field_ids = vec![FieldRef::Committed(field)];
     vec![
-        Action::TombstoneFieldData(super::TombstoneFieldData {
-            fragment: Ref::Committed(fragment),
-            field_ids: field_ids.clone(),
+        Action::TombstoneFieldData(super::TombstoneFieldData::new_unchecked(
+            Ref::Committed(fragment),
+            field_ids.clone(),
             data_change,
-        }),
-        Action::AddDataFile(super::AddDataFile {
-            fragment: Ref::Committed(fragment),
-            file: DataFile::new_unstarted("data/replaced.lance", ConcreteFileVersion::V2_0),
-            field_ids,
-            data_change,
-            base: None,
-        }),
+        )),
+        Action::AddDataFile(
+            super::AddDataFile::try_new_unchecked(
+                Ref::Committed(fragment),
+                DataFile::new_unstarted("data/replaced.lance", ConcreteFileVersion::V2_0),
+                field_ids,
+                None,
+                data_change,
+            )
+            .unwrap(),
+        ),
     ]
 }
 

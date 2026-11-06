@@ -3831,21 +3831,24 @@ mod composite {
 
     fn append_with_both_fields(dataset: &Dataset) -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 5,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: existing_data_file(dataset, 0),
-                field_ids: vec![FieldRef::Committed(0), FieldRef::Committed(1)],
-                data_change: true,
-                base: None,
-            }),
+            })),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    existing_data_file(dataset, 0),
+                    vec![FieldRef::Committed(0), FieldRef::Committed(1)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ]
     }
 
@@ -4190,18 +4193,20 @@ mod composite {
             .unwrap();
         assert_eq!(file.fields.as_ref(), &[0]);
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment_id),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment_id),
-                file: without_fields(file),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(fragment_id),
+                vec![FieldRef::Committed(0)],
+            )),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment_id),
+                    without_fields(file),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ]
     }
 

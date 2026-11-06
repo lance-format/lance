@@ -588,13 +588,16 @@ mod tests {
     }
 
     fn rearranged_data_file(data_change: bool) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment: Ref::Local(0),
-            file: one_column_file("data/moved.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Local(0),
+                one_column_file("data/moved.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                data_change,
+            )
+            .unwrap(),
+        )
     }
 
     /// A fragment added with `data_change = false` holds rows that were
@@ -606,9 +609,9 @@ mod tests {
     #[rstest]
     #[case::an_overlay(vec![
         rearranged_data_file(false),
-        Action::AddOverlays(crate::transaction::action::AddOverlays {
-            fragment: Ref::Local(0),
-            overlays: vec![crate::format::overlay::DataOverlayFile {
+        Action::AddOverlays(crate::transaction::action::AddOverlays::new_unchecked(
+            Ref::Local(0),
+            vec![crate::format::overlay::DataOverlayFile {
                 data_file: crate::format::DataFile::new(
                     "data/overlay.lance",
                     vec![0],
@@ -622,17 +625,15 @@ mod tests {
                 ),
                 committed_version: 0,
             }],
-            data_change: true,
-        }),
+        )),
     ], "AddOverlays")]
     #[case::a_changed_data_file(vec![rearranged_data_file(true)], "AddDataFile")]
     #[case::a_changing_tombstone(vec![
         rearranged_data_file(false),
-        Action::TombstoneFieldData(crate::transaction::action::TombstoneFieldData {
-            fragment: Ref::Local(0),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-        }),
+        Action::TombstoneFieldData(crate::transaction::action::TombstoneFieldData::new(
+            Ref::Local(0),
+            vec![FieldRef::Committed(0)],
+        )),
     ], "TombstoneFieldData")]
     fn test_a_rearranged_fragment_takes_no_data_change(
         #[case] writes: Vec<Action>,
@@ -640,7 +641,10 @@ mod tests {
     ) {
         let mut add = add_fragment(Ref::Local(0));
         if let Action::AddFragment(fragment) = &mut add {
-            fragment.data_change = false;
+            *fragment = AddFragment::new_unchecked(AddFragmentParts {
+                data_change: false,
+                ..fragment.parts().clone()
+            });
         }
         let mut actions = vec![add];
         actions.extend(writes);

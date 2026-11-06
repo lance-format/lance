@@ -381,7 +381,10 @@ mod tests {
     #[case::destination_added_as_a_data_change(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.data_change = true;
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    data_change: true,
+                    ..add.parts().clone()
+                });
             }
         },
         "adds with data_change true"
