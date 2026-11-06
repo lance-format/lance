@@ -69,9 +69,10 @@
 //! index in `OptimizeOptions::index_names` refuses instead.
 //!
 //! An unfiltered pass also skips an entire index when a segment cannot be
-//! translated through tagged fragment reuse, or its optional FTS tokenizer
-//! cannot be built by this process. Naming that index refuses instead. Storage
-//! failures opening supported segments still fail the optimization.
+//! translated through tagged fragment reuse. A single-process pass additionally
+//! skips indices whose FTS tokenizer cannot be built locally. Naming such an
+//! index refuses instead. Storage failures opening supported segments still
+//! fail the optimization.
 
 mod consolidate;
 
@@ -532,20 +533,24 @@ fn validate_partition_rebalancing_options(options: &OptimizeOptions) -> Result<(
 /// Plan the optimization of the dataset's indices.
 ///
 /// See the module documentation for what the plan contains and which indices
-/// it leaves alone.
+/// it leaves alone. Unbounded tasks load FTS tokenizers on workers; the driver
+/// does not need their resources. Split scalar plans open a reference index
+/// during planning and may still require those resources on the driver.
 pub async fn plan_optimize_indices(
     dataset: &Dataset,
     options: &OptimizeOptions,
 ) -> Result<OptimizeIndicesPlan> {
     let indices = load_all_indices(dataset).await?;
-    Ok(plan_optimize_indices_or_skip(dataset, &indices, options)
-        .await?
-        .unwrap_or_else(|| OptimizeIndicesPlan {
-            plan_id: Uuid::new_v4(),
-            read_version: dataset.manifest.version,
-            tasks: Vec::new(),
-            merges: Vec::new(),
-        }))
+    Ok(
+        plan_optimize_indices_or_skip(dataset, &indices, options, OptimizeExecution::Distributed)
+            .await?
+            .unwrap_or_else(|| OptimizeIndicesPlan {
+                plan_id: Uuid::new_v4(),
+                read_version: dataset.manifest.version,
+                tasks: Vec::new(),
+                merges: Vec::new(),
+            }),
+    )
 }
 
 /// Whether the table carries a tagged fragment reuse history this build
@@ -569,6 +574,13 @@ async fn has_unsupported_frag_reuse_history(
         .has_unsupported_transitions())
 }
 
+/// Tokenizer resources in the planner matter only when it also executes tasks.
+#[derive(Clone, Copy)]
+pub(crate) enum OptimizeExecution {
+    Local,
+    Distributed,
+}
+
 /// Capability checks must precede segment opens: an unavailable translator or
 /// process-local tokenizer must not prevent maintenance of the other indices.
 /// Check every sibling, since optimizing only part of a name can overlap the
@@ -577,14 +589,16 @@ async fn optimization_unavailable_reason(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
     tagged: bool,
+    execution: OptimizeExecution,
 ) -> Result<Option<String>> {
     for segment in segments {
         if tagged {
             let cannot_translate = match segment_coverage_reason(dataset, segment).await? {
                 Some(MissingCoverageReason::Unsupported) => true,
-                // Maintenance opens withdrawn segments with an empty remapper,
-                // which still requires the plugin's batch remapping entry point.
-                Some(MissingCoverageReason::Withdrawn) => {
+                // Scalar maintenance requires the plugin's batch remapping entry
+                // point even for an empty remapper. Vector definitions instead
+                // proceed to training without opening an existing index file.
+                Some(MissingCoverageReason::Withdrawn) if !segment_has_vector_details(segment) => {
                     super::frag_reuse_reader::segment_supports_batch_remapping(dataset, segment)
                         .await?
                         == Some(false)
@@ -598,7 +612,8 @@ async fn optimization_unavailable_reason(
                 )));
             }
         }
-        if let Some(details) = &segment.index_details
+        if matches!(execution, OptimizeExecution::Local)
+            && let Some(details) = &segment.index_details
             && segment_has_inverted_details(segment)
         {
             // The registry also accepts historical type URLs for this payload.
@@ -630,6 +645,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     dataset: &Dataset,
     indices: &[IndexMetadata],
     options: &OptimizeOptions,
+    execution: OptimizeExecution,
 ) -> Result<Option<OptimizeIndicesPlan>> {
     validate_partition_rebalancing_options(options)?;
     consolidate::validate_options(options)?;
@@ -652,7 +668,9 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         merges: Vec::new(),
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
-        if let Some(reason) = optimization_unavailable_reason(dataset, &segments, tagged).await? {
+        if let Some(reason) =
+            optimization_unavailable_reason(dataset, &segments, tagged, execution).await?
+        {
             if named {
                 return Err(Error::not_supported(format!(
                     "Cannot optimize index '{name}': {reason}"

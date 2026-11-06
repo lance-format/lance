@@ -1270,6 +1270,120 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
     );
 }
 
+#[tokio::test]
+async fn test_optimize_trains_vector_definition_under_tagged_history() {
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .into_ram_dataset(FragmentCount(2), FragmentRowCount(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(
+            &["vec"],
+            IndexType::Vector,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+        )
+        .name("vec_idx".into())
+        .train(false)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::ReserveFragments { num_fragments: 2 },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let old_fragments = dataset.fragments().to_vec();
+    let (transition, new_fragments) = prepare_partition(&dataset, &[0, 1], 2).await;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let before = load_all_indices_by_name(&dataset, "vec_idx").await.unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(crate::index::append::is_definition_only_segment(&before[0]));
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
+        Some(MissingCoverageReason::Withdrawn)
+    );
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "vec_idx");
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let after = dataset.load_indices_by_name("vec_idx").await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].uuid, before[0].uuid);
+    assert_eq!(
+        after[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.fragment_bitmap.as_ref()
+    );
+    dataset.validate().await.unwrap();
+
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    let query = rows["vec"].as_fixed_size_list().value(0);
+    let expected = dataset
+        .scan()
+        .nearest("vec", query.as_ref(), 4)
+        .unwrap()
+        .use_index(false)
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let actual = dataset
+        .scan()
+        .nearest("vec", query.as_ref(), 4)
+        .unwrap()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = expected["i"].as_primitive::<Int32Type>();
+    let actual = actual["i"].as_primitive::<Int32Type>();
+    let hits = actual
+        .values()
+        .iter()
+        .filter(|id| expected.values().contains(id))
+        .count();
+    let recall = hits as f64 / expected.len() as f64;
+    assert_eq!(recall, 1.0);
+}
+
 #[rstest]
 #[case::jieba("jieba")]
 #[case::lindera("lindera")]
@@ -1385,11 +1499,24 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
     assert!(error.to_string().contains(&tokenizer), "{error}");
 
     let options = OptimizeOptions::default().max_rows_per_task(is_bounded.then_some(2));
-    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
-        .await
-        .unwrap();
-    assert!(!plan.tasks.is_empty());
-    assert!(plan.tasks.iter().all(|task| task.reference.name == "i_idx"));
+    if !is_bounded {
+        // Workers may have tokenizer resources that are absent on the driver.
+        let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.reference.name == "text_idx")
+        );
+        let named = options.clone().index_names(vec!["text_idx".into()]);
+        let plan = crate::index::optimize::plan_optimize_indices(&dataset, &named)
+            .await
+            .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].reference.name, "text_idx");
+    }
     dataset.optimize_indices(&options).await.unwrap();
     assert_eq!(
         load_all_indices_by_name(&dataset, "text_idx")
