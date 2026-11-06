@@ -50,7 +50,7 @@ use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::{
     reader::FileReaderOptions,
     version::{ConcreteFileVersion, LanceFileVersion},
@@ -64,6 +64,7 @@ use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
+use crate::index::vector::VectorIndexParams;
 use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -71,6 +72,7 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
+use lance_linalg::distance::MetricType;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
@@ -756,10 +758,10 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     assert!(tracker.incremental_stats().read_iops > 0);
 }
 
-/// Counts and artificially delays reads of deletion files. The delay holds
-/// concurrent cold-cache loads open long enough that they reliably overlap,
-/// so the store read count reflects cache coalescing (or its absence) rather
-/// than scheduling luck.
+/// Counts and delays reads of deletion files. The delay keeps concurrent
+/// cold-cache loads of the same file open long enough that they overlap.
+/// `ThrottledStore` cannot be used instead: it does not support the local file
+/// store's `GetResultPayload::File`.
 #[derive(Debug, Default)]
 struct DelayedDeletionReads {
     reads: Arc<AtomicUsize>,
@@ -879,11 +881,7 @@ impl object_store::ObjectStore for DelayedDeletionReadStore {
 /// scan concurrently, and both load the deletion vector of every fragment. On a
 /// cold metadata cache the two loads of the same file must share one read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cold_prefiltered_vector_search_reads_each_deletion_file_once() {
-    use crate::index::vector::VectorIndexParams;
-    use lance_datagen::Dimension;
-    use lance_linalg::distance::MetricType;
-
+async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
     let dir = tempfile::tempdir().unwrap();
     let uri = file_object_store_uri(dir.path());
     let reader = gen_batch()

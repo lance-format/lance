@@ -21,9 +21,7 @@ pub async fn read_dataset_deletion_file(
     dataset
         .metadata_cache
         .get_or_insert_with_key(key, || async {
-            // Resolved inside the loader so cache hits skip this work, and so
-            // concurrent cold loads coalesce into a single deletion-file read
-            // instead of racing through get-then-insert.
+            // Resolve the store inside the loader so cache hits skip it.
             let dataset_dir = dataset.dataset_dir_for_deletion(deletion_file)?;
             let object_store = dataset.object_store_for_deletion(deletion_file).await?;
             read_deletion_file(
