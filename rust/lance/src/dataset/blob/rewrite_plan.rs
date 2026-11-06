@@ -488,10 +488,13 @@ mod tests {
     use crate::dataset::blob::test_util::managed_blob_schema;
     use crate::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
     use crate::dataset::optimize::execution::rechunk_row_lineage;
+    use crate::dataset::rowids::{RowLineage, place_row_lineage};
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
     use arrow_array::Array;
     use arrow_array::cast::AsArray;
+    use arrow_array::types::{UInt32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, Int32Array, LargeBinaryArray, LargeListArray, ListArray, RecordBatchIterator,
         StringArray, StructArray, UInt32Array, UInt64Array,
@@ -499,11 +502,15 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema};
     use futures::TryStreamExt;
+    use lance_arrow::RecordBatchExt;
+    use lance_core::ROW_ID;
     use lance_core::datatypes::{BLOB_V2_LOGICAL_TYPE, BlobKind, BlobV2Layout};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_table::format::BasePath;
     use lance_table::format::Fragment;
+    use lance_table::rowids::RowIdSequence;
+    use lance_table::rowids::version::RowDatasetVersionSequence;
     use std::num::NonZeroUsize;
 
     /// A dataset with no Blob v2 column anywhere in its schema.
@@ -1485,6 +1492,43 @@ mod tests {
         dataset
     }
 
+    /// A `rows`-row managed Blob v2 dataset with stable row ids, where row `i`
+    /// holds [`named_payload`]`("row", i)` so every row's payload is distinct.
+    ///
+    /// Separate from `managed_blob_dataset`, which writes a single row without
+    /// stable row ids: a reordering rewrite needs several rows to reorder, and
+    /// the lineage branch it exercises only runs when stable row ids are on.
+    async fn stable_row_id_managed_blob_dataset(dir: &TempStrDir, rows: usize) -> Arc<Dataset> {
+        let schema = Arc::new(managed_blob_schema(vec![
+            Field::new("id", DataType::UInt32, false),
+            managed_blob_column(),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..rows as u32)),
+                named_blob_values("row", rows),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    enable_stable_row_ids: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(dataset.manifest.uses_stable_row_ids());
+        assert!(BlobRewritePlan::can_preserve_managed(&dataset).unwrap());
+        dataset
+    }
+
     /// The preserved descriptor of the single blob row in `batch`.
     ///
     /// Returns `(kind, blob_id, uri, blob_size, inline_len)`. `inline_len` is the
@@ -1830,6 +1874,170 @@ mod tests {
             "the rewrite published a different object instead of preserving the \
              source reference"
         );
+    }
+
+    /// A rewrite that reorders rows under stable row ids: each row id has to end
+    /// up on the blob it started on, not on whichever row landed at its old
+    /// offset. The lineage is therefore built from the written order rather than
+    /// carried over positionally, and it has to survive cleanup of the old files.
+    #[tokio::test]
+    async fn a_reordered_rewrite_with_stable_row_ids_keeps_every_row_id_on_its_blob() {
+        const ROWS: usize = 4;
+        let dir = TempStrDir::default();
+        let dataset = stable_row_id_managed_blob_dataset(&dir, ROWS).await;
+
+        // Scan in reverse `id` order, so the rewritten fragment holds the rows in
+        // the opposite order from the one they were written in.
+        let batch = dataset
+            .scan()
+            .with_row_id()
+            .with_row_address()
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), ROWS);
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_primitive::<UInt32Type>();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        assert_eq!(
+            ids.values(),
+            &(0..ROWS as u32).rev().collect::<Vec<_>>(),
+            "the scan did not reverse the rows, so this test would not reorder anything"
+        );
+        // What each row id must still read back after the rewrite, captured
+        // before any of it moves.
+        let expected: Vec<(u64, u32, Vec<u8>)> = (0..ROWS)
+            .map(|row| {
+                (
+                    row_ids.value(row),
+                    ids.value(row),
+                    named_payload("row", ids.value(row) as usize),
+                )
+            })
+            .collect();
+
+        // `_rowid` is not a field of the dataset schema, so the plan would carry
+        // it through as an ordinary column of the new fragment. Drop it from the
+        // input and keep the ids separately, in the order the rows are written.
+        let written_row_ids: Vec<u64> = row_ids.values().to_vec();
+        let batch = batch.drop_column(ROW_ID).unwrap();
+
+        let old_fragments = dataset.fragments().to_vec();
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batch.schema().as_ref(), false).unwrap();
+        let transformed = plan.transform(batch).await.unwrap();
+        assert_eq!(transformed.schema(), *plan.output_schema());
+
+        let written = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![transformed])
+            .await
+            .unwrap();
+        let Operation::Append {
+            fragments: mut new_fragments,
+        } = written.operation
+        else {
+            unreachable!("an uncommitted insert always carries Append");
+        };
+
+        // The rows moved, so `rechunk_row_lineage` -- which reassigns the old
+        // sequences positionally -- would hand each offset the wrong row id.
+        // Build each fragment's sequence from the ids actually written to it.
+        let source_version = dataset.manifest.version;
+        let mut remaining = written_row_ids.as_slice();
+        for fragment in new_fragments.iter_mut() {
+            let (ids, rest) = remaining.split_at(fragment.physical_rows.unwrap());
+            remaining = rest;
+            let versions =
+                RowDatasetVersionSequence::from_uniform_row_count(ids.len() as u64, source_version);
+            let lineage = RowLineage {
+                row_ids: RowIdSequence::try_from_iter(ids.iter().copied()).unwrap(),
+                created_at: versions.clone(),
+                last_updated_at: versions,
+            };
+            place_row_lineage(dataset.as_ref(), &lineage)
+                .await
+                .unwrap()
+                .apply(fragment);
+        }
+        assert!(remaining.is_empty());
+
+        let committed = CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new_from_version(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: old_fragments.clone(),
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        // Drop the pre-rewrite snapshot: holding it open would protect the old
+        // files and hide whether the new ones carry the payload.
+        drop(dataset);
+        let removed = cleanup_old_versions(
+            &committed,
+            CleanupPolicy {
+                before_version: Some(committed.version_id()),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            removed.data_files_removed > 0,
+            "the rewrite left every source file in use, so this test would not \
+             exercise cleanup at all"
+        );
+
+        let reopened = Arc::new(Dataset::open(&dir).await.unwrap());
+        for (row_id, id, payload) in expected {
+            let blobs = reopened.take_blobs(&[row_id], "blob").await.unwrap();
+            let blob = blobs[0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("row id {row_id} lost its blob"));
+            assert_eq!(
+                blob.read().await.unwrap().as_ref(),
+                payload,
+                "row id {row_id} resolved to another row's payload"
+            );
+            let row = reopened
+                .scan()
+                .with_row_id()
+                .filter(&format!("{ROW_ID} = {row_id}"))
+                .unwrap()
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(row.num_rows(), 1, "row id {row_id} is no longer readable");
+            assert_eq!(
+                row.column_by_name("id")
+                    .unwrap()
+                    .as_primitive::<UInt32Type>()
+                    .value(0),
+                id,
+                "row id {row_id} moved to another row's values"
+            );
+        }
     }
 
     /// A managed Blob v2 dataset whose rows live in primary storage, with
