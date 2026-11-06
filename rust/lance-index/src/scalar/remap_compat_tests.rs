@@ -21,14 +21,12 @@ use lance_io::object_store::ObjectStore;
 use lance_select::Remapper;
 use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use roaring::RoaringBitmap;
-use rstest::rstest;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::lance_format::LanceIndexStore;
-#[allow(deprecated)]
 use crate::scalar::{
-    AnyQuery, BatchRowIdRemapper, CreatedIndex, IndexStore, RemapUnavailable, RowAddrTranslator,
-    ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    AnyQuery, CreatedIndex, IndexStore, RemapUnavailable, RowAddrTranslator, ScalarIndex,
+    ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -121,21 +119,6 @@ struct Hops {
     budget: u64,
 }
 
-#[async_trait]
-#[allow(deprecated)]
-impl BatchRowIdRemapper for Hops {
-    async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        self.translations.fetch_add(1, Ordering::Relaxed);
-        Ok(ids.iter().map(|&address| Self::remap(address)).collect())
-    }
-    fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
-        self.physical_rows(fragment)
-    }
-    fn materialization_budget_bytes(&self) -> u64 {
-        self.budget
-    }
-}
-
 impl Hops {
     fn remap(address: u64) -> Option<u64> {
         let fragment = RowAddress::from(address).fragment_id();
@@ -158,7 +141,6 @@ impl Hops {
     }
 }
 
-/// The same moves as a fragment reuse history's [`Remapper`].
 impl RemapperBacking for Hops {
     fn fragment_needs_translation(&self, fragment: u32) -> bool {
         matches!(fragment, 1 | 3)
@@ -185,23 +167,9 @@ impl RemapperBacking for Hops {
     }
 }
 
-/// How a translator that may need reads reaches `remap_streaming`.
-#[derive(Debug, Clone, Copy)]
-enum Translator {
-    /// The deprecated batch remapper.
-    Batch,
-    /// A fragment reuse history's remapper.
-    Remapper,
-}
-
-impl Translator {
-    #[allow(deprecated)]
-    fn over(self, hops: &Arc<Hops>) -> RowAddrTranslator {
-        match self {
-            Self::Batch => RowAddrTranslator::Batch(hops.clone()),
-            Self::Remapper => RowAddrTranslator::Remapper(Remapper::from_backing(hops.clone())),
-        }
-    }
+/// A translator that may need reads, as `remap_streaming` receives it.
+fn over(hops: &Arc<Hops>) -> RowAddrTranslator {
+    RowAddrTranslator::Remapper(Remapper::from_backing(hops.clone()))
 }
 
 fn hops_with_budget(budget: u64) -> Arc<Hops> {
@@ -243,15 +211,12 @@ async fn legacy_only_index_gets_a_synchronous_map_as_it_is() {
     );
 }
 
-#[rstest]
-#[case::batch(Translator::Batch)]
-#[case::remapper(Translator::Remapper)]
 #[tokio::test]
-async fn legacy_only_index_gets_a_complete_materialized_map_once(#[case] kind: Translator) {
+async fn legacy_only_index_gets_a_complete_materialized_map_once() {
     let (_dir, store) = temp_store();
     let index = LegacyOnlyIndex::new(Some(vec![1, 3]));
     let hops = hops_with_budget(u64::MAX);
-    let translator = kind.over(&hops);
+    let translator = over(&hops);
     index
         .remap_streaming(&translator, store.as_ref())
         .await
@@ -280,21 +245,13 @@ async fn legacy_only_index_gets_a_complete_materialized_map_once(#[case] kind: T
     );
 }
 
-#[rstest]
-#[case::batch(Translator::Batch)]
-#[case::remapper(Translator::Remapper)]
 #[tokio::test]
-async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven(
-    #[case] kind: Translator,
-) {
+async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven() {
     let (_dir, store) = temp_store();
     // Unknown stored fragments.
     let index = LegacyOnlyIndex::new(None);
     let hops = hops_with_budget(u64::MAX);
-    let Err(error) = index
-        .remap_streaming(&kind.over(&hops), store.as_ref())
-        .await
-    else {
+    let Err(error) = index.remap_streaming(&over(&hops), store.as_ref()).await else {
         panic!("the fallback cannot run without stored fragments");
     };
     assert_eq!(
@@ -309,10 +266,7 @@ async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven(
     // Over budget.
     let index = LegacyOnlyIndex::new(Some(vec![1, 3]));
     let hops = hops_with_budget(16);
-    let Err(error) = index
-        .remap_streaming(&kind.over(&hops), store.as_ref())
-        .await
-    else {
+    let Err(error) = index.remap_streaming(&over(&hops), store.as_ref()).await else {
         panic!("the fallback cannot run over budget");
     };
     assert!(matches!(

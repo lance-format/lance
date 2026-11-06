@@ -2221,7 +2221,7 @@ async fn resolver_dispatch_v0_uses_the_compact_handle() {
     .await
     .unwrap();
     // assert_legacy_metadata asserts every segment resolves to V0 with a
-    // handle equivalent to the compact legacy index.
+    // remapper equivalent to the compact legacy index.
     assert!(assert_legacy_metadata(&dataset).await.is_some());
 }
 

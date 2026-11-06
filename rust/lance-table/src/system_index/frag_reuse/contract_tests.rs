@@ -1173,13 +1173,6 @@ async fn following_stops_at_a_live_source_only_under_tagged(
     let mut addrs = vec![Some(address(0, 0)), Some(address(1, 0))];
     follow(&[2]).translate_in_place(&mut addrs).await.unwrap();
     assert_eq!(addrs, [Some(address(2, 0)); 2]);
-
-    if let Some(remap) = history.legacy_compact_index() {
-        assert_eq!(
-            remap.unwrap().remap_row_id(address(0, 0)),
-            Some(address(2, 0))
-        );
-    }
 }
 
 /// How a reader translates `addrs`, stored by `segment`, under `history`:

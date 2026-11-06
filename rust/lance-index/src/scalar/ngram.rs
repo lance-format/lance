@@ -27,7 +27,7 @@ use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     TrainingRequest, VALUE_COLUMN_NAME,
 };
-use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
@@ -2533,26 +2533,38 @@ mod tests {
     }
 
     /// Postings are translated per posting in slices of at most 64K
-    /// addresses: two trigrams with 40K rows each reach a batch translator as
+    /// addresses: two trigrams with 40K rows each reach a remapper as
     /// calls of at most 40K addresses, never as one 64K call over the spill
     /// batch's concatenated postings (which is what materializing every
     /// address of the batch first would produce), and every row comes out
     /// translated.
     #[test_log::test(tokio::test)]
-    #[allow(deprecated)]
     async fn test_ngram_index_remap_translates_postings_in_bounded_slices() {
-        use lance_index_core::remapping::BatchRowIdRemapper;
+        use lance_select::Remapper;
+        use lance_select::remapper::{RemapperBacking, TranslateFuture};
+        use roaring::RoaringBitmap;
         use std::sync::Mutex;
 
         #[derive(Debug)]
         struct Recording {
             calls: Mutex<Vec<usize>>,
         }
-        #[async_trait::async_trait]
-        impl BatchRowIdRemapper for Recording {
-            async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-                self.calls.lock().unwrap().push(row_ids.len());
-                Ok(row_ids.iter().map(|id| Some(id + 1_000_000)).collect())
+        impl RemapperBacking for Recording {
+            fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+                true
+            }
+            fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+                fragments.clone()
+            }
+            fn translate_in_place<'a>(
+                &'a self,
+                addrs: &'a mut [Option<u64>],
+            ) -> TranslateFuture<'a> {
+                self.calls.lock().unwrap().push(addrs.len());
+                for slot in addrs.iter_mut() {
+                    *slot = slot.map(|id| id + 1_000_000);
+                }
+                Box::pin(std::future::ready(Ok(())))
             }
         }
 
@@ -2583,7 +2595,7 @@ mod tests {
         });
         index
             .remap_streaming(
-                &RowAddrTranslator::Batch(recording.clone()),
+                &RowAddrTranslator::Remapper(Remapper::from_backing(recording.clone())),
                 test_store.as_ref(),
             )
             .await
@@ -2756,7 +2768,6 @@ mod tests {
     fn test_remap_then_keep_relocates_and_filters() {
         use arrow_array::UInt32Array;
         use roaring::{RoaringBitmap, RoaringTreemap};
-        use uuid::Uuid;
 
         use super::NGramIndexSpillState;
         use crate::scalar::OldIndexDataFilter;

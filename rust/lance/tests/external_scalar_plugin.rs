@@ -31,8 +31,8 @@ use lance_index::{
     metrics::{MetricsCollector, NoOpMetricsCollector},
     progress::IndexBuildProgress,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, Remapper,
-        ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, Remapper, ScalarIndex,
+        ScalarIndexParams, SearchResult, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
