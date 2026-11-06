@@ -13,6 +13,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
+use rayon::prelude::*;
 
 mod batch;
 mod positions;
@@ -81,7 +82,23 @@ struct ProbeEntry {
     end: u64,
 }
 
-type MergedIndex = RangeInclusiveMap<u64, Arc<(U64Segment, U64Segment)>>;
+type MergedIndex = RangeInclusiveMap<u64, Arc<MergedChunk>>;
+
+#[derive(Debug, DeepSizeOf)]
+struct MergedChunk {
+    segments: (U64Segment, U64Segment),
+    /// Chunks built together share one source group. An entire disjoint append
+    /// can be removed without rebuilding older groups or keeping old indices.
+    sources: Arc<Vec<FragmentIdentity>>,
+}
+
+impl PartialEq for MergedChunk {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.sources, &other.sources) && self.segments == other.segments
+    }
+}
+
+impl Eq for MergedChunk {}
 
 pub struct FragmentRowIdIndex {
     pub fragment_id: u32,
@@ -118,6 +135,13 @@ impl FragmentIdentity {
     }
 }
 
+impl DeepSizeOf for FragmentIdentity {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // Weak identities own no sequence or deletion data.
+        0
+    }
+}
+
 impl RowIdIndex {
     /// Create a new index from fragment ids and their row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
@@ -129,7 +153,9 @@ impl RowIdIndex {
     /// Reuse requires the same fragment id and the same sequence and deletion
     /// vector allocations. The caller must establish content identity before
     /// sharing those allocations. The previous index itself is never retained.
-    /// Unchanged merged maps also share their chunks across a disjoint append.
+    /// Unchanged merged maps also share their chunks across a disjoint append
+    /// of undeleted range segments, including when revisiting the old snapshot.
+    /// Partially changed source groups rebuild through the normal cost gate.
     ///
     /// ```
     /// # use lance_table::rowids::{RowIdIndex, FragmentRowIdIndex};
@@ -181,10 +207,26 @@ impl RowIdIndex {
                 sources,
             });
         }
-        for fragment in &mut fragments {
-            // A shared fragment already owns its immutable lookup. Only freshly
-            // constructed entries have unique ownership here.
-            if let Some(entry) = Arc::get_mut(fragment) {
+        // Shared entries are already prepared. Native encodings need no work;
+        // avoid even starting the CPU pool for a directory-only version change.
+        let lookups: Vec<_> = fragments
+            .iter_mut()
+            .filter_map(Arc::get_mut)
+            .filter(|entry| {
+                entry.segments.iter().any(|segment| {
+                    matches!(
+                        entry.sequence.0[segment.seq_idx],
+                        U64Segment::Array(_) | U64Segment::RangeWithBitmap { .. }
+                    )
+                })
+            })
+            .collect();
+        if lookups.len() > 1 {
+            lookups
+                .into_par_iter()
+                .for_each(FragmentEntry::build_lookups);
+        } else {
+            for entry in lookups {
                 entry.build_lookups();
             }
         }
@@ -197,8 +239,8 @@ impl RowIdIndex {
         })
     }
 
-    /// Share old merged chunks only when every old source is unchanged and
-    /// new sources cannot intersect them. Other changes need normal validation.
+    /// Keep complete unchanged source groups and drop groups absent in this
+    /// snapshot. Partial changes and intersecting additions need normal validation.
     fn reuse_merged(
         &self,
         sources: &[FragmentRowIdIndex],
@@ -210,21 +252,55 @@ impl RowIdIndex {
         let old_keys: HashSet<_> = self.sources.iter().map(FragmentIdentity::key).collect();
         let new_keys: HashSet<_> = identities.iter().map(FragmentIdentity::key).collect();
         // Repeating a source must still go through normal duplicate validation.
-        if old_keys.len() != self.sources.len()
-            || new_keys.len() != identities.len()
-            || !old_keys.is_subset(&new_keys)
-        {
+        if old_keys.len() != self.sources.len() || new_keys.len() != identities.len() {
             return Ok(None);
         }
+        let mut groups = HashMap::new();
+        let mut retained_keys = HashSet::new();
+        for (_, chunk) in previous.iter() {
+            let group = Arc::as_ptr(&chunk.sources);
+            if groups.contains_key(&group) {
+                continue;
+            }
+            let present = chunk
+                .sources
+                .iter()
+                .filter(|source| new_keys.contains(&source.key()))
+                .count();
+            if present != 0 && present != chunk.sources.len() {
+                return Ok(None);
+            }
+            let keep = present == chunk.sources.len();
+            if keep {
+                retained_keys.extend(chunk.sources.iter().map(FragmentIdentity::key));
+            }
+            groups.insert(group, keep);
+        }
+        let mut merged: MergedIndex = previous
+            .iter()
+            .filter(|(_, chunk)| groups[&Arc::as_ptr(&chunk.sources)])
+            .map(|(range, chunk)| (range.clone(), chunk.clone()))
+            .collect();
         let mut additions = Vec::new();
         for (source, identity) in sources.iter().zip(identities) {
-            if old_keys.contains(&identity.key()) {
+            if retained_keys.contains(&identity.key()) {
                 continue;
+            }
+            // Preserve the normal cost gate for additions that enumerate IDs:
+            // a previously cheap merged map can become cheaper to probe.
+            if !source.deletion_vector.is_empty()
+                || source
+                    .row_id_sequence
+                    .0
+                    .iter()
+                    .any(|segment| !matches!(segment, U64Segment::Range(_)))
+            {
+                return Ok(None);
             }
             if source
                 .row_id_sequence
                 .row_id_range()
-                .is_some_and(|range| previous.overlapping(range).next().is_some())
+                .is_some_and(|range| merged.overlapping(range).next().is_some())
             {
                 return Ok(None);
             }
@@ -234,7 +310,6 @@ impl RowIdIndex {
                 deletion_vector: source.deletion_vector.clone(),
             });
         }
-        let mut merged = previous.clone();
         for (range, chunk) in Self::build_merged(&additions)? {
             merged.insert(range, chunk);
         }
@@ -242,6 +317,12 @@ impl RowIdIndex {
     }
 
     fn build_merged(sources: &[FragmentRowIdIndex]) -> Result<MergedIndex> {
+        let identities = Arc::new(
+            sources
+                .iter()
+                .map(FragmentIdentity::new)
+                .collect::<Vec<_>>(),
+        );
         let chunks = sources
             .iter()
             .flat_map(decompose_sequence)
@@ -263,11 +344,17 @@ impl RowIdIndex {
             }
         }
 
-        Ok(RangeInclusiveMap::from_iter(
-            final_chunks
-                .into_iter()
-                .map(|(range, chunk)| (range, Arc::new(chunk))),
-        ))
+        Ok(RangeInclusiveMap::from_iter(final_chunks.into_iter().map(
+            |(range, segments)| {
+                (
+                    range,
+                    Arc::new(MergedChunk {
+                        segments,
+                        sources: identities.clone(),
+                    }),
+                )
+            },
+        )))
     }
 
     /// Get the address for a given row id.
@@ -331,7 +418,7 @@ impl RowIdIndex {
             let Some((range, segments)) = chunks.peek() else {
                 break;
             };
-            let (row_id_seg, addr_seg) = segments.as_ref();
+            let (row_id_seg, addr_seg) = &segments.segments;
             if id < *range.start() {
                 continue; // falls in a gap between chunks
             }
@@ -405,7 +492,7 @@ impl RowIdIndex {
 }
 
 fn merged_get(merged: &MergedIndex, row_id: u64) -> Option<RowAddress> {
-    let (row_id_segment, address_segment) = merged.get(&row_id)?.as_ref();
+    let (row_id_segment, address_segment) = &merged.get(&row_id)?.segments;
     let pos = row_id_segment.position(row_id)?;
     let address = address_segment.get(pos)?;
     Some(RowAddress::from(address))
@@ -755,7 +842,7 @@ impl DeepSizeOf for RowIdIndex {
                     .iter()
                     .map(|(_, chunk)| {
                         2 * std::mem::size_of::<u64>()
-                            + std::mem::size_of::<Arc<(U64Segment, U64Segment)>>()
+                            + std::mem::size_of::<Arc<MergedChunk>>()
                             + chunk.deep_size_of_children(context)
                     })
                     .sum()
@@ -1004,7 +1091,11 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
     for (_, (row_ids, row_addrs)) in overlapping_chunks.iter() {
         values.extend(row_ids.iter().zip(row_addrs.iter()));
     }
-    values.sort_by_key(|(row_id, _)| *row_id);
+    if values.len() as u64 > MERGE_ROWS_BUDGET {
+        values.par_sort_unstable_by_key(|(row_id, _)| *row_id);
+    } else {
+        values.sort_unstable_by_key(|(row_id, _)| *row_id);
+    }
     // A duplicate row id here means two fragments claim the same live id: a
     // corrupt index, not a resolvable sparse-coverage case.
     if let Some(w) = values.windows(2).find(|w| w[0].0 == w[1].0) {
@@ -1095,6 +1186,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(appended.get_many(&queries).unwrap(), expected);
         assert_eq!(first.get(6).unwrap(), None);
+        let revisited = RowIdIndex::new_reusing(&sources[..2], Some(&appended)).unwrap();
+        assert!(Arc::ptr_eq(
+            first.merged.as_ref().unwrap().get(&0).unwrap(),
+            revisited.merged.as_ref().unwrap().get(&0).unwrap(),
+        ));
+        assert_eq!(revisited.get(6).unwrap(), None);
+        assert_eq!(revisited.get(5).unwrap(), expected[0]);
         drop(first);
         assert!(old.upgrade().is_none());
         assert_eq!(appended.get_many(&queries).unwrap(), expected);
@@ -1214,12 +1312,23 @@ mod tests {
 
         // Past the row budget, with one fragment covering any id.
         let wide = fragment(1, sparse_sequence(MERGE_ROWS_BUDGET + 1));
-        let index = RowIdIndex::new(&[wide]).unwrap();
-        assert!(index.merged.is_none());
-        assert_eq!(
-            index.get(6).unwrap(),
-            Some(RowAddress::new_from_parts(1, 3))
-        );
+        let mut sources = vec![fragment(
+            8,
+            RowIdSequence(vec![U64Segment::Range(10_000_000..10_000_010)]),
+        )];
+        let previous = RowIdIndex::new(&sources).unwrap();
+        let empty = RowIdIndex::new(&[]).unwrap();
+        sources.push(wide);
+        // A cheap old merged map must not force a large disjoint addition into
+        // the merged path when constructing the complete input would probe.
+        for previous in [None, Some(&empty), Some(&previous)] {
+            let index = RowIdIndex::new_reusing(&sources, previous).unwrap();
+            assert!(index.merged.is_none());
+            assert_eq!(
+                index.get(6).unwrap(),
+                Some(RowAddress::new_from_parts(1, 3))
+            );
+        }
     }
 
     #[test]
@@ -1234,7 +1343,7 @@ mod tests {
 
         let merged = index.merged.as_ref().expect("small input should be merged");
         assert!(matches!(
-            merged.get(&100).unwrap().0,
+            merged.get(&100).unwrap().segments.0,
             U64Segment::Ranges { .. }
         ));
 

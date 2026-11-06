@@ -567,21 +567,28 @@ fn bench_shot_table(c: &mut Criterion) {
     group.finish();
 }
 
-/// Warm batch lookup with independently recorded physical addresses. Set
-/// BENCH_NUM_ROWS, BENCH_BATCH_FRAGMENTS and BENCH_BATCH_LAYOUT (shuffled,
-/// disjoint or sorted) to exercise overlapping arrays and sparse probe trees.
+/// Construction and warm batch lookup with independent physical addresses.
+/// Set BENCH_NUM_ROWS, BENCH_BATCH_FRAGMENTS, BENCH_BATCH_STRIDE and
+/// BENCH_BATCH_LAYOUT (shuffled, disjoint or sorted) to exercise dense, packed
+/// and full-width keys with overlapping arrays or sparse probe trees.
 fn bench_batch_lookup(c: &mut Criterion) {
     let rows = num_rows() as usize;
     let fragment_count = std::env::var("BENCH_BATCH_FRAGMENTS")
         .map(|s| s.parse::<usize>().unwrap())
         .unwrap_or(10);
     let layout = std::env::var("BENCH_BATCH_LAYOUT").unwrap_or_else(|_| "shuffled".into());
+    let stride = std::env::var("BENCH_BATCH_STRIDE")
+        .map(|s| s.parse::<u64>().unwrap())
+        .unwrap_or(2);
     assert!(matches!(
         layout.as_str(),
         "shuffled" | "disjoint" | "sorted"
     ));
     assert!(fragment_count > 0 && fragment_count <= rows);
-    let mut ids: Vec<u64> = (0..rows as u64).map(|id| id * 2).collect();
+    assert!(stride > 0);
+    let mut ids: Vec<u64> = (0..rows as u64)
+        .map(|id| id.checked_mul(stride).unwrap())
+        .collect();
     if layout == "shuffled" {
         ids.shuffle(&mut SmallRng::seed_from_u64(42));
     }
@@ -618,10 +625,15 @@ fn bench_batch_lookup(c: &mut Criterion) {
         .collect();
     let index = RowIdIndex::new(&fragments).unwrap();
     let mut rng = SmallRng::seed_from_u64(7);
-    let mut group = c.benchmark_group(format!("row_id_index_batch/{layout}/f{fragment_count}"));
+    let mut group = c.benchmark_group(format!(
+        "row_id_index_batch/{layout}/f{fragment_count}/stride{stride}"
+    ));
     group.sample_size(20);
     group.warm_up_time(std::time::Duration::from_secs(1));
     group.measurement_time(std::time::Duration::from_secs(3));
+    group.bench_function("build", |b| {
+        b.iter(|| std::hint::black_box(RowIdIndex::new(&fragments).unwrap()));
+    });
     for count in [1, 31, 32, 33, 1000] {
         let batches: Vec<_> = (0..16)
             .map(|_| {

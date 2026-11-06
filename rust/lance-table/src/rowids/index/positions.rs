@@ -82,10 +82,12 @@ impl Positions {
             let mut offsets: Vec<u32> = (0..values.len()).map(|offset| offset as u32).collect();
             offsets.sort_unstable_by_key(|&offset| (values.get(offset as usize), offset));
             offsets.dedup_by_key(|offset| values.get(*offset as usize));
-            let keys = offsets
-                .iter()
-                .filter_map(|&offset| values.get(offset as usize))
-                .collect();
+            let mut keys = Vec::with_capacity(offsets.len());
+            keys.extend(
+                offsets
+                    .iter()
+                    .filter_map(|&offset| values.get(offset as usize)),
+            );
             Self::Wide { keys, offsets }
         }
     }
