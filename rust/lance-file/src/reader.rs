@@ -2362,7 +2362,8 @@ impl FileReader {
             .await
     }
 
-    /// Estimates the bytes on disk that reading `ranges` of `projection` loads.
+    /// Estimates the bytes on disk that reading `ranges` (sorted and disjoint)
+    /// of `projection` loads.
     pub async fn estimate_read_bytes(
         &self,
         ranges: &[Range<u64>],
@@ -2544,7 +2545,8 @@ impl ProjectedFileReader {
         self.core.metadata_provider.version()
     }
 
-    /// Estimates the bytes on disk that reading `ranges` of `projection` loads.
+    /// Estimates the bytes on disk that reading `ranges` (sorted and disjoint)
+    /// of `projection` loads.
     pub async fn estimate_read_bytes(
         &self,
         ranges: &[Range<u64>],
@@ -2595,11 +2597,17 @@ fn structure_only_columns(
     }
 }
 
+/// Bytes of `columns` that `ranges` (sorted and disjoint) cover, walking each
+/// column's pages and the ranges together.
 fn estimate_bytes_in_ranges<'a>(
     columns: impl Iterator<Item = &'a Arc<ColumnInfo>>,
     ranges: &[Range<u64>],
     num_rows: u64,
 ) -> u64 {
+    debug_assert!(
+        ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+        "ranges must be sorted and disjoint: {ranges:?}"
+    );
     let mut bytes = 0.0;
     for column in columns {
         // Pages count their column's own values, such as a fixed-size list's
@@ -2613,6 +2621,8 @@ fn estimate_bytes_in_ranges<'a>(
         // Older files leave the priority at zero, so fall back to counting rows
         // from the first page.
         let mut next_start = 0.0;
+        // The first range that may overlap the current page or a later one.
+        let mut first_range = 0;
         for page in column.page_infos.iter() {
             let page_rows = page.num_rows as f64 / values_per_row;
             let start = if page.priority > 0 {
@@ -2625,10 +2635,13 @@ fn estimate_bytes_in_ranges<'a>(
             if page.num_rows == 0 {
                 continue;
             }
-            let rows_read: f64 = ranges
+            while first_range < ranges.len() && ranges[first_range].end as f64 <= start {
+                first_range += 1;
+            }
+            let rows_read: f64 = ranges[first_range..]
                 .iter()
+                .take_while(|range| (range.start as f64) < end)
                 .map(|range| (range.end as f64).min(end) - (range.start as f64).max(start))
-                .filter(|rows| *rows > 0.0)
                 .sum();
             if rows_read > 0.0 {
                 let page_bytes: u64 = page
@@ -3839,6 +3852,17 @@ mod tests {
             "{half} vs {vector}"
         );
         assert_eq!(estimate(vec![], "big").await, 0);
+        // Many scattered ranges cost what they cost one at a time.
+        let scattered: Vec<_> = (0..ROWS).step_by(97).map(|row| row..row + 13).collect();
+        let mut one_at_a_time = 0;
+        for range in &scattered {
+            one_at_a_time += estimate(vec![range.clone()], "big").await;
+        }
+        let together = estimate(scattered.clone(), "big").await;
+        assert!(
+            together.abs_diff(one_at_a_time) <= scattered.len() as u64,
+            "{together} vs {one_at_a_time}"
+        );
         if !with_points {
             return;
         }

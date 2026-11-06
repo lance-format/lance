@@ -187,8 +187,8 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
 
-    /// Estimates the bytes on disk that reading `ranges` of `projection` loads.
-    /// Readers that cannot read ranges (v1) report 0.
+    /// Estimates the bytes on disk that reading `ranges` (sorted and disjoint)
+    /// of `projection` loads. Readers that cannot read ranges (v1) report 0.
     fn estimate_read_bytes(
         &self,
         _ranges: Arc<[Range<u64>]>,
@@ -4209,7 +4209,8 @@ impl FragmentReader {
         .await
     }
 
-    /// Estimates the bytes on disk that [`Self::read_ranges`] loads for `ranges`.
+    /// Estimates the bytes on disk that [`Self::read_ranges`] loads for `ranges`
+    /// (sorted and disjoint).
     pub async fn estimate_read_bytes(&self, ranges: Arc<[Range<u64>]>) -> Result<u64> {
         let estimates =
             futures::future::try_join_all(self.readers.iter().map(|reader| {
