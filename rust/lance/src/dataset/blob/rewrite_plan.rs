@@ -32,9 +32,10 @@ use crate::{Error, Result};
 
 /// What a plan does to each batch.
 enum Rewrite {
-    /// The dataset has no Blob v2 column reachable from this batch, so the batch
-    /// is already in its final form. Only the row address column is dropped, when
-    /// the caller asked for that.
+    /// No projected column needs conversion: either no Blob v2 column is
+    /// reachable from this batch, or every one that is already carries the
+    /// logical layout. The batch is therefore already in its final form. Only the
+    /// row address column is dropped, when the caller asked for that.
     Passthrough { drop_row_addresses: bool },
     /// At least one Blob v2 column needs rewriting.
     BlobV2(BlobV2BatchRewritePlan),
@@ -146,8 +147,8 @@ impl BlobRewritePlan {
     /// `retain_row_addresses` keeps the row address column in the output.
     ///
     /// Rewriting a Blob v2 column needs row addresses in the *input*, because that
-    /// is how a descriptor is resolved to its payload. So when the dataset has a
-    /// Blob v2 column reachable from this schema, `input_schema` must contain the
+    /// is how a descriptor is resolved to its payload. So when this schema reaches
+    /// a Blob v2 column that needs converting, `input_schema` must contain the
     /// row address column and this returns an error if it does not. A schema with
     /// nothing to rewrite has no such requirement, and `retain_row_addresses` then
     /// only decides whether an existing row address column is carried through.
