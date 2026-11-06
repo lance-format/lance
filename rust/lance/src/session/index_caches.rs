@@ -122,6 +122,58 @@ impl CacheKey for RowIdIndexKey {
     }
 }
 
+/// A complete answer for one live stable ID in one manifest generation. This
+/// never stands in for the complete reverse index stored by `RowIdIndexKey`.
+pub(crate) struct PointRowIdResolutionKey<'a> {
+    pub version: u64,
+    pub e_tag: &'a str,
+    pub row_id: u64,
+}
+
+impl CacheKey for PointRowIdResolutionKey<'_> {
+    type ValueType = crate::dataset::rowids::resolve::CachedPointResolution;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_point_resolution")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdPointResolution"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-point-resolution", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+        builder.write_u64(self.row_id);
+    }
+}
+
+/// One current generation's cold point scan. A subsequent distinct request can
+/// amortize full-map construction instead of repeatedly scanning spilled IDs.
+pub(crate) struct RowIdPointHistoryKey;
+
+impl CacheKey for RowIdPointHistoryKey {
+    type ValueType = crate::dataset::rowids::resolve::CachedPointHistory;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_point_history/current")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdPointHistory"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-point-history", 1)
+    }
+
+    fn write_key(&self, _builder: &mut KeyBuilder) {}
+}
+
 /// Decoded fragment reuse history with `index_version = 0`, keyed by
 /// `index::frag_reuse::v0_cache_identity`.
 #[derive(Debug)]
