@@ -1410,18 +1410,21 @@ pub(crate) async fn do_commit_detached_transaction(
             }
         };
 
-        // Before `migrate_indices`, which fills in missing vector details from
-        // one segment per name and would hide a mismatch.
-        if let Err(error) = crate::index::vector::ivf::validate_committed_vector_segments(
-            dataset,
-            &transaction.operation,
-            &indices,
-        )
-        .await
-        {
-            cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
-            return Err(error);
-        }
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                dataset,
+                &transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &transaction_file).await;
+            }
+            checked
+        })
+        .await?;
 
         manifest.version = random_version;
 
@@ -2008,18 +2011,22 @@ pub(crate) async fn commit_transaction(
             }
         };
 
-        // Before `migrate_indices`, which fills in missing vector details from
-        // one segment per name and would hide a mismatch.
-        if let Err(error) = crate::index::vector::ivf::validate_committed_vector_segments(
-            &dataset,
-            &attempt_transaction.operation,
-            &indices,
-        )
-        .await
-        {
-            cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
-            return Err(error);
-        }
+        // Boxed with its cleanup: an error held across the cleanup's await
+        // would be stored in the commit future itself.
+        Box::pin(async {
+            let checked = crate::index::vector::ivf::validate_committed_vector_segments(
+                &dataset,
+                &attempt_transaction.operation,
+                &indices,
+            )
+            .await;
+            if checked.is_err() {
+                cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
+                    .await;
+            }
+            checked
+        })
+        .await?;
 
         manifest.version = target_version;
 

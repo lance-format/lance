@@ -3216,23 +3216,9 @@ mod tests {
                 .is_empty()
         );
 
-        // A commit refuses segments whose details disagree, yet a manifest
-        // written by an older release can still hold this set. Give the
-        // second segment the first one's details so that only the index
-        // files differ, which still reaches append's own guard.
-        segments[1].index_details = segments[0].index_details.clone();
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: segments,
-                removed_indices: vec![],
-            },
-            None,
-        );
-        dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await
-            .unwrap();
+        // Bypass commit-time validation only to exercise append's independent guard
+        // against an incompatible segment set already present in the manifest.
+        crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, segments).await;
 
         let (appended_batch, _) = clustered_vector_batch(
             schema.clone(),

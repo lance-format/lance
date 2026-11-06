@@ -6188,19 +6188,38 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
+        // Real segments: a commit reads the index files of the vector segments
+        // that share a name.
+        async fn build_segment(dataset: &mut Dataset, name: &str, fragment: u32) -> IndexMetadata {
+            dataset
+                .create_index_builder(
+                    &["indexable"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                )
+                .name(name.to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
 
         let mut dataset = fixture.open().await.unwrap();
-        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
 
-        let seg_a = Uuid::new_v4();
-        let seg_b = Uuid::new_v4();
-        write_dummy_index_artifact(&dataset, seg_a).await.unwrap();
-        write_dummy_index_artifact(&dataset, seg_b).await.unwrap();
-
-        let index_a = dummy_index_metadata(&dataset, field_id, seg_a, [0_u32]);
-        let index_b = dummy_index_metadata(&dataset, field_id, seg_b, [1_u32]);
+        let index_a = build_segment(&mut dataset, "some_index", fragments[0]).await;
+        let index_b = build_segment(&mut dataset, "some_index", fragments[1]).await;
+        let seg_a = index_a.uuid;
+        let seg_b = index_b.uuid;
         let initial_tx = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
@@ -6216,9 +6235,10 @@ mod tests {
 
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
-        let seg_c = Uuid::new_v4();
-        write_dummy_index_artifact(&dataset, seg_c).await.unwrap();
-        let index_c = dummy_index_metadata(&dataset, field_id, seg_c, [2_u32]);
+        // A build may not take the name of an existing index.
+        let mut index_c = build_segment(&mut dataset, "worker_idx", fragments[2]).await;
+        index_c.name = "some_index".to_string();
+        let seg_c = index_c.uuid;
         let replace_tx = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
@@ -6237,7 +6257,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(removed.index_files_removed, 2);
+        assert_eq!(
+            removed.index_files_removed,
+            index_a.files.as_ref().unwrap().len() as u64
+        );
         assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
