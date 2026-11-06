@@ -120,31 +120,61 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<R
             })
             .await;
     }
-    let cached = if let Some((index, fragments)) =
+    let (cached, restore_units) = if let Some(promotion) =
         super::resolve::promote_fragments(dataset, with_deletions).await?
     {
+        let super::resolve::FragmentPromotion {
+            index,
+            fragments,
+            units,
+            loaded_fragments,
+        } = promotion;
         tracing::debug!(
             event = "row_id_index_build",
             total_fragments = fragments.len(),
-            retained_fragments = fragments.len(),
-            loaded_fragments = 0,
-            prepared_fragments = 0,
+            retained_fragments = fragments.len() - loaded_fragments,
+            loaded_fragments,
+            prepared_fragments = loaded_fragments,
             "combined prepared row id fragments"
         );
-        CachedRowIdIndex {
-            version: dataset.manifest.version,
-            e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
-                Error::internal("cached row id index requires a manifest generation token")
-            })?,
-            index: Arc::new(index),
-            fragments,
-        }
+        (
+            CachedRowIdIndex {
+                version: dataset.manifest.version,
+                e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
+                    Error::internal("cached row id index requires a manifest generation token")
+                })?,
+                index: Arc::new(index),
+                fragments,
+            },
+            Some(units),
+        )
     } else {
-        build(dataset, with_deletions, previous.as_deref()).await?
+        (
+            build(dataset, with_deletions, previous.as_deref()).await?,
+            None,
+        )
     };
     let cached = Arc::new(cached);
     let index = cached.index.clone();
-    dataset.index_cache.insert_with_key(&key, cached).await;
+    dataset
+        .index_cache
+        .insert_with_key(&key, cached.clone())
+        .await;
+    if let Some(units) = restore_units {
+        let admitted = dataset
+            .index_cache
+            .get_with_key(&key)
+            .await
+            .is_some_and(|value| Arc::ptr_eq(&value, &cached));
+        if !admitted {
+            // A complete view may exceed admission even when individual units
+            // fit. Keep the bounded fragment working set; the returned complete
+            // index is owned only by its active caller and shares those units.
+            for (key, unit) in units {
+                dataset.index_cache.insert_with_key(&key, unit).await;
+            }
+        }
+    }
     Ok(index)
 }
 
