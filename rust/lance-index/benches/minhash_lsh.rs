@@ -107,10 +107,10 @@ fn bench_minhash_lsh(c: &mut Criterion) {
         let cold_cache = LanceCache::no_cache();
         let warm_cache = LanceCache::with_capacity(64 << 20);
         let (cold, warm) = runtime.block_on(async {
-            let cold = MinHashLshIndex::load_remapped(store.clone(), &details, None, &cold_cache)
+            let cold = MinHashLshIndex::load(store.clone(), &details, None, &cold_cache)
                 .await
                 .unwrap();
-            let warm = MinHashLshIndex::load_remapped(store.clone(), &details, None, &warm_cache)
+            let warm = MinHashLshIndex::load(store.clone(), &details, None, &warm_cache)
                 .await
                 .unwrap();
             warm.prewarm().await.unwrap();

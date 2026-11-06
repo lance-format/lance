@@ -349,7 +349,7 @@ impl std::fmt::Debug for RTreeIndex {
 impl RTreeIndex {
     /// Load the index, translating every row address it reports through
     /// `remapper` (`None` when they are current).
-    pub async fn load_remapped(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         remapper: Option<Remapper>,
         index_cache: &LanceCache,
@@ -1251,7 +1251,7 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load_remapped(
+        Ok(RTreeIndex::load(
             index_store,
             DeprecatedRemapper::sync(frag_reuse_index),
             cache,
@@ -1274,7 +1274,7 @@ impl RemappingIndexLoader for RTreeIndexPlugin {
         remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load_remapped(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(RTreeIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
     }
 }
 
@@ -1551,7 +1551,7 @@ mod tests {
         );
 
         (
-            RTreeIndex::load_remapped(store.clone(), None, &LanceCache::no_cache())
+            RTreeIndex::load(store.clone(), None, &LanceCache::no_cache())
                 .await
                 .unwrap(),
             store,
@@ -1796,7 +1796,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let first_index = RTreeIndex::load_remapped(first_store, None, &LanceCache::no_cache())
+        let first_index = RTreeIndex::load(first_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let mut first_index = first_index.as_ref().clone();
@@ -1865,7 +1865,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let merged = RTreeIndex::load_remapped(merged_store, None, &LanceCache::no_cache())
+        let merged = RTreeIndex::load(merged_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         let mut expected_geometry = RowAddrTreeMap::new();
@@ -1937,7 +1937,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let old_index = RTreeIndex::load_remapped(old_store, None, &LanceCache::no_cache())
+        let old_index = RTreeIndex::load(old_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -1958,7 +1958,7 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = RTreeIndex::load_remapped(new_store, None, &LanceCache::no_cache())
+        let updated = RTreeIndex::load(new_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
         assert_eq!(updated.metadata.num_items, 0);
@@ -2081,7 +2081,7 @@ mod tests {
             .update(new_stream, dest_store.as_ref(), filter)
             .await
             .unwrap();
-        let updated = RTreeIndex::load_remapped(dest_store, None, &LanceCache::no_cache())
+        let updated = RTreeIndex::load(dest_store, None, &LanceCache::no_cache())
             .await
             .unwrap();
 
@@ -2202,10 +2202,9 @@ mod tests {
             .await
             .unwrap();
 
-        let new_rtree_index =
-            RTreeIndex::load_remapped(new_store.clone(), None, &LanceCache::no_cache())
-                .await
-                .unwrap();
+        let new_rtree_index = RTreeIndex::load(new_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
 
         let mut search_bbox = BoundingBox::new();
         search_bbox.add_rect(&Rect::new(
@@ -2269,9 +2268,7 @@ mod tests {
         let (_, store, _tmpdir) = train_index(&point_arr, Some(32)).await;
 
         let cache = LanceCache::with_capacity(10 << 20);
-        let rtree_index = RTreeIndex::load_remapped(store, None, &cache)
-            .await
-            .unwrap();
+        let rtree_index = RTreeIndex::load(store, None, &cache).await.unwrap();
 
         // Call prewarm
         rtree_index.prewarm().await.unwrap();

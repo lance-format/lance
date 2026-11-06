@@ -84,7 +84,7 @@ async fn build_rtree(
         )
         .await?;
 
-    let index = RTreeIndex::load_remapped(store, None, &LanceCache::no_cache()).await?;
+    let index = RTreeIndex::load(store, None, &LanceCache::no_cache()).await?;
 
     Ok(index)
 }
@@ -138,7 +138,7 @@ fn bench_rtree(c: &mut Criterion) {
     });
 
     let index = rt
-        .block_on(RTreeIndex::load_remapped(
+        .block_on(RTreeIndex::load(
             store.clone(),
             None,
             &LanceCache::no_cache(),

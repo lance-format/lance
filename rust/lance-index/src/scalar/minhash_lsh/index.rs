@@ -257,7 +257,7 @@ fn check_index_file(
 impl MinHashLshIndex {
     /// Load the index, translating every row address it reports through
     /// `remapper` (`None` when they are current).
-    pub async fn load_remapped(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
         remapper: Option<Remapper>,
@@ -2197,7 +2197,7 @@ mod selection_tests {
             .unwrap();
 
         let cache = LanceCache::no_cache();
-        let mut loaded = MinHashLshIndex::load_remapped(store, &details, None, &cache)
+        let mut loaded = MinHashLshIndex::load(store, &details, None, &cache)
             .await
             .unwrap();
         // One row per page and one page per refill make every later row of a

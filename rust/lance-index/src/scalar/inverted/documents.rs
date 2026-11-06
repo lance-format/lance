@@ -2072,7 +2072,7 @@ impl PartitionDocuments {
 
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
-        DocSet::load_remapped(self.reader().await?, false, self.remapper.as_ref()).await
+        DocSet::load(self.reader().await?, false, self.remapper.as_ref()).await
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
@@ -3087,7 +3087,7 @@ mod tests {
             reader.schema().metadata.get(TOTAL_TOKENS_KEY),
             Some(&"10".to_owned())
         );
-        let complete = DocSet::load_remapped(reader, false, None).await.unwrap();
+        let complete = DocSet::load(reader, false, None).await.unwrap();
         assert_eq!(complete.len(), 3);
         assert_eq!(complete.row_id(1), 20);
         assert_eq!(complete.total_tokens_num(), 10);

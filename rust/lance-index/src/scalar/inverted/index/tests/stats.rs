@@ -276,7 +276,7 @@ async fn load_counted_v2_index_with_counter(
         posting_file: posting_file_path(0),
         counter: counter.clone(),
     });
-    let index = InvertedIndex::load_remapped(counting_store, None, &cache)
+    let index = InvertedIndex::load(counting_store, None, &cache)
         .await
         .unwrap();
     (index, counter, tmpdir)
@@ -377,9 +377,7 @@ async fn load_counted_v3_index(
         posting_file: posting_file_path(partitions[0]),
         counter: counter.clone(),
     });
-    let index = InvertedIndex::load_remapped(store, None, &cache)
-        .await
-        .unwrap();
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
     assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
     (index, counter, tmpdir)
 }
@@ -427,8 +425,8 @@ async fn test_modern_search_avoids_unrequested_postings(
 /// wraps the IndexStore so reads against the posting file are counted,
 /// then asserts:
 ///
-/// * `InvertedIndex::load_remapped` does not touch the posting file at all
-///   (`InvertedPartition::load_remapped` only needs the token file and docs file).
+/// * `InvertedIndex::load` does not touch the posting file at all
+///   (`InvertedPartition::load` only needs the token file and docs file).
 /// * `bm25_stats_for_terms(["t0"])` reads exactly one metadata row from
 ///   the posting file for token 0 regardless of how many unique tokens the
 ///   partition has.
@@ -456,7 +454,7 @@ async fn test_bm25_stats_for_terms_is_lazy(#[case] num_tokens: usize) {
     assert_eq!(
         counter.read_range_calls(),
         0,
-        "InvertedIndex::load_remapped must not read the posting file (was {} calls)",
+        "InvertedIndex::load must not read the posting file (was {} calls)",
         counter.read_range_calls(),
     );
     assert_eq!(counter.rows_read(), 0);
@@ -1411,7 +1409,7 @@ async fn load_v2_index_with_grouped_postings(
     // The inverted list keeps only a `WeakLanceCache`, so the caller must
     // hold this `Arc<LanceCache>` alive for the cache to stay usable.
     let cache = Arc::new(LanceCache::with_capacity(1 << 30));
-    let index = InvertedIndex::load_remapped(store, None, cache.as_ref())
+    let index = InvertedIndex::load(store, None, cache.as_ref())
         .await
         .unwrap();
     (index, cache)

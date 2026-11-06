@@ -852,7 +852,7 @@ impl RemappingIndexLoader for MinHashLshIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
-            MinHashLshIndex::load_remapped(index_store, index_details, remapper, cache).await?
+            MinHashLshIndex::load(index_store, index_details, remapper, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
     }

@@ -858,7 +858,7 @@ async fn test_build_search_uses_configured_posting_block_size() {
     write_test_metadata(&store, vec![0], params).await;
 
     let cache = Arc::new(LanceCache::with_capacity(4096));
-    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     assert_eq!(index.partitions[0].inverted_list.block_size(), block_size);
@@ -950,7 +950,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
     }
     source.write(source_store.as_ref()).await.unwrap();
 
-    let source_partition = InvertedPartition::load_remapped(
+    let source_partition = InvertedPartition::load(
         source_store,
         0,
         None,
@@ -985,7 +985,7 @@ async fn test_into_builder_chunks_postings_by_list_children(
     ));
     merged.write(dest_store.as_ref()).await.unwrap();
     let merged_cache = LanceCache::with_capacity(1 << 20);
-    let merged_partition = InvertedPartition::load_remapped(
+    let merged_partition = InvertedPartition::load(
         dest_store,
         0,
         None,
@@ -1064,7 +1064,7 @@ async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
         control: control.clone(),
         fail_token: None,
     });
-    let source_partition = InvertedPartition::load_remapped(
+    let source_partition = InvertedPartition::load(
         controlled_store,
         0,
         None,
@@ -1149,7 +1149,7 @@ async fn test_v1_position_merge_reads_are_bounded_and_ordered() {
         control: error_control.clone(),
         fail_token: Some(1),
     });
-    let error_partition = InvertedPartition::load_remapped(
+    let error_partition = InvertedPartition::load(
         error_store,
         0,
         None,
@@ -1217,7 +1217,7 @@ async fn test_chunk_posting_mode_controls_buffer_sharing() {
     }
     source.write(source_store.as_ref()).await.unwrap();
 
-    let source_partition = InvertedPartition::load_remapped(
+    let source_partition = InvertedPartition::load(
         source_store,
         0,
         None,
@@ -1867,7 +1867,7 @@ async fn test_remap_to_empty_posting_list() {
     builder.docs.append(2, 1);
     builder.write(store.as_ref()).await.unwrap();
 
-    let index = InvertedPartition::load_remapped(
+    let index = InvertedPartition::load(
         store.clone(),
         0,
         None,

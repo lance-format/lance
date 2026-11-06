@@ -20,7 +20,6 @@ use super::{
     AnyQuery, BuiltinIndexType, IndexFile, IndexReader, IndexStore, IndexWriter, MetricsCollector,
     ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
 };
-use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
@@ -470,26 +469,6 @@ impl NGramIndex {
     /// canonical segment in `dest_store`, unioning their posting lists by token
     /// without rescanning the dataset.
     pub async fn merge_segments(
-        segment_stores: &[Arc<dyn IndexStore>],
-        new_data: Option<SendableRecordBatchStream>,
-        dest_store: &dyn IndexStore,
-        old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    ) -> Result<CreatedIndex> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::merge_segments_with_remapper(
-            segment_stores,
-            new_data,
-            dest_store,
-            old_data_filters,
-            frag_reuse_index,
-        )
-        .await
-    }
-
-    #[doc(hidden)]
-    pub async fn merge_segments_with_remapper(
         segment_stores: &[Arc<dyn IndexStore>],
         new_data: Option<SendableRecordBatchStream>,
         dest_store: &dyn IndexStore,

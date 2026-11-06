@@ -89,7 +89,7 @@ async fn build_multi_partition_index(
     // Keep the cache alive and return it: the partition readers hold only a
     // WeakLanceCache, so the prewarmed entries vanish if this Arc is dropped.
     let cache = Arc::new(LanceCache::with_capacity(1 << 20));
-    let index = InvertedIndex::load_remapped(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
         .await
         .unwrap();
     (index, cache)
@@ -209,7 +209,7 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let index = InvertedIndex::load_remapped(src_store, None, &LanceCache::no_cache()).await?;
+    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(index.format_version(), format_version);
     assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V2);
 
@@ -227,7 +227,7 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
 
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V2);
 
-    let updated = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(updated.format_version(), format_version);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
     assert_eq!(updated.partitions.len(), 2);
@@ -280,7 +280,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
 
     write_test_metadata(&src_store, vec![0], params).await;
 
-    let index = InvertedIndex::load_remapped(src_store, None, &LanceCache::no_cache()).await?;
+    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
     assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V3);
 
@@ -289,7 +289,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
         .await?;
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V3);
 
-    let updated = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V3);
 
@@ -330,7 +330,7 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
     .await?;
 
     assert_eq!(created.index_version, 0);
-    let merged = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.index_version(), 0);
     assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
 
@@ -386,7 +386,7 @@ async fn test_merge_segments_preserves_format_version(
     .await?;
     assert_eq!(created.index_version, format_version.index_version());
 
-    let merged = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.format_version(), format_version);
     assert_eq!(merged.index_version(), format_version.index_version());
 
@@ -419,7 +419,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
 
     write_test_metadata(&empty_store, Vec::new(), params.clone()).await;
-    let empty = InvertedIndex::load_remapped(empty_store, None, &LanceCache::no_cache()).await?;
+    let empty = InvertedIndex::load(empty_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(empty.partition_count(), 0);
     assert_eq!(empty.format_version(), InvertedListFormatVersion::V1);
 
@@ -447,7 +447,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     .await?;
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V1);
 
-    let merged = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.format_version(), InvertedListFormatVersion::V1);
     assert_eq!(merged.index_version(), INVERTED_INDEX_VERSION_V1);
 
@@ -508,7 +508,7 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
         )
         .await?;
 
-    let merged = InvertedIndex::load_remapped(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
     assert_eq!(merged.partitions.len(), 2);
     let mut partition_ids = merged
         .partitions
@@ -562,7 +562,7 @@ async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
         .await
         .unwrap();
     assert!(

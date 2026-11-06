@@ -628,7 +628,7 @@ impl RemappingIndexLoader for InvertedIndexPlugin {
         remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index = InvertedIndex::load_remapped(index_store, remapper, cache).await?;
+        let index = InvertedIndex::load(index_store, remapper, cache).await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();

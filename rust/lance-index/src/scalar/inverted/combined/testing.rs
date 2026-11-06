@@ -381,7 +381,7 @@ pub(super) async fn element_document_index(
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let index = InvertedIndex::load_remapped(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
         .await
         .unwrap();
     (index, tmpdir)

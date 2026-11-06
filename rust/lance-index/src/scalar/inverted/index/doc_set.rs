@@ -480,7 +480,7 @@ impl DocSet {
     /// `remapper` as a batch. A deleted row keeps its slot as a tombstone
     /// until the layout-aware decoding below, so documents stay aligned with
     /// the posting lists that reference them by position.
-    pub async fn load_remapped(
+    pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
         remapper: Option<&Remapper>,

@@ -142,7 +142,7 @@ fn bench_inverted(c: &mut Criterion) {
             .unwrap();
     });
     let invert_index = rt
-        .block_on(InvertedIndex::load_remapped(
+        .block_on(InvertedIndex::load(
             phrase_search_store,
             None,
             &LanceCache::no_cache(),

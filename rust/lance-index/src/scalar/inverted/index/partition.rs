@@ -858,7 +858,7 @@ impl InvertedPartition {
         Ok((total_tokens, stale.len() as usize, row_freqs))
     }
 
-    pub async fn load_remapped(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         id: u64,
         remapper: Option<Remapper>,

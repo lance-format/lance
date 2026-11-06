@@ -342,7 +342,7 @@ impl InvertedIndex {
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
                 let Some(remapper) = remapper else {
-                    let docs = DocSet::load_remapped(docs_reader, true, None).await?;
+                    let docs = DocSet::load(docs_reader, true, None).await?;
                     return Result::Ok((docs, None));
                 };
                 // The postings name documents by the row addresses the index was
@@ -509,7 +509,7 @@ impl InvertedIndex {
         }
     }
 
-    pub async fn load_remapped(
+    pub async fn load(
         store: Arc<dyn IndexStore>,
         remapper: Option<Remapper>,
         index_cache: &LanceCache,
@@ -563,7 +563,7 @@ impl InvertedIndex {
                     let token_set_format = format;
                     async move {
                         Result::Ok(Arc::new(
-                            InvertedPartition::load_remapped(
+                            InvertedPartition::load(
                                 store,
                                 id,
                                 remapper,
