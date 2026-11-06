@@ -185,11 +185,11 @@ mod tests {
     use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
-        DropField, DropIndex, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment,
-        ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile,
-        TombstoneFieldData, UpdateCompactedSsTables,
+        AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
+        AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
+        ConfigUpdate, DropField, DropIndex, RefreshRowVersionMetadata, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
+        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -206,7 +206,7 @@ mod tests {
 
     fn all_actions() -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: Some(RowIdMeta::Inline(vec![1, 2, 3].into())),
@@ -215,7 +215,7 @@ mod tests {
                 ))),
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),

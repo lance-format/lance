@@ -124,7 +124,7 @@ mod tests {
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
     use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
     use crate::transaction::action::{
-        Action, AddFragment, AddOverlays, Ref, RemoveFragment, TombstoneFieldData,
+        Action, AddFragment, AddFragmentParts, AddOverlays, Ref, RemoveFragment, TombstoneFieldData,
     };
     use lance_file::version::ConcreteFileVersion;
     use roaring::RoaringBitmap;
@@ -141,22 +141,24 @@ mod tests {
     }
 
     fn append(local: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(local),
             physical_rows: 5,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn compact(local: u32) -> Action {
-        let Action::AddFragment(mut fragment) = append(local) else {
+        let Action::AddFragment(fragment) = append(local) else {
             unreachable!()
         };
-        fragment.data_change = false;
-        Action::AddFragment(fragment)
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
+            data_change: false,
+            ..fragment.into_parts()
+        }))
     }
 
     /// `key_fields` is the only key list. The filter type keeps a field list

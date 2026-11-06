@@ -1100,8 +1100,8 @@ mod tests {
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        RemoveFragment, SetDeletionFile, TombstoneFieldData,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AlterField,
+        ConfigUpdate, DropField, RemoveFragment, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -1144,14 +1144,14 @@ mod tests {
     }
 
     fn add_fragment(id: Ref) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id,
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn add_data_file(fragment: Ref, fields: &[i32]) -> Action {

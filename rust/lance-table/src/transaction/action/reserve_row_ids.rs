@@ -72,7 +72,7 @@ mod tests {
     use crate::transaction::action::test_support::{
         apply, apply_after_reading, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddFragment, Ref};
+    use crate::transaction::action::{Action, AddFragment, AddFragmentParts, Ref};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use rstest::rstest;
 
@@ -81,14 +81,14 @@ mod tests {
     }
 
     fn add_fragment(local: u32, physical_rows: u64) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(local),
             physical_rows,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn row_id_meta(row_ids: std::ops::Range<u64>) -> RowIdMeta {
@@ -159,14 +159,16 @@ mod tests {
 
         let next = apply(
             &reserved,
-            vec![Action::AddFragment(AddFragment {
-                id: Ref::Local(0),
-                physical_rows: 10,
-                row_id_meta: Some(row_id_meta(1000..1010)),
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })],
+            vec![Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: Some(row_id_meta(1000..1010)),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            ))],
         )
         .unwrap();
 
@@ -189,14 +191,16 @@ mod tests {
         // aside and the next append would hand them out a second time.
         let error = apply(
             &stable_manifest(),
-            vec![Action::AddFragment(AddFragment {
-                id: Ref::Local(0),
-                physical_rows: 10,
-                row_id_meta: Some(row_id_meta(1000..1010)),
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })],
+            vec![Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: Some(row_id_meta(1000..1010)),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            ))],
         )
         .unwrap_err();
 
@@ -230,14 +234,14 @@ mod tests {
     /// repeats, as a writer encoding its own could.
     fn supplied(local: u32, row_ids: Vec<u64>) -> Action {
         let sequence = RowIdSequence::from(row_ids.as_slice());
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(local),
             physical_rows: row_ids.len() as u64,
             row_id_meta: Some(RowIdMeta::Inline(write_row_ids(&sequence).into())),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     /// A row id names one row, so a supplied id carried by two fragments of

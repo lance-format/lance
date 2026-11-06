@@ -74,7 +74,8 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest, footprint, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, FieldRef, Ref, ReserveFragmentIds,
+        Action, AddDataFile, AddField, AddFragment, AddFragmentParts, FieldRef, Ref,
+        ReserveFragmentIds,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
@@ -121,14 +122,14 @@ mod tests {
                     parent: None,
                     def: added_field("fresh"),
                 }),
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -156,14 +157,14 @@ mod tests {
     #[test]
     fn test_reset_discards_what_earlier_actions_in_the_operation_did() {
         let mint_fragment = |token| {
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(token),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            })
+            }))
         };
         let write = |token, path: &str| {
             Action::AddDataFile(
@@ -210,14 +211,14 @@ mod tests {
     }
 
     fn mint_fragment(token: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(token),
             physical_rows: 4,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn mint_field(token: u32, name: &str) -> Action {
@@ -267,14 +268,16 @@ mod tests {
         // Even a pure append, which writes no committed coordinate at all, is
         // preempted: its rows would either vanish or survive the reset
         // depending on which commit landed first.
-        let append = footprint(vec![Action::AddFragment(AddFragment {
-            id: Ref::Local(0),
-            physical_rows: 4,
-            row_id_meta: None,
-            last_updated_at_version_meta: None,
-            created_at_version_meta: None,
-            data_change: true,
-        })]);
+        let append = footprint(vec![Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            },
+        ))]);
 
         assert!(reset.conflicts_with(&append));
         assert!(append.conflicts_with(&reset));
@@ -286,14 +289,14 @@ mod tests {
         // or records nothing at all, still cannot land on either side of a
         // reset.
         let requires_only = footprint(vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: false,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),

@@ -172,8 +172,8 @@ mod tests {
         apply, backed_manifest, footprint, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, CompositeOperation, FieldRef, Ref, RemoveFragment,
-        TombstoneFieldData, UserStep,
+        Action, AddDataFile, AddFragment, AddFragmentParts, CompositeOperation, FieldRef, Ref,
+        RemoveFragment, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
@@ -533,14 +533,16 @@ mod tests {
     }
 
     fn append() -> Vec<Action> {
-        let mut actions = vec![Action::AddFragment(AddFragment {
-            id: Ref::Local(0),
-            physical_rows: 3,
-            row_id_meta: None,
-            last_updated_at_version_meta: None,
-            created_at_version_meta: None,
-            data_change: true,
-        })];
+        let mut actions = vec![Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(0),
+                physical_rows: 3,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            },
+        ))];
         actions.extend(rewrite_field_zero(Ref::Local(0), true));
         actions
     }

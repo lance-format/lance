@@ -852,7 +852,7 @@ mod tests {
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, UserStep,
+        Action, AddDataFile, AddFragment, AddFragmentParts, FieldRef, Ref, RemoveFragment, UserStep,
     };
     use crate::transaction::operation::RewriteGroup;
     use lance_file::version::ConcreteFileVersion;
@@ -965,14 +965,16 @@ mod tests {
             uuid: uuid.clone(),
             operation: Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "append batch",
-                vec![Action::AddFragment(AddFragment {
-                    id: Ref::Local(0),
-                    physical_rows: 1,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: true,
-                })],
+                vec![Action::AddFragment(AddFragment::new_unchecked(
+                    AddFragmentParts {
+                        id: Ref::Local(0),
+                        physical_rows: 1,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    },
+                ))],
             )])),
             tag: None,
             transaction_properties: None,
@@ -1054,14 +1056,14 @@ mod tests {
             .flat_map(|index| {
                 let token = index as u32;
                 [
-                    Action::AddFragment(AddFragment {
+                    Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                         id: Ref::Local(token),
                         physical_rows: 1_000_000,
                         row_id_meta: None,
                         last_updated_at_version_meta: None,
                         created_at_version_meta: None,
                         data_change,
-                    }),
+                    })),
                     Action::AddDataFile(
                         AddDataFile::try_new_unchecked(
                             Ref::Local(token),

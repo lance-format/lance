@@ -136,7 +136,9 @@ mod tests {
         survivors, table, transition,
     };
     use crate::transaction::action::test_support::{apply_with_indices, footprint};
-    use crate::transaction::action::{Action, AddDataFile, RemoveFragment, SetDeletionFile};
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, AddFragmentParts, RemoveFragment, SetDeletionFile,
+    };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
@@ -251,7 +253,10 @@ mod tests {
         });
         let mut actions = compaction(&[0], 0, false, Some(ordered(survivors(&[0], &[(0, 3)]))));
         if let Action::AddFragment(add) = &mut actions[1] {
-            add.physical_rows = ROWS - 1;
+            *add = AddFragment::new_unchecked(AddFragmentParts {
+                physical_rows: ROWS - 1,
+                ..add.parts().clone()
+            });
         }
 
         let (_, indices) = commit(&manifest, actions, Vec::new()).unwrap();
@@ -302,10 +307,20 @@ mod tests {
         |manifest: &mut Manifest, actions: &mut Vec<Action>| {
             let reserved = reserved_destination(manifest);
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.id = Ref::Committed(reserved);
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    id: Ref::Committed(reserved),
+                    ..add.parts().clone()
+                });
             }
             if let Action::AddDataFile(file) = &mut actions[3] {
-                *file = AddDataFile::try_new_unchecked(Ref::Committed(reserved), file.file().clone(), file.field_ids().to_vec(), file.base(), file.data_change()).unwrap();
+                *file = AddDataFile::try_new_unchecked(
+                    Ref::Committed(reserved),
+                    file.file().clone(),
+                    file.field_ids().to_vec(),
+                    file.base(),
+                    file.data_change(),
+                )
+                .unwrap();
             }
             if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
                 t.destinations = vec![Ref::Committed(reserved)];
@@ -353,7 +368,10 @@ mod tests {
     #[case::rows_not_conserved(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.physical_rows = 2 * ROWS - 1;
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    physical_rows: 2 * ROWS - 1,
+                    ..add.parts().clone()
+                });
             }
         },
         "does not conserve rows"

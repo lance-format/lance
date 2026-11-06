@@ -120,7 +120,7 @@ mod test_support;
 pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
-pub use add_fragment::AddFragment;
+pub use add_fragment::{AddFragment, AddFragmentParts};
 pub use add_index_segment::AddIndexSegment;
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
@@ -299,20 +299,21 @@ impl std::fmt::Display for FieldId {
 /// # use lance_file::version::ConcreteFileVersion;
 /// # use lance_table::format::DataFile;
 /// use lance_table::transaction::action::{
-///     Action, AddDataFile, AddFragment, CompositeOperation, FieldRef, Ref, UserStep,
+///     Action, AddDataFile, AddFragment, AddFragmentParts, CompositeOperation, FieldRef, Ref,
+///     UserStep,
 /// };
 ///
 /// let operation = CompositeOperation::new(vec![
 ///     UserStep::new(
 ///         "add a fragment",
-///         vec![Action::AddFragment(AddFragment {
+///         vec![Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
 ///             id: Ref::Local(0),
 ///             physical_rows: 10,
 ///             row_id_meta: None,
 ///             last_updated_at_version_meta: None,
 ///             created_at_version_meta: None,
 ///             data_change: true,
-///         })],
+///         }))],
 ///     ),
 ///     UserStep::new(
 ///         "back its one column",

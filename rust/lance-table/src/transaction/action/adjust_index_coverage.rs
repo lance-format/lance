@@ -229,8 +229,8 @@ mod tests {
         apply_with_indices, backed_manifest, footprint, nested_schema,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddIndexSegment, FieldRef, RemoveFragment,
-        TombstoneFieldData,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, FieldRef,
+        RemoveFragment, TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
@@ -292,14 +292,14 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 adjust(segment.uuid, "by_a", vec![Ref::Local(0)], vec![]),
             ],
             vec![segment],

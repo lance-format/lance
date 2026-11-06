@@ -67,7 +67,7 @@ impl TryFrom<pb_actions::RemoveFragment> for RemoveFragment {
 mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply, backed_manifest};
-    use crate::transaction::action::{Action, AddFragment};
+    use crate::transaction::action::{Action, AddFragment, AddFragmentParts};
 
     #[test]
     fn test_remove_fragment() {
@@ -88,14 +88,14 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::RemoveFragment(RemoveFragment {
                     fragment: Ref::Local(0),
                     data_change: true,

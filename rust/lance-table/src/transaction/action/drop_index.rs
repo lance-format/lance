@@ -77,8 +77,8 @@ mod tests {
         apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddIndexSegment, CompositeOperation, FieldRef, Ref,
-        RemoveIndexSegment, UserStep,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, CompositeOperation,
+        FieldRef, Ref, RemoveIndexSegment, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -111,14 +111,14 @@ mod tests {
     /// keeping an index current takes.
     fn append_and_index(name: &str) -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),

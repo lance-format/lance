@@ -303,7 +303,9 @@ mod tests {
         added_field, apply, backed_manifest, manifest_with_base, mint_base, one_column_file,
         unbacked_manifest,
     };
-    use crate::transaction::action::{Action, AddField, AddFragment, TombstoneFieldData};
+    use crate::transaction::action::{
+        Action, AddField, AddFragment, AddFragmentParts, TombstoneFieldData,
+    };
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_core::ROW_ID_FIELD_ID;
     use lance_file::version::ConcreteFileVersion;
@@ -429,14 +431,14 @@ mod tests {
     }
 
     fn new_fragment(row_id_meta: Option<RowIdMeta>) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(0),
             physical_rows: 10,
             row_id_meta,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn file_binding(fragment: Ref, field_ids: &[i32]) -> Action {

@@ -1470,10 +1470,10 @@ mod tests {
         manifest_with_base, mint_base, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData,
-        UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
+        AdjustIndexCoverage, AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -1609,14 +1609,14 @@ mod tests {
                 parent: None,
                 def: added_field("added"),
             }),
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
@@ -1818,14 +1818,14 @@ mod tests {
     }
 
     fn mint_fragment(token: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(token),
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn write_data(fragment: Ref, field: FieldRef) -> Action {
@@ -2352,14 +2352,16 @@ mod tests {
         let result = apply_after_reading(
             &read,
             &current,
-            vec![Action::AddFragment(AddFragment {
-                id: Ref::Committed(id),
-                physical_rows: 10,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })],
+            vec![Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Committed(id),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            ))],
         );
 
         match expected_error {

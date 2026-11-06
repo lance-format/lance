@@ -436,7 +436,7 @@ mod tests {
         replace_field_data,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AdjustIndexCoverage,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AdjustIndexCoverage,
         CompositeOperation, DropField, Footprint, RemoveFragment, RemoveIndexSegment, ResetTable,
         TombstoneFieldData, UserStep,
     };
@@ -1001,14 +1001,14 @@ mod tests {
                     parent: None,
                     def: added_field("fresh"),
                 }),
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -1251,14 +1251,14 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
                     ..segment("by_a", vec![FieldRef::Committed(0)])

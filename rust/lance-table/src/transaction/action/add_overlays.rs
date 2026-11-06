@@ -212,8 +212,8 @@ mod tests {
         added_field, apply, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage, AlterField,
-        CompositeOperation, DropField, FieldRef, RemoveFragment, SetDeletionFile,
+        Action, AddField, AddFragment, AddFragmentParts, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, DropField, FieldRef, RemoveFragment, SetDeletionFile,
         TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
@@ -249,14 +249,14 @@ mod tests {
     }
 
     fn mint(physical_rows: u64) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(0),
             physical_rows,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     /// A stable-row-id manifest whose one fragment holds three rows, with or
@@ -334,14 +334,14 @@ mod tests {
         let out = apply(
             &backed_manifest(),
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 add(Ref::Local(0), vec![overlay("a.lance", &[0])]),
             ],
         )
@@ -538,11 +538,14 @@ mod tests {
                 2, 2, 2,
             ]))
             .unwrap();
-        let Action::AddFragment(mut minted) = mint(3) else {
+        let Action::AddFragment(minted) = mint(3) else {
             unreachable!()
         };
-        minted.last_updated_at_version_meta = Some(minted_with.clone());
-        minted.created_at_version_meta = Some(minted_with.clone());
+        let minted = AddFragment::new_unchecked(AddFragmentParts {
+            last_updated_at_version_meta: Some(minted_with.clone()),
+            created_at_version_meta: Some(minted_with.clone()),
+            ..minted.into_parts()
+        });
 
         let mut manifest = stable_row_id_manifest(true);
         // The overlay is the minted fragment's only data, which a required
@@ -726,14 +729,14 @@ mod tests {
         #[case] schema_change_conflicts_landing_second: bool,
     ) {
         let overlaid = footprint(vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
         ]);
         let schema_change = footprint(schema_change);
@@ -772,14 +775,14 @@ mod tests {
     #[test]
     fn test_an_overlay_on_a_minted_fragment_does_not_conflict_with_a_deletion() {
         let overlaid = footprint(vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
         ]);
         let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile {
@@ -801,14 +804,16 @@ mod tests {
     fn test_a_tightening_cannot_land_after_an_overlay_of_its_field(#[case] fragment: Ref) {
         let mut actions = Vec::new();
         if fragment.committed().is_none() {
-            actions.push(Action::AddFragment(AddFragment {
-                id: fragment,
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            }));
+            actions.push(Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: fragment,
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            )));
         }
         actions.push(add(fragment, vec![overlay("a.lance", &[0])]));
         let overlaid = footprint(actions);

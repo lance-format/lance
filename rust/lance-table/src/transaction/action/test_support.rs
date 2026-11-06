@@ -175,8 +175,8 @@ pub(super) fn one_column_file(path: &str) -> DataFile {
 /// `ROWS` rows each, every one backed by a file for field 0.
 pub(super) mod frag_reuse {
     use super::super::{
-        Action, AddDataFile, AddFragment, AppendFragReuseTransition, FieldRef, FragReuseMapping,
-        Ref, RemoveFragment,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AppendFragReuseTransition, FieldRef,
+        FragReuseMapping, Ref, RemoveFragment,
     };
     use crate::format::pb::fragment_reuse_index_details as pb_fri;
     use crate::format::{DataFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb};
@@ -286,15 +286,17 @@ pub(super) mod frag_reuse {
             .iter()
             .flat_map(|source| source * ROWS..(source + 1) * ROWS)
             .collect();
-        actions.push(Action::AddFragment(AddFragment {
-            id: Ref::Local(token),
-            physical_rows: rows,
-            row_id_meta: stable_row_ids
-                .then(|| RowIdMeta::Inline(write_row_ids(&row_ids.as_slice().into()).into())),
-            last_updated_at_version_meta: stable_row_ids.then(versions),
-            created_at_version_meta: stable_row_ids.then(versions),
-            data_change: false,
-        }));
+        actions.push(Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(token),
+                physical_rows: rows,
+                row_id_meta: stable_row_ids
+                    .then(|| RowIdMeta::Inline(write_row_ids(&row_ids.as_slice().into()).into())),
+                last_updated_at_version_meta: stable_row_ids.then(versions),
+                created_at_version_meta: stable_row_ids.then(versions),
+                data_change: false,
+            },
+        )));
         actions.push(Action::AddDataFile(
             AddDataFile::try_new_unchecked(
                 Ref::Local(token),

@@ -2850,8 +2850,8 @@ mod composite {
         new_mem_wal_index_meta,
     };
     use lance_table::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
+        AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
         CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RefreshRowVersionMetadata,
         RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
         RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
@@ -3075,14 +3075,14 @@ mod composite {
                             parent: None,
                             def: int32_field(&format!("racer_{racer}")),
                         }),
-                        Action::AddFragment(AddFragment {
+                        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                             id: Ref::Local(0),
                             physical_rows: 5,
                             row_id_meta: None,
                             last_updated_at_version_meta: None,
                             created_at_version_meta: None,
                             data_change: true,
-                        }),
+                        })),
                     ],
                 ))
                 .await
@@ -3101,14 +3101,14 @@ mod composite {
                         parent: None,
                         def: int32_field("mine"),
                     }),
-                    Action::AddFragment(AddFragment {
+                    Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                         id: Ref::Local(0),
                         physical_rows: 5,
                         row_id_meta: None,
                         last_updated_at_version_meta: None,
                         created_at_version_meta: None,
                         data_change: true,
-                    }),
+                    })),
                     Action::AddDataFile(
                         AddDataFile::try_new_unchecked(
                             Ref::Local(0),
@@ -3351,14 +3351,14 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -3503,22 +3503,22 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
-                Action::AddFragment(AddFragment {
+                })),
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(1),
                     physical_rows: 6,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
             ],
         )
         .await;
@@ -3561,7 +3561,7 @@ mod composite {
         let written = commit(
             reserved,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Committed(2),
                     physical_rows: 5,
                     row_id_meta: Some(RowIdMeta::Inline(
@@ -3570,7 +3570,7 @@ mod composite {
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(2),
@@ -3602,14 +3602,16 @@ mod composite {
         let read_version = dataset.version().version;
 
         let append = |local| {
-            vec![Action::AddFragment(AddFragment {
-                id: Ref::Local(local),
-                physical_rows: 4,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })]
+            vec![Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Local(local),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            ))]
         };
 
         let first = CommitBuilder::new(dataset.clone())
@@ -3865,14 +3867,14 @@ mod composite {
 
     fn append_with_field_zero(dataset: &Dataset) -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 5,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
@@ -4046,14 +4048,14 @@ mod composite {
         let read_version = with_b.version().version;
         let b = with_b.schema().field("b").unwrap().id;
         let append_only_b = vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 5,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
@@ -4322,14 +4324,14 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 5,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -4829,14 +4831,14 @@ mod composite {
         commit(
             dataset,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 5,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -5031,14 +5033,14 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 5,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -5177,14 +5179,14 @@ mod composite {
     /// when `key_hashes` is given.
     fn keyed_append(dataset: &Dataset, key_hashes: Option<&[u64]>) -> Vec<Action> {
         let mut actions = vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 5,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
@@ -5317,14 +5319,14 @@ mod composite {
                     data_change: true,
                     base: None,
                 }),
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 1,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
+                })),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Local(0),
@@ -5440,14 +5442,14 @@ mod composite {
         // The base file is declared for `b` alone, so the conflict with dropping
         // `a` comes from the overlay, whose file carries `a`.
         let stale_append = vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 5,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
+            })),
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
@@ -5561,14 +5563,16 @@ mod composite {
                     })
                 })
                 .collect();
-            actions.push(Action::AddFragment(AddFragment {
-                id: Ref::Local(0),
-                physical_rows: written.physical_rows.unwrap() as u64,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: false,
-            }));
+            actions.push(Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Local(0),
+                    physical_rows: written.physical_rows.unwrap() as u64,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: false,
+                },
+            )));
             for file in &written.files {
                 actions.push(Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
