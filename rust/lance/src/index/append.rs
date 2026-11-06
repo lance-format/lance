@@ -895,9 +895,9 @@ async fn merge_scalar_indices<'a>(
         return Ok(None);
     }
 
-    // Whether a segment's type moved from row ids to row addresses, so that it
-    // may predate that move: BTree, Bitmap, LabelList, and a JSON index over a
-    // BTree, Bitmap, or LabelList target.
+    // Whether a segment's type moved to an address-domain format version, so
+    // that it may predate that move: BTree, Bitmap, LabelList, and a JSON index
+    // over a target that stores row addresses today.
     let migrated_to_row_addrs = |segment: &IndexMetadata| {
         matches!(
             index_type,
@@ -905,7 +905,7 @@ async fn merge_scalar_indices<'a>(
         ) || segment
             .index_details
             .as_deref()
-            .is_some_and(json::wraps_row_addr_migrated_target)
+            .is_some_and(json::wraps_row_addr_domain_target)
     };
 
     // `select_segments_to_merge` only looks at the trailing `num_indices_to_merge`

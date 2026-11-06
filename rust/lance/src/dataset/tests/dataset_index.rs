@@ -7960,18 +7960,30 @@ async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
     assert_json_index_matches_scan(&dataset, &[1, 5, 6, 9, 14]).await;
 }
 
-/// A JSON segment written before its target moved to row addresses stores row
-/// ids. Optimizing must rebuild it rather than leave it beside (or merge it
-/// with) address-domain data, even in append mode, which selects no segment to
-/// merge.
+/// A JSON segment written before `JSON_ROW_ADDR_DOMAIN_VERSION` is version 0.
+/// Optimizing must rebuild it rather than leave it beside (or merge it with)
+/// version-1 data, even in append mode, which selects no segment to merge.
+///
+/// For a BTree target the legacy segment stores row ids. For a ZoneMap target
+/// it already stores row addresses, but its version 0 wrapper is classified as
+/// row ids, so leaving it beside a fresh version 1 segment would mix domains.
+#[rstest]
+#[case::btree("btree")]
+#[case::zonemap("zonemap")]
 #[tokio::test]
-async fn test_optimize_rebuilds_legacy_json_btree_segment_with_stable_row_ids() {
+async fn test_optimize_rebuilds_legacy_json_segment_with_stable_row_ids(
+    #[case] target_index_type: &str,
+) {
     use lance_table::format::IndexMetadata;
     use prost::Message;
 
     let mut dataset = stable_row_id_json_dataset("memory://").await;
     let segment = dataset
-        .create_index_builder(&["json"], IndexType::Scalar, &json_index_params("btree"))
+        .create_index_builder(
+            &["json"],
+            IndexType::Scalar,
+            &json_index_params(target_index_type),
+        )
         .name("json_idx".to_string())
         .execute_uncommitted()
         .await

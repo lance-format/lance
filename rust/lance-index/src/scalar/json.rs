@@ -74,7 +74,7 @@ const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
 ///
 /// Like [`legacy_row_id_domain_version`], but keyed off the target's own
 /// encoded details rather than its plugin name, for a caller that only has the
-/// raw details (e.g. [`wraps_row_addr_migrated_target`] and
+/// raw details (e.g. [`wraps_row_addr_domain_target`] and
 /// [`relabel_as_row_id_domain`], neither of which has a plugin instance handy).
 fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32> {
     if target_details.type_url.ends_with("BTreeIndexDetails") {
@@ -88,15 +88,25 @@ fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32>
     }
 }
 
-/// Whether `index_details` belong to a JSON index whose target type moved from
-/// row ids to row addresses, so that a segment of it written before that move
-/// stores row ids while a freshly trained one stores row addresses.
-pub fn wraps_row_addr_migrated_target(index_details: &prost_types::Any) -> bool {
+/// Whether `index_details` belong to a JSON index whose freshly trained segments
+/// are [`JSON_ROW_ADDR_DOMAIN_VERSION`], so that a segment of it written before
+/// that version is classified as row-id domain while a fresh one is not.
+///
+/// That covers targets that moved from row ids to row addresses (BTree, Bitmap,
+/// LabelList), whose legacy segments really store row ids, and targets that
+/// always stored row addresses (ZoneMap, BloomFilter, FM), whose legacy
+/// segments store addresses but carry the version-0 wrapper that
+/// `IndexMetadata::results_are_row_addrs` reads as row ids. Either way such a
+/// segment cannot share a named index with a fresh one and must be rebuilt.
+pub fn wraps_row_addr_domain_target(index_details: &prost_types::Any) -> bool {
     index_details.type_url.ends_with("JsonIndexDetails")
         && crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
             .ok()
             .and_then(|details| details.target_details)
-            .is_some_and(|target_details| legacy_target_index_version(&target_details).is_some())
+            .is_some_and(|target_details| {
+                legacy_target_index_version(&target_details).is_some()
+                    || lance_table::format::index_details_are_row_addrs(&target_details, 0)
+            })
 }
 
 /// The JSON segment version that matches the domain of a target persisted with
@@ -2840,7 +2850,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wraps_row_addr_migrated_target() {
+    fn test_wraps_row_addr_domain_target() {
         let json_over = |target: prost_types::Any| {
             prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
                 path: "v".to_string(),
@@ -2856,11 +2866,14 @@ mod tests {
             prost_types::Any::from_msg(&crate::pbold::BitmapIndexDetails::default()).unwrap();
         let ngram =
             prost_types::Any::from_msg(&crate::pbold::NGramIndexDetails::default()).unwrap();
+        let zonemap =
+            prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap();
 
-        assert!(wraps_row_addr_migrated_target(&json_over(btree.clone())));
-        assert!(wraps_row_addr_migrated_target(&json_over(bitmap)));
-        assert!(!wraps_row_addr_migrated_target(&json_over(ngram)));
-        assert!(!wraps_row_addr_migrated_target(&btree));
+        assert!(wraps_row_addr_domain_target(&json_over(btree.clone())));
+        assert!(wraps_row_addr_domain_target(&json_over(bitmap)));
+        assert!(wraps_row_addr_domain_target(&json_over(zonemap)));
+        assert!(!wraps_row_addr_domain_target(&json_over(ngram)));
+        assert!(!wraps_row_addr_domain_target(&btree));
     }
 
     /// Regression test for https://github.com/lance-format/lance/issues/7859.
