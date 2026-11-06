@@ -18,6 +18,9 @@ use crate::{Dataset, Error, Result};
 
 use super::{cache::load_source, get_row_id_index_with, read_row_id_sequence};
 
+/// Bound inline search work; larger encoded sources use the CPU pool.
+const INLINE_POINT_LOOKUP_BYTES: usize = 16 * 1024;
+
 #[derive(Debug)]
 pub struct CachedPointResolution {
     address: Option<RowAddress>,
@@ -140,18 +143,24 @@ async fn resolve_point(dataset: &Dataset, row_id: u64) -> Result<Option<RowAddre
         loads.push(async move {
             // Inline native segments resolve without object-store reads.
             // Spilled sources have no manifest ID bounds and remain candidates.
+            let is_small_inline = matches!(&fragment.row_id_meta,
+                Some(RowIdMeta::Inline(bytes)) if bytes.len() <= INLINE_POINT_LOOKUP_BYTES);
             let row_id_sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
             let source = FragmentRowIdIndex {
                 fragment_id: fragment.id as u32,
                 row_id_sequence: row_id_sequence.clone(),
                 deletion_vector: Arc::new(DeletionVector::default()),
             };
-            let address = spawn_cpu(move || {
+            let lookup = move || {
                 source
                     .get_many(&[row_id])
                     .map(|mut addresses| addresses.pop().flatten())
-            })
-            .await;
+            };
+            let address = if is_small_inline {
+                lookup()
+            } else {
+                spawn_cpu(lookup).await
+            };
             if fragment.deletion_file.is_none() || matches!(address, Ok(None)) {
                 return address;
             }
@@ -162,12 +171,16 @@ async fn resolve_point(dataset: &Dataset, row_id: u64) -> Result<Option<RowAddre
                 Ok(address) => Ok(address
                     .filter(|address| !source.deletion_vector.contains(address.row_offset()))),
                 Err(_) => {
-                    spawn_cpu(move || {
+                    let lookup = move || {
                         source
                             .get_many(&[row_id])
                             .map(|mut addresses| addresses.pop().flatten())
-                    })
-                    .await
+                    };
+                    if is_small_inline {
+                        lookup()
+                    } else {
+                        spawn_cpu(lookup).await
+                    }
                 }
             }
         });
