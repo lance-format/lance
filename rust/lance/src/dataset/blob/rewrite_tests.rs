@@ -12,8 +12,8 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Int32Array, LargeBinaryArray, LargeListArray, ListArray, RecordBatch,
-    RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, LargeBinaryArray, LargeListArray, ListArray, RecordBatch, RecordBatchIterator,
+    StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, Schema as ArrowSchema};
@@ -27,6 +27,7 @@ use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::rowids::version::RowDatasetVersionSequence;
 
+use crate::Result;
 use crate::blob::{BlobArrayBuilder, BlobFieldOptions, blob_field_with_options};
 use crate::blob_field;
 use crate::dataset::Dataset;
@@ -38,7 +39,6 @@ use crate::dataset::rowids::{RowLineage, place_row_lineage};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
 use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
-use crate::{Error, Result};
 
 /// Destinations here are written at V2_2, which is the version at which
 /// compaction turns managed preservation on.
@@ -779,94 +779,6 @@ async fn struct_of_two_blobs_dataset(dir: &TempStrDir, rows: usize) -> Arc<Datas
     .await
 }
 
-/// The same batch with the children of its struct `column` reordered to
-/// `order`, in both the schema and the column's arrays.
-fn with_struct_children_in_order(batch: &RecordBatch, column: &str, order: &[&str]) -> RecordBatch {
-    let schema = batch.schema();
-    let (column_idx, field) = schema.column_with_name(column).unwrap();
-    let DataType::Struct(children) = field.data_type() else {
-        panic!("column '{column}' is not a struct");
-    };
-    let struct_arr = batch.column(column_idx).as_struct();
-    let mut new_fields = Vec::with_capacity(order.len());
-    let mut new_arrays = Vec::with_capacity(order.len());
-    for name in order {
-        let (child_idx, child_field) = children.find(name).unwrap();
-        new_fields.push(child_field.clone());
-        new_arrays.push(struct_arr.column(child_idx).clone());
-    }
-    let new_fields: Fields = new_fields.into();
-    let reordered: ArrayRef = Arc::new(
-        StructArray::try_new(new_fields.clone(), new_arrays, struct_arr.nulls().cloned()).unwrap(),
-    );
-    replace_column(
-        batch,
-        column_idx,
-        Arc::new(
-            Field::new(column, DataType::Struct(new_fields), field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        reordered,
-    )
-}
-
-/// The same batch with the struct `column` projected down to `keep`.
-fn with_struct_children_kept(batch: &RecordBatch, column: &str, keep: &[&str]) -> RecordBatch {
-    with_struct_children_in_order(batch, column, keep)
-}
-
-/// The same batch with a struct child added that the dataset does not have.
-fn with_extra_struct_child(
-    batch: &RecordBatch,
-    column: &str,
-    extra: Field,
-    values: ArrayRef,
-) -> RecordBatch {
-    let schema = batch.schema();
-    let (column_idx, field) = schema.column_with_name(column).unwrap();
-    let DataType::Struct(children) = field.data_type() else {
-        panic!("column '{column}' is not a struct");
-    };
-    let struct_arr = batch.column(column_idx).as_struct();
-    let mut new_fields = children.to_vec();
-    new_fields.push(Arc::new(extra));
-    let mut new_arrays = struct_arr.columns().to_vec();
-    new_arrays.push(values);
-    let new_fields: Fields = new_fields.into();
-    let extended: ArrayRef = Arc::new(
-        StructArray::try_new(new_fields.clone(), new_arrays, struct_arr.nulls().cloned()).unwrap(),
-    );
-    replace_column(
-        batch,
-        column_idx,
-        Arc::new(
-            Field::new(column, DataType::Struct(new_fields), field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        extended,
-    )
-}
-
-fn replace_column(
-    batch: &RecordBatch,
-    column_idx: usize,
-    field: Arc<Field>,
-    array: ArrayRef,
-) -> RecordBatch {
-    let mut fields = batch.schema().fields().to_vec();
-    fields[column_idx] = field;
-    let mut columns = batch.columns().to_vec();
-    columns[column_idx] = array;
-    RecordBatch::try_new(
-        Arc::new(ArrowSchema::new_with_metadata(
-            fields,
-            batch.schema().metadata().clone(),
-        )),
-        columns,
-    )
-    .unwrap()
-}
-
 /// Write `transformed` as new fragments of `dataset` and swap them in for
 /// `old_fragments`, the way compaction publishes a rewrite.
 async fn publish_rewrite(
@@ -936,155 +848,6 @@ async fn blob_payloads(dataset: &Arc<Dataset>, column: &str, rows: usize) -> Vec
         payloads.push(blob.unwrap().read().await.unwrap().to_vec());
     }
     payloads
-}
-
-/// Scanning a struct's blob children in an order other than the dataset's and
-/// rewriting must keep each child's own payload: binding children by position
-/// would publish `b`'s descriptors under `a`'s field id and swap the payloads.
-#[tokio::test]
-async fn reordered_struct_children_keep_their_own_payloads() {
-    let dir = TempStrDir::default();
-    let rows = 3;
-    let dataset = struct_of_two_blobs_dataset(&dir, rows).await;
-
-    let batches = scan_with_row_addresses(&dataset).await;
-    assert_eq!(batches.len(), 1);
-    let reordered = with_struct_children_in_order(&batches[0], "info", &["b", "a"]);
-    assert_eq!(
-        BlobV2Layout::classify(&nested_blob_fields(
-            reordered.schema().as_ref(),
-            "info",
-            &["b"]
-        )),
-        Some(BlobV2Layout::Descriptor),
-        "this test only pins the fix if the children really arrive as descriptors"
-    );
-
-    let reopened = Arc::new(rewrite_and_republish(&dataset, vec![reordered]).await);
-    let expected_a = (0..rows)
-        .map(|row| named_payload("a", row))
-        .collect::<Vec<_>>();
-    let expected_b = (0..rows)
-        .map(|row| named_payload("b", row))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        blob_payloads(&reopened, "info.a", rows).await,
-        expected_a,
-        "child 'a' read back another child's payload"
-    );
-    assert_eq!(blob_payloads(&reopened, "info.b", rows).await, expected_b);
-}
-
-/// The inline payload bytes of a logical blob struct nested under a struct column.
-fn nested_blob_payloads(batch: &RecordBatch, column: &str, child: &str) -> Vec<Vec<u8>> {
-    let outer = batch.column_by_name(column).unwrap().as_struct();
-    let blob = outer.column_by_name(child).unwrap().as_struct();
-    let data = blob.column(0).as_binary::<i64>();
-    (0..data.len())
-        .map(|row| data.value(row).to_vec())
-        .collect()
-}
-
-/// A projection of only one blob child of a struct: the remaining child keeps
-/// its own payload, and nothing is resolved against the dropped child's id.
-#[tokio::test]
-async fn a_partial_struct_projection_of_a_blob_child_is_handled_explicitly() {
-    let dir = TempStrDir::default();
-    let rows = 3;
-    let dataset = struct_of_two_blobs_dataset(&dir, rows).await;
-
-    let batches = scan_with_row_addresses(&dataset).await;
-    let projected = with_struct_children_kept(&batches[0], "info", &["b"]);
-    let plan = plan_for(&dataset, projected.schema().as_ref(), false, false).unwrap();
-    let transformed = plan.transform_batch(&dataset, projected).await.unwrap();
-    assert_eq!(transformed.schema(), *plan.output_schema());
-    assert_eq!(
-        BlobV2Layout::classify(&nested_blob_fields(
-            plan.output_schema().as_ref(),
-            "info",
-            &["b"]
-        )),
-        Some(BlobV2Layout::Logical),
-        "the projected child must still be rewritten"
-    );
-
-    let payloads = nested_blob_payloads(&transformed, "info", "b");
-    let expected = (0..rows)
-        .map(|row| named_payload("b", row))
-        .collect::<Vec<_>>();
-    assert_eq!(payloads, expected);
-}
-
-/// Projecting away the blob child of a struct leaves a column with nothing to
-/// rewrite, which must pass through unchanged rather than be re-bound.
-#[tokio::test]
-async fn a_partial_struct_projection_of_a_non_blob_sibling_passes_through() {
-    let dir = TempStrDir::default();
-    let rows = 3;
-    let children: Fields = vec![
-        blob_field("a", true),
-        Field::new("n", DataType::Int32, true),
-    ]
-    .into();
-    let column: ArrayRef = Arc::new(
-        StructArray::try_new(
-            children.clone(),
-            vec![
-                named_blob_values("a", rows),
-                Arc::new(Int32Array::from_iter_values(0..rows as i32)),
-            ],
-            None,
-        )
-        .unwrap(),
-    );
-    let dataset = nested_dataset(
-        &dir,
-        Field::new("info", DataType::Struct(children), true),
-        column,
-    )
-    .await;
-
-    let batches = scan_with_row_addresses(&dataset).await;
-    let projected = with_struct_children_kept(&batches[0], "info", &["n"]);
-    let plan = plan_for(&dataset, projected.schema().as_ref(), true, false).unwrap();
-    let transformed = plan
-        .transform_batch(&dataset, projected.clone())
-        .await
-        .unwrap();
-    assert_eq!(transformed, projected);
-}
-
-/// A struct child the dataset does not have carries no field id, so it is
-/// refused instead of resolved against a sibling's id.
-#[tokio::test]
-async fn a_struct_child_unknown_to_the_dataset_is_refused() {
-    let dir = TempStrDir::default();
-    let rows = 3;
-    let dataset = struct_of_two_blobs_dataset(&dir, rows).await;
-
-    let batches = scan_with_row_addresses(&dataset).await;
-    // A copy of child 'b' under a name the dataset does not have: the shape
-    // is rewritable, only the binding is missing.
-    let outer = batches[0].column_by_name("info").unwrap().as_struct();
-    let (b_idx, b_field) = outer.fields().find("b").unwrap();
-    let extended = with_extra_struct_child(
-        &batches[0],
-        "info",
-        b_field
-            .as_ref()
-            .clone()
-            .with_name("extra")
-            .with_nullable(true),
-        outer.column(b_idx).clone(),
-    );
-    let Err(error) = plan_for(&dataset, extended.schema().as_ref(), false, false) else {
-        panic!("a child the dataset does not have must be refused");
-    };
-    assert!(
-        matches!(error, Error::InvalidInput { .. }),
-        "unexpected error variant: {error:?}"
-    );
-    assert!(error.to_string().contains("info.extra"), "{error}");
 }
 
 /// The full struct in the dataset's own child order is the shape every

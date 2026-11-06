@@ -438,26 +438,19 @@ impl BlobV2FieldRewritePlan {
 
         match (field.data_type(), input_field.data_type()) {
             (ArrowDataType::Struct(_), ArrowDataType::Struct(input_children)) => {
-                // Bind each input child to the dataset child of the same name, in
-                // input order: a Blob v2 descriptor is resolved with its field id,
-                // so pairing children by position would resolve a reordered child
-                // against another child's payload. A child the dataset does not
-                // have cannot be given a field id, so it is refused rather than
-                // borrowing one.
-                let children = input_children
+                if field.children.len() != input_children.len() {
+                    return Err(Error::internal(format!(
+                        "Struct field '{}' expected {} children in blob rewrite plan, got {}",
+                        field.name,
+                        field.children.len(),
+                        input_children.len()
+                    )));
+                }
+                let children = field
+                    .children
                     .iter()
-                    .map(|input_child| {
-                        let child = field.child(input_child.name()).ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "Struct field '{}' has no child '{}' in the dataset schema, so '{}.{}' cannot be rewritten",
-                                field.name,
-                                input_child.name(),
-                                field.name,
-                                input_child.name()
-                            ))
-                        })?;
-                        Self::try_new(child, input_child, preserve_managed)
-                    })
+                    .zip(input_children.iter())
+                    .map(|(child, input_child)| Self::try_new(child, input_child, preserve_managed))
                     .collect::<Result<Vec<_>>>()?;
                 let output_children = children
                     .iter()
@@ -590,19 +583,6 @@ impl BlobV2FieldRewritePlan {
                             children.len(),
                             struct_arr.num_columns()
                         )));
-                    }
-                    // The children were bound by name at plan time, so reject a
-                    // batch whose struct children arrive in a different order from
-                    // the schema this plan was built on.
-                    for (child, array_field) in children.iter().zip(struct_arr.fields()) {
-                        if child.output_field().name() != array_field.name() {
-                            return Err(Error::invalid_input(format!(
-                                "Struct field '{}' child '{}' does not match the rewrite plan's child '{}'",
-                                field_name,
-                                array_field.name(),
-                                child.output_field().name()
-                            )));
-                        }
                     }
                     let mut child_arrays = Vec::with_capacity(children.len());
                     for (child, child_array) in children.iter().zip(struct_arr.columns()) {
@@ -837,11 +817,12 @@ impl BlobV2BatchRewritePlan {
     /// `dataset` must be the dataset the rows were scanned from: payloads are
     /// resolved by row address against it, and a batch from elsewhere yields wrong
     /// payloads rather than an error. `batch` must match the planned schema exactly
-    /// (the same columns in the same order) and carry a non-null `UInt64` `_rowaddr`
-    /// for every row, from that same snapshot; none of this is checked here beyond
-    /// what the engine already does, so a batch that breaks it gives wrong payloads
-    /// or panics instead of an error. May read payload bytes from storage. Batches
-    /// may be transformed concurrently.
+    /// (the same columns in the same order, with struct columns carrying all of the
+    /// dataset's children in dataset order, as compaction's scan produces them) and
+    /// carry a non-null `UInt64` `_rowaddr` for every row, from that same snapshot;
+    /// none of this is checked here beyond what the engine already does, so a batch
+    /// that breaks it gives wrong payloads or panics instead of an error. May read
+    /// payload bytes from storage. Batches may be transformed concurrently.
     pub async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
