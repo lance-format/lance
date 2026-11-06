@@ -198,15 +198,14 @@ impl BlobRewritePlan {
         } else {
             input_schema.clone()
         };
-        let rewrites_blobs = BlobV2BatchRewritePlan::try_new(
+        let plan = BlobV2BatchRewritePlan::try_new(
             dataset.schema(),
             probe_schema.as_ref(),
             retain_row_addresses,
             preserve_managed,
-        )?
-        .rewrites_anything();
+        )?;
 
-        if !rewrites_blobs {
+        if !plan.rewrites_anything() {
             let drop_row_addresses = !retain_row_addresses;
             let output_schema = if drop_row_addresses {
                 Arc::new(ArrowSchema::new_with_metadata(
@@ -256,12 +255,9 @@ impl BlobRewritePlan {
             )));
         }
 
-        let inner = BlobV2BatchRewritePlan::try_new(
-            dataset.schema(),
-            input_schema.as_ref(),
-            retain_row_addresses,
-            preserve_managed,
-        )?;
+        // The probe plan is the final plan: the check above proves `_rowaddr` is
+        // present, so `probe_schema` is `input_schema`.
+        let inner = plan;
         let output_schema = inner.output_schema().clone();
         Ok(Self {
             dataset,
