@@ -320,6 +320,60 @@ impl RowIdIndex {
         Ok(Some(Self::build_probe(fragments, probes, sources)))
     }
 
+    /// Combine independently prepared indices without rebuilding their lookups.
+    ///
+    /// The caller must verify that each input's row IDs, deletions and physical
+    /// addresses belong to the desired snapshot. Fragment IDs must be disjoint
+    /// across all input sources, including empty fragments; duplicates return an
+    /// invalid-input error. Original source sequences need not remain alive.
+    ///
+    /// Shares prepared probe allocations directly and rebuilds only routing
+    /// metadata, without retaining the input indices. Returns `None` for merged
+    /// inputs or when the combined overlap requires the merged representation;
+    /// the caller can load the original sequences and use [`Self::new`]. Empty
+    /// input produces an empty index. Duplicate live row IDs remain errors at
+    /// lookup time, as with an index built by [`Self::new`].
+    ///
+    /// ```
+    /// # use lance_table::rowids::RowIdIndex;
+    /// # fn example(prepared: &[&RowIdIndex]) -> lance_core::Result<()> {
+    /// if let Some(combined) = RowIdIndex::try_combine(prepared)? {
+    ///     let addresses = combined.get_many(&[10, 20, 10])?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_combine(indices: &[&Self]) -> Result<Option<Self>> {
+        if indices.is_empty() {
+            return Self::new(&[]).map(Some);
+        }
+        let mut seen = RoaringBitmap::new();
+        let mut sources = Vec::with_capacity(indices.iter().map(|index| index.sources.len()).sum());
+        for index in indices {
+            for source in &index.sources {
+                if !seen.insert(source.fragment_id) {
+                    return Err(Error::invalid_input(format!(
+                        "indices contains duplicate fragment_id {}",
+                        source.fragment_id
+                    )));
+                }
+                sources.push(source.clone());
+            }
+        }
+        if indices.iter().any(|index| index.merged.is_some()) {
+            return Ok(None);
+        }
+        let fragments: Vec<_> = indices
+            .iter()
+            .flat_map(|index| index.fragments.iter().cloned())
+            .collect();
+        let probes = probe_entries(&fragments);
+        if !probing_beats_merging(&fragments, &probes) {
+            return Ok(None);
+        }
+        Ok(Some(Self::build_probe(fragments, probes, sources)))
+    }
+
     fn build_probe(
         mut fragments: Vec<Arc<FragmentEntry>>,
         probes: Vec<ProbeEntry>,
@@ -1527,6 +1581,153 @@ mod tests {
         let error = invalid.get(queries[2]).unwrap_err();
         assert!(matches!(error, Error::Internal { .. }));
         assert!(error.to_string().contains("live in multiple fragments"));
+    }
+
+    #[test]
+    fn combine_empty_and_duplicate_fragment_sources() {
+        let empty = RowIdIndex::try_combine(&[]).unwrap().unwrap();
+        assert_eq!(empty.get(0).unwrap(), None);
+        assert_eq!(empty.get_many(&[0, u64::MAX]).unwrap(), vec![None; 2]);
+
+        // Empty fragments still own their physical address namespace. Validate
+        // all sources even when their merged representation cannot be combined.
+        let sources = [
+            fragment(7, RowIdSequence::default()),
+            fragment(7, RowIdSequence::default()),
+        ];
+        let first = RowIdIndex::new(&sources[..1]).unwrap();
+        let second = RowIdIndex::new(&sources[1..]).unwrap();
+        let repeated = RowIdIndex::new(&sources).unwrap();
+        for indices in [vec![&first, &first], vec![&first, &second], vec![&repeated]] {
+            let error = RowIdIndex::try_combine(&indices).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("duplicate fragment_id 7"));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(true)]
+    #[case::unsorted(false)]
+    fn combine_independent_probes_preserves_lookups_and_shares_memory(#[case] sorted: bool) {
+        let len = MERGE_ROWS_BUDGET + 1;
+        let rows: Vec<Vec<_>> = (0..2)
+            .map(|parity| {
+                let mut ids: Vec<_> = (0..len).map(|offset| offset * 4 + parity).collect();
+                if !sorted {
+                    ids.reverse();
+                }
+                ids
+            })
+            .collect();
+        let sources: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, ids)| {
+                let array = ids.clone().into();
+                let segment = if sorted {
+                    U64Segment::SortedArray(array)
+                } else {
+                    U64Segment::Array(array)
+                };
+                let mut source = fragment(i as u32 + 7, RowIdSequence(vec![segment]));
+                source.deletion_vector =
+                    Arc::new(DeletionVector::Bitmap([1].into_iter().collect()));
+                source
+            })
+            .collect();
+        let originals: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::downgrade(&source.row_id_sequence))
+            .collect();
+        let indices: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::new(RowIdIndex::new(std::slice::from_ref(source)).unwrap()))
+            .collect();
+        assert!(indices.iter().all(|index| index.merged.is_none()));
+        drop(sources);
+        if !sorted {
+            assert!(originals.iter().all(|source| source.upgrade().is_none()));
+        }
+        // Reverse the inputs to exercise remapping of the routing directory.
+        let combined = RowIdIndex::try_combine(&[&indices[1], &indices[0]])
+            .unwrap()
+            .unwrap();
+        for (i, index) in indices.iter().enumerate() {
+            assert!(Arc::ptr_eq(&index.fragments[0], &combined.fragments[1 - i]));
+        }
+        let mut queries = vec![2, u64::MAX];
+        let mut expected = vec![None, None];
+        for (i, ids) in rows.iter().enumerate() {
+            for offset in [0, 1, 17, len as usize - 1, 0] {
+                queries.push(ids[offset]);
+                expected.push(
+                    (offset != 1).then(|| RowAddress::new_from_parts(i as u32 + 7, offset as u32)),
+                );
+            }
+        }
+        // Both the scalar path and the interleaved batch path retain input
+        // order, repeated requests, deletion holes and in-range misses.
+        for (&id, &address) in queries.iter().zip(&expected) {
+            assert_eq!(combined.get(id).unwrap(), address);
+        }
+        queries = queries.repeat(4);
+        expected = expected.repeat(4);
+        assert_eq!(combined.get_many(&queries).unwrap(), expected);
+        let mut context = lance_core::deepsize::Context::default();
+        let units_charge: usize = indices
+            .iter()
+            .map(|index| index.deep_size_of_children(&mut context))
+            .sum();
+        assert!(units_charge > 1_000_000);
+        assert!(combined.deep_size_of_children(&mut context) < 4096);
+        assert!(combined.deep_size_of() > 1_000_000);
+        let parents: Vec<_> = indices.iter().map(Arc::downgrade).collect();
+        drop(indices);
+        assert!(parents.iter().all(|index| index.upgrade().is_none()));
+        assert_eq!(combined.get_many(&queries).unwrap(), expected);
+    }
+
+    #[test]
+    fn combine_preserves_overlap_gate_and_live_duplicate_errors() {
+        // A deletion makes each large range costly to merge, but preparing its
+        // probe remains constant-time. No large test array is needed here.
+        let indices: Vec<_> = (0..=MAX_PROBE_DEPTH)
+            .map(|id| {
+                let mut source = fragment(
+                    id as u32,
+                    RowIdSequence(vec![U64Segment::Range(0..MERGE_ROWS_BUDGET + 1)]),
+                );
+                source.deletion_vector = Arc::new(DeletionVector::Bitmap(
+                    [u32::from(id != 0)].into_iter().collect(),
+                ));
+                RowIdIndex::new(&[source]).unwrap()
+            })
+            .collect();
+        let references: Vec<_> = indices.iter().collect();
+        let pair = RowIdIndex::try_combine(&references[..2]).unwrap().unwrap();
+        assert_eq!(pair.get(0).unwrap(), Some(RowAddress::new_from_parts(1, 0)));
+        assert_eq!(pair.get(1).unwrap(), Some(RowAddress::new_from_parts(0, 1)));
+        let error = pair.get(2).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(error.to_string().contains("live in multiple fragments"));
+        let error = pair.get_many(&[2; 32]).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(error.to_string().contains("live in multiple fragments"));
+        assert!(
+            RowIdIndex::try_combine(&references[..MAX_PROBE_DEPTH as usize])
+                .unwrap()
+                .is_some()
+        );
+        assert!(RowIdIndex::try_combine(&references).unwrap().is_none());
+
+        let small = RowIdIndex::new(&[fragment(99, sparse_sequence(3))]).unwrap();
+        assert!(small.merged.is_some());
+        assert!(RowIdIndex::try_combine(&[&small]).unwrap().is_none());
+        assert!(
+            RowIdIndex::try_combine(&[&indices[0], &small])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
