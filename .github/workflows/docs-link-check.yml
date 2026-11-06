@@ -54,7 +54,7 @@ jobs:
         with:
           # Restricted to http(s) on purpose. Relative links resolve against
           # the assembled multi-repo site (docs/make-full-website.sh pulls
-          # docs/src/format/catalog, format/namespace, guide/spark and
+          # docs/src/format/catalog, format/namespace, integrations/spark and
           # friends from other repositories), so they cannot be verified from
           # this checkout alone and would report as broken on every run.
           #

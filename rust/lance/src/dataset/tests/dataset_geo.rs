@@ -14,6 +14,7 @@ use crate::dataset::{
 };
 
 use crate::index::DatasetIndexExt;
+use crate::utils::test::geo;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::UInt32Array;
@@ -30,10 +31,11 @@ use geoarrow_array::{
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_arrow::RecordBatchExt;
-use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::ScalarIndexParams;
 use rstest::rstest;
 
@@ -245,6 +247,48 @@ async fn test_geo_rtree_index() {
     assert_intersects_sql(&mut dataset, true).await;
 }
 
+/// Any code can build a default registry before the first index operation, as a
+/// directory namespace does when it rewrites its manifest, and that freezes plugin
+/// registration. The R-tree index must not depend on coming first.
+#[tokio::test]
+async fn test_rtree_index_after_a_default_registry_froze_registration() {
+    let frozen = IndexPluginRegistry::with_default_plugins();
+    let err = frozen.get_plugin_by_name("rtree").unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidInput { .. }));
+    assert_contains!(err.to_string(), "No scalar index plugin found");
+
+    let (dataset, _) = geo::dataset_with_committed_rtree_index("memory://", 10, 3).await;
+
+    // This line crosses the diagonal where the last row of the first fragment
+    // meets the first row of the second one.
+    let sql = "SELECT id FROM dataset \
+               WHERE St_Intersects(geometry, ST_GeomFromText('LINESTRING ( 11 9, 9 11 )'))";
+    let batches = dataset
+        .sql(sql)
+        .build()
+        .await
+        .unwrap()
+        .into_batch_records()
+        .await
+        .unwrap();
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![9, 10]);
+
+    let plan = dataset
+        .sql(&format!("Explain {sql}"))
+        .build()
+        .await
+        .unwrap()
+        .into_batch_records()
+        .await
+        .unwrap();
+    assert_contains!(format!("{plan:?}"), "ScalarIndexQuery");
+}
+
 #[rstest]
 #[case::without_crs(None, false)]
 #[case::crs_at_build(Some(r#"{"crs":"OGC:CRS84"}"#), true)]
@@ -343,6 +387,7 @@ async fn test_rtree_crs(#[case] crs_metadata: Option<&str>, #[case] has_crs_at_b
 async fn test_staged_rtree_after_rewrite_columns(
     #[case] checkout_latest: bool,
     #[case] update_mode: Option<UpdateMode>,
+    #[values(false, true)] from_stream: bool,
 ) {
     let point_type = PointType::new(Dimension::XY, Default::default());
     let mut points = PointBuilder::new(point_type.clone());
@@ -385,26 +430,41 @@ async fn test_staged_rtree_after_rewrite_columns(
         .await
         .unwrap();
 
+    // Row 0 moves to (10 10). The stream form supplies every live row of the
+    // fragment, so row 1 is written back unchanged.
     let mut points = PointBuilder::new(point_type.clone());
     points.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
-    let update = record_batch!((ROW_ID, UInt64, [0]))
-        .unwrap()
-        .try_with_column(
-            point_type.to_field("point", true),
-            points.finish().to_array_ref(),
-        )
-        .unwrap();
-    let update_schema = update.schema();
-    let (fragment, fields_modified) = dataset
-        .get_fragment(0)
-        .unwrap()
-        .update_columns(
-            RecordBatchIterator::new([Ok(update)], update_schema),
-            ROW_ID,
-            ROW_ID,
-        )
-        .await
-        .unwrap();
+    if from_stream {
+        points.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+    }
+    let points = points.finish().to_array_ref();
+    let mut fragment = dataset.get_fragment(0).unwrap();
+    let (fragment, fields_modified) = if from_stream {
+        let update = record_batch!((ROW_ADDR, UInt64, [0, 1]))
+            .unwrap()
+            .try_with_column(point_type.to_field("point", true), points)
+            .unwrap();
+        let update_schema = update.schema();
+        let result = fragment
+            .update_columns_from_stream(RecordBatchIterator::new([Ok(update)], update_schema), None)
+            .await
+            .unwrap();
+        (result.fragment, result.fields_modified)
+    } else {
+        let update = record_batch!((ROW_ID, UInt64, [0]))
+            .unwrap()
+            .try_with_column(point_type.to_field("point", true), points)
+            .unwrap();
+        let update_schema = update.schema();
+        fragment
+            .update_columns(
+                RecordBatchIterator::new([Ok(update)], update_schema),
+                ROW_ID,
+                ROW_ID,
+            )
+            .await
+            .unwrap()
+    };
     let point_field_id = dataset.schema().field("point").unwrap().id as u32;
     let id_field_id = dataset.schema().field("id").unwrap().id as u32;
     assert!(fields_modified.contains(&point_field_id));

@@ -22,7 +22,7 @@ impl InvertedPrewarmState {
 #[derive(Clone)]
 pub struct InvertedIndex {
     pub(super) params: InvertedIndexParams,
-    pub(super) store: Arc<dyn IndexStore>,
+    pub(in crate::scalar::inverted) store: Arc<dyn IndexStore>,
     pub(super) tokenizer: Box<dyn LanceTokenizer>,
     pub(super) token_set_format: TokenSetFormat,
     pub(super) format_version: InvertedListFormatVersion,
@@ -904,7 +904,7 @@ impl InvertedIndex {
         let mut state = self.prewarm_state.lock().await;
         if state.satisfies(options.with_position)
             && self
-                .prewarm_diagnostics(options.with_position)
+                .prewarm_readiness_diagnostics(options.with_position)
                 .await
                 .fully_resident()
         {
@@ -982,7 +982,7 @@ impl InvertedIndex {
             );
         }
         self.aggregate_corpus_stats().await?;
-        let diagnostics = self.prewarm_diagnostics(with_position).await;
+        let diagnostics = self.prewarm_readiness_diagnostics(with_position).await;
         if !diagnostics.fully_resident() {
             if best_effort {
                 warn!(
@@ -1008,7 +1008,7 @@ impl InvertedIndex {
     }
 
     pub async fn prewarm_residency_result(&self, with_position: bool) -> FtsPrewarmResult {
-        let diagnostics = self.prewarm_diagnostics(with_position).await;
+        let diagnostics = self.prewarm_readiness_diagnostics(with_position).await;
         if diagnostics.fully_resident() {
             FtsPrewarmResult::fully_resident()
         } else {
@@ -1016,11 +1016,11 @@ impl InvertedIndex {
         }
     }
 
-    async fn prewarm_diagnostics(&self, with_position: bool) -> FtsPrewarmDiagnostics {
+    async fn prewarm_readiness_diagnostics(&self, with_position: bool) -> FtsPrewarmDiagnostics {
         let statuses = futures::future::join_all(self.partitions.iter().map(|partition| async {
             let (posting_resident, position_resident) = partition
                 .inverted_list
-                .prewarm_residency_status(with_position)
+                .prewarm_readiness_status(with_position)
                 .await;
             FtsPrewarmPartitionStatus {
                 segment_id: None,
@@ -1032,6 +1032,13 @@ impl InvertedIndex {
             }
         }))
         .await;
+        self.prewarm_diagnostics_from_statuses(statuses)
+    }
+
+    fn prewarm_diagnostics_from_statuses(
+        &self,
+        statuses: Vec<FtsPrewarmPartitionStatus>,
+    ) -> FtsPrewarmDiagnostics {
         let failing_partitions = statuses
             .into_iter()
             .filter(|status| !status.query_ready())

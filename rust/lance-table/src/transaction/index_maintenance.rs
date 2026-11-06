@@ -289,6 +289,45 @@ impl Transaction {
         live: &RoaringBitmap,
         rewrites: &[(u64, Vec<u32>)],
     ) {
+        Self::withdraw_coverage(indices, lineage, live, Some(rewrites));
+    }
+
+    /// Withdraw retired index provenance whose values cannot be verified after
+    /// transaction cleanup. Live coverage survives when the reader can still
+    /// filter out withdrawn rows; see [`Self::withdraw_rewritten_coverage`].
+    /// Unknown coverage is withdrawn in full. Empty segments follow the same
+    /// retirement rules as rewritten coverage, retaining the last segment as
+    /// the definition to rebuild.
+    ///
+    /// ```
+    /// # use lance_table::{format::IndexMetadata, transaction::Transaction};
+    /// # use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
+    /// # use roaring::RoaringBitmap;
+    /// # fn withdraw(indices: &mut Vec<IndexMetadata>, lineage: &TaggedLineage, live: &RoaringBitmap) {
+    /// Transaction::withdraw_unverified_retired_coverage(indices, lineage, live);
+    /// # }
+    /// ```
+    pub fn withdraw_unverified_retired_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: &TaggedLineage,
+        live: &RoaringBitmap,
+    ) {
+        Self::withdraw_coverage(indices, Some(lineage), live, None);
+    }
+
+    /// A missing rewrite list withdraws all retired provenance. A present list
+    /// withdraws only coverage invalidated by those column rewrites.
+    fn withdraw_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: Option<&TaggedLineage>,
+        live: &RoaringBitmap,
+        rewrites: Option<&[(u64, Vec<u32>)]>,
+    ) {
+        let reason = if rewrites.is_some() {
+            "an in-place rewrite of an indexed column"
+        } else {
+            "transaction cleanup left retired provenance unverified"
+        };
         let mut emptied = Vec::new();
         for index in indices.iter_mut().filter(|index| !is_system_index(index)) {
             let indexed: HashSet<u32> = index
@@ -297,35 +336,50 @@ impl Transaction {
                 .filter_map(|field| u32::try_from(*field).ok())
                 .collect();
             let Some(bitmap) = index.fragment_bitmap.as_mut() else {
+                if rewrites.is_none() {
+                    index.fragment_bitmap = Some(RoaringBitmap::new());
+                    emptied.push(index.uuid);
+                    log::warn!(
+                        "index {} (segment {}): withdrew unknown coverage because {reason}; \
+                         its rows are scanned until the index is optimized",
+                        index.name,
+                        index.uuid,
+                    );
+                }
                 continue;
             };
             let retired = &*bitmap - live;
-            let mut withdrawn = RoaringBitmap::new();
-            for (fragment, fields) in rewrites {
-                if !fields.iter().any(|field| indexed.contains(field)) {
-                    continue;
-                }
-                let Ok(rewritten) = u32::try_from(*fragment) else {
-                    continue;
-                };
-                if bitmap.contains(rewritten) {
-                    withdrawn.insert(rewritten);
-                }
-                // Every retired source whose rows reach the rewritten
-                // fragment goes; the sources of one transition all reach the
-                // same destinations, so the transition is withdrawn whole.
-                for source in retired.iter() {
-                    match lineage.and_then(|lineage| lineage.destinations_of(source)) {
-                        Some(destinations) if destinations.contains(&rewritten) => {
-                            withdrawn.insert(source);
-                        }
-                        Some(_) => {}
-                        None => {
-                            withdrawn.insert(source);
+            let mut withdrawn = if let Some(rewrites) = rewrites {
+                let mut withdrawn = RoaringBitmap::new();
+                for (fragment, fields) in rewrites {
+                    if !fields.iter().any(|field| indexed.contains(field)) {
+                        continue;
+                    }
+                    let Ok(rewritten) = u32::try_from(*fragment) else {
+                        continue;
+                    };
+                    if bitmap.contains(rewritten) {
+                        withdrawn.insert(rewritten);
+                    }
+                    // Every retired source whose rows reach the rewritten
+                    // fragment goes; the sources of one transition all reach the
+                    // same destinations, so the transition is withdrawn whole.
+                    for source in retired.iter() {
+                        match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                            Some(destinations) if destinations.contains(&rewritten) => {
+                                withdrawn.insert(source);
+                            }
+                            Some(_) => {}
+                            None => {
+                                withdrawn.insert(source);
+                            }
                         }
                     }
                 }
-            }
+                withdrawn
+            } else {
+                retired.clone()
+            };
             if withdrawn.is_empty() {
                 continue;
             }
@@ -364,8 +418,8 @@ impl Transaction {
                 emptied.push(index.uuid);
             }
             log::warn!(
-                "index {} (segment {}): withdrew {} fragment(s) of coverage after an in-place \
-                 rewrite of an indexed column; the rows they covered are scanned until the index \
+                "index {} (segment {}): withdrew {} fragment(s) of coverage because {reason}; \
+                 the rows they covered are scanned until the index \
                  is optimized",
                 index.name,
                 index.uuid,
@@ -2465,6 +2519,41 @@ mod withdrawal_tests {
     /// F1, F2 -> F3 then F3 -> F4 (F4 live), plus an unrelated F6 -> F8.
     fn history() -> IndexMetadata {
         tagged_entry(&[(&[1, 2], &[3]), (&[3], &[4]), (&[6], &[8])])
+    }
+
+    #[rstest::rstest]
+    #[case::retired(Some(&[1, 2, 3, 6][..]), &[])]
+    #[case::live_only_remainder(Some(&[1, 2, 9][..]), &[])]
+    #[case::translating_remainder(Some(&[1, 2, 8][..]), &[8])]
+    #[case::unchanged_live(Some(&[8, 9][..]), &[8, 9])]
+    #[case::unknown(None, &[])]
+    #[test]
+    fn withdraws_unverified_retired_provenance(
+        #[case] bitmap: Option<&[u32]>,
+        #[case] expected: &[u32],
+    ) {
+        let entry = history();
+        let live = RoaringBitmap::from_iter([4u32, 8, 9]);
+        let mut indices = vec![segment(bitmap, vec![0]), entry.clone()];
+        Transaction::withdraw_unverified_retired_coverage(&mut indices, &lineage(&entry), &live);
+        assert_eq!(indices.len(), 2, "the last segment is kept for rebuilding");
+        assert_eq!(
+            indices[0].fragment_bitmap,
+            Some(expected.iter().copied().collect())
+        );
+        assert_eq!(indices[1].fragment_bitmap, entry.fragment_bitmap);
+    }
+
+    #[test]
+    fn unverified_retired_segment_leaves_a_serving_sibling() {
+        let entry = history();
+        let live = RoaringBitmap::from_iter([4u32, 8, 9]);
+        let sibling = segment(Some(&[8, 9]), vec![0]);
+        let mut indices = vec![segment(Some(&[1, 2]), vec![0]), sibling.clone()];
+        Transaction::withdraw_unverified_retired_coverage(&mut indices, &lineage(&entry), &live);
+        assert_eq!(indices.len(), 1);
+        assert_eq!(indices[0].uuid, sibling.uuid);
+        assert_eq!(indices[0].fragment_bitmap, sibling.fragment_bitmap);
     }
 
     #[test]

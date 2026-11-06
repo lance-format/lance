@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import json
+import multiprocessing
 import pickle
 import random
 import re
@@ -13,7 +14,12 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from lance.lance import Compaction
-from lance.optimize import RewriteResult
+from lance.optimize import (
+    OptimizeIndexMerge,
+    OptimizeIndexTask,
+    OptimizeIndices,
+    RewriteResult,
+)
 from lance.vector import vec_to_table
 
 
@@ -480,7 +486,7 @@ def test_optimize_max_bytes(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     arr = pa.array(range(4 * 1024 * 1024))
     arr = pa.FixedSizeListArray.from_arrays(arr, 1024)
-    data = pa.table({"a": arr})
+    data = pa.table({"id": range(len(arr)), "a": arr})
 
     # Write out 4K rows and 32MB of data
     dataset = lance.write_dataset(
@@ -489,19 +495,24 @@ def test_optimize_max_bytes(tmp_path: Path):
     # We get 2 fragments
     assert len(dataset.get_fragments()) == 2
 
+    # Deletions trigger rewriting files that already exceed the byte threshold.
+    dataset.delete("id % 1024 = 0")
+
     # Now run compaction with a small max_bytes_per_file (1000 bytes) to get more
     # fragments.  The exact number is a bit tricky to calculate because we don't
     # split into a new fragment until we've actually written data and that depends
     # on how much the file format chooses to accumulate, but it should be more than 2
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
-        materialize_deletions=False,
+        materialize_deletions=True,
+        materialize_deletions_threshold=0.0,
         max_bytes_per_file=1000,
         batch_size=128,
     )
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added > 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added > 2
 
     num_frags = len(dataset.get_fragments())
@@ -515,18 +526,24 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
-    # Same test but use Compaction.plan
+    dataset.delete("id % 1024 = 0")
+
+    # Same writer test but use Compaction.plan
     plan = Compaction.plan(
         dataset,
         options=dict(
-            target_rows_per_fragment=100 * 1024, max_bytes_per_file=1000, batch_size=128
+            target_rows_per_fragment=100 * 1024,
+            max_bytes_per_file=1000,
+            batch_size=128,
+            materialize_deletions_threshold=0.0,
         ),
     )
     results = [task.execute(dataset) for task in plan.tasks]
     metrics = Compaction.commit(dataset, results)
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added > 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added > 2
 
     dataset = lance.write_dataset(
@@ -537,18 +554,22 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
+    dataset.delete("id % 1024 = 0")
+
     # In this test max_bytes_per_file is still too small but the batch size
     # is so large we read the entire input in a single batch
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
-        materialize_deletions=False,
+        materialize_deletions=True,
+        materialize_deletions_threshold=0.0,
         max_bytes_per_file=1000,
         batch_size=2 * 1024,
     )
 
+    assert dataset.count_rows() == len(arr) - 4
     assert metrics.fragments_removed == 2
     assert metrics.fragments_added == 2
-    assert metrics.files_removed == 2
+    assert metrics.files_removed == 4  # Two data files and their deletion files
     assert metrics.files_added == 2
 
     num_frags = len(dataset.get_fragments())
@@ -1392,3 +1413,123 @@ def test_remap_row_addrs(tmp_path: Path):
         pa.array([old[i] for i in sample], pa.uint64())
     ).to_pylist()
     assert remapped == [new[i] for i in sample]
+
+
+@pytest.mark.parametrize("min_bytes", [None, 1024 * 1024, 0, -1, 1024 * 1024 + 1])
+def test_min_bytes_per_file(tmp_path: Path, min_bytes):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(4)}), tmp_path / "dataset", max_rows_per_file=2
+    )
+    dataset.update_config({"lance.compaction.min_bytes_per_file": "1"})
+    options = dict(max_bytes_per_file=1024 * 1024, min_bytes_per_file=min_bytes)
+    if min_bytes is not None and (min_bytes <= 0 or min_bytes > 1024 * 1024):
+        error = OverflowError if min_bytes < 0 else OSError
+        with pytest.raises(error):
+            Compaction.plan(dataset, options)
+        with pytest.raises(error):
+            dataset.optimize.compact_files(**options)
+        return
+
+    plan = Compaction.plan(dataset, options)
+    assert json.loads(plan.json())["options"]["min_bytes_per_file"] == (
+        1 if min_bytes is None else min_bytes
+    )
+    version = dataset.version
+    metrics = dataset.optimize.compact_files(**options)
+    if min_bytes is None:
+        assert not plan.tasks
+        assert metrics.fragments_removed == 0
+        assert dataset.version == version
+    else:
+        assert plan.tasks
+        assert metrics.fragments_removed == 2
+
+
+def test_optimize_indices_distributed(tmp_path: Path):
+    """The plan's tasks and merges travel to worker processes by pickle and
+    their results travel back, while the table keeps taking writes."""
+
+    def table(start: int, rows: int) -> pa.Table:
+        vectors = np.random.default_rng(start).random((rows, 8), dtype=np.float32)
+        return vec_to_table(vectors).append_column(
+            "id", pa.array(range(start, start + rows))
+        )
+
+    # A vector index and a BTree index over fragment 0 (256 rows), then four
+    # unindexed fragments 1..4 of 64 rows each.
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(table(0, 256), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    dataset = lance.write_dataset(
+        table(256, 256), uri, mode="append", max_rows_per_file=64
+    )
+    version = dataset.version
+
+    # Two tasks of two fragments per index, each index merged by one merge.
+    plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
+    assert {(task.index_name, tuple(task.fragments)) for task in plan.tasks} == {
+        ("vector_idx", (1, 2)),
+        ("vector_idx", (3, 4)),
+        ("id_idx", (1, 2)),
+        ("id_idx", (3, 4)),
+    }
+    assert len(plan.merges) == 2
+    segment_plan = OptimizeIndices.plan(dataset, {"max_rows_per_segment": 128})
+    assert {
+        (task.index_name, tuple(task.fragments)) for task in segment_plan.tasks
+    } == {(task.index_name, tuple(task.fragments)) for task in plan.tasks}
+    # The task and output bounds pack separately: four 128-row task results
+    # become four output segments instead of the two groups above.
+    assert sorted(merge.group for merge in segment_plan.merges) == [0, 1, 2, 3]
+
+    # Each worker rebuilds its own dataset handle from the pickled one, as a
+    # worker on another machine would; a unit reads the version it was
+    # planned from, whatever version the handle is at.
+    context = multiprocessing.get_context("spawn")
+    with context.Pool(2) as pool:
+        built = pool.starmap_async(
+            OptimizeIndexTask.execute, [(task, dataset) for task in plan.tasks]
+        ).get(timeout=300)
+        assert len(built) == 4 and None not in built
+        # An append lands after the task results and before the merges: the
+        # commit still goes through, and the new fragment waits for the next
+        # optimize.
+        lance.write_dataset(table(512, 10), uri, mode="append")
+        # Every merge may be given every task result.
+        merged = pool.starmap_async(
+            OptimizeIndexMerge.execute,
+            [(merge, dataset, built) for merge in plan.merges],
+        ).get(timeout=300)
+    assert {result.group for result in merged} == {merge.group for merge in plan.merges}
+
+    OptimizeIndices.commit(dataset, merged)
+    assert dataset.version == version + 2
+    # The vector tasks appended a segment; the BTree merge absorbed the old one.
+    assert dataset.stats.index_stats("vector_idx")["num_indices"] == 2
+    assert dataset.stats.index_stats("id_idx")["num_indices"] == 1
+    for name in ["vector_idx", "id_idx"]:
+        stats = dataset.stats.index_stats(name)
+        assert stats["num_indexed_rows"] == 512
+        assert stats["num_unindexed_rows"] == 10
+    assert dataset.to_table(filter="id = 300")["id"].to_pylist() == [300]
+    # Rows of the new fragments find themselves through one partition: the
+    # segments the tasks built put them where the reference model says.
+    sample = dataset.to_table(
+        columns=["id", "vector"], filter="id >= 256 and id < 512 and id % 16 = 0"
+    )
+    assert sample.num_rows == 16
+    hits = 0
+    for id_, vector in zip(sample["id"].to_pylist(), sample["vector"].to_pylist()):
+        nearest = dataset.to_table(
+            columns=["id"],
+            nearest={"column": "vector", "q": vector, "k": 1, "nprobes": 1},
+        )
+        hits += nearest["id"].to_pylist() == [id_]
+    assert hits / sample.num_rows == 1.0
+
+    # Only the fragment appended meanwhile is left to plan.
+    plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
+    assert {tuple(task.fragments) for task in plan.tasks} == {(5,)}

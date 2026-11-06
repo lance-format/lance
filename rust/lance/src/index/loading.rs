@@ -904,7 +904,9 @@ impl Dataset {
         let index_dir = self.indice_files_dir(index_meta)?;
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
-        let file_cache = self.index_cache.for_index(uuid, None);
+        // Physical file keys also let shallow clones share immutable columns.
+        // Translated partitions remain scoped to the dataset and FRI below.
+        let file_cache = self.session.index_cache.with_key_prefix("ivf-file");
         let resident_columns_handle = Some(ResidentColumns::shared(&aux_file_key(
             &object_store,
             &index_dir,
@@ -1199,6 +1201,21 @@ impl Dataset {
                             Ok(wrap_ivf(ivf))
                         }
                     },
+
+                    "IVF_HNSW_RQ" => {
+                        let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            remapping,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                            open_context,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
 
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(

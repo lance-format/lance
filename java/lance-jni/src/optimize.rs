@@ -40,6 +40,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -63,6 +64,7 @@ pub extern "system" fn Java_org_lance_compaction_Compaction_nativePlanCompaction
             target_rows_per_fragment,
             max_rows_per_group,
             max_bytes_per_file,
+            min_bytes_per_file,
             materialize_deletions,
             materialize_deletions_threshold,
             num_threads,
@@ -89,6 +91,7 @@ fn inner_plan_compaction<'local>(
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -114,6 +117,7 @@ fn inner_plan_compaction<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -219,6 +223,7 @@ fn inner_commit_compaction<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &JObject::null(),
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -260,6 +265,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -285,6 +291,7 @@ pub extern "system" fn Java_org_lance_compaction_CompactionTask_nativeExecute<'l
             target_rows_per_fragment,
             max_rows_per_group,
             max_bytes_per_file,
+            min_bytes_per_file,
             materialize_deletions,
             materialize_deletions_threshold,
             num_threads,
@@ -313,6 +320,7 @@ fn inner_execute_task<'local>(
     target_rows_per_fragment: JObject,        // Optional<Long>
     max_rows_per_group: JObject,              // Optional<Long>
     max_bytes_per_file: JObject,              // Optional<Long>
+    min_bytes_per_file: JObject,              // Optional<Long>
     materialize_deletions: JObject,           // Optional<Boolean>
     materialize_deletions_threshold: JObject, // Optional<Float>
     num_threads: JObject,                     // Optional<Long>
@@ -339,6 +347,7 @@ fn inner_execute_task<'local>(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,
@@ -386,7 +395,7 @@ const REWRITE_RESULT_CLASS: &str = "org/lance/compaction/RewriteResult";
 const REWRITE_RESULT_CONSTRUCTOR_SIG: &str = "(Lorg/lance/compaction/CompactionMetrics;Ljava/util/List;Ljava/util/List;J[BLjava/lang/Long;Ljava/util/List;)V";
 const COMPACTION_OPTIONS_CLASS: &str = "org/lance/compaction/CompactionOptions";
 const COMPACTION_MODE_CLASS: &str = "org/lance/compaction/CompactionMode";
-const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
+const COMPACTION_OPTIONS_CONSTRUCTOR_SIG: &str = "(Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/List;Ljava/util/Optional;Ljava/util/Optional;Ljava/util/Optional;)V";
 
 /// The Java `TaskData` carries no output properties, so a task whose outputs
 /// carry a clustering id or metadata cannot cross into Java without losing
@@ -462,6 +471,8 @@ impl IntoJava for &CompactionOptions {
         let max_rows_per_group_opt = to_java_optional(env, max_rows_per_group)?;
         let max_bytes_per_file = to_java_long_obj(env, self.max_bytes_per_file.map(|v| v as i64))?;
         let max_bytes_per_file_opt = to_java_optional(env, max_bytes_per_file)?;
+        let min_bytes_per_file = to_java_long_obj(env, self.min_bytes_per_file.map(|v| v as i64))?;
+        let min_bytes_per_file_opt = to_java_optional(env, min_bytes_per_file)?;
         let materialize_deletions = to_java_boolean_obj(env, Some(self.materialize_deletions))?;
         let materialize_deletions_opt = to_java_optional(env, materialize_deletions)?;
         let materialize_deletions_threshold =
@@ -530,6 +541,7 @@ impl IntoJava for &CompactionOptions {
                 JValueGen::Object(&target_rows_per_fragment_opt),
                 JValueGen::Object(&max_rows_per_group_opt),
                 JValueGen::Object(&max_bytes_per_file_opt),
+                JValueGen::Object(&min_bytes_per_file_opt),
                 JValueGen::Object(&materialize_deletions_opt),
                 JValueGen::Object(&materialize_deletions_threshold_opt),
                 JValueGen::Object(&num_threads_opt),

@@ -99,6 +99,14 @@ fn convert_java_compaction_options_to_rust(
             &[],
         )?
         .l()?;
+    let min_bytes_per_file = env
+        .call_method(
+            &java_options,
+            "getMinBytesPerFile",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
     let materialize_deletions = env
         .call_method(
             &java_options,
@@ -208,6 +216,7 @@ fn convert_java_compaction_options_to_rust(
         &target_rows_per_fragment,
         &max_rows_per_group,
         &max_bytes_per_file,
+        &min_bytes_per_file,
         &materialize_deletions,
         &materialize_deletions_threshold,
         &num_threads,

@@ -215,6 +215,10 @@ pub fn apply_fast_rotation_in_place(output: &mut [f32], signs: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -230,5 +234,85 @@ mod tests {
         let signs = random_fast_rotation_signs(129);
         apply_fast_rotation(&input, &mut output, &signs);
         assert_eq!(output.len(), 129);
+    }
+
+    /// Deterministic sign bytes so sign-flip decisions are reproducible.
+    fn deterministic_signs(dim: usize) -> Vec<u8> {
+        (0..fast_rotation_signs_len(dim))
+            .map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8)
+            .collect()
+    }
+
+    /// RaBitQ's error bounds require the rotation to be orthonormal.
+    ///
+    /// Applying the transform to every basis vector yields the rotation matrix
+    /// column by column; `R^T R` must then be the identity. This covers both
+    /// the power-of-two FWHT path and the truncated FWHT plus Kac path (e.g.
+    /// 24 and 200), where a wrong scale factor would otherwise go unnoticed.
+    fn assert_orthonormal(dim: usize) {
+        let signs = deterministic_signs(dim);
+        let mut rotation = vec![0.0f32; dim * dim];
+        let mut basis = vec![0.0f32; dim];
+        for i in 0..dim {
+            basis.fill(0.0);
+            basis[i] = 1.0;
+            apply_fast_rotation(&basis, &mut rotation[i * dim..(i + 1) * dim], &signs);
+        }
+
+        for i in 0..dim {
+            for j in 0..dim {
+                let dot: f64 = (0..dim)
+                    .map(|k| f64::from(rotation[i * dim + k]) * f64::from(rotation[j * dim + k]))
+                    .sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - expected).abs() < 1e-4,
+                    "dim={dim}: column dot product ({i}, {j}) = {dot}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    // Power-of-two dimensions use plain FWHT rounds; the others exercise the
+    // truncated FWHT plus Kac path. RaBitQ only accepts dimensions divisible
+    // by 8.
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_is_orthonormal(#[case] dim: usize) {
+        assert_orthonormal(dim);
+    }
+
+    /// Random inputs must keep their norm under the rotation.
+    ///
+    /// `R^T R = I` is checked above; this covers the error-bound assumption
+    /// on arbitrary vectors, including the truncated FWHT plus Kac path.
+    #[rstest]
+    #[case::dim8(8)]
+    #[case::dim16(16)]
+    #[case::dim24(24)]
+    #[case::dim32(32)]
+    #[case::dim128(128)]
+    #[case::dim200(200)]
+    #[case::dim256(256)]
+    fn test_fast_rotation_preserves_vector_norms(#[case] dim: usize) {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let signs = deterministic_signs(dim);
+        for _ in 0..8 {
+            let input: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() - 0.5).collect();
+            let mut output = vec![0.0f32; dim];
+            apply_fast_rotation(&input, &mut output, &signs);
+            let in_sq: f32 = input.iter().map(|v| v * v).sum();
+            let out_sq: f32 = output.iter().map(|v| v * v).sum();
+            assert!(
+                (in_sq - out_sq).abs() < 1e-5 * in_sq.max(1.0),
+                "dim={dim}: input norm {in_sq}, output norm {out_sq}"
+            );
+        }
     }
 }

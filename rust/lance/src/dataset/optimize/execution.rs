@@ -18,7 +18,7 @@ use super::planning::{
 };
 use super::repack;
 use crate::Dataset;
-use crate::dataset::blob::BlobV2BatchRewritePlan;
+use crate::dataset::blob::{BlobV2BatchRewritePlan, SidecarRewrite};
 use crate::dataset::index::load_indices_for_remapping;
 use crate::dataset::rowids::{
     RowLineage, RowLineagePlan, RowLineageSpill, RowVersionKind, inline_row_lineage_max_bytes,
@@ -27,8 +27,7 @@ use crate::dataset::rowids::{
 use crate::dataset::utils::{CapturedRowIds, make_rowid_capture_stream};
 use crate::dataset::versions;
 use crate::dataset::{
-    WriteMode, WriteParams, cleanup_data_fragments,
-    write::write_fragments_internal_with_file_row_counts,
+    WriteMode, WriteParams, cleanup_data_fragments, write::write_fragments_internal_impl,
 };
 use crate::io::commit::migrate_fragments;
 use crate::io::deletion::read_dataset_deletion_file;
@@ -605,6 +604,7 @@ pub(super) async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
+    let mut sidecars = None;
     if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
@@ -631,16 +631,22 @@ pub(super) async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+            let supports_prepared = matches!(
+                write_version,
+                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+            );
+            let mut rewrite_plan = BlobV2BatchRewritePlan::try_new(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
-                managed_blobs_enabled(dataset.schema())?
-                    && matches!(
-                        write_version,
-                        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                    ),
-            )?);
+                supports_prepared,
+            )?;
+            if supports_prepared && !managed_blobs_enabled(dataset.schema())? {
+                let context = Arc::new(SidecarRewrite::default());
+                rewrite_plan = rewrite_plan.with_sidecar_rewrite(context.clone());
+                sidecars = Some(context);
+            }
+            let rewrite_plan = Arc::new(rewrite_plan);
             let transformed_schema = rewrite_plan.output_schema().clone();
             let transformed = reader_with_progress.then(move |batch_result| {
                 let dataset = dataset_arc.clone();
@@ -814,7 +820,7 @@ pub(super) async fn rewrite_files(
             }
             None => None,
         };
-        let (frags, _) = write_fragments_internal_with_file_row_counts(
+        let (frags, _) = write_fragments_internal_impl(
             write_version,
             Some(dataset.as_ref()),
             dataset.object_store.clone(),
@@ -824,6 +830,11 @@ pub(super) async fn rewrite_files(
             params,
             None,
             Some(file_row_counts),
+            None,
+            false,
+            false,
+            None,
+            sidecars.clone(),
         )
         .await?;
         new_fragments = frags;

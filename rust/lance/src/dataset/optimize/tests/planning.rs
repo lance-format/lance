@@ -4,7 +4,59 @@
 //! Compaction tests for the planning contract area.
 
 use super::*;
-use crate::dataset::optimize::planning::{CandidateBin, CompactionCandidacy};
+use crate::dataset::optimize::planning::{
+    CandidateBin, CompactionCandidacy, FragmentMetrics, fragment_file_bytes,
+};
+
+#[rstest::rstest]
+#[case::below_default(Some(949), Some(1000), None, true)]
+#[case::at_default(Some(950), Some(1000), None, false)]
+#[case::above_default(Some(951), Some(1000), None, false)]
+#[case::below_explicit(Some(899), Some(1000), Some(900), true)]
+#[case::at_explicit(Some(900), Some(1000), Some(900), false)]
+#[case::higher_threshold(Some(950), Some(1000), Some(1000), true)]
+#[case::round_up(Some(95), Some(101), None, true)]
+#[case::at_rounded_threshold(Some(96), Some(101), None, false)]
+#[case::unknown(None, Some(1000), Some(900), true)]
+#[case::writer_default(
+    Some((WriteParams::default().max_bytes_per_file as u128 * 95).div_ceil(100) as u64),
+    None,
+    None,
+    false
+)]
+#[case::max_integer(Some(usize::MAX as u64), Some(usize::MAX), None, false)]
+fn merge_candidate_byte_threshold(
+    #[case] bytes: Option<u64>,
+    #[case] cap: Option<usize>,
+    #[case] min_bytes: Option<usize>,
+    #[case] expected: bool,
+) {
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1000,
+        max_bytes_per_file: cap,
+        min_bytes_per_file: min_bytes,
+        ..Default::default()
+    })
+    .unwrap();
+    let fragment = Fragment::new(0).with_file(
+        "data.lance",
+        vec![0],
+        vec![0],
+        ConcreteFileVersion::V2_2,
+        bytes.and_then(std::num::NonZero::new),
+    );
+    let fields = HashSet::from([0]);
+    let metrics = FragmentMetrics {
+        physical_rows: 10,
+        num_deletions: 0,
+    };
+    assert_eq!(
+        planner
+            .candidacy_of(&fragment, &metrics, &fields, false)
+            .map(|reason| matches!(reason, CompactionCandidacy::CompactWithNeighbors)),
+        expected.then_some(true)
+    );
+}
 
 #[test]
 fn test_candidate_bin() {
@@ -1448,6 +1500,10 @@ fn test_from_dataset_config() {
             "1000000".to_string(),
         ),
         (
+            "lance.compaction.min_bytes_per_file".to_string(),
+            "950000".to_string(),
+        ),
+        (
             "lance.compaction.materialize_deletions".to_string(),
             "false".to_string(),
         ),
@@ -1497,6 +1553,7 @@ fn test_from_dataset_config() {
     assert_eq!(opts.target_rows_per_fragment, 500_000);
     assert_eq!(opts.max_rows_per_group, 2048);
     assert_eq!(opts.max_bytes_per_file, Some(1_000_000));
+    assert_eq!(opts.min_bytes_per_file, Some(950_000));
     assert!(!opts.materialize_deletions);
     assert!((opts.materialize_deletions_threshold - 0.25).abs() < f32::EPSILON);
     assert!(opts.defer_index_remap);
@@ -1509,12 +1566,30 @@ fn test_from_dataset_config() {
     assert_eq!(opts.max_source_fragments, Some(20));
     assert_eq!(opts.max_source_rows, Some(1_000_000));
     assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
+
+    let mut serialized = serde_json::to_value(&opts).unwrap();
+    assert_eq!(
+        serde_json::from_value::<CompactionOptions>(serialized.clone()).unwrap(),
+        opts
+    );
+    // Older serialized options omit the byte threshold.
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("min_bytes_per_file");
+    assert_eq!(
+        serde_json::from_value::<CompactionOptions>(serialized)
+            .unwrap()
+            .min_bytes_per_file,
+        None
+    );
 }
 #[test]
 fn test_from_dataset_config_empty() {
     let config = HashMap::new();
     let opts = CompactionOptions::from_dataset_config(&config).unwrap();
     let defaults = CompactionOptions::default();
+    assert_eq!(opts.min_bytes_per_file, None);
     assert_eq!(
         opts.target_rows_per_fragment,
         defaults.target_rows_per_fragment
@@ -1575,17 +1650,27 @@ fn test_from_dataset_config_ignores_other_keys() {
     let opts = CompactionOptions::from_dataset_config(&config).unwrap();
     assert_eq!(opts.target_rows_per_fragment, 500_000);
 }
-#[test]
-fn test_from_dataset_config_invalid_value() {
-    let config = HashMap::from([(
-        "lance.compaction.target_rows_per_fragment".to_string(),
-        "not_a_number".to_string(),
-    )]);
-
-    let result = CompactionOptions::from_dataset_config(&config);
-    let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("target_rows_per_fragment"));
-    assert!(err_msg.contains("not_a_number"));
+#[rstest::rstest]
+#[case::invalid_rows("target_rows_per_fragment", "not_a_number")]
+#[case::zero_min_bytes("min_bytes_per_file", "0")]
+#[case::negative_min_bytes("min_bytes_per_file", "-1")]
+#[case::min_bytes_above_max("min_bytes_per_file", "1001")]
+#[case::fractional_min_bytes("min_bytes_per_file", "0.95")]
+fn test_from_dataset_config_invalid_value(#[case] key: &str, #[case] value: &str) {
+    let config = HashMap::from([
+        (format!("lance.compaction.{key}"), value.to_string()),
+        (
+            "lance.compaction.max_bytes_per_file".to_string(),
+            "1000".to_string(),
+        ),
+    ]);
+    let error = CompactionOptions::from_dataset_config(&config)
+        .and_then(|mut options| options.validate())
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    let message = error.to_string();
+    assert!(message.contains(key));
+    assert!(message.contains(value));
 }
 #[test]
 fn test_from_dataset_config_invalid_bool() {
@@ -1962,7 +2047,7 @@ fn compaction_storage_version_config(
 }
 
 #[tokio::test]
-async fn byte_aware_consolidation_settles_after_rewrite() {
+async fn compaction_skips_fragments_above_min_bytes() {
     let dir = TempStrDir::default();
     let reader = lance_datagen::gen_batch()
         .col("id", lance_datagen::array::step::<Int32Type>())
@@ -1994,44 +2079,45 @@ async fn byte_aware_consolidation_settles_after_rewrite() {
         .unwrap();
     let fields = dataset.schema().field_ids().into_iter().collect();
     let fragment = &dataset.fragments()[0];
-    assert!(consolidation::fragment_file_bytes(fragment, &fields).is_some());
+    assert!(fragment_file_bytes(fragment, &fields).is_some());
     let mut multi_file = fragment.clone();
     multi_file.files.push(fragment.files[0].clone());
-    assert_eq!(
-        consolidation::fragment_file_bytes(&multi_file, &fields),
-        None
-    );
+    assert_eq!(fragment_file_bytes(&multi_file, &fields), None);
     let mut obsolete = fragment.clone();
     let mut obsolete_fields = obsolete.files[0].fields.to_vec();
     obsolete_fields.push(i32::MAX);
     obsolete.files[0].fields = obsolete_fields.into();
-    assert_eq!(consolidation::fragment_file_bytes(&obsolete, &fields), None);
+    assert_eq!(fragment_file_bytes(&obsolete, &fields), None);
     let before = dataset.scan().try_into_batch().await.unwrap();
     let options = CompactionOptions {
         target_rows_per_fragment: 10_000,
         max_bytes_per_file: Some(16 * 1024),
+        // Flush within this small fixture so the byte cap, rather than the
+        // final close, splits the output into multiple files below the row target.
+        batch_size: Some(16),
+        data_cache_bytes: Some(1024),
         ..Default::default()
     };
-    let planner = DefaultCompactionPlanner::new(options.clone())
-        .unwrap()
-        .with_byte_aware_consolidation();
+    let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
     assert!(planner.plan(&dataset).await.unwrap().num_tasks() > 0);
-    compact_files_with_planner(&mut dataset, None, &planner)
+    compact_files(&mut dataset, options.clone(), None)
         .await
         .unwrap();
     dataset.checkout_latest().await.unwrap();
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
-    assert_eq!(planner.plan(&dataset).await.unwrap().num_tasks(), 0);
-    // Opt-in changes planning, not the existing row-only API contract.
-    if dataset.fragments().len() > 1 {
-        assert!(
-            plan_compaction(&dataset, &options)
-                .await
-                .unwrap()
-                .num_tasks()
-                > 0
-        );
-    }
+    assert!(dataset.fragments().len() > 1);
+    assert_eq!(
+        plan_compaction(&dataset, &options)
+            .await
+            .unwrap()
+            .num_tasks(),
+        0
+    );
+    let settled_version = dataset.version().version;
+    compact_files(&mut dataset, options.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.version().version, settled_version);
     let mut scan = dataset.scan();
     scan.filter("id >= 64").unwrap();
     assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 64);
@@ -2066,9 +2152,7 @@ async fn byte_full_fragment_preserves_small_runs_on_both_sides() {
         max_bytes_per_file: Some(8 * 1024),
         ..Default::default()
     };
-    let planner = DefaultCompactionPlanner::new(options)
-        .unwrap()
-        .with_byte_aware_consolidation();
+    let planner = DefaultCompactionPlanner::new(options).unwrap();
     let plan = planner.plan(&dataset).await.unwrap();
     assert_eq!(plan.num_tasks(), 2);
     let middle_id = dataset.fragments()[2].id;

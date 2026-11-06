@@ -22,6 +22,7 @@ mod scorer;
 pub mod tokenizer;
 mod wand;
 
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_index_core::remapping::BatchRowIdRemapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -368,9 +369,11 @@ pub async fn prepare_bm25_query(
     metrics: Option<&dyn crate::scalar::MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
 ) -> Result<PreparedBm25Query> {
-    let first_index = indices.first().ok_or_else(|| {
-        lance_core::Error::invalid_input("FTS index requires at least one segment")
-    })?;
+    if indices.is_empty() {
+        return Err(lance_core::Error::invalid_input(
+            "FTS index requires at least one segment",
+        ));
+    }
     let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
         let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
         let has_all_query_positions =
@@ -401,39 +404,31 @@ pub async fn prepare_bm25_query(
         term_ids = Some(Arc::new(prepared_term_ids));
         (scorer, true)
     } else {
-        let (mut total_tokens, mut num_docs, first_token_docs) =
-            first_index.bm25_stats_for_terms(&terms, metrics).await?;
-        let mut token_docs = HashMap::with_capacity(terms.len());
-        for (term, count) in terms.iter().cloned().zip(first_token_docs) {
-            token_docs.insert(term, count);
-        }
-
-        for index in indices.iter().skip(1) {
-            let (segment_total_tokens, segment_num_docs, segment_token_docs) =
-                index.bm25_stats_for_terms(&terms, metrics).await?;
-            total_tokens = total_tokens
-                .checked_add(segment_total_tokens)
-                .ok_or_else(|| lance_core::Error::index("FTS corpus token count overflows u64"))?;
-            num_docs = num_docs.checked_add(segment_num_docs).ok_or_else(|| {
-                lance_core::Error::index("FTS corpus document count overflows usize")
-            })?;
-            for (term, count) in terms.iter().zip(segment_token_docs) {
-                let total = token_docs.get_mut(term).ok_or_else(|| {
-                    lance_core::Error::internal(format!(
-                        "global scorer term '{term}' was not initialized"
-                    ))
-                })?;
-                *total = total.checked_add(count).ok_or_else(|| {
-                    lance_core::Error::index(format!(
-                        "FTS document frequency for term '{term}' overflows usize"
-                    ))
-                })?;
-            }
-        }
-        (
-            Arc::new(MemBM25Scorer::new(total_tokens, num_docs, token_docs)),
-            true,
-        )
+        // Read the segments' statistics together rather than one segment
+        // after another, up to the largest IO parallelism among the segments'
+        // stores, so uncached statistics cost about one segment's read latency
+        // per window instead of the sum over all segments.
+        let parallelism = indices
+            .iter()
+            .map(|index| index.store.io_parallelism())
+            .max()
+            .unwrap_or(1)
+            .min(indices.len());
+        // Collected first: holding a lazily mapped iterator across the await
+        // makes rustc check `Send` for the closure over every lifetime
+        // (rust-lang/rust#64552), which fails where callers box this future.
+        let fetches = indices
+            .iter()
+            .map(|index| index.bm25_stats_for_terms(&terms, metrics))
+            .collect::<Vec<_>>();
+        let segment_stats = stream::iter(fetches)
+            .buffered(parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let scorer = merge_loaded_bm25_stats(&terms, segment_stats)?.ok_or_else(|| {
+            lance_core::Error::internal("BM25 scorer aggregation requires at least one segment")
+        })?;
+        (scorer, true)
     };
 
     Ok(PreparedBm25Query {
