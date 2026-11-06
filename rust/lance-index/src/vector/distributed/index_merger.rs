@@ -826,9 +826,9 @@ fn filter_batch_to_owned_rows(
 /// `auxiliary.idx` into `target_dir`.
 ///
 /// Supports IVF_FLAT, IVF_PQ, IVF_SQ, IVF_HNSW_FLAT, IVF_HNSW_PQ, and
-/// IVF_HNSW_SQ storage types. For PQ and SQ, this assumes all selected source
-/// segments share the same quantizer/codebook and distance type; it reuses the
-/// first encountered metadata.
+/// IVF_HNSW_SQ storage types. Source segments must share the same quantizer/codebook
+/// and distance type. Mismatched models are rejected because the output uses one
+/// model to interpret every source segment's codes.
 pub async fn merge_partial_vector_auxiliary_files(
     object_store: &lance_io::object_store::ObjectStore,
     aux_paths: &[object_store::path::Path],
@@ -1099,7 +1099,13 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
 
-                if sq_meta.is_none() {
+                if let Some(expected) = &sq_meta {
+                    if expected != &sq_meta_parsed {
+                        return Err(Error::index(format!(
+                            "SQ quantizer metadata mismatch across shards: expected {expected:?}, got {sq_meta_parsed:?}"
+                        )));
+                    }
+                } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
@@ -1517,7 +1523,13 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 {
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
-                if sq_meta.is_none() {
+                if let Some(expected) = &sq_meta {
+                    if expected != &sq_meta_parsed {
+                        return Err(Error::index(format!(
+                            "SQ quantizer metadata mismatch across shards: expected {expected:?}, got {sq_meta_parsed:?}"
+                        )));
+                    }
+                } else {
                     sq_meta = Some(sq_meta_parsed.clone());
                 }
                 if v2w_opt.is_none() {
@@ -1744,7 +1756,8 @@ mod tests {
     use super::*;
 
     use arrow_array::{
-        FixedSizeListArray, Float32Array, Float64Array, RecordBatch, UInt8Array, UInt64Array,
+        ArrayRef, FixedSizeListArray, Float32Array, Float64Array, RecordBatch, UInt8Array,
+        UInt64Array,
     };
     use arrow_schema::Field;
     use bytes::Bytes;
@@ -2301,6 +2314,89 @@ mod tests {
             row_ids.extend_from_slice(batch[ROW_ID].as_primitive::<UInt64Type>().values());
         }
         assert_eq!(row_ids, kept);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_sq_model_mismatch(
+        #[values(false, true)] filtered: bool,
+        #[values(false, true)] different_bits: bool,
+    ) {
+        let store = ObjectStore::memory();
+        let target = Path::from("merged");
+        let mut paths = Vec::with_capacity(2);
+        for shard in 0..2 {
+            let path = Path::from(format!("shard_{shard}/{INDEX_AUXILIARY_FILE_NAME}"));
+            let metadata = ScalarQuantizationMetadata {
+                dim: 2,
+                num_bits: if different_bits && shard == 1 { 4 } else { 8 },
+                bounds: 0.0..if !different_bits && shard == 1 {
+                    2.0
+                } else {
+                    1.0
+                },
+            };
+            let mut writer = init_writer_for_sq(
+                &store,
+                &path,
+                DistanceType::L2,
+                &metadata,
+                ConcreteFileVersion::V2_1,
+            )
+            .await
+            .unwrap();
+            let ivf = pb::Ivf {
+                lengths: vec![1],
+                ..Default::default()
+            };
+            let position = writer
+                .add_global_buffer(Bytes::from(ivf.encode_to_vec()))
+                .await
+                .unwrap();
+            writer.add_schema_metadata(IVF_METADATA_KEY, position.to_string());
+            let codes =
+                FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0, 255]), 2).unwrap();
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    ROW_ID,
+                    Arc::new(UInt64Array::from(vec![shard as u64])) as ArrayRef,
+                ),
+                (SQ_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            ])
+            .unwrap();
+            writer.write_batch(&batch).await.unwrap();
+            writer.finish().await.unwrap();
+            paths.push(path);
+        }
+        let result = if filtered {
+            let filters = (0..2)
+                .map(|id| OldIndexDataFilter::RowIds(lance_select::RowAddrTreeMap::from_iter([id])))
+                .collect::<Vec<_>>();
+            merge_partial_vector_auxiliary_files_with_row_filters(
+                &store,
+                &paths,
+                &target,
+                &filters,
+                crate::progress::noop_progress(),
+            )
+            .await
+        } else {
+            merge_partial_vector_auxiliary_files(
+                &store,
+                &paths,
+                &target,
+                crate::progress::noop_progress(),
+            )
+            .await
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("SQ quantizer metadata mismatch across shards"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
