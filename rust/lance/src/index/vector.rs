@@ -1280,8 +1280,9 @@ pub(crate) async fn build_vector_index(
     .await
 }
 
-/// Train a vector index's IVF model and quantizer from the whole table and
-/// write a segment that carries that model and no rows.
+/// Train a vector index's IVF model and quantizer from the whole table, or
+/// from `fragment_ids` alone, and write a segment that carries that model and
+/// no rows.
 ///
 /// A distributed rebuild hands this segment to every build task as the model
 /// to encode against; the segment itself is never committed.
@@ -1293,6 +1294,7 @@ pub(crate) async fn build_vector_model_segment(
     uuid: Uuid,
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+    fragment_ids: Option<&[u32]>,
     progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<BuiltVectorSegment> {
     build_vector_index_impl(
@@ -1303,7 +1305,7 @@ pub(crate) async fn build_vector_model_segment(
         params,
         frag_reuse_index,
         progress,
-        None,
+        fragment_ids,
         true,
     )
     .await

@@ -35,7 +35,10 @@
 //! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
 //! segments within a physical-row budget, leaving unindexed fragments alone.
 //! Shared models merge directly; differing models are re-encoded in tasks under
-//! the newest selected model, then merged into one output. All selected coverage
+//! the newest selected model, then merged into one output. A segment selection
+//! ([`OptimizeOptions::consolidate_selected`]) instead trains a model on its own
+//! rows when the models differ, and may pack its output into several segments
+//! of at most `max_rows_per_segment` rows. All selected coverage
 //! must be present before committing. A caller may retry the same results on a
 //! refreshed dataset after a concurrent append or delete; a changed source owner
 //! or restored source rows require replanning. Tagged fragment reuse is not
@@ -917,27 +920,56 @@ async fn plan_split_rebuild(
             "the column has too few rows to train the index",
         );
     }
+    let reference = train_model_segment(
+        dataset,
+        field_path,
+        last,
+        &params,
+        None,
+        options.progress.clone(),
+    )
+    .await?;
+    Ok(Some(SplitInputs {
+        reference,
+        fragments: dataset.fragments().as_ref().clone(),
+        absorbed: Vec::new(),
+        replaces: segments.iter().map(|segment| segment.uuid).collect(),
+    }))
+}
+
+/// Train a model for the index `like` belongs to, from `fragment_ids` or the
+/// whole table, and describe it as a segment outside the manifest that build
+/// tasks encode against.
+async fn train_model_segment(
+    dataset: &Dataset,
+    field_path: &str,
+    like: &IndexMetadata,
+    params: &VectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<IndexMetadata> {
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let built = build_vector_model_segment(
         dataset,
         field_path,
-        name,
+        &like.name,
         uuid,
-        &params,
+        params,
         frag_reuse_index,
-        options.progress.clone(),
+        fragment_ids,
+        progress,
     )
     .await?;
-    let reference = IndexMetadata {
+    Ok(IndexMetadata {
         uuid,
-        name: name.to_string(),
-        fields: last.fields.clone(),
+        name: like.name.clone(),
+        fields: like.fields.clone(),
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
         index_details: Some(Arc::new(vector_index_details(
-            &params,
+            params,
             built.target_partition_size,
         ))),
         index_version: params.index_type().version(),
@@ -946,13 +978,7 @@ async fn plan_split_rebuild(
         files: Some(built.files),
         clustering_id: None,
         metadata: Default::default(),
-    };
-    Ok(Some(SplitInputs {
-        reference,
-        fragments: dataset.fragments().as_ref().clone(),
-        absorbed: Vec::new(),
-        replaces: segments.iter().map(|segment| segment.uuid).collect(),
-    }))
+    })
 }
 
 /// Drop the candidates a split merge cannot absorb. A segment with no live
