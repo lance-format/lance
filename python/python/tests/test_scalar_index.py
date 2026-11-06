@@ -6070,10 +6070,16 @@ def test_fm_index(tmp_path):
     ds = ds.commit_existing_index_segments(index_name, "text", [segment])
 
     def check_patterns(ds):
-        for pattern in [" ", "left\x00right", "left right", "left"]:
+        safe_predicate = "contains(text, 'left')"
+        assert f"@{index_name}" in ds.scanner(filter=safe_predicate).explain_plan()
+        assert sorted(
+            ds.to_table(filter=safe_predicate, columns=["id"])["id"].to_pylist()
+        ) == [0, 1, 2]
+
+        for pattern in [" ", "left\x00right", "left right"]:
             predicate = f"contains(text, '{pattern}')"
             plan = ds.scanner(filter=predicate).explain_plan()
-            assert (f"@{index_name}" in plan) == (pattern == "left")
+            assert f"@{index_name}" not in plan
             for expression in [
                 predicate,
                 f"NOT ({predicate})",
