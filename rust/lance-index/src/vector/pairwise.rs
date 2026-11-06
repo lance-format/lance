@@ -29,12 +29,12 @@ use super::{
     bq::pairwise::RQPairScorer, flat::pairwise::FlatPairScorer, pq::pairwise::PQPairScorer,
     quantizer::Quantizer, sq::pairwise::SQPairScorer,
 };
-use crate::scalar::RowIdRemapper;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, RecordBatch, UInt64Array};
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Schema};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::{Error, ROW_ID, Result};
 use lance_io::{
@@ -165,26 +165,23 @@ impl PairwiseScorer {
             }
     }
 
-    /// Stage `rows` of a source index batch once: remapped row IDs followed by
-    /// the quantizer payload. Replays never touch the source index again.
-    pub(crate) fn stage(
-        &self,
-        source: &RecordBatch,
-        rows: Range<usize>,
-        remapper: Option<&dyn RowIdRemapper>,
-    ) -> Result<RecordBatch> {
+    /// Stage `rows` of a source index batch once: row IDs followed by the
+    /// quantizer payload. Replays never touch the source index again. A row
+    /// translation deleted (its ID is [`RowAddress::TOMBSTONE_ROW`]) keeps
+    /// its slot, staged with a null ID.
+    pub(crate) fn stage(&self, source: &RecordBatch, rows: Range<usize>) -> Result<RecordBatch> {
         let ids = source
             .column_by_name(ROW_ID)
             .ok_or_else(|| Error::internal("index batch missing row IDs"))?
             .as_primitive_opt::<UInt64Type>()
             .ok_or_else(|| Error::internal("index row IDs must be UInt64"))?
             .slice(rows.start, rows.len());
-        let ids = match remapper {
-            Some(remapper) => ids
-                .iter()
-                .map(|id| id.and_then(|id| remapper.remap_row_id(id)))
-                .collect::<UInt64Array>(),
-            None => ids,
+        let ids = if ids.values().contains(&RowAddress::TOMBSTONE_ROW) {
+            ids.iter()
+                .map(|id| id.filter(|&id| id != RowAddress::TOMBSTONE_ROW))
+                .collect::<UInt64Array>()
+        } else {
+            ids
         };
         let payload = match self {
             Self::Flat(scorer) => scorer.stage(source, rows)?,
@@ -426,7 +423,7 @@ impl PairwisePartition {
         let scorer = PairwiseScorer::new(quantizer, centroid, metric, &schema)?;
         let batches = sources
             .iter()
-            .map(|source| scorer.stage(source, 0..source.num_rows(), None))
+            .map(|source| scorer.stage(source, 0..source.num_rows()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             batch_size: sources.iter().map(RecordBatch::num_rows).max().unwrap_or(0),
@@ -575,6 +572,7 @@ mod tests {
     use crate::vector::flat::index::FlatQuantizer;
     use crate::vector::quantizer::Quantization;
     use arrow_array::types::{Float32Type, UInt64Type};
+    use lance_arrow::RecordBatchExt;
     use lance_datagen::{array, gen_batch};
     use lance_io::spill::LocalSpillStore;
     use rstest::rstest;
@@ -725,13 +723,33 @@ mod tests {
         });
     }
 
+    /// A row whose translation deleted it keeps its slot, staged with a null
+    /// ID so that no pair names it; its codes stay aligned with the rest.
+    #[test]
+    fn test_stage_nulls_tombstoned_ids() {
+        let scorer = flat_scorer();
+        let batch = flat_batch();
+        let mut ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        ids[1] = RowAddress::TOMBSTONE_ROW;
+        let tombstoned = batch
+            .replace_column_by_name(ROW_ID, Arc::new(UInt64Array::from(ids)))
+            .unwrap();
+        let staged = scorer.stage(&tombstoned, 0..4).unwrap();
+        let untranslated = scorer.stage(&batch, 0..4).unwrap();
+        assert_eq!(
+            staged[ROW_ID].as_primitive::<UInt64Type>(),
+            &UInt64Array::from(vec![Some(0), None, Some(2), Some(3)])
+        );
+        assert_eq!(staged.columns()[1..], untranslated.columns()[1..]);
+    }
+
     #[tokio::test]
     async fn test_pairwise_spill_roundtrip_and_bounds() {
         let scorer = flat_scorer();
         let batch = flat_batch();
         let staged = [
-            scorer.stage(&batch, 0..32, None).unwrap(),
-            scorer.stage(&batch, 0..1, None).unwrap(),
+            scorer.stage(&batch, 0..32).unwrap(),
+            scorer.stage(&batch, 0..1).unwrap(),
         ];
         let store = LocalSpillStore::default();
         let mut writer = PairwiseSpillWriter::new(&store).await.unwrap();
@@ -875,8 +893,8 @@ mod tests {
         let batch = flat_batch();
         let prepared = PairwisePartition {
             encoded: EncodedPartition::Memory(vec![
-                scorer.stage(&batch, 0..16, None).unwrap(),
-                scorer.stage(&batch, 16..32, None).unwrap(),
+                scorer.stage(&batch, 0..16).unwrap(),
+                scorer.stage(&batch, 16..32).unwrap(),
             ]),
             scorer: Arc::new(scorer),
             batch_size: 16,

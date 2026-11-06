@@ -11287,7 +11287,7 @@ mod tests {
         // one row id owns several doc ids. row 100 -> {0, 1}, row 101 -> {2}.
         let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
         let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
-        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false).unwrap();
 
         assert_eq!(docs.doc_ids(100).collect::<Vec<_>>(), vec![0, 1]);
         assert_eq!(docs.doc_ids(101).collect::<Vec<_>>(), vec![2]);
@@ -11310,7 +11310,7 @@ mod tests {
         // would evaluate doc 1, miss the term, and drop the row (lancedb#3352).
         let row_id_col = arrow_array::UInt64Array::from(vec![100_u64, 100, 101]);
         let num_tokens_col = arrow_array::UInt32Array::from(vec![1_u32, 1, 1]);
-        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false, None).unwrap();
+        let docs = DocSet::from_columns(&row_id_col, &num_tokens_col, false).unwrap();
 
         let posting = PostingIterator::with_query_weight(
             String::from("needle"),

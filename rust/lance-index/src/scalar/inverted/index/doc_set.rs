@@ -477,23 +477,21 @@ impl DocSet {
     }
 
     /// Load the documents, translating their row addresses through
-    /// `remapper` as a batch. A deleted row keeps its slot as a tombstone
-    /// until the layout-aware decoding below, so documents stay aligned with
-    /// the posting lists that reference them by position.
+    /// `remapper` as a batch. A deleted row keeps its slot as a tombstone,
+    /// so documents stay aligned with the posting lists that reference them
+    /// by position.
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
         remapper: Option<&Remapper>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let (batch, frag_reuse_index) = match remapper {
+        let batch = match remapper {
             Some(remapper) => {
                 let row_id_idx = batch.schema().index_of(ROW_ID)?;
-                let (batch, remapper) =
-                    translate_preserving_layout(remapper, batch, row_id_idx).await?;
-                (batch, Some(remapper))
+                translate_preserving_layout(remapper, batch, row_id_idx).await?
             }
-            None => (batch, None),
+            None => batch,
         };
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
         let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
@@ -505,13 +503,7 @@ impl DocSet {
             };
             doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
         }
-        Self::from_columns_with_doc_indices(
-            row_id_col,
-            num_tokens_col,
-            &doc_indices,
-            is_legacy,
-            frag_reuse_index,
-        )
+        Self::from_columns_with_doc_indices(row_id_col, num_tokens_col, &doc_indices, is_legacy)
     }
 
     /// Build a `DocSet` carrying only the per-doc `num_tokens` array;
@@ -549,15 +541,8 @@ impl DocSet {
         row_id_col: &UInt64Array,
         num_tokens_col: &arrow_array::UInt32Array,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
-        Self::from_columns_with_doc_indices(
-            row_id_col,
-            num_tokens_col,
-            &[],
-            is_legacy,
-            frag_reuse_index,
-        )
+        Self::from_columns_with_doc_indices(row_id_col, num_tokens_col, &[], is_legacy)
     }
 
     pub fn from_columns_with_doc_indices(
@@ -565,7 +550,6 @@ impl DocSet {
         num_tokens_col: &arrow_array::UInt32Array,
         doc_index_cols: &[&arrow_array::UInt32Array],
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if doc_index_cols
             .iter()
@@ -587,12 +571,7 @@ impl DocSet {
             let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
                 .values()
                 .iter()
-                .map(|id| match frag_reuse_index.as_ref() {
-                    Some(frag_reuse_index_ref) => frag_reuse_index_ref
-                        .remap_row_id(*id)
-                        .unwrap_or(RowAddress::TOMBSTONE_ROW),
-                    None => *id,
-                })
+                .copied()
                 .zip(num_tokens_col.values().iter())
                 .sorted_unstable_by_key(|x| x.0)
                 .unzip();
@@ -610,56 +589,18 @@ impl DocSet {
             });
         }
 
-        // If frag reuse happened, remap the row_ids through it. Crucially we
-        // must NOT drop the rows the reuse index deleted, because the posting
-        // lists reference doc_ids *positionally* (a doc_id is an index into
-        // these arrays, fixed at build time). Dropping deleted rows would
-        // renumber every later doc_id and desync the posting lists, so wand
-        // would index `num_tokens`/`row_ids` out of bounds or score the wrong
-        // doc. Instead we tombstone deleted rows in place: their slot survives
-        // (so doc_ids stay aligned with the posting lists) carrying
-        // `RowAddress::TOMBSTONE_ROW`, which wand skips, and they are left out
-        // of `inv` so a row_id lookup never resolves to a deleted doc. The
-        // heavyweight physical remap (`DocSet::remap`) is what actually
-        // renumbers and compacts; this load-time path only has to stay
-        // consistent until then.
-        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            let mut row_ids = Vec::with_capacity(row_id_col.len());
-            let num_tokens = num_tokens_col.values().to_vec();
-            let mut inv = Vec::with_capacity(row_id_col.len());
-            for (doc_id, row_id) in row_id_col.values().iter().enumerate() {
-                match frag_reuse_index_ref.remap_row_id(*row_id) {
-                    Some(new_row_id) => {
-                        row_ids.push(new_row_id);
-                        inv.push((new_row_id, doc_id as u32));
-                    }
-                    None => {
-                        // Deleted: keep the slot (doc_ids must not shift) but
-                        // tombstone it and leave it out of `inv`.
-                        row_ids.push(RowAddress::TOMBSTONE_ROW);
-                    }
-                }
-            }
-            inv.sort_unstable_by_key(|entry| entry.0);
-
-            let total_tokens = num_tokens.iter().map(|&x| x as u64).sum();
-            return Ok(Self {
-                row_ids,
-                num_tokens: NumTokens::Owned(num_tokens),
-                doc_indices,
-                inv,
-                total_tokens,
-                scoring_quantized: false,
-                norms: Arc::new(std::sync::OnceLock::new()),
-                row_ids_ascending: Arc::new(std::sync::OnceLock::new()),
-            });
-        }
-
+        // A row translation deleted keeps its slot, with
+        // `RowAddress::TOMBSTONE_ROW` (see `Self::load`): the posting lists
+        // reference doc_ids *positionally*, so dropping it would renumber every
+        // later doc and desync them. wand skips the tombstone, and leaving it
+        // out of `inv` keeps a row_id lookup from resolving to it. The
+        // physical remap (`DocSet::remap`) is what renumbers and compacts.
         let row_ids = row_id_col.values().to_vec();
         let num_tokens = num_tokens_col.values().to_vec();
         let mut inv: Vec<(u64, u32)> = row_ids
             .iter()
             .enumerate()
+            .filter(|(_, row_id)| **row_id != RowAddress::TOMBSTONE_ROW)
             .map(|(doc_id, row_id)| (*row_id, doc_id as u32))
             .collect();
         if !row_ids.is_sorted() {

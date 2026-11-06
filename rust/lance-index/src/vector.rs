@@ -39,6 +39,8 @@ pub mod pca;
 pub mod pq;
 pub mod pretransform;
 pub mod quantizer;
+#[cfg(test)]
+mod remap_contract;
 pub mod residual;
 pub mod shared;
 pub mod sq;

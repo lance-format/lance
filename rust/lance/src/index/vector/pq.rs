@@ -689,8 +689,6 @@ pub(crate) fn build_pq_storage(
         pq.dimension,
         distance_type,
         false,
-        // TODO: support auto-remap with frag_reuse_index for HNSW
-        None,
     )?;
 
     Ok(pq_store)

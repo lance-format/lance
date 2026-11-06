@@ -184,7 +184,7 @@ fn sq_storage(vectors: &FixedSizeListArray, row_ids: UInt64Array) -> ScalarQuant
     ]));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(vectors.clone()), Arc::new(row_ids)]).unwrap();
-    StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer, None)
+    StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer)
         .unwrap()
         .build(vec![batch])
         .unwrap()

@@ -34,11 +34,10 @@ use lance_core::{Error, ROW_ID_FIELD, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::versions as file_versions;
 use lance_file::writer::FileWriterOptions;
-use lance_index::frag_reuse::{CompactFragReuseIndex, CompactFragReuseIndexHandle};
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
-use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
@@ -1553,11 +1552,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         column: String,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Result<(Q::Storage, S)> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        let storage =
-            StorageBuilder::new_with_remapper(column, distance_type, quantizer, frag_reuse_index)?
-                .build(batches)?;
+        let storage = StorageBuilder::new(column, distance_type, quantizer)?.build(batches)?;
+        let storage = match frag_reuse_index {
+            Some(frag_reuse_index) => storage.remap(frag_reuse_index.row_addr_remap())?,
+            None => storage,
+        };
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))

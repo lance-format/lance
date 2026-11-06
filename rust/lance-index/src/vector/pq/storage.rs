@@ -45,8 +45,6 @@ use super::distance::{
     build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance,
     compute_pq_distance_4bit_row, compute_pq_distance_4bit_rows, quantize_4bit_distance_table,
 };
-use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
-use crate::scalar::RowIdRemapper;
 use crate::vector::graph::{OrderedFloat, OrderedNode};
 use crate::{
     INDEX_METADATA_SCHEMA_KEY, IndexMetadata, pb,
@@ -215,38 +213,12 @@ impl ProductQuantizationStorage {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         codebook: FixedSizeListArray,
-        batch: RecordBatch,
-        num_bits: u32,
-        num_sub_vectors: usize,
-        dimension: usize,
-        distance_type: DistanceType,
-        transposed: bool,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Self> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::new_with_remapper(
-            codebook,
-            batch,
-            num_bits,
-            num_sub_vectors,
-            dimension,
-            distance_type,
-            transposed,
-            frag_reuse_index,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_remapper(
-        codebook: FixedSizeListArray,
         mut batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
         distance_type: DistanceType,
         transposed: bool,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         if batch.num_columns() != 2 {
             log::warn!(
@@ -265,7 +237,7 @@ impl ProductQuantizationStorage {
                 "Row ID column not found from PQ storage".to_string(),
             ));
         };
-        let mut row_ids: Arc<UInt64Array> = row_ids
+        let row_ids: Arc<UInt64Array> = row_ids
             .as_primitive_opt::<UInt64Type>()
             .ok_or(Error::index(
                 "Row ID column is not of type UInt64".to_string(),
@@ -292,57 +264,12 @@ impl ProductQuantizationStorage {
             batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
         }
 
-        let mut pq_code: Arc<UInt8Array> = batch[PQ_CODE_COLUMN]
+        let pq_code: Arc<UInt8Array> = batch[PQ_CODE_COLUMN]
             .as_fixed_size_list()
             .values()
             .as_primitive()
             .clone()
             .into();
-
-        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            let transposed_codes = pq_code.values();
-            let mut new_row_ids = Vec::with_capacity(row_ids.len());
-            let mut new_codes = Vec::with_capacity(row_ids.len() * num_sub_vectors);
-
-            let row_ids_values = row_ids.values();
-            for (i, row_id) in row_ids_values.iter().enumerate() {
-                if let Some(mapped_value) = frag_reuse_index_ref.remap_row_id(*row_id) {
-                    new_row_ids.push(mapped_value);
-                    new_codes.extend(get_pq_code(
-                        transposed_codes,
-                        num_bits,
-                        num_sub_vectors,
-                        i as u32,
-                    ));
-                }
-            }
-
-            let new_row_ids = Arc::new(UInt64Array::from(new_row_ids));
-            let new_codes = UInt8Array::from(new_codes);
-            batch = if new_row_ids.is_empty() {
-                RecordBatch::new_empty(batch.schema())
-            } else {
-                let num_bytes_in_code = new_codes.len() / new_row_ids.len();
-                let new_transposed_codes =
-                    transpose(&new_codes, new_row_ids.len(), num_bytes_in_code);
-                let codes_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
-                    new_transposed_codes,
-                    num_bytes_in_code as i32,
-                )?);
-                RecordBatch::try_new(batch.schema(), vec![new_row_ids, codes_fsl])?
-            };
-            pq_code = batch[PQ_CODE_COLUMN]
-                .as_fixed_size_list()
-                .values()
-                .as_primitive::<UInt8Type>()
-                .clone()
-                .into();
-            // Refresh the stored row ids from the remapped batch. Without this
-            // the storage keeps the pre-remap (compacted-away) addresses while
-            // its codes are remapped, so search returns stale row ids and the
-            // take fails with "fragment ... does not exist".
-            row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone().into();
-        }
 
         let distance_type = match distance_type {
             DistanceType::Cosine => DistanceType::L2,
@@ -397,7 +324,6 @@ impl ProductQuantizationStorage {
         quantizer: ProductQuantizer,
         batch: &RecordBatch,
         vector_col: &str,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let codebook = quantizer.codebook.clone();
         let num_bits = quantizer.num_bits;
@@ -414,7 +340,6 @@ impl ProductQuantizationStorage {
             dimension,
             metric_type,
             false,
-            frag_reuse_index,
         )
     }
 
@@ -437,11 +362,7 @@ impl ProductQuantizationStorage {
     ///
     /// Currently it loads everything in memory.
     /// TODO: support lazy loading later.
-    pub async fn load(
-        object_store: &ObjectStore,
-        path: &Path,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Self> {
+    pub async fn load(object_store: &ObjectStore, path: &Path) -> Result<Self> {
         let reader = V1FileReader::try_new_self_described(object_store, path, None).await?;
         let schema = reader.schema();
 
@@ -459,14 +380,7 @@ impl ProductQuantizationStorage {
             DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
         let metadata = ProductQuantizationMetadata::load(&reader).await?;
-        Self::load_partition(
-            &reader,
-            0..reader.len(),
-            distance_type,
-            &metadata,
-            frag_reuse_index,
-        )
-        .await
+        Self::load_partition(&reader, 0..reader.len(), distance_type, &metadata).await
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -567,7 +481,6 @@ impl QuantizerStorage for ProductQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self>
     where
         Self: Sized,
@@ -596,37 +509,6 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
-            frag_reuse_index,
-        )
-    }
-
-    fn try_from_batch_with_remapper(
-        batch: RecordBatch,
-        metadata: &Self::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
-        let distance_type = match distance_type {
-            DistanceType::Cosine => DistanceType::L2,
-            _ => distance_type,
-        };
-        let codebook = match &metadata.codebook {
-            Some(codebook) => codebook.clone(),
-            None => {
-                debug_assert!(!metadata.codebook_tensor.is_empty());
-                let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
-                FixedSizeListArray::try_from(&codebook_tensor)?
-            }
-        };
-        Self::new_with_remapper(
-            codebook,
-            batch,
-            metadata.nbits,
-            metadata.num_sub_vectors,
-            metadata.dimension,
-            distance_type,
-            metadata.transposed,
-            frag_reuse_index,
         )
     }
 
@@ -635,17 +517,13 @@ impl QuantizerStorage for ProductQuantizationStorage {
         quantizer: &Quantizer,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let Quantizer::Product(quantizer) = quantizer else {
             return Err(Error::internal(
                 "product quantization storage received a non-product quantizer".to_string(),
             ));
         };
-        Ok(
-            Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)?
-                .with_prepared_targets(quantizer),
-        )
+        Ok(Self::try_from_batch(batch, metadata, distance_type)?.with_prepared_targets(quantizer))
     }
 
     fn metadata(&self) -> &Self::Metadata {
@@ -725,7 +603,6 @@ impl QuantizerStorage for ProductQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         // Hard coded to float32 for now
         let codebook = metadata
@@ -752,7 +629,6 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.dimension,
             distance_type,
             metadata.transposed,
-            frag_reuse_index,
         )
     }
 }
@@ -1696,7 +1572,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
             .unwrap()
             .build(vec![batch])
             .unwrap()
@@ -1729,7 +1605,7 @@ mod tests {
         )
         .unwrap();
 
-        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq, None)
+        StorageBuilder::new("vec".to_owned(), pq.distance_type, pq)
             .unwrap()
             .build(vec![batch])
             .unwrap()
@@ -1830,7 +1706,7 @@ mod tests {
         let row_ids = UInt64Array::from_iter_values(0..rows as u64);
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
-        StorageBuilder::new("vec".to_owned(), distance_type, pq, None)
+        StorageBuilder::new("vec".to_owned(), distance_type, pq)
             .unwrap()
             .build(vec![batch])
             .unwrap()
@@ -1940,7 +1816,6 @@ mod tests {
             &Quantizer::Product(quantizer),
             source.metadata(),
             DistanceType::L2,
-            None,
         )
         .unwrap();
         assert!(storage.l2_targets.is_none());
@@ -1958,7 +1833,6 @@ mod tests {
             &quantizer,
             source.metadata(),
             distance_type,
-            None,
         )
         .unwrap();
         let second = ProductQuantizationStorage::try_from_batch_with_quantizer(
@@ -1966,7 +1840,6 @@ mod tests {
             &quantizer,
             source.metadata(),
             distance_type,
-            None,
         )
         .unwrap();
 
@@ -2161,62 +2034,6 @@ mod tests {
                 .chain((TOTAL / 2..TOTAL).map(|i| (i as u64, None)))
                 .collect(),
         )
-    }
-
-    #[tokio::test]
-    async fn test_async_remap_preserves_transposed_codes() {
-        #[derive(Debug)]
-        struct Mapping(RowAddrRemap);
-        impl lance_select::remapper::RemapperBacking for Mapping {
-            fn fragment_needs_translation(&self, _fragment: u32) -> bool {
-                true
-            }
-
-            fn translate_fragments(
-                &self,
-                fragments: &roaring::RoaringBitmap,
-            ) -> roaring::RoaringBitmap {
-                fragments.clone()
-            }
-
-            fn translate_in_place<'a>(
-                &'a self,
-                addrs: &'a mut [Option<u64>],
-            ) -> lance_select::remapper::TranslateFuture<'a> {
-                for slot in addrs.iter_mut() {
-                    *slot = slot.and_then(|id| self.0.get(id).unwrap_or(Some(id)));
-                }
-                Box::pin(std::future::ready(Ok(())))
-            }
-        }
-        let storage = create_pq_storage().await;
-        let mapping = pq_remap_compact();
-        let expected = storage.remap(&mapping).unwrap();
-        let remapper =
-            lance_index_core::remapping::Remapper::from_backing(Arc::new(Mapping(mapping)));
-        let row_id_idx = storage.batch.schema().index_of(ROW_ID).unwrap();
-        let (batch, remapper) = lance_index_core::remapping::translate_preserving_layout(
-            &remapper,
-            storage.batch.clone(),
-            row_id_idx,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            batch.column_by_name(PQ_CODE_COLUMN),
-            storage.batch.column_by_name(PQ_CODE_COLUMN)
-        );
-        let mut metadata = storage.metadata.clone();
-        metadata.transposed = true;
-        let actual = ProductQuantizationStorage::try_from_batch_with_remapper(
-            batch,
-            &metadata,
-            storage.distance_type,
-            Some(remapper),
-        )
-        .unwrap();
-        assert_eq!(actual.row_ids, expected.row_ids);
-        assert_eq!(actual.pq_code, expected.pq_code);
     }
 
     #[rstest]

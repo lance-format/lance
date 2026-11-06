@@ -3378,26 +3378,24 @@ async fn build_hnsw_from_storage_batch(
                 .as_fixed_size_list()
                 .value_type();
             if vector_type == DataType::UInt8 && distance_type == DistanceType::Hamming {
-                let storage =
-                    FlatBinStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                let storage = FlatBinStorage::try_from_batch(batch, &metadata, distance_type)?;
                 HNSW::index_vectors(&storage, hnsw_params.clone())
             } else {
-                let storage =
-                    FlatFloatStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                let storage = FlatFloatStorage::try_from_batch(batch, &metadata, distance_type)?;
                 HNSW::index_vectors(&storage, hnsw_params.clone())
             }
         }
         "IVF_HNSW_PQ" => {
             let metadata = read_pq_storage_metadata(aux_reader).await?;
             let storage =
-                ProductQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                ProductQuantizationStorage::try_from_batch(batch, &metadata, distance_type)?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         "IVF_HNSW_SQ" => {
             let metadata =
                 read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
             let storage =
-                ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+                ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type)?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         other => Err(Error::index(format!(

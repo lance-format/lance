@@ -4,8 +4,6 @@
 use std::{borrow::Cow, sync::Arc};
 
 use super::index::FlatMetadata;
-use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
-use crate::scalar::RowIdRemapper;
 use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
@@ -71,25 +69,7 @@ impl QuantizerStorage for FlatFloatStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
-    }
-
-    fn try_from_batch_with_remapper(
-        batch: RecordBatch,
-        metadata: &Self::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
-        let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
-        } else {
-            batch
-        };
-
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -124,7 +104,6 @@ impl QuantizerStorage for FlatFloatStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
-        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
@@ -251,25 +230,7 @@ impl QuantizerStorage for FlatBinStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
-        let frag_reuse_index = frag_reuse_index
-            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
-    }
-
-    fn try_from_batch_with_remapper(
-        batch: RecordBatch,
-        metadata: &Self::Metadata,
-        distance_type: DistanceType,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
-        let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
-        } else {
-            batch
-        };
-
         let row_ids = Arc::new(
             batch
                 .column_by_name(ROW_ID)
@@ -302,7 +263,6 @@ impl QuantizerStorage for FlatBinStorage {
         _: std::ops::Range<usize>,
         _: DistanceType,
         _: &Self::Metadata,
-        _: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         unimplemented!("Flat will be used in new index builder which doesn't require this")
     }
@@ -810,8 +770,7 @@ mod tests {
         let batch = make_flat_test_batch(vectors.clone(), 0);
         let metadata = FlatMetadata { dim: 4 };
 
-        let loaded =
-            FlatFloatStorage::try_from_batch(batch, &metadata, distance_type, None).unwrap();
+        let loaded = FlatFloatStorage::try_from_batch(batch, &metadata, distance_type).unwrap();
         assert_eq!(loaded.distance_type(), distance_type);
         assert_eq!(loaded.norms.is_some(), expect_norms);
 
@@ -894,13 +853,9 @@ mod tests {
         let normalized = lance_linalg::kernels::normalize_fsl(&raw).unwrap();
         let query = normalized.value(0);
         let batch = make_flat_test_batch(normalized, 0);
-        let storage = FlatFloatStorage::try_from_batch(
-            batch,
-            &FlatMetadata { dim: 3 },
-            DistanceType::Cosine,
-            None,
-        )
-        .unwrap();
+        let storage =
+            FlatFloatStorage::try_from_batch(batch, &FlatMetadata { dim: 3 }, DistanceType::Cosine)
+                .unwrap();
 
         let distance = storage.dist_calculator(query, 0.0).distance(0);
         assert!(

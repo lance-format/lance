@@ -191,7 +191,7 @@ fn bench_hnsw_sq(c: &mut Criterion) {
     let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(fsl.clone()), Arc::new(row_ids)]).unwrap();
-    let sq_storage = StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer, None)
+    let sq_storage = StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer)
         .unwrap()
         .build(vec![batch])
         .unwrap();
@@ -291,7 +291,7 @@ fn bench_hnsw_pq(c: &mut Criterion) {
     let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(fsl.clone()), Arc::new(row_ids)]).unwrap();
-    let pq_storage = StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer, None)
+    let pq_storage = StorageBuilder::new("vector".to_owned(), DistanceType::L2, quantizer)
         .unwrap()
         .build(vec![batch])
         .unwrap();

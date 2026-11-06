@@ -56,7 +56,6 @@ fn mock_rq_storage(num_bits: u8, rotation_type: RQRotationType) -> RabitQuantiza
             .unwrap(),
         &rq.metadata(None),
         DistanceType::L2,
-        None,
     )
     .unwrap()
 }
@@ -332,7 +331,6 @@ fn ex_code_storage_load(c: &mut Criterion) {
                         blocked_batch.clone(),
                         &metadata,
                         DistanceType::L2,
-                        None,
                     )
                     .unwrap(),
                 )
@@ -351,7 +349,6 @@ fn ex_code_storage_load(c: &mut Criterion) {
                         legacy_batch.clone(),
                         &metadata,
                         DistanceType::L2,
-                        None,
                     )
                     .unwrap(),
                 )
@@ -446,8 +443,7 @@ fn ex_bulk_paths(c: &mut Criterion) {
         ])
         .unwrap();
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
 
         let query: ArrayRef = Arc::new(Float32Array::from(
             (0..BULK_DIM)
@@ -596,7 +592,7 @@ fn heap_topk(c: &mut Criterion) {
     ])
     .unwrap();
     let storage =
-        RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None).unwrap();
+        RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
     let query: ArrayRef = Arc::new(Float32Array::from(
         (0..TOPK_DIM)
             .map(|_| rng.random_range(-1.0f32..1.0))

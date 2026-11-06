@@ -76,7 +76,6 @@ pub fn bench_storage(c: &mut Criterion) {
             DistanceType::L2,
             -1.0..1.0,
             repeat_with(|| create_sq_batch(0..(TOTAL / num_chunks) as u64, 512)).take(num_chunks),
-            None,
         )
         .unwrap();
         c.bench_function(

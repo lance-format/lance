@@ -353,7 +353,7 @@ impl InvertedIndex {
                     .await?;
                 let row_id_idx = batch.schema().index_of(ROW_ID)?;
                 let built_with = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let (batch, _) = translate_preserving_layout(&remapper, batch, row_id_idx).await?;
+                let batch = translate_preserving_layout(&remapper, batch, row_id_idx).await?;
                 let translated = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let mut translation = built_with
                     .values()
@@ -367,7 +367,6 @@ impl InvertedIndex {
                     translated,
                     batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>(),
                     true,
-                    None,
                 )?;
                 Result::Ok((docs, Some(Arc::<[(u64, u64)]>::from(translation))))
             }

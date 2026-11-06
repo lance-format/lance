@@ -266,7 +266,6 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ProductQuantizer> {
             storage_batch,
             &metadata,
             distance_type,
-            None,
         )?;
 
         Ok(Self::new(index, storage))
@@ -310,7 +309,6 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatQuantizer> {
             storage_batch,
             &metadata,
             distance_type,
-            None,
         )?;
 
         Ok(Self::new(index, storage))
@@ -354,7 +352,6 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, FlatBinQuantizer> {
             storage_batch,
             &metadata,
             distance_type,
-            None,
         )?;
 
         Ok(Self::new(index, storage))
@@ -401,7 +398,6 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, ScalarQuantizer> {
             distance_type,
             header.bounds_start..header.bounds_end,
             storage_batches,
-            None,
         )?;
 
         Ok(Self::new(index, storage))
@@ -506,7 +502,6 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             storage_batch,
             &metadata,
             distance_type,
-            None,
         )?;
 
         Ok(Self::new(index, storage))
@@ -602,7 +597,6 @@ mod tests {
             dim,
             DistanceType::L2,
             false,
-            None,
         )
         .unwrap()
     }
@@ -660,7 +654,6 @@ mod tests {
                 dim,
                 dt,
                 false,
-                None,
             )
             .unwrap();
 
@@ -829,7 +822,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(sq_codes_fsl)]).unwrap();
 
-        ScalarQuantizationStorage::try_new(8, distance_type, -1.0..1.0, [batch], None).unwrap()
+        ScalarQuantizationStorage::try_new(8, distance_type, -1.0..1.0, [batch]).unwrap()
     }
 
     // ----- SQ tests ---------------------------------------------------------
@@ -898,7 +891,6 @@ mod tests {
             DistanceType::L2,
             -1.0..1.0,
             [make_batch(0, 10), make_batch(10, 10), make_batch(20, 10)],
-            None,
         )
         .unwrap();
         assert_eq!(storage.len(), 30);
@@ -979,13 +971,8 @@ mod tests {
         ])
         .unwrap();
 
-        <RabitQuantizer as Quantization>::Storage::try_from_batch(
-            batch,
-            &metadata,
-            distance_type,
-            None,
-        )
-        .unwrap()
+        <RabitQuantizer as Quantization>::Storage::try_from_batch(batch, &metadata, distance_type)
+            .unwrap()
     }
 
     // ----- RabitQ tests -----------------------------------------------------

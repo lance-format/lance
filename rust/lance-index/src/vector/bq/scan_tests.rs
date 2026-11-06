@@ -246,7 +246,6 @@ impl Fixture {
             batch,
             self.rq.metadata_ref(),
             self.distance_type,
-            None,
         )
         .unwrap();
         let batch = stored.to_batches().unwrap().next().unwrap();
@@ -306,7 +305,6 @@ impl Fixture {
             partition.full_batch(),
             &self.metadata,
             self.distance_type,
-            None,
         )
         .unwrap()
     }

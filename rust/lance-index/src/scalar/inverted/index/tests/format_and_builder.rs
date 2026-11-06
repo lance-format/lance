@@ -704,7 +704,7 @@ fn test_cached_num_tokens_uses_supplied_total_and_full_stays_owned() {
     assert!(matches!(&docs.num_tokens, NumTokens::Shared(_)));
 
     let row_ids = UInt64Array::from(vec![10, 20, 30]);
-    let full = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+    let full = DocSet::from_columns(&row_ids, &num_tokens, false).unwrap();
     assert!(matches!(&full.num_tokens, NumTokens::Owned(_)));
     assert_eq!(full.total_tokens_num(), 16);
     assert_eq!(full.row_id(1), 20);
@@ -714,7 +714,7 @@ fn test_cached_num_tokens_uses_supplied_total_and_full_stays_owned() {
 fn test_combined_fields_append_invalidates_row_ids_ascending_cache() {
     let row_ids = UInt64Array::from(vec![10, 20, 30]);
     let num_tokens = UInt32Array::from(vec![1, 1, 1]);
-    let mut docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+    let mut docs = DocSet::from_columns(&row_ids, &num_tokens, false).unwrap();
 
     // Memoize the ascending answer for the current (sorted) row_ids.
     assert!(docs.row_ids_strictly_ascending());
@@ -748,7 +748,7 @@ fn test_doc_length_by_row_id_matches_scan() {
     // sums the matching row's lengths, and return 0 for an absent row.
     let row_ids = UInt64Array::from(vec![30, 10, 20]);
     let num_tokens = UInt32Array::from(vec![8, 3, 5]);
-    let docs = DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap();
+    let docs = DocSet::from_columns(&row_ids, &num_tokens, false).unwrap();
     for target in [10u64, 20, 30, 99] {
         let expected: u64 = docs
             .iter()
@@ -764,7 +764,7 @@ fn test_doc_length_by_row_id_matches_scan() {
     // as several list documents forms a contiguous run whose lengths sum.
     let legacy_row_ids = UInt64Array::from(vec![10, 10, 20]);
     let legacy_num_tokens = UInt32Array::from(vec![3, 4, 5]);
-    let legacy = DocSet::from_columns(&legacy_row_ids, &legacy_num_tokens, true, None).unwrap();
+    let legacy = DocSet::from_columns(&legacy_row_ids, &legacy_num_tokens, true).unwrap();
     assert!(legacy.inv.is_empty());
     assert_eq!(legacy.doc_length_by_row_id(10), 7);
     assert_eq!(legacy.doc_length_by_row_id(20), 5);

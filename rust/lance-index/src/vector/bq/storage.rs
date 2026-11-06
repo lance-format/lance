@@ -4,7 +4,7 @@
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::borrow::Cow;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::ops::Sub;
 use std::sync::{
     Arc, OnceLock,
@@ -41,9 +41,7 @@ use num_traits::AsPrimitive;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::pb;
-use crate::scalar::RowIdRemapper;
 use crate::vector::ApproxMode;
 use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
@@ -2663,35 +2661,6 @@ pub fn unpack_codes(codes: &FixedSizeListArray) -> FixedSizeListArray {
     FixedSizeListArray::try_new_from_values(UInt8Array::from(unpacked), code_len as i32).unwrap()
 }
 
-/// Build a row-id remapping for the rows present in this partition from a
-/// fragment-reuse index, mirroring the PQ storage frag-reuse path.
-///
-/// Returns `None` when there is nothing to do (no fragment-reuse index, or the
-/// index leaves every present row id unchanged), so callers keep the zero-cost
-/// no-op path. Otherwise, returns a `HashMap` mapping every affected old row id
-/// to `Some(new_id)` for surviving rows or `None` for rows whose covering
-/// fragment was compacted away, suitable for `RabitQuantizationStorage::remap`.
-fn build_frag_reuse_mapping(
-    fri: Option<&dyn RowIdRemapper>,
-    row_ids: &UInt64Array,
-) -> Option<HashMap<u64, Option<u64>>> {
-    let fri = fri?;
-    let mut mapping: HashMap<u64, Option<u64>> = HashMap::new();
-    for row_id in row_ids.values().iter() {
-        match fri.remap_row_id(*row_id) {
-            Some(new_id) if new_id == *row_id => {}
-            mapped => {
-                mapping.insert(*row_id, mapped);
-            }
-        }
-    }
-    if mapping.is_empty() {
-        None
-    } else {
-        Some(mapping)
-    }
-}
-
 #[async_trait]
 impl QuantizerStorage for RabitQuantizationStorage {
     type Metadata = RabitQuantizationMetadata;
@@ -2708,17 +2677,6 @@ impl QuantizerStorage for RabitQuantizationStorage {
         batch: RecordBatch,
         metadata: &Self::Metadata,
         distance_type: DistanceType,
-        fri: Option<Arc<FragReuseIndex>>,
-    ) -> Result<Self> {
-        let fri = fri.map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::try_from_batch_with_remapper(batch, metadata, distance_type, fri)
-    }
-
-    fn try_from_batch_with_remapper(
-        batch: RecordBatch,
-        metadata: &Self::Metadata,
-        distance_type: DistanceType,
-        fri: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let distance_type = match (metadata.query_estimator, distance_type) {
             (RabitQueryEstimator::RawQuery, DistanceType::Cosine) => DistanceType::L2,
@@ -2845,7 +2803,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let packed_ex_codes =
             maybe_pack_ex_codes(ex_codes.as_ref(), ex_bits, error_factors.as_ref());
 
-        let storage = Self {
+        Ok(Self {
             metadata,
             batch,
             distance_type,
@@ -2858,12 +2816,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
-        };
-
-        match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
-            Some(mapping) => storage.remap(&RowAddrRemap::direct(mapping)),
-            None => Ok(storage),
-        }
+        })
     }
 
     fn metadata(&self) -> &Self::Metadata {
@@ -2875,11 +2828,10 @@ impl QuantizerStorage for RabitQuantizationStorage {
         range: std::ops::Range<usize>,
         distance_type: DistanceType,
         metadata: &Self::Metadata,
-        frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
         let schema = reader.schema();
         let batch = reader.read_range(range, schema).await?;
-        Self::try_from_batch(batch, metadata, distance_type, frag_reuse_index)
+        Self::try_from_batch(batch, metadata, distance_type)
     }
 
     fn remap(&self, mapping: &RowAddrRemap) -> Result<Self> {
@@ -3124,7 +3076,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query = Arc::new(Float32Array::from_iter_values(
@@ -3172,7 +3123,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query_values = (0..code_dim)
@@ -3213,7 +3163,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query_values = (0..code_dim)
@@ -3345,7 +3294,6 @@ mod tests {
             make_test_batch_with_ex(codes, make_test_ex_codes(rows, dim, 7)),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let eager = full
@@ -3453,9 +3401,8 @@ mod tests {
         .unwrap();
         let batch = make_test_batch(codes);
 
-        let err =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .expect_err("a dimension that is not a multiple of 8 must be rejected");
+        let err = RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2)
+            .expect_err("a dimension that is not a multiple of 8 must be rejected");
         assert!(
             matches!(err, Error::InvalidInput { .. }),
             "unexpected variant: {err:?}"
@@ -3495,9 +3442,8 @@ mod tests {
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0u8; 16]), 8).unwrap();
         let batch = make_test_batch(codes);
-        let err =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .expect_err("metadata without a code dimension must be rejected");
+        let err = RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2)
+            .expect_err("metadata without a code dimension must be rejected");
         assert!(
             matches!(err, Error::CorruptFile { .. }),
             "expected CorruptFile, got {err:?}"
@@ -3529,7 +3475,7 @@ mod tests {
         )
         .unwrap();
         let batch = make_test_batch(codes);
-        RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+        RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2)
             .expect("a code dimension recovered from the rotation matrix must still load");
     }
 
@@ -3674,8 +3620,7 @@ mod tests {
         ])
         .unwrap();
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
         let calc = storage.dist_calculator(query, 0.0);
 
@@ -3818,7 +3763,6 @@ mod tests {
                         batch,
                         &metadata,
                         DistanceType::L2,
-                        None,
                     )
                     .unwrap();
 
@@ -3948,8 +3892,7 @@ mod tests {
             )
             .unwrap();
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
         let normal = storage.dist_calculator(query.clone(), 0.0).distance_all(0);
 
@@ -3996,7 +3939,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query = Arc::new(Float32Array::from_iter_values(
@@ -4183,8 +4125,7 @@ mod tests {
             batch
         };
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         // The FastScan transpose only exists for indexes that can reach the
         // bulk bypass path (no error factors); gated indexes fall through to
         // the exact per-row kernels in `distance_all`.
@@ -4320,8 +4261,7 @@ mod tests {
         let ex_codes = make_test_ex_codes(num_rows, code_dim, num_bits);
         let batch = make_test_batch_with_ex(codes, ex_codes);
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
 
         let mut calc = storage.dist_calculator(query, 4.0);
@@ -4416,8 +4356,7 @@ mod tests {
             )
             .unwrap();
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
         let calc = storage.dist_calculator(query, 4.0);
         assert!(
@@ -4720,7 +4659,6 @@ mod tests {
             make_test_batch(codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
@@ -4756,7 +4694,6 @@ mod tests {
             make_test_batch_with_ex(codes, ex_codes),
             &metadata,
             DistanceType::Dot,
-            None,
         )
         .unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
@@ -4815,8 +4752,7 @@ mod tests {
             make_test_batch_with_ex(codes, make_test_ex_codes(ROWS, DIM, num_bits))
         };
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot).unwrap();
         let centroid = vec![centroid_value; DIM];
         let query = (0..DIM)
             .map(|i| (i % 7) as f32 / 8.0 - 0.125)
@@ -4924,8 +4860,7 @@ mod tests {
             make_test_batch_with_ex(codes, make_test_ex_codes(ROWS, DIM, num_bits))
         };
         let mut storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot).unwrap();
         // A vector equal to its centroid has a zero residual, regardless of codes.
         storage.add_factors = Float32Array::from(vec![1.0; ROWS]);
         storage.scale_factors = Float32Array::from(vec![0.0; ROWS]);
@@ -4979,7 +4914,6 @@ mod tests {
             ),
             &metadata,
             DistanceType::Dot,
-            None,
         )
         .unwrap();
         let centroid = vec![0.125; DIM];
@@ -5057,8 +4991,7 @@ mod tests {
             make_test_ex_codes(2, DIM, 5),
         );
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::Dot).unwrap();
         let query = (0..DIM).map(|i| (i % 7) as f32 * 1e20).collect::<Vec<_>>();
         let centroid = centroid_value.map(|v| vec![v; DIM]);
         let factors = storage.raw_query_factors(1.0, &query, centroid.as_deref());
@@ -5087,7 +5020,6 @@ mod tests {
             make_test_batch(original_codes.clone()),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
 
@@ -5107,7 +5039,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::Cosine,
-            None,
         )
         .unwrap();
 
@@ -5125,12 +5056,10 @@ mod tests {
             batch.clone(),
             &metadata,
             DistanceType::Cosine,
-            None,
         )
         .unwrap();
         let l2_storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
 
         assert_eq!(cosine_storage.distance_type(), DistanceType::Cosine);
 
@@ -5154,7 +5083,6 @@ mod tests {
             make_test_batch(original_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap_err();
         assert!(
@@ -5176,9 +5104,8 @@ mod tests {
             .drop_column(EX_ADD_FACTORS_COLUMN)
             .unwrap();
 
-        let err =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap_err();
+        let err = RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2)
+            .unwrap_err();
         assert!(
             err.to_string().contains("requires __add_factors_ex column"),
             "{}",
@@ -5198,7 +5125,6 @@ mod tests {
             make_test_batch_with_ex(original_codes, ex_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
 
@@ -5227,8 +5153,7 @@ mod tests {
             .unwrap();
 
         let storage =
-            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
-                .unwrap();
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2).unwrap();
         let query = Arc::new(Float32Array::from(vec![1.0; code_dim])) as ArrayRef;
         let calc = storage.dist_calculator(query, 4.0);
 
@@ -5247,7 +5172,6 @@ mod tests {
             make_test_batch(original_codes.clone()),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
 
@@ -5292,7 +5216,6 @@ mod tests {
             make_test_batch_with_ex(original_codes.clone(), ex_codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
 
@@ -5345,7 +5268,6 @@ mod tests {
             remapped_batch,
             &remapped.metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         assert_eq!(remapped.ex_codes, reloaded.ex_codes);
@@ -5382,7 +5304,6 @@ mod tests {
             make_test_batch(codes),
             &metadata,
             DistanceType::L2,
-            None,
         )
         .unwrap();
         let query = Arc::new(Float32Array::from_iter_values(

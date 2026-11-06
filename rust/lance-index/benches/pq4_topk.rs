@@ -60,7 +60,7 @@ fn build_case(
         ],
     )
     .unwrap();
-    let storage = StorageBuilder::new("vec".to_owned(), DistanceType::L2, pq, None)
+    let storage = StorageBuilder::new("vec".to_owned(), DistanceType::L2, pq)
         .unwrap()
         .build(vec![batch])
         .unwrap();

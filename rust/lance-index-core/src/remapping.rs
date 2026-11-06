@@ -17,10 +17,7 @@ use roaring::RoaringBitmap;
 use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
-use lance_select::{RowAddrTreeMap, RowSetOps};
 use roaring::RoaringTreemap;
-
-use crate::scalar::RowIdRemapper;
 
 pub use lance_select::Remapper;
 pub use lance_select::remapper::{DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable};
@@ -50,14 +47,16 @@ pub async fn translate_treemap(
 
 /// Translate the row-address column at `addr_idx` of `batch` through
 /// `remapper` without changing the batch's layout: a deleted row keeps its
-/// slot, with the tombstone address. The returned synchronous remapper drops
-/// tombstones, for consumers whose layout-aware decoding takes one.
+/// slot, with [`RowAddress::TOMBSTONE_ROW`], for consumers whose encoded
+/// columns are not row-aligned and must drop it while decoding.
+///
+/// [`RowAddress::TOMBSTONE_ROW`]: lance_core::utils::address::RowAddress::TOMBSTONE_ROW
 #[doc(hidden)]
 pub async fn translate_preserving_layout(
     remapper: &Remapper,
     batch: RecordBatch,
     addr_idx: usize,
-) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
+) -> Result<RecordBatch> {
     let addrs = batch
         .columns()
         .get(addr_idx)
@@ -81,8 +80,7 @@ pub async fn translate_preserving_layout(
     }
     let mut columns = batch.columns().to_vec();
     columns[addr_idx] = Arc::new(UInt64Array::from(translated));
-    let batch = RecordBatch::try_new(batch.schema(), columns)?;
-    Ok((batch, Arc::new(TombstoneRowIdRemapper)))
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 /// Translate the row addresses in column `addr_idx` of `batch` through
@@ -300,57 +298,6 @@ impl<'a> RowAddrTranslatorRef<'a> {
     }
 }
 
-#[derive(Debug)]
-struct TombstoneRowIdRemapper;
-
-impl RowIdRemapper for TombstoneRowIdRemapper {
-    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        (row_id != lance_core::utils::address::RowAddress::TOMBSTONE_ROW).then_some(row_id)
-    }
-
-    fn remap_row_addrs_tree_map(&self, rows: &RowAddrTreeMap) -> RowAddrTreeMap {
-        let mut result = rows.clone();
-        result.remove(lance_core::utils::address::RowAddress::TOMBSTONE_ROW);
-        result
-    }
-
-    fn remap_row_ids_roaring_tree_map(&self, rows: &RoaringTreemap) -> RoaringTreemap {
-        rows.iter().filter_map(|id| self.remap_row_id(id)).collect()
-    }
-
-    fn remap_row_ids_record_batch(
-        &self,
-        batch: RecordBatch,
-        row_id_idx: usize,
-    ) -> Result<RecordBatch> {
-        let ids = batch
-            .columns()
-            .get(row_id_idx)
-            .and_then(|array| array.as_primitive_opt::<UInt64Type>())
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "row-ID column {row_id_idx} must exist and have type UInt64"
-                ))
-            })?;
-        let (positions, ids): (Vec<_>, Vec<_>) = ids
-            .iter()
-            .enumerate()
-            .filter_map(|(position, id)| {
-                id.and_then(|id| self.remap_row_id(id))
-                    .map(|id| (position as u64, id))
-            })
-            .unzip();
-        let positions = UInt64Array::from(positions);
-        let mut columns = batch
-            .columns()
-            .iter()
-            .map(|array| arrow_select::take::take(array, &positions, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        columns[row_id_idx] = Arc::new(UInt64Array::from(ids));
-        Ok(RecordBatch::try_new(batch.schema(), columns)?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,7 +366,7 @@ mod tests {
                 ("value", Int32, [1, 2, 3, 4])
             )
             .unwrap();
-            let (translated, tombstones) = translate_preserving_layout(&remapper, batch, 0)
+            let translated = translate_preserving_layout(&remapper, batch, 0)
                 .await
                 .unwrap();
             let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
@@ -440,7 +387,6 @@ mod tests {
                 )
                 .unwrap()
             );
-            assert_eq!(tombstones.remap_row_id(tombstone), None);
 
             let rows = BATCH_SIZE + 1;
             let batch = RecordBatch::try_from_iter([(
@@ -449,7 +395,7 @@ mod tests {
             )])
             .unwrap();
             let before = moves.calls.load(Ordering::Relaxed);
-            let (translated, _) = translate_preserving_layout(&remapper, batch, 0)
+            let translated = translate_preserving_layout(&remapper, batch, 0)
                 .await
                 .unwrap();
             assert_eq!(translated.num_rows(), rows);
