@@ -3218,18 +3218,7 @@ mod tests {
 
         // Bypass commit-time validation only to exercise append's independent guard
         // against an incompatible segment set already present in the manifest.
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: segments,
-                removed_indices: vec![],
-            },
-            None,
-        );
-        dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await
-            .unwrap();
+        crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, segments).await;
 
         let (appended_batch, _) = clustered_vector_batch(
             schema.clone(),
