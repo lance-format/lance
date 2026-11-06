@@ -350,9 +350,6 @@ enum BlobV2FieldRewritePlan {
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
-        /// The layout the column arrives in. A column already in logical layout is
-        /// in its final form, so transforming it hands the array back unchanged.
-        input_layout: Option<BlobV2Layout>,
     },
     Struct {
         field_name: String,
@@ -408,8 +405,7 @@ impl BlobV2FieldRewritePlan {
                     input_field.data_type()
                 )));
             };
-            let input_layout = BlobV2Layout::classify(input_children);
-            let output_field = match input_layout {
+            let output_field = match BlobV2Layout::classify(input_children) {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
                 Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
                     field,
@@ -437,7 +433,6 @@ impl BlobV2FieldRewritePlan {
                 field_id,
                 field_name: field.name.clone(),
                 output_field,
-                input_layout,
             });
         }
 
@@ -528,27 +523,11 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
-    /// Whether transforming this field does anything beyond handing the array back.
-    fn rewrites_anything(&self) -> bool {
-        match self {
-            Self::Passthrough { .. } => false,
-            // Mirrors the Blob arm of `transform`, which returns a logical-layout
-            // array untouched.
-            Self::Blob { input_layout, .. } => *input_layout != Some(BlobV2Layout::Logical),
-            Self::Struct { children, .. } => children.iter().any(|child| child.rewrites_anything()),
-            Self::List { child, .. } | Self::LargeList { child, .. } => child.rewrites_anything(),
-        }
-    }
-
-    /// `target_base_id` is the base the rewritten rows will be written to, which a
-    /// preserved reference needs in order to keep naming the source objects: a
-    /// descriptor that stays implicit resolves against the *destination* file's base.
     fn transform<'a>(
         &'a self,
         dataset: &'a Arc<Dataset>,
         array: ArrayRef,
         row_addrs: Arc<[u64]>,
-        target_base_id: Option<u32>,
     ) -> BoxFuture<'a, Result<ArrayRef>> {
         async move {
             match self {
@@ -558,7 +537,6 @@ impl BlobV2FieldRewritePlan {
                     field_id,
                     field_name,
                     output_field,
-                    ..
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
@@ -568,7 +546,7 @@ impl BlobV2FieldRewritePlan {
                                 if let Some(sidecars) = sidecars {
                                     return sidecars.prepare(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
                                 }
-                                return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, target_base_id).await;
+                                return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, None).await;
                             }
                             let descriptor =
                                 BlobV2Descriptor::try_from_struct(struct_arr, field_name)?;
@@ -613,9 +591,11 @@ impl BlobV2FieldRewritePlan {
                             struct_arr.num_columns()
                         )));
                     }
-                    // The children were bound to names at plan time, so a batch
-                    // whose columns arrive in another order must not be paired
-                    // positionally against them.
+                    // The children were bound by name at plan time. A caller that
+                    // builds the plan from one batch's schema and then hands it a
+                    // differently ordered batch would otherwise pair them
+                    // positionally; this is the only place that pairing is checked
+                    // at runtime.
                     for (child, array_field) in children.iter().zip(struct_arr.fields()) {
                         if child.output_field().name() != array_field.name() {
                             return Err(Error::invalid_input(format!(
@@ -630,12 +610,7 @@ impl BlobV2FieldRewritePlan {
                     for (child, child_array) in children.iter().zip(struct_arr.columns()) {
                         child_arrays.push(
                             child
-                                .transform(
-                                    dataset,
-                                    child_array.clone(),
-                                    row_addrs.clone(),
-                                    target_base_id,
-                                )
+                                .transform(dataset, child_array.clone(), row_addrs.clone())
                                 .await?,
                         );
                     }
@@ -661,7 +636,6 @@ impl BlobV2FieldRewritePlan {
                         child,
                         array.as_list::<i32>(),
                         row_addrs,
-                        target_base_id,
                     )
                     .await
                 }
@@ -674,7 +648,6 @@ impl BlobV2FieldRewritePlan {
                         child,
                         array.as_list::<i64>(),
                         row_addrs,
-                        target_base_id,
                     )
                     .await
                 }
@@ -690,7 +663,6 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     child: &BlobV2FieldRewritePlan,
     list_array: &GenericListArray<O>,
     row_addrs: Arc<[u64]>,
-    target_base_id: Option<u32>,
 ) -> Result<ArrayRef> {
     let list_array = if list_array.null_count() > 0 {
         list_array.filter_garbage_nulls()
@@ -734,12 +706,7 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
 
     let values = list_array.values().slice(values_start, values_len);
     let values = child
-        .transform(
-            dataset,
-            values,
-            Arc::<[u64]>::from(child_row_addrs),
-            target_base_id,
-        )
+        .transform(dataset, values, Arc::<[u64]>::from(child_row_addrs))
         .await?;
     let list_array = GenericListArray::<O>::try_new(
         child.output_field().clone(),
@@ -750,17 +717,41 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
+/// How a batch carrying Blob v2 columns is rewritten before it is written back as
+/// new fragments of the same dataset.
+///
+/// This is the rewrite compaction applies: a Blob v2 row holds a descriptor, not
+/// the payload, so rewriting the row has to either republish a reference to the
+/// payload or read the bytes back and materialize them. Building the plan inspects
+/// the schemas, so build one per (dataset schema, batch schema) pair and share it
+/// across every batch with that schema.
 pub struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
     output_schema: SchemaRef,
-    /// The base the rewritten rows are written to. `None` is primary storage,
-    /// which is where every in-crate rewrite writes.
-    target_base_id: Option<u32>,
 }
 
 impl BlobV2BatchRewritePlan {
-    pub(crate) fn try_new(
+    /// Plan the rewrite of batches shaped like `input_schema`, scanned from the
+    /// dataset `schema` describes.
+    ///
+    /// `input_schema` must be the schema of a scan of that same dataset taken with
+    /// [`Scanner::with_row_address`], because a descriptor is resolved to its
+    /// payload by row address; an input without `_rowaddr` is an error. Take that
+    /// scan with [`BlobHandling::AllBinary`] so legacy blob columns arrive
+    /// materialized. `keep_row_addr` keeps `_rowaddr` in the output.
+    ///
+    /// Set `preserve_managed` to `true` only when the destination files are written
+    /// at a version that can represent a prepared blob (`V2_2` or later; compaction
+    /// derives it from its write version). A managed descriptor is then kept as a
+    /// reference to the source object instead of being copied, so the source
+    /// snapshot must stay alive until the rewritten fragments are committed. With
+    /// `false`, payloads are materialized. The output is meant to be written into
+    /// the same dataset's primary storage.
+    ///
+    /// [`Scanner::with_row_address`]: crate::dataset::scanner::Scanner::with_row_address
+    /// [`BlobHandling::AllBinary`]: lance_core::datatypes::BlobHandling::AllBinary
+    pub fn try_new(
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
         keep_row_addr: bool,
@@ -801,20 +792,7 @@ impl BlobV2BatchRewritePlan {
                 output_fields,
                 input_schema.metadata().clone(),
             )),
-            target_base_id: None,
         })
-    }
-
-    /// Write the rewritten rows to the registered base `base_id` instead of to
-    /// primary storage.
-    ///
-    /// A preserved managed reference that carries no explicit base resolves
-    /// against the base of the data file holding it, so a plan whose output goes
-    /// to a different base than the source objects must name that destination
-    /// here or the published references point at the wrong base.
-    pub(crate) fn with_target_base_id(mut self, base_id: Option<u32>) -> Self {
-        self.target_base_id = base_id;
-        self
     }
 
     /// Build the prepared rewrite used by ordinary sidecar compaction.
@@ -843,18 +821,19 @@ impl BlobV2BatchRewritePlan {
         self
     }
 
-    pub(crate) fn output_schema(&self) -> &SchemaRef {
+    /// The schema every [`Self::transform_batch`] output has; open the writer with it.
+    pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    /// Whether any column of this plan rewrites a Blob v2 value, at any nesting depth.
-    pub(crate) fn rewrites_anything(&self) -> bool {
-        self.columns
-            .iter()
-            .any(|(_, column)| column.rewrites_anything())
-    }
-
-    pub(crate) async fn transform_batch(
+    /// Rewrite one batch of rows scanned from `dataset`.
+    ///
+    /// `dataset` must be the dataset the rows were scanned from: payloads are
+    /// resolved by row address against it, and a batch from elsewhere yields wrong
+    /// payloads rather than an error. `batch` must have the schema the plan was
+    /// built for. May read payload bytes from storage. Batches may be transformed
+    /// concurrently.
+    pub async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
         batch: RecordBatch,
@@ -875,7 +854,6 @@ impl BlobV2BatchRewritePlan {
                         dataset,
                         batch.column(*column_idx).clone(),
                         row_addrs.clone(),
-                        self.target_base_id,
                     )
                     .await?,
             );

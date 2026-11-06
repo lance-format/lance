@@ -153,7 +153,7 @@ use crate::session::Session;
 use crate::utils::temporal::{SystemTime, timestamp_to_nanos, utc_now};
 use crate::{Error, Result};
 pub use blob::{
-    BlobFile, BlobRangeRequest, BlobReadRange, BlobRewritePlan, ReadBlob, ReadBlobRange,
+    BlobFile, BlobRangeRequest, BlobReadRange, BlobV2BatchRewritePlan, ReadBlob, ReadBlobRange,
     ReadBlobRangesBuilder, ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream,
     preserve_managed_descriptors,
 };
