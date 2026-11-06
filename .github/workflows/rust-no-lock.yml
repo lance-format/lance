@@ -45,6 +45,12 @@ jobs:
       # Remove Cargo.lock to force a fresh resolution
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
+      # Only the nightly run on main saves the cache, so PRs reuse it without
+      # filling the repo's cache quota with large all-features builds.
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: no-lock
+          save-if: ${{ github.event_name == 'schedule' }}
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - name: Install protoc
         uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
