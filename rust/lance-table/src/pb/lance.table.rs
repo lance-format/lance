@@ -1261,6 +1261,11 @@ pub struct IndexMetadata {
     #[prost(map = "string, string", tag = "13")]
     pub metadata:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Maps stored local fragment IDs to committed source fragment IDs, preserving row offsets.
+    /// Absent when the index uses its normal committed row references.
+    /// Requires both reader and writer feature flags once a feature bit is assigned.
+    #[prost(message, optional, tag = "15")]
+    pub fragment_id_map: ::core::option::Option<FragmentIdMap>,
 }
 impl ::prost::Name for IndexMetadata {
     const NAME: &'static str = "IndexMetadata";
@@ -1270,6 +1275,25 @@ impl ::prost::Name for IndexMetadata {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lance.table.IndexMetadata".into()
+    }
+}
+/// Segment local mapping from stored fragment IDs to committed source fragment IDs.
+/// Must be nonempty and cover every physical fragment ID stored in the segment.
+/// Values must be unique committed fragment IDs, and keys and values must be less than 2^32 - 1.
+/// Applied before the Fragment Reuse Index (FRI).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FragmentIdMap {
+    #[prost(map = "uint32, uint32", tag = "1")]
+    pub entries: ::std::collections::HashMap<u32, u32>,
+}
+impl ::prost::Name for FragmentIdMap {
+    const NAME: &'static str = "FragmentIdMap";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.FragmentIdMap".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.FragmentIdMap".into()
     }
 }
 /// Metadata about a single file within an index segment.

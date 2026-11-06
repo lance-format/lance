@@ -459,6 +459,21 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Maps stored local fragment IDs to committed source fragment IDs, preserving row offsets.
+   * Absent when the index uses its normal committed row references.
+   * Requires both reader and writer feature flags once a feature bit is assigned.
+   */
+  optional FragmentIdMap fragment_id_map = 15;
+}
+
+/* Segment local mapping from stored fragment IDs to committed source fragment IDs.
+ * Must be nonempty and cover every physical fragment ID stored in the segment.
+ * Values must be unique committed fragment IDs, and keys and values must be less than 2^32 - 1.
+ * Applied before the Fragment Reuse Index (FRI).
+ */
+message FragmentIdMap {
+  map<uint32, uint32> entries = 1;
 }
 
 // Metadata about a single file within an index segment.
