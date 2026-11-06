@@ -89,11 +89,11 @@ pub struct TransactionRebase<'a> {
 #[derive(Debug)]
 struct ReadFragments {
     fragments: Arc<Vec<Fragment>>,
-    /// The paths of the files `data_change: false` replacements wrote in this
-    /// attempt's window, by fragment id. Such a file holds the values the
-    /// index read, unless something the window's checks cannot see changed
-    /// them first, so this is `None` until the window is known to have no
-    /// gap, and again once it holds a `Merge`.
+    /// The paths of the files `data_change: false` replacements wrote since
+    /// the read version, by fragment id. Such a file holds the values the
+    /// index read unless a change the checks did not see came first, so this
+    /// is `None` unless [`TransactionRebase::track_moved_files`] was called,
+    /// and again once a `Merge` is checked.
     moved_files: Option<HashMap<u64, HashSet<String>>>,
 }
 

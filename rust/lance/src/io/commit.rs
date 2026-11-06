@@ -1880,6 +1880,10 @@ pub(crate) async fn commit_transaction(
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(&missing, dataset.manifest.version)?;
+            // A retry checks only the versions since its previous attempt.
+            if checked_since == read_version && missing.is_empty() {
+                rebase.track_moved_files();
+            }
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {

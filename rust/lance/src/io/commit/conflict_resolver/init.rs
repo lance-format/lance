@@ -316,6 +316,18 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
+    /// Record the files `data_change: false` replacements write in the
+    /// transactions checked next, so that the finish keeps an index's coverage
+    /// of values they only moved. Call it only when those transactions are
+    /// every version since the read version: the finish compares against the
+    /// read version's fragments, so a change the checks did not see could lie
+    /// under any moved file.
+    pub(crate) fn track_moved_files(&mut self) {
+        if let Some(read) = &mut self.read_fragments {
+            read.moved_files = Some(HashMap::new());
+        }
+    }
+
     /// Handle gaps in the transaction history required to safely rebase.
     pub(crate) fn check_missing_versions(
         &mut self,
@@ -323,9 +335,6 @@ impl<'a> TransactionRebase<'a> {
         latest_version: u64,
     ) -> Result<()> {
         if missing.is_empty() {
-            if let Some(read) = &mut self.read_fragments {
-                read.moved_files = Some(HashMap::new());
-            }
             return Ok(());
         }
         // A missing transaction may have changed a source fragment or inserted
