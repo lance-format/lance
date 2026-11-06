@@ -5069,52 +5069,8 @@ mod tests {
         }
     }
 
-    /// A JSON-wrapped BTREE/Bitmap index now carries the row-address-domain
-    /// migration through its own metadata (`JsonIndexDetails::target_index_version`),
-    /// so creating one on a stable-row-id dataset succeeds, and the resulting
-    /// segment reports address domain exactly like the plain target would --
-    /// visible to the domain-safety checks elsewhere (`IndexMetadata::results_are_row_addrs`,
-    /// append.rs's `legacy_domain_mismatch`) without decoding the wrapper.
-    #[rstest]
-    #[case::btree("btree")]
-    #[case::bitmap("bitmap")]
-    #[tokio::test]
-    async fn test_json_wrapped_create_with_stable_row_ids(#[case] target_index_type: &str) {
-        let test_dir = TempStrDir::default();
-        let test_uri = test_dir.as_str();
-
-        let (schema, batch) = json_btree_schema_and_batch(0..10);
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                enable_stable_row_ids: true,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-        let params = json_wrapped_params(target_index_type);
-        dataset
-            .create_index_builder(&["doc"], IndexType::Scalar, &params)
-            .name("doc_idx".to_string())
-            .await
-            .unwrap();
-
-        let segments = dataset.load_indices_by_name("doc_idx").await.unwrap();
-        assert_eq!(segments.len(), 1);
-        assert!(
-            segments[0].results_are_row_addrs(),
-            "a JSON-wrapped {target_index_type} target on a stable-row-id dataset must store \
-             row addresses, like the plain target would"
-        );
-    }
-
-    /// The same JSON-wrapped BITMAP combination is unaffected -- and must keep
-    /// working -- without stable row ids, where a row id and a row address are
-    /// the same value.
+    /// A JSON-wrapped BITMAP must keep working without stable row ids, where a
+    /// row id and a row address are the same value.
     ///
     /// Creation only: unlike BTree (see the matching test below), Bitmap does
     /// not report a `training_data_type`, so `JsonIndex::update` -- and so

@@ -7913,20 +7913,24 @@ async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
     }
 }
 
-/// On a stable-row-id dataset a JSON index over a BTree stores row addresses,
-/// and keeps doing so through a delete, an append, and an optimize that updates
-/// the one existing segment in place. That update must filter the old segment's
-/// data by fragment: a row-id filter would treat every address past the first
-/// fragment as a deleted row and drop it.
+/// On a stable-row-id dataset a JSON index over a BTree or ZoneMap stores row
+/// addresses, which differ from row ids past fragment 0, and keeps doing so
+/// through a delete, an append, and an optimize that updates the one existing
+/// segment in place. That update must filter the old segment's data by
+/// fragment: a row-id filter would treat every address past the first fragment
+/// as a deleted row and drop it.
+#[rstest]
+#[case::btree("btree")]
+#[case::zonemap("zonemap")]
 #[tokio::test]
-async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
+async fn test_json_row_addr_domain_with_stable_row_ids(#[case] target_index_type: &str) {
     let mut dataset = stable_row_id_json_dataset("memory://").await;
     dataset
         .create_index(
             &["json"],
             IndexType::Scalar,
             Some("json_idx".to_string()),
-            &json_index_params("btree"),
+            &json_index_params(target_index_type),
             false,
         )
         .await
@@ -7938,6 +7942,10 @@ async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
         lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION as i32
     );
     assert!(segments[0].results_are_row_addrs());
+    let mut scan = dataset.scan();
+    scan.filter("json_get_int(json, 'val') >= 6").unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
 
     dataset
         .delete("json_get_int(json, 'val') = 5")
@@ -8058,48 +8066,6 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
 
     assert_eq!(baseline.num_rows(), 1);
     assert_eq!(indexed.num_rows(), baseline.num_rows());
-}
-
-/// A JSON-wrapped zonemap answers in row addresses, which differ from stable
-/// row ids past fragment 0, so the wrapper must report its target's domain.
-#[tokio::test]
-async fn test_json_zonemap_index_with_stable_row_ids() {
-    let batch = json_batch(vec![
-        r#"{"val": 1}"#,
-        r#"{"val": 2}"#,
-        r#"{"val": 3}"#,
-        r#"{"val": 4}"#,
-    ]);
-    let schema = batch.schema();
-    let write_params = WriteParams {
-        enable_stable_row_ids: true,
-        max_rows_per_file: 2,
-        ..Default::default()
-    };
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new([Ok(batch)], schema),
-        "memory://",
-        Some(write_params),
-    )
-    .await
-    .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 2);
-    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
-        "target_index_type": "zonemap",
-        "path": "val",
-    }));
-    dataset
-        .create_index(&["json"], IndexType::Scalar, None, &params, false)
-        .await
-        .unwrap();
-
-    let predicate = "json_get_int(json, 'val') >= 2";
-    let mut scan = dataset.scan();
-    scan.filter(predicate).unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
-    let indexed = scan.try_into_batch().await.unwrap();
-    assert_eq!(indexed.num_rows(), 3);
 }
 
 /// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path

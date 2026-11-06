@@ -38,8 +38,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex,
-        SearchOptions, SearchResult, UpdateCriteria,
+        AnyQuery, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, SearchOptions,
+        SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -71,11 +71,6 @@ const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
 /// which for BTree, Bitmap, and LabelList was the row-id-domain format. `None`
 /// for every other target, whose format has not changed since: its plugin's
 /// current version is still correct.
-///
-/// Like [`legacy_row_id_domain_version`], but keyed off the target's own
-/// encoded details rather than its plugin name, for a caller that only has the
-/// raw details (e.g. [`wraps_row_addr_domain_target`] and
-/// [`relabel_as_row_id_domain`], neither of which has a plugin instance handy).
 fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32> {
     if target_details.type_url.ends_with("BTreeIndexDetails") {
         Some(crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION)
@@ -222,30 +217,6 @@ impl JsonIndex {
             .map(JsonIndexTargetType::try_from)
             .transpose()
     }
-}
-
-/// The pre-migration, row-id-domain version for `builtin`'s on-disk format, if it has
-/// one (BTree, Bitmap, and LabelList are the only builtins with a second, address-domain
-/// format -- see `BTREE_ROW_ID_DOMAIN_VERSION`, `BITMAP_ROW_ID_DOMAIN_VERSION`, and
-/// `LABEL_LIST_ROW_ID_DOMAIN_VERSION`).
-fn legacy_row_id_domain_version(builtin_name: &str) -> Option<u32> {
-    [
-        (
-            BuiltinIndexType::BTree,
-            crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
-        ),
-        (
-            BuiltinIndexType::Bitmap,
-            crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
-        ),
-        (
-            BuiltinIndexType::LabelList,
-            crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
-        ),
-    ]
-    .into_iter()
-    .find(|(builtin, _)| builtin_name.eq_ignore_ascii_case(builtin.as_str()))
-    .map(|(_, version)| version)
 }
 
 impl DeepSizeOf for JsonIndex {
@@ -433,10 +404,7 @@ pub struct JsonIndexParameters {
 /// (the `params` field of the `ScalarIndexParams` that `JsonIndex::derive_index_params`
 /// returns -- not the target's own params). `None` if `params_json` doesn't parse as
 /// [`JsonIndexParameters`].
-///
-/// Exposed so callers that only have a `ScalarIndexParams` (not a live `JsonIndex`) can
-/// still tell what a JSON index wraps, e.g. to reject an unsafe wrapped combination before
-/// training -- see `build_scalar_index`'s JSON-wrapped-address-domain guard.
+#[deprecated(note = "no longer used by Lance; parse `JsonIndexParameters` directly")]
 pub fn json_wrapped_target_type(params_json: &str) -> Option<String> {
     serde_json::from_str::<JsonIndexParameters>(params_json)
         .ok()
@@ -1469,10 +1437,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         // If `target_index_version` is missing then we have to guess.  Our best guess
         // is that this is an old index written before `target_index_version` was added.
         // These indexes were the old versions that stored row ids and not row addresses.
-        let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
-            // Minhash, ngram, and rtree have no row-id-domain version of their own.
-            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
-        });
+        let target_index_version = json_details
+            .target_index_version
+            .or_else(|| legacy_target_index_version(target_details))
+            .unwrap_or(0);
 
         let target_index = target_plugin
             .load_index(
@@ -1676,6 +1644,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_json_wrapped_target_type() {
         assert_eq!(
             json_wrapped_target_type(r#"{"target_index_type":"btree","path":"x"}"#),
@@ -1970,20 +1939,7 @@ mod tests {
         path: &str,
         json_docs: &[&str],
     ) -> Arc<dyn ScalarIndex> {
-        let (index, _) =
-            train_json_index(store, target_index_type, expected_ordering, path, json_docs).await;
-        index
-    }
-
-    /// Train a JSON index and return it alongside the details it produced.
-    async fn train_json_index(
-        store: Arc<dyn IndexStore>,
-        target_index_type: &str,
-        expected_ordering: TrainingOrdering,
-        path: &str,
-        json_docs: &[&str],
-    ) -> (Arc<dyn ScalarIndex>, prost_types::Any) {
-        let created = train_json_index_created(
+        let created = train_json_index(
             store.clone(),
             target_index_type,
             expected_ordering,
@@ -1991,14 +1947,11 @@ mod tests {
             json_docs,
         )
         .await;
-        let index = load_json_index(store, &created.index_details).await;
-        (index, created.index_details)
+        load_json_index(store, &created.index_details).await
     }
 
-    /// The training half of [`train_json_index`], returning the full `CreatedIndex`
-    /// (including the wrapper's own domain-tagged `index_version`) instead of just
-    /// the loaded index and its details.
-    async fn train_json_index_created(
+    /// Train a JSON index without loading it.
+    async fn train_json_index(
         store: Arc<dyn IndexStore>,
         target_index_type: &str,
         expected_ordering: TrainingOrdering,
@@ -2366,7 +2319,7 @@ mod tests {
     /// field would have written; with an out-of-range value, the details a build
     /// that added a variant this one does not know would have written.
     fn details_with_target_data_type(details: &prost_types::Any, value: i32) -> prost_types::Any {
-        let mut decoded = crate::pb::JsonIndexDetails::decode(details.value.as_slice()).unwrap();
+        let mut decoded = decode_details(details);
         decoded.target_data_type = value;
         prost_types::Any::from_msg(&decoded).unwrap()
     }
@@ -2427,14 +2380,15 @@ mod tests {
         #[case] expected_json_name: &str,
     ) {
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store,
             target_index_type,
             TrainingOrdering::None,
             "v",
             &[json_doc],
         )
-        .await;
+        .await
+        .index_details;
 
         let decoded = decode_details(&details);
         assert_eq!(decoded.target_data_type, expected as i32);
@@ -2461,14 +2415,16 @@ mod tests {
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_details_target_data_type_survives_remap(#[case] target_index_type: &str) {
         let (store, _tmpdir) = local_json_index_store();
-        let (index, details) = train_json_index(
-            store,
+        let details = train_json_index(
+            store.clone(),
             target_index_type,
             TrainingOrdering::None,
             "v",
             &[r#"{"v": "a"}"#, r#"{"v": "b"}"#],
         )
-        .await;
+        .await
+        .index_details;
+        let index = load_json_index(store, &details).await;
         assert_eq!(
             decode_target_data_type(&details),
             crate::pb::JsonTargetDataType::Utf8 as i32
@@ -2504,14 +2460,15 @@ mod tests {
         use lance_select::RowAddrTreeMap;
 
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store.clone(),
             target_index_type,
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#, r#"{"v": 2}"#],
         )
-        .await;
+        .await
+        .index_details;
         let legacy_details = details_with_target_data_type(
             &details,
             crate::pb::JsonTargetDataType::Unspecified as i32,
@@ -2563,14 +2520,15 @@ mod tests {
         const FUTURE_VARIANT: i32 = 99;
 
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store.clone(),
             "btree",
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#],
         )
-        .await;
+        .await
+        .index_details;
         let future_details = details_with_target_data_type(&details, FUTURE_VARIANT);
 
         let index = load_json_index(store, &future_details).await;
@@ -2595,14 +2553,15 @@ mod tests {
         const FUTURE_VARIANT: i32 = 99;
 
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store.clone(),
             "btree",
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#],
         )
-        .await;
+        .await
+        .index_details;
         let future_details = details_with_target_data_type(&details, FUTURE_VARIANT);
 
         let index = load_json_index(store, &future_details).await;
@@ -2633,14 +2592,15 @@ mod tests {
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_update_records_target_data_type_for_legacy_details() {
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store.clone(),
             "btree",
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#],
         )
-        .await;
+        .await
+        .index_details;
         let legacy_details = details_with_target_data_type(
             &details,
             crate::pb::JsonTargetDataType::Unspecified as i32,
@@ -2673,14 +2633,15 @@ mod tests {
         let plugin = registry.get_plugin_by_name("json").unwrap();
 
         let (store, _tmpdir) = local_json_index_store();
-        let (_index, details) = train_json_index(
+        let details = train_json_index(
             store,
             "btree",
             TrainingOrdering::None,
             "v",
             &[r#"{"v": 1}"#],
         )
-        .await;
+        .await
+        .index_details;
 
         assert_eq!(
             plugin.details_as_json(&details).unwrap(),
@@ -2738,7 +2699,7 @@ mod tests {
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_legacy_details_load_target_as_row_ids(#[case] target_index_type: &str) {
         let (store, _tmpdir) = local_json_index_store();
-        let created = train_json_index_created(
+        let created = train_json_index(
             store.clone(),
             target_index_type,
             TrainingOrdering::None,
@@ -2778,7 +2739,7 @@ mod tests {
         #[case] address_domain: bool,
     ) {
         let (store, _tmpdir) = local_json_index_store();
-        let created = train_json_index_created(
+        let created = train_json_index(
             store.clone(),
             target_index_type,
             expected_ordering,
@@ -2814,7 +2775,7 @@ mod tests {
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_relabel_as_row_id_domain() {
         let (store, _tmpdir) = local_json_index_store();
-        let mut created = train_json_index_created(
+        let mut created = train_json_index(
             store.clone(),
             "btree",
             TrainingOrdering::None,
