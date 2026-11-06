@@ -124,6 +124,13 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     fn io_buffer_size(&self) -> Option<u64> {
         None
     }
+
+    /// The ranges of one request at most this many bytes apart are read
+    /// together, including the bytes between them. 0 when the implementation
+    /// reads every range on its own.
+    fn coalesce_gap(&self) -> u64 {
+        0
+    }
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer

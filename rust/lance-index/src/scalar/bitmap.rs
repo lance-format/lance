@@ -716,26 +716,25 @@ impl BitmapIndex {
         };
         let cache_key = BitmapKey::try_new(row_offset)?;
 
-        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            if let Some(metrics) = metrics {
-                metrics.record_index_cache_hit();
-            }
-            return Ok(cached);
-        }
-
-        // Record that we're loading a partition from disk
+        // Concurrent misses on one value share a single load, and the caller
+        // gets the cached bitmap rather than a second copy of it.
+        let (bitmap, hit) = self
+            .index_cache
+            .get_or_insert_with_key_hit(cache_key, || async move {
+                if let Some(metrics) = metrics {
+                    metrics.record_part_load();
+                }
+                self.read_bitmap_at(row_offset).await
+            })
+            .await?;
         if let Some(metrics) = metrics {
-            metrics.record_index_cache_miss();
-            metrics.record_part_load();
+            if hit {
+                metrics.record_index_cache_hit();
+            } else {
+                metrics.record_index_cache_miss();
+            }
         }
-
-        let bitmap = self.read_bitmap_at(row_offset).await?;
-
-        self.index_cache
-            .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
-            .await;
-
-        Ok(Arc::new(bitmap))
+        Ok(bitmap)
     }
 
     /// Read one row set straight from the lookup file, remapped through the

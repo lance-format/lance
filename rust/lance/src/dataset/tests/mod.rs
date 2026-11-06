@@ -17,6 +17,7 @@ mod dataset_io;
 mod dataset_merge_update;
 mod dataset_migrations;
 mod dataset_overlay_index_masking;
+mod dataset_read_budget;
 mod dataset_scanner;
 mod dataset_scanner_knn;
 mod dataset_scanner_plans;

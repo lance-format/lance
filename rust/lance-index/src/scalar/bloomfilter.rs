@@ -74,10 +74,9 @@ struct BloomFilterStatistics {
 
 impl DeepSizeOf for BloomFilterStatistics {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // Estimate the size of the bloom filter
-        // We could try to get the actual size from the Sbbf if it has a method for that,
-        // but for now we'll estimate based on the number of bytes it serializes to
-        self.bloom_filter.to_bytes().len()
+        // Measured without serializing: the cache weighs entries on insert and
+        // on every size walk.
+        self.bloom_filter.estimated_memory_size()
     }
 }
 
