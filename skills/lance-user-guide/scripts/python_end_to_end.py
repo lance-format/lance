@@ -11,16 +11,24 @@ import pyarrow as pa
 import lance
 
 
-def _build_fixed_size_vectors(num_rows: int, dim: int) -> tuple[pa.FixedSizeListArray, np.ndarray]:
+def _build_fixed_size_vectors(
+    num_rows: int, dim: int
+) -> tuple[pa.FixedSizeListArray, np.ndarray]:
     vectors = np.random.rand(num_rows, dim).astype("float32")
     flat = pa.array(vectors.reshape(-1), type=pa.float32())
     return pa.FixedSizeListArray.from_arrays(flat, dim), vectors
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal Lance write/index/query example")
-    parser.add_argument("--uri", default="example.lance", help="Dataset URI (directory)")
-    parser.add_argument("--mode", default="overwrite", choices=["create", "append", "overwrite"])
+    parser = argparse.ArgumentParser(
+        description="Minimal Lance write/index/query example"
+    )
+    parser.add_argument(
+        "--uri", default="example.lance", help="Dataset URI (directory)"
+    )
+    parser.add_argument(
+        "--mode", default="overwrite", choices=["create", "append", "overwrite"]
+    )
     parser.add_argument("--rows", type=int, default=1000)
     parser.add_argument("--dim", type=int, default=32)
 
@@ -40,7 +48,13 @@ def main() -> None:
     uri = str(Path(args.uri))
     vec_arr, vec_np = _build_fixed_size_vectors(args.rows, args.dim)
     categories = pa.array(["a" if i % 2 == 0 else "b" for i in range(args.rows)])
-    table = pa.table({"id": pa.array(range(args.rows), pa.int64()), "category": categories, "vector": vec_arr})
+    table = pa.table(
+        {
+            "id": pa.array(range(args.rows), pa.int64()),
+            "category": categories,
+            "vector": vec_arr,
+        }
+    )
 
     ds = lance.write_dataset(table, uri, mode=args.mode)
     ds = lance.dataset(uri)

@@ -4,6 +4,7 @@ If there are, assert that we have incremented the minor version.
 
 Can also be used as a library to detect breaking changes without version validation.
 """
+
 import argparse
 import os
 import sys
@@ -40,10 +41,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("base", help="Base commit/tag for comparison")
     parser.add_argument("head", help="Head commit/tag for comparison")
-    parser.add_argument("last_stable_version", nargs="?", help="Last stable version (for validation)")
-    parser.add_argument("current_version", nargs="?", help="Current version (for validation)")
-    parser.add_argument("--detect-only", action="store_true",
-                        help="Only detect breaking changes, don't validate version")
+    parser.add_argument(
+        "last_stable_version", nargs="?", help="Last stable version (for validation)"
+    )
+    parser.add_argument(
+        "current_version", nargs="?", help="Current version (for validation)"
+    )
+    parser.add_argument(
+        "--detect-only",
+        action="store_true",
+        help="Only detect breaking changes, don't validate version",
+    )
     args = parser.parse_args()
 
     repo = Github(os.environ["GITHUB_TOKEN"]).get_repo(os.environ["GITHUB_REPOSITORY"])
