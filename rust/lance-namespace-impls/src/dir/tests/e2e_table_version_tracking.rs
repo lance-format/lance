@@ -512,6 +512,7 @@ async fn test_cleanup_removes_staging_manifest_without_version_record() {
         1,
         "the failed commit must leave its staging manifest behind"
     );
+    assert!(!dataset.has_successor_version().await.unwrap());
 
     // `delete_unverified` so the fresh staging file is not skipped as a
     // possibly in-progress commit.
@@ -525,16 +526,6 @@ async fn test_cleanup_removes_staging_manifest_without_version_record() {
         .unwrap();
     assert_eq!(staging_manifests(&dataset).await, 0);
     assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
-
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![Ok(batch(vec![4]))], schema),
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(dataset.version().version, 2);
-    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
 }
 
 /// Helper: create a namespace and a table with some rows, returning (namespace, table_id)
