@@ -23,7 +23,7 @@ use super::{get_row_id_index_with, overlapping_id_spans, read_row_id_sequence};
 const INLINE_PREPARE_BYTES: usize = 16 * 1024;
 /// Bound decoded source rows while allowing small fragments to retain remote
 /// I/O concurrency. This schedules work; it is not an RSS limit.
-const PREPARE_ROW_BUDGET: usize = 128 * 1024 * 1024;
+const PREPARE_ROW_BUDGET: usize = 192 * 1024 * 1024;
 /// Larger routing directories use the CPU pool when combining prepared units.
 const INLINE_COMBINE_FRAGMENTS: usize = 64;
 
