@@ -1503,6 +1503,7 @@ async fn test_write_manifest(
         None,
         // Previously classified from a None inline copy, which validated.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1570,6 +1571,7 @@ async fn test_clone_rejects_unknown_writer_requirements() {
         dataset.manifest_location.naming_scheme,
         None,
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1690,6 +1692,7 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         dataset.manifest_location.naming_scheme,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1800,6 +1803,7 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
         dataset.manifest_location.naming_scheme,
         None,
         false,
+        None,
     )
     .await
     .unwrap();
@@ -1845,6 +1849,7 @@ async fn test_restore_rejects_unknown_target_flags() {
         None,
         // No inline transaction to classify from, so validate.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1862,6 +1867,7 @@ async fn test_restore_rejects_unknown_target_flags() {
         None,
         // No inline transaction to classify from, so validate.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1908,6 +1914,7 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
         None,
         // No inline transaction to classify from, so validate.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2488,6 +2495,7 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
         None,
         // No inline transaction to classify from, so validate.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2536,6 +2544,7 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
         None,
         // No inline transaction to classify from, so validate.
         true,
+        None,
     )
     .await
     .unwrap();
@@ -4616,6 +4625,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
         None,
         // Previously classified from a None inline copy, which validated.
         true,
+        None,
     )
     .await
     .expect_err("a nullable primary key must not reach a manifest");
