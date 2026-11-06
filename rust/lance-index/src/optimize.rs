@@ -147,14 +147,14 @@ impl OptimizeOptions {
         }
     }
 
-    /// Consolidate the named segments of one vector index, wherever they sit,
-    /// without training.
+    /// Consolidate the named segments of one vector index, wherever they sit.
     ///
-    /// They are re-encoded into one segment with the model of the newest live
-    /// segment, dropping deleted rows; a source trained on a different
-    /// distribution can lose recall under that model. The selection is not
-    /// bounded by a row budget, and segments the index no longer has are
-    /// skipped.
+    /// Their rows are re-encoded, dropping deleted ones. Segments that share
+    /// one model keep it; otherwise a new model is trained on the selected
+    /// rows, since encoding data under a model trained on other data loses
+    /// recall. Output is one segment, or segments of at most
+    /// [`Self::max_rows_per_segment`] rows. The selection is not bounded by a
+    /// row budget, and segments the index no longer has are skipped.
     pub fn consolidate_selected(index_name: impl Into<String>, segments: Vec<Uuid>) -> Self {
         Self {
             index_names: Some(vec![index_name.into()]),

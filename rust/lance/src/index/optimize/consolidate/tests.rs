@@ -346,7 +346,7 @@ async fn incomplete_or_duplicate_results_cannot_replace_sources() {
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("replace a source twice"));
+    assert!(error.to_string().contains("cover a fragment twice"));
     assert_eq!(segments(&dataset).await, before);
     commit_optimize_indices(&mut dataset, results, &options)
         .await
@@ -598,7 +598,7 @@ fn select(segments: &[&IndexMetadata]) -> OptimizeOptions {
 #[case(false)]
 #[case(true)]
 #[tokio::test]
-async fn selected_older_segments_are_rewritten_without_deleted_rows(#[case] stable: bool) {
+async fn selected_segments_with_different_models_are_retrained(#[case] stable: bool) {
     let dir = TempStrDir::default();
     let mut dataset = fixture(&dir, stable).await;
     let old = segments(&dataset).await;
@@ -614,15 +614,18 @@ async fn selected_older_segments_are_rewritten_without_deleted_rows(#[case] stab
         (BASE + SMALL) as u64
     );
 
+    let mut models = Vec::new();
+    for segment in &old {
+        models.push(model(&dataset, segment).await);
+    }
     let options = select(&[&old[0], &old[1]]);
     let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
     assert_eq!(plan.merges.len(), 1);
     assert_eq!(plan.merges[0].replaces, vec![old[0].uuid, old[1].uuid]);
-    assert!(
-        plan.tasks
-            .iter()
-            .all(|task| task.reference.uuid == old[2].uuid)
-    );
+    // One model trained for the selection, outside the manifest.
+    let trained = plan.tasks[0].reference.uuid;
+    assert!(plan.tasks.iter().all(|task| task.reference.uuid == trained));
+    assert!(old.iter().all(|segment| segment.uuid != trained));
     dataset.optimize_indices(&options).await.unwrap();
 
     let new = segments(&dataset).await;
@@ -630,11 +633,72 @@ async fn selected_older_segments_are_rewritten_without_deleted_rows(#[case] stab
     assert_eq!(new[0], old[2]);
     assert_eq!(files(&dir, old[2].uuid), newest_files);
     assert_eq!(indexed_rows(&dataset, &new[1]).await, live);
-    assert_eq!(
-        model(&dataset, &new[1]).await,
-        model(&dataset, &old[2]).await
-    );
+    let retrained = model(&dataset, &new[1]).await;
+    assert!(models.iter().all(|source| *source != retrained));
+    // Sized from the selected rows, not copied from a source's two partitions.
+    let index = dataset
+        .open_vector_index("vector", &new[1].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(index.ivf_model().num_partitions(), 1);
     assert_query(&dataset, live as usize + SMALL).await;
+}
+
+#[tokio::test]
+async fn a_shared_model_selection_keeps_its_model() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    // An append is encoded under the newest model, so it shares old[2]'s.
+    append(&mut dataset, BASE + 2 * SMALL, SMALL).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    let appended = segments(&dataset).await[3].clone();
+    let shared = model(&dataset, &old[2]).await;
+    assert_eq!(model(&dataset, &appended).await, shared);
+
+    let options = select(&[&old[2], &appended]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.reference.uuid == appended.uuid)
+    );
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    assert_eq!(model(&dataset, &new[2]).await, shared);
+    assert_query(&dataset, BASE + 3 * SMALL).await;
+}
+
+#[tokio::test]
+async fn a_selection_packs_its_output_and_splits_a_segment() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    dataset
+        .optimize_indices(&select(&[&old[1], &old[2]]))
+        .await
+        .unwrap();
+    let merged = segments(&dataset).await[1].clone();
+    assert_eq!(indexed_rows(&dataset, &merged).await, 2 * SMALL as u64);
+    let merged_model = model(&dataset, &merged).await;
+
+    // One segment shares its own model, so splitting it keeps that model.
+    let options = select(&[&merged]).max_rows_per_segment(Some(SMALL as u64));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 2);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    assert_eq!(new[0], old[0]);
+    for output in &new[1..] {
+        assert_eq!(indexed_rows(&dataset, output).await, SMALL as u64);
+        assert_eq!(model(&dataset, output).await, merged_model);
+    }
+    assert_query(&dataset, BASE + 2 * SMALL).await;
 }
 
 #[tokio::test]
@@ -706,6 +770,8 @@ async fn invalid_selections_are_rejected() {
         select(&[&old[0]]).index_names(vec![NAME.to_string(), "other".to_string()]),
         budgeted,
         select(&[&old[0]]).num_indices_to_merge(Some(1)),
+        select(&[&old[0]]).max_rows_per_segment(Some(0)),
+        OptimizeOptions::consolidate(BASE as u64).max_rows_per_segment(Some(SMALL as u64)),
     ] {
         let error = plan_optimize_indices(&dataset, &invalid).await.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
