@@ -4,7 +4,7 @@
 use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::fragment::FragReadConfig;
-use crate::dataset::rowids::get_row_id_index_with;
+use crate::dataset::rowids::resolve_row_ids;
 use crate::io::exec::AddRowOffsetExec;
 use crate::{Error, Result};
 use arrow::{compute::concat_batches, datatypes::UInt64Type};
@@ -558,10 +558,9 @@ impl TakeBuilder {
                 .row_ids
                 .as_ref()
                 .expect("row_ids must be set if row_addrs is not");
-            let addrs = if let Some(row_id_index) =
-                get_row_id_index_with(&self.dataset, !self.ignore_deletions).await?
+            let addrs = if let Some(resolved) =
+                resolve_row_ids(&self.dataset, row_ids, !self.ignore_deletions).await?
             {
-                let resolved = row_id_index.get_many(row_ids)?;
                 if self.missing_row_policy == MissingRowPolicy::Error
                     && let Some(first_missing_index) =
                         resolved.iter().position(|address| address.is_none())
