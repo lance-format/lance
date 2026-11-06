@@ -41,6 +41,7 @@ import org.lance.memwal.InitializeMemWalParams;
 import org.lance.memwal.MemWalIndexDetails;
 import org.lance.memwal.ShardWriter;
 import org.lance.memwal.ShardWriterConfig;
+import org.lance.merge.MergeInsertAnalysis;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 import org.lance.namespace.LanceNamespace;
@@ -2691,6 +2692,32 @@ public class Dataset implements Closeable {
   }
 
   private native MergeInsertResult nativeMergeInsert(
+      MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
+
+  /**
+   * Analyze one streaming merge without committing a dataset version.
+   *
+   * <p>The stream has no materialized statistics and is consumed once. Analysis can write temporary
+   * data, deletion and replay files, then cleans up uncommitted data. Execution errors return
+   * partial reports; planning/validation errors throw. Cleanup failures are logged for orphan
+   * cleanup. Cancelling execution can interrupt cleanup. Join and write times overlap; pool peaks
+   * measure DataFusion reservations rather than process memory.
+   *
+   * <p>For example, inspect {@code report.getReplaySpills().getBytesWritten()} to diagnose staging,
+   * and {@code report.getExecution().getError()} for an execution failure.
+   *
+   * @param mergeInsert the same options accepted by {@link #mergeInsert}
+   * @param source streaming source, consumed by this call
+   * @return an operation-owned protobuf-backed diagnostic snapshot
+   */
+  public MergeInsertAnalysis analyzeMergeInsert(
+      MergeInsertParams mergeInsert, ArrowArrayStream source) {
+    try (LockManager.ReadLock ignored = lockManager.acquireReadLock()) {
+      return nativeAnalyzeMergeInsert(mergeInsert, source.memoryAddress());
+    }
+  }
+
+  private native MergeInsertAnalysis nativeAnalyzeMergeInsert(
       MergeInsertParams mergeInsert, long arrowStreamMemoryAddress);
 
   /**

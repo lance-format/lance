@@ -2,7 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::MergeInsertJoinStrategy;
 use arrow_array::record_batch;
+use prost::Message;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 #[tokio::test]
 async fn test_plan_upsert() {
@@ -385,6 +388,36 @@ async fn test_analyze_plan_reports_the_given_source_shape() {
             .try_build()
             .unwrap()
     };
+
+    let report = new_job()
+        .analyze_plan_report_batches(vec![source.clone()])
+        .await
+        .unwrap();
+    assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
+    assert_eq!(report.execution.error, None);
+    assert!(
+        report
+            .execution
+            .summary
+            .all_times
+            .contains_key("merge_write_time")
+    );
+    assert!(report.execution.pool_peak_reserved_bytes.is_some());
+    assert_eq!(report.write_mode, MergeInsertWriteStrategy::RewriteRows);
+    let stats = report.stats.unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 1);
+    assert!(stats.bytes_written > 0);
+    assert_eq!(report.fragments_touched, Some(1));
+    assert!(report.execution.plan.contains("DataSourceExec"));
+    assert_eq!(report.joins.len(), 1);
+    assert!(matches!(
+        report.joins[0].strategy,
+        MergeInsertJoinStrategy::Hash(PartitionMode::CollectLeft)
+    ));
+    assert_eq!(report.joins[0].join_type, JoinType::Left);
+    assert_eq!(ds.version().version, 1);
+    assert_eq!(ds.count_rows(None).await.unwrap(), 64);
 
     let materialized = new_job()
         .analyze_plan_batches(vec![source.clone()])
@@ -1288,7 +1321,10 @@ enum AnalyzedWriteNode {
 #[case::in_place_update(AnalyzedWriteNode::InPlace)]
 #[case::delete_only(AnalyzedWriteNode::DeleteOnly)]
 #[tokio::test]
-async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWriteNode) {
+async fn test_analyze_plan_removes_written_files(
+    #[case] write_node: AnalyzedWriteNode,
+    #[values(false, true)] structured: bool,
+) {
     let tempdir = TempStrDir::default();
     let data = lance_datagen::gen_batch()
         .col("key", array::step::<UInt32Type>())
@@ -1345,7 +1381,23 @@ async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWri
         ),
     };
 
-    let analysis = job.analyze_plan_batches(vec![source]).await.unwrap();
+    let analysis = if structured {
+        let report = job.analyze_plan_report_batches(vec![source]).await.unwrap();
+        assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
+        assert_eq!(report.fragments_touched, Some(2));
+        assert!(report.stats.is_some());
+        assert_eq!(
+            report.write_mode,
+            match write_node {
+                AnalyzedWriteNode::FullSchema => MergeInsertWriteStrategy::RewriteRows,
+                AnalyzedWriteNode::InPlace => MergeInsertWriteStrategy::RewriteColumns,
+                AnalyzedWriteNode::DeleteOnly => MergeInsertWriteStrategy::DeleteOnly,
+            }
+        );
+        report.execution.plan
+    } else {
+        job.analyze_plan_batches(vec![source]).await.unwrap()
+    };
     assert!(
         analysis.trim_start().starts_with(expected_node),
         "expected the {expected_node} write node:\n{analysis}"
@@ -1364,10 +1416,18 @@ async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWri
 /// analyses must not accumulate those objects, and the committed blobs the
 /// target rows still reference must stay readable.
 #[rstest::rstest]
-#[case::packed(65 * 1024)]
-#[case::dedicated(4 * 1024 * 1024 + 1)]
+#[case::packed_text(65 * 1024, false, false)]
+#[case::packed_report(65 * 1024, true, false)]
+#[case::packed_indexed(65 * 1024, true, true)]
+#[case::dedicated_text(4 * 1024 * 1024 + 1, false, false)]
+#[case::dedicated_report(4 * 1024 * 1024 + 1, true, false)]
+#[case::dedicated_indexed(4 * 1024 * 1024 + 1, true, true)]
 #[tokio::test]
-async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: usize) {
+async fn test_analyze_plan_removes_written_blob_payloads(
+    #[case] payload_size: usize,
+    #[case] structured: bool,
+    #[case] indexed: bool,
+) {
     let tempdir = TempStrDir::default();
     let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
         Field::new("id", DataType::Int64, true),
@@ -1399,6 +1459,21 @@ async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: u
         .unwrap(),
     );
     assert_eq!(dataset.get_fragments().len(), 2);
+    let mut dataset = Arc::unwrap_or_clone(dataset);
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let dataset = Arc::new(dataset);
+    let version = dataset.version().version;
     let files_before = list_dataset_files(&tempdir);
     let blobs_dir = std::path::Path::new(tempdir.as_ref() as &str).join("_blobs");
     assert!(
@@ -1413,18 +1488,25 @@ async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: u
         .try_build()
         .unwrap();
     for _ in 0..2 {
-        let analysis = job
-            .analyze_plan_batches(vec![make_batch(vec![0, 2], 2)])
-            .await
-            .unwrap();
+        let batches = vec![make_batch(vec![0, 2], 2)];
+        let analysis = if structured {
+            let report = job.analyze_plan_report_batches(batches).await.unwrap();
+            assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
+            assert_eq!(report.index_used, Some(indexed));
+            report.execution.plan
+        } else {
+            job.analyze_plan_batches(batches).await.unwrap()
+        };
         assert!(
-            analysis.trim_start().starts_with("MergeInsert:"),
+            analysis
+                .trim_start()
+                .starts_with(if indexed { "Subplan " } else { "MergeInsert:" }),
             "expected the full-schema write node:\n{analysis}"
         );
     }
 
     assert_eq!(list_dataset_files(&tempdir), files_before);
-    assert_eq!(dataset.version().version, 1);
+    assert_eq!(dataset.version().version, version);
     for blob in dataset
         .take_blobs_by_indices(&[0, 1], "payload")
         .await
@@ -1435,4 +1517,360 @@ async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: u
             vec![1; payload_size]
         );
     }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_structured_merge_subplans(
+    #[values(false, true)] indexed: bool,
+    #[values(false, true)] streaming: bool,
+) {
+    if run_trace_test_in_child() {
+        return;
+    }
+    let directory = TempStrDir::default();
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("other", array::cycle_utf8_literals(&["a", "b"]))
+        .into_reader_rows(RowCount::from(3), BatchCount::from(2));
+    let mut dataset = Dataset::write(
+        data,
+        &directory,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let dataset = Arc::new(dataset);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let version = dataset.version().version;
+    let files = list_dataset_files(&directory);
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap();
+    let source =
+        record_batch!(("key", UInt32, [1, 1, 4]), ("value", UInt32, [99, 88, 44])).unwrap();
+    let trace_dir = TempStrDir::default();
+    let trace_path = std::path::Path::new(trace_dir.as_ref()).join("analysis.log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+        .with_writer(std::fs::File::create(&trace_path).unwrap())
+        .finish();
+    let report = tracing::instrument::WithSubscriber::with_subscriber(
+        async {
+            if streaming {
+                job.analyze_plan_report(reader_to_stream(Box::new(RecordBatchIterator::new(
+                    [Ok(source.clone())],
+                    source.schema(),
+                ))))
+                .await
+                .unwrap()
+            } else {
+                job.analyze_plan_report_batches(vec![source.clone()])
+                    .await
+                    .unwrap()
+            }
+        },
+        subscriber,
+    )
+    .await;
+    let trace = std::fs::read_to_string(trace_path).unwrap();
+    assert!(trace.contains(&format!("operation_id={}", report.operation_id)));
+    assert!(trace.lines().any(|line| {
+        line.contains("merge_analysis_subplan")
+            && line.contains(&format!("operation_id={}", report.operation_id))
+    }));
+    assert_eq!(
+        report.execution.outcome,
+        ExecutionOutcome::Complete,
+        "{:?}",
+        report.execution.error
+    );
+    assert_eq!(report.index_used, Some(indexed));
+    assert_eq!(report.join_index_segments, Some(usize::from(indexed)));
+    assert_eq!(report.stats.as_ref().unwrap().num_updated_rows, 2);
+    assert_eq!(report.stats.as_ref().unwrap().num_skipped_duplicates, 1);
+    assert!(report.stats.as_ref().unwrap().bytes_written > 0);
+    assert_eq!(report.fragments_touched, Some(2));
+    assert!(report.replay_spills.bytes_written > 0);
+    assert!(report.replay_spills.bytes_read > 0);
+    assert!(report.scratch_spills.is_none());
+    assert!(report.join_duration.is_some());
+    assert_eq!(
+        report.mapped_target_rows,
+        if indexed { Some(2) } else { None }
+    );
+    assert!(
+        report
+            .subplans
+            .iter()
+            .any(|plan| plan.purpose == "fragment_update_sort")
+    );
+    let mut ids = report
+        .subplans
+        .iter()
+        .map(|plan| plan.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), report.subplans.len());
+    let counted: usize = report
+        .subplans
+        .iter()
+        .map(|plan| plan.execution.summary.spilled_bytes().unwrap_or(0))
+        .sum();
+    assert_eq!(
+        report.operator_spills.bytes_written,
+        report.execution.summary.spilled_bytes().unwrap_or(0) + counted
+    );
+    let wire = crate::pb::MergeAnalysisReport::decode(report.to_bytes().as_slice()).unwrap();
+    assert_eq!(wire.join_index_segments, Some(u64::from(indexed)));
+    assert_eq!(wire.scratch_spills, None);
+    assert_eq!(wire.subplans.len(), report.subplans.len());
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    assert_eq!(list_dataset_files(&directory), files);
+    let (updated, stats) = job.execute_batches(vec![source]).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let result = updated
+        .scan()
+        .filter("key = 1")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(result["value"].as_primitive::<UInt32Type>().value(0), 99);
+}
+
+#[tokio::test]
+async fn test_structured_merge_replay_quota_failure() {
+    if run_trace_test_in_child() {
+        return;
+    }
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("other", array::step::<UInt32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+    let dataset = Arc::new(
+        Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let mut job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap();
+    // The source must omit a non-key column to use column rewriting.
+    let data = record_batch!(("key", UInt32, [1]), ("value", UInt32, [10])).unwrap();
+    job.spill_execution_options.max_temp_directory_size = Some(1);
+    let trace_dir = TempStrDir::default();
+    let trace_path = std::path::Path::new(trace_dir.as_ref()).join("failed-analysis.log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+        .with_writer(std::fs::File::create(&trace_path).unwrap())
+        .finish();
+    let report = tracing::instrument::WithSubscriber::with_subscriber(
+        job.analyze_plan_report_batches(vec![data]),
+        subscriber,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.execution.outcome, ExecutionOutcome::Failed);
+    assert!(
+        std::fs::read_to_string(trace_path)
+            .unwrap()
+            .contains(&format!("operation_id={}", report.operation_id))
+    );
+    assert!(report.execution.error.as_ref().unwrap().contains("limit"));
+    assert!(report.stats.is_none());
+    assert!(report.fragments_touched.is_none());
+    assert!(report.replay_spills.spill_count > 0);
+    assert_eq!(dataset.version().version, 1);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+}
+
+// Other tests install global subscribers and change tracing callsite interest.
+// Run each capture assertion in a fresh process without weakening its checks.
+fn run_trace_test_in_child() -> bool {
+    if std::env::var_os("LANCE_MERGE_TRACE_TEST_CHILD").is_some() {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            std::thread::current().name().unwrap(),
+            "--nocapture",
+        ])
+        .env("LANCE_MERGE_TRACE_TEST_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated trace test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+#[tokio::test]
+async fn test_concurrent_merge_analysis_scopes() {
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("other", array::step::<UInt32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+    let dataset = Arc::new(
+        Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_owned()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap();
+    let source = record_batch!(("key", UInt32, [1, 3]), ("value", UInt32, [99, 44])).unwrap();
+    let baseline = job
+        .analyze_plan_report_batches(vec![source.clone()])
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        job.analyze_plan_report_batches(vec![source.clone()]),
+        job.analyze_plan_report_batches(vec![source])
+    );
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_ne!(first.operation_id, second.operation_id);
+    for report in [first, second] {
+        assert_eq!(report.execution.outcome, ExecutionOutcome::Complete);
+        assert_eq!(
+            report.replay_spills.bytes_written,
+            baseline.replay_spills.bytes_written
+        );
+        assert_eq!(
+            report.replay_spills.spill_count,
+            baseline.replay_spills.spill_count
+        );
+        assert_eq!(report.stats.unwrap().num_updated_rows, 2);
+        assert!(report.execution.pool_peak_reserved_bytes.is_some());
+    }
+    assert_eq!(dataset.version().version, 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn test_structured_analysis_failure_after_writing() {
+    #[derive(Debug, Default)]
+    struct FailAfterFile {
+        completed: AtomicU32,
+    }
+    #[async_trait::async_trait]
+    impl crate::dataset::progress::WriteFragmentProgress for FailAfterFile {
+        async fn begin(&self, _: &Fragment) -> Result<()> {
+            if self.completed.load(Ordering::Relaxed) > 0 {
+                Err(Error::io("analysis second-file failure"))
+            } else {
+                Ok(())
+            }
+        }
+        async fn complete(&self, _: &Fragment) -> Result<()> {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let directory = TempStrDir::default();
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+    let dataset = Arc::new(
+        Dataset::write(
+            data,
+            &directory,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let files = list_dataset_files(&directory);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let progress = Arc::new(FailAfterFile::default());
+    let params = WriteParams {
+        max_rows_per_file: 1,
+        max_rows_per_group: 1,
+        progress: progress.clone(),
+        ..Default::default()
+    };
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_owned()])
+        .unwrap()
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .with_params(&params)
+        .try_build()
+        .unwrap();
+    let source = record_batch!(
+        ("key", UInt32, [100, 101, 102]),
+        ("value", UInt32, [1, 2, 3])
+    )
+    .unwrap();
+    let report = job.analyze_plan_report_batches(vec![source]).await.unwrap();
+    assert_eq!(progress.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(report.execution.outcome, ExecutionOutcome::Failed);
+    assert!(
+        report
+            .execution
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("analysis second-file failure")
+    );
+    assert!(report.stats.is_none());
+    assert_eq!(list_dataset_files(&directory), files);
+    assert_eq!(dataset.version().version, 1);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
 }

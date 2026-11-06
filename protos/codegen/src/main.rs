@@ -208,6 +208,7 @@ fn generate_lance(
             proto_dir.join("ann.proto"),
             proto_dir.join("fts.proto"),
             proto_dir.join("cache_diagnostics.proto"),
+            proto_dir.join("merge_analysis.proto"),
         ],
         &[&proto_dir],
     )?;
