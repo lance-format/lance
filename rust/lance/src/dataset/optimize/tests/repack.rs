@@ -214,16 +214,28 @@ async fn repack_keeps_scalar_index() {
     dataset.validate().await.unwrap();
 }
 
-/// An index built before a repack and committed after it keeps its coverage,
-/// since the repack only moved the values the index read. When a version
-/// before the repack has been cleaned up, it may have changed those values, so
-/// the coverage of the files the repack wrote is withdrawn.
+/// What happens to `d` on fragment 0 before the repack, behind a CreateIndex
+/// built at the version `write_backfilled` leaves.
+#[derive(Debug)]
+enum BeforeTheRepack {
+    Nothing,
+    /// An in-place update whose version is then cleaned up.
+    CleanedUpUpdate,
+    /// A `Merge` that points `d` at a new file holding a new value.
+    InPlaceMerge,
+}
+
+/// An index built before a repack and committed after it keeps its coverage
+/// of the repacked fragments, since the repack only moved the values the
+/// index read. A change to those values before the repack that the rebase
+/// cannot see withdraws it, and so does any `Merge` in between.
 #[rstest]
-#[case::complete_history(false, vec![0, 1], "d = 6")]
-#[case::update_cleaned_up(true, vec![], "d = 100")]
+#[case::nothing(BeforeTheRepack::Nothing, vec![0, 1], "d = 6")]
+#[case::cleaned_up_update(BeforeTheRepack::CleanedUpUpdate, vec![], "d = 100")]
+#[case::in_place_merge(BeforeTheRepack::InPlaceMerge, vec![], "d = 100")]
 #[tokio::test]
 async fn index_built_across_a_repack(
-    #[case] update_cleaned_up: bool,
+    #[case] before: BeforeTheRepack,
     #[case] coverage: Vec<u32>,
     #[case] filter: &str,
 ) {
@@ -250,26 +262,55 @@ async fn index_built_across_a_repack(
     );
 
     let mut latest = stale.clone();
-    if update_cleaned_up {
-        write_new_value_of_d(&mut latest, NewValueOfD::InPlaceUpdate).await;
+    match before {
+        BeforeTheRepack::Nothing => {}
+        BeforeTheRepack::CleanedUpUpdate => {
+            write_new_value_of_d(&mut latest, NewValueOfD::InPlaceUpdate).await;
+        }
+        BeforeTheRepack::InPlaceMerge => {
+            // Fragment 0 holds a = 0..4, so d = a + 1 = [1, 2, 3, 4].
+            let schema = latest.schema().project(&["d"]).unwrap();
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::from(&schema)),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 100, 4]))],
+            )
+            .unwrap();
+            let crate::dataset::transaction::DataReplacementGroup(_, new_file) = latest
+                .get_fragment(0)
+                .unwrap()
+                .write_columns(futures::stream::iter([Ok(batch)]), &schema)
+                .await
+                .unwrap();
+            let mut fragments = latest.fragments().as_ref().clone();
+            let file = fragments[0]
+                .files
+                .iter_mut()
+                .find(|file| file.fields == new_file.fields)
+                .unwrap();
+            *file = new_file;
+            latest = CommitBuilder::new(Arc::new(latest.clone()))
+                .execute(Transaction::new(
+                    latest.manifest.version,
+                    Operation::Merge {
+                        fragments,
+                        schema: latest.schema().clone(),
+                        preserves_nullability: true,
+                    },
+                    None,
+                ))
+                .await
+                .unwrap();
+        }
     }
-    let updated = latest.manifest.version;
+    let changed = latest.manifest.version;
     compact_files(&mut latest, repack_options(Some(1)), None)
         .await
         .unwrap();
-    if update_cleaned_up {
-        let latest = CommitBuilder::new(Arc::new(latest.clone()))
-            .execute(Transaction::new(
-                latest.manifest.version,
-                Operation::ReserveFragments { num_fragments: 1 },
-                None,
-            ))
-            .await
-            .unwrap();
+    if matches!(before, BeforeTheRepack::CleanedUpUpdate) {
         latest
             .cleanup(
                 CleanupPolicyBuilder::default()
-                    .versions(vec![stale.manifest.version, updated])
+                    .versions(vec![stale.manifest.version, changed])
                     .unwrap()
                     .build(),
             )

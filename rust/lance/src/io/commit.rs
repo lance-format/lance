@@ -1880,7 +1880,8 @@ pub(crate) async fn commit_transaction(
                 .filter(|version| !seen.contains(version))
                 .collect::<Vec<_>>();
             rebase.check_missing_versions(&missing, dataset.manifest.version)?;
-            // A retry checks only the versions since its previous attempt.
+            // A retry's window starts after its previous attempt, so it would
+            // miss the moves recorded there; not tracking only costs coverage.
             if checked_since == read_version && missing.is_empty() {
                 rebase.track_moved_files();
             }

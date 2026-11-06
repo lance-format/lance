@@ -90,10 +90,12 @@ pub struct TransactionRebase<'a> {
 struct ReadFragments {
     fragments: Arc<Vec<Fragment>>,
     /// The paths of the files `data_change: false` replacements wrote since
-    /// the read version, by fragment id. Such a file holds the values the
-    /// index read unless a change the checks did not see came first, so this
-    /// is `None` unless [`TransactionRebase::track_moved_files`] was called,
-    /// and again once a `Merge` is checked.
+    /// the read version, by fragment id. The finish keeps coverage of a field
+    /// whose current file is one of these: a change checked before the move
+    /// already withdrew it in its own arm, and
+    /// [`TransactionRebase::track_moved_files`] is called only when no change
+    /// went unchecked. `None` when not tracking, and once a `Merge` is
+    /// checked, since only the finish catches its in-place rewrites.
     moved_files: Option<HashMap<u64, HashSet<String>>>,
 }
 
