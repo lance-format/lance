@@ -15,8 +15,7 @@
 use crate::pbold;
 use crate::scalar::expression::{SargableQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::seed::IndexSeedWriter;
 use crate::scalar::{
@@ -26,8 +25,8 @@ use crate::scalar::{
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::Remapper;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
@@ -42,7 +41,6 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
-use crate::scalar::RowIdRemapper;
 use crate::{Index, IndexType};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -2126,29 +2124,6 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 }
 
 #[async_trait]
-impl RemappingIndexLoader for ZoneMapIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let use_seeds = index_details
-            .to_msg::<pbold::ZoneMapIndexDetails>()
-            .ok()
-            .and_then(|d| d.use_seeds)
-            .unwrap_or(false);
-        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
-        Ok(
-            ZoneMapIndex::load(index_store, remapper, cache, use_seeds, version).await?
-                as Arc<dyn ScalarIndex>,
-        )
-    }
-}
-
-#[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(false)
@@ -2194,21 +2169,23 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
+        let use_seeds = index_details
+            .to_msg::<pbold::ZoneMapIndexDetails>()
+            .ok()
+            .and_then(|d| d.use_seeds)
+            .unwrap_or(false);
+        let version = ZoneMapIndexVersion::from_metadata(index_version)?;
+        Ok(
+            ZoneMapIndex::load(index_store, remapper, cache, use_seeds, version).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     fn might_use_seeds(&self, index_details: &prost_types::Any) -> bool {

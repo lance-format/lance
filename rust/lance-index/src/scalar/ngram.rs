@@ -4,7 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper, translate_treemap};
+use lance_index_core::remapping::{Remapper, translate_treemap};
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -24,8 +24,8 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, RemappingIndexLoader, ScalarIndexPlugin,
-    TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -1906,37 +1906,16 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
-        )
-        .await
-    }
-
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
-    }
-}
-
-#[async_trait]
-impl RemappingIndexLoader for NGramIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         _index_version: u32,
         remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(NGramIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 }
 

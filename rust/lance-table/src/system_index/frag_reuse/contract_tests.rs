@@ -54,12 +54,6 @@ fn record_natively(
 fn empty_round_trips(#[case] format: HistoryFormat) {
     let empty = FragReuseHistory::empty(format);
     assert_eq!(empty.format(), format);
-    // Only a version 0 history has a remap plugins without a remapping
-    // loader can apply.
-    assert_eq!(
-        empty.legacy_compact_index().is_some(),
-        format == HistoryFormat::Legacy
-    );
     assert!(empty.content().is_empty());
     assert!(empty.ledger().transitions().is_empty());
     assert!(empty.fragment_bitmap().is_empty());
@@ -120,16 +114,6 @@ fn validate_refuses_what_repair_repairs(
                 repaired,
                 FragReuseHistory::from_legacy_versions(vec![first]).unwrap()
             );
-            // The synchronous remap handed to plugins without a remapping
-            // loader is built from the repaired history too.
-            let compact = repaired.legacy_compact_index().unwrap().unwrap();
-            let kept: Vec<u64> = compact
-                .details
-                .versions
-                .iter()
-                .map(|version| version.dataset_version)
-                .collect();
-            assert_eq!(kept, vec![1]);
         }
         None => {
             let error = raw.repair().unwrap_err();

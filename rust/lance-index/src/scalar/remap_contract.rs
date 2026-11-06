@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! The contract every scalar index that translates row addresses upholds,
-//! run against each one: loaded through its
-//! [`RemappingIndexLoader`](super::registry::RemappingIndexLoader) with a
-//! scripted [`Remapper`], it answers with the rows' current addresses, never
+//! run against each one: loaded through
+//! [`ScalarIndexPlugin::load_index`](super::registry::ScalarIndexPlugin::load_index)
+//! with a scripted [`Remapper`], it answers with the rows' current addresses, never
 //! with a stale one, and translates in batches.
 //!
 //! The script stands in for a fragment reuse history, so no history is
@@ -256,18 +256,17 @@ fn json() -> Case {
     }
 }
 
-/// An index of `case`'s kind over [`rows`], loaded through its remapping
-/// loader with `remapper`.
+/// An index of `case`'s kind over [`rows`], loaded through its plugin with
+/// `remapper`.
 async fn load(
     case: &Case,
     store_dir: &TempObjDir,
     remapper: Option<Remapper>,
 ) -> Arc<dyn ScalarIndex> {
     let (store, created) = train(case, store_dir).await;
+    assert!(case.plugin.translates_row_addrs());
     case.plugin
-        .remapping_loader()
-        .expect("translates row addresses")
-        .load_remapped(
+        .load_index(
             store,
             &created.index_details,
             created.index_version,
@@ -435,10 +434,7 @@ async fn answers_with_built_addresses_without_a_remapper(#[case] case: Case) {
 async fn warm_open_answers_with_current_addresses(#[case] case: Case) {
     let store_dir = TempObjDir::default();
     let (store, created) = train(&case, &store_dir).await;
-    let loader = case
-        .plugin
-        .remapping_loader()
-        .expect("translates row addresses");
+    let loader = &case.plugin;
     let cache = LanceCache::with_capacity(64 * 1024 * 1024);
     let loads = AtomicUsize::new(0);
     let open = |remapper: Remapper| {
@@ -452,7 +448,7 @@ async fn warm_open_answers_with_current_addresses(#[case] case: Case) {
             async move {
                 loads.fetch_add(1, Ordering::SeqCst);
                 loader
-                    .load_remapped(
+                    .load_index(
                         store,
                         &created.index_details,
                         created.index_version,
@@ -462,7 +458,7 @@ async fn warm_open_answers_with_current_addresses(#[case] case: Case) {
                     .await
             }
         });
-        loader.get_or_insert_remapped_in_cache(store, Some(remapper), cache, load)
+        loader.get_or_insert_in_cache(store, Some(remapper), cache, load)
     };
 
     let (remapper, _) = script().into_remapper();

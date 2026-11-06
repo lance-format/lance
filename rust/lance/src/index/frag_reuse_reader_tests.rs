@@ -1087,10 +1087,14 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
                 uuid,
                 super::super::frag_reuse::v0_cache_identity(dataset, fri)
             );
-            let remapper = remapping
-                .legacy_row_id_remapper()
-                .unwrap()
-                .expect("a version 0 history hands loaders the synchronous remapper");
+            let resolved = Some((uuid, remapping));
+            let Some(remapper) =
+                super::super::frag_reuse::segment_remapper(dataset, index, &resolved)
+                    .await
+                    .unwrap()
+            else {
+                continue;
+            };
             let legacy = dataset
                 .open_frag_reuse_index(&NoOpMetricsCollector)
                 .await
@@ -1099,14 +1103,19 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
             for version in &legacy.details.versions {
                 for group in &version.groups {
                     for source in &group.old_frags {
-                        for offset in 0..source.physical_rows {
-                            let address =
-                                RowAddress::new_from_parts(source.id as u32, offset as u32).into();
-                            assert_eq!(
-                                remapper.remap_row_id(address),
-                                legacy.remap_row_id(address)
-                            );
-                        }
+                        let addresses: Vec<u64> = (0..source.physical_rows)
+                            .map(|offset| {
+                                RowAddress::new_from_parts(source.id as u32, offset as u32).into()
+                            })
+                            .collect();
+                        let mut translated: Vec<Option<u64>> =
+                            addresses.iter().copied().map(Some).collect();
+                        remapper.translate_in_place(&mut translated).await.unwrap();
+                        let expected: Vec<Option<u64>> = addresses
+                            .iter()
+                            .map(|&address| legacy.remap_row_id(address))
+                            .collect();
+                        assert_eq!(translated, expected);
                     }
                 }
             }
@@ -1115,147 +1124,6 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         }
     }
     fri.cloned()
-}
-
-/// A stored version 0 history an older writer left invalid is read repaired
-/// on every path: the synchronous remapper a plugin without a remapping
-/// loader is handed answers exactly as the remapper a built-in index binds,
-/// not as the stored details would.
-#[tokio::test]
-async fn legacy_synchronous_remapper_reads_the_repaired_history() {
-    use crate::dataset::optimize::{CompactionOptions, compact_files};
-    use crate::dataset::transaction::{Operation, Transaction};
-    use lance_core::utils::address::RowAddress;
-    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseIndexDetails};
-
-    let mut dataset = lance_datagen::gen_batch()
-        .col("i", lance_datagen::array::step::<Int32Type>())
-        .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(10))
-        .await
-        .unwrap();
-    dataset
-        .create_index(
-            &["i"],
-            IndexType::Scalar,
-            None,
-            &ScalarIndexParams::default(),
-            false,
-        )
-        .await
-        .unwrap();
-    compact_files(
-        &mut dataset,
-        CompactionOptions {
-            target_rows_per_fragment: 20,
-            defer_index_remap: true,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-    let produced = dataset.fragments()[0].id;
-    assert_eq!(dataset.fragments()[0].physical_rows, Some(20));
-
-    // Plant a version that reads half of a fragment the first one produced
-    // with 20 rows: it does not fit the lineage, so decoding drops it, but
-    // the compact remap of the stored details applies it.
-    let entry = dataset
-        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut versions = crate::index::frag_reuse::load_frag_reuse_index_details(&dataset, &entry)
-        .await
-        .unwrap()
-        .versions
-        .clone();
-    let digest = |id: u64| FragDigest {
-        id,
-        physical_rows: 10,
-        num_deleted_rows: 0,
-    };
-    let mut rows = roaring::RoaringTreemap::new();
-    rows.insert_range(
-        u64::from(RowAddress::new_from_parts(produced as u32, 0))
-            ..u64::from(RowAddress::new_from_parts(produced as u32, 10)),
-    );
-    let mut changed_row_addrs = Vec::new();
-    rows.serialize_into(&mut changed_row_addrs).unwrap();
-    versions.push(lance_index::frag_reuse::FragReuseVersion {
-        dataset_version: dataset.manifest.version,
-        groups: vec![FragReuseGroup {
-            changed_row_addrs,
-            old_frags: vec![digest(produced)],
-            new_frags: vec![digest(100)],
-        }],
-    });
-    let details = FragReuseIndexDetails { versions };
-    let bitmap = details.new_frag_bitmap();
-    let planted = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, bitmap)
-        .await
-        .unwrap();
-    dataset
-        .apply_commit(
-            Transaction::new(
-                dataset.manifest.version,
-                Operation::CreateIndex {
-                    new_indices: vec![planted],
-                    removed_indices: vec![entry],
-                },
-                None,
-            ),
-            &Default::default(),
-            &Default::default(),
-        )
-        .await
-        .unwrap();
-
-    let segment = dataset
-        .load_indices_by_name("i_idx")
-        .await
-        .unwrap()
-        .remove(0);
-    let (_, resolved) = crate::index::frag_reuse::open_row_id_remapping(&dataset, &segment)
-        .await
-        .unwrap()
-        .unwrap();
-    let synchronous = resolved.legacy_row_id_remapper().unwrap().unwrap();
-    let bound = crate::index::frag_reuse::segment_remapper(
-        &dataset,
-        &segment,
-        &Some((Uuid::nil(), resolved)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let stored = dataset
-        .open_frag_reuse_index(&NoOpMetricsCollector)
-        .await
-        .unwrap()
-        .unwrap();
-
-    let addresses: Vec<u64> = (0..4)
-        .chain([produced as u32])
-        .flat_map(|fragment| {
-            (0..10).map(move |offset| RowAddress::new_from_parts(fragment, offset).into())
-        })
-        .collect();
-    let mut translated: Vec<Option<u64>> = addresses.iter().copied().map(Some).collect();
-    bound.translate_in_place(&mut translated).await.unwrap();
-    let synchronous: Vec<Option<u64>> = addresses
-        .iter()
-        .map(|&address| synchronous.remap_row_id(address))
-        .collect();
-    assert_eq!(synchronous, translated);
-    let unrepaired: Vec<Option<u64>> = addresses
-        .iter()
-        .map(|&address| stored.remap_row_id(address))
-        .collect();
-    assert_ne!(
-        synchronous, unrepaired,
-        "the planted version must change the stored remap"
-    );
 }
 
 // Exercise external history with the exact InlineContent bytes emitted by

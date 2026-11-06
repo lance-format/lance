@@ -16,7 +16,6 @@ pub(crate) mod ngram;
 pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
-use super::frag_reuse::ResolvedRemapping;
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
@@ -897,33 +896,17 @@ pub(crate) async fn open_scalar_index_with_plan(
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
-    let remapping_loader = plugin.remapping_loader();
-    let (remapper, frag_reuse_index) = match remapping_loader {
-        Some(_) => (
-            super::frag_reuse::segment_remapper(dataset, index, &resolved).await?,
-            None,
-        ),
-        // A plugin without a remapping loader cannot translate, so its
-        // segments that need translation are left out of query listings
-        // under every history format. Opened anyway under a version 0 index,
-        // its deprecated loader is handed the legacy remapper, as before; a
-        // tagged history has no remapper such a plugin can apply.
-        None => match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(remapping @ ResolvedRemapping::V0 { .. }) => {
-                (None, remapping.legacy_row_id_remapper()?)
-            }
-            Some(ResolvedRemapping::V1Identity) | None => (None, None),
-            Some(ResolvedRemapping::V1Translate { .. }) => {
-                return Err(Error::not_supported(format!(
-                    "segment {index_uuid} of index `{}` needs its row addresses translated \
-                     through the fragment reuse history, and its {} plugin does not \
-                     implement a remapping loader",
-                    index.name,
-                    plugin.name()
-                )));
-            }
-        },
-    };
+    let remapper = super::frag_reuse::segment_remapper(dataset, index, &resolved).await?;
+    // Query listings leave out the segments a plugin cannot translate; one
+    // opened by uuid anyway is refused rather than read with stale addresses.
+    if remapper.is_some() && !plugin.translates_row_addrs() {
+        return Err(Error::not_supported(format!(
+            "segment {index_uuid} of index `{}` needs its row addresses translated \
+             through the fragment reuse history, and its {} plugin does not translate them",
+            index.name,
+            plugin.name()
+        )));
+    }
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -931,7 +914,6 @@ pub(crate) async fn open_scalar_index_with_plan(
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
         let remapper = remapper.clone();
-        let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
         async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
@@ -946,30 +928,15 @@ pub(crate) async fn open_scalar_index_with_plan(
 
             let index_version = u32::try_from(index.index_version).unwrap_or(0);
 
-            let index = match remapping_loader {
-                Some(loader) => {
-                    loader
-                        .load_remapped(
-                            index_store,
-                            &index_details,
-                            index_version,
-                            remapper,
-                            &index_cache,
-                        )
-                        .await?
-                }
-                None => {
-                    plugin
-                        .load_index(
-                            index_store,
-                            &index_details,
-                            index_version,
-                            frag_reuse_index,
-                            &index_cache,
-                        )
-                        .await?
-                }
-            };
+            let index = plugin
+                .load_index(
+                    index_store,
+                    &index_details,
+                    index_version,
+                    remapper,
+                    &index_cache,
+                )
+                .await?;
 
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();
@@ -977,18 +944,9 @@ pub(crate) async fn open_scalar_index_with_plan(
         }
     });
 
-    match remapping_loader {
-        Some(loader) => {
-            loader
-                .get_or_insert_remapped_in_cache(index_store, remapper, &index_cache, load)
-                .await
-        }
-        None => {
-            plugin
-                .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-                .await
-        }
-    }
+    plugin
+        .get_or_insert_in_cache(index_store, remapper, &index_cache, load)
+        .await
 }
 
 pub(crate) async fn cached_scalar_index_container(

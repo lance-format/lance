@@ -10,7 +10,7 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
 use std::sync::Arc;
 
-use crate::scalar::registry::{RemappingIndexLoader, ScalarIndexPlugin};
+use crate::scalar::registry::ScalarIndexPlugin;
 use crate::scalar::zoned::ZoneBound;
 use crate::scalar::zonemap::{
     CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
@@ -35,8 +35,9 @@ use lance_core::{
 use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::ArrayGeneratorExt;
 use lance_datagen::{BatchCount, RowCount, array};
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
+use lance_index_core::remapping::Remapper;
 use lance_io::object_store::ObjectStore;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::ops::Bound;
 
@@ -45,7 +46,7 @@ use crate::scalar::CreatedIndex;
 use crate::scalar::seed::IndexSeedWriter;
 use crate::scalar::zoned::ZoneProcessor;
 use crate::scalar::{
-    RowIdRemapper, SargableQuery, ScalarIndex, SearchResult,
+    SargableQuery, ScalarIndex, SearchResult,
     lance_format::LanceIndexStore,
     zonemap::{
         HarvestedZoneSeed, ReusedZones, SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY,
@@ -160,40 +161,30 @@ impl TestRemapper {
     }
 
     fn into_remapper(self) -> Remapper {
-        Remapper::from_backing(Arc::new(DeprecatedRemapper(Arc::new(self))))
+        Remapper::from_backing(Arc::new(self))
     }
 }
 
 fn remapping(remapper: Arc<TestRemapper>) -> Option<Remapper> {
-    DeprecatedRemapper::sync(Some(remapper))
+    Some(Remapper::from_backing(remapper))
 }
 
-impl RowIdRemapper for TestRemapper {
-    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        self.mappings.get(&row_id).copied()
+/// Every fragment needs translation and fragment bitmaps pass through
+/// unchanged; an address without a mapping was deleted.
+impl RemapperBacking for TestRemapper {
+    fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+        true
     }
 
-    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
-        self.mappings
-            .iter()
-            .filter(|(old, _)| row_addrs.contains(**old))
-            .map(|(_, new)| *new)
-            .collect()
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        fragments.clone()
     }
 
-    fn remap_row_ids_roaring_tree_map(
-        &self,
-        _row_ids: &roaring::RoaringTreemap,
-    ) -> roaring::RoaringTreemap {
-        unreachable!()
-    }
-
-    fn remap_row_ids_record_batch(
-        &self,
-        _batch: RecordBatch,
-        _row_id_idx: usize,
-    ) -> lance_core::Result<RecordBatch> {
-        unreachable!()
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        for slot in addrs.iter_mut() {
+            *slot = slot.and_then(|addr| self.mappings.get(&addr).copied());
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -5495,17 +5486,6 @@ async fn test_unsupported_index_version_is_refused() {
     let details = make_zone_map_index_details(2, false, true);
     let err = ZoneMapIndexPlugin
         .load_index(
-            index.store.clone(),
-            &details,
-            2,
-            None,
-            &LanceCache::no_cache(),
-        )
-        .await
-        .unwrap_err();
-    assert!(matches!(err, Error::NotSupported { .. }), "{err}");
-    let err = ZoneMapIndexPlugin
-        .load_remapped(
             index.store.clone(),
             &details,
             2,

@@ -18,9 +18,8 @@ use lance_core::{
 
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
-use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
-use lance_index_core::remapping::{BatchRowIdRemapper, Remapper};
+use lance_index_core::remapping::Remapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -202,90 +201,100 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// older segment correctly instead of reinterpreting it under the newest
     /// format.
     ///
-    /// `frag_reuse_index` is deprecated: a plugin that translates row
-    /// addresses implements [`remapping_loader`](Self::remapping_loader)
-    /// instead, and Lance then opens its segments through that loader, not
-    /// this method. Lance passes `Some` here only to a plugin without a
-    /// remapping loader, for a segment opened while the table has a version
-    /// 0 fragment reuse index. Query listings keep such a segment only when
-    /// the history moves none of its rows (it was built after every rewrite
-    /// it covers); `DatasetIndexInternalExt::open_scalar_index` opens one by
-    /// uuid whether listed or not. The parameter stays in the signature so
-    /// existing plugins compile.
+    /// `remapper` is `None` when the segment's addresses are current. A
+    /// rewrite (compaction) recorded in a fragment reuse history moves rows
+    /// without rebuilding the indices over them; a segment built before it
+    /// still stores the old addresses, and Lance hands it a [`Remapper`]
+    /// that translates them into the addresses the rows have now. Lance
+    /// does so only when [`translates_row_addrs`](Self::translates_row_addrs)
+    /// is `true`. The remapper translates asynchronously and in batches:
+    /// translate the addresses at hand together (a page, a posting list, a
+    /// search result) rather than one at a time, and use
+    /// [`Remapper::fragment_needs_translation`] to skip fragments it leaves
+    /// unchanged.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use async_trait::async_trait;
+    /// # use lance_core::{Result, cache::LanceCache};
+    /// # use lance_index::scalar::{IndexStore, Remapper, ScalarIndex};
+    /// # use lance_index::scalar::expression::ScalarQueryParser;
+    /// # use lance_index::scalar::registry::ScalarIndexPlugin;
+    /// #[derive(Debug)]
+    /// struct AddressListPlugin;
+    ///
+    /// impl AddressListPlugin {
+    ///     /// Reads the row addresses the segment stores.
+    ///     async fn read_addresses(&self, store: &dyn IndexStore) -> Result<Vec<u64>> {
+    ///         // ...
+    /// #       unimplemented!()
+    ///     }
+    ///
+    ///     /// Builds the in-memory index over row addresses that are current.
+    ///     fn open(
+    ///         &self,
+    ///         store: Arc<dyn IndexStore>,
+    ///         addresses: Vec<u64>,
+    ///     ) -> Result<Arc<dyn ScalarIndex>> {
+    ///         // ...
+    /// #       unimplemented!()
+    ///     }
+    /// }
+    ///
+    /// #[async_trait]
+    /// impl ScalarIndexPlugin for AddressListPlugin {
+    ///     fn translates_row_addrs(&self) -> bool {
+    ///         true
+    ///     }
+    ///
+    ///     async fn load_index(
+    ///         &self,
+    ///         index_store: Arc<dyn IndexStore>,
+    ///         _index_details: &prost_types::Any,
+    ///         _index_version: u32,
+    ///         remapper: Option<Remapper>,
+    ///         _cache: &LanceCache,
+    ///     ) -> Result<Arc<dyn ScalarIndex>> {
+    ///         let stored = self.read_addresses(index_store.as_ref()).await?;
+    ///         let addresses = match remapper {
+    ///             None => stored,
+    ///             Some(remapper) => {
+    ///                 let mut addresses: Vec<Option<u64>> =
+    ///                     stored.into_iter().map(Some).collect();
+    ///                 // One batch for every address at hand; a row the rewrite
+    ///                 // deleted translates to `None`.
+    ///                 remapper.translate_in_place(&mut addresses).await?;
+    ///                 addresses.into_iter().flatten().collect()
+    ///             }
+    ///         };
+    ///         self.open(index_store, addresses)
+    ///     }
+    ///
+    ///     // ...
+    /// #   fn name(&self) -> &str { "AddressList" }
+    /// #   fn provides_exact_answer(&self) -> bool { true }
+    /// #   fn version(&self) -> u32 { 0 }
+    /// #   fn new_query_parser(&self, _: String, _: &prost_types::Any)
+    /// #       -> Option<Box<dyn ScalarQueryParser>> { None }
+    /// }
+    /// ```
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
-    /// This plugin's loader for segments whose rows a rewrite may have moved,
-    /// if it can translate them.
+    /// Whether [`load_index`](Self::load_index) applies the [`Remapper`] it
+    /// is handed.
     ///
-    /// A fragment reuse history lets a rewrite (compaction) move rows without
-    /// rebuilding the indices over them. A segment built before such a
-    /// rewrite still stores the old row addresses, and is read through a
-    /// [`Remapper`] that translates them. Implementing
-    /// [`RemappingIndexLoader`] declares that this plugin applies one; a
-    /// plugin that returns `None` (the default) cannot, so a segment of it
-    /// that needs translation is left out of query listings under every
-    /// fragment reuse history format, and its rows are scanned instead.
-    ///
-    /// Lance opens every segment of a plugin with a remapping loader through
-    /// it, caching with
-    /// [`RemappingIndexLoader::get_or_insert_remapped_in_cache`]; this
-    /// trait's cache hooks then serve only direct callers. See
-    /// [`RemappingIndexLoader`] for an example.
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        None
-    }
-
-    /// Whether this plugin can await batch row-ID translation while loading its data.
-    ///
-    /// Returning `true` requires overriding
-    /// [`load_index_with_remapping`](Self::load_index_with_remapping).
-    #[deprecated(
-        since = "15.0.0",
-        note = "implement `remapping_loader` instead; Lance no longer loads through \
-                `load_index_with_remapping`"
-    )]
-    fn supports_batch_row_id_remapping(&self) -> bool {
+    /// A plugin that returns `false` (the default) is never handed one: its
+    /// segments whose rows a rewrite moved are left out of query listings,
+    /// and their rows are scanned instead.
+    fn translates_row_addrs(&self) -> bool {
         false
-    }
-
-    /// Load under a mapping whose payload may require asynchronous reads.
-    ///
-    /// This entry point is additive; the legacy [`load_index`](Self::load_index)
-    /// path never routes through it.
-    #[deprecated(
-        since = "15.0.0",
-        note = "implement `remapping_loader`; `RemappingIndexLoader::load_remapped` \
-                translates through a `Remapper`"
-    )]
-    #[allow(deprecated)]
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        if remapping.is_some() {
-            debug_assert!(
-                !self.supports_batch_row_id_remapping(),
-                "{} advertises batch row-ID remapping but does not override load_index_with_remapping",
-                self.name()
-            );
-            return Err(lance_core::Error::not_supported(format!(
-                "{} does not support asynchronous row-ID remapping",
-                self.name()
-            )));
-        }
-        self.load_index(index_store, index_details, index_version, None, cache)
-            .await
     }
 
     /// Look up a previously-opened index in the cache.
@@ -297,13 +306,13 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Plugins whose index has a serializable representation should override this
     /// (together with [`put_in_cache`](Self::put_in_cache)) to store that
     /// representation under a sized [`CacheKey`] with
-    /// a codec, and reconstruct the index here. `index_store` and
-    /// `frag_reuse_index` are provided so the override can rebuild the index
-    /// without re-reading metadata.
+    /// a codec, and reconstruct the index here. `index_store` and `remapper`
+    /// are provided so the override can rebuild the index without
+    /// re-reading metadata.
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
@@ -333,29 +342,36 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Open an index through the cache, awaiting `load` only on a miss.
+    /// Open an index through the cache, awaiting `load` (a
+    /// [`load_index`](Self::load_index) with the same `remapper`) only on a
+    /// miss.
     ///
-    /// The default read-through / write-back over
+    /// The caller namespaces `cache` per segment and per translation (the
+    /// translation plan's fingerprint), so every remapper handed in under
+    /// one namespace translates every address the same way. What is specific
+    /// to a request is only the storage the remapper reads row maps through:
+    /// the stores of the request's dataset. An index rebuilt from cached
+    /// state takes `remapper`, so it reads through those.
+    ///
+    /// The default caches the live index bound to `index_store`, with the
+    /// remapper it was loaded with, in the entry the default
     /// [`get_from_cache`](Self::get_from_cache) and
-    /// [`put_in_cache`](Self::put_in_cache) does not coalesce concurrent cold
-    /// opens; plugins with a serializable form should override with
-    /// [`single_flight_open`] so one shared load populates the sized state key.
+    /// [`put_in_cache`](Self::put_in_cache) use, and coalesces concurrent
+    /// cold opens. Serving it is sound: its remapper translates as this
+    /// request's would, and the index is reloaded with this request's
+    /// remapper whenever the request arrives with a different storage
+    /// binding. A plugin that overrides those two hooks overrides this one
+    /// too, for example with [`single_flight_open`].
     async fn get_or_insert_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        if let Some(index) = self
-            .get_from_cache(index_store.clone(), frag_reuse_index, cache)
-            .await?
-        {
-            return Ok(index);
-        }
-        let index = load.await?;
-        self.put_in_cache(index_store, cache, index.clone()).await?;
-        Ok(index)
+        // `load` already holds an equivalent remapper.
+        let _ = remapper;
+        single_flight_store_bound_open(index_store, cache, load, |_| async { Ok(None) }).await
     }
 
     /// Optional hook allowing a plugin to provide statistics without loading the index.
@@ -445,156 +461,11 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Loads a scalar index segment whose stored row addresses are translated
-/// through a [`Remapper`]. See [`ScalarIndexPlugin::remapping_loader`].
-///
-/// A rewrite (compaction) that records a fragment reuse history moves rows
-/// without rebuilding the indices over them. A segment built before it still
-/// stores the old row addresses; Lance opens it through this loader with a
-/// [`Remapper`] that translates them into the addresses the rows have now.
-///
-/// A plugin implements this trait and returns itself from
-/// [`ScalarIndexPlugin::remapping_loader`]:
-///
-/// ```
-/// # use std::sync::Arc;
-/// # use async_trait::async_trait;
-/// # use lance_core::{Result, cache::LanceCache};
-/// # use lance_index::scalar::{IndexStore, Remapper, RowIdRemapper, ScalarIndex};
-/// # use lance_index::scalar::expression::ScalarQueryParser;
-/// # use lance_index::scalar::registry::{RemappingIndexLoader, ScalarIndexPlugin};
-/// #[derive(Debug)]
-/// struct AddressListPlugin;
-///
-/// impl AddressListPlugin {
-///     /// Reads the row addresses the segment stores.
-///     async fn read_addresses(&self, store: &dyn IndexStore) -> Result<Vec<u64>> {
-///         // ...
-/// #       unimplemented!()
-///     }
-///
-///     /// Builds the in-memory index over row addresses that are current.
-///     fn open(
-///         &self,
-///         store: Arc<dyn IndexStore>,
-///         addresses: Vec<u64>,
-///     ) -> Result<Arc<dyn ScalarIndex>> {
-///         // ...
-/// #       unimplemented!()
-///     }
-/// }
-///
-/// #[async_trait]
-/// impl RemappingIndexLoader for AddressListPlugin {
-///     async fn load_remapped(
-///         &self,
-///         index_store: Arc<dyn IndexStore>,
-///         _index_details: &prost_types::Any,
-///         _index_version: u32,
-///         remapper: Option<Remapper>,
-///         _cache: &LanceCache,
-///     ) -> Result<Arc<dyn ScalarIndex>> {
-///         let stored = self.read_addresses(index_store.as_ref()).await?;
-///         let addresses = match remapper {
-///             None => stored,
-///             Some(remapper) => {
-///                 let mut addresses: Vec<Option<u64>> =
-///                     stored.into_iter().map(Some).collect();
-///                 // One batch for every address at hand; a row the rewrite
-///                 // deleted translates to `None`.
-///                 remapper.translate_in_place(&mut addresses).await?;
-///                 addresses.into_iter().flatten().collect()
-///             }
-///         };
-///         self.open(index_store, addresses)
-///     }
-/// }
-///
-/// #[async_trait]
-/// impl ScalarIndexPlugin for AddressListPlugin {
-///     fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-///         Some(self)
-///     }
-///
-///     async fn load_index(
-///         &self,
-///         index_store: Arc<dyn IndexStore>,
-///         index_details: &prost_types::Any,
-///         index_version: u32,
-///         _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-///         cache: &LanceCache,
-///     ) -> Result<Arc<dyn ScalarIndex>> {
-///         // Lance opens segments through the remapping loader; this serves
-///         // callers that load one directly, with current addresses.
-///         self.load_remapped(index_store, index_details, index_version, None, cache)
-///             .await
-///     }
-///
-///     // ...
-/// #   fn name(&self) -> &str { "AddressList" }
-/// #   fn provides_exact_answer(&self) -> bool { true }
-/// #   fn version(&self) -> u32 { 0 }
-/// #   fn new_query_parser(&self, _: String, _: &prost_types::Any)
-/// #       -> Option<Box<dyn ScalarQueryParser>> { None }
-/// }
-/// ```
-#[async_trait]
-pub trait RemappingIndexLoader: Send + Sync {
-    /// Load a segment, as [`ScalarIndexPlugin::load_index`] does, translating
-    /// every row address the loaded index reports through `remapper`.
-    ///
-    /// `remapper` is `None` when the segment's addresses are current. The
-    /// remapper translates asynchronously and in batches: translate the
-    /// addresses at hand together (a page, a posting list, a search result)
-    /// rather than one at a time, and use
-    /// [`Remapper::fragment_needs_translation`] to skip fragments it leaves
-    /// unchanged.
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>>;
-
-    /// Open a segment through the cache, awaiting `load` (a
-    /// [`load_remapped`](Self::load_remapped) with the same `remapper`) only
-    /// on a miss.
-    ///
-    /// The caller namespaces `cache` per segment and per translation (the
-    /// translation plan's fingerprint), so every remapper handed in under
-    /// one namespace translates every address the same way. What is specific
-    /// to a request is only the storage the remapper reads row maps through:
-    /// the stores of the request's dataset. An index rebuilt from cached
-    /// state takes `remapper`, so it reads through those.
-    ///
-    /// The default instead caches the live index bound to `index_store`,
-    /// with the remapper it was loaded with, and coalesces concurrent cold
-    /// opens. Serving it is sound: its remapper translates as this request's
-    /// would, and the index is reloaded with this request's remapper
-    /// whenever the request arrives with a different storage binding.
-    /// Plugins with a serializable form override it, for example with
-    /// [`single_flight_open`].
-    async fn get_or_insert_remapped_in_cache(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-        load: ScalarIndexLoad<'_>,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        // `load` already holds an equivalent remapper.
-        let _ = remapper;
-        single_flight_store_bound_open(index_store, cache, load, |_| async { Ok(None) }).await
-    }
-}
-
 /// A boxed, `Send` future performing the storage-level load of a scalar index
 /// (compat checks, `load_index`, metrics).
 ///
-/// Passed to [`RemappingIndexLoader::get_or_insert_remapped_in_cache`] or
-/// [`ScalarIndexPlugin::get_or_insert_in_cache`], which await it at most once
-/// on a cache miss and drop it un-awaited on a warm hit.
+/// Passed to [`ScalarIndexPlugin::get_or_insert_in_cache`], which awaits it
+/// at most once on a cache miss and drops it un-awaited on a warm hit.
 pub type ScalarIndexLoad<'a> = BoxFuture<'a, Result<Arc<dyn ScalarIndex>>>;
 
 /// Single-flight open helper for plugins with a serializable form.

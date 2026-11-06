@@ -25,11 +25,8 @@ use crate::scalar::RowIdRemapper;
 
 /// Translates a bounded batch of row IDs, allowing encodings to read external data.
 ///
-/// Deprecated for loading indices: a plugin translates through the
-/// [`Remapper`] its `RemappingIndexLoader` is handed, and
-/// `ScalarIndexPlugin::load_index_with_remapping`, which took this trait, is
-/// deprecated. The trait itself is not marked `#[deprecated]` yet because
-/// index rewrites (`remap_streaming`, [`materialize_remap`]) still take it.
+/// Index rewrites (`remap_streaming`, [`materialize_remap`]) take it; an
+/// index load translates through a [`Remapper`] instead.
 #[async_trait]
 pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     /// Results correspond to input positions, including duplicates. `None` removes a row.
@@ -144,45 +141,6 @@ pub async fn translate_record_batch(
         translated.into_iter().flatten(),
     ));
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
-}
-
-/// A [`Remapper`] that applies a [`RowIdRemapper`] handed to a deprecated
-/// entry point (`ScalarIndexPlugin::load_index` or its cache hooks), so an
-/// index that translates through a [`Remapper`] serves those entry points
-/// with its one loader.
-///
-/// A [`RowIdRemapper`] does not say which fragments it moves: every fragment
-/// is treated as needing translation, and fragment bitmaps are returned
-/// unchanged. Transitional, like the entry points it serves.
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct DeprecatedRemapper(pub Arc<dyn RowIdRemapper>);
-
-impl DeprecatedRemapper {
-    /// The [`Remapper`] applying `sync`, if any.
-    pub fn sync(sync: Option<Arc<dyn RowIdRemapper>>) -> Option<Remapper> {
-        sync.map(|sync| Remapper::from_backing(Arc::new(Self(sync))))
-    }
-}
-
-impl lance_select::remapper::RemapperBacking for DeprecatedRemapper {
-    fn fragment_needs_translation(&self, _fragment: u32) -> bool {
-        true
-    }
-
-    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
-        fragments.clone()
-    }
-
-    fn translate_in_place<'a>(
-        &'a self,
-        addrs: &'a mut [Option<u64>],
-    ) -> lance_select::remapper::TranslateFuture<'a> {
-        for slot in addrs.iter_mut() {
-            *slot = slot.and_then(|addr| self.0.remap_row_id(addr));
-        }
-        Box::pin(std::future::ready(Ok(())))
-    }
 }
 
 /// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that

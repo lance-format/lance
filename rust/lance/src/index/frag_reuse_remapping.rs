@@ -19,15 +19,13 @@ use std::sync::Arc;
 /// Whether this build translates the row addresses of scalar segments with
 /// `details`: `None` when no plugin reads them.
 ///
-/// A plugin translates when it implements a remapping loader. One that
-/// implements only the deprecated loaders does not, under any history
-/// format. A JSON index answers through its target index, so it translates
-/// only when its target's plugin does.
+/// A JSON index answers through its target index, so it translates only
+/// when its target's plugin does.
 pub(super) fn scalar_plugin_translates(details: &prost_types::Any) -> Option<bool> {
     let plugin = super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
         .ok()?;
-    if plugin.remapping_loader().is_none() {
+    if !plugin.translates_row_addrs() {
         return Some(false);
     }
     if details.type_url.ends_with(&JsonIndexDetails::full_name()) {

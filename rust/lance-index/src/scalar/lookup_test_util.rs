@@ -8,14 +8,14 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{UInt32Type, UInt64Type};
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch};
 use futures::TryStreamExt;
-use lance_core::Result;
-use lance_select::RowAddrTreeMap;
-use roaring::RoaringTreemap;
+use lance_select::Remapper;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
+use roaring::RoaringBitmap;
 
 use crate::metrics::NoOpMetricsCollector;
-use crate::scalar::{RowIdRemapper, ScalarIndex, lookup_schema};
+use crate::scalar::{ScalarIndex, lookup_schema};
 
 /// Every `(key position, row)` pair `lookup` streams, sorted, checking each
 /// batch names its row column after the index's result domain.
@@ -66,49 +66,33 @@ impl CompactedToFragmentOne {
     }
 }
 
-impl RowIdRemapper for CompactedToFragmentOne {
-    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+impl CompactedToFragmentOne {
+    pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
         (!self.deleted.contains(&row_id)).then(|| Self::moved(row_id))
     }
 
-    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
-        row_addrs
-            .row_addrs()
-            .unwrap()
-            .filter_map(|addr| self.remap_row_id(u64::from(addr)))
-            .collect()
+    pub fn into_remapper(self) -> Remapper {
+        Remapper::from_backing(Arc::new(self))
+    }
+}
+
+impl RemapperBacking for CompactedToFragmentOne {
+    fn fragment_needs_translation(&self, fragment: u32) -> bool {
+        fragment == 0
     }
 
-    fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
-        row_ids
-            .iter()
-            .filter_map(|row_id| self.remap_row_id(row_id))
-            .collect()
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        let mut translated = fragments.clone();
+        if translated.remove(0) {
+            translated.insert(1);
+        }
+        translated
     }
 
-    fn remap_row_ids_record_batch(
-        &self,
-        batch: RecordBatch,
-        row_id_idx: usize,
-    ) -> Result<RecordBatch> {
-        let (positions, row_ids): (Vec<u64>, Vec<u64>) = batch
-            .column(row_id_idx)
-            .as_primitive::<UInt64Type>()
-            .values()
-            .iter()
-            .enumerate()
-            .filter_map(|(position, &row_id)| {
-                self.remap_row_id(row_id)
-                    .map(|row_id| (position as u64, row_id))
-            })
-            .unzip();
-        let positions = UInt64Array::from(positions);
-        let mut columns = batch
-            .columns()
-            .iter()
-            .map(|column| arrow_select::take::take(column, &positions, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        columns[row_id_idx] = Arc::new(UInt64Array::from(row_ids));
-        Ok(RecordBatch::try_new(batch.schema(), columns)?)
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        for slot in addrs.iter_mut() {
+            *slot = slot.and_then(|addr| self.remap_row_id(addr));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }

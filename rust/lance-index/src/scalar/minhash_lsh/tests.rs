@@ -707,35 +707,6 @@ async fn test_remap_rewrites_and_drops_row_ids() {
     assert_eq!(row_ids(&remapped, &bases[3], 1).await, vec![9]);
 }
 
-/// Row id remapper of a segment opened after a deferred compaction.
-#[derive(Debug)]
-struct TestRemapper(HashMap<u64, Option<u64>>);
-
-impl RowIdRemapper for TestRemapper {
-    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        self.0.get(&row_id).copied().unwrap_or(Some(row_id))
-    }
-
-    fn remap_row_addrs_tree_map(&self, _row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
-        unreachable!()
-    }
-
-    fn remap_row_ids_roaring_tree_map(
-        &self,
-        _row_ids: &roaring::RoaringTreemap,
-    ) -> roaring::RoaringTreemap {
-        unreachable!()
-    }
-
-    fn remap_row_ids_record_batch(
-        &self,
-        _batch: RecordBatch,
-        _row_id_idx: usize,
-    ) -> Result<RecordBatch> {
-        unreachable!()
-    }
-}
-
 #[tokio::test]
 async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     // The segment stores fragment 0 addresses; a deferred compaction moved
@@ -747,16 +718,16 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     let rows = corpus_rows(&bases, &[]);
     build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
     let compacted = |row: u64| (1u64 << 32) | row;
-    let remapper = TestRemapper(HashMap::from([
-        (0u64, Some(compacted(0))),
-        (1u64, Some(compacted(1))),
-        (2u64, None),
-        (3u64, Some(compacted(3))),
-    ]));
+    let (remapper, _) = lance_select::remapper::ScriptedRemapper::new()
+        .moved(0, compacted(0))
+        .moved(1, compacted(1))
+        .deleted(2)
+        .moved(3, compacted(3))
+        .into_remapper();
     let index = MinHashLshIndex::load(
         store.clone(),
         &MinHashLshIndexParams::default().details_any().unwrap(),
-        lance_index_core::remapping::DeprecatedRemapper::sync(Some(Arc::new(remapper))),
+        Some(remapper),
         &LanceCache::no_cache(),
     )
     .await

@@ -4,7 +4,7 @@
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper, remap_row_addrs_tree_map_async};
+use lance_index_core::remapping::{Remapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
     borrow::Cow,
@@ -56,12 +56,11 @@ use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, RowIdRemapper, UpdateCriteria,
+        CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, RemappingIndexLoader, ScalarIndexLoad, ScalarIndexPlugin,
-            TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
-            single_flight_open,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -2574,43 +2573,6 @@ impl BasicTrainer for BitmapIndexPlugin {
 }
 
 #[async_trait]
-impl RemappingIndexLoader for BitmapIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
-        Ok(
-            BitmapIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
-                as Arc<dyn ScalarIndex>,
-        )
-    }
-
-    async fn get_or_insert_remapped_in_cache(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-        load: ScalarIndexLoad<'_>,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        single_flight_open(
-            cache,
-            BitmapIndexStateKey,
-            load,
-            BitmapIndexState::from_scalar_index,
-            move |state| {
-                Ok(state.to_bitmap_index(index_store, cache, remapper)? as Arc<dyn ScalarIndex>)
-            },
-        )
-        .await
-    }
-}
-
-#[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
@@ -2648,39 +2610,32 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
+        _index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
+        let results_are_row_addresses = index_version >= BITMAP_ROW_ADDR_DOMAIN_VERSION;
+        Ok(
+            BitmapIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BitmapIndexStateKey).await else {
             return Ok(None);
         };
-        let index = state.to_bitmap_index(
-            index_store,
-            cache,
-            DeprecatedRemapper::sync(frag_reuse_index),
-        )?;
+        let index = state.to_bitmap_index(index_store, cache, remapper)?;
         Ok(Some(index as Arc<dyn ScalarIndex>))
     }
 
@@ -2700,15 +2655,18 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
     async fn get_or_insert_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.get_or_insert_remapped_in_cache(
-            index_store,
-            DeprecatedRemapper::sync(frag_reuse_index),
+        single_flight_open(
             cache,
+            BitmapIndexStateKey,
             load,
+            BitmapIndexState::from_scalar_index,
+            move |state| {
+                Ok(state.to_bitmap_index(index_store, cache, remapper)? as Arc<dyn ScalarIndex>)
+            },
         )
         .await
     }
@@ -4032,7 +3990,7 @@ mod tests {
         };
         let index = BitmapIndex::load(
             store,
-            DeprecatedRemapper::sync(Some(Arc::new(remapper))),
+            Some(remapper.into_remapper()),
             &LanceCache::no_cache(),
             true,
         )

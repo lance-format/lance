@@ -37,19 +37,19 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper, RowAddrTranslator};
+use lance_index_core::remapping::{Remapper, RowAddrTranslator};
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
 use crate::pb;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, RemappingIndexLoader, ScalarIndexPlugin,
-    TrainingCriteria, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+    TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
-    RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -2322,21 +2322,6 @@ impl BasicTrainer for FMIndexPlugin {
 }
 
 #[async_trait]
-impl RemappingIndexLoader for FMIndexPlugin {
-    async fn load_remapped(
-        &self,
-        store: Arc<dyn IndexStore>,
-        details: &prost_types::Any,
-        _index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
-        Ok(FMIndexScalarIndex::load(store, remapper, cache).await? as Arc<dyn ScalarIndex>)
-    }
-}
-
-#[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(false)
@@ -2375,22 +2360,16 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         &self,
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
-        index_version: u32,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        _index_version: u32,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            store,
-            details,
-            index_version,
-            DeprecatedRemapper::sync(fri),
-            cache,
-        )
-        .await
+        let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
+        Ok(FMIndexScalarIndex::load(store, remapper, cache).await? as Arc<dyn ScalarIndex>)
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
     async fn load_statistics(
         &self,
@@ -2756,7 +2735,7 @@ mod tests {
         });
         let index = FMIndexScalarIndex::load(
             store,
-            DeprecatedRemapper::sync(Some(remapper.clone())),
+            Some(Remapper::from_backing(remapper.clone())),
             &LanceCache::no_cache(),
         )
         .await

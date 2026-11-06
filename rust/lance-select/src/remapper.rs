@@ -49,8 +49,8 @@ pub trait RemapperBacking: Send + Sync + Debug {
 /// longer answers for, translates to `None`.
 ///
 /// An index is handed a remapper when it is loaded (see
-/// `lance_index::scalar::registry::RemappingIndexLoader`) and translates the
-/// addresses it reads in batches:
+/// `lance_index::scalar::registry::ScalarIndexPlugin::load_index`) and
+/// translates the addresses it reads in batches:
 ///
 /// ```
 /// # use lance_core::Result;

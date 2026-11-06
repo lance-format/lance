@@ -3,7 +3,7 @@
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper, translate_record_batch};
+use lance_index_core::remapping::{Remapper, translate_record_batch};
 use std::{
     any::Any,
     cmp::Ordering,
@@ -29,11 +29,11 @@ use crate::{
 use crate::{
     progress::{IndexBuildProgress, noop_progress},
     scalar::{
-        CreatedIndex, RowIdRemapper, UpdateCriteria,
+        CreatedIndex, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, RemappingIndexLoader, ScalarIndexLoad, ScalarIndexPlugin,
-            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -4044,8 +4044,8 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         Ok(true)
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -4079,35 +4079,28 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
+        _index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
+        let results_are_row_addresses = index_version >= BTREE_ROW_ADDR_DOMAIN_VERSION;
+        Ok(
+            BTreeIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await
     }
 
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(state) = cache.get_with_key(&BTreeIndexStateKey).await else {
             return Ok(None);
         };
-        Ok(Some(state.reconstruct(
-            index_store,
-            cache,
-            DeprecatedRemapper::sync(frag_reuse_index),
-        )?))
+        Ok(Some(state.reconstruct(index_store, cache, remapper)?))
     }
 
     async fn put_in_cache(
@@ -4124,40 +4117,6 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
     }
 
     async fn get_or_insert_in_cache(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        cache: &LanceCache,
-        load: ScalarIndexLoad<'_>,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        self.get_or_insert_remapped_in_cache(
-            index_store,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
-            load,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl RemappingIndexLoader for BTreeIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let results_are_row_addresses = index_version >= BTREE_ROW_ADDR_DOMAIN_VERSION;
-        Ok(
-            BTreeIndex::load(index_store, remapper, cache, results_are_row_addresses).await?
-                as Arc<dyn ScalarIndex>,
-        )
-    }
-
-    async fn get_or_insert_remapped_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
         remapper: Option<Remapper>,
@@ -4178,7 +4137,6 @@ impl RemappingIndexLoader for BTreeIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
-    use lance_index_core::remapping::DeprecatedRemapper;
     use std::sync::atomic::Ordering;
     use std::{
         collections::{HashMap, HashSet},
@@ -4748,7 +4706,7 @@ mod tests {
         };
         let index = BTreeIndex::load(
             store,
-            DeprecatedRemapper::sync(Some(Arc::new(remapper))),
+            Some(remapper.into_remapper()),
             &LanceCache::no_cache(),
             true,
         )
@@ -8213,10 +8171,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_btree_index_state_reconstruct_applies_frag_reuse_index() {
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
-        use std::collections::HashMap;
-        use uuid::Uuid;
-
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -8245,19 +8199,15 @@ mod tests {
 
         // Remap row 0 -> row 5000 (outside the original [0, 1000) range so no collision).
         // Querying for value == 0 should now return row 5000, confirming reconstruct threaded
-        // the FragReuseIndex through to the rebuilt BTreeIndex.
-        let frag_reuse_index: Arc<dyn crate::scalar::RowIdRemapper> =
-            Arc::new(FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-                Uuid::new_v4(),
-                vec![HashMap::from([(0u64, Some(5000u64))])],
-                FragReuseIndexDetails { versions: vec![] },
-            ))));
-        let reconstructed = state
-            .reconstruct(
-                test_store.clone(),
-                &LanceCache::no_cache(),
-                DeprecatedRemapper::sync(Some(frag_reuse_index)),
+        // the remapper through to the rebuilt BTreeIndex.
+        let (remapper, _) = (1..1000)
+            .fold(
+                lance_select::remapper::ScriptedRemapper::new().moved(0, 5000),
+                |script, row| script.moved(row, row),
             )
+            .into_remapper();
+        let reconstructed = state
+            .reconstruct(test_store.clone(), &LanceCache::no_cache(), Some(remapper))
             .unwrap();
 
         let result = reconstructed

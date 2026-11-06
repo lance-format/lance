@@ -5,14 +5,12 @@ use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::registry::{
-    BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
-    IndexWriter, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
-    UpdateCriteria,
+    IndexWriter, OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
@@ -43,7 +41,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper, translate_record_batch};
+use lance_index_core::remapping::{Remapper, translate_record_batch};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -1248,33 +1246,14 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load(
-            index_store,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
-        )
-        .await? as Arc<dyn ScalarIndex>)
-    }
-
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
-    }
-}
-
-#[async_trait]
-impl RemappingIndexLoader for RTreeIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
         remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(RTreeIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 }
 
@@ -1286,7 +1265,6 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::RelationQuery;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
@@ -1299,16 +1277,16 @@ mod tests {
     use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_geo::bbox::is_empty_rect;
+    use lance_select::remapper::ScriptedRemapper;
     use rand::Rng;
 
     /// An rtree is not in the shared remap suite, whose rows are scalar
     /// values, so this is its instance of that contract: loaded through its
-    /// remapping loader with a scripted remapper, it answers with current
+    /// plugin with a scripted remapper, it answers with current
     /// addresses only, translating a search's rows as one batch.
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_remapped_search_answers_with_current_addresses() {
-        use lance_select::remapper::ScriptedRemapper;
         let address = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
         let point_type = PointType::new(Dimension::XY, Default::default());
         let mut builder = PointBuilder::new(point_type);
@@ -1327,9 +1305,7 @@ mod tests {
             .moved(address(0, 4), address(1, 4))
             .into_remapper();
         let index = RTreeIndexPlugin
-            .remapping_loader()
-            .unwrap()
-            .load_remapped(
+            .load_index(
                 store,
                 &prost_types::Any::default(),
                 0,
@@ -1811,19 +1787,13 @@ mod tests {
             .collect();
         match remapping {
             "sync" => {
-                first_index.remapper = DeprecatedRemapper::sync(Some(Arc::new(
-                    FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-                        uuid::Uuid::new_v4(),
-                        vec![
-                            source_ids
-                                .iter()
-                                .copied()
-                                .zip(mapped_ids.iter().copied().map(Some))
-                                .collect(),
-                        ],
-                        FragReuseIndexDetails { versions: vec![] },
-                    ))),
-                )))
+                let script = source_ids
+                    .iter()
+                    .zip(&mapped_ids)
+                    .fold(ScriptedRemapper::new(), |script, (&from, &to)| {
+                        script.moved(from, to)
+                    });
+                first_index.remapper = Some(script.into_remapper().0)
             }
             "async" => first_index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}
@@ -2026,13 +1996,12 @@ mod tests {
             .collect();
         match remapping {
             "sync" => {
-                index.remapper = DeprecatedRemapper::sync(Some(Arc::new(FragReuseIndexHandle(
-                    Arc::new(FragReuseIndex::new(
-                        uuid::Uuid::new_v4(),
-                        vec![(0..4).zip(old_ids.iter().copied().map(Some)).collect()],
-                        FragReuseIndexDetails { versions: vec![] },
-                    )),
-                ))))
+                let script = (0..4)
+                    .zip(&old_ids)
+                    .fold(ScriptedRemapper::new(), |script, (from, &to)| {
+                        script.moved(from, to)
+                    });
+                index.remapper = Some(script.into_remapper().0)
             }
             "async" => index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}

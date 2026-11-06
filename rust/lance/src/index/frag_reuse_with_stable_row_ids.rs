@@ -48,9 +48,9 @@ pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexM
     manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
 }
 
-/// Whether `type_name` translates through a remapping loader but has no
+/// Whether `type_name` translates row addresses but has no
 /// query test over a stable-row-ID table with a fragment reuse index yet. A
-/// remapping loader is only a proxy for applying the legacy fragment reuse
+/// plugin that translates is only a proxy for applying the legacy fragment reuse
 /// index on load, so every admitted type needs such a test.
 fn lacks_stable_row_id_query_test(type_name: &str) -> bool {
     [
@@ -92,7 +92,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     }
     let applies_frag_reuse = details
         .get_plugin()
-        .is_ok_and(|plugin| plugin.remapping_loader().is_some())
+        .is_ok_and(|plugin| plugin.translates_row_addrs())
         && !lacks_stable_row_id_query_test(type_name);
     if !applies_frag_reuse {
         return Some(format!(

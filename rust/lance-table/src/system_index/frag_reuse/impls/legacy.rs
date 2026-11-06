@@ -380,10 +380,6 @@ impl FriImpl for LegacyHistory {
     fn bind(&self, _plan: TranslationPlan, _mappings: Arc<dyn MappingSource>) -> Remapper {
         Remapper::from_backing(self.translation().clone())
     }
-
-    fn legacy_compact_index(&self) -> Option<Result<Arc<CompactFragReuseIndex>>> {
-        Some(self.translation().compact_index())
-    }
 }
 
 /// The translation of a version 0 history: the compact in-memory remap

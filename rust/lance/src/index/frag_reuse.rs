@@ -16,10 +16,10 @@ use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
-    FragReuseIndexDetails, FragReuseVersion,
+    CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails,
+    FragReuseVersion,
 };
-use lance_index::scalar::{Remapper, RowIdRemapper};
+use lance_index::scalar::Remapper;
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_table::format::pb::FragmentReuseIndexDetails;
 use lance_table::format::pb::fragment_reuse_index_details::{
@@ -45,18 +45,13 @@ use uuid::Uuid;
 /// The remapper resolved for one index open.
 ///
 /// The FRI version picks the interface and the segment's need picks the
-/// behavior: `V0` carries the version 0 history, which plugins with a
-/// remapping loader bind a [`Remapper`] from and the rest apply as the
-/// synchronous remapper; `V1Identity` carries no remapper at all (the
-/// segment's rows are untouched, so the plugin's original load path
-/// applies); `V1Translate` carries the plan a [`Remapper`] is bound from.
+/// behavior: `V0` carries the version 0 history a [`Remapper`] is bound
+/// from; `V1Identity` carries no remapper at all (the segment's rows are
+/// untouched); `V1Translate` carries the plan a [`Remapper`] is bound from.
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A version 0 history, as decoded: invalid versions an older writer
-    /// left are dropped. Its synchronous remap (see
-    /// [`Self::legacy_row_id_remapper`]) reaches only plugins without a
-    /// remapping loader: a segment of one that a query listing keeps,
-    /// because the history moves none of its rows, or one opened by uuid.
+    /// left are dropped.
     V0 {
         history: FragReuseHistory,
         /// The `dataset_version` of the FRI entry holding `history`.
@@ -690,7 +685,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
 }
 
 /// The [`Remapper`] a segment `resolved` for is loaded with by a plugin's
-/// remapping loader: `None` when its addresses are current.
+/// `load_index`: `None` when its addresses are current.
 pub(crate) async fn segment_remapper(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -707,23 +702,6 @@ pub(crate) async fn segment_remapper(
             history,
             entry_version,
         }) => legacy_segment_remapper(dataset, *entry_version, history, index).await,
-    }
-}
-
-impl ResolvedRemapping {
-    /// The synchronous remapper the deprecated loaders of a plugin without
-    /// a remapping loader are handed: `None` unless this is a version 0
-    /// history, the only one such a plugin can apply.
-    pub(crate) fn legacy_row_id_remapper(
-        &self,
-    ) -> lance_core::Result<Option<Arc<dyn RowIdRemapper>>> {
-        let Self::V0 { history, .. } = self else {
-            return Ok(None);
-        };
-        let index = history.legacy_compact_index().ok_or_else(|| {
-            Error::internal("a version 0 fragment reuse history has no version 0 remap")
-        })??;
-        Ok(Some(Arc::new(CompactFragReuseIndexHandle(index))))
     }
 }
 

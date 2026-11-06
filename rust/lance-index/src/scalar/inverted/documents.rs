@@ -2201,11 +2201,9 @@ mod tests {
     use async_trait::async_trait;
     use lance_core::cache::{LanceCache, QuickCacheBackend};
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_index_core::remapping::DeprecatedRemapper;
-    use lance_index_core::scalar::RowIdRemapper;
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
-    use roaring::RoaringTreemap;
+    use lance_select::remapper::{RemapperBacking, TranslateFuture};
     use tokio::sync::Notify;
 
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2486,7 +2484,7 @@ mod tests {
         store: Arc<dyn IndexStore>,
         path: &str,
         index_cache: &LanceCache,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
     ) -> Result<PartitionDocuments> {
         let reader = store.open_index_file(path).await?;
         PartitionDocuments::try_new(
@@ -2495,7 +2493,7 @@ mod tests {
             0,
             WeakLanceCache::from(index_cache),
             reader.as_ref(),
-            DeprecatedRemapper::sync(remapper),
+            remapper,
             false,
         )
     }
@@ -2548,9 +2546,7 @@ mod tests {
         num_docs: usize,
         remapper: Option<&TestRemapper>,
     ) -> Result<VersionAddressProjection> {
-        let remapper = DeprecatedRemapper::sync(
-            remapper.map(|remapper| Arc::new(remapper.clone()) as Arc<dyn RowIdRemapper>),
-        );
+        let remapper = remapper.map(|remapper| Remapper::from_backing(Arc::new(remapper.clone())));
         futures::executor::block_on(VersionAddressProjection::try_new(
             raw,
             num_docs,
@@ -2559,21 +2555,22 @@ mod tests {
         ))
     }
 
-    impl RowIdRemapper for TestRemapper {
-        fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-            self.mapping.get(&row_id).copied().unwrap_or(Some(row_id))
+    /// An address without a mapping is unchanged.
+    impl RemapperBacking for TestRemapper {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
         }
 
-        fn remap_row_addrs_tree_map(&self, _: &RowAddrTreeMap) -> RowAddrTreeMap {
-            unreachable!("not used by document projection tests")
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
         }
 
-        fn remap_row_ids_roaring_tree_map(&self, _: &RoaringTreemap) -> RoaringTreemap {
-            unreachable!("not used by document projection tests")
-        }
-
-        fn remap_row_ids_record_batch(&self, _: RecordBatch, _: usize) -> Result<RecordBatch> {
-            unreachable!("not used by document projection tests")
+        fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+            for slot in addrs.iter_mut() {
+                *slot =
+                    slot.and_then(|addr| self.mapping.get(&addr).copied().unwrap_or(Some(addr)));
+            }
+            Box::pin(std::future::ready(Ok(())))
         }
     }
 
@@ -3227,9 +3224,9 @@ mod tests {
             Some("10"),
         )
         .await;
-        let remapper: Arc<dyn RowIdRemapper> = Arc::new(TestRemapper {
+        let remapper = Remapper::from_backing(Arc::new(TestRemapper {
             mapping: remapping.into_iter().collect(),
-        });
+        }));
         let documents = open_documents(store, path, cache.as_ref(), Some(remapper))
             .await
             .unwrap();

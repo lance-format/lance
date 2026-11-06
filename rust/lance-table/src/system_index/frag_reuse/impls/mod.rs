@@ -22,7 +22,6 @@ use lance_core::{Error, Result};
 use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
-use super::CompactFragReuseIndex;
 use super::history::{HistoryFormat, Record, RewriteRecord, split_records};
 use super::ledger::FragReuseLedger;
 use super::mapping::MappingSource;
@@ -77,11 +76,6 @@ pub trait FriImpl: Send + Sync + Debug {
 
     /// See [`TranslationPlan::bind`]. `plan` was planned by this history.
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper;
-
-    /// See [`FragReuseHistory::legacy_compact_index`](super::history::FragReuseHistory::legacy_compact_index).
-    fn legacy_compact_index(&self) -> Option<Result<Arc<CompactFragReuseIndex>>> {
-        None
-    }
 }
 
 /// The records every format stores: each record's exact wire bytes in

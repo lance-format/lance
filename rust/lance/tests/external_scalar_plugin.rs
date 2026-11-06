@@ -27,7 +27,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
+        CreatedIndex, IndexStore, Remapper, ScalarIndex, ScalarIndexParams,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
@@ -70,9 +70,8 @@ impl Name for StaleIndexDetails {
     const PACKAGE: &'static str = "example.index";
 }
 
-/// Like [`ExampleIndexPlugin`], but drops the fragment reuse remapper it is
-/// handed and has no remapping loader: it keeps answering with the row
-/// addresses it was built with.
+/// Like [`ExampleIndexPlugin`], but does not translate row addresses: it
+/// keeps answering with the row addresses it was built with.
 #[derive(Debug, Default)]
 struct StaleIndexPlugin;
 
@@ -137,7 +136,7 @@ impl ScalarIndexPlugin for StaleIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         ZoneMapIndexPlugin
@@ -211,17 +210,11 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         ZoneMapIndexPlugin
-            .load_index(
-                index_store,
-                index_details,
-                index_version,
-                frag_reuse_index,
-                cache,
-            )
+            .load_index(index_store, index_details, index_version, remapper, cache)
             .await
     }
 
@@ -658,8 +651,8 @@ async fn commit_external_segments_replaces_only_overlapping_coverage() {
         .unwrap();
 }
 
-/// Under either fragment reuse history format, a segment of a plugin without
-/// a remapping loader leaves the query listing once its rows move, so they
+/// Under either fragment reuse history format, a segment of a plugin that
+/// does not translate row addresses leaves the query listing once its rows move, so they
 /// are scanned instead of answered from stale addresses. So does a JSON
 /// index over such a plugin, which answers through it. A built-in index
 /// keeps serving its segment through the history.
@@ -779,8 +772,8 @@ async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagg
     }
 }
 
-/// Under either fragment reuse history format, a segment of a plugin without
-/// a remapping loader stays listed, and answers queries, when the history
+/// Under either fragment reuse history format, a segment of a plugin that
+/// does not translate row addresses stays listed, and answers queries, when the history
 /// moves none of its rows: it covers only fragments no rewrite touched, or it
 /// was built after the rewrite.
 #[rstest]

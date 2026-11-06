@@ -93,18 +93,18 @@ use crate::scalar::expression::ScalarQueryParser;
 use crate::scalar::inverted::tokenizer::InvertedIndexParams;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use crate::scalar::registry::{
-    BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+    VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchResult, UpdateCriteria,
+    MetricsCollector, OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult,
+    UpdateCriteria,
 };
 use crate::vector::graph::OrderedFloat;
 use crate::{Index, IndexType};
 use crate::{pb, pbold};
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
+use lance_index_core::remapping::Remapper;
 
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
@@ -842,23 +842,6 @@ impl BasicTrainer for MinHashLshIndexPlugin {
 }
 
 #[async_trait]
-impl RemappingIndexLoader for MinHashLshIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        _index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(
-            MinHashLshIndex::load(index_store, index_details, remapper, cache).await?
-                as Arc<dyn ScalarIndex>,
-        )
-    }
-}
-
-#[async_trait]
 impl ScalarIndexPlugin for MinHashLshIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
@@ -894,22 +877,18 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _index_version: u32,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
+        Ok(
+            MinHashLshIndex::load(index_store, index_details, remapper, cache).await?
+                as Arc<dyn ScalarIndex>,
         )
-        .await
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     fn validate_new_segments_against_existing(

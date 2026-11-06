@@ -10,8 +10,7 @@
 use crate::pb;
 use crate::scalar::expression::{BloomFilterQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, RemappingIndexLoader, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest,
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
 };
 use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
@@ -23,8 +22,8 @@ use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::Remapper;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{DeprecatedRemapper, Remapper};
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -35,9 +34,7 @@ use std::sync::LazyLock;
 use datafusion_execution::SendableRecordBatchStream;
 use std::sync::Arc;
 
-use crate::scalar::{
-    AnyQuery, IndexStore, MetricsCollector, RowIdRemapper, ScalarIndex, SearchResult,
-};
+use crate::scalar::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
 use crate::{Index, IndexType};
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
@@ -1452,20 +1449,6 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 }
 
 #[async_trait]
-impl RemappingIndexLoader for BloomFilterIndexPlugin {
-    async fn load_remapped(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
-        remapper: Option<Remapper>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(BloomFilterIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
-    }
-}
-
-#[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(false)
@@ -1502,23 +1485,16 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        self.load_remapped(
-            index_store,
-            index_details,
-            index_version,
-            DeprecatedRemapper::sync(frag_reuse_index),
-            cache,
-        )
-        .await
+        Ok(BloomFilterIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
     }
 
-    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
-        Some(self)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     async fn load_statistics(
@@ -1557,9 +1533,7 @@ impl TrainingRequest for BloomFilterIndexTrainingRequest {
 
 #[cfg(test)]
 mod tests {
-    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::scalar::registry::VALUE_COLUMN_NAME;
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
@@ -2939,22 +2913,15 @@ mod tests {
         );
 
         let remapped_base = 2_u64 << 32;
-        let remapper = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-            uuid::Uuid::new_v4(),
-            vec![HashMap::from([
-                (0, Some(remapped_base)),
-                (1, Some(remapped_base + 1)),
-                (2, Some(remapped_base + 2)),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        )));
-        let remapped_first = BloomFilterIndex::load(
-            first_store,
-            lance_index_core::remapping::DeprecatedRemapper::sync(Some(Arc::new(remapper))),
-            &LanceCache::no_cache(),
-        )
-        .await
-        .unwrap();
+        let (remapper, _) = lance_select::remapper::ScriptedRemapper::new()
+            .moved(0, remapped_base)
+            .moved(1, remapped_base + 1)
+            .moved(2, remapped_base + 2)
+            .into_remapper();
+        let remapped_first =
+            BloomFilterIndex::load(first_store, Some(remapper), &LanceCache::no_cache())
+                .await
+                .unwrap();
         let (_remapped_tmpdir, remapped_store) = create_store();
         merge_bloomfilter_indices(
             &[(remapped_first.as_ref(), &RoaringBitmap::from_iter([2]))],
