@@ -174,9 +174,10 @@ impl FtsToken {
 /// The tokenizer options are the same as the tokenizer-related options accepted by
 /// ``LanceDataset.create_scalar_index(..., index_type="INVERTED")``. ``None`` uses
 /// the selected analyzer profile's default, except ``max_token_length=None``, which
-/// disables the length limit; omitting it keeps the default limit of 40. Returned
-/// positions are normalized to the first retained token while preserving gaps left
-/// by token filters.
+/// disables the length limit; omitting it keeps the default limit of 40 UTF-8 bytes.
+/// This is an exclusive limit: tokens whose UTF-8 encoded length is at least the
+/// limit are removed. Returned positions are normalized to the first retained token
+/// while preserving gaps left by token filters.
 ///
 /// Examples
 /// --------

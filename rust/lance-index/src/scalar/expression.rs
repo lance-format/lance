@@ -22,8 +22,8 @@ use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
-#[cfg(feature = "geo")]
-use super::{GeoQuery, RelationQuery};
+use crate::scalar::inverted::InvertedIndexParams;
+use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
 use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
@@ -52,10 +52,10 @@ const MAX_DEPTH: usize = 500;
 /// "z" column then we must fallback to an IndexedExpression with no scalar_query and
 /// only a refine.
 ///
-/// Two IndexedExpressions can be AND'd together.  Each part is AND'd together.
-/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query only
-///   or both are refine only
-/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query
+/// Two IndexedExpressions can be AND'd together. Each part is AND'd together.
+/// Two IndexedExpressions can be OR'd when both have a scalar query. If either side
+/// has a refine, the original OR expression refines the union of the index results.
+/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query.
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
@@ -1131,6 +1131,7 @@ fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
 pub struct FtsQueryParser {
     index_name: String,
     index_type: String,
+    tokenizer_params: Option<InvertedIndexParams>,
 }
 
 impl FtsQueryParser {
@@ -1138,7 +1139,26 @@ impl FtsQueryParser {
         Self {
             index_name: name,
             index_type,
+            tokenizer_params: None,
         }
+    }
+
+    /// The tokenizer settings of the index. A query the index tokenizer reduces
+    /// to no tokens, such as one made only of stop words, is left to the scan,
+    /// since the index cannot narrow the rows it matches.
+    pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
+        self.tokenizer_params = Some(params);
+        self
+    }
+
+    fn has_index_tokens(&self, query: &str) -> bool {
+        let Some(params) = &self.tokenizer_params else {
+            return true;
+        };
+        params
+            .build()
+            .and_then(|mut tokenizer| try_collect_query_tokens(query, &mut tokenizer))
+            .is_ok_and(|tokens| !tokens.is_empty())
     }
 }
 
@@ -1186,131 +1206,18 @@ impl ScalarQueryParser for FtsQueryParser {
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar
             && func.name() == "contains_tokens"
+            && self.has_index_tokens(&scalar_str)
         {
             let query = TokenQuery::TokensContains(scalar_str);
-            return Some(IndexedExpression::index_query(
+            // The index tokenizer can lowercase, fold and drop stop words, so
+            // its rows are candidates the scan still has to check.
+            return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),
                 self.index_type.clone(),
                 Arc::new(query),
+                true,
             ));
-        }
-        None
-    }
-}
-
-/// A parser for geo indices that handles spatial queries
-#[cfg(feature = "geo")]
-#[derive(Debug, Clone)]
-pub struct GeoQueryParser {
-    index_name: String,
-    index_type: String,
-}
-
-#[cfg(feature = "geo")]
-impl GeoQueryParser {
-    pub fn new(index_name: String, index_type: String) -> Self {
-        Self {
-            index_name,
-            index_type,
-        }
-    }
-}
-
-#[cfg(feature = "geo")]
-impl ScalarQueryParser for GeoQueryParser {
-    fn visit_between(
-        &self,
-        _: &str,
-        _: &Bound<ScalarValue>,
-        _: &Bound<ScalarValue>,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        Some(IndexedExpression::index_query_with_recheck(
-            column.to_string(),
-            self.index_name.clone(),
-            self.index_type.clone(),
-            Arc::new(GeoQuery::IsNull),
-            true,
-        ))
-    }
-
-    fn visit_comparison(
-        &self,
-        _: &str,
-        _: &ScalarValue,
-        _: &Operator,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_scalar_function(
-        &self,
-        column: &str,
-        _data_type: &DataType,
-        func: &ScalarUDF,
-        args: &[Expr],
-    ) -> Option<IndexedExpression> {
-        if (func.name() == "st_intersects"
-            || func.name() == "st_contains"
-            || func.name() == "st_within"
-            || func.name() == "st_touches"
-            || func.name() == "st_crosses"
-            || func.name() == "st_overlaps"
-            || func.name() == "st_covers"
-            || func.name() == "st_coveredby")
-            && args.len() == 2
-        {
-            let left_arg = &args[0];
-            let right_arg = &args[1];
-            return match (left_arg, right_arg) {
-                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
-                    let mut field = Field::new("_geo", left_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: left_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
-                    let mut field = Field::new("_geo", right_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: right_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                _ => None,
-            };
         }
         None
     }
@@ -1346,7 +1253,25 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
+    ///
+    /// Set `needs_recheck` when the results of the index are inexact and have to be
+    /// filtered again. A [`ScalarQueryParser`] outside this crate builds its answer here.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_index::scalar::AnyQuery;
+    /// # use lance_index::scalar::expression::IndexedExpression;
+    /// # fn parse(query: Arc<dyn AnyQuery>) -> IndexedExpression {
+    /// IndexedExpression::index_query_with_recheck(
+    ///     "column".to_string(),
+    ///     "column_idx".to_string(),
+    ///     "MyIndex".to_string(),
+    ///     query,
+    ///     true,
+    /// )
+    /// # }
+    /// ```
+    pub fn index_query_with_recheck(
         column: String,
         index_name: String,
         index_type: String,
@@ -1418,13 +1343,18 @@ impl IndexedExpression {
         }
     }
 
-    /// Try and perform a logical OR of two indexed expressions
+    /// Try and perform a logical OR of two indexed expressions, where `expr` is the
+    /// original OR expression
     ///
-    /// This is a bit tricky because something like:
+    /// The refine expressions cannot be OR'd on their own because something like:
     ///   (color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)
     /// is not equivalent to:
     ///   (color == 'blue' OR color == 'green') AND (size < 20 OR size < 50)
-    fn maybe_or(self, other: Self) -> Option<Self> {
+    ///
+    /// Every row matching a side is in the result of that side's index query, so the OR
+    /// of the two index queries still finds every matching row. If either side has a
+    /// refine then the rows found are refined with the original expression.
+    fn maybe_or(self, other: Self, expr: &BinaryExpr) -> Option<Self> {
         // If either expression is missing a scalar_query then we need to load all rows from
         // the database and so we short-circuit and return None
         let scalar_query = self.scalar_query?;
@@ -1433,28 +1363,8 @@ impl IndexedExpression {
             Box::new(scalar_query),
             Box::new(other_scalar_query),
         ));
-
-        let refine_expr = match (self.refine_expr, other.refine_expr) {
-            // TODO
-            //
-            // To handle these cases we need a way of going back from a scalar expression query to a logical DF expression (perhaps
-            // we can store the expression that led to the creation of the query)
-            //
-            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)"
-            //
-            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'" but then we need to
-            // refine that load with the full original expression which, at the moment, we no longer have.
-            (Some(_), Some(_)) => {
-                return None;
-            }
-            (Some(_), None) => {
-                return None;
-            }
-            (None, Some(_)) => {
-                return None;
-            }
-            (None, None) => None,
-        };
+        let refine_expr = (self.refine_expr.is_some() || other.refine_expr.is_some())
+            .then(|| Expr::BinaryExpr(expr.clone()));
         Some(Self {
             scalar_query,
             refine_expr,
@@ -2451,7 +2361,7 @@ fn visit_or(
     let left = visit_node(&expr.left, index_info, depth + 1)?;
     let right = visit_node(&expr.right, index_info, depth + 1)?;
     Ok(match (left, right) {
-        (Some(left), Some(right)) => left.maybe_or(right),
+        (Some(left), Some(right)) => left.maybe_or(right, expr),
         // If one side can use an index and the other side cannot then
         // we must abandon the entire thing.  For example, consider the
         // query "color == 'blue' or size > 10" where color is indexed but
@@ -3465,18 +3375,81 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left, right)),
+                scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
                 refine_expr: Some(refine),
             }),
             false,
         );
-        // Examples of things that are not yet supported but should be supportable someday
-
-        // OR'd group of refined index searches (see IndexedExpression::or for details)
-        check_no_index(
+        // OR'd group of refined index searches: the OR of the index searches finds every
+        // row either side could match and the original OR refines them
+        let col = |name: &str| Expr::Column(Column::new_unqualified(name));
+        let aisle_refined = col("aisle")
+            .eq(datafusion_expr::lit(10_i64))
+            .and(col("size").gt(datafusion_expr::lit(30_i64)));
+        let color_refined = col("color")
+            .eq(datafusion_expr::lit("blue"))
+            .and(col("size").gt(datafusion_expr::lit(20_i64)));
+        let or_query = ScalarIndexExpr::Or(left, right.clone());
+        check(
+            &index_info,
+            "(aisle = 10 AND size > 30) OR color = 'blue'",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(col("color").eq(datafusion_expr::lit("blue"))),
+                ),
+            }),
+            false,
+        );
+        check(
             &index_info,
             "(aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(aisle_refined.clone().or(color_refined.clone())),
+            }),
+            false,
         );
+        // Nested in an AND, the original OR is AND'd with the other refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)) AND size < 50",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(color_refined.clone())
+                        .and(col("size").lt(datafusion_expr::lit(50_i64))),
+                ),
+            }),
+            false,
+        );
+        // Nested in an OR, the outermost OR is the refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR color = 'blue') OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(ScalarIndexExpr::Or(Box::new(or_query), right)),
+                refine_expr: Some(
+                    aisle_refined
+                        .or(col("color").eq(datafusion_expr::lit("blue")))
+                        .or(color_refined),
+                ),
+            }),
+            false,
+        );
+        // An index search with a refine cannot be negated, so NOT gives up on the index
+        check_no_index(
+            &index_info,
+            "NOT ((aisle = 10 AND size > 30) OR color = 'blue')",
+        );
+        // A side with no index search still makes the OR a full scan
+        check_no_index(&index_info, "(aisle = 10 AND size > 30) OR size < 5");
+
+        // Examples of things that are not yet supported but should be supportable someday
 
         // Non-normalized arithmetic (can use expression simplification)
         check_no_index(&index_info, "aisle + 3 < 10");

@@ -318,12 +318,12 @@ impl ScalarIndex for LabelListIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     fn results_are_row_addresses(&self) -> bool {
         self.values_index.results_are_row_addresses()
+    }
+
+    fn can_remap(&self) -> bool {
+        true
     }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
@@ -1108,6 +1108,10 @@ impl BasicTrainer for LabelListIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1532,7 +1536,7 @@ mod tests {
     // Every LabelList build or update now sorts through DataFusion with spilling
     // enabled. Most tests below get that from the default, process-cached
     // session, whose pool `LANCE_MEM_POOL_SIZE` governs, and so share that
-    // resource group -- see the same pattern in btree.rs, json.rs and rtree.rs.
+    // resource group -- see the same pattern in btree.rs and json.rs.
     // The spill-forcing test below passes an explicit `mem_pool_size` for the
     // spilling half, but its baseline build goes through the default session
     // like everything else, so it joins the group too.

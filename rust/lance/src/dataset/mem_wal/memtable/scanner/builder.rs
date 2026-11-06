@@ -27,10 +27,11 @@ use super::exec::{
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
 use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
 };
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// Vector search query parameters.
 #[derive(Debug, Clone)]
@@ -3738,6 +3739,8 @@ mod tests {
             "NOT (i = 7)",
             "i = 7 AND rid > 3",
             "i = 7 OR rid = 0",
+            "(i = 7 AND rid > 3) OR s = 'b'",
+            "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
             "rid >= 6 AND f > 0.0",
             "b",
             "NOT b",
@@ -3768,6 +3771,8 @@ mod tests {
                     "s LIKE 'ap%'",
                     "b",
                     "d = DATE '2022-01-08'",
+                    "(i = 7 AND rid > 3) OR s = 'b'",
+                    "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
                 ] {
                     let (batch_store, indexes, schema) = &memtable;
                     let mut scanner =
