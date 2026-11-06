@@ -1185,7 +1185,7 @@ async fn test_build_index_metadata_from_segments_accepts_carried_fields() {
 /// The per-segment rules only pin the keyed field and its count, so two
 /// segments can disagree about the carried columns and each still pass. That
 /// pair must be refused at commit, because `IndexDescriptionImpl::try_new`
-/// requires `fields` to be identical across segments -- committing it would
+/// requires the same keyed and carried fields across segments -- committing it would
 /// leave `describe_indices` erroring on metadata this call just wrote.
 #[tokio::test]
 async fn test_build_index_metadata_from_segments_rejects_mixed_covering_declarations() {
@@ -1295,12 +1295,12 @@ async fn test_build_index_metadata_from_segments_rejects_wrong_field_provenance(
     assert!(error.to_string().contains("expected keyed field"));
 }
 
-/// Matching cardinality is not enough: `covering_fields` must actually be
-/// the trailing slice of `fields`. `fields = [vector, id]`,
-/// `covering_fields = [999]` has exactly one keyed field but carries a
-/// column that is not even present in `fields`, let alone its suffix.
+/// A segment's declaration is held to the same rule as committed metadata.
+/// `fields = [vector, id, id]`, `covering_fields = [id, id]` has the
+/// expected keyed field but carries one column twice, which neither
+/// covering layout allows.
 #[tokio::test]
-async fn test_build_index_metadata_from_segments_rejects_non_suffix_covering_fields() {
+async fn test_build_index_metadata_from_segments_rejects_a_repeated_covering_field() {
     use lance_datagen::{BatchCount, RowCount, array};
 
     let test_dir = tempfile::tempdir().unwrap();
@@ -1326,8 +1326,8 @@ async fn test_build_index_metadata_from_segments_rejects_non_suffix_covering_fie
         b"segment",
     )
     .await;
-    metadata.fields = vec![vector_field_id, id_field_id];
-    metadata.covering_fields = vec![999];
+    metadata.fields = vec![vector_field_id, id_field_id, id_field_id];
+    metadata.covering_fields = vec![id_field_id, id_field_id];
 
     let error = build_index_metadata_from_segments(
         &dataset,
@@ -1337,7 +1337,7 @@ async fn test_build_index_metadata_from_segments_rejects_non_suffix_covering_fie
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("are not among its fields"));
+    assert!(error.to_string().contains("more than once"), "{error}");
 }
 
 #[tokio::test]
@@ -3044,4 +3044,423 @@ async fn test_committing_a_compaction_an_unsupported_index_covers_is_rejected() 
     let after = manifest_index(&dataset, "id_idx").await;
     assert_eq!(after.uuid, before.uuid);
     assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
+}
+
+/// A commit derives the covering bits from the declarations it commits. A
+/// suffix-layout index needs only the covering bit, so its table stays open
+/// to builds without the independent layout. An index keyed on `a` that
+/// carries `a` and `b` needs both bits. Either reads back as declared, an
+/// unrelated commit keeps the bits, and dropping the index clears them.
+/// On a stable-row-id table the B-tree also stores row addresses, so it
+/// sets the writer-only row-address bit too, which the unrelated commit
+/// keeps and the drop clears.
+#[rstest]
+#[case::suffix(false, false, FLAG_COVERED_INDEX_METADATA)]
+#[case::independent(true, false, FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+#[case::independent_row_addr_btree(true, true, FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+#[tokio::test]
+async fn test_covering_bits_follow_the_committed_declarations(
+    #[case] keys_only: bool,
+    #[case] stable_row_ids: bool,
+    #[case] expected: u64,
+) {
+    let params = stable_row_ids.then(|| WriteParams {
+        enable_stable_row_ids: true,
+        ..Default::default()
+    });
+    let mut dataset = write_btree_table("memory://", &["a"], params).await;
+    let row_addr_fence = |dataset: &Dataset| {
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ROW_ADDR_INDICES,
+            0
+        );
+        dataset.manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES != 0
+    };
+    let a = dataset.schema().field_id("a").unwrap();
+    let b = dataset.schema().field_id("b").unwrap();
+    let plain = dataset.load_indices().await.unwrap()[0].clone();
+    let declaration = if keys_only {
+        (vec![a], vec![a, b])
+    } else {
+        (vec![a, b], vec![b])
+    };
+
+    let transaction = redeclare_covering(
+        &dataset,
+        &plain,
+        declaration.0.clone(),
+        declaration.1.clone(),
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(covering_bits(&dataset), (expected, expected));
+    assert_eq!(row_addr_fence(&dataset), stable_row_ids);
+
+    dataset.delete("a = 0").await.unwrap();
+    assert_eq!(covering_bits(&dataset), (expected, expected));
+    assert_eq!(row_addr_fence(&dataset), stable_row_ids);
+    let stored = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (stored[0].fields.clone(), stored[0].covering_fields.clone()),
+        declaration
+    );
+    assert_eq!(stored[0].keyed_field(), Some(a));
+
+    dataset.drop_index(&plain.name).await.unwrap();
+    assert_eq!(covering_bits(&dataset), (0, 0));
+    assert!(!row_addr_fence(&dataset));
+}
+
+/// A segment keyed on `a` and `b` that carries `a` is composite, so it
+/// cannot commit as an index on `a`.
+#[rstest]
+#[case::keys_only(&["a"], &["b"], true)]
+#[case::carries_its_leading_key(&["a", "b"], &["a"], false)]
+#[tokio::test]
+async fn test_commit_existing_index_segments_reads_keys_like_the_manifest(
+    #[case] fields: &[&str],
+    #[case] covering_fields: &[&str],
+    #[case] commits: bool,
+) {
+    let mut dataset = write_btree_table("memory://", &[], None).await;
+    let ids = |names: &[&str]| -> Vec<i32> {
+        names
+            .iter()
+            .map(|name| dataset.schema().field_id(name).unwrap())
+            .collect()
+    };
+    let a = dataset.schema().field_id("a").unwrap();
+    let segment = IndexMetadata {
+        fields: ids(fields),
+        covering_fields: ids(covering_fields),
+        ..dataset
+            .create_index_builder(
+                &["a"],
+                IndexType::BTree,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            )
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+
+    let committed = dataset
+        .commit_existing_index_segments("a_idx", "a", vec![segment.clone()])
+        .await;
+
+    if !commits {
+        let error = committed.unwrap_err();
+        assert!(
+            error.to_string().contains("expected keyed field"),
+            "unexpected error: {error}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let stored = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored[0].keyed_field(), Some(a));
+    assert_eq!(stored[0].covering_fields, segment.covering_fields);
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(covering_bits(&dataset), (covering, covering));
+}
+
+/// A table of two fragments with columns `a`, `b` and `c`, and one
+/// uncommitted BTree segment on `a` per fragment.
+async fn two_btree_segments() -> (Dataset, [IndexMetadata; 2]) {
+    let data = gen_batch()
+        .col("a", array::step::<Int32Type>())
+        .col("b", array::step::<Int32Type>())
+        .col("c", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 20,
+            max_rows_per_group: 20,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    let mut segments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        segments.push(
+            dataset
+                .create_index_builder(&["a"], IndexType::BTree, &params)
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    (dataset, segments.try_into().unwrap())
+}
+
+#[tokio::test]
+async fn test_commit_existing_index_segments_accepts_one_index_in_both_layouts() {
+    let (mut dataset, [first, second]) = two_btree_segments().await;
+    let [a, b] = ["a", "b"].map(|name| dataset.schema().field_id(name).unwrap());
+    let keys_only = IndexMetadata {
+        fields: vec![a],
+        covering_fields: vec![b],
+        ..first
+    };
+    let suffix = IndexMetadata {
+        fields: vec![a, b],
+        covering_fields: vec![b],
+        ..second
+    };
+
+    dataset
+        .commit_existing_index_segments("a_idx", "a", vec![keys_only, suffix])
+        .await
+        .unwrap();
+
+    let stored = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored
+            .iter()
+            .all(|segment| segment.keyed_field() == Some(a) && segment.covering_fields == [b])
+    );
+}
+
+#[rstest]
+#[case::same_declaration("b", true)]
+#[case::different_carried_field("c", false)]
+#[tokio::test]
+async fn test_commit_existing_index_segments_retains_a_sibling_in_the_other_layout(
+    #[case] carried_by_second: &str,
+    #[case] commits: bool,
+) {
+    let (mut dataset, [first, second]) = two_btree_segments().await;
+    let [a, b, carried] =
+        ["a", "b", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
+    let first = IndexMetadata {
+        fields: vec![a],
+        covering_fields: vec![b],
+        ..first
+    };
+    let second = IndexMetadata {
+        fields: vec![a, carried],
+        covering_fields: vec![carried],
+        ..second
+    };
+    dataset
+        .commit_existing_index_segments("a_idx", "a", vec![first])
+        .await
+        .unwrap();
+
+    let committed = dataset
+        .commit_existing_index_segments("a_idx", "a", vec![second])
+        .await;
+
+    if !commits {
+        let error = committed.unwrap_err();
+        assert!(
+            error.to_string().contains("cannot mix declarations"),
+            "unexpected error: {error}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let stored = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored
+            .iter()
+            .all(|segment| segment.keyed_field() == Some(a) && segment.covering_fields == [b])
+    );
+}
+
+/// A commit that loses a race retries against the winner's index list. The
+/// retry here needs the independent layout, so the suffix entry the winner
+/// committed must be stored as its keys in that same manifest: the flag is
+/// never published beside a suffix-layout entry.
+#[tokio::test]
+async fn test_retry_stores_the_winners_suffix_entry_as_its_keys() {
+    let mut dataset = write_btree_table("memory://", &["a", "c"], None).await;
+    let [a, b, c] = ["a", "b", "c"].map(|name| dataset.schema().field_id(name).unwrap());
+    let indices = dataset.load_indices().await.unwrap();
+    let plain = |keyed: i32| {
+        indices
+            .iter()
+            .find(|index| index.fields == [keyed])
+            .unwrap()
+            .clone()
+    };
+    let winner = redeclare_covering(&dataset, &plain(a), vec![a, b], vec![b]);
+    let retried = redeclare_covering(&dataset, &plain(c), vec![c], vec![c, b]);
+
+    dataset
+        .apply_commit(winner, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        covering_bits(&dataset),
+        (FLAG_COVERED_INDEX_METADATA, FLAG_COVERED_INDEX_METADATA)
+    );
+    dataset
+        .apply_commit(retried, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(covering_bits(&dataset), (covering, covering));
+
+    let reader = dataset
+        .object_store
+        .open(&dataset.manifest_location.path)
+        .await
+        .unwrap();
+    let section: lance_table::format::pb::IndexSection =
+        lance_io::utils::read_message(reader.as_ref(), dataset.manifest.index_section.unwrap())
+            .await
+            .unwrap();
+    let stored_winner = section
+        .indices
+        .iter()
+        .find(|entry| entry.name == plain(a).name)
+        .unwrap();
+    assert_eq!(
+        (
+            stored_winner.fields.clone(),
+            stored_winner.covering_fields.clone()
+        ),
+        (vec![a], vec![b]),
+        "the winner's suffix entry must be stored as its keys"
+    );
+
+    let decoded = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await
+    .unwrap();
+    for (keyed, covering_fields) in [(a, vec![b]), (c, vec![c, b])] {
+        let index = decoded
+            .iter()
+            .find(|index| index.keyed_field() == Some(keyed))
+            .unwrap();
+        assert_eq!(index.covering_fields, covering_fields);
+    }
+}
+
+/// Once the independent bit stores a single-key suffix entry as its keys,
+/// that entry reads back keys-only, so the bit outlives the independent
+/// index that set it. The committing session caches what a fresh reader
+/// decodes, so dropping that index sets the same bits warm or cold.
+/// Dropping the last covered index is the atomic reverse conversion the
+/// format asks for, so both bits clear together.
+#[rstest]
+#[case::warm(false)]
+#[case::cold(true)]
+#[tokio::test]
+async fn test_independent_bit_outlives_the_index_that_set_it(#[case] cold: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = write_btree_table(dir.as_str(), &["a", "c"], None).await;
+    let [a, b, c] = ["a", "b", "c"].map(|name| dataset.schema().field_id(name).unwrap());
+    let indices = dataset.load_indices().await.unwrap();
+    let plain = |keyed: i32| {
+        indices
+            .iter()
+            .find(|index| index.fields == [keyed])
+            .unwrap()
+            .clone()
+    };
+    for (keyed, fields, covering_fields) in [(a, vec![a, b], vec![b]), (c, vec![c], vec![c, b])] {
+        let transaction = redeclare_covering(&dataset, &plain(keyed), fields, covering_fields);
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+    if cold {
+        dataset = DatasetBuilder::from_uri(dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+    }
+
+    dataset.drop_index(&plain(c).name).await.unwrap();
+
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(covering_bits(&dataset), (covering, covering));
+    let suffix = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == plain(a).name)
+        .cloned()
+        .unwrap();
+    assert_eq!((suffix.fields, suffix.covering_fields), (vec![a], vec![b]));
+
+    dataset.drop_index(&plain(a).name).await.unwrap();
+    assert_eq!(covering_bits(&dataset), (0, 0));
+}
+
+/// `Manifest::shallow_clone` builds the clone's flags directly, and the
+/// clone writes back the index section it read, so both bits must survive.
+#[tokio::test]
+async fn test_shallow_clone_keeps_the_independent_covering_contract() {
+    let dir = TempStrDir::default();
+    let mut dataset = write_btree_table(dir.as_str(), &["a"], None).await;
+    let a = dataset.schema().field_id("a").unwrap();
+    let b = dataset.schema().field_id("b").unwrap();
+    let plain = dataset.load_indices().await.unwrap()[0].clone();
+    let transaction = redeclare_covering(&dataset, &plain, vec![a], vec![a, b]);
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(covering_bits(&cloned), (covering, covering));
+    let stored = read_manifest_indexes(
+        &cloned.object_store,
+        &cloned.manifest_location,
+        &cloned.manifest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (stored[0].fields.clone(), stored[0].covering_fields.clone()),
+        (vec![a], vec![a, b])
+    );
 }

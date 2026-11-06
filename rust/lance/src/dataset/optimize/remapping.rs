@@ -5011,13 +5011,18 @@ mod tests {
     /// the `Drop` arm returns without committing. The `Keep`/`Remapped` arms are
     /// therefore unreachable for a covered index, so a "declaration preserved"
     /// assertion would pass even if those arms stopped preserving it. Assert the
-    /// refusal instead.
+    /// refusal instead. A keys-only declaration must resolve its keyed field
+    /// from the shape and then hit the same refusal.
+    #[rstest::rstest]
+    #[case::suffix(false)]
+    #[case::keys_only(true)]
     #[tokio::test]
-    async fn test_remap_column_index_refuses_a_covered_index() {
+    async fn test_remap_column_index_refuses_a_covered_index(#[case] keys_only: bool) {
         use crate::dataset::index::DatasetIndexRemapperOptions;
         use crate::dataset::optimize::{
             CompactionOptions, commit_compaction, plan_compaction, rewrite_files,
         };
+        use crate::dataset::transaction::{Operation, Transaction};
         use crate::utils::test::covering;
         use lance_core::utils::tempfile::TempStrDir;
         use std::borrow::Cow;
@@ -5028,7 +5033,30 @@ mod tests {
         covering::append_vector_payload_rows(&mut dataset, covering::ROWS_PER_FRAGMENT).await;
         covering::create_ivf_pq_index(&mut dataset, "vec").await;
 
-        let (_, id_field_id) = covering::declare_covering(&mut dataset, "vec", "payload").await;
+        let (vec_field_id, id_field_id) =
+            covering::declare_covering(&mut dataset, "vec", "payload").await;
+        if keys_only {
+            let suffix = dataset.load_indices().await.unwrap()[0].clone();
+            let keys_only = IndexMetadata {
+                fields: vec![vec_field_id],
+                ..suffix.clone()
+            };
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![keys_only],
+                            removed_indices: vec![suffix],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
         let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
 
         // Delete some (not all) rows so the remap has real work to do and does
@@ -5066,6 +5094,12 @@ mod tests {
             .find(|idx| idx.name == index_name)
             .cloned()
             .expect("precondition: the covered index exists");
+        assert_eq!(
+            before.requires_independent_contract(),
+            keys_only,
+            "precondition: the committed layout survived compaction"
+        );
+        assert_eq!(before.keyed_field(), Some(vec_field_id));
 
         // `remap_column_index` is user-directed -- the caller named this index --
         // so it must refuse rather than no-op. Refusing is also what makes this

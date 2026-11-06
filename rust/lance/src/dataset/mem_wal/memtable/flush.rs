@@ -737,10 +737,13 @@ impl MemTableFlusher {
                 }
                 FlushOutcome::Wrote(index_meta) => {
                     // Queries find a generation's index by name and field.
-                    if index_meta.name != spec.name || index_meta.fields != spec.field_ids {
+                    if index_meta.name != spec.name || index_meta.keyed_fields() != spec.field_ids {
                         return Err(Error::internal(format!(
                             "index '{}' on fields {:?} recorded its file as '{}' on fields {:?}",
-                            spec.name, spec.field_ids, index_meta.name, index_meta.fields
+                            spec.name,
+                            spec.field_ids,
+                            index_meta.name,
+                            index_meta.keyed_fields()
                         )));
                     }
                     created.push(*index_meta);

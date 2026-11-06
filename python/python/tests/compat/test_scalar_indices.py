@@ -9,6 +9,7 @@ BLOOMFILTER, JSON, FTS) created with one version of Lance can be read
 and written by other versions.
 """
 
+import dataclasses
 import os
 import shutil
 from pathlib import Path
@@ -1006,3 +1007,89 @@ class FtsIndex(UpgradeDowngradeTest):
         if method_name in {"create", "check_write"}:
             return {"LANCE_FTS_FORMAT_VERSION": "1"}
         return {}
+
+
+class CoveredBTreeIndex(UpgradeDowngradeTest):
+    """A BTREE index on `a` that carries `b`, in either covering layout.
+
+    The suffix layout, `fields=[a, b]`, stays readable by releases that know
+    covered indices. The keys-only layout, `fields=[a]` carrying `a` and `b`,
+    needs feature flag 1 << 13, which those releases must refuse.
+    """
+
+    def __init__(self, path: Path, keys_only: bool):
+        self.path = path
+        self.keys_only = keys_only
+
+    def declaration(self) -> dict[str, list[int]]:
+        fields = lance.dataset(self.path).lance_schema.fields()
+        ids = {field.name(): field.id() for field in fields}
+        a_id, b_id = ids["a"], ids["b"]
+        if self.keys_only:
+            return {"fields": [a_id], "covering_fields": [a_id, b_id]}
+        return {"fields": [a_id, b_id], "covering_fields": [b_id]}
+
+    def create(self):
+        shutil.rmtree(self.path, ignore_errors=True)
+        dataset = lance.write_dataset(
+            pa.table({"a": pa.array(range(16)), "b": pa.array(range(16))}),
+            self.path,
+            data_storage_version="2.1",
+        )
+        dataset.create_scalar_index("a", "BTREE")
+        plain = dataset.get_transactions(1)[0].operation.new_indices[0]
+        covered = dataclasses.replace(plain, **self.declaration())
+        lance.LanceDataset.commit(
+            self.path,
+            lance.LanceOperation.CreateIndex(
+                new_indices=[covered], removed_indices=[plain]
+            ),
+            read_version=dataset.version,
+        )
+
+    def check_read(self):
+        lance.dataset(self.path).count_rows()
+
+    def check_commit_then_drop_transactions(self):
+        dataset = lance.dataset(self.path)
+        committed = dataset.read_transaction(dataset.version - 1).operation
+        dropped = dataset.read_transaction(dataset.version).operation
+        declaration = self.declaration()
+        for index in committed.new_indices + dropped.removed_indices:
+            carried = index.covering_fields
+            assert carried == declaration["covering_fields"]
+            assert index.fields[: len(index.fields) - len(carried)] == [
+                declaration["fields"][0]
+            ]
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("keys_only", [False, True], ids=["suffix", "keys_only"])
+def test_independent_covering_fields_with_older_release(
+    venv_factory, tmp_path, keys_only
+):
+    case = CoveredBTreeIndex(tmp_path / "data.lance", keys_only)
+    case.create()
+    segment = lance.dataset(case.path).describe_indices()[0].segments[0]
+    assert segment.covering_fields == case.declaration()["covering_fields"]
+    case.check_read()
+
+    older = venv_factory.get_venv("13.0.0")
+    if keys_only:
+        with pytest.raises(RuntimeError, match="cannot be read by this version"):
+            older.execute_method(case, "check_read")
+    else:
+        older.execute_method(case, "check_read")
+
+
+@pytest.mark.compat
+def test_keys_only_index_transactions_with_older_release(venv_factory, tmp_path):
+    case = CoveredBTreeIndex(tmp_path / "data.lance", keys_only=True)
+    case.create()
+    dataset = lance.dataset(case.path)
+    dataset.drop_index(dataset.describe_indices()[0].name)
+    case.check_commit_then_drop_transactions()
+
+    venv_factory.get_venv("13.0.0").execute_method(
+        case, "check_commit_then_drop_transactions"
+    )

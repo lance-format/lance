@@ -11,8 +11,8 @@
 //! metadata it stamps, the validation that runs before it.
 
 use crate::feature_flags::{
-    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
-    FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
     ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
     validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
@@ -2055,6 +2055,18 @@ impl Transaction {
         {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+        // Derived the same way. Leaving it unset is the atomic reverse
+        // conversion the format asks for: every entry left is in the suffix
+        // layout, and the manifest writer stores them all that way. A
+        // single-key entry the bit once normalized reads back keys-only, so the
+        // bit stays until that entry goes too.
+        if final_indices
+            .iter()
+            .any(IndexMetadata::requires_independent_contract)
+        {
+            manifest.reader_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
+            manifest.writer_feature_flags |= FLAG_INDEPENDENT_COVERING_FIELDS;
         }
         apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
 
@@ -4179,6 +4191,98 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
+        IndexMetadata {
+            fields,
+            covering_fields,
+            ..sample_index_metadata(name)
+        }
+    }
+
+    /// The commit derives both covering bits from the index list it commits.
+    /// A suffix-layout entry needs only the covering bit, so a table with only
+    /// those stays readable by builds without the independent layout.
+    #[rstest]
+    #[case::uncovered(vec![], 0)]
+    #[case::suffix_only(vec![(vec![0, 1], vec![1])], FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(vec![(vec![0], vec![0, 1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::mixed(vec![(vec![0, 1], vec![1]), (vec![0], vec![1])], FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    fn build_manifest_derives_the_covering_bits(
+        #[case] declarations: Vec<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let manifest = sample_manifest();
+        let new_indices = declarations
+            .into_iter()
+            .enumerate()
+            .map(|(i, (fields, covering_fields))| {
+                covered_index(&format!("idx_{i}"), fields, covering_fields)
+            })
+            .collect();
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let (built, _) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+    }
+
+    /// Dropping the last entry that needs the independent layout clears its
+    /// bit, and the covering bit with it unless a covered entry remains. The
+    /// remaining entries have the shapes a reader decodes from the manifest:
+    /// a single-key suffix entry the flag normalized reads back keys-only and
+    /// keeps the bit, while a composite one reads back in the suffix layout.
+    #[rstest]
+    #[case::last_covered_index(None, 0)]
+    #[case::normalized_entry_remains(Some((vec![0], vec![1])), FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::composite_suffix_entry_remains(Some((vec![0, 1, 1], vec![1])), FLAG_COVERED_INDEX_METADATA)]
+    fn dropping_the_last_independent_entry_clears_its_bit(
+        #[case] remaining: Option<(Vec<i32>, Vec<i32>)>,
+        #[case] expected: u64,
+    ) {
+        let covering_flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        let mut manifest = sample_manifest();
+        manifest.reader_feature_flags |= covering_flags;
+        manifest.writer_feature_flags |= covering_flags;
+        let independent = covered_index("independent", vec![0], vec![0, 1]);
+        let keep_remaining = remaining.is_some();
+        let mut current_indices = vec![independent.clone()];
+        if let Some((fields, covering_fields)) = remaining {
+            current_indices.push(covered_index("remaining", fields, covering_fields));
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![independent],
+            },
+            None,
+        );
+
+        let (built, final_indices) = transaction
+            .build_manifest(
+                Some(&manifest),
+                current_indices,
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
+
+        assert_eq!(built.reader_feature_flags & covering_flags, expected);
+        assert_eq!(built.writer_feature_flags & covering_flags, expected);
+        assert_eq!(final_indices.len(), usize::from(keep_remaining));
     }
 
     #[test]

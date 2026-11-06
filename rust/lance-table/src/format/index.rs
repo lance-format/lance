@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::pb;
+use crate::feature_flags::CoveringContract;
 use lance_core::cache::{CacheEntryReader, CacheEntryWriter};
 use lance_core::{Error, Result};
 
@@ -54,16 +55,21 @@ pub struct IndexMetadata {
     /// may instead be merely carried, not keyed on -- see [`Self::covering_fields`].
     pub fields: Vec<i32>,
 
-    /// Fields whose values this index carries but is not keyed on.
+    /// Fields whose values this index carries.
     ///
-    /// Always a suffix of [`Self::fields`], and never all of it, so
-    /// `fields[0]` is always a column the index is keyed on. Empty for an
-    /// index that carries no extra columns.
+    /// Empty for an index that carries no extra columns. Otherwise the shape
+    /// decides how to read it. A trailing slice of [`Self::fields`] shorter
+    /// than `fields` is the suffix layout: those entries of `fields` are
+    /// carried, not keyed on. Any other declaration is independent: every
+    /// entry of `fields` is a key, and this list may repeat one of them.
+    /// [`Self::keyed_fields`] reads the shape, and dependency checks read
+    /// [`Self::dependency_fields`], which covers both layouts.
     ///
-    /// These ids also appear in [`Self::fields`]. That is deliberate: every
-    /// consumer that reads `fields` as the index's dependency set then covers
-    /// them with no change. Dependency checks read
-    /// [`Self::dependency_fields`], which does not rely on that repetition.
+    /// A manifest stores its whole index section in one layout, selected by
+    /// [`FLAG_INDEPENDENT_COVERING_FIELDS`](crate::feature_flags::FLAG_INDEPENDENT_COVERING_FIELDS).
+    /// [`Self::from_manifest_proto`] and [`Self::to_manifest_proto`] convert
+    /// between that layout and this shape. A transaction file always stores
+    /// the suffix layout.
     pub covering_fields: Vec<i32>,
 
     /// Human readable index name
@@ -280,16 +286,36 @@ impl IndexMetadata {
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
-    /// columns of [`Self::covering_fields`] removed.
+    /// columns of [`Self::covering_fields`] removed when they use the suffix
+    /// layout. Under the independent layout this is all of `fields`.
     ///
     /// Only this prefix decides which column an index answers for;
     /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
-    /// that declares no fields, and empty for a declaration longer than
-    /// `fields`: decoding validates, but metadata built by a caller this build
-    /// never validated does not, and failing closed beats an underflow.
+    /// that declares no fields.
     pub fn keyed_fields(&self) -> &[i32] {
-        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
-        &self.fields[..keyed]
+        Self::keyed_fields_of(&self.fields, &self.covering_fields)
+    }
+
+    /// [`Self::keyed_fields`] for a field list and covering declaration held
+    /// outside an `IndexMetadata`.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7, 11], &[11]), &[7]);
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7], &[7, 11]), &[7]);
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7, 11], &[7]), &[7, 11]);
+    /// ```
+    pub fn keyed_fields_of<'a>(fields: &'a [i32], covering_fields: &[i32]) -> &'a [i32] {
+        &fields[..suffix_layout_key_count(fields, covering_fields).unwrap_or(fields.len())]
+    }
+
+    /// Whether only [`CoveringContract::Independent`] can store this entry,
+    /// because its carried fields are not a shorter trailing slice of
+    /// [`Self::fields`].
+    pub fn requires_independent_contract(&self) -> bool {
+        !self.covering_fields.is_empty()
+            && suffix_layout_key_count(&self.fields, &self.covering_fields).is_none()
     }
 
     /// The single column this index is keyed on, or `None` when it is keyed on
@@ -302,6 +328,34 @@ impl IndexMetadata {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    /// Whether `other` is keyed on the same fields and carries the same
+    /// fields, whichever layout each entry uses.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// let entry = |fields: Vec<i32>, covering_fields: Vec<i32>| IndexMetadata {
+    ///     uuid: uuid::Uuid::new_v4(),
+    ///     name: "idx".to_string(),
+    ///     fields,
+    ///     covering_fields,
+    ///     dataset_version: 1,
+    ///     fragment_bitmap: None,
+    ///     index_details: None,
+    ///     index_version: 0,
+    ///     created_at: None,
+    ///     base_id: None,
+    ///     files: None,
+    ///     clustering_id: None,
+    ///     metadata: Default::default(),
+    /// };
+    /// assert!(entry(vec![7, 11], vec![11]).declares_same_fields(&entry(vec![7], vec![11])));
+    /// assert!(!entry(vec![7], vec![11]).declares_same_fields(&entry(vec![7], vec![13])));
+    /// ```
+    pub fn declares_same_fields(&self, other: &Self) -> bool {
+        self.keyed_fields() == other.keyed_fields() && self.covering_fields == other.covering_fields
     }
 
     /// Every field whose change can leave this index stale: [`Self::fields`],
@@ -353,19 +407,51 @@ impl IndexMetadata {
         Cow::Owned(fields)
     }
 
-    /// Check the covering declaration against [`Self::fields`].
+    /// Check the rules a covering declaration obeys in either layout.
+    ///
+    /// No carried column may repeat, and a covered index must be keyed on at
+    /// least one field. An empty declaration is always valid, which is what
+    /// keeps the system indices -- `mem_wal` and `frag_reuse`, both of which
+    /// commit no fields at all -- passing this check. Whether the shape is
+    /// stored as the suffix layout or the independent one is checked where a
+    /// manifest is decoded or encoded, which knows the manifest's contract.
+    pub fn validate_covering_fields(&self) -> Result<()> {
+        if self.covering_fields.is_empty() {
+            return Ok(());
+        }
+        self.validate_no_repeated_covering_field()?;
+        if self.fields.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering fields {:?} but no fields; \
+                 at least one field must remain indexed",
+                self.name, self.covering_fields,
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_no_repeated_covering_field(&self) -> Result<()> {
+        let mut seen = HashSet::with_capacity(self.covering_fields.len());
+        if let Some(duplicate) = self.covering_fields.iter().find(|f| !seen.insert(**f)) {
+            return Err(Error::invalid_input(format!(
+                "index '{}' declares covering field {} more than once in {:?}",
+                self.name, duplicate, self.covering_fields,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check the covering declaration against [`Self::fields`] under
+    /// [`CoveringContract::Suffix`].
     ///
     /// Carried columns must be a suffix of `fields` and must not consume all of
-    /// it, so `fields[0]` is always a column the index is keyed on. An empty
-    /// declaration is always valid, which is what keeps the system indices --
-    /// `mem_wal` and `frag_reuse`, both of which commit no fields at all --
-    /// passing this check.
+    /// it, so `fields[0]` is always a column the index is keyed on.
     ///
     /// The rules are checked from most to least specific, because one bad
     /// declaration usually trips several: an id that is not a field at all is
     /// reported ahead of the length and ordering rules, which would otherwise
     /// name a consequence instead of the cause.
-    pub fn validate_covering_fields(&self) -> Result<()> {
+    fn validate_suffix_contract(&self) -> Result<()> {
         if self.covering_fields.is_empty() {
             return Ok(());
         }
@@ -388,13 +474,7 @@ impl IndexMetadata {
         // below cannot stand in for this, because `fields` may repeat the id in
         // the same positions -- `fields = [7, 11, 11]` has `[11, 11]` as a
         // genuine tail.
-        let mut seen = HashSet::with_capacity(self.covering_fields.len());
-        if let Some(duplicate) = self.covering_fields.iter().find(|f| !seen.insert(**f)) {
-            return Err(Error::invalid_input(format!(
-                "index '{}' declares covering field {} more than once in {:?}",
-                self.name, duplicate, self.covering_fields,
-            )));
-        }
+        self.validate_no_repeated_covering_field()?;
 
         if self.covering_fields.len() >= self.fields.len() {
             return Err(Error::invalid_input(format!(
@@ -415,6 +495,110 @@ impl IndexMetadata {
 
         Ok(())
     }
+
+    /// Decode one entry of a manifest's index section under the manifest's
+    /// [`CoveringContract`].
+    ///
+    /// Under [`CoveringContract::Suffix`] the carried fields must be the
+    /// trailing entries of `fields`. Under [`CoveringContract::Independent`]
+    /// an entry whose carried fields happen to end its key list gets them
+    /// appended, so its in-memory shape keeps the same keys.
+    pub fn from_manifest_proto(
+        proto: pb::IndexMetadata,
+        contract: CoveringContract,
+    ) -> Result<Self> {
+        let mut metadata = Self::decode(proto)?;
+        match contract {
+            // A manifest that fails this was written by something that did not
+            // follow the format contract; refuse it rather than read it as an
+            // independent declaration with different keys.
+            CoveringContract::Suffix => metadata.validate_suffix_contract()?,
+            CoveringContract::Independent => {
+                metadata.validate_covering_fields()?;
+                metadata.restore_suffix_layout();
+            }
+        }
+        Ok(metadata)
+    }
+
+    /// The shape this entry has once a manifest written under `contract`
+    /// stores it and a reader decodes it again.
+    ///
+    /// A commit caches its index list in this shape, so the session that wrote
+    /// a manifest reads the same entries a fresh reader would.
+    pub fn into_stored_shape(mut self, contract: CoveringContract) -> Self {
+        if contract == CoveringContract::Independent {
+            if let Some(key_count) = suffix_layout_key_count(&self.fields, &self.covering_fields) {
+                self.fields.truncate(key_count);
+            }
+            self.restore_suffix_layout();
+        }
+        self
+    }
+
+    /// Under the independent contract, an entry whose carried fields happen to
+    /// end its key list would read as the suffix layout with fewer keys, so its
+    /// carried fields are appended to keep its keys.
+    fn restore_suffix_layout(&mut self) {
+        if suffix_layout_key_count(&self.fields, &self.covering_fields).is_some() {
+            self.fields.extend_from_slice(&self.covering_fields);
+        }
+    }
+
+    /// Encode this entry for a manifest's index section under `contract`.
+    ///
+    /// Under [`CoveringContract::Independent`] an entry in the suffix layout
+    /// drops its carried suffix from `fields`, the normalization the format
+    /// requires of every entry once the flag is set. Under
+    /// [`CoveringContract::Suffix`] an entry only the independent layout can
+    /// store is refused.
+    pub fn to_manifest_proto(&self, contract: CoveringContract) -> Result<pb::IndexMetadata> {
+        let suffix_key_count = match contract {
+            CoveringContract::Suffix => {
+                self.validate_suffix_contract()?;
+                None
+            }
+            CoveringContract::Independent => {
+                self.validate_covering_fields()?;
+                suffix_layout_key_count(&self.fields, &self.covering_fields)
+            }
+        };
+        let mut proto = pb::IndexMetadata::from(self);
+        if let Some(key_count) = suffix_key_count {
+            proto.fields.truncate(key_count);
+        }
+        Ok(proto)
+    }
+
+    /// Encode this entry for a transaction file, in the suffix layout: `fields`
+    /// lists the keys, then the carried fields.
+    ///
+    /// A transaction file records no covering contract, so it uses the layout
+    /// every released reader decodes. [`Self::from_transaction_proto`] reads the
+    /// entry back with the same keys and carried fields.
+    pub(crate) fn to_transaction_proto(&self) -> Result<pb::IndexMetadata> {
+        self.validate_covering_fields()?;
+        let mut proto = pb::IndexMetadata::from(self);
+        proto.fields = [self.keyed_fields(), &self.covering_fields].concat();
+        Ok(proto)
+    }
+
+    /// Decode one entry of a transaction file, which holds only the suffix
+    /// layout. An entry in any other shape is refused rather than read as
+    /// keys-only.
+    pub(crate) fn from_transaction_proto(proto: pb::IndexMetadata) -> Result<Self> {
+        let metadata = Self::decode(proto)?;
+        metadata.validate_suffix_contract()?;
+        Ok(metadata)
+    }
+}
+
+/// How many leading entries of `fields` are keys under the suffix layout, or
+/// `None` when `covering_fields` is not a shorter trailing slice of `fields`
+/// and so can only be read as independent.
+fn suffix_layout_key_count(fields: &[i32], covering_fields: &[i32]) -> Option<usize> {
+    let key_count = fields.len().checked_sub(covering_fields.len())?;
+    (key_count > 0 && fields.ends_with(covering_fields)).then_some(key_count)
 }
 
 impl DeepSizeOf for IndexMetadata {
@@ -447,10 +631,22 @@ impl DeepSizeOf for IndexMetadata {
     }
 }
 
+/// Decodes an entry outside a manifest or a transaction file, such as a cache
+/// entry, and reads its shape as [`IndexMetadata::covering_fields`] describes.
+/// Manifest entries go through [`IndexMetadata::from_manifest_proto`], and
+/// transaction entries through `IndexMetadata::from_transaction_proto`.
 impl TryFrom<pb::IndexMetadata> for IndexMetadata {
     type Error = Error;
 
     fn try_from(proto: pb::IndexMetadata) -> Result<Self> {
+        let metadata = Self::decode(proto)?;
+        metadata.validate_covering_fields()?;
+        Ok(metadata)
+    }
+}
+
+impl IndexMetadata {
+    fn decode(proto: pb::IndexMetadata) -> Result<Self> {
         let fragment_bitmap = if proto.fragment_bitmap.is_empty() {
             None
         } else {
@@ -492,7 +688,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             })
             .transpose()?;
 
-        let metadata = Self {
+        Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
             })??,
@@ -508,17 +704,7 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             files,
             clustering_id: proto.clustering_id,
             metadata: proto.metadata,
-        };
-
-        // This is the single boundary between manifest bytes and
-        // `IndexMetadata`, so validating once here is what lets every reader
-        // treat the declaration as a trailing slice of `fields`. A manifest
-        // that fails this was written by something that did not follow the
-        // format contract; refuse it rather than let each use site quietly
-        // ignore the index.
-        metadata.validate_covering_fields()?;
-
-        Ok(metadata)
+        })
     }
 }
 
@@ -834,6 +1020,7 @@ mod tests {
                 clustering_id: None,
                 metadata: Default::default(),
             },
+            index_metadata_with(vec![3], vec![3, 4]),
         ];
 
         // Simulate a disk-backed store: HashMap<String, Vec<u8>>
@@ -861,6 +1048,7 @@ mod tests {
             assert_eq!(orig.uuid, rec.uuid);
             assert_eq!(orig.name, rec.name);
             assert_eq!(orig.fields, rec.fields);
+            assert_eq!(orig.covering_fields, rec.covering_fields);
             assert_eq!(orig.dataset_version, rec.dataset_version);
             assert_eq!(orig.fragment_bitmap, rec.fragment_bitmap);
             assert_eq!(orig.index_version, rec.index_version);
@@ -869,81 +1057,186 @@ mod tests {
         }
     }
 
-    /// The covering declaration must survive both conversion directions.
-    /// A dropped `covering_fields` would leave index files holding carried
-    /// columns the manifest no longer names.
-    #[test]
-    fn test_covering_fields_survives_proto_roundtrip() {
-        let original = IndexMetadata {
-            uuid: Uuid::new_v4(),
-            name: "covered".to_string(),
-            fields: vec![7, 11, 13],
-            covering_fields: vec![11, 13],
-            dataset_version: 1,
-            fragment_bitmap: None,
-            index_details: None,
-            index_version: 0,
-            created_at: None,
-            base_id: None,
-            files: None,
-            clustering_id: None,
-            metadata: Default::default(),
-        };
+    /// The covering declaration must survive both conversion directions under
+    /// either contract. A dropped `covering_fields` would leave index files
+    /// holding carried columns the manifest no longer names.
+    #[rstest]
+    #[case::suffix(CoveringContract::Suffix, vec![7, 11, 13], vec![11, 13], vec![7, 11, 13])]
+    #[case::independent(CoveringContract::Independent, vec![7], vec![11, 13], vec![7])]
+    fn test_covering_fields_survives_proto_roundtrip(
+        #[case] contract: CoveringContract,
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] stored_fields: Vec<i32>,
+    ) {
+        let original = index_metadata_with(fields, covering_fields);
 
-        let proto = pb::IndexMetadata::from(&original);
+        let proto = original.to_manifest_proto(contract).unwrap();
+        assert_eq!(proto.fields, stored_fields);
         assert_eq!(proto.covering_fields, vec![11, 13]);
 
-        let recovered = IndexMetadata::try_from(proto).unwrap();
+        let recovered = IndexMetadata::from_manifest_proto(proto, contract).unwrap();
         assert_eq!(recovered, original);
+        assert_eq!(original.into_stored_shape(contract), recovered);
     }
 
-    /// `TryFrom<pb::IndexMetadata>` is the only path from manifest bytes to
-    /// `IndexMetadata`, so validating here is what lets every reader downstream
-    /// assume the declaration really is a trailing slice of `fields`. Without
-    /// it, a malformed declaration reaches each use site instead, where the
-    /// keyed count saturates to zero and the index is silently ignored.
-    #[test]
-    fn test_try_from_proto_rejects_a_malformed_covering_declaration() {
-        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![7, 11], vec![11]));
-        // The leading entry, not the trailing one: claims the keyed column is
-        // carried.
-        proto.covering_fields = vec![7];
+    /// Under the independent contract both lists are stored as declared: the
+    /// carried list keeps its own order and may repeat a key.
+    #[rstest]
+    #[case::independent(vec![7], vec![13, 11])]
+    #[case::overlap(vec![11, 7], vec![7, 13])]
+    #[case::carries_its_only_key(vec![7], vec![7])]
+    fn independent_field_lists_roundtrip(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+    ) {
+        let metadata = index_metadata_with(fields.clone(), covering_fields.clone());
 
-        let err = IndexMetadata::try_from(proto)
-            .expect_err("a malformed covering declaration must not decode");
-        assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "expected InvalidInput, got {:?}",
-            err
+        let proto = metadata
+            .to_manifest_proto(CoveringContract::Independent)
+            .unwrap();
+        assert_eq!(proto.fields, fields);
+        assert_eq!(proto.covering_fields, covering_fields);
+        assert_eq!(
+            IndexMetadata::from_manifest_proto(proto, CoveringContract::Independent).unwrap(),
+            metadata
         );
-        assert!(
-            err.to_string().contains("must come last"),
-            "unexpected message: {err}"
+    }
+
+    /// Once the flag is set every suffix-layout entry is stored as its key
+    /// prefix, and reading it back gives the same keys. `[7, 11, 11]` carrying
+    /// `[11]` is keyed on 7 and 11; stored as `fields = [7, 11]`, it would read
+    /// as keyed on 7 alone if decode did not restore the suffix layout.
+    #[rstest]
+    #[case::single_key(vec![7, 11], vec![11], vec![7], vec![7])]
+    #[case::carries_its_key(vec![1, 1], vec![1], vec![1], vec![1])]
+    #[case::composite_ending_in_its_carried_field(vec![7, 11, 11], vec![11], vec![7, 11], vec![7, 11])]
+    fn independent_contract_stores_suffix_entries_as_their_keys(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] stored_fields: Vec<i32>,
+        #[case] keyed: Vec<i32>,
+    ) {
+        let metadata = index_metadata_with(fields, covering_fields.clone());
+
+        let proto = metadata
+            .to_manifest_proto(CoveringContract::Independent)
+            .unwrap();
+        assert_eq!(proto.fields, stored_fields);
+        assert_eq!(proto.covering_fields, covering_fields);
+
+        let decoded =
+            IndexMetadata::from_manifest_proto(proto, CoveringContract::Independent).unwrap();
+        assert_eq!(decoded.keyed_fields(), keyed.as_slice());
+        assert_eq!(decoded.covering_fields, covering_fields);
+        assert_eq!(
+            dependency_set(&decoded),
+            dependency_set(&metadata),
+            "the dependency set must not change"
         );
+        assert_eq!(
+            metadata.into_stored_shape(CoveringContract::Independent),
+            decoded,
+            "the committing session must cache what a reader decodes"
+        );
+    }
+
+    fn dependency_set(metadata: &IndexMetadata) -> HashSet<i32> {
+        metadata.dependency_fields().iter().copied().collect()
+    }
+
+    /// The same bytes name different keys under each contract, so decode must
+    /// take the contract from the manifest rather than guess from the shape.
+    #[rstest]
+    #[case::independent(CoveringContract::Independent, vec![7, 11])]
+    #[case::suffix(CoveringContract::Suffix, vec![7])]
+    fn manifest_contract_decides_the_keys_of_a_tail_shaped_entry(
+        #[case] contract: CoveringContract,
+        #[case] keyed: Vec<i32>,
+    ) {
+        let proto = pb::IndexMetadata::from(&index_metadata_with(vec![7, 11], vec![11]));
+
+        let decoded = IndexMetadata::from_manifest_proto(proto, contract).unwrap();
+
+        assert_eq!(decoded.keyed_fields(), keyed.as_slice());
+        assert_eq!(decoded.covering_fields, vec![11]);
+        assert_eq!(dependency_set(&decoded), HashSet::from([7, 11]));
+    }
+
+    /// Without the flag a manifest may only hold suffix-layout entries, so an
+    /// entry that names a key as carried is corrupt there: refused on read,
+    /// and never written. A cache entry keeps its own shape and decodes.
+    #[test]
+    fn suffix_contract_rejects_a_non_tail_covering_declaration() {
+        let metadata = index_metadata_with(vec![7, 11], vec![7]);
+        let proto = pb::IndexMetadata::from(&metadata);
+
+        for err in [
+            IndexMetadata::from_manifest_proto(proto.clone(), CoveringContract::Suffix)
+                .expect_err("a non-tail declaration must not decode without the flag"),
+            metadata
+                .to_manifest_proto(CoveringContract::Suffix)
+                .expect_err("a non-tail declaration must not be written without the flag"),
+        ] {
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {:?}",
+                err
+            );
+            assert!(
+                err.to_string().contains("must come last"),
+                "unexpected message: {err}"
+            );
+        }
+
+        assert_eq!(IndexMetadata::try_from(proto).unwrap(), metadata);
     }
 
     /// Only the keyed prefix decides which column an index answers for, and
-    /// nearly every selection path needs exactly one such column. Metadata read
-    /// from a manifest this build never wrote can still be malformed, so both
-    /// accessors must fail closed -- no keyed field -- rather than underflow.
+    /// nearly every selection path needs exactly one such column. A shorter
+    /// trailing slice of `fields` reads as the suffix layout; any other covered
+    /// shape reads as independent, which only that contract can store.
     #[rstest]
-    #[case::not_covered(vec![7], vec![], vec![7], Some(7))]
-    #[case::covered(vec![7, 11], vec![11], vec![7], Some(7))]
-    #[case::covered_multi(vec![7, 11, 13], vec![11, 13], vec![7], Some(7))]
-    #[case::covered_composite(vec![7, 11, 13], vec![13], vec![7, 11], None)]
-    #[case::composite(vec![7, 11], vec![], vec![7, 11], None)]
-    #[case::system_index_no_fields(vec![], vec![], vec![], None)]
-    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], vec![], None)]
+    #[case::not_covered(vec![7], vec![], vec![7], Some(7), false)]
+    #[case::covered(vec![7, 11], vec![11], vec![7], Some(7), false)]
+    #[case::covered_multi(vec![7, 11, 13], vec![11, 13], vec![7], Some(7), false)]
+    #[case::covered_composite(vec![7, 11, 13], vec![13], vec![7, 11], None, false)]
+    #[case::composite(vec![7, 11], vec![], vec![7, 11], None, false)]
+    #[case::system_index_no_fields(vec![], vec![], vec![], None, false)]
+    #[case::independent(vec![7], vec![11], vec![7], Some(7), true)]
+    #[case::independent_longer_than_fields(vec![7], vec![11, 13], vec![7], Some(7), true)]
+    #[case::carries_its_only_key(vec![7], vec![7], vec![7], Some(7), true)]
+    #[case::independent_composite(vec![7, 11], vec![7], vec![7, 11], None, true)]
     fn test_keyed_fields(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,
         #[case] expected_keyed: Vec<i32>,
         #[case] expected_single: Option<i32>,
+        #[case] independent: bool,
     ) {
         let metadata = index_metadata_with(fields, covering_fields);
 
         assert_eq!(metadata.keyed_fields(), expected_keyed.as_slice());
         assert_eq!(metadata.keyed_field(), expected_single);
+        assert_eq!(metadata.requires_independent_contract(), independent);
+    }
+
+    #[rstest]
+    #[case::suffix_and_keys_only((vec![7, 11], vec![11]), (vec![7], vec![11]), true)]
+    #[case::tail_shaped_layouts((vec![7, 11, 11], vec![11]), (vec![7, 11], vec![11]), false)]
+    #[case::different_carried_fields((vec![7], vec![11]), (vec![7], vec![13]), false)]
+    #[case::different_keys((vec![7, 11], vec![11]), (vec![8], vec![11]), false)]
+    #[case::same_fields_one_carried((vec![7, 11], vec![11]), (vec![7, 11], vec![]), false)]
+    fn test_declares_same_fields(
+        #[case] left: (Vec<i32>, Vec<i32>),
+        #[case] right: (Vec<i32>, Vec<i32>),
+        #[case] same: bool,
+    ) {
+        let left = index_metadata_with(left.0, left.1);
+        let right = index_metadata_with(right.0, right.1);
+
+        assert_eq!(left.declares_same_fields(&right), same);
+        assert_eq!(right.declares_same_fields(&left), same);
     }
 
     /// The dependency set is the same whether or not `fields` repeats the
@@ -1090,32 +1383,51 @@ mod tests {
         );
     }
 
+    /// `validate_covering_fields` holds the rules of both layouts, which is
+    /// also what decoding under the independent contract checks. Decoding
+    /// under the suffix contract adds the suffix rules.
     #[rstest]
-    #[case::empty_is_valid(vec![7], vec![], None)]
+    #[case::empty_is_valid(vec![7], vec![], None, None)]
     // mem_wal and frag_reuse both commit no fields at all; a bare
     // `covering_fields.len() < fields.len()` check would reject them.
-    #[case::system_index_no_fields(vec![], vec![], None)]
-    #[case::valid_single_covered(vec![7, 11], vec![11], None)]
-    #[case::valid_suffix(vec![7, 11, 13], vec![11, 13], None)]
-    #[case::not_a_suffix(vec![7, 11, 13], vec![11], Some("must come last"))]
-    #[case::not_a_subset(vec![7, 11], vec![99], Some("are not among its fields"))]
-    #[case::wrong_order(vec![7, 11, 13], vec![13, 11], Some("must come last"))]
-    #[case::all_fields_covered(vec![7], vec![7], Some("at least one field must remain indexed"))]
-    #[case::covers_the_search_key(vec![7, 11], vec![7, 11], Some("at least one field must remain indexed"))]
+    #[case::system_index_no_fields(vec![], vec![], None, None)]
+    #[case::valid_single_covered(vec![7, 11], vec![11], None, None)]
+    #[case::valid_suffix(vec![7, 11, 13], vec![11, 13], None, None)]
+    #[case::not_a_suffix(vec![7, 11, 13], vec![11], None, Some("must come last"))]
+    #[case::not_a_subset(vec![7, 11], vec![99], None, Some("are not among its fields"))]
+    #[case::wrong_order(vec![7, 11, 13], vec![13, 11], None, Some("must come last"))]
+    #[case::all_fields_covered(vec![7], vec![7], None, Some("at least one field must remain indexed"))]
+    #[case::covers_the_search_key(vec![7, 11], vec![7, 11], None, Some("at least one field must remain indexed"))]
     // `fields` repeats the id in the same positions, so `[11, 11]` is a genuine
     // tail of it -- only the duplicate check rejects this.
-    #[case::duplicate_covered(vec![7, 11, 11], vec![11, 11], Some("more than once"))]
+    #[case::duplicate_covered(vec![7, 11, 11], vec![11, 11], Some("more than once"), Some("more than once"))]
+    #[case::duplicate_independent(vec![7], vec![11, 11], Some("more than once"), Some("are not among its fields"))]
+    #[case::no_key_fields(vec![], vec![11], Some("at least one field must remain indexed"), Some("are not among its fields"))]
     // Both over-long and naming an unknown id: the unknown id is the cause, so
     // it must be reported ahead of "at least one field must remain indexed".
-    #[case::unknown_id_reported_before_length(vec![7, 11], vec![99, 11], Some("are not among its fields"))]
+    #[case::unknown_id_reported_before_length(vec![7, 11], vec![99, 11], None, Some("are not among its fields"))]
     fn test_validate_covering_fields(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,
-        #[case] expected_error: Option<&str>,
+        #[case] either_layout_error: Option<&str>,
+        #[case] suffix_contract_error: Option<&str>,
     ) {
         let metadata = index_metadata_with(fields, covering_fields);
-        let result = metadata.validate_covering_fields();
+        let proto = pb::IndexMetadata::from(&metadata);
 
+        assert_validation(metadata.validate_covering_fields(), either_layout_error);
+        assert_validation(
+            IndexMetadata::from_manifest_proto(proto.clone(), CoveringContract::Independent)
+                .map(drop),
+            either_layout_error,
+        );
+        assert_validation(
+            IndexMetadata::from_manifest_proto(proto, CoveringContract::Suffix).map(drop),
+            suffix_contract_error,
+        );
+    }
+
+    fn assert_validation(result: Result<()>, expected_error: Option<&str>) {
         match expected_error {
             None => assert!(result.is_ok(), "expected valid, got {:?}", result),
             Some(fragment) => {
