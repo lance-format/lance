@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::{HashMap, HashSet};
 use std::ops::RangeInclusive;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::bitmap::{Bitmap, count_ones};
 use super::encoded_array::EncodedU64Array;
@@ -14,6 +15,9 @@ use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 
 mod batch;
+mod positions;
+
+use positions::Positions;
 
 /// Fragments one lookup may have to probe before the merged map is worth its
 /// build, whatever that build costs. A compacted table interleaves its
@@ -50,7 +54,7 @@ const RANK_BLOCK_BYTES: usize = 256;
 #[derive(Debug)]
 pub struct RowIdIndex {
     /// Fragments that hold at least one row id.
-    fragments: Vec<FragmentEntry>,
+    fragments: Vec<Arc<FragmentEntry>>,
     /// Every piece of every segment of `fragments`, sorted by its lowest row
     /// id (see [`probe_spans`]).
     probes: Vec<ProbeEntry>,
@@ -58,6 +62,7 @@ pub struct RowIdIndex {
     /// sits at `end_tree[len() / 2 + i]`.
     end_tree: Vec<u64>,
     merged: Option<MergedIndex>,
+    sources: Vec<FragmentIdentity>,
 }
 
 /// One piece of one segment of one fragment, as the probe tree sees it. The
@@ -76,7 +81,7 @@ struct ProbeEntry {
     end: u64,
 }
 
-type MergedIndex = RangeInclusiveMap<u64, (U64Segment, U64Segment)>;
+type MergedIndex = RangeInclusiveMap<u64, Arc<(U64Segment, U64Segment)>>;
 
 pub struct FragmentRowIdIndex {
     pub fragment_id: u32,
@@ -84,37 +89,159 @@ pub struct FragmentRowIdIndex {
     pub deletion_vector: Arc<DeletionVector>,
 }
 
+#[derive(Debug)]
+struct FragmentIdentity {
+    fragment_id: u32,
+    sequence: Weak<RowIdSequence>,
+    deletion_vector: Weak<DeletionVector>,
+}
+
+type FragmentKey = (u32, *const RowIdSequence, *const DeletionVector);
+
+impl FragmentIdentity {
+    fn new(source: &FragmentRowIdIndex) -> Self {
+        Self {
+            fragment_id: source.fragment_id,
+            sequence: Arc::downgrade(&source.row_id_sequence),
+            deletion_vector: Arc::downgrade(&source.deletion_vector),
+        }
+    }
+
+    fn key(&self) -> FragmentKey {
+        // Weak references keep allocation identities from being recycled while
+        // this index can still use them to recognize a source.
+        (
+            self.fragment_id,
+            self.sequence.as_ptr(),
+            self.deletion_vector.as_ptr(),
+        )
+    }
+}
+
 impl RowIdIndex {
-    /// Create a new index from a list of fragment ids and their corresponding row id sequences.
+    /// Create a new index from fragment ids and their row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let fragments: Vec<FragmentEntry> = fragment_indices
+        Self::new_reusing(fragment_indices, None)
+    }
+
+    /// Build a snapshot's index, reusing immutable lookup data from `previous`.
+    ///
+    /// Reuse requires the same fragment id and the same sequence and deletion
+    /// vector allocations. The caller must establish content identity before
+    /// sharing those allocations. The previous index itself is never retained.
+    /// Unchanged merged maps also share their chunks across a disjoint append.
+    ///
+    /// ```
+    /// # use lance_table::rowids::{RowIdIndex, FragmentRowIdIndex};
+    /// # fn example(fragments: &[FragmentRowIdIndex]) -> lance_core::Result<()> {
+    /// let first = RowIdIndex::new(fragments)?;
+    /// let next = RowIdIndex::new_reusing(fragments, Some(&first))?;
+    /// assert_eq!(first.get(0)?, next.get(0)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_reusing(
+        fragment_indices: &[FragmentRowIdIndex],
+        previous: Option<&Self>,
+    ) -> Result<Self> {
+        let sources: Vec<_> = fragment_indices.iter().map(FragmentIdentity::new).collect();
+        if let Some(previous) = previous
+            && let Some(merged) = previous.reuse_merged(fragment_indices, &sources)?
+        {
+            return Ok(Self {
+                fragments: Vec::new(),
+                probes: Vec::new(),
+                end_tree: Vec::new(),
+                merged: Some(merged),
+                sources,
+            });
+        }
+        let prepared: HashMap<_, _> = previous
+            .into_iter()
+            .flat_map(|previous| &previous.fragments)
+            .map(|entry| (entry.identity.key(), entry))
+            .collect();
+        let mut fragments: Vec<Arc<FragmentEntry>> = fragment_indices
             .iter()
-            .filter_map(FragmentEntry::new)
+            .zip(&sources)
+            .filter_map(|(source, identity)| {
+                if let Some(reused) = prepared.get(&identity.key()) {
+                    return Some(Arc::clone(reused));
+                }
+                FragmentEntry::new(source).map(Arc::new)
+            })
             .collect();
         let probes = probe_entries(&fragments);
-
-        let mut index = Self {
+        if !probing_beats_merging(&fragments, &probes) {
+            return Ok(Self {
+                fragments: Vec::new(),
+                probes: Vec::new(),
+                end_tree: Vec::new(),
+                merged: Some(Self::build_merged(fragment_indices)?),
+                sources,
+            });
+        }
+        for fragment in &mut fragments {
+            // A shared fragment already owns its immutable lookup. Only freshly
+            // constructed entries have unique ownership here.
+            if let Some(entry) = Arc::get_mut(fragment) {
+                entry.build_lookups();
+            }
+        }
+        Ok(Self {
             end_tree: build_end_tree(&probes),
             probes,
             fragments,
             merged: None,
-        };
-        if !probing_beats_merging(&index.fragments, &index.probes) {
-            index.merged = Some(index.build_merged()?);
-        }
-        Ok(index)
+            sources,
+        })
     }
 
-    fn build_merged(&self) -> Result<MergedIndex> {
-        let sources: Vec<FragmentRowIdIndex> = self
-            .fragments
-            .iter()
-            .map(|entry| FragmentRowIdIndex {
-                fragment_id: entry.fragment_id,
-                row_id_sequence: entry.sequence.clone(),
-                deletion_vector: entry.deletion_vector.clone(),
-            })
-            .collect();
+    /// Share old merged chunks only when every old source is unchanged and
+    /// new sources cannot intersect them. Other changes need normal validation.
+    fn reuse_merged(
+        &self,
+        sources: &[FragmentRowIdIndex],
+        identities: &[FragmentIdentity],
+    ) -> Result<Option<MergedIndex>> {
+        let Some(previous) = &self.merged else {
+            return Ok(None);
+        };
+        let old_keys: HashSet<_> = self.sources.iter().map(FragmentIdentity::key).collect();
+        let new_keys: HashSet<_> = identities.iter().map(FragmentIdentity::key).collect();
+        // Repeating a source must still go through normal duplicate validation.
+        if old_keys.len() != self.sources.len()
+            || new_keys.len() != identities.len()
+            || !old_keys.is_subset(&new_keys)
+        {
+            return Ok(None);
+        }
+        let mut additions = Vec::new();
+        for (source, identity) in sources.iter().zip(identities) {
+            if old_keys.contains(&identity.key()) {
+                continue;
+            }
+            if source
+                .row_id_sequence
+                .row_id_range()
+                .is_some_and(|range| previous.overlapping(range).next().is_some())
+            {
+                return Ok(None);
+            }
+            additions.push(FragmentRowIdIndex {
+                fragment_id: source.fragment_id,
+                row_id_sequence: source.row_id_sequence.clone(),
+                deletion_vector: source.deletion_vector.clone(),
+            });
+        }
+        let mut merged = previous.clone();
+        for (range, chunk) in Self::build_merged(&additions)? {
+            merged.insert(range, chunk);
+        }
+        Ok(Some(merged))
+    }
+
+    fn build_merged(sources: &[FragmentRowIdIndex]) -> Result<MergedIndex> {
         let chunks = sources
             .iter()
             .flat_map(decompose_sequence)
@@ -136,7 +263,11 @@ impl RowIdIndex {
             }
         }
 
-        Ok(RangeInclusiveMap::from_iter(final_chunks))
+        Ok(RangeInclusiveMap::from_iter(
+            final_chunks
+                .into_iter()
+                .map(|(range, chunk)| (range, Arc::new(chunk))),
+        ))
     }
 
     /// Get the address for a given row id.
@@ -197,9 +328,10 @@ impl RowIdIndex {
                     break;
                 }
             }
-            let Some((range, (row_id_seg, addr_seg))) = chunks.peek() else {
+            let Some((range, segments)) = chunks.peek() else {
                 break;
             };
+            let (row_id_seg, addr_seg) = segments.as_ref();
             if id < *range.start() {
                 continue; // falls in a gap between chunks
             }
@@ -273,7 +405,7 @@ impl RowIdIndex {
 }
 
 fn merged_get(merged: &MergedIndex, row_id: u64) -> Option<RowAddress> {
-    let (row_id_segment, address_segment) = merged.get(&row_id)?;
+    let (row_id_segment, address_segment) = merged.get(&row_id)?.as_ref();
     let pos = row_id_segment.position(row_id)?;
     let address = address_segment.get(pos)?;
     Some(RowAddress::from(address))
@@ -286,6 +418,8 @@ struct SegmentEntry {
     range: RangeInclusive<u64>,
     start_offset: u32,
     lookup: SegmentLookup,
+    /// Cached once so sharing a sorted segment never rescans all its IDs.
+    probe_spans: Vec<(u64, u64)>,
 }
 
 /// How a [`SegmentEntry`] finds the position of a row id.
@@ -295,7 +429,7 @@ enum SegmentLookup {
     Native,
     /// Row id to position for an unsorted [`U64Segment::Array`], whose own
     /// `position` scans.
-    Positions(Vec<(u64, u32)>),
+    Positions(Positions),
     /// Set bits before each [`RANK_BLOCK_BYTES`] block of a
     /// [`U64Segment::RangeWithBitmap`] bitmap, whose own `position` counts
     /// the whole prefix.
@@ -308,10 +442,9 @@ impl SegmentEntry {
         let segment = &sequence.0[self.seq_idx];
         match &self.lookup {
             SegmentLookup::Native => segment.position(row_id),
-            SegmentLookup::Positions(positions) => positions
-                .binary_search_by_key(&row_id, |(id, _)| *id)
-                .ok()
-                .map(|found| positions[found].1 as usize),
+            SegmentLookup::Positions(positions) => {
+                positions.get(row_id).map(|offset| offset as usize)
+            }
             SegmentLookup::BitmapRank(rank) => {
                 let U64Segment::RangeWithBitmap { range, bitmap } = segment else {
                     return None;
@@ -336,17 +469,10 @@ impl SegmentEntry {
 /// directory counts its ones on the way, so the segment is read once.
 fn build_lookup(segment: &U64Segment) -> (SegmentLookup, usize) {
     match segment {
-        U64Segment::Array(_) => {
-            let mut positions: Vec<(u64, u32)> = segment
-                .iter()
-                .enumerate()
-                .map(|(position, row_id)| (row_id, position as u32))
-                .collect();
-            positions.sort_unstable();
-            // The first position of a repeated id wins, as `position` does.
-            positions.dedup_by_key(|(row_id, _)| *row_id);
-            (SegmentLookup::Positions(positions), segment.len())
-        }
+        U64Segment::Array(values) => (
+            SegmentLookup::Positions(Positions::new(values)),
+            values.len(),
+        ),
         U64Segment::RangeWithBitmap { bitmap, .. } => {
             let (rank, ones) = build_bitmap_rank(bitmap);
             (SegmentLookup::BitmapRank(rank), ones)
@@ -369,6 +495,7 @@ fn build_bitmap_rank(bitmap: &Bitmap) -> (Vec<u32>, usize) {
 #[derive(Debug)]
 struct FragmentEntry {
     fragment_id: u32,
+    identity: FragmentIdentity,
     sequence: Arc<RowIdSequence>,
     deletion_vector: Arc<DeletionVector>,
     segments: Vec<SegmentEntry>,
@@ -383,7 +510,8 @@ impl FragmentEntry {
         let mut merge_rows: u64 = 0;
         let deleted = !source.deletion_vector.is_empty();
         for (seq_idx, segment) in source.row_id_sequence.0.iter().enumerate() {
-            let (lookup, len) = build_lookup(segment);
+            let len = segment.len();
+            let lookup = SegmentLookup::Native;
             // A `Range` without deletions decomposes in constant time.
             if deleted || !matches!(segment, U64Segment::Range(_)) {
                 merge_rows += len as u64;
@@ -395,6 +523,7 @@ impl FragmentEntry {
             {
                 segments.push(SegmentEntry {
                     seq_idx,
+                    probe_spans: probe_spans(segment, &range),
                     range,
                     start_offset,
                     lookup,
@@ -407,11 +536,37 @@ impl FragmentEntry {
         }
         Some(Self {
             fragment_id: source.fragment_id,
+            identity: FragmentIdentity::new(source),
             sequence: source.row_id_sequence.clone(),
             deletion_vector: source.deletion_vector.clone(),
             segments,
             merge_rows,
         })
+    }
+
+    /// Build only the selected probe representation. Array lookup owns the IDs
+    /// it needs, so replace those source segments instead of retaining both copies.
+    fn build_lookups(&mut self) {
+        for entry in &mut self.segments {
+            entry.lookup = build_lookup(&self.sequence.0[entry.seq_idx]).0;
+        }
+        if self
+            .sequence
+            .0
+            .iter()
+            .any(|segment| matches!(segment, U64Segment::Array(_)))
+        {
+            self.sequence = Arc::new(RowIdSequence(
+                self.sequence
+                    .0
+                    .iter()
+                    .map(|segment| match segment {
+                        U64Segment::Array(_) => U64Segment::Range(0..0),
+                        _ => segment.clone(),
+                    })
+                    .collect(),
+            ));
+        }
     }
 
     /// Address of `row_id` in segment `segment` of this fragment, or `None`
@@ -431,7 +586,7 @@ impl FragmentEntry {
 }
 
 /// Every piece of every segment of `fragments`, sorted by its lowest row id.
-fn probe_entries(fragments: &[FragmentEntry]) -> Vec<ProbeEntry> {
+fn probe_entries(fragments: &[Arc<FragmentEntry>]) -> Vec<ProbeEntry> {
     let mut probes: Vec<ProbeEntry> = fragments
         .iter()
         .enumerate()
@@ -441,14 +596,12 @@ fn probe_entries(fragments: &[FragmentEntry]) -> Vec<ProbeEntry> {
                 .iter()
                 .enumerate()
                 .flat_map(move |(segment, seg)| {
-                    probe_spans(&entry.sequence.0[seg.seq_idx], &seg.range)
-                        .into_iter()
-                        .map(move |(start, end)| ProbeEntry {
-                            fragment: fragment as u32,
-                            segment: segment as u32,
-                            start,
-                            end,
-                        })
+                    seg.probe_spans.iter().map(move |&(start, end)| ProbeEntry {
+                        fragment: fragment as u32,
+                        segment: segment as u32,
+                        start,
+                        end,
+                    })
                 })
         })
         .collect();
@@ -530,7 +683,7 @@ fn sorted_gap_spans<T: Copy + Into<u64>>(base: u64, offsets: &[T], spans: &mut V
 /// Probing costs the segments that cover one id, per lookup; merging costs the
 /// row ids it reads, once. So probe only when both stay on the right side of
 /// [`MAX_PROBE_DEPTH`] and [`MERGE_ROWS_BUDGET`].
-fn probing_beats_merging(fragments: &[FragmentEntry], probes: &[ProbeEntry]) -> bool {
+fn probing_beats_merging(fragments: &[Arc<FragmentEntry>], probes: &[ProbeEntry]) -> bool {
     let merge_rows: u64 = fragments.iter().map(|entry| entry.merge_rows).sum();
     merge_rows > MERGE_ROWS_BUDGET && max_overlap_depth(probes) <= MAX_PROBE_DEPTH
 }
@@ -567,52 +720,52 @@ fn build_end_tree(probes: &[ProbeEntry]) -> Vec<u64> {
     tree
 }
 
-impl DeepSizeOf for RowIdIndex {
-    /// Charges the sequences and deletion vectors the `Arc`s keep alive, which
-    /// a sequence cached under its own key is charged for as well.
+impl DeepSizeOf for FragmentEntry {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        let fragment_bytes: usize = self
-            .fragments
-            .iter()
-            .map(|entry| {
-                entry.sequence.deep_size_of_children(context)
-                    + entry.deletion_vector.deep_size_of_children(context)
-                    + entry.segments.capacity() * std::mem::size_of::<SegmentEntry>()
-                    + entry
-                        .segments
-                        .iter()
-                        .map(|segment| match &segment.lookup {
+        self.sequence.deep_size_of_children(context)
+            + self.deletion_vector.deep_size_of_children(context)
+            + self.segments.capacity() * std::mem::size_of::<SegmentEntry>()
+            + self
+                .segments
+                .iter()
+                .map(|segment| {
+                    segment.probe_spans.capacity() * std::mem::size_of::<(u64, u64)>()
+                        + match &segment.lookup {
                             SegmentLookup::Native => 0,
                             SegmentLookup::Positions(positions) => {
-                                positions.capacity() * std::mem::size_of::<(u64, u32)>()
+                                positions.deep_size_of_children(context)
                             }
                             SegmentLookup::BitmapRank(rank) => {
                                 rank.capacity() * std::mem::size_of::<u32>()
                             }
-                        })
-                        .sum::<usize>()
-            })
-            .sum();
+                        }
+                })
+                .sum::<usize>()
+    }
+}
+
+impl DeepSizeOf for RowIdIndex {
+    /// Count shared immutable allocations once within the caller's context.
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         let merged_bytes: usize = self
             .merged
             .as_ref()
             .map(|merged| {
                 merged
                     .iter()
-                    .map(|(_, (row_id_segment, address_segment))| {
-                        (2 * std::mem::size_of::<u64>())
-                            + std::mem::size_of::<(U64Segment, U64Segment)>()
-                            + row_id_segment.deep_size_of_children(context)
-                            + address_segment.deep_size_of_children(context)
+                    .map(|(_, chunk)| {
+                        2 * std::mem::size_of::<u64>()
+                            + std::mem::size_of::<Arc<(U64Segment, U64Segment)>>()
+                            + chunk.deep_size_of_children(context)
                     })
                     .sum()
             })
             .unwrap_or(0);
-        fragment_bytes
+        self.fragments.deep_size_of_children(context)
             + merged_bytes
-            + self.fragments.capacity() * std::mem::size_of::<FragmentEntry>()
             + self.probes.capacity() * std::mem::size_of::<ProbeEntry>()
             + self.end_tree.capacity() * std::mem::size_of::<u64>()
+            + self.sources.capacity() * std::mem::size_of::<FragmentIdentity>()
     }
 }
 
@@ -872,16 +1025,21 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 impl RowIdIndex {
     /// Index that answers from the probe path, whatever the gate decided.
     fn probing(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let fragments: Vec<FragmentEntry> = fragment_indices
+        let mut fragments: Vec<Arc<FragmentEntry>> = fragment_indices
             .iter()
             .filter_map(FragmentEntry::new)
+            .map(Arc::new)
             .collect();
         let probes = probe_entries(&fragments);
+        for fragment in &mut fragments {
+            Arc::get_mut(fragment).unwrap().build_lookups();
+        }
         Ok(Self {
             end_tree: build_end_tree(&probes),
             probes,
             fragments,
             merged: None,
+            sources: fragment_indices.iter().map(FragmentIdentity::new).collect(),
         })
     }
 }
@@ -907,6 +1065,142 @@ mod tests {
             row_id_sequence: Arc::new(sequence),
             deletion_vector: Arc::new(DeletionVector::default()),
         }
+    }
+
+    #[test]
+    fn reuse_merged_append_and_changed_deletions() {
+        let mut sources = vec![
+            fragment(
+                3,
+                RowIdSequence(vec![U64Segment::Array(vec![4, 0, 2].into())]),
+            ),
+            fragment(
+                8,
+                RowIdSequence(vec![U64Segment::Array(vec![5, 1, 3].into())]),
+            ),
+        ];
+        let first = Arc::new(RowIdIndex::new(&sources).unwrap());
+        let old = Arc::downgrade(&first);
+        sources.push(fragment(9, RowIdSequence(vec![U64Segment::Range(6..8)])));
+        let appended = RowIdIndex::new_reusing(&sources, Some(&first)).unwrap();
+        assert!(Arc::ptr_eq(
+            first.merged.as_ref().unwrap().get(&0).unwrap(),
+            appended.merged.as_ref().unwrap().get(&0).unwrap(),
+        ));
+        let queries = [5, 0, 6, 2, 7, 5, 8];
+        let expected = [(8, 0), (3, 1), (9, 0), (3, 2), (9, 1), (8, 0)]
+            .into_iter()
+            .map(|(f, o)| Some(RowAddress::new_from_parts(f, o)))
+            .chain([None])
+            .collect::<Vec<_>>();
+        assert_eq!(appended.get_many(&queries).unwrap(), expected);
+        assert_eq!(first.get(6).unwrap(), None);
+        drop(first);
+        assert!(old.upgrade().is_none());
+        assert_eq!(appended.get_many(&queries).unwrap(), expected);
+
+        sources[0].deletion_vector = Arc::new(DeletionVector::Bitmap([1].into_iter().collect()));
+        let deleted = RowIdIndex::new_reusing(&sources, Some(&appended)).unwrap();
+        assert_eq!(deleted.get(0).unwrap(), None);
+        assert_eq!(
+            appended.get(0).unwrap(),
+            Some(RowAddress::new_from_parts(3, 1))
+        );
+        sources.push(fragment(12, RowIdSequence(vec![U64Segment::Range(7..9)])));
+        let error = RowIdIndex::new_reusing(&sources, Some(&deleted)).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(error.to_string().contains("stable row id 7"));
+    }
+
+    #[test]
+    fn dense_probe_drops_source_and_keeps_physical_offsets() {
+        let ids: Vec<_> = (0..1024).rev().map(|i| i * 10).collect();
+        let source = fragment(
+            7,
+            RowIdSequence(vec![U64Segment::Array(ids.clone().into())]),
+        );
+        let sequence = Arc::downgrade(&source.row_id_sequence);
+        let index = RowIdIndex::probing(&[source]).unwrap();
+        assert!(sequence.upgrade().is_none());
+        assert!(index.deep_size_of() < 8 * ids.len());
+        let queries: Vec<_> = (0..10250).rev().collect();
+        let expected: Vec<_> = queries
+            .iter()
+            .map(|id| {
+                ids.iter()
+                    .position(|candidate| candidate == id)
+                    .map(|offset| RowAddress::new_from_parts(7, offset as u32))
+            })
+            .collect();
+        assert_eq!(index.get_many(&queries).unwrap(), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(true)]
+    #[case::unsorted(false)]
+    fn reuse_probe_preserves_positions_and_snapshot_deletions(#[case] sorted: bool) {
+        let len = MERGE_ROWS_BUDGET / 2 + 1;
+        let ids = |parity| {
+            let mut ids: Vec<_> = (0..len)
+                .map(|offset| 2 * offset + parity + u64::from(offset >= len / 2) * PROBE_GAP * 2)
+                .collect();
+            if !sorted {
+                ids.reverse();
+            }
+            ids
+        };
+        let rows = [ids(0), ids(1)];
+        let mut sources: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, ids)| {
+                let array = ids.clone().into();
+                let segment = if sorted {
+                    U64Segment::SortedArray(array)
+                } else {
+                    U64Segment::Array(array)
+                };
+                fragment(i as u32 + 7, RowIdSequence(vec![segment]))
+            })
+            .collect();
+        let first = Arc::new(RowIdIndex::new(&sources).unwrap());
+        assert!(first.merged.is_none());
+        let old = Arc::downgrade(&first);
+        sources.reverse();
+        sources.push(fragment(
+            9,
+            RowIdSequence(vec![U64Segment::Range(9_000_000..9_000_002)]),
+        ));
+        let appended = RowIdIndex::new_reusing(&sources, Some(&first)).unwrap();
+        assert!(Arc::ptr_eq(&first.fragments[0], &appended.fragments[1]));
+        assert!(Arc::ptr_eq(&first.fragments[1], &appended.fragments[0]));
+        let queries = [
+            rows[0][0],
+            rows[1][2],
+            rows[0][len as usize - 1],
+            9_000_001,
+            u64::MAX,
+            rows[0][0],
+        ];
+        let expected = vec![
+            Some(RowAddress::new_from_parts(7, 0)),
+            Some(RowAddress::new_from_parts(8, 2)),
+            Some(RowAddress::new_from_parts(7, len as u32 - 1)),
+            Some(RowAddress::new_from_parts(9, 1)),
+            None,
+            Some(RowAddress::new_from_parts(7, 0)),
+        ];
+        assert_eq!(appended.get_many(&queries).unwrap(), expected);
+        drop(first);
+        assert!(old.upgrade().is_none());
+
+        sources[1].deletion_vector = Arc::new(DeletionVector::Bitmap([0].into_iter().collect()));
+        let deleted = RowIdIndex::new_reusing(&sources, Some(&appended)).unwrap();
+        assert!(Arc::ptr_eq(&appended.fragments[0], &deleted.fragments[0]));
+        assert!(!Arc::ptr_eq(&appended.fragments[1], &deleted.fragments[1]));
+        assert_eq!(deleted.get(queries[0]).unwrap(), None);
+        assert_eq!(appended.get_many(&queries).unwrap(), expected);
+        assert_eq!(deleted.get(queries[2]).unwrap(), expected[2]);
     }
 
     #[test]
