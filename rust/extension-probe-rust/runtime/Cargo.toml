@@ -1,0 +1,15 @@
+[package]
+name = "lance-extension-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+lance-core = { path = "../../lance-core" }
+lance-io = { path = "../../lance-io", default-features = false, features = ["opendal"] }
+libloading = "0.8"
+object_store = "0.14.2"
