@@ -875,23 +875,48 @@ impl object_store::ObjectStore for DelayedDeletionReadStore {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_cold_deletion_vector_loads_coalesce_to_single_read() {
+/// A prefiltered vector search builds the deletion mask and runs the filter
+/// scan concurrently, and both load the deletion vector of every fragment. On a
+/// cold metadata cache the two loads of the same file must share one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cold_prefiltered_vector_search_reads_each_deletion_file_once() {
+    use crate::index::vector::VectorIndexParams;
+    use lance_datagen::Dimension;
+    use lance_linalg::distance::MetricType;
+
     let dir = tempfile::tempdir().unwrap();
     let uri = file_object_store_uri(dir.path());
-
-    let batch = gen_batch()
+    let reader = gen_batch()
         .col("id", array::step::<Int32Type>())
-        .into_batch_rows(RowCount::from(8))
-        .unwrap();
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+        .into_reader_rows(RowCount::from(800), BatchCount::from(1));
     let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        reader,
         &uri,
-        None,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
-    dataset.delete("id < 2").await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset.delete("id % 10 = 0").await.unwrap();
+    let deletion_files = dataset
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .count();
+    assert_eq!(deletion_files, 8);
 
     // Re-open with a fresh session (cold metadata cache) on a store that counts
     // and delays deletion-file reads.
@@ -905,30 +930,21 @@ async fn concurrent_cold_deletion_vector_loads_coalesce_to_single_read() {
         .load()
         .await
         .unwrap();
+    assert_eq!(deletion_reads.reads(), 0);
 
-    let fragment = dataset
-        .get_fragments()
-        .into_iter()
-        .find(|fragment| fragment.metadata.deletion_file.is_some())
+    let query = arrow_array::Float32Array::from(vec![0.5f32; 16]);
+    let results = dataset
+        .scan()
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .filter("id > 5")
+        .unwrap()
+        .prefilter(true)
+        .try_into_batch()
+        .await
         .unwrap();
-    assert_eq!(
-        deletion_reads.reads(),
-        0,
-        "opening the dataset must not read the deletion file"
-    );
-
-    // 8 concurrent cold loads of the same deletion vector must not race: the
-    // metadata cache's single-flight load should let exactly one read through.
-    let deletion_vectors =
-        futures::future::join_all((0..8).map(|_| fragment.get_deletion_vector())).await;
-    for deletion_vector in deletion_vectors {
-        assert_eq!(deletion_vector.unwrap().unwrap().len(), 2);
-    }
-    assert_eq!(
-        deletion_reads.reads(),
-        1,
-        "concurrent cold deletion vector loads must coalesce into one store read"
-    );
+    assert_eq!(results.num_rows(), 10);
+    assert_eq!(deletion_reads.reads(), deletion_files);
 }
 
 #[tokio::test]
