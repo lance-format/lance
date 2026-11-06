@@ -3,10 +3,11 @@
 
 //! Exercise registration from a downstream crate, without changing the builtin registry.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::{RecordBatchIterator, record_batch};
-use arrow_schema::{DataType, Field};
+use arrow_array::{RecordBatch, RecordBatchIterator, StringArray, record_batch};
+use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance::{
@@ -17,6 +18,8 @@ use lance::{
     },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
+use lance_arrow::ARROW_EXT_NAME_KEY;
+use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::{
@@ -24,7 +27,7 @@ use lance_index::{
     metrics::NoOpMetricsCollector,
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
+        CreatedIndex, IndexStore, Remapper, ScalarIndex, ScalarIndexParams,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
@@ -35,6 +38,7 @@ use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
+use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
 use prost::Name;
 use rstest::rstest;
 use tempfile::tempdir;
@@ -55,7 +59,91 @@ const ROWS_PER_ZONE: u64 = 2;
 // Every test registers before its first dataset operation, even when tests run concurrently.
 static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
     register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+    register_scalar_index_plugin::<StaleIndexDetails, StaleIndexPlugin>().unwrap();
 });
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StaleIndexDetails {}
+
+impl Name for StaleIndexDetails {
+    const NAME: &'static str = "StaleIndexDetails";
+    const PACKAGE: &'static str = "example.index";
+}
+
+/// Like [`ExampleIndexPlugin`], but does not translate row addresses: it
+/// keeps answering with the row addresses it was built with.
+#[derive(Debug, Default)]
+struct StaleIndexPlugin;
+
+#[async_trait]
+impl BasicTrainer for StaleIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        ZoneMapIndexPlugin.new_training_request(params, field)
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let mut created = ZoneMapIndexPlugin
+            .train_index(data, index_store, request, fragment_ids, progress)
+            .await?;
+        created.index_details = prost_types::Any::from_msg(&StaleIndexDetails {})?;
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for StaleIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Stale"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZoneMapIndexPlugin.version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        _remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        ZoneMapIndexPlugin
+            .load_index(index_store, index_details, index_version, None, cache)
+            .await
+    }
+}
 
 #[async_trait]
 impl BasicTrainer for ExampleIndexPlugin {
@@ -122,17 +210,11 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         ZoneMapIndexPlugin
-            .load_index(
-                index_store,
-                index_details,
-                index_version,
-                frag_reuse_index,
-                cache,
-            )
+            .load_index(index_store, index_details, index_version, remapper, cache)
             .await
     }
 
@@ -567,4 +649,257 @@ async fn commit_external_segments_replaces_only_overlapping_coverage() {
         .open_scalar_index("value", &replaced.uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+}
+
+/// Under either fragment reuse history format, a segment of a plugin that
+/// does not translate row addresses leaves the query listing once its rows move, so they
+/// are scanned instead of answered from stale addresses. So does a JSON
+/// index over such a plugin, which answers through it. A built-in index
+/// keeps serving its segment through the history.
+#[rstest]
+#[case::v0(false)]
+#[case::tagged(true)]
+#[tokio::test]
+async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagged: bool) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40])
+    )
+    .unwrap();
+    let json_field = Field::new("doc", DataType::Utf8, false).with_metadata(HashMap::from([(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    )]));
+    let docs = StringArray::from_iter_values((1..=4).map(|val| format!(r#"{{"val": {val}}}"#)));
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(json_field));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(docs));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let json_over_stale = ScalarIndexParams::new("json".to_string())
+        .with_params(&serde_json::json!({"target_index_type": "stale", "path": "val"}));
+    for (column, name, params) in [
+        (
+            "value",
+            "btree_index",
+            ScalarIndexParams::new("btree".to_string()),
+        ),
+        (
+            "other",
+            "stale_index",
+            ScalarIndexParams::new("stale".to_string()),
+        ),
+        ("doc", "json_stale_index", json_over_stale),
+    ] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Scalar,
+                Some(name.to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset.delete("value = 1").await.unwrap();
+    if tagged {
+        // The sticky flag makes the compaction record a tagged history.
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    }
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+    let fri = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "__lance_frag_reuse")
+        .map(|index| index.index_version);
+    assert_eq!(fri, Some(i32::from(tagged)));
+
+    let listed: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| index.name.clone())
+        .collect();
+    assert!(listed.contains(&"btree_index".to_string()), "{listed:?}");
+    assert!(!listed.contains(&"stale_index".to_string()), "{listed:?}");
+    assert!(
+        !listed.contains(&"json_stale_index".to_string()),
+        "{listed:?}"
+    );
+
+    for filter in ["value = 3", "other = 30", "json_get_int(doc, 'val') = 3"] {
+        let mut full_scan = dataset.scan();
+        full_scan.filter(filter).unwrap().use_scalar_index(false);
+        let expected = full_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 1, "{filter}");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(filter).unwrap();
+        assert_eq!(
+            indexed_scan.try_into_batch().await.unwrap(),
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+/// Under either fragment reuse history format, a segment of a plugin that
+/// does not translate row addresses stays listed, and answers queries, when the history
+/// moves none of its rows: it covers only fragments no rewrite touched, or it
+/// was built after the rewrite.
+#[rstest]
+#[case::v0(false)]
+#[case::tagged(true)]
+#[tokio::test]
+async fn fragment_reuse_keeps_listing_plugins_that_need_no_translation(#[case] tagged: bool) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40]),
+        ("third", Int64, [100, 200, 300, 400])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema.clone()),
+        directory.path().to_str().unwrap(),
+        Some(write_params.clone()),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["other"],
+            IndexType::Scalar,
+            Some("untouched_index".to_string()),
+            &ScalarIndexParams::new("stale".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    let appended = record_batch!(
+        ("value", Int64, [5, 6]),
+        ("other", Int64, [50, 60]),
+        ("third", Int64, [500, 600])
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+    // A built-in index over the appended fragment makes the compaction
+    // record a history.
+    dataset
+        .create_index(
+            &["third"],
+            IndexType::Scalar,
+            Some("btree_index".to_string()),
+            &ScalarIndexParams::new("btree".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.delete("value = 5").await.unwrap();
+    if tagged {
+        // The sticky flag makes the compaction record a tagged history.
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    }
+    let untouched: Vec<u64> = dataset.fragments()[..2].iter().map(|f| f.id).collect();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 2,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    // Only the appended fragment, with its deletion, was rewritten.
+    let fragments: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(fragments.len(), 3, "{fragments:?}");
+    assert_eq!(fragments[..2], untouched);
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("built_after_index".to_string()),
+            &ScalarIndexParams::new("stale".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let fri = indices
+        .iter()
+        .find(|index| index.name == "__lance_frag_reuse")
+        .map(|index| index.index_version);
+    assert_eq!(fri, Some(i32::from(tagged)));
+    for (column, name) in [("other", "untouched_index"), ("value", "built_after_index")] {
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {indices:?}"));
+        dataset
+            .open_scalar_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+
+    for filter in ["other = 30", "value = 6"] {
+        let mut full_scan = dataset.scan();
+        full_scan.filter(filter).unwrap().use_scalar_index(false);
+        let expected = full_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 1, "{filter}");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{filter}: {plan}");
+        assert_eq!(
+            indexed_scan.try_into_batch().await.unwrap(),
+            expected,
+            "{filter}"
+        );
+    }
 }

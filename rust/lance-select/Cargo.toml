@@ -24,6 +24,12 @@ roaring = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+# Exposes `remapper::ScriptedRemapper`, which index tests use in place of a
+# fragment reuse history. Enable it as a dev-dependency feature only.
+test-util = []
 
 [[bench]]
 name = "index_expr_result"

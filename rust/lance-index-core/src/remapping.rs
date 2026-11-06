@@ -24,6 +24,9 @@ use roaring::RoaringTreemap;
 use crate::scalar::RowIdRemapper;
 
 /// Translates a bounded batch of row IDs, allowing encodings to read external data.
+///
+/// Index rewrites (`remap_streaming`, [`materialize_remap`]) take it; an
+/// index load translates through a [`Remapper`] instead.
 #[async_trait]
 pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     /// Results correspond to input positions, including duplicates. `None` removes a row.
@@ -48,6 +51,97 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
 
 /// The default [`BatchRowIdRemapper::materialization_budget_bytes`]: 256 MiB.
 pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+pub use lance_select::Remapper;
+
+/// The translation of every row address in `addrs` through `remapper`,
+/// without the ones that translate to `None`.
+///
+/// A posting can hold millions of addresses, so they are translated in
+/// batches of at most `BATCH_SIZE` to bound the temporary buffer.
+pub async fn translate_treemap(
+    remapper: &Remapper,
+    addrs: &RoaringTreemap,
+) -> Result<RoaringTreemap> {
+    let mut translated = RoaringTreemap::new();
+    let mut iter = addrs.iter();
+    let mut batch: Vec<Option<u64>> = Vec::with_capacity(BATCH_SIZE.min(addrs.len() as usize));
+    loop {
+        batch.clear();
+        batch.extend(iter.by_ref().take(BATCH_SIZE).map(Some));
+        if batch.is_empty() {
+            return Ok(translated);
+        }
+        remapper.translate_in_place(&mut batch).await?;
+        translated.extend(batch.iter().filter_map(|addr| *addr));
+    }
+}
+
+/// Translate the row-address column at `addr_idx` of `batch` through
+/// `remapper` without changing the batch's layout: a deleted row keeps its
+/// slot, with the tombstone address. The returned synchronous remapper drops
+/// tombstones, for consumers whose layout-aware decoding takes one.
+#[doc(hidden)]
+pub async fn translate_preserving_layout(
+    remapper: &Remapper,
+    batch: RecordBatch,
+    addr_idx: usize,
+) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
+    let addrs = batch
+        .columns()
+        .get(addr_idx)
+        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "row address column {addr_idx} must have type UInt64"
+            ))
+        })?;
+    let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+    let mut translated = Vec::with_capacity(addrs.len());
+    let mut slice: Vec<Option<u64>> = Vec::with_capacity(addrs.len().min(BATCH_SIZE));
+    for start in (0..addrs.len()).step_by(BATCH_SIZE) {
+        let end = (start + BATCH_SIZE).min(addrs.len());
+        slice.clear();
+        slice.extend(
+            (start..end).map(|position| addrs.is_valid(position).then(|| addrs.value(position))),
+        );
+        remapper.translate_in_place(&mut slice).await?;
+        translated.extend(slice.iter().map(|addr| addr.unwrap_or(tombstone)));
+    }
+    let mut columns = batch.columns().to_vec();
+    columns[addr_idx] = Arc::new(UInt64Array::from(translated));
+    let batch = RecordBatch::try_new(batch.schema(), columns)?;
+    Ok((batch, Arc::new(TombstoneRowIdRemapper)))
+}
+
+/// Translate the row addresses in column `addr_idx` of `batch` through
+/// `remapper`, as one batch, and drop the rows whose address translates to
+/// `None`. A null address is dropped too: it names no row.
+pub async fn translate_record_batch(
+    remapper: &Remapper,
+    batch: RecordBatch,
+    addr_idx: usize,
+) -> Result<RecordBatch> {
+    let addrs = batch
+        .columns()
+        .get(addr_idx)
+        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "row address column {addr_idx} must have type UInt64"
+            ))
+        })?;
+    let mut translated: Vec<Option<u64>> = addrs.iter().collect();
+    remapper.translate_in_place(&mut translated).await?;
+    let kept =
+        arrow_array::BooleanArray::from_iter(translated.iter().map(|addr| Some(addr.is_some())));
+    let batch = arrow_select::filter::filter_record_batch(&batch, &kept)?;
+    let mut columns = batch.columns().to_vec();
+    columns[addr_idx] = Arc::new(UInt64Array::from_iter_values(
+        translated.into_iter().flatten(),
+    ));
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
+}
 
 /// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
 /// `HashMap::with_capacity(entries)` reserves.
@@ -750,6 +844,140 @@ mod tests {
                 remapper.remap_row_id(lance_core::utils::address::RowAddress::TOMBSTONE_ROW),
                 None
             );
+        });
+    }
+
+    /// A [`Remapper`] following [`Sizing`]'s moves, and the calls it makes.
+    fn sizing_remapper() -> (Remapper, Arc<Sizing>) {
+        let sizing = Arc::new(Sizing::new(&[], u64::MAX));
+        let remapper = Remapper::from_backing(Arc::new(SizingBacking(sizing.clone())));
+        (remapper, sizing)
+    }
+
+    #[derive(Debug)]
+    struct SizingBacking(Arc<Sizing>);
+
+    impl lance_select::remapper::RemapperBacking for SizingBacking {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(async move {
+                let inputs: Vec<u64> = addrs.iter().flatten().copied().collect();
+                let mut translated = self.0.remap_row_ids(&inputs).await?.into_iter();
+                for slot in addrs.iter_mut().filter(|slot| slot.is_some()) {
+                    *slot = translated.next().flatten();
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn translate_preserving_layout_keeps_every_slot() {
+        block_on(async {
+            let (remapper, sizing) = sizing_remapper();
+            let batch = record_batch!(
+                (
+                    "addr",
+                    UInt64,
+                    [Some(addr(1, 0)), None, Some(addr(1, 1)), Some(addr(2, 0))]
+                ),
+                ("value", Int32, [1, 2, 3, 4])
+            )
+            .unwrap();
+            let (translated, tombstones) = translate_preserving_layout(&remapper, batch, 0)
+                .await
+                .unwrap();
+            let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
+            assert_eq!(
+                translated,
+                record_batch!(
+                    (
+                        "addr",
+                        UInt64,
+                        [
+                            Some(addr(5, 0)),
+                            Some(tombstone),
+                            Some(tombstone),
+                            Some(addr(2, 0))
+                        ]
+                    ),
+                    ("value", Int32, [1, 2, 3, 4])
+                )
+                .unwrap()
+            );
+            assert_eq!(tombstones.remap_row_id(tombstone), None);
+
+            let rows = BATCH_SIZE + 1;
+            let batch = RecordBatch::try_from_iter([(
+                "addr",
+                Arc::new(UInt64Array::from(vec![addr(1, 0); rows])) as arrow_array::ArrayRef,
+            )])
+            .unwrap();
+            let before = sizing.calls.load(Ordering::Relaxed);
+            let (translated, _) = translate_preserving_layout(&remapper, batch, 0)
+                .await
+                .unwrap();
+            assert_eq!(translated.num_rows(), rows);
+            assert_eq!(sizing.calls.load(Ordering::Relaxed) - before, 2);
+        });
+    }
+
+    #[test]
+    fn translate_record_batch_drops_deleted_and_null_rows() {
+        block_on(async {
+            let (remapper, _) = sizing_remapper();
+            let batch = record_batch!(
+                (
+                    "addr",
+                    UInt64,
+                    [Some(addr(1, 0)), None, Some(addr(1, 1)), Some(addr(2, 0))]
+                ),
+                ("value", Int32, [1, 2, 3, 4])
+            )
+            .unwrap();
+            let translated = translate_record_batch(&remapper, batch.clone(), 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                translated,
+                record_batch!(
+                    ("addr", UInt64, [addr(5, 0), addr(2, 0)]),
+                    ("value", Int32, [1, 4])
+                )
+                .unwrap()
+            );
+
+            let error = translate_record_batch(&remapper, batch, 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        });
+    }
+
+    #[test]
+    fn translate_treemap_translates_in_bounded_batches() {
+        block_on(async {
+            let (remapper, sizing) = sizing_remapper();
+            let addrs: RoaringTreemap = (0..=BATCH_SIZE as u64)
+                .map(|offset| addr(1, offset))
+                .collect();
+            let translated = translate_treemap(&remapper, &addrs).await.unwrap();
+            let expected: RoaringTreemap = (0..=BATCH_SIZE as u64)
+                .filter(|&offset| offset != 1)
+                .map(|offset| addr(5, offset))
+                .collect();
+            assert_eq!(translated, expected);
+            assert_eq!(sizing.calls.load(Ordering::Relaxed), 2);
         });
     }
 }

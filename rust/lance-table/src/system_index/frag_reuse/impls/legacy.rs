@@ -6,34 +6,43 @@
 //! and writer understands.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::{Bytes, BytesMut};
 use lance_core::{Error, Result};
+use lance_select::Remapper;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use prost::Message;
 use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use super::legacy_srid::LegacySridHistory;
 use super::lift;
 use super::{FriImpl, Records, StoredRecord, concat, invalid_edit};
 use crate::format::IndexMetadata;
 use crate::format::pb::fragment_reuse_index_details as pb;
-use crate::system_index::frag_reuse::FragReuseVersion;
 use crate::system_index::frag_reuse::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, Record, RewriteRecord, length_delimited,
     split_records,
 };
+use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, SegmentSummary, TranslationPlan,
+    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport,
+};
+use crate::system_index::frag_reuse::{
+    CompactFragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
 };
 use crate::system_index::is_system_index;
 
+/// The records, and the translation built from them the first time a plan
+/// of this history is bound.
 #[derive(Debug, Default)]
-pub struct LegacyHistory(Records);
+pub struct LegacyHistory(Records, OnceLock<Arc<LegacyRemapper>>);
 
 impl LegacyHistory {
     pub fn decode(content: Bytes) -> Result<Self> {
-        Records::decode(HistoryFormat::Legacy, content).map(Self)
+        Records::decode(HistoryFormat::Legacy, content)
+            .map(|records| Self(records, OnceLock::new()))
     }
 
     /// The history a committed entry stores, repairing one an older writer
@@ -204,6 +213,11 @@ fn is_caught_up_with_version(
 }
 
 impl LegacyHistory {
+    fn translation(&self) -> &Arc<LegacyRemapper> {
+        self.1
+            .get_or_init(|| Arc::new(LegacyRemapper::new(self.versions())))
+    }
+
     fn versions(&self) -> impl Iterator<Item = &pb::Version> {
         self.0
             .stored
@@ -214,23 +228,34 @@ impl LegacyHistory {
             })
     }
 
-    fn plan_segment(&self, context: &ReadContext, segment: &SegmentSummary) -> ReadPlan {
+    fn is_direct(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| !bitmap.is_empty())
+            && self.is_caught_up(context.entry_version, segment)
+    }
+
+    fn plan_segment(
+        &self,
+        history: Arc<dyn FriImpl>,
+        context: &ReadContext,
+        segment: &SegmentSummary,
+    ) -> ReadPlan {
         let coverage = segment
             .fragment_bitmap
             .as_ref()
             .map(|bitmap| bitmap & context.live_fragments)
             .unwrap_or_default();
-        let is_direct = segment
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| !bitmap.is_empty())
-            && self.is_caught_up(context.entry_version, segment);
-        if is_direct {
+        if self.is_direct(context, segment) {
             ReadPlan::Direct
+        } else if segment.translation == TranslationSupport::Unsupported {
+            ReadPlan::Excluded
         } else {
             ReadPlan::Translate(TranslationPlan::new(
-                &self.0.ledger,
+                history,
                 coverage,
+                RoaringBitmap::new(),
                 RoaringBitmap::new(),
                 &[],
             ))
@@ -335,20 +360,93 @@ impl FriImpl for LegacyHistory {
         })
     }
 
-    // The legacy reader applies the history to every segment it opens and
-    // trusts every kind to translate.
-    fn needs_translation_support(&self, _context: &ReadContext, _segment: &SegmentSummary) -> bool {
-        false
+    fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        !self.is_direct(context, segment)
     }
 
     /// Every segment that is not caught up translates its live coverage: the
     /// stored bitmap a legacy reader projected onto destinations already
     /// names it.
-    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+    fn plan(self: Arc<Self>, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
         group
             .iter()
-            .map(|segment| self.plan_segment(context, segment))
+            .map(|segment| self.plan_segment(self.clone(), context, segment))
             .collect()
+    }
+
+    /// Every plan binds to the same translation, the frozen version 0 one:
+    /// it moves addresses through every compaction version and ignores the
+    /// plan's coverage, as released readers did. It never reads mappings.
+    fn bind(&self, _plan: TranslationPlan, _mappings: Arc<dyn MappingSource>) -> Remapper {
+        Remapper::from_backing(self.translation().clone())
+    }
+}
+
+/// The translation of a version 0 history: the compact in-memory remap
+/// released readers apply, wrapped unchanged. Every future it returns is
+/// complete.
+#[derive(Debug)]
+pub struct LegacyRemapper {
+    index: std::result::Result<Arc<CompactFragReuseIndex>, String>,
+    sources: RoaringBitmap,
+}
+
+impl LegacyRemapper {
+    fn new<'a>(versions: impl Iterator<Item = &'a pb::Version>) -> Self {
+        let versions: Vec<&pb::Version> = versions.collect();
+        let sources = versions
+            .iter()
+            .flat_map(|version| &version.groups)
+            .flat_map(|group| &group.old_fragments)
+            .map(|digest| digest.id as u32)
+            .collect();
+        let index = versions
+            .into_iter()
+            .map(|version| FragReuseVersion::try_from(version.clone()))
+            .collect::<Result<Vec<_>>>()
+            .and_then(|versions| {
+                CompactFragReuseIndex::try_new(Uuid::nil(), FragReuseIndexDetails { versions })
+            })
+            .map(Arc::new)
+            .map_err(|error| error.to_string());
+        Self { index, sources }
+    }
+
+    /// The version 0 remap itself. Fails when the history's mappings cannot
+    /// be decoded.
+    fn compact_index(&self) -> Result<Arc<CompactFragReuseIndex>> {
+        self.index.clone().map_err(|message| {
+            Error::corrupt_file_named(
+                "FRI details",
+                format!("the version 0 fragment reuse mappings do not decode: {message}"),
+            )
+        })
+    }
+}
+
+impl RemapperBacking for LegacyRemapper {
+    fn fragment_needs_translation(&self, fragment: u32) -> bool {
+        self.sources.contains(fragment)
+    }
+
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        let mut translated = fragments.clone();
+        match &self.index {
+            Ok(index) => {
+                // Never fails: it only edits the bitmap.
+                let _ = index.remap_fragment_bitmap(&mut translated);
+            }
+            // Nothing translates through a history that does not decode.
+            Err(_) => translated -= &self.sources,
+        }
+        translated
+    }
+
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        let result = self
+            .compact_index()
+            .map(|index| index.remap_row_ids_in_place(addrs));
+        Box::pin(std::future::ready(result))
     }
 }
 

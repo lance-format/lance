@@ -31,7 +31,7 @@ use lance_index::{
     optimize::OptimizeOptions,
     progress::IndexBuildProgress,
     scalar::{
-        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, Remapper, ScalarIndex,
         ScalarIndexParams, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
         expression::{IndexInformationProvider, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
@@ -168,7 +168,7 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         index_version: u32,
-        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        _remapper: Option<Remapper>,
         _cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         index_details.to_msg::<ExampleIndexDetails>()?;

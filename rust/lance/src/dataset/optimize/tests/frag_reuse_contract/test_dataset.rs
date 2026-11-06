@@ -70,17 +70,6 @@ pub(super) struct TestDataset {
     /// destinations, so an in-place update of any of these rows withdraws
     /// the whole transition and uncovers all of them.
     translated_together: Vec<BTreeSet<i32>>,
-    /// The fragments an index kind without a batch remapper is expected to
-    /// scan under a tagged history: every fragment a rewrite the history
-    /// records retired or created once the index exists, and every fragment
-    /// sharing a segment with one. A segment built after every rewrite it
-    /// touches is caught up and served as is, so a rewrite before the index
-    /// was built leaves nothing to scan
-    /// (https://github.com/lance-format/lance/issues/10693).
-    unservable_without_remapper: BTreeSet<u64>,
-    /// Whether the index exists: segments built after a rewrite have
-    /// nothing to translate through it.
-    is_indexed: bool,
     /// The `i` the next appended row takes, so appended rows never reuse a
     /// deleted row's identity.
     next_i: i32,
@@ -110,8 +99,6 @@ impl TestDataset {
             model,
             uncovered: (0..next_i).collect(),
             translated_together: Vec::new(),
-            unservable_without_remapper: BTreeSet::new(),
-            is_indexed: false,
             next_i,
             _dir: dir,
         };
@@ -126,7 +113,6 @@ impl TestDataset {
     }
 
     pub(super) async fn create_index(&mut self) {
-        self.is_indexed = true;
         let params = self.kind.params();
         self.dataset
             .create_index(
@@ -264,12 +250,9 @@ impl TestDataset {
             defer_index_remap: true,
             ..Default::default()
         };
-        let before = self.fragment_set();
-        let lineage_before = self.history_lineage().await;
         compact_files(&mut self.dataset, options, None)
             .await
             .unwrap();
-        self.record_rewrite(before, lineage_before).await;
         self.widen_uncovered_to_fragments().await;
     }
 
@@ -288,8 +271,6 @@ impl TestDataset {
         let dest_base_id = self.dataset.manifest.max_fragment_id().unwrap() - 1;
         let old_fragments: Vec<Fragment> = self.dataset.fragments().iter().cloned().collect();
         let source_ids: Vec<u64> = old_fragments.iter().map(|fragment| fragment.id).collect();
-        let before = self.fragment_set();
-        let lineage_before = self.history_lineage().await;
         let (transition, new_fragments) =
             prepare_partition(&self.dataset, &source_ids, dest_base_id).await;
         // The partition rewrites every live fragment, so this transition
@@ -322,7 +303,6 @@ impl TestDataset {
             ))
             .await
             .unwrap();
-        self.record_rewrite(before, lineage_before).await;
         self.widen_uncovered_to_fragments().await;
     }
 
@@ -401,13 +381,8 @@ impl TestDataset {
             defer_index_remap: false,
             ..Default::default()
         };
-        let before = self.fragment_set();
-        let lineage_before = self.history_lineage().await;
         match compact_files(&mut self.dataset, options, None).await {
-            Ok(_) => {
-                self.record_rewrite(before, lineage_before).await;
-                self.widen_uncovered_to_fragments().await;
-            }
+            Ok(_) => self.widen_uncovered_to_fragments().await,
             // A refused compaction leaves the table, and the appended rows
             // unindexed, as they were.
             Err(Error::InvalidInput { .. } | Error::NotSupported { .. }) => {}
@@ -421,12 +396,6 @@ impl TestDataset {
             .await
             .unwrap();
         self.uncovered.clear();
-        // An optimize that cannot translate a segment's rows leaves the
-        // index as it is, so the rows appended since stay scanned too.
-        let live = self.fragment_set();
-        if !live.is_disjoint(&self.unservable_without_remapper) {
-            self.unservable_without_remapper.extend(live);
-        }
     }
 
     pub(super) async fn remap(&mut self) {
@@ -442,37 +411,6 @@ impl TestDataset {
 
     pub(super) async fn trim(&mut self) {
         cleanup_frag_reuse_index(&mut self.dataset).await.unwrap();
-    }
-
-    fn fragment_set(&self) -> BTreeSet<u64> {
-        self.dataset.fragments().iter().map(|f| f.id).collect()
-    }
-
-    /// The fragments the history names.
-    async fn history_lineage(&self) -> BTreeSet<u64> {
-        self.dataset
-            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-            .await
-            .unwrap()
-            .and_then(|entry| entry.fragment_bitmap)
-            .map(|bitmap| bitmap.iter().map(u64::from).collect())
-            .unwrap_or_default()
-    }
-
-    /// Records the fragments a rewrite from `before` retired and created,
-    /// when a tagged history records it: the index's segments built before it
-    /// hold addresses only translation reaches. A rewrite of fragments no
-    /// segment translates through is not recorded.
-    async fn record_rewrite(&mut self, before: BTreeSet<u64>, lineage_before: BTreeSet<u64>) {
-        if matches!(self.form, HistoryForm::V0) || !self.is_indexed {
-            return;
-        }
-        if self.history_lineage().await.is_subset(&lineage_before) {
-            return;
-        }
-        let after = self.fragment_set();
-        self.unservable_without_remapper
-            .extend(before.symmetric_difference(&after).copied());
     }
 
     /// The fragment holding each live row, by `i`.
@@ -541,15 +479,8 @@ impl TestDataset {
             }
         }
         let fragment_ids = Self::fragment_ids(&self.dataset).await;
-        let mut expected_unindexed: BTreeSet<u64> =
+        let expected_unindexed: BTreeSet<u64> =
             self.uncovered.iter().map(|i| fragment_ids[i]).collect();
-        if !kind.translates_tagged_history() {
-            expected_unindexed.extend(
-                fragment_ids
-                    .values()
-                    .filter(|fragment_id| self.unservable_without_remapper.contains(fragment_id)),
-            );
-        }
         for (handle, which) in handles {
             let unindexed: BTreeSet<u64> = handle
                 .unindexed_fragments(INDEX_NAME)

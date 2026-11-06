@@ -7,7 +7,7 @@
 //! keeps that identity separate from dataset-version row addresses so scoring
 //! never has to infer which value a numeric slot represents.
 
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_async};
+use lance_index_core::remapping::Remapper;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
@@ -27,7 +27,7 @@ use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 
 use crate::FtsPrewarmDocumentStatus;
-use crate::scalar::{IndexReader, IndexStore, RowIdRemapper};
+use crate::scalar::{IndexReader, IndexStore};
 
 use super::index::{
     DocSet, NUM_TOKEN_COL, count_row_id_runs, dequantize_doc_length, doc_index_storage_column,
@@ -756,37 +756,10 @@ impl DeepSizeOf for VersionAddressProjection {
 }
 
 impl VersionAddressProjection {
-    /// Additive sibling of [`Self::try_new`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    async fn try_new_with_remapping(
-        raw: &UInt64Array,
-        num_docs: usize,
-        remapping: &dyn BatchRowIdRemapper,
-        path: &str,
-    ) -> Result<Arc<Self>> {
-        let mut projection = Self::try_new(raw, num_docs, None, path)?;
-        let mut addresses = Vec::with_capacity(raw.len());
-        let mut live_docs = RoaringBitmap::new();
-        for ids in raw.values().chunks(64 * 1024) {
-            for address in remap_row_ids_async(remapping, ids).await? {
-                let doc_id = addresses.len() as u32;
-                if let Some(address) = address {
-                    live_docs.insert(doc_id);
-                    addresses.push(address);
-                } else {
-                    addresses.push(0);
-                }
-            }
-        }
-        projection.addresses = AddressValues::Owned(Arc::new(addresses));
-        projection.live_docs = Some(live_docs);
-        Ok(Arc::new(projection))
-    }
-
-    fn try_new(
+    async fn try_new(
         raw: &UInt64Array,
         expected_num_docs: usize,
-        remapper: Option<&dyn RowIdRemapper>,
+        remapper: Option<&Remapper>,
         path: &str,
     ) -> Result<Self> {
         if raw.len() != expected_num_docs {
@@ -816,16 +789,21 @@ impl VersionAddressProjection {
 
         let mut addresses = Vec::with_capacity(raw.len());
         let mut live_docs = RoaringBitmap::new();
-        for (doc_id, &address) in raw.values().iter().enumerate() {
-            match remapper.remap_row_id(address) {
-                Some(current) => {
-                    addresses.push(current);
-                    live_docs.insert(doc_id as u32);
-                }
-                None => {
+        // Translated in slices so the temporary buffer stays bounded.
+        let mut translated = Vec::with_capacity(raw.len().min(64 * 1024));
+        for ids in raw.values().chunks(64 * 1024) {
+            translated.clear();
+            translated.extend(ids.iter().copied().map(Some));
+            remapper.translate_in_place(&mut translated).await?;
+            for address in &translated {
+                match address {
+                    Some(current) => {
+                        live_docs.insert(addresses.len() as u32);
+                        addresses.push(*current);
+                    }
                     // The value in a dead slot is intentionally meaningless;
                     // callers must consult `live_docs` before reading it.
-                    addresses.push(0);
+                    None => addresses.push(0),
                 }
             }
         }
@@ -1142,13 +1120,6 @@ impl DocVisibility {
     }
 }
 
-/// A request's row-ID translation, excluded from reader-free cache snapshots.
-#[derive(Clone)]
-pub(super) enum DocumentRemapping {
-    Sync(Arc<dyn RowIdRemapper>),
-    Batch(Arc<dyn BatchRowIdRemapper>),
-}
-
 /// Modern query-side document state for one partition.
 pub(super) struct PartitionDocuments {
     store: Arc<dyn IndexStore>,
@@ -1159,11 +1130,9 @@ pub(super) struct PartitionDocuments {
     coordinate_rank: usize,
     persisted_total_tokens: Option<u64>,
     quantized_scoring: bool,
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    remapper: Option<Arc<dyn RowIdRemapper>>,
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates the stored row addresses; `None` when they are current.
+    /// A request's translation, excluded from reader-free cache snapshots.
+    remapper: Option<Remapper>,
     lengths: Arc<OnceCell<Arc<DocLengths>>>,
     projection: Arc<OnceCell<Arc<VersionAddressProjection>>>,
     shared_addresses: Arc<ArcSwapWeak<UInt64Array>>,
@@ -1449,7 +1418,7 @@ impl PartitionDocuments {
         partition_id: u64,
         index_cache: WeakLanceCache,
         reader: &dyn IndexReader,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         quantized_scoring: bool,
     ) -> Result<Self> {
         let num_docs = reader.num_rows();
@@ -1484,38 +1453,11 @@ impl PartitionDocuments {
             persisted_total_tokens,
             quantized_scoring,
             remapper,
-            batch_remapper: None,
             lengths: Arc::new(OnceCell::new()),
             projection: Arc::new(OnceCell::new()),
             shared_addresses: Arc::new(ArcSwapWeak::from(Weak::new())),
             prewarm_complete: Arc::new(OnceCell::new()),
         })
-    }
-
-    /// Additive sibling of [`Self::try_new`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    pub(crate) fn try_new_with_remapping(
-        store: Arc<dyn IndexStore>,
-        path: String,
-        partition_id: u64,
-        index_cache: WeakLanceCache,
-        reader: &dyn IndexReader,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        quantized_scoring: bool,
-    ) -> Result<Self> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let mut docs = Self::try_new(
-            store,
-            path,
-            partition_id,
-            index_cache,
-            reader,
-            None,
-            quantized_scoring,
-        )?;
-        docs.batch_remapper = remapping;
-        debug_assert!(docs.remapper.is_none() || docs.batch_remapper.is_none());
-        Ok(docs)
     }
 
     /// Share reader-free state within the same index and fragment-reuse namespace.
@@ -1524,13 +1466,8 @@ impl PartitionDocuments {
     pub(crate) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        remapping: Option<DocumentRemapping>,
+        remapper: Option<Remapper>,
     ) -> Self {
-        let (remapper, batch_remapper) = match remapping {
-            Some(DocumentRemapping::Sync(remapper)) => (Some(remapper), None),
-            Some(DocumentRemapping::Batch(remapper)) => (None, Some(remapper)),
-            None => (None, None),
-        };
         Self {
             store,
             path: self.path.clone(),
@@ -1541,7 +1478,6 @@ impl PartitionDocuments {
             persisted_total_tokens: self.persisted_total_tokens,
             quantized_scoring: self.quantized_scoring,
             remapper,
-            batch_remapper,
             lengths: self.lengths.clone(),
             projection: self.projection.clone(),
             shared_addresses: self.shared_addresses.clone(),
@@ -1731,24 +1667,15 @@ impl PartitionDocuments {
         let projection = self
             .projection
             .get_or_try_init(|| async {
-                if let Some(remapping) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    VersionAddressProjection::try_new_with_remapping(
+                Result::Ok(Arc::new(
+                    VersionAddressProjection::try_new(
                         row_ids.as_ref(),
                         self.num_docs,
-                        remapping.as_ref(),
+                        self.remapper.as_ref(),
                         &self.path,
                     )
-                    .await
-                } else {
-                    // Legacy synchronous remapping path.
-                    Result::Ok(Arc::new(VersionAddressProjection::try_new(
-                        row_ids.as_ref(),
-                        self.num_docs,
-                        self.remapper.as_deref(),
-                        &self.path,
-                    )?))
-                }
+                    .await?,
+                ))
             })
             .await
             .cloned()?;
@@ -1789,7 +1716,7 @@ impl PartitionDocuments {
         if mask.max_len() == Some(0) {
             return Some(DocVisibility::Selected(RoaringBitmap::new()));
         }
-        if mask.is_select_all() && self.remapper.is_none() && self.batch_remapper.is_none() {
+        if mask.is_select_all() && self.remapper.is_none() {
             return Some(DocVisibility::All);
         }
 
@@ -1813,7 +1740,7 @@ impl PartitionDocuments {
         if let Some(projection) = self.resident_address_projection() {
             return self.resolve_projected_addresses(&projection, doc_ids);
         }
-        if self.remapper.is_some() || self.batch_remapper.is_some() {
+        if self.remapper.is_some() {
             let projection = self.address_projection().await?;
             return self.resolve_projected_addresses(&projection, doc_ids);
         }
@@ -1905,7 +1832,6 @@ impl PartitionDocuments {
 
         let addresses_need_sparse_read = self.resident_address_projection().is_none()
             && self.remapper.is_none()
-            && self.batch_remapper.is_none()
             && self.shared_addresses.load().upgrade().is_none()
             && self.prefer_sparse_document_read(doc_ids.len());
         let lengths_need_sparse_read =
@@ -2146,13 +2072,7 @@ impl PartitionDocuments {
 
     /// Materialize the build-side table for rewrite/update operations.
     pub(crate) async fn load_build_docset(&self) -> Result<DocSet> {
-        if let Some(remapping) = &self.batch_remapper {
-            // Tagged asynchronous path.
-            DocSet::load_with_remapping(self.reader().await?, false, Some(remapping.clone())).await
-        } else {
-            // Legacy synchronous remapping path.
-            DocSet::load(self.reader().await?, false, self.remapper.clone()).await
-        }
+        DocSet::load(self.reader().await?, false, self.remapper.as_ref()).await
     }
 
     pub(crate) async fn prewarm(&self) -> Result<()> {
@@ -2173,24 +2093,15 @@ impl PartitionDocuments {
                             format!("{ROW_ID} contains null values"),
                         ));
                     }
-                    let projection = if let Some(remapping) = &self.batch_remapper {
-                        // Tagged asynchronous path.
-                        VersionAddressProjection::try_new_with_remapping(
+                    let projection = Arc::new(
+                        VersionAddressProjection::try_new(
                             row_ids.as_ref(),
                             self.num_docs,
-                            remapping.as_ref(),
+                            self.remapper.as_ref(),
                             &self.path,
                         )
-                        .await?
-                    } else {
-                        // Legacy synchronous remapping path.
-                        Arc::new(VersionAddressProjection::try_new(
-                            row_ids.as_ref(),
-                            self.num_docs,
-                            self.remapper.as_deref(),
-                            &self.path,
-                        )?)
-                    };
+                        .await?,
+                    );
                     let cached_row_ids = Arc::new(CachedDocRowIds {
                         row_ids: row_ids.clone(),
                     });
@@ -2292,7 +2203,7 @@ mod tests {
     use lance_core::utils::tempfile::TempObjDir;
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
-    use roaring::RoaringTreemap;
+    use lance_select::remapper::{RemapperBacking, TranslateFuture};
     use tokio::sync::Notify;
 
     use crate::scalar::lance_format::LanceIndexStore;
@@ -2573,7 +2484,7 @@ mod tests {
         store: Arc<dyn IndexStore>,
         path: &str,
         index_cache: &LanceCache,
-        remapper: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
     ) -> Result<PartitionDocuments> {
         let reader = store.open_index_file(path).await?;
         PartitionDocuments::try_new(
@@ -2623,26 +2534,43 @@ mod tests {
         )
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct TestRemapper {
         mapping: HashMap<u64, Option<u64>>,
     }
 
-    impl RowIdRemapper for TestRemapper {
-        fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-            self.mapping.get(&row_id).copied().unwrap_or(Some(row_id))
+    /// The projection of `raw` under `remapper`, whose translation completes
+    /// without waiting, so a synchronous test can build it.
+    fn sync_projection(
+        raw: &UInt64Array,
+        num_docs: usize,
+        remapper: Option<&TestRemapper>,
+    ) -> Result<VersionAddressProjection> {
+        let remapper = remapper.map(|remapper| Remapper::from_backing(Arc::new(remapper.clone())));
+        futures::executor::block_on(VersionAddressProjection::try_new(
+            raw,
+            num_docs,
+            remapper.as_ref(),
+            "docs",
+        ))
+    }
+
+    /// An address without a mapping is unchanged.
+    impl RemapperBacking for TestRemapper {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
         }
 
-        fn remap_row_addrs_tree_map(&self, _: &RowAddrTreeMap) -> RowAddrTreeMap {
-            unreachable!("not used by document projection tests")
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
         }
 
-        fn remap_row_ids_roaring_tree_map(&self, _: &RoaringTreemap) -> RoaringTreemap {
-            unreachable!("not used by document projection tests")
-        }
-
-        fn remap_row_ids_record_batch(&self, _: RecordBatch, _: usize) -> Result<RecordBatch> {
-            unreachable!("not used by document projection tests")
+        fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+            for slot in addrs.iter_mut() {
+                *slot =
+                    slot.and_then(|addr| self.mapping.get(&addr).copied().unwrap_or(Some(addr)));
+            }
+            Box::pin(std::future::ready(Ok(())))
         }
     }
 
@@ -2858,10 +2786,8 @@ mod tests {
         let remapper = TestRemapper {
             mapping: HashMap::from([(10, Some(100)), (20, None), (30, Some(300))]),
         };
-        let projection = Arc::new(
-            VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
-                .expect("valid projection"),
-        );
+        let projection =
+            Arc::new(sync_projection(&raw, 4, Some(&remapper)).expect("valid projection"));
         let projection = projection.resident(None).unwrap();
 
         let expected = RowAddressProjectionOrderError::OutOfOrder {
@@ -2929,10 +2855,8 @@ mod tests {
         let remapper = TestRemapper {
             mapping: HashMap::from([(10, Some(100)), (20, None), (30, Some(300))]),
         };
-        let projection = Arc::new(
-            VersionAddressProjection::try_new(&raw, 4, Some(&remapper), "docs")
-                .expect("valid projection"),
-        );
+        let projection =
+            Arc::new(sync_projection(&raw, 4, Some(&remapper)).expect("valid projection"));
         let projection = projection.resident(None).unwrap();
 
         assert_eq!(projection.address(DocId::new(0)), Some(100));
@@ -3110,15 +3034,7 @@ mod tests {
             mapping: entries.into_iter().collect(),
         });
         let projection = Arc::new(
-            VersionAddressProjection::try_new(
-                raw.as_ref(),
-                raw.len(),
-                remapper
-                    .as_ref()
-                    .map(|remapper| remapper as &dyn RowIdRemapper),
-                "docs",
-            )
-            .expect("valid projection"),
+            sync_projection(raw.as_ref(), raw.len(), remapper.as_ref()).expect("valid projection"),
         );
         let projection = projection.resident(Some(raw)).unwrap();
 
@@ -3308,9 +3224,9 @@ mod tests {
             Some("10"),
         )
         .await;
-        let remapper: Arc<dyn RowIdRemapper> = Arc::new(TestRemapper {
+        let remapper = Remapper::from_backing(Arc::new(TestRemapper {
             mapping: remapping.into_iter().collect(),
-        });
+        }));
         let documents = open_documents(store, path, cache.as_ref(), Some(remapper))
             .await
             .unwrap();

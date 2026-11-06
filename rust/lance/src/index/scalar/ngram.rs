@@ -205,7 +205,7 @@ pub(in crate::index) async fn open_and_merge_segments(
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let frag_reuse_index = frag_reuse_index
         .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-    NGramIndex::merge_segments_with_remapper(
+    NGramIndex::merge_segments(
         &segment_stores,
         new_data,
         new_store,

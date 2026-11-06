@@ -924,8 +924,7 @@ impl Dataset {
             io_stats: metrics.io_stats(),
         };
         let resolved =
-            frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
-                .await?;
+            frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose).await?;
         // The index state (paths, model, quantizer metadata) and a legacy
         // whole-index entry embed no translated rows: they live in the plain
         // per-index namespace and stay warm across appends and unrelated
@@ -933,7 +932,7 @@ impl Dataset {
         // the translated namespace of `query_cache`.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
-        let remapping = resolved.map(|(_, remapping)| remapping);
+        let remapping = frag_reuse::segment_remapper(self, index_meta, &resolved).await?;
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());

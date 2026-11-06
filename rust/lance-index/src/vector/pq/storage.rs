@@ -2016,7 +2016,7 @@ mod tests {
     ) {
         let source = create_pq_storage_with_distance(distance_type).await;
         let reader = write_partitioned_pq_file(&source).await;
-        let loader = IvfQuantizationStorage::<ProductQuantizer>::try_new(reader, None)
+        let loader = IvfQuantizationStorage::<ProductQuantizer>::open(reader)
             .await
             .unwrap();
 

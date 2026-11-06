@@ -476,46 +476,21 @@ impl DocSet {
         Ok(batch)
     }
 
+    /// Load the documents, translating their row addresses through
+    /// `remapper` as a batch. A deleted row keeps its slot as a tombstone
+    /// until the layout-aware decoding below, so documents stay aligned with
+    /// the posting lists that reference them by position.
     pub async fn load(
         reader: Arc<dyn IndexReader>,
         is_legacy: bool,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<&Remapper>,
     ) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-        let num_tokens_col = batch[NUM_TOKEN_COL].as_primitive::<datatypes::UInt32Type>();
-        let mut doc_indices = Vec::new();
-        for rank in 0.. {
-            let column_name = doc_index_storage_column(rank);
-            let Some(column) = batch.column_by_name(&column_name) else {
-                break;
-            };
-            doc_indices.push(column.as_primitive::<datatypes::UInt32Type>());
-        }
-        Self::from_columns_with_doc_indices(
-            row_id_col,
-            num_tokens_col,
-            &doc_indices,
-            is_legacy,
-            frag_reuse_index,
-        )
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    pub(crate) async fn load_with_remapping(
-        reader: Arc<dyn IndexReader>,
-        is_legacy: bool,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-    ) -> Result<Self> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        let batch = reader.read_range(0..reader.num_rows(), None).await?;
-        let (batch, frag_reuse_index) = match remapping {
-            Some(remapping) => {
+        let (batch, frag_reuse_index) = match remapper {
+            Some(remapper) => {
                 let row_id_idx = batch.schema().index_of(ROW_ID)?;
                 let (batch, remapper) =
-                    remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
-                        .await?;
+                    translate_preserving_layout(remapper, batch, row_id_idx).await?;
                 (batch, Some(remapper))
             }
             None => (batch, None),
@@ -604,17 +579,19 @@ impl DocSet {
             .iter()
             .map(|column| column.values().to_vec())
             .collect::<Vec<_>>();
-        // for legacy format, the row id is doc id; sorting keeps binary search viable
+        // for legacy format, the row id is doc id; sorting keeps binary search viable.
+        // A deleted row keeps its document as a tombstone: the corpus statistics
+        // (document count, total length) were taken over every document, and
+        // a document's length is paired with its own row before sorting.
         if is_legacy {
             let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
                 .values()
                 .iter()
-                .filter_map(|id| {
-                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
-                    } else {
-                        Some(*id)
-                    }
+                .map(|id| match frag_reuse_index.as_ref() {
+                    Some(frag_reuse_index_ref) => frag_reuse_index_ref
+                        .remap_row_id(*id)
+                        .unwrap_or(RowAddress::TOMBSTONE_ROW),
+                    None => *id,
                 })
                 .zip(num_tokens_col.values().iter())
                 .sorted_unstable_by_key(|x| x.0)

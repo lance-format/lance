@@ -127,6 +127,11 @@ pub(super) enum PostingMetadata {
     LegacyV1 {
         offsets: Vec<usize>,
         max_scores: Option<Vec<f32>>,
+        /// Legacy postings name documents by the row addresses the index was
+        /// built with, so a translated segment rewrites each posting it reads
+        /// through these `(built_with, translated)` pairs, sorted by the
+        /// first. Decoded postings stay untranslated in the cache.
+        translation: Option<Arc<[(u64, u64)]>>,
     },
     /// V2: per-token `max_score` and `length` live as columns in the
     /// posting file. The bulk vectors are filled lazily by
@@ -165,6 +170,7 @@ impl std::fmt::Debug for PostingListReader {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
+                ..
             } => {
                 s.field("layout", &"legacy_v1")
                     .field("offsets", offsets)
@@ -185,7 +191,14 @@ impl DeepSizeOf for PostingListReader {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
-            } => offsets.deep_size_of_children(context) + max_scores.deep_size_of_children(context),
+                translation,
+            } => {
+                offsets.deep_size_of_children(context)
+                    + max_scores.deep_size_of_children(context)
+                    + translation.as_ref().map_or(0, |translation| {
+                        std::mem::size_of_val::<[(u64, u64)]>(translation)
+                    })
+            }
             PostingMetadata::V2 { metadata } => metadata
                 .get()
                 .map(|loaded| {
@@ -228,6 +241,7 @@ impl PostingListReader {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
+                translation: None,
             }
         } else {
             PostingMetadata::V2 {
@@ -661,7 +675,30 @@ impl PostingListReader {
             posting.set_positions(positions);
         }
 
+        if let PostingMetadata::LegacyV1 {
+            translation: Some(translation),
+            ..
+        } = &self.metadata
+        {
+            posting = translate_legacy_posting(posting, translation)?;
+        }
+
         Ok(posting)
+    }
+
+    /// Translate the row addresses every legacy posting names through
+    /// `translation`; see [`PostingMetadata::LegacyV1`].
+    pub(super) fn set_legacy_translation(&mut self, translation: Arc<[(u64, u64)]>) -> Result<()> {
+        let PostingMetadata::LegacyV1 {
+            translation: slot, ..
+        } = &mut self.metadata
+        else {
+            return Err(Error::internal(
+                "only legacy FTS postings name documents by row address",
+            ));
+        };
+        *slot = Some(translation);
+        Ok(())
     }
 
     async fn cached_exact_posting(
@@ -915,5 +952,92 @@ impl PostingListReader {
             self.block_size,
             self.positions_layout,
         )
+    }
+}
+
+/// A legacy posting with its row addresses translated: an address the
+/// translation does not hold belongs to a deleted row and is dropped, and the
+/// entries are re-sorted because translation need not preserve address order.
+fn translate_legacy_posting(
+    posting: PostingList,
+    translation: &[(u64, u64)],
+) -> Result<PostingList> {
+    let PostingList::Plain(posting) = posting else {
+        return Err(Error::internal(
+            "legacy FTS postings must be plain row-address lists",
+        ));
+    };
+    let mut entries = posting
+        .row_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(position, built_with)| {
+            translation
+                .binary_search_by_key(built_with, |entry| entry.0)
+                .ok()
+                .map(|found| (translation[found].1, position as u32))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    let positions = UInt32Array::from_iter_values(entries.iter().map(|entry| entry.1));
+    let frequencies = arrow_select::take::take(
+        &arrow_array::Float32Array::new(posting.frequencies.clone(), None),
+        &positions,
+        None,
+    )?;
+    let doc_positions = posting
+        .positions
+        .as_ref()
+        .map(|list| arrow_select::take::take(list, &positions, None))
+        .transpose()?;
+    Ok(PostingList::Plain(PlainPostingList::new(
+        entries.iter().map(|entry| entry.0).collect(),
+        frequencies.as_primitive::<Float32Type>().values().clone(),
+        posting.max_score,
+        doc_positions.map(|list| list.as_list::<i32>().clone()),
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::ListArray;
+    use arrow_array::types::Int32Type;
+
+    use super::*;
+
+    /// A legacy posting's addresses follow the translation; the entry of a
+    /// deleted row is dropped, and the rest are re-sorted together with
+    /// their frequencies and positions.
+    #[test]
+    fn translate_legacy_posting_follows_the_translation() {
+        let positions = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(0)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+        ]);
+        let posting = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![10_u64, 20, 30]),
+            ScalarBuffer::from(vec![1.0_f32, 2.0, 3.0]),
+            Some(3.0),
+            Some(positions),
+        ));
+        // Row 10 moved past row 30, and row 20 was deleted.
+        let translation = [(10, 300), (30, 100)];
+
+        let PostingList::Plain(translated) =
+            translate_legacy_posting(posting, &translation).unwrap()
+        else {
+            panic!("a legacy posting stays plain");
+        };
+        assert_eq!(translated.row_ids.as_ref(), &[100, 300]);
+        assert_eq!(translated.frequencies.as_ref(), &[3.0, 1.0]);
+        assert_eq!(translated.max_score, Some(3.0));
+        assert_eq!(
+            translated.positions,
+            Some(ListArray::from_iter_primitive::<Int32Type, _, _>([
+                Some(vec![Some(3)]),
+                Some(vec![Some(0)]),
+            ]))
+        );
     }
 }

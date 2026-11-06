@@ -236,6 +236,10 @@ impl FragReuseHistory {
         Self(imp)
     }
 
+    pub(super) fn imp(&self) -> &Arc<dyn FriImpl> {
+        &self.0
+    }
+
     /// A history with no records, in `format`.
     pub fn empty(format: HistoryFormat) -> Self {
         match format {
@@ -538,7 +542,7 @@ impl FragReuseHistory {
     /// order. A logical index is planned as a whole: a fragment one segment
     /// covers directly is never translated into for another.
     pub fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
-        self.0.plan(context, group)
+        self.0.clone().plan(context, group)
     }
 
     /// The live fragments each segment of `group` answers for, as planned by

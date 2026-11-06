@@ -425,7 +425,6 @@ async fn vector_fragment_search_requires_every_contributor(
 #[case::complete("complete")]
 #[case::missing_segment("missing")]
 #[case::unsupported_version("version")]
-#[case::unsupported_async_plugin("plugin")]
 #[tokio::test]
 async fn destination_coverage_requires_every_contributing_segment(#[case] scenario: &str) {
     let mut dataset = fixture().await;
@@ -479,14 +478,6 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
         }
         "version" => {
             indices[second].index_version = i32::MAX;
-        }
-        "plugin" => {
-            // A segment requiring an unsupported consumer must not be opened or
-            // counted toward the logical index's destination coverage.
-            indices[second].index_details = Some(Arc::new(
-                prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
-            ));
-            assert!(crate::index::segment::index_is_usable(&indices[second]));
         }
         "complete" => {}
         _ => unreachable!(),
@@ -1086,10 +1077,9 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         .iter()
         .filter(|index| index.name != FRAG_REUSE_INDEX_NAME)
     {
-        let resolved =
-            super::super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
-                .await
-                .unwrap();
+        let resolved = super::super::frag_reuse::open_row_id_remapping(dataset, index)
+            .await
+            .unwrap();
         if let Some(fri) = fri {
             assert_eq!(fri.index_version, 0);
             let (uuid, remapping) = resolved.unwrap();
@@ -1097,8 +1087,13 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
                 uuid,
                 super::super::frag_reuse::v0_cache_identity(dataset, fri)
             );
-            let super::super::frag_reuse::ResolvedRemapping::V0(remapper) = remapping else {
-                panic!("V1 must use the synchronous remapper");
+            let resolved = Some((uuid, remapping));
+            let Some(remapper) =
+                super::super::frag_reuse::segment_remapper(dataset, index, &resolved)
+                    .await
+                    .unwrap()
+            else {
+                continue;
             };
             let legacy = dataset
                 .open_frag_reuse_index(&NoOpMetricsCollector)
@@ -1108,14 +1103,19 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
             for version in &legacy.details.versions {
                 for group in &version.groups {
                     for source in &group.old_frags {
-                        for offset in 0..source.physical_rows {
-                            let address =
-                                RowAddress::new_from_parts(source.id as u32, offset as u32).into();
-                            assert_eq!(
-                                remapper.remap_row_id(address),
-                                legacy.remap_row_id(address)
-                            );
-                        }
+                        let addresses: Vec<u64> = (0..source.physical_rows)
+                            .map(|offset| {
+                                RowAddress::new_from_parts(source.id as u32, offset as u32).into()
+                            })
+                            .collect();
+                        let mut translated: Vec<Option<u64>> =
+                            addresses.iter().copied().map(Some).collect();
+                        remapper.translate_in_place(&mut translated).await.unwrap();
+                        let expected: Vec<Option<u64>> = addresses
+                            .iter()
+                            .map(|&address| legacy.remap_row_id(address))
+                            .collect();
+                        assert_eq!(translated, expected);
                     }
                 }
             }
@@ -1366,13 +1366,6 @@ async fn legacy_reader_guard_rejects_new_entry_points() {
             let Err(error) = FragmentReuseIndex::open(&dataset, &index).await else {
                 panic!("guard must reject new reader construction");
             };
-            assert!(matches!(error, Error::Internal { .. }));
-            assert!(
-                error
-                    .to_string()
-                    .contains("V1 operation entered the new FRI reader")
-            );
-            let error = load_history(&dataset, &index).await.unwrap_err();
             assert!(matches!(error, Error::Internal { .. }));
             assert!(
                 error
@@ -1640,7 +1633,7 @@ async fn released_legacy_fri_keeps_version_zero_on_append() {
         .unwrap();
     assert_eq!(fri.index_version, 0);
     // Decode the released writer's actual Any, not a reserialized modern protobuf.
-    let history = load_history(&dataset, fri).await.unwrap();
+    let history = dataset.frag_reuse_history().await.unwrap().unwrap();
     let ledger = history.ledger();
     assert!(!ledger.transitions().is_empty());
     let legacy = dataset
@@ -1889,35 +1882,6 @@ async fn vector_partition_uses_shared_remapping_and_cached_reconstruction(#[case
     search(dataset.clone()).await;
 }
 
-#[tokio::test]
-async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
-    let mut dataset = fixture().await;
-    // Only metadata is needed: the unsupported reader must never open it.
-    let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
-    indices[0].index_version = 0;
-    indices[0].index_details = Some(Arc::new(
-        prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
-    ));
-    let key = IndexMetadataKey {
-        version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
-    };
-    dataset
-        .index_cache
-        .insert_with_key(&key, Arc::new(indices))
-        .await;
-    let (transition, destinations) = prepare(&dataset).await;
-    let content = InlineContent {
-        legacy_versions: vec![],
-        transitions: vec![transition],
-    }
-    .encode_to_vec();
-    install(&mut dataset, content, destinations, false).await;
-    assert!(dataset.load_index_by_name("i_idx").await.unwrap().is_none());
-    assert_eq!(dataset.count_rows(Some("i = 2".into())).await.unwrap(), 1);
-}
-
 /// System indexes are table-level metadata, not per-fragment query segments:
 /// MemWAL stores `fragment_bitmap: None` and has no remap plugin, so tagged
 /// coverage filtering must pass it through instead of silently dropping it
@@ -2049,9 +2013,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         "no plan may exist before the first tagged open"
     );
 
-    let first = open_row_id_remapping(&dataset, &siblings[0], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let first = open_row_id_remapping(&dataset, &siblings[0]).await.unwrap();
     assert!(matches!(
         first,
         Some((_, ResolvedRemapping::V1Translate { .. }))
@@ -2097,24 +2059,15 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     assert_ne!(planned, no_coverage);
     // The pruned plan derives nothing for the sibling: a query opens it as
     // contributing nothing, its fragments being scanned.
-    match open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap()
-    {
+    match open_row_id_remapping(&dataset, &siblings[1]).await.unwrap() {
         Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
             assert_eq!(fingerprint, no_coverage);
         }
         other => panic!("expected an empty translation, got {other:?}"),
     }
-    match open_row_id_remapping_with_plan(
-        &dataset,
-        &siblings[1],
-        None,
-        OpenPurpose::Maintenance,
-        &NoOpMetricsCollector,
-    )
-    .await
-    .unwrap()
+    match open_row_id_remapping_with_plan(&dataset, &siblings[1], None, OpenPurpose::Maintenance)
+        .await
+        .unwrap()
     {
         Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
             assert_eq!(fingerprint, no_coverage, "the pruned plan was recomputed");
@@ -2125,9 +2078,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     // With the real plan restored, the sibling opens as a cache hit on the
     // same plan entry; nothing is recomputed or re-published.
     plan_cache.insert_with_key(&key, plan.clone()).await;
-    let second = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let second = open_row_id_remapping(&dataset, &siblings[1]).await.unwrap();
     assert!(matches!(
         second,
         Some((_, ResolvedRemapping::V1Translate { .. }))
@@ -2160,9 +2111,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .index_cache
         .insert_with_key(&metadata_key, Arc::new(vec![fri.clone()]))
         .await;
-    let warm = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let warm = open_row_id_remapping(&dataset, &siblings[1]).await.unwrap();
     assert!(
         matches!(warm, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "a warm open must resolve purely from the cached plan"
@@ -2177,7 +2126,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     let mut dataset = fixture().await;
     let segment = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
     assert!(
-        open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector)
+        open_row_id_remapping(&dataset, &segment)
             .await
             .unwrap()
             .is_none()
@@ -2230,18 +2179,14 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     // The committed segment covers rewritten fragments: it needs translation.
     let indices = dataset.load_indices().await.unwrap();
     let segment = indices.iter().find(|index| index.name == "i_idx").unwrap();
-    let resolved = open_row_id_remapping(&dataset, segment, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, segment).await.unwrap();
     assert!(
         matches!(resolved, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "{resolved:?}"
     );
 
     // The untouched segment resolves to identity and carries no remapper.
-    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, &untouched).await.unwrap();
     assert!(
         matches!(resolved, Some((_, ResolvedRemapping::V1Identity))),
         "{resolved:?}"
@@ -2250,9 +2195,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     // A segment absent from the committed listing cannot be resolved.
     let mut unknown = untouched.clone();
     unknown.uuid = Uuid::new_v4();
-    let error = open_row_id_remapping(&dataset, &unknown, &NoOpMetricsCollector)
-        .await
-        .unwrap_err();
+    let error = open_row_id_remapping(&dataset, &unknown).await.unwrap_err();
     assert!(
         error
             .to_string()
@@ -2280,13 +2223,13 @@ async fn resolver_dispatch_v0_uses_the_compact_handle() {
     assert!(assert_legacy_metadata(&dataset).await.is_some());
 }
 
+/// FM translates its row addresses through a tagged history: a segment
+/// built before a stable partition keeps answering substring queries for
+/// the moved rows from the index, at their current addresses.
 #[tokio::test]
-async fn legacy_api_plugin_keeps_untouched_segments_available() {
-    use crate::index::frag_reuse::{ResolvedRemapping, open_row_id_remapping};
+async fn fm_segment_translates_under_a_tagged_history() {
     use lance_index::scalar::BuiltinIndexType;
 
-    // The FM plugin only implements the legacy synchronous API
-    // (supports_batch_row_id_remapping is false).
     let batch = arrow_array::record_batch!(
         ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
         (
@@ -2319,30 +2262,7 @@ async fn legacy_api_plugin_keeps_untouched_segments_available() {
         )
         .await
         .unwrap();
-    let (transition, mut destinations) = prepare(&dataset).await;
-    let appended =
-        arrow_array::record_batch!(("i", Int32, [8]), ("text", Utf8, ["extra8"])).unwrap();
-    dataset
-        .append(
-            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
-            None,
-        )
-        .await
-        .unwrap();
-    let untouched_fragment = dataset
-        .fragments()
-        .iter()
-        .max_by_key(|fragment| fragment.id)
-        .unwrap()
-        .clone();
-    let untouched = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
-        .name("text_idx".into())
-        .replace(true)
-        .fragments(vec![untouched_fragment.id as u32])
-        .execute_uncommitted()
-        .await
-        .unwrap();
-    destinations.push(untouched_fragment);
+    let (transition, destinations) = prepare(&dataset).await;
     let content = InlineContent {
         legacy_versions: vec![],
         transitions: vec![transition],
@@ -2350,61 +2270,20 @@ async fn legacy_api_plugin_keeps_untouched_segments_available() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    // The committed segment needs translation, which the FM plugin cannot do:
-    // it is excluded from coverage and substring queries fall back to a scan,
-    // still returning correct rows.
-    let usable =
-        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", "text_idx")
-            .await
-            .unwrap();
-    assert!(usable.is_empty());
-    let mut scan = dataset.scan();
-    scan.filter("contains(text, 'row2')").unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(!plan.contains("ScalarIndexQuery"), "{plan}");
-    let rows = scan.try_into_batch().await.unwrap();
-    assert_eq!(rows.num_rows(), 1, "{plan}");
-    assert_eq!(rows["i"].as_primitive::<Int32Type>().value(0), 2);
-
-    // The untouched FM segment resolves to identity, loads through the
-    // plugin's original entry point, and serves queries: the availability win
-    // for legacy-API-only plugins.
-    let mut all = crate::index::loading::load_all_indices(&dataset)
-        .await
-        .unwrap()
-        .as_ref()
-        .clone();
-    all.push(untouched.clone());
-    persist_fixture(&mut dataset, all).await;
-    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
-        .await
-        .unwrap();
-    assert!(
-        matches!(resolved, Some((_, ResolvedRemapping::V1Identity))),
-        "{resolved:?}"
-    );
     let usable =
         crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", "text_idx")
             .await
             .unwrap();
     assert_eq!(usable.len(), 1);
-    assert_eq!(usable[0].uuid, untouched.uuid);
-    let mut scan = dataset.scan();
-    scan.filter("contains(text, 'extra8')").unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
-    let rows = scan.try_into_batch().await.unwrap();
-    assert_eq!(rows.num_rows(), 1, "{plan}");
-    assert_eq!(rows["i"].as_primitive::<Int32Type>().value(0), 8);
-    // Rows in fragments the identity segment does not cover still come back
-    // correctly through the scan side of the plan.
-    assert_eq!(
-        dataset
-            .count_rows(Some("contains(text, 'row2')".into()))
-            .await
-            .unwrap(),
-        1
-    );
+    for i in [2, 5] {
+        let mut scan = dataset.scan();
+        scan.filter(&format!("contains(text, 'row{i}')")).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let rows = scan.try_into_batch().await.unwrap();
+        assert_eq!(rows.num_rows(), 1, "{plan}");
+        assert_eq!(rows["i"].as_primitive::<Int32Type>().value(0), i);
+    }
 }
 
 #[tokio::test]
@@ -2425,13 +2304,9 @@ async fn legacy_traffic_guard_rejects_batch_entry_points() {
         .clone();
     lance_index::scalar::LEGACY_TRAFFIC_ONLY
         .scope((), async {
-            let error = crate::index::frag_reuse::open_row_id_remapping(
-                &dataset,
-                &segment,
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap_err();
+            let error = crate::index::frag_reuse::open_row_id_remapping(&dataset, &segment)
+                .await
+                .unwrap_err();
             assert!(
                 error.to_string().contains("entered batch row-ID remapping"),
                 "{error}"
@@ -3215,14 +3090,11 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
 // ---- cache identity: translated entries follow the translation state ----
 
 /// Open `i_idx` through the real scalar path, returning how many index loads
-/// it took (0 = served from the cache) and the cached container.
-async fn open_i_idx(dataset: &Dataset) -> (usize, Arc<dyn lance_index::scalar::ScalarIndex>) {
+/// it took (0 = served from the cache). The btree caches its reader-free
+/// state, not a container, so the load count is the cache signal.
+async fn open_i_idx(dataset: &Dataset) -> usize {
     let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
-    let (loads, container) = open_segment(dataset, &index).await;
-    (
-        loads,
-        container.expect("a translating open leaves its container in the cache"),
-    )
+    open_segment(dataset, &index).await.0
 }
 
 /// `(index loads, cached container)`: the container is absent on a plugin's
@@ -3443,14 +3315,13 @@ async fn install_history(
 #[tokio::test]
 async fn tagged_append_keeps_translated_entries_warm() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, before) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "cold open loads the index");
     assert_eq!(count(&dataset, 2).await, 1);
 
     append_rows(&mut dataset, &[100]).await;
-    let (loads, after) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 0, "an append must not evict translated entries");
-    assert!(same_container(&before, &after));
     assert_eq!(count(&dataset, 2).await, 1);
     assert_eq!(count(&dataset, 100).await, 1, "the appended row is scanned");
 }
@@ -3460,7 +3331,7 @@ async fn tagged_append_keeps_translated_entries_warm() {
 #[tokio::test]
 async fn coverage_change_misses_without_new_fri() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let fri_before = fri_entry(
         &crate::index::loading::load_all_indices(&dataset)
@@ -3492,7 +3363,7 @@ async fn coverage_change_misses_without_new_fri() {
     .uuid;
     assert_eq!(fri_before, fri_after);
 
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "a coverage change must miss");
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, usize::from(value % 2 == 1));
@@ -3504,7 +3375,7 @@ async fn coverage_change_misses_without_new_fri() {
 #[tokio::test]
 async fn relevant_transition_misses_translated_entries() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let first = decode_transitions(&dataset).await;
     assert_eq!(first.len(), 1);
@@ -3523,7 +3394,7 @@ async fn relevant_transition_misses_translated_entries() {
     transitions.push(second);
     install_history(&mut dataset, transitions, live).await;
 
-    let (loads, _) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1, "a transition on the path must miss");
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, 1, "value {value}");
@@ -3537,7 +3408,7 @@ async fn relevant_transition_misses_translated_entries() {
 #[tokio::test]
 async fn unrelated_transition_keeps_translated_entries_warm() {
     let mut dataset = persisted_translating_fixture().await;
-    let (loads, before) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
     let fri_before = fri_entry(
         &crate::index::loading::load_all_indices(&dataset)
@@ -3561,12 +3432,11 @@ async fn unrelated_transition_keeps_translated_entries_warm() {
     let fri_after = install_history(&mut dataset, transitions, live).await.uuid;
     assert_ne!(fri_before, fri_after);
 
-    let (loads, after) = open_i_idx(&dataset).await;
+    let loads = open_i_idx(&dataset).await;
     assert_eq!(
         loads, 0,
         "a transition off the segment's path must not evict its entries"
     );
-    assert!(same_container(&before, &after));
     for value in 0..8 {
         assert_eq!(count(&dataset, value).await, 1, "value {value}");
     }
@@ -3623,9 +3493,7 @@ async fn identity_segment_survives_two_appends() {
         .clone();
     all.push(untouched.clone());
     persist_fixture(&mut dataset, all).await;
-    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, &untouched).await.unwrap();
     assert!(matches!(resolved, Some((_, ResolvedRemapping::V1Identity))));
 
     let (loads, before) = open_segment(&dataset, &untouched).await;
@@ -3642,76 +3510,108 @@ async fn identity_segment_survives_two_appends() {
     assert_eq!(count(&dataset, 300).await, 1);
 }
 
-// A legacy-layout full-text index (tokens, postings and documents at the
-// index root, no metadata file) keeps its per-document lengths aligned with
-// the row ids it was built with, so it cannot be translated under a tagged
-// history. The tagged reader excludes the segment from coverage, and a real
-// full-text query on the tagged table returns exactly what an index-free scan
-// returns: neither misaligned scores nor an error.
-#[tokio::test]
-async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
-    let batch = arrow_array::record_batch!(
-        ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
-        (
-            "text",
-            Utf8,
-            [
-                Some("even"),
-                Some("odd"),
-                Some("even"),
-                Some("odd"),
-                None,
-                Some("odd"),
-                Some("even"),
-                Some("odd")
-            ]
+async fn legacy_fts_scores(
+    dataset: &Dataset,
+    query: &str,
+) -> std::collections::BTreeMap<String, f32> {
+    let batch = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(
+            lance_index::scalar::FullTextSearchQuery::new(query.to_owned())
+                .with_column("text".into())
+                .unwrap(),
         )
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-    let mut dataset = Dataset::write(
-        reader,
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 4,
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let texts = batch["text"].as_string::<i32>();
+    let scores = batch[lance_index::scalar::inverted::SCORE_COL]
+        .as_primitive::<arrow_array::types::Float32Type>();
+    (0..batch.num_rows())
+        .map(|row| (texts.value(row).to_owned(), scores.value(row)))
+        .collect()
+}
+
+// Global BM25 statistics are not adjusted on deletion or translation, so a
+// rebuilt index is no reference: the scores before compaction are. The
+// released 0.27.0 fixture holds a real legacy-layout index (one fragment).
+#[tokio::test]
+async fn legacy_layout_fts_keeps_scores_through_a_version_0_history() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+    let test_dir = crate::utils::test::copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    // The first document precedes the others in the documents file, so
+    // dropping it shifts every later document if lengths are not kept aligned.
+    dataset.delete("text = 'frodo was a puppy'").await.unwrap();
+    let queries = ["puppy", "happy", "tail", "frodo puppy"];
+    let mut before = Vec::new();
+    for query in queries {
+        before.push(legacy_fts_scores(&dataset, query).await);
+    }
+    assert_eq!(before[0].len(), 2, "{before:?}");
+    let text_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
             ..Default::default()
-        }),
+        },
+        None,
     )
     .await
     .unwrap();
+    let fri = dataset
+        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        .await
+        .unwrap()
+        .expect("deferred remap records a fragment reuse history");
+    assert_eq!(fri.index_version, 0);
+    let text_idx = dataset.load_indices().await.unwrap();
+    assert!(
+        text_idx.iter().any(|index| index.uuid == text_uuid),
+        "the segment must answer through the history, not an eager remap"
+    );
+    assert_ne!(dataset.fragments()[0].id, 0, "compaction rewrote nothing");
+
+    for (query, before) in queries.into_iter().zip(&before) {
+        let after = legacy_fts_scores(&dataset, query).await;
+        assert_eq!(&after, before, "query {query:?}");
+    }
+}
+
+// The same released legacy-layout index under a tagged history: it translates
+// like any other segment and keeps the scores it gave before the rewrite.
+#[tokio::test]
+async fn legacy_layout_fts_keeps_scores_through_a_tagged_history() {
+    let test_dir = crate::utils::test::copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    dataset.delete("text = 'frodo was a puppy'").await.unwrap();
+    // `prepare` splits rows by the parity of `i`: the two survivors (11, 14)
+    // land in different destinations.
     dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".into()),
-            // The fixture below rewrites the initial partition's file names.
-            &lance_index::scalar::InvertedIndexParams::default().num_workers(1),
-            true,
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "i".into(),
+                "CAST(length(text) / 2 AS INT)".into(),
+            )]),
+            None,
+            None,
         )
         .await
         .unwrap();
-    let index = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-
-    // Rewrite the single-partition index into the legacy layout: the
-    // partition files move to the root names and the metadata file goes.
-    let index_dir = dataset.indices_dir().join(index.uuid.to_string());
-    for name in ["tokens.lance", "invert.lance", "docs.lance"] {
-        let from = index_dir.clone().join(format!("part_0_{name}"));
-        let to = index_dir.clone().join(name);
-        dataset.object_store.copy(&from, &to).await.unwrap();
-        dataset.object_store.delete(&from).await.unwrap();
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let queries = ["puppy", "happy", "tail", "frodo puppy"];
+    let mut before = Vec::new();
+    for query in queries {
+        before.push(legacy_fts_scores(&dataset, query).await);
     }
-    dataset
-        .object_store
-        .delete(&index_dir.clone().join("metadata.lance"))
-        .await
-        .unwrap();
+    assert_eq!(before[0].len(), 2, "{before:?}");
 
-    dataset.delete("i = 3").await.unwrap();
     let (transition, destinations) = prepare(&dataset).await;
     let content = InlineContent {
         legacy_versions: vec![],
@@ -3720,53 +3620,22 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    // Excluded from coverage: no usable segment is advertised for the column.
     let usable =
-        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", "text_idx")
+        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", &index_name)
             .await
             .unwrap();
-    assert!(usable.is_empty(), "{usable:?}");
+    assert_eq!(usable.len(), 1, "{usable:?}");
+    assert_eq!(
+        usable[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10, 11])
+    );
 
-    // The truth: an index-free scan of the tagged snapshot.
-    let mut scan = dataset.scan();
-    scan.filter("text = 'even'").unwrap();
-    scan.use_scalar_index(false);
-    let expected = scan
-        .try_into_batch()
-        .await
-        .unwrap()
-        .column_by_name("i")
-        .unwrap()
-        .as_primitive::<Int32Type>()
-        .values()
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(expected, std::collections::BTreeSet::from([0, 2, 6]));
-
-    // A real full-text query on the tagged table matches it, cold and warm.
+    // Cold and warm.
     for _ in 0..2 {
-        let mut scan = dataset.scan();
-        // The column is named: a column-less query discovers its columns from
-        // the usable segments, and this snapshot advertises none.
-        scan.full_text_search(
-            lance_index::scalar::FullTextSearchQuery::new("even".into())
-                .with_column("text".into())
-                .unwrap(),
-        )
-        .unwrap();
-        let actual = scan
-            .try_into_batch()
-            .await
-            .unwrap()
-            .column_by_name("i")
-            .unwrap()
-            .as_primitive::<Int32Type>()
-            .values()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(actual, expected);
+        for (query, before) in queries.into_iter().zip(&before) {
+            let after = legacy_fts_scores(&dataset, query).await;
+            assert_eq!(&after, before, "query {query:?}");
+        }
     }
 }
 
@@ -4437,7 +4306,7 @@ async fn segment_state_matrix_at_the_open_layer() {
         let dataset = dataset.clone();
         let segment = segment.clone();
         async move {
-            match open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector).await {
+            match open_row_id_remapping(&dataset, &segment).await {
                 Ok(_) => Cell::Serves,
                 Err(_) => Cell::Error,
             }
@@ -4452,7 +4321,6 @@ async fn segment_state_matrix_at_the_open_layer() {
                 &segment,
                 None,
                 OpenPurpose::Maintenance,
-                &NoOpMetricsCollector,
             )
             .await
             {

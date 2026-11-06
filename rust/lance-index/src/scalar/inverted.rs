@@ -23,7 +23,7 @@ pub mod tokenizer;
 mod wand;
 
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_index_core::remapping::BatchRowIdRemapper;
+use lance_index_core::remapping::Remapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -43,7 +43,6 @@ pub use compound::{
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
 use datafusion_execution::SendableRecordBatchStream;
-use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
@@ -473,7 +472,7 @@ use lance_core::Error;
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
 use crate::scalar::{
-    CreatedIndex, RowIdRemapper, ScalarIndex,
+    CreatedIndex, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
         BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin,
@@ -617,6 +616,31 @@ impl BasicTrainer for InvertedIndexPlugin {
     }
 }
 
+impl InvertedIndexPlugin {
+    fn reader_free_snapshot(index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Self::downcast(index)?
+            .cache_snapshot()
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn rebind(
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapper: Option<Remapper>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        Self::downcast(index)?
+            .with_store(index_store, remapper)
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn downcast(index: &dyn ScalarIndex) -> Result<&InvertedIndex> {
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))
+    }
+}
+
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
@@ -659,19 +683,17 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         }
     }
 
-    /// Load an index from storage
-    ///
-    /// The index details should match the details that were returned when the index was
-    /// originally trained.
+    /// The index details should match the details that were returned when
+    /// the index was originally trained.
     async fn load_index(
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let index = InvertedIndex::load(index_store, remapper, cache).await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
@@ -683,35 +705,18 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         Ok(index as Arc<dyn ScalarIndex>)
     }
 
-    fn supports_batch_row_id_remapping(&self) -> bool {
+    fn translates_row_addrs(&self) -> bool {
         true
     }
 
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        index_details: &prost_types::Any,
-        _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        let index =
-            InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
-        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
-        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
-        let physical_granularity = index.params().get_document_granularity();
-        if physical_granularity != expected_granularity {
-            return Err(Error::index(format!(
-                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
-            )));
-        }
-        Ok(index as Arc<dyn ScalarIndex>)
-    }
-
+    /// Caches a reader-free snapshot and only a weak reference to the live
+    /// index, so cached FTS state does not keep a request's readers (and
+    /// their credentials) alive; each request rebinds the snapshot to its own
+    /// store and remapper.
     async fn get_or_insert_in_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
@@ -720,16 +725,8 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             index_store,
             cache,
             load,
-            move |index| async move {
-                let index = index
-                    .as_any()
-                    .downcast_ref::<InvertedIndex>()
-                    .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
-                index
-                    .with_store(rebind_store, frag_reuse_index.map(DocumentRemapping::Sync))
-                    .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-            },
-            |index| self.cache_snapshot(index),
+            move |index| async move { Self::rebind(index.as_ref(), rebind_store, remapper) },
+            Self::reader_free_snapshot,
         )
         .await
     }
@@ -740,7 +737,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
         index: Arc<dyn ScalarIndex>,
     ) -> Result<()> {
-        let snapshot = self.cache_snapshot(index.as_ref())?;
+        let snapshot = Self::reader_free_snapshot(index.as_ref())?;
         cache
             .insert_unsized_with_key(
                 &ScalarIndexCacheKey,
@@ -754,34 +751,10 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         Ok(())
     }
 
-    fn cache_snapshot(&self, index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .cache_snapshot()
-            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-    }
-
-    fn rebind_with_remapping(
-        &self,
-        index: &dyn ScalarIndex,
-        index_store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        index
-            .as_any()
-            .downcast_ref::<InvertedIndex>()
-            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .with_store(index_store, remapping.map(DocumentRemapping::Batch))
-            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-    }
-
     async fn get_from_cache(
         &self,
         index_store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Option<Arc<dyn ScalarIndex>>> {
         let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
@@ -795,7 +768,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
             .as_any()
             .downcast_ref::<InvertedIndex>()
             .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
-            .with_store(index_store, frag_reuse_index.map(DocumentRemapping::Sync))
+            .with_store(index_store, remapper)
             .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 

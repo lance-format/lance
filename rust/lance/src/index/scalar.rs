@@ -16,7 +16,6 @@ pub(crate) mod ngram;
 pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
-use super::frag_reuse::ResolvedRemapping;
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
@@ -892,31 +891,29 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
-        dataset, index, staged, purpose, metrics,
-    )
-    .await?;
+    let resolved =
+        super::frag_reuse::open_row_id_remapping_with_plan(dataset, index, staged, purpose).await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
-    let (frag_reuse_index, batch_remapping) =
-        match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
-            // An untouched segment on a tagged dataset loads the original way,
-            // with no remapper; every plugin (including legacy-API-only ones)
-            // supports this.
-            Some(ResolvedRemapping::V1Identity) => (None, None),
-            Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
-            None => (None, None),
-        };
+    let remapper = super::frag_reuse::segment_remapper(dataset, index, &resolved).await?;
+    // Query listings leave out the segments a plugin cannot translate; one
+    // opened by uuid anyway is refused rather than read with stale addresses.
+    if remapper.is_some() && !plugin.translates_row_addrs() {
+        return Err(Error::not_supported(format!(
+            "segment {index_uuid} of index `{}` needs its row addresses translated \
+             through the fragment reuse history, and its {} plugin does not translate them",
+            index.name,
+            plugin.name()
+        )));
+    }
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
     // already validated this session, saving the extra `open_index_file` IOP.
     let load: ScalarIndexLoad = Box::pin({
         let index_store = index_store.clone();
-        let batch_remapping = batch_remapping.clone();
-        let frag_reuse_index = frag_reuse_index.clone();
+        let remapper = remapper.clone();
         let index_cache = index_cache.clone();
         async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
@@ -931,30 +928,15 @@ pub(crate) async fn open_scalar_index_with_plan(
 
             let index_version = u32::try_from(index.index_version).unwrap_or(0);
 
-            let index = match batch_remapping {
-                Some(remapping) => {
-                    plugin
-                        .load_index_with_remapping(
-                            index_store,
-                            &index_details,
-                            index_version,
-                            Some(remapping),
-                            &index_cache,
-                        )
-                        .await?
-                }
-                None => {
-                    plugin
-                        .load_index(
-                            index_store,
-                            &index_details,
-                            index_version,
-                            frag_reuse_index,
-                            &index_cache,
-                        )
-                        .await?
-                }
-            };
+            let index = plugin
+                .load_index(
+                    index_store,
+                    &index_details,
+                    index_version,
+                    remapper,
+                    &index_cache,
+                )
+                .await?;
 
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();
@@ -962,23 +944,9 @@ pub(crate) async fn open_scalar_index_with_plan(
         }
     });
 
-    if batch_remapping.is_some() {
-        let rebind_store = index_store.clone();
-        lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
-            index_store,
-            &index_cache,
-            load,
-            move |index| async move {
-                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
-            },
-            |index| plugin.cache_snapshot(index),
-        )
+    plugin
+        .get_or_insert_in_cache(index_store, remapper, &index_cache, load)
         .await
-    } else {
-        plugin
-            .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-            .await
-    }
 }
 
 pub(crate) async fn cached_scalar_index_container(
@@ -987,7 +955,7 @@ pub(crate) async fn cached_scalar_index_container(
 ) -> Option<Arc<dyn ScalarIndex>> {
     let metadata = dataset.load_indices().await.ok()?;
     let index = metadata.iter().find(|idx| idx.uuid == *uuid)?;
-    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
+    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index)
         .await
         .ok()?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);

@@ -98,12 +98,13 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    MetricsCollector, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchResult, UpdateCriteria,
+    MetricsCollector, OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult,
+    UpdateCriteria,
 };
 use crate::vector::graph::OrderedFloat;
 use crate::{Index, IndexType};
 use crate::{pb, pbold};
+use lance_index_core::remapping::Remapper;
 
 /// On-disk format version of the index files. The format is unstable; bump
 /// on any layout change instead of adding compatibility paths.
@@ -877,13 +878,17 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
-            MinHashLshIndex::load(index_store, index_details, frag_reuse_index, cache).await?
+            MinHashLshIndex::load(index_store, index_details, remapper, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
+    }
+
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     fn validate_new_segments_against_existing(

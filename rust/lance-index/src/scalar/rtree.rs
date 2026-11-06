@@ -10,8 +10,7 @@ use crate::scalar::registry::{
 use crate::scalar::rtree::sort::Sorter;
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
-    IndexWriter, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
-    UpdateCriteria,
+    IndexWriter, OldIndexDataFilter, ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::{Index, IndexType, pb};
 use arrow_array::UInt32Array;
@@ -42,9 +41,7 @@ use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
 pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{
-    BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
-};
+use lance_index_core::remapping::{Remapper, translate_record_batch};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -331,11 +328,8 @@ impl CacheKey for RTreeCacheKey {
 pub struct RTreeIndex {
     pub(crate) metadata: Arc<RTreeMetadata>,
     store: Arc<dyn IndexStore>,
-    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
-    /// `batch_remapper`; both `None` means no translation is needed.
-    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    /// Asynchronous batch remapper (tagged histories).
-    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Translates the stored row addresses; `None` when they are current.
+    remapper: Option<Remapper>,
     index_cache: WeakLanceCache,
     pages_reader: Arc<dyn IndexReader>,
     nulls_reader: Arc<dyn IndexReader>,
@@ -351,35 +345,13 @@ impl std::fmt::Debug for RTreeIndex {
 }
 
 impl RTreeIndex {
+    /// Load the index, translating every row address it reports through
+    /// `remapper` (`None` when they are current).
     pub async fn load(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        Self::load_inner(store, frag_reuse_index, None, index_cache).await
-    }
-
-    /// Additive sibling of [`Self::load`] for mappings that require
-    /// asynchronous batch row-ID translation.
-    async fn load_with_remapping(
-        store: Arc<dyn IndexStore>,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
-        lance_index_core::remapping::check_batch_remapping_entry()?;
-        Self::load_inner(store, None, remapping, index_cache).await
-    }
-
-    async fn load_inner(
-        store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
-        index_cache: &LanceCache,
-    ) -> Result<Arc<Self>> {
-        debug_assert!(
-            frag_reuse_index.is_none() || batch_remapper.is_none(),
-            "RTree legacy and batch remappers are mutually exclusive"
-        );
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
         validate_stored_page_size(metadata.page_size, metadata.num_items)?;
@@ -388,8 +360,7 @@ impl RTreeIndex {
         Ok(Arc::new(Self {
             metadata: Arc::new(metadata),
             store,
-            frag_reuse_index,
-            batch_remapper,
+            remapper,
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
@@ -497,12 +468,9 @@ impl RTreeIndex {
     }
 
     async fn remap_row_addrs(&self, row_addrs: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
-        if let Some(remapper) = &self.frag_reuse_index {
-            Ok(remapper.remap_row_addrs_tree_map(&row_addrs))
-        } else if let Some(remapper) = &self.batch_remapper {
-            remap_row_addrs_tree_map_async(remapper.as_ref(), &row_addrs).await
-        } else {
-            Ok(row_addrs)
+        match &self.remapper {
+            Some(remapper) => remapper.translate_set(&row_addrs).await,
+            None => Ok(row_addrs),
         }
     }
 
@@ -519,10 +487,8 @@ impl RTreeIndex {
         }
 
         let mut data = self.clone().into_data_stream().await?;
-        if let Some(remapper) = self.frag_reuse_index.clone() {
+        if let Some(remapper) = self.remapper.clone() {
             data = remap_rtree_data(data, remapper);
-        } else if let Some(remapper) = self.batch_remapper.clone() {
-            data = remap_rtree_data_async(data, remapper);
         }
         if let Some(filter) = old_data_filter {
             data = filter_rtree_data(data, filter.clone());
@@ -585,26 +551,13 @@ fn filter_rtree_data(
 
 fn remap_rtree_data(
     data: SendableRecordBatchStream,
-    remapper: Arc<dyn RowIdRemapper>,
-) -> SendableRecordBatchStream {
-    let schema = data.schema();
-    let remapped = data.map(move |batch_result| {
-        let batch = batch_result?;
-        // The row ID is column 1 in BBOX_ROWID_SCHEMA.
-        Ok(remapper.remap_row_ids_record_batch(batch, 1)?)
-    });
-    Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
-}
-
-fn remap_rtree_data_async(
-    data: SendableRecordBatchStream,
-    remapper: Arc<dyn BatchRowIdRemapper>,
+    remapper: Remapper,
 ) -> SendableRecordBatchStream {
     let schema = data.schema();
     let remapped = data.and_then(move |batch| {
         let remapper = remapper.clone();
         // The row ID is column 1 in BBOX_ROWID_SCHEMA.
-        async move { Ok(remap_record_batch_async(remapper.as_ref(), batch, 1).await?) }
+        async move { Ok(translate_record_batch(&remapper, batch, 1).await?) }
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, remapped))
 }
@@ -1293,24 +1246,14 @@ impl ScalarIndexPlugin for RTreeIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
         _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load(index_store, frag_reuse_index, cache).await? as Arc<dyn ScalarIndex>)
-    }
-    fn supports_batch_row_id_remapping(&self) -> bool {
-        true
+        Ok(RTreeIndex::load(index_store, remapper, cache).await? as Arc<dyn ScalarIndex>)
     }
 
-    async fn load_index_with_remapping(
-        &self,
-        index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _index_version: u32,
-        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
-        cache: &LanceCache,
-    ) -> Result<Arc<dyn ScalarIndex>> {
-        Ok(RTreeIndex::load_with_remapping(index_store, remapping, cache).await?)
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 }
 
@@ -1322,18 +1265,79 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::RelationQuery;
     use crate::scalar::registry::VALUE_COLUMN_NAME;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
+    use datafusion_common::ScalarValue;
     use geo_types::{LineString, Rect, coord, line_string};
     use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
     use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_geo::bbox::is_empty_rect;
+    use lance_select::remapper::ScriptedRemapper;
     use rand::Rng;
+
+    /// An rtree is not in the shared remap suite, whose rows are scalar
+    /// values, so this is its instance of that contract: loaded through its
+    /// plugin with a scripted remapper, it answers with current
+    /// addresses only, translating a search's rows as one batch.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_remapped_search_answers_with_current_addresses() {
+        let address = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut builder = PointBuilder::new(point_type);
+        for i in 0..4 {
+            builder.push_point(Some(&geo_types::point!(x: i as f64, y: i as f64)));
+        }
+        builder.push_null();
+        let points = builder.finish();
+        // `train_index` stores row `i` at `address(0, i)`.
+        let (_, store, _tmpdir) = train_index(&points, None).await;
+        let (remapper, script) = ScriptedRemapper::new()
+            .moved(address(0, 0), address(1, 3))
+            .deleted(address(0, 1))
+            .moved(address(0, 2), address(1, 1))
+            .moved(address(0, 3), address(1, 0))
+            .moved(address(0, 4), address(1, 4))
+            .into_remapper();
+        let index = RTreeIndexPlugin
+            .load_index(
+                store,
+                &prost_types::Any::default(),
+                0,
+                Some(remapper),
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+
+        let rect_type = RectType::new(Dimension::XY, Default::default());
+        let mut rects = RectBuilder::new(rect_type.clone());
+        rects.push_rect(Some(&Rect::new(
+            coord! { x: -1.0, y: -1.0 },
+            coord! { x: 10.0, y: 10.0 },
+        )));
+        let query = GeoQuery::IntersectQuery(RelationQuery {
+            value: ScalarValue::try_from_array(&rects.finish().into_array_ref(), 0).unwrap(),
+            field: rect_type.to_field("geo", true),
+        });
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let rows = result.row_addrs();
+        assert_eq!(
+            rows.selected_rows(),
+            &RowAddrTreeMap::from_iter([address(1, 3), address(1, 1), address(1, 0)])
+        );
+        assert_eq!(
+            rows.null_rows(),
+            &RowAddrTreeMap::from_iter([address(1, 4)])
+        );
+        // One batch for the matches, one for the nulls.
+        assert_eq!(script.batches(), 2);
+    }
 
     #[rstest::rstest]
     #[case::leaf("leaf")]
@@ -1783,21 +1787,15 @@ mod tests {
             .collect();
         match remapping {
             "sync" => {
-                first_index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
-                    FragReuseIndex::new(
-                        uuid::Uuid::new_v4(),
-                        vec![
-                            source_ids
-                                .iter()
-                                .copied()
-                                .zip(mapped_ids.iter().copied().map(Some))
-                                .collect(),
-                        ],
-                        FragReuseIndexDetails { versions: vec![] },
-                    ),
-                ))));
+                let script = source_ids
+                    .iter()
+                    .zip(&mapped_ids)
+                    .fold(ScriptedRemapper::new(), |script, (&from, &to)| {
+                        script.moved(from, to)
+                    });
+                first_index.remapper = Some(script.into_remapper().0)
             }
-            "async" => first_index.batch_remapper = Some(Arc::new(TestRemapper)),
+            "async" => first_index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}
         }
         let filter = match filter_kind {
@@ -1940,18 +1938,29 @@ mod tests {
     #[derive(Debug)]
     struct TestRemapper;
 
-    #[async_trait]
-    impl BatchRowIdRemapper for TestRemapper {
-        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-            Ok(row_ids
-                .iter()
-                .map(|id| {
-                    let address = RowAddress::from(*id);
+    impl lance_select::remapper::RemapperBacking for TestRemapper {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(async move {
+                for addr in addrs.iter_mut().flatten() {
+                    let address = RowAddress::from(*addr);
                     let fragment = address.fragment_id();
                     let offset = address.row_offset();
-                    Some(RowAddress::new_from_parts(2 + fragment + offset / 2, offset % 2).into())
-                })
-                .collect())
+                    *addr =
+                        RowAddress::new_from_parts(2 + fragment + offset / 2, offset % 2).into();
+                }
+                Ok(())
+            })
         }
     }
 
@@ -1987,15 +1996,14 @@ mod tests {
             .collect();
         match remapping {
             "sync" => {
-                index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
-                    FragReuseIndex::new(
-                        uuid::Uuid::new_v4(),
-                        vec![(0..4).zip(old_ids.iter().copied().map(Some)).collect()],
-                        FragReuseIndexDetails { versions: vec![] },
-                    ),
-                ))));
+                let script = (0..4)
+                    .zip(&old_ids)
+                    .fold(ScriptedRemapper::new(), |script, (from, &to)| {
+                        script.moved(from, to)
+                    });
+                index.remapper = Some(script.into_remapper().0)
             }
-            "async" => index.batch_remapper = Some(Arc::new(TestRemapper)),
+            "async" => index.remapper = Some(Remapper::from_backing(Arc::new(TestRemapper))),
             _ => {}
         }
         let retained_ids = old_ids[2..].iter().copied().collect::<RowAddrTreeMap>();

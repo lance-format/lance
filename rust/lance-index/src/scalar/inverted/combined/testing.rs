@@ -15,13 +15,13 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
-use lance_core::Result;
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::error::DataFusionResult;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
-use lance_select::RowAddrTreeMap;
-use roaring::RoaringTreemap;
+use lance_select::Remapper;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
+use roaring::RoaringBitmap;
 
 use super::super::builder::{BLOCK_SIZE, InnerBuilder, PositionRecorder};
 use super::super::documents::{AddressKeyedDocuments, PartitionDocuments};
@@ -44,8 +44,8 @@ use super::{
 };
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
+use crate::scalar::IndexStore;
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexStore, RowIdRemapper};
 
 pub(super) fn term(idf: f32, entries: &[(u64, f32)]) -> MaterializedTerm {
     let mut postings = entries.to_vec();
@@ -137,21 +137,20 @@ pub(super) fn compressed_list(postings: &[(u32, u32)]) -> CompressedPostingList 
 #[derive(Debug)]
 struct DeletedRows(Vec<u64>);
 
-impl RowIdRemapper for DeletedRows {
-    fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        (!self.0.contains(&row_id)).then_some(row_id)
+impl RemapperBacking for DeletedRows {
+    fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+        true
     }
 
-    fn remap_row_addrs_tree_map(&self, _: &RowAddrTreeMap) -> RowAddrTreeMap {
-        unreachable!("document fixtures only remap single row ids")
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        fragments.clone()
     }
 
-    fn remap_row_ids_roaring_tree_map(&self, _: &RoaringTreemap) -> RoaringTreemap {
-        unreachable!("document fixtures only remap single row ids")
-    }
-
-    fn remap_row_ids_record_batch(&self, _: RecordBatch, _: usize) -> Result<RecordBatch> {
-        unreachable!("document fixtures only remap single row ids")
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        for slot in addrs.iter_mut() {
+            *slot = slot.filter(|addr| !self.0.contains(addr));
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -194,8 +193,8 @@ pub(super) async fn modern_identity_docs(
     writer.finish().await.unwrap();
 
     let reader = store.open_index_file(DOCS_PATH).await.unwrap();
-    let remapper: Option<Arc<dyn RowIdRemapper>> = (!dead_rows.is_empty())
-        .then(|| Arc::new(DeletedRows(dead_rows.to_vec())) as Arc<dyn RowIdRemapper>);
+    let remapper = (!dead_rows.is_empty())
+        .then(|| Remapper::from_backing(Arc::new(DeletedRows(dead_rows.to_vec()))));
     PartitionDocuments::try_new(
         store.clone(),
         DOCS_PATH.to_owned(),

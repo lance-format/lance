@@ -15,6 +15,7 @@
 //! ├── policy          FriPolicy: which format and edits the table allows
 //! ├── plan            ReadPlan and its inputs (SegmentSummary, ReadContext)
 //! ├── ledger          FragReuseLedger: decoded transitions, metadata only
+//! ├── mapping         MappingSource: the caller's reader of row-map files
 //! ├── lineage         TaggedLineage: may a segment keep its provenance?
 //! ├── gate            classify: which commits a tagged table admits
 //! ├── metadata        feature-flag and entry guards for the tagged format
@@ -36,7 +37,10 @@
 //!   [`policy::FriPolicy`].
 //! - Opening an index segment under a history:
 //!   [`history::FragReuseHistory::plan`] returns a [`plan::ReadPlan`] per
-//!   segment (`Direct`, `Translate` or `Excluded`).
+//!   segment (`Direct`, `Translate` or `Excluded`). A `Translate` plan's
+//!   [`plan::TranslationPlan::bind`] takes the caller's
+//!   [`mapping::MappingSource`] and returns the segment's
+//!   [`lance_select::Remapper`].
 //! - Changing how one format behaves: its file under `impls`, checked by
 //!   `contract_tests`.
 //!
@@ -51,6 +55,7 @@ pub mod history;
 mod impls;
 pub mod ledger;
 pub mod lineage;
+pub mod mapping;
 pub mod metadata;
 pub mod plan;
 pub mod policy;

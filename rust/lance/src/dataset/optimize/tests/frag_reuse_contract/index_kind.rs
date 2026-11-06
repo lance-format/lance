@@ -108,13 +108,6 @@ pub(super) enum IndexKind {
 }
 
 impl IndexKind {
-    /// Whether the kind has a batch row-id remapper, without which the tagged
-    /// reader leaves out every segment that has not caught up with the
-    /// history.
-    pub(super) fn translates_tagged_history(self) -> bool {
-        !matches!(self, Self::Fm)
-    }
-
     pub(super) fn column(self) -> &'static str {
         match self {
             Self::BTree | Self::Bitmap | Self::ZoneMap | Self::BloomFilter => "v",

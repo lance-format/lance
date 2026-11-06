@@ -12,16 +12,21 @@
 //!   certainty-tagged wrappers around a `RowAddrMask` returned by a scalar-
 //!   index expression evaluation, plus their boolean algebra
 //!   (`Not`/`BitAnd`/`BitOr`).
+//! * [`remapper`] — `Remapper`: the batch translation of the row addresses an
+//!   index segment stored through a fragment reuse history, the only view of
+//!   that history an index sees.
 //!
 //! These types were extracted from `lance-core` and `lance-index` so that
 //! consumers (benchmarks, downstream filtering code) can depend on the
 //! mask substrate without pulling in either of those larger crates.
 
 pub mod mask;
+pub mod remapper;
 pub mod result;
 
 pub use mask::{
     NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
     RowIdMask, RowIdSet, RowSetOps, bitmap_to_ranges, ranges_to_bitmap,
 };
+pub use remapper::Remapper;
 pub use result::{IndexExprResult, NullableIndexExprResult};

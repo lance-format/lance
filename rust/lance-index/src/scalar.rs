@@ -26,8 +26,8 @@ use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
 pub use lance_index_core::remapping::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, LEGACY_TRAFFIC_ONLY,
-    RemapUnavailable, RowAddrTranslator, RowAddrTranslatorRef, check_batch_remapping_entry,
-    materialize_remap,
+    RemapUnavailable, Remapper, RowAddrTranslator, RowAddrTranslatorRef,
+    check_batch_remapping_entry, materialize_remap,
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
@@ -55,6 +55,8 @@ pub mod ngram;
 pub mod registry;
 #[cfg(test)]
 mod remap_compat_tests;
+#[cfg(test)]
+mod remap_contract;
 #[cfg(feature = "geo")]
 pub mod rtree;
 pub mod seed;

@@ -48,9 +48,19 @@ pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexM
     manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
 }
 
-/// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
-/// fragment reuse index on load, so every admitted type needs a query test on
-/// that path.
+/// Whether `type_name` translates row addresses but has no
+/// query test over a stable-row-ID table with a fragment reuse index yet. A
+/// plugin that translates is only a proxy for applying the legacy fragment reuse
+/// index on load, so every admitted type needs such a test.
+fn lacks_stable_row_id_query_test(type_name: &str) -> bool {
+    [
+        lance_index::pb::FmIndexDetails::full_name(),
+        lance_index::pb::MinHashLshIndexDetails::full_name(),
+    ]
+    .iter()
+    .any(|name| type_name.eq_ignore_ascii_case(name))
+}
+
 fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     let Some(details) = index.index_details.as_ref() else {
         return Some("a legacy index without type details, which stores stable row IDs".into());
@@ -82,7 +92,8 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     }
     let applies_frag_reuse = details
         .get_plugin()
-        .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping());
+        .is_ok_and(|plugin| plugin.translates_row_addrs())
+        && !lacks_stable_row_id_query_test(type_name);
     if !applies_frag_reuse {
         return Some(format!(
             "a {display_type} index, which does not apply the fragment reuse index"
@@ -1253,14 +1264,10 @@ mod tests {
                 .contains("Refusing to apply the fragment reuse index to index `category_idx`"),
             "{error}"
         );
-        let error = crate::index::frag_reuse::open_row_id_remapping(
-            &dataset,
-            &hidden("vec_idx"),
-            &NoOpMetricsCollector,
-        )
-        .await
-        .err()
-        .unwrap();
+        let error = crate::index::frag_reuse::open_row_id_remapping(&dataset, &hidden("vec_idx"))
+            .await
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()

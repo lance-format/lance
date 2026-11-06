@@ -6,6 +6,7 @@ use crate::scalar::inverted::InvertedIndexPlugin;
 use crate::scalar::registry::ScalarIndexPlugin;
 use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_io::object_store::WrappingObjectStore;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use object_store::list::PaginatedListStore;
 
 #[derive(Debug, Default)]
@@ -36,11 +37,21 @@ struct OffsetBatchRemapper {
     calls: AtomicU32,
 }
 
-#[async_trait]
-impl BatchRowIdRemapper for OffsetBatchRemapper {
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+impl RemapperBacking for OffsetBatchRemapper {
+    fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+        true
+    }
+
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        fragments.clone()
+    }
+
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Ok(row_ids.iter().map(|row_id| Some(row_id + 1000)).collect())
+        for addr in addrs.iter_mut().flatten() {
+            *addr += 1000;
+        }
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -62,15 +73,20 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     )
     .await
     .unwrap();
-    let plugin = InvertedIndexPlugin;
     let remapper = Arc::new(OffsetBatchRemapper::default());
     let remapper_weak = Arc::downgrade(&remapper);
     let cache = LanceCache::with_capacity(1 << 20);
-    let index = InvertedIndex::load_with_remapping(store, Some(remapper.clone()), &cache)
-        .await
-        .unwrap();
+    let index = InvertedIndex::load(
+        store,
+        Some(Remapper::from_backing(remapper.clone())),
+        &cache,
+    )
+    .await
+    .unwrap();
     index.prewarm().await.unwrap();
-    let snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    let snapshot = InvertedIndexPlugin::reader_free_snapshot(index.as_ref())
+        .unwrap()
+        .unwrap();
     let reader = Arc::downgrade(
         index.partitions[0]
             .inverted_list
@@ -106,10 +122,13 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     ));
     let remapper = Arc::new(OffsetBatchRemapper::default());
     let remapper_weak = Arc::downgrade(&remapper);
-    let index = plugin
-        .rebind_with_remapping(snapshot.as_ref(), store, Some(remapper.clone()))
-        .unwrap()
-        .unwrap();
+    let index = InvertedIndexPlugin::rebind(
+        snapshot.as_ref(),
+        store,
+        Some(Remapper::from_backing(remapper.clone())),
+    )
+    .unwrap()
+    .unwrap();
     let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
     assert!(
         inverted.shares_prewarm_state(snapshot.as_any().downcast_ref::<InvertedIndex>().unwrap())
@@ -126,7 +145,9 @@ async fn translated_fts_snapshot_rebinds_current_store_and_releases_request_reso
     assert_eq!(documents.row_id(0), 1100);
     assert_eq!(remapper.calls.load(Ordering::Relaxed), 1);
     let reader = Arc::downgrade(partition.inverted_list.reader.get().await.unwrap());
-    let rebound_snapshot = plugin.cache_snapshot(index.as_ref()).unwrap().unwrap();
+    let rebound_snapshot = InvertedIndexPlugin::reader_free_snapshot(index.as_ref())
+        .unwrap()
+        .unwrap();
     drop(index);
     drop(remapper);
     assert!(reader.upgrade().is_none());

@@ -443,6 +443,7 @@ impl PostingListReader {
             PostingMetadata::LegacyV1 {
                 offsets,
                 max_scores,
+                ..
             } => (Some(offsets.clone()), max_scores.clone(), None),
             PostingMetadata::V2 { metadata } => (
                 None,

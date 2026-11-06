@@ -5,11 +5,14 @@
 //! and tagged transitions. Every writer of this format validates it, so a
 //! tagged history is never repaired.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
+use lance_select::Remapper;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use prost::Message;
 use prost::encoding::{WireType, decode_key, decode_varint};
 use roaring::RoaringBitmap;
@@ -20,7 +23,10 @@ use crate::system_index::frag_reuse::history::{
     HistoryFormat, Record, RewriteRecord, TRANSITION_FIELD, length_delimited,
 };
 use crate::system_index::frag_reuse::ledger::{
-    STABLE_PARTITION_FIELD, corrupt, next_field, require_message,
+    FragReuseLedger, Mapping, STABLE_PARTITION_FIELD, corrupt, next_field, require_message,
+};
+use crate::system_index::frag_reuse::mapping::{
+    MappingRef, MappingSource, translate_stable_partition,
 };
 use crate::system_index::frag_reuse::plan::{
     ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport, segment_plans,
@@ -212,8 +218,18 @@ impl FriImpl for TaggedHistory {
         !self.is_direct(context, segment)
     }
 
-    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+    fn plan(self: Arc<Self>, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
         let ledger = &self.0.ledger;
+        let history: Arc<dyn FriImpl> = self.clone();
+        // A fragment of the snapshot that a transition still consumes ends a
+        // translated path instead of being followed through the rewrite.
+        let stops: RoaringBitmap = ledger
+            .transitions()
+            .iter()
+            .flat_map(|transition| transition.sources())
+            .map(|source| source.id as u32)
+            .filter(|&fragment| context.live_fragments.contains(fragment))
+            .collect();
         let mut plans = vec![ReadPlan::Excluded; group.len()];
         // Only segments the reader can use establish coverage: a destination
         // needs all of its contributing sources.
@@ -237,21 +253,180 @@ impl FriImpl for TaggedHistory {
             plans[position] = if bitmap.is_empty() {
                 // Nothing needs translating, but the segment's files may still
                 // hold the rows whose coverage was withdrawn: never direct.
-                ReadPlan::Translate(TranslationPlan::nothing(ledger))
+                ReadPlan::Translate(TranslationPlan::nothing(history.clone()))
             } else if self.is_direct(context, &group[position]) {
                 ReadPlan::Direct
             } else if parts.coverage.is_empty() {
-                ReadPlan::Translate(TranslationPlan::nothing(ledger))
+                ReadPlan::Translate(TranslationPlan::nothing(history.clone()))
             } else {
                 ReadPlan::Translate(TranslationPlan::new(
-                    ledger,
+                    history.clone(),
                     parts.coverage,
                     parts.excluded,
+                    stops.clone(),
                     &parts.path,
                 ))
             };
         }
         plans
+    }
+
+    fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {
+        Remapper::from_backing(Arc::new(TaggedRemapper {
+            ledger: self.0.ledger.clone(),
+            coverage: plan.coverage().clone(),
+            excluded: plan.excluded_fragments().clone(),
+            stops: plan.stops().clone(),
+            mappings,
+        }))
+    }
+}
+
+/// Translation addresses are handed to transitions in batches of at most
+/// this many, bounding the buffers one batch holds.
+const TRANSLATE_BATCH: usize = 64 * 1024;
+
+/// One segment's translation under a tagged history: each address follows
+/// the transitions that consume its fragment until it reaches a fragment of
+/// the snapshot, and is kept only when it lands in the segment's coverage.
+#[derive(Debug)]
+struct TaggedRemapper {
+    ledger: Arc<FragReuseLedger>,
+    coverage: RoaringBitmap,
+    /// Fragments sibling segments cover directly: a path entering one
+    /// belongs to the sibling, so the address is dropped.
+    excluded: RoaringBitmap,
+    /// Live fragments a transition still consumes: a path reaching one
+    /// ends there instead of following the rewrite, so the address keeps
+    /// pointing into it.
+    stops: RoaringBitmap,
+    mappings: Arc<dyn MappingSource>,
+}
+
+impl TaggedRemapper {
+    /// The transition an address in `fragment` moves through next, or `None`
+    /// when its path ends there.
+    fn next_hop(&self, fragment: u32) -> Option<usize> {
+        if self.stops.contains(fragment) {
+            return None;
+        }
+        self.ledger.consumer(fragment)
+    }
+
+    async fn hop(&self, transition: usize, rows: &[u64]) -> Result<Vec<Option<u64>>> {
+        let transition = &self.ledger.transitions()[transition];
+        match transition.mapping() {
+            Mapping::OrderedCompaction(remap) => rows
+                .iter()
+                .map(|&row| {
+                    remap.get(row).ok_or_else(|| {
+                        Error::invalid_input(format!("row ID {row} is outside compaction mapping"))
+                    })
+                })
+                .collect(),
+            Mapping::StablePartition(partition) => {
+                translate_stable_partition(
+                    self.mappings.as_ref(),
+                    &MappingRef::of(partition),
+                    transition.sources(),
+                    transition.destinations(),
+                    rows,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Translate one batch. Addresses waiting on the same transition are
+    /// translated together, so a lazily read mapping is read once per batch.
+    async fn translate_batch(&self, addrs: &mut [Option<u64>]) -> Result<()> {
+        let mut pending: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (position, slot) in addrs.iter_mut().enumerate() {
+            let Some(addr) = *slot else {
+                continue;
+            };
+            let fragment = RowAddress::from(addr).fragment_id();
+            if self.coverage.contains(fragment) {
+                continue;
+            }
+            match self.next_hop(fragment) {
+                Some(transition) => pending.entry(transition).or_default().push(position),
+                None => *slot = None,
+            }
+        }
+        while let Some((transition, positions)) = pending.pop_first() {
+            let rows = positions
+                .iter()
+                .map(|&position| {
+                    addrs[position].ok_or_else(|| {
+                        Error::internal("deleted address queued for FRI translation")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let translated = self.hop(transition, &rows).await?;
+            for (position, addr) in positions.into_iter().zip(translated) {
+                let addr = addr.filter(|addr| {
+                    !self
+                        .excluded
+                        .contains(RowAddress::from(*addr).fragment_id())
+                });
+                addrs[position] = addr;
+                if let Some(addr) = addr
+                    && let Some(next) = self.next_hop(RowAddress::from(addr).fragment_id())
+                {
+                    pending.entry(next).or_default().push(position);
+                }
+            }
+        }
+        for slot in addrs.iter_mut() {
+            if slot
+                .is_some_and(|addr| !self.coverage.contains(RowAddress::from(addr).fragment_id()))
+            {
+                *slot = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RemapperBacking for TaggedRemapper {
+    fn fragment_needs_translation(&self, fragment: u32) -> bool {
+        !self.coverage.contains(fragment)
+    }
+
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        let mut translated = fragments & &self.coverage;
+        let mut pending: Vec<u32> = (fragments - &self.coverage).iter().collect();
+        let mut visited = RoaringBitmap::new();
+        while let Some(fragment) = pending.pop() {
+            if !visited.insert(fragment) {
+                continue;
+            }
+            let Some(transition) = self.next_hop(fragment) else {
+                continue;
+            };
+            for destination in self.ledger.transitions()[transition].destinations() {
+                let destination = destination.id as u32;
+                if self.excluded.contains(destination) {
+                    continue;
+                }
+                if self.next_hop(destination).is_some() {
+                    pending.push(destination);
+                } else if self.coverage.contains(destination) {
+                    translated.insert(destination);
+                }
+            }
+        }
+        translated
+    }
+
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        Box::pin(async move {
+            for batch in addrs.chunks_mut(TRANSLATE_BATCH) {
+                self.translate_batch(batch).await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -345,6 +520,7 @@ mod tests {
     use crate::system_index::frag_reuse::history::{FragReuseHistory, RawHistory};
     use crate::system_index::frag_reuse::ledger::Mapping;
     use crate::system_index::frag_reuse::plan::RowDomain;
+    use lance_core::utils::stable_partition::CountsMatrix;
 
     #[test]
     fn appended_transitions_are_validated_against_the_whole_lineage() {
@@ -361,6 +537,118 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("duplicate consumer"), "{error}");
+    }
+
+    /// Ordered compactions read no row map.
+    #[derive(Debug)]
+    struct NoRowMaps;
+
+    #[async_trait::async_trait]
+    impl MappingSource for NoRowMaps {
+        async fn counts(&self, mapping: &MappingRef) -> Result<Arc<CountsMatrix>> {
+            Err(Error::internal(format!("unexpected row map {mapping:?}")))
+        }
+
+        async fn read(
+            &self,
+            mapping: &MappingRef,
+            _rows: std::ops::Range<u64>,
+        ) -> Result<arrow_array::UInt16Array> {
+            Err(Error::internal(format!("unexpected row map {mapping:?}")))
+        }
+    }
+
+    /// A path that enters a fragment a sibling segment covers belongs to the
+    /// sibling: the address is dropped there, even when the path continues
+    /// into this segment's coverage. An address already in an excluded
+    /// fragment is still translated, since a projected bitmap may name it.
+    #[tokio::test]
+    async fn paths_into_a_sibling_fragment_are_dropped() {
+        // 0 -> 1 -> 2 -> 3, with fragment 9 never rewritten.
+        let mut history = FragReuseHistory::empty(HistoryFormat::Tagged);
+        for (version, (source, destination)) in [(0, 1), (1, 2), (2, 3)].into_iter().enumerate() {
+            history = history
+                .append(RewriteRecord::new(
+                    version as u64 + 1,
+                    vec![ordered(&[whole(source, 2)], &[(destination, 2)])],
+                ))
+                .unwrap();
+        }
+        let remapper = Remapper::from_backing(Arc::new(TaggedRemapper {
+            ledger: history.ledger().clone(),
+            coverage: RoaringBitmap::from_iter([3, 9]),
+            excluded: RoaringBitmap::from_iter([2]),
+            stops: RoaringBitmap::new(),
+            mappings: Arc::new(NoRowMaps),
+        }));
+        let address = |fragment| u64::from(RowAddress::new_from_parts(fragment, 1));
+
+        let mut addrs = [0, 1, 2, 3, 9].map(|fragment| Some(address(fragment)));
+        remapper.translate_in_place(&mut addrs).await.unwrap();
+        assert_eq!(
+            addrs,
+            [
+                None,
+                None,
+                Some(address(3)),
+                Some(address(3)),
+                Some(address(9))
+            ]
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([0, 1])),
+            RoaringBitmap::new()
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([2, 9])),
+            RoaringBitmap::from_iter([3, 9])
+        );
+        assert!(remapper.fragment_needs_translation(2));
+        assert!(!remapper.fragment_needs_translation(3));
+    }
+
+    /// A path that reaches a live fragment a transition still consumes ends
+    /// there: the address keeps pointing into it rather than following the
+    /// rewrite on.
+    #[tokio::test]
+    async fn paths_end_at_a_stop_fragment() {
+        // 0 -> 1 -> 2 -> 3, with fragment 1 still live.
+        let mut history = FragReuseHistory::empty(HistoryFormat::Tagged);
+        for (version, (source, destination)) in [(0, 1), (1, 2), (2, 3)].into_iter().enumerate() {
+            history = history
+                .append(RewriteRecord::new(
+                    version as u64 + 1,
+                    vec![ordered(&[whole(source, 2)], &[(destination, 2)])],
+                ))
+                .unwrap();
+        }
+        let remapper = Remapper::from_backing(Arc::new(TaggedRemapper {
+            ledger: history.ledger().clone(),
+            coverage: RoaringBitmap::from_iter([1, 3]),
+            excluded: RoaringBitmap::new(),
+            stops: RoaringBitmap::from_iter([1]),
+            mappings: Arc::new(NoRowMaps),
+        }));
+        let address = |fragment| u64::from(RowAddress::new_from_parts(fragment, 1));
+
+        let mut addrs = [0, 1, 2].map(|fragment| Some(address(fragment)));
+        remapper.translate_in_place(&mut addrs).await.unwrap();
+        assert_eq!(
+            addrs,
+            [Some(address(1)), Some(address(1)), Some(address(3))]
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([0])),
+            RoaringBitmap::from_iter([1])
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([1])),
+            RoaringBitmap::from_iter([1])
+        );
+        assert_eq!(
+            remapper.translate_fragments(&RoaringBitmap::from_iter([2])),
+            RoaringBitmap::from_iter([3])
+        );
     }
 
     #[test]

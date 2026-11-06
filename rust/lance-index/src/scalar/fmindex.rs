@@ -37,7 +37,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{Remapper, RowAddrTranslator};
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
@@ -49,7 +49,7 @@ use crate::scalar::registry::{
 };
 use crate::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
-    RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -1516,7 +1516,7 @@ impl FMIndexScalarIndex {
 
     async fn load(
         store: Arc<dyn IndexStore>,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         let files = store.list_files_with_sizes().await?;
@@ -1534,14 +1534,16 @@ impl FMIndexScalarIndex {
         let mut parts = futures::stream::iter(pfiles)
             .map(|(id, name)| {
                 let store = Arc::clone(&store);
-                let fri = fri.clone();
+                let remapper = remapper.clone();
                 async move {
                     let mut partition = Self::load_partition(store.as_ref(), &name, id).await?;
-                    if let Some(fri) = fri {
-                        for row_id in &mut partition.fm.row_ids {
-                            *row_id = fri
-                                .remap_row_id(*row_id)
-                                .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                    if let Some(remapper) = remapper {
+                        let mut translated: Vec<Option<u64>> =
+                            partition.fm.row_ids.iter().copied().map(Some).collect();
+                        remapper.translate_in_place(&mut translated).await?;
+                        for (row_id, translated) in partition.fm.row_ids.iter_mut().zip(translated)
+                        {
+                            *row_id = translated.unwrap_or(RowAddress::TOMBSTONE_ROW);
                         }
                     }
                     Result::<_>::Ok((id, Arc::new(partition)))
@@ -2359,11 +2361,15 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         store: Arc<dyn IndexStore>,
         details: &prost_types::Any,
         _index_version: u32,
-        fri: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let _ = details.to_msg::<pb::FmIndexDetails>().unwrap_or_default();
-        Ok(FMIndexScalarIndex::load(store, fri, cache).await? as Arc<dyn ScalarIndex>)
+        Ok(FMIndexScalarIndex::load(store, remapper, cache).await? as Arc<dyn ScalarIndex>)
+    }
+
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
     async fn load_statistics(
         &self,
@@ -2727,10 +2733,13 @@ mod tests {
         let remapper = Arc::new(CompactedToFragmentOne {
             deleted: deleted.into_iter().collect(),
         });
-        let index =
-            FMIndexScalarIndex::load(store, Some(remapper.clone()), &LanceCache::no_cache())
-                .await
-                .unwrap();
+        let index = FMIndexScalarIndex::load(
+            store,
+            Some(Remapper::from_backing(remapper.clone())),
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
         if is_prewarmed {
             index.prewarm().await.unwrap();
         }

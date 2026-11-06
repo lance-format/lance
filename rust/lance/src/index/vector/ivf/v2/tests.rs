@@ -4493,7 +4493,7 @@ async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
     max_in_flight.store(0, Ordering::SeqCst);
     let _storage = lance_index::vector::storage::IvfQuantizationStorage::<
         lance_index::vector::pq::ProductQuantizer,
-    >::try_new(reader, None)
+    >::open(reader)
     .await
     .unwrap();
     assert_eq!(

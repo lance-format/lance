@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{Remapper, RowAddrTranslator};
 use std::{
     ops::Bound,
     sync::{Arc, Mutex},
@@ -38,8 +38,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex,
-        SearchOptions, SearchResult, UpdateCriteria,
+        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, ScalarIndex, SearchOptions,
+        SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -1369,7 +1369,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
         _index_version: u32,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let registry = self.registry().unwrap();
@@ -1388,12 +1388,19 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
         });
 
+        if remapper.is_some() && !target_plugin.translates_row_addrs() {
+            return Err(Error::not_supported(format!(
+                "a JSON index over a {} index cannot translate row addresses: that \
+                 plugin does not translate them",
+                target_plugin.name()
+            )));
+        }
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
                 target_index_version,
-                frag_reuse_index,
+                remapper,
                 cache,
             )
             .await?;
@@ -1401,6 +1408,12 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
             JsonIndex::new(target_index, json_details.path)
                 .with_target_data_type(json_details.target_data_type),
         ))
+    }
+
+    /// A JSON index answers through its target index and forwards the
+    /// remapper to it; it refuses one its target cannot apply.
+    fn translates_row_addrs(&self) -> bool {
+        true
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {

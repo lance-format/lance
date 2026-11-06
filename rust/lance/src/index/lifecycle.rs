@@ -529,18 +529,26 @@ impl DatasetIndexExt for Dataset {
         // Readers apply the fragment reuse index to every index they open. The
         // history's plan only excludes indices failing the kind check, so the
         // history is decoded only when one does.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+        let mut indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
             && indices.iter().any(is_hidden_by_frag_reuse)
         {
             Arc::new(indices_visible_with_frag_reuse(self, &indices).await?)
         } else {
             indices
         };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+        if let Some(fri) = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .cloned()
+        {
             match fri.index_version {
                 // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
+                // remapped in load_all_indices(); only segments that cannot
+                // apply the history are left for a scan.
+                0 => {
+                    indices =
+                        frag_reuse::exclude_untranslatable_v0_segments(self, &fri, indices).await?;
+                }
                 1 => {
                     // Cache the coverage-rewritten listing per snapshot identity:
                     // load_indices sits on the query-planning and merge_insert
@@ -557,7 +565,7 @@ impl DatasetIndexExt for Dataset {
                         .index_cache
                         .get_or_insert_with_key(derived_key, || async {
                             let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                                frag_reuse_reader::load_indices(self, &fri, &indices).await?;
                             Ok(derived.as_ref().clone())
                         })
                         .await;

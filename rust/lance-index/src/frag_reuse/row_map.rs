@@ -351,7 +351,7 @@ impl RowMapWriter {
 /// Reader over a row map file: one tail read at open, block reads on demand.
 pub struct RowMapReader {
     reader: Arc<dyn IndexReader>,
-    counts: CountsMatrix,
+    counts: Arc<CountsMatrix>,
     /// When present, block reads are served from (and populated into) the shared
     /// index cache in ~4 MiB chunks. When absent, reads go straight to the file.
     block_cache: Option<RowMapBlockCache>,
@@ -430,7 +430,7 @@ impl RowMapReader {
         }
         Ok(Self {
             reader,
-            counts,
+            counts: Arc::new(counts),
             block_cache,
         })
     }
@@ -439,6 +439,52 @@ impl RowMapReader {
     /// and per-block counter bases without any label IO.
     pub fn counts(&self) -> &CountsMatrix {
         &self.counts
+    }
+
+    /// [`Self::counts`], shared rather than borrowed.
+    pub fn shared_counts(&self) -> Arc<CountsMatrix> {
+        self.counts.clone()
+    }
+
+    /// The labels of the source rows `rows`. With a block cache attached, the
+    /// rows are served from (and populate) the ~4 MiB chunks that hold them;
+    /// without one, exactly `rows` are read.
+    pub async fn labels(&self, rows: Range<u64>) -> Result<UInt16Array> {
+        if rows.start > rows.end || rows.end > self.counts.total_rows() {
+            return Err(Error::invalid_input(format!(
+                "source rows {rows:?} are outside the {} rows of this row map",
+                self.counts.total_rows()
+            )));
+        }
+        let Some(block_cache) = &self.block_cache else {
+            return self
+                .read_labels(rows.start as usize..rows.end as usize)
+                .await;
+        };
+        if rows.is_empty() {
+            return Ok(UInt16Array::from(Vec::<u16>::new()));
+        }
+        let first_chunk = self.counts.block_of(rows.start) / ROW_MAP_CACHE_CHUNK_BLOCKS;
+        let last_chunk = self.counts.block_of(rows.end - 1) / ROW_MAP_CACHE_CHUNK_BLOCKS;
+        let mut parts = Vec::with_capacity(last_chunk - first_chunk + 1);
+        for chunk_idx in first_chunk..=last_chunk {
+            let chunk_rows = self.chunk_row_range(chunk_idx);
+            let start = rows.start.max(chunk_rows.start);
+            let end = rows.end.min(chunk_rows.end);
+            let chunk = self.chunk_labels(block_cache, chunk_idx).await?;
+            parts.push(
+                chunk
+                    .labels
+                    .slice((start - chunk_rows.start) as usize, (end - start) as usize),
+            );
+        }
+        if let [labels] = parts.as_slice() {
+            return Ok(labels.clone());
+        }
+        let parts: Vec<&dyn Array> = parts.iter().map(|labels| labels as &dyn Array).collect();
+        Ok(arrow_select::concat::concat(&parts)?
+            .as_primitive::<UInt16Type>()
+            .clone())
     }
 
     /// The decoded labels of one block.
@@ -922,6 +968,24 @@ mod tests {
             reader.translate_many(&rows).await.unwrap(),
             "cache-off path is byte-identical to cache-on translations"
         );
+
+        // Label ranges: inside one chunk, straddling a chunk boundary (a
+        // chunk is 256 rows), spanning several chunks, empty, and the whole
+        // map, served from chunks by the cached reader and read exactly by
+        // the uncached one.
+        for rows in [3..9, 200..300, 250..800, 256..256, 0..total] {
+            let cached = reader.labels(rows.clone()).await.unwrap();
+            assert_eq!(cached.len() as u64, rows.end - rows.start, "{rows:?}");
+            assert_eq!(
+                cached,
+                uncached.labels(rows.clone()).await.unwrap(),
+                "{rows:?}"
+            );
+        }
+        for out_of_range in [total - 1..total + 1, Range { start: 9, end: 3 }] {
+            assert!(reader.labels(out_of_range.clone()).await.is_err());
+            assert!(uncached.labels(out_of_range).await.is_err());
+        }
     }
 
     /// Counts the label reads an [`IndexReader`] serves, and how many rows

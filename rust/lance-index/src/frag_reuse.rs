@@ -21,6 +21,7 @@ use serde::Serialize;
 
 pub use lance_table::system_index::frag_reuse::*;
 
+pub mod mapping_source;
 pub mod row_map;
 /// Fragment-level stable-partition mapping reader.
 pub mod stable_partition;
