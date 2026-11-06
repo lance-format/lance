@@ -399,13 +399,14 @@ def dataset(tmp_path):
 def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
+    # Train on all rows and allow k-means to converge so each partition can
+    # satisfy test_ann's k=15 search with nprobes=1.
     yield dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
-        max_iters=2,
-        sample_rate=2,
+        sample_rate=tbl.num_rows // 4,
     )
 
 
@@ -2988,6 +2989,7 @@ def test_drop_indices(indexed_dataset):
 def test_read_partition(indexed_dataset):
     idx_name = indexed_dataset.describe_indices()[0].name
     reader = VectorIndexReader(indexed_dataset, idx_name)
+    assert reader.num_partitions() == 4
 
     num_rows = indexed_dataset.count_rows()
     row_sum = 0
@@ -2995,6 +2997,8 @@ def test_read_partition(indexed_dataset):
         res = reader.read_partition(part_id)
         row_sum += res.num_rows
         assert "_rowid" in res.column_names
+        # test_ann searches just one partition and expects 15 results.
+        assert res.num_rows >= 15
     assert row_sum == num_rows
 
     row_sum = 0
