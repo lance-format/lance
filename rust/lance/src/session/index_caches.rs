@@ -122,6 +122,32 @@ impl CacheKey for RowIdIndexKey {
     }
 }
 
+/// Raw row-ID bounds, independent of deletion visibility and prepared graphs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentSpanKey {
+    pub source: InternalCacheKey,
+}
+
+impl CacheKey for RowIdFragmentSpanKey {
+    type ValueType = crate::dataset::rowids::resolve::FragmentSpan;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_span")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentSpan"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-span", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.source.as_bytes());
+    }
+}
+
 /// An immutable fragment's prepared row-ID lookup, including effective deletions.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreparedRowIdFragmentKey {
