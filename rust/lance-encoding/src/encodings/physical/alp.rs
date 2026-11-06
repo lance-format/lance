@@ -1976,10 +1976,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_round_trip_decimal_f32_uses_alp() {
-        let mut values = Vec::with_capacity(4096);
-        for i in 0..4096 {
+    #[rstest]
+    #[case::full_chunks(4096)]
+    #[case::short_chunk(1000)]
+    #[case::raw_tail(1025)]
+    fn test_round_trip_decimal_f32_uses_alp(#[case] num_values: usize) {
+        let mut values = Vec::with_capacity(num_values);
+        for i in 0..num_values {
             values.push(((i * 73) % 10000) as f32 / 100.0);
         }
         let encoding = round_trip_f32(&values);
@@ -1989,10 +1992,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_round_trip_sensor_f64() {
-        let mut values = Vec::with_capacity(4096);
-        for i in 0..4096 {
+    #[rstest]
+    #[case::full_chunks(4096)]
+    #[case::short_chunk(1000)]
+    #[case::raw_tail(1025)]
+    fn test_round_trip_sensor_f64(#[case] num_values: usize) {
+        let mut values = Vec::with_capacity(num_values);
+        for i in 0..num_values {
             let v = 20.0 + (i as f64 / 10.0).sin();
             values.push((v * 10.0).round() / 10.0);
         }
