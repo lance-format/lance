@@ -222,9 +222,6 @@ async fn resolve_point(dataset: &Dataset, row_id: u64) -> Result<Option<RowAddre
 mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
-    use lance_table::format::{
-        ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-    };
     use lance_table::rowids::RowIdSequence;
     use lance_table::rowids::version::RowDatasetVersionSequence;
     use lance_table::transaction::{Operation, Transaction};
@@ -232,9 +229,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::ProjectionRequest;
-    use crate::dataset::rowids::{
-        RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, get_row_id_index, place_row_lineage,
-    };
+    use crate::dataset::rowids::{RowLineage, get_row_id_index, place_row_lineage};
     use crate::dataset::write::CommitBuilder;
     use crate::session::Session;
 
@@ -412,43 +407,24 @@ mod tests {
 
     #[tokio::test]
     async fn deleted_segment_copy_is_filtered_before_duplicate_validation() {
-        let mut dataset = super::super::cache::tests::dataset(true).await;
-        dataset.delete("i < 10").await.unwrap();
-        // Inline encoding preserves the two explicit segments. A spilled
-        // sequence is re-encoded and can combine them into an unsorted array.
-        dataset
-            .update_config([(SPILL_ROW_LINEAGE_CONFIG_KEY, "false")])
-            .await
-            .unwrap();
+        let mut dataset = super::super::cache::tests::dataset(false).await;
+        let expected = scan_address(&dataset, 7).await;
+        dataset.delete("i < 5").await.unwrap();
+        // Avoid compaction: its fragment order need not match payload order.
+        // Keep two explicit inline segments in the original ten-row fragment.
         let mut fragments = dataset.manifest.fragments.as_ref().clone();
-        // Keep user columns in their existing file, but replace every old
-        // lineage reference before installing the new inline lineage.
-        for file in &mut fragments[0].files {
-            let (fields, columns): (Vec<_>, Vec<_>) = file
-                .fields
-                .iter()
-                .zip(file.column_indices.iter())
-                .filter(|(field, _)| {
-                    !matches!(
-                        **field,
-                        ROW_ID_FIELD_ID
-                            | ROW_CREATED_AT_VERSION_FIELD_ID
-                            | ROW_LAST_UPDATED_AT_VERSION_FIELD_ID
-                    )
-                })
-                .map(|(field, column)| (*field, *column))
-                .unzip();
-            file.fields = fields.into();
-            file.column_indices = columns.into();
-        }
-        fragments[0].files.retain(|file| !file.fields.is_empty());
-        let mut sequence = RowIdSequence::from(0..10);
-        sequence.extend(RowIdSequence::from(0..10));
-        let fragment_id = fragments[0].id as u32;
+        assert_eq!(fragments[0].physical_rows, Some(10));
+        assert_eq!(
+            expected,
+            RowAddress::new_from_parts(fragments[0].id as u32, 7)
+        );
+        assert!(fragments[0].deletion_file.is_some());
+        let mut sequence = RowIdSequence::from(0..5);
+        sequence.extend(RowIdSequence::from(0..5));
         let lineage = RowLineage {
             row_ids: sequence,
-            created_at: RowDatasetVersionSequence::from_uniform_row_count(20, 1),
-            last_updated_at: RowDatasetVersionSequence::from_uniform_row_count(20, 1),
+            created_at: RowDatasetVersionSequence::from_uniform_row_count(10, 1),
+            last_updated_at: RowDatasetVersionSequence::from_uniform_row_count(10, 1),
         };
         place_row_lineage(&dataset, &lineage)
             .await
@@ -477,22 +453,22 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            resolve_row_ids(&dataset, &[7, 7], true)
+            resolve_row_ids(&dataset, &[2, 2], true)
                 .await
                 .unwrap()
                 .unwrap(),
-            vec![Some(RowAddress::new_from_parts(fragment_id, 17)); 2]
+            vec![Some(expected); 2]
         );
         let batch = dataset
             .take_rows(
-                &[7],
+                &[2],
                 ProjectionRequest::from_columns(["i"], dataset.schema()),
             )
             .await
             .unwrap();
         assert_eq!(
             batch["i"].as_primitive::<Int32Type>().values().as_ref(),
-            &[17]
+            &[7]
         );
     }
 
