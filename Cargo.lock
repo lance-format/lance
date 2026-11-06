@@ -4609,6 +4609,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-chrome",
+ "tracing-mock",
  "tracing-subscriber",
  "tracking-allocator",
  "url",
@@ -4715,6 +4716,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "tracing-mock",
  "twox-hash",
  "url",
 ]
