@@ -13,6 +13,7 @@ use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::PhysicalExpr;
@@ -509,7 +510,7 @@ impl TakeStream {
                 // Taken in input order, the order the batches are emitted in.
                 let admission = this.scan_budget.as_ref().map(ScanBudget::admission);
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32, admission))
+                    SpawnedTask::spawn(this.map_batch(batch, batch_index as u32, admission))
                         .map(|res| res.unwrap()),
                 )
             })

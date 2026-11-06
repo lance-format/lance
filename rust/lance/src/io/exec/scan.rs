@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
@@ -119,10 +120,11 @@ fn budgeted_fragment_batches(
     budget_reader: BudgetReader,
 ) -> BoxStream<'static, Result<FragmentBatchStream>> {
     let scan_budget = ScanBudget::new(budget_reader);
-    let chunk_bytes = scan_budget.chunk_bytes();
+    let chunk_size = scan_budget.chunk_size();
     let batch_size = config.batch_size as u32;
     stream::iter(file_fragments.into_iter().enumerate())
         .map(move |(priority, file_fragment)| {
+            let chunk_size = chunk_size.clone();
             let open = open_scan_fragment(
                 file_fragment.fragment.clone(),
                 projection.clone(),
@@ -132,7 +134,7 @@ fn budgeted_fragment_batches(
                 priority as u32,
                 force_row_address,
             );
-            tokio::spawn(
+            SpawnedTask::spawn(
                 async move {
                     let reader = Arc::new(open.await?);
                     // A scan range counts rows after deletions, like `read_range`.
@@ -143,7 +145,8 @@ fn budgeted_fragment_batches(
                         Some(range) => range.start as u64..range.end as u64,
                         None => 0..file_fragment.fragment.physical_rows().await? as u64,
                     };
-                    let chunks = plan_chunks(&reader, &[rows], batch_size, chunk_bytes).await?;
+                    let chunks =
+                        plan_chunks(&reader, &[rows], batch_size, chunk_size.bytes()).await?;
                     Ok::<_, DataFusionError>(stream::iter(chunks.into_iter().map(move |chunk| {
                         Ok::<_, DataFusionError>((reader.clone(), range.is_some(), chunk))
                     })))
@@ -190,7 +193,7 @@ fn budgeted_fragment_batches(
                             .boxed(),
                     )
                 };
-                tokio::spawn(read.in_current_span()).map(|res| res.unwrap())
+                SpawnedTask::spawn(read.in_current_span()).map(|res| res.unwrap())
             },
         )
         .buffered(readahead)

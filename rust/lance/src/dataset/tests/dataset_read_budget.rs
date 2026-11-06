@@ -19,7 +19,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
-use lance_datagen::{ArrayGenerator, ByteCount, array, gen_batch};
+use lance_datagen::{ArrayGenerator, ArrayGeneratorExt, ByteCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_index::IndexType;
@@ -50,6 +50,9 @@ enum Shape {
     Vector,
     Struct,
     LargeBinary,
+    /// Few distinct strings, dictionary encoded.
+    LowCardinality,
+    AllNull,
 }
 
 impl Shape {
@@ -73,6 +76,14 @@ impl Shape {
                     Field::new("a", DataType::Int32, true),
                     Field::new("b", DataType::Utf8, true),
                 ])),
+                16 * 1024,
+            ),
+            Self::LowCardinality => (
+                array::cycle_utf8_literals(&["red", "green", "blue", "yellow"]),
+                64 * 1024,
+            ),
+            Self::AllNull => (
+                array::rand_utf8(ByteCount::from(100), false).with_random_nulls(1.0),
                 16 * 1024,
             ),
             // Rows larger than the tighter limits below.
@@ -201,6 +212,8 @@ async fn read(dataset: &Arc<Dataset>, read: Read, batch_size: usize, rows: u64) 
                 .unwrap()
         }
         Read::Take => {
+            // Rows that exist after any deletions.
+            let rows = rows.min(dataset.count_rows(None).await.unwrap() as u64);
             let mut rows: Vec<u64> = (0..rows).step_by(13).collect();
             rows.reverse();
             rows.extend_from_slice(&[0, 0, rows[0]]);
@@ -295,6 +308,27 @@ async fn read_all(dataset: &Arc<Dataset>, batch_size: usize, rows: u64) -> Vec<R
     results
 }
 
+/// Runs `work` and returns its output with the most bytes the session's read
+/// budget held at once while it ran.
+async fn with_peak_reserved<T>(dataset: &Dataset, work: impl Future<Output = T>) -> (T, u64) {
+    let budget = dataset.session.read_budget().unwrap().clone();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = tokio::spawn({
+        let done = done.clone();
+        async move {
+            let mut peak = 0;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                peak = peak.max(budget.reserved_bytes());
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+            peak
+        }
+    });
+    let output = work.await;
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    (output, sampler.await.unwrap())
+}
+
 fn assert_released(dataset: &Dataset) {
     let budget = dataset.session.read_budget().unwrap();
     assert_eq!(budget.reserved_bytes(), 0, "a read kept a reservation");
@@ -334,7 +368,9 @@ async fn test_budgeted_reads_match_unbudgeted(
         Shape::ListOfBinary,
         Shape::Vector,
         Shape::Struct,
-        Shape::LargeBinary
+        Shape::LargeBinary,
+        Shape::LowCardinality,
+        Shape::AllNull
     )]
     shape: Shape,
 ) {
@@ -342,7 +378,7 @@ async fn test_budgeted_reads_match_unbudgeted(
     let rows = write(&dir, version, shape, 4, None).await;
     let expected = read_all(&open(&dir, None).await, 1024, rows).await;
     let check = async {
-        for limit in [1, 4 * 1024 * 1024, 64 * 1024 * 1024] {
+        for limit in [1, 4 * 1024 * 1024, 64 * 1024 * 1024, u64::MAX] {
             let dataset = open(&dir, Some(limit)).await;
             for batch_size in [3, 1024, 65536] {
                 assert_eq!(
@@ -352,12 +388,22 @@ async fn test_budgeted_reads_match_unbudgeted(
                 );
                 assert_released(&dataset);
             }
-            let concurrent = futures::future::join_all(READS.iter().map(|kind| {
-                let dataset = dataset.clone();
-                async move { read(&dataset, *kind, 1024, rows).await }
-            }))
+            let (concurrent, peak) = with_peak_reserved(
+                &dataset,
+                futures::future::join_all(READS.iter().map(|kind| {
+                    let dataset = dataset.clone();
+                    async move { read(&dataset, *kind, 1024, rows).await }
+                })),
+            )
             .await;
             assert_eq!(concurrent, expected, "limit {limit}, concurrent");
+            // Where chunks are small next to the limit, reads stay close to it.
+            if limit == 64 * 1024 * 1024 {
+                assert!(
+                    peak as f64 <= 1.5 * limit as f64,
+                    "reads reserved {peak} bytes under a limit of {limit}"
+                );
+            }
             assert_released(&dataset);
         }
     };
@@ -576,6 +622,93 @@ async fn test_failed_budgeted_reads_release() {
     assert_released_eventually(&dataset).await;
 }
 
+/// A scan its consumer has paused does not stop another query whose reads fit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_paused_scan_does_not_block_reads_that_fit() {
+    let dir = TempStrDir::default();
+    let rows = write(&dir, LanceFileVersion::V2_2, Shape::FixedBinary, 4, None).await;
+    let expected = read_all(&open(&dir, None).await, 1024, rows).await;
+    let dataset = open(&dir, Some(64 * 1024 * 1024)).await;
+    let mut scanner = dataset.scan();
+    scanner.batch_size(16).project(&["id", "value"]).unwrap();
+    let mut paused = scanner.try_into_stream().await.unwrap();
+    paused.try_next().await.unwrap().unwrap();
+    let actual = tokio::time::timeout(Duration::from_secs(120), read_all(&dataset, 1024, rows))
+        .await
+        .expect("a read waited for a paused scan");
+    assert_eq!(actual, expected);
+    drop(paused);
+    assert_released_eventually(&dataset).await;
+}
+
+/// Deleted rows, a column added in a second data file per fragment, stable row
+/// ids and system columns, with one fragment read ahead at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_budgeted_reads_of_evolved_datasets() {
+    let dir = TempStrDir::default();
+    let (generator, rows) = Shape::FixedBinary.generator();
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("value", generator)
+        .into_dataset_with_params(
+            &dir,
+            FragmentCount::from(4),
+            FragmentRowCount::from((rows / 4) as u32),
+            Some(WriteParams {
+                max_rows_per_file: (rows / 4) as usize,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    dataset.delete("id % 5 = 0").await.unwrap();
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "extra".to_string(),
+                "id * 2".to_string(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let scan = |dataset: Arc<Dataset>| async move {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", "value", "extra"])
+            .unwrap()
+            .with_row_id()
+            .with_row_address()
+            .fragment_readahead(1)
+            .filter("id % 3 = 0")
+            .unwrap();
+        by_id(
+            scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap(),
+        )
+    };
+    let expected = scan(open(&dir, None).await).await;
+    for limit in [1, 4 * 1024 * 1024] {
+        let dataset = open(&dir, Some(limit)).await;
+        let actual = tokio::time::timeout(Duration::from_secs(300), scan(dataset.clone()))
+            .await
+            .expect("a budgeted read hung");
+        assert_eq!(actual, expected, "limit {limit}");
+        assert_eq!(
+            read_all(&dataset, 1024, rows).await,
+            read_all(&open(&dir, None).await, 1024, rows).await
+        );
+        assert_released(&dataset);
+    }
+}
+
 /// The estimate a budgeted read reserves covers what the read loads, for every
 /// file version, column shape and page size, whole fragments and parts of them.
 #[rstest]
@@ -596,16 +729,16 @@ async fn test_estimate_covers_bytes_read(
         Shape::ListOfBinary,
         Shape::Vector,
         Shape::Struct,
-        Shape::LargeBinary
+        Shape::LargeBinary,
+        Shape::LowCardinality,
+        Shape::AllNull
     )]
     shape: Shape,
     #[values(None, Some(64 * 1024), Some(1 << 30))] max_page_bytes: Option<u64>,
 ) {
     let dir = TempStrDir::default();
     let rows = write(&dir, version, shape, 1, max_page_bytes).await;
-    let dataset = open(&dir, None).await;
-    let fragment = dataset.get_fragments().remove(0);
-    let schema = dataset.schema().project(&["value"]).unwrap();
+    let schema = open(&dir, None).await.schema().project(&["value"]).unwrap();
     let chunk = rows / 16;
     let cases: Vec<(&str, Vec<Range<u64>>)> = vec![
         ("whole", vec![0..rows]),
@@ -620,7 +753,10 @@ async fn test_estimate_covers_bytes_read(
         ),
     ];
     for (name, ranges) in cases {
-        // A fresh reader per case, so no case reads pages another loaded.
+        // A fresh session and reader per case, so no case finds metadata or
+        // pages another loaded already cached.
+        let dataset = open(&dir, None).await;
+        let fragment = dataset.get_fragments().remove(0);
         let reader = fragment
             .open(&schema, FragReadConfig::default())
             .await

@@ -111,7 +111,8 @@ pub struct ScanBudget {
     /// Reserve the whole read as one unit instead of chunk by chunk, for
     /// consumers that collect all of it before using any.
     whole_read: bool,
-    /// Decoded bytes per byte read, learned from the scan's first batches.
+    /// Decoded bytes per byte read, learned from each chunk's first batch and
+    /// shared by all the scan's chunks.
     decoded_per_raw: Arc<AtomicU64>,
 }
 
@@ -134,9 +135,10 @@ impl ScanBudget {
         }
     }
 
-    /// The same scan's budget for another partition, which consumes its
-    /// chunks independently and so needs its own reader.
-    pub fn for_partition(&self) -> Self {
+    /// The same scan's budget for another stream of its reads, such as a
+    /// partition, which is consumed independently and so needs its own reader.
+    /// What the scan learns about decoded sizes is shared.
+    pub fn sibling(&self) -> Self {
         Self {
             reader: self.reader.sibling(),
             whole_read: self.whole_read,
@@ -148,9 +150,12 @@ impl ScanBudget {
         self.whole_read
     }
 
-    /// The size the scan splits fragments into.
-    pub fn chunk_bytes(&self) -> u64 {
-        chunk_bytes(self.reader.limit())
+    /// The size on disk the scan splits fragments into.
+    pub fn chunk_size(&self) -> ChunkSize {
+        ChunkSize {
+            limit: self.reader.limit(),
+            decoded_per_raw: self.decoded_per_raw.clone(),
+        }
     }
 
     /// The next chunk's place in line. Call in the order the scan consumes
@@ -160,6 +165,22 @@ impl ScanBudget {
             admission: self.reader.admission(),
             decoded_per_raw: self.decoded_per_raw.clone(),
         }
+    }
+}
+
+/// The size on disk of a scan's chunks, chosen so that a chunk's pages and
+/// their decoded data, which a chunk reserves together, are about one chunk of
+/// the budget. Follows the decoded size the scan learns.
+#[derive(Clone)]
+pub struct ChunkSize {
+    limit: u64,
+    decoded_per_raw: Arc<AtomicU64>,
+}
+
+impl ChunkSize {
+    pub fn bytes(&self) -> u64 {
+        let decoded_per_raw = f64::from_bits(self.decoded_per_raw.load(Ordering::Relaxed));
+        ((chunk_bytes(self.limit) as f64 / (1.0 + decoded_per_raw)) as u64).max(1)
     }
 }
 

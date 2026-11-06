@@ -82,7 +82,7 @@ use crate::dataset::scanner::{
 use crate::dataset::versions;
 
 use super::column_width::{self, MeasuredWidths};
-use super::read_budget::{self, ChunkAdmission, ChunkBudget, ReadChunk, ScanBudget};
+use super::read_budget::{self, ChunkAdmission, ChunkBudget, ChunkSize, ReadChunk, ScanBudget};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
@@ -879,7 +879,7 @@ impl FilteredReadStream {
                     materialization_context,
                     materialize_blob_v2_binary,
                     fragment_readahead,
-                    scan_budget.chunk_bytes(),
+                    scan_budget.chunk_size(),
                 );
                 match threading_mode {
                     FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => {
@@ -1787,7 +1787,7 @@ impl FilteredReadStream {
     }
 
     /// Opens the fragments and splits each one's ranges into chunks of about
-    /// `chunk_bytes` on disk, to be admitted by a read memory budget.
+    /// `chunk_size` on disk, to be admitted by a read memory budget.
     #[allow(clippy::too_many_arguments)]
     fn budgeted_chunk_stream(
         dataset: Arc<Dataset>,
@@ -1797,10 +1797,11 @@ impl FilteredReadStream {
         materialization_context: Arc<BlobMaterializationContext>,
         materialize_blob_v2_binary: bool,
         readahead: usize,
-        chunk_bytes: u64,
+        chunk_size: ChunkSize,
     ) -> FragmentChunkStream {
         futures::stream::iter(scoped_fragments)
             .map(move |scoped_fragment| {
+                let chunk_size = chunk_size.clone();
                 let open = Self::open_fragment(
                     dataset.clone(),
                     scoped_fragment,
@@ -1812,7 +1813,7 @@ impl FilteredReadStream {
                 SpawnedTask::spawn(
                     async move {
                         let fragment = open.await?;
-                        let chunks = fragment.plan_chunks(chunk_bytes).await?;
+                        let chunks = fragment.plan_chunks(chunk_size.bytes()).await?;
                         Ok::<_, Error>(futures::stream::iter(
                             chunks
                                 .into_iter()
@@ -1869,7 +1870,7 @@ impl FilteredReadStream {
     fn partition_task_stream(
         shared: &SharedChunks,
     ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
-        let scan_budget = shared.scan_budget.for_partition();
+        let scan_budget = shared.scan_budget.sibling();
         futures::stream::unfold(shared.chunks.clone(), |chunks| async move {
             let chunk = chunks.lock().await.next().await?;
             Some((chunk, chunks))
@@ -3528,9 +3529,13 @@ struct RowStreamRead {
     loaded_fragments: OnceCell<StreamFragments>,
     global_metrics: Arc<FilteredReadGlobalMetrics>,
     baseline_metrics: BaselineMetrics,
-    /// The plan execution this read belongs to
-    query: QueryId,
+    /// Under a read memory budget, each batch reads with a sibling of this,
+    /// so the batches share what the read learns about decoded sizes
+    scan_budget: Option<ScanBudget>,
 }
+
+/// Rows sampled to estimate what a row-stream read loads per row.
+const SAMPLED_ROWS: u64 = 64;
 
 impl RowStreamRead {
     #[allow(clippy::too_many_arguments)]
@@ -3547,6 +3552,7 @@ impl RowStreamRead {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
         let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
+        let dataset_budget = dataset.session.read_budget().cloned();
         Self {
             dataset,
             source,
@@ -3558,16 +3564,18 @@ impl RowStreamRead {
             loaded_fragments: OnceCell::new(),
             global_metrics: Arc::new(FilteredReadGlobalMetrics::new(metrics)),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
-            query,
+            // `collect_all` gathers each batch's whole read before returning it.
+            scan_budget: dataset_budget.map(|budget| ScanBudget::whole_read(budget.reader(query))),
         }
     }
 
     /// Under a read memory budget, the rows to take per batch so that one
     /// batch's read is about one chunk of the budget. A batch reads all of its
     /// rows at once, so a larger one would have to wait for the overdraft.
-    /// Estimated from the first fragment's pages; any failure keeps `batch_rows`.
+    /// Estimated from rows spread over the first fragment, since the rows a
+    /// stream takes are scattered; any failure keeps `batch_rows`.
     async fn budgeted_batch_rows(&self, batch_rows: usize) -> usize {
-        let Some(budget) = self.dataset.session.read_budget() else {
+        let Some(scan_budget) = &self.scan_budget else {
             return batch_rows;
         };
         if batch_rows == 0 {
@@ -3593,13 +3601,17 @@ impl RowStreamRead {
         else {
             return batch_rows;
         };
-        let rows = fragment.num_physical_rows.min(batch_rows as u64);
-        let Ok(bytes) = reader.estimate_read_bytes(vec![0..rows].into()).await else {
+        let step = (fragment.num_physical_rows / SAMPLED_ROWS).max(1);
+        let sample: Vec<Range<u64>> = (0..fragment.num_physical_rows)
+            .step_by(step as usize)
+            .map(|row| row..row + 1)
+            .collect();
+        let rows = sample.len() as u64;
+        let Ok(bytes) = reader.estimate_read_bytes(sample.into()).await else {
             return batch_rows;
         };
         let bytes_per_row = (bytes / rows).max(1);
-        (read_budget::chunk_bytes(budget.limit()) / bytes_per_row).clamp(1, batch_rows as u64)
-            as usize
+        (scan_budget.chunk_size().bytes() / bytes_per_row).clamp(1, batch_rows as u64) as usize
     }
 
     async fn load_fragments(&self) -> Result<&StreamFragments> {
@@ -3820,11 +3832,7 @@ impl RowStreamRead {
             Some(priority_offset),
             self.materialization_context.clone(),
             false,
-            // `collect_all` gathers the whole read before returning it.
-            self.dataset
-                .session
-                .read_budget()
-                .map(|budget| ScanBudget::whole_read(budget.reader(self.query))),
+            self.scan_budget.as_ref().map(ScanBudget::sibling),
         )?;
         let decode_parallelism = match self.source.read_options.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(n) => n,

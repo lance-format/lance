@@ -1,49 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! A process-wide memory budget for the data that queries read.
+//! A memory budget for the data that a session's queries read.
 //!
 //! A reader reserves the bytes a unit of work loads before requesting it and
 //! releases them once the unit is decoded. A reader's units are admitted in
 //! order, each once it fits under the limit; this is what bounds read-ahead.
-//! Read-ahead leaves the last eighth of the limit to readers' first units, so
-//! small reads are not queued behind read-ahead. A reader that holds nothing is
-//! admitted even when its unit does not fit, by taking the overdraft, which
-//! lets one query at a time exceed the limit by what it needs to make progress.
-//! All readers of that query may use the overdraft, because a downstream reader
-//! of a query cannot wait for its own upstream to drain.
+//! Read-ahead leaves the last eighth of the limit to readers' first units and
+//! to small readers, so small reads are not queued behind large ones. A reader
+//! that holds nothing is admitted even when its unit does not fit, by taking
+//! the overdraft, which lets one query at a time exceed the limit by what it
+//! needs to make progress. All readers of that query may use the overdraft,
+//! because a downstream reader of a query cannot wait for its own upstream to
+//! drain.
 //!
-//! This is deadlock-free: a reader only waits while it holds reservations that
-//! drain without anyone being admitted, and the query holding the overdraft is
-//! never refused, so it finishes and frees the overdraft for the next query.
+//! A reader only waits for memory that drains as consumers take what they
+//! read: its own reservations, other readers' reservations, or the overdraft,
+//! which its query releases as its consumer takes the overdrawn unit. A query
+//! whose consumer stops taking while it holds the overdraft therefore holds up
+//! other queries' units that do not fit.
 
+use std::any::Any;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-/// Identifies the query a reader belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct QueryId(usize);
+/// Identifies the query a reader belongs to. It holds the object that
+/// identifies the query, so no other query can take its place while a reader
+/// of it is alive.
+#[derive(Clone)]
+pub struct QueryId(Arc<dyn Any + Send + Sync>);
 
 impl QueryId {
     /// The query identified by `owner`, an object that lives exactly as long
     /// as one execution (for example its task context).
-    pub fn of<T: ?Sized>(owner: &Arc<T>) -> Self {
-        Self(Arc::as_ptr(owner) as *const () as usize)
+    pub fn of<T: Any + Send + Sync>(owner: &Arc<T>) -> Self {
+        Self(owner.clone())
     }
 
     /// A fresh identity for a read that is not part of a plan execution.
     pub fn unique() -> Self {
-        // Odd values never collide with the (aligned) addresses used by `of`.
-        static NEXT: AtomicUsize = AtomicUsize::new(1);
-        Self(NEXT.fetch_add(2, Ordering::Relaxed))
+        Self(Arc::new(()))
+    }
+
+    fn addr(&self) -> *const () {
+        Arc::as_ptr(&self.0) as *const ()
     }
 }
 
-/// Read-ahead may use all but `1 / FIRST_UNIT_SHARE` of the limit.
-const FIRST_UNIT_SHARE: u64 = 8;
+impl PartialEq for QueryId {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr() == other.addr()
+    }
+}
+
+impl Eq for QueryId {}
+
+impl std::fmt::Debug for QueryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueryId({:p})", self.addr())
+    }
+}
+
+/// Read-ahead may use all but `1 / SMALL_READ_SHARE` of the limit; the rest is
+/// for readers' first units and for readers holding no more than it.
+const SMALL_READ_SHARE: u64 = 8;
 
 /// A memory limit shared by every reader of a session.
 pub struct ReadMemoryBudget {
@@ -151,7 +174,7 @@ impl BudgetReader {
     /// independently consumed stream: a reader's units wait for the ones
     /// before them, so streams sharing a reader could wait for each other.
     pub fn sibling(&self) -> Self {
-        self.0.budget.reader(self.0.query)
+        self.0.budget.reader(self.0.query.clone())
     }
 
     /// Reserves `bytes` the reader already holds, without waiting: memory that
@@ -204,12 +227,13 @@ impl Admission {
                 let mut queue = reader.queue.lock().unwrap();
                 let total = state.reserved.saturating_add(bytes);
                 // Read-ahead stops short of the last part of the limit, which
-                // only a reader's first unit may use, so a small read is not
-                // queued behind other readers' read-ahead.
-                let limit = if queue.held == 0 {
+                // only a reader's first unit or a small reader may use, so a
+                // small read is not queued behind other readers' read-ahead.
+                let small_share = budget.limit / SMALL_READ_SHARE;
+                let limit = if queue.held == 0 || queue.held + bytes <= small_share {
                     budget.limit
                 } else {
-                    budget.limit - budget.limit / FIRST_UNIT_SHARE
+                    budget.limit - small_share
                 };
                 let grant = if self.ticket != queue.serving_ticket {
                     None
@@ -219,9 +243,9 @@ impl Admission {
                     // The reader holds nothing, so it can only make progress by
                     // exceeding the limit: take the overdraft if it is free or
                     // already held by this query.
-                    match state.overdraft {
+                    match &state.overdraft {
                         None => Some(true),
-                        Some((query, _)) if query == reader.query => Some(true),
+                        Some((query, _)) if *query == reader.query => Some(true),
                         Some(_) => None,
                     }
                 } else {
@@ -231,8 +255,8 @@ impl Admission {
                     state.reserved += bytes;
                     queue.held += bytes;
                     if overdraft {
-                        let covered = state.overdraft.map_or(0, |(_, covered)| covered);
-                        state.overdraft = Some((reader.query, covered + 1));
+                        let covered = state.overdraft.as_ref().map_or(0, |(_, covered)| *covered);
+                        state.overdraft = Some((reader.query.clone(), covered + 1));
                     }
                     queue.advance_past(self.ticket);
                     self.queued = false;
@@ -307,7 +331,7 @@ impl Drop for Reservation {
         state.reserved -= bytes;
         reader.queue.lock().unwrap().held -= bytes;
         if self.overdraft {
-            state.overdraft = match state.overdraft {
+            state.overdraft = match state.overdraft.take() {
                 Some((query, covered)) if covered > 1 => Some((query, covered - 1)),
                 _ => None,
             };
@@ -341,6 +365,19 @@ mod tests {
         tokio::time::sleep(WAIT).await;
         assert!(!handle.is_finished(), "{bytes} bytes should wait");
         handle
+    }
+
+    /// A query's identity is not reused while it is held, even after its
+    /// owner is dropped.
+    #[test]
+    fn test_query_id_outlives_its_owner() {
+        let owner = Arc::new(0u64);
+        let query = QueryId::of(&owner);
+        assert_eq!(query, QueryId::of(&owner));
+        drop(owner);
+        let others: Vec<_> = (0..64).map(|_| Arc::new(0u64)).collect();
+        assert!(others.iter().all(|other| QueryId::of(other) != query));
+        assert_ne!(QueryId::unique(), QueryId::unique());
     }
 
     #[tokio::test]
@@ -382,6 +419,14 @@ mod tests {
             .now_or_never()
             .expect("a first unit uses the room read-ahead leaves");
         read_ahead.abort();
+        // A reader holding little keeps reading ahead into that room.
+        let small = budget.reader(QueryId::unique());
+        let _first = small.admission().reserve(40).await;
+        small
+            .admission()
+            .reserve(40)
+            .now_or_never()
+            .expect("a small reader reads ahead into the room large ones leave");
     }
 
     #[tokio::test]
@@ -419,7 +464,7 @@ mod tests {
     async fn test_query_shares_its_overdraft() {
         let budget = budget(100);
         let query = QueryId::unique();
-        let upstream = budget.reader(query).admission().reserve(500).await;
+        let upstream = budget.reader(query.clone()).admission().reserve(500).await;
         // A downstream reader of the same query cannot wait for its upstream.
         let downstream = budget
             .reader(query)
@@ -490,7 +535,7 @@ mod tests {
         for _ in 0..64 {
             let query = QueryId::unique();
             let readers: Vec<_> = (0..rng.random_range(1..=3))
-                .map(|_| budget.reader(query))
+                .map(|_| budget.reader(query.clone()))
                 .collect();
             let units: Vec<Vec<u64>> = readers
                 .iter()
