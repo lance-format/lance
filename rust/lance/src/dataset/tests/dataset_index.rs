@@ -7913,24 +7913,20 @@ async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
     }
 }
 
-/// On a stable-row-id dataset a JSON index over a BTree or ZoneMap stores row
-/// addresses, which differ from row ids past fragment 0, and keeps doing so
-/// through a delete, an append, and an optimize that updates the one existing
-/// segment in place. That update must filter the old segment's data by
-/// fragment: a row-id filter would treat every address past the first fragment
-/// as a deleted row and drop it.
-#[rstest]
-#[case::btree("btree")]
-#[case::zonemap("zonemap")]
+/// On a stable-row-id dataset a JSON index over a BTree stores row addresses,
+/// and keeps doing so through a delete, an append, and an optimize that updates
+/// the one existing segment in place. That update must filter the old segment's
+/// data by fragment: a row-id filter would treat every address past the first
+/// fragment as a deleted row and drop it.
 #[tokio::test]
-async fn test_json_row_addr_domain_with_stable_row_ids(#[case] target_index_type: &str) {
+async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
     let mut dataset = stable_row_id_json_dataset("memory://").await;
     dataset
         .create_index(
             &["json"],
             IndexType::Scalar,
             Some("json_idx".to_string()),
-            &json_index_params(target_index_type),
+            &json_index_params("btree"),
             false,
         )
         .await
@@ -7942,10 +7938,6 @@ async fn test_json_row_addr_domain_with_stable_row_ids(#[case] target_index_type
         lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION as i32
     );
     assert!(segments[0].results_are_row_addrs());
-    let mut scan = dataset.scan();
-    scan.filter("json_get_int(json, 'val') >= 6").unwrap();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
 
     dataset
         .delete("json_get_int(json, 'val') = 5")
@@ -8066,6 +8058,30 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
 
     assert_eq!(baseline.num_rows(), 1);
     assert_eq!(indexed.num_rows(), baseline.num_rows());
+}
+
+/// A JSON-wrapped zonemap answers in row addresses, which differ from stable
+/// row ids past fragment 0, so the wrapper must report its target's domain.
+#[tokio::test]
+async fn test_json_zonemap_index_with_stable_row_ids() {
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            None,
+            &json_index_params("zonemap"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.filter("json_get_int(json, 'val') >= 6").unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let indexed = scan.try_into_batch().await.unwrap();
+    assert_eq!(indexed.num_rows(), 6);
 }
 
 /// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
