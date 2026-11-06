@@ -95,8 +95,6 @@ type FragmentChunkStream = BoxStream<'static, Result<FragmentChunk>>;
 struct SharedChunks {
     chunks: Arc<AsyncMutex<FragmentChunkStream>>,
     scan_budget: ScanBudget,
-    /// Chunks each partition admits ahead of the one it is emitting
-    readahead: usize,
 }
 
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
@@ -887,11 +885,10 @@ impl FilteredReadStream {
                     FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => {
                         Self::budgeted_task_stream(chunks, fragment_readahead, scan_budget)
                     }
-                    FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
+                    FilteredReadThreadingMode::MultiplePartitions(_) => {
                         budgeted_chunks = Some(SharedChunks {
                             chunks: Arc::new(AsyncMutex::new(chunks)),
                             scan_budget,
-                            readahead: (fragment_readahead / num_partitions.max(1)).max(1),
                         });
                         futures::stream::empty().boxed()
                     }
@@ -1866,7 +1863,9 @@ impl FilteredReadStream {
     /// One partition's tasks from the chunks its partitions share. A partition
     /// admits the chunks it takes with its own reader: partitions are consumed
     /// independently, so one partition's held memory must never stand in line
-    /// before another's next chunk.
+    /// before another's next chunk. It takes a chunk only when its consumer
+    /// asks for one: taking chunks ahead could leave the shared stream locked
+    /// by a partition its consumer has stopped polling.
     fn partition_task_stream(
         shared: &SharedChunks,
     ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
@@ -1875,8 +1874,7 @@ impl FilteredReadStream {
             let chunk = chunks.lock().await.next().await?;
             Some((chunk, chunks))
         })
-        .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
-        .buffered(shared.readahead)
+        .then(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
         .try_flatten()
         .boxed()
     }
