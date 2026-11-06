@@ -1460,10 +1460,32 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
         });
     }
 
+    // The .json suffix is appended to the last segment when stored, so each
+    // segment must fit in 255 bytes with room for that suffix.
+    const MAX_SEGMENT_BYTES: usize = 250;
+
     for segment in branch_name.split('/') {
         if segment.is_empty() {
             return Err(Error::InvalidRef {
                 message: "Branch name cannot have empty segments between '/'".to_string(),
+            });
+        }
+        if segment == "." {
+            return Err(Error::InvalidRef {
+                message: format!(
+                    "Branch segment '{}' is a reserved path component",
+                    segment
+                ),
+            });
+        }
+        if segment.len() > MAX_SEGMENT_BYTES {
+            return Err(Error::InvalidRef {
+                message: format!(
+                    "Branch segment '{}' exceeds the maximum length of {} bytes ({} bytes)",
+                    &segment[..40],
+                    MAX_SEGMENT_BYTES,
+                    segment.len()
+                ),
             });
         }
         if !segment
@@ -1690,7 +1712,9 @@ mod tests {
             "segment//empty",
             "name.lock",
             "bad@character",
-            "bad segment"
+            "bad segment",
+            ".",
+            "a/./b"
         )]
         branch_name: &str,
     ) {
@@ -1698,6 +1722,25 @@ mod tests {
             check_valid_branch(branch_name).is_err(),
             "Branch name '{}' should be invalid",
             branch_name
+        );
+    }
+
+    #[test]
+    fn test_branch_name_too_long() {
+        let long_segment = "x".repeat(251);
+        assert!(
+            check_valid_branch(&long_segment).is_err(),
+            "A 251-byte segment should be rejected"
+        );
+        let at_limit = "x".repeat(250);
+        assert!(
+            check_valid_branch(&at_limit).is_ok(),
+            "A 250-byte segment should be accepted"
+        );
+        let nested_long = format!("ok/{}", "y".repeat(251));
+        assert!(
+            check_valid_branch(&nested_long).is_err(),
+            "A nested 251-byte segment should be rejected"
         );
     }
 
