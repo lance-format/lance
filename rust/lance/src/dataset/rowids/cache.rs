@@ -24,9 +24,11 @@ use super::{overlapping_id_spans, read_row_id_sequence};
 /// Locks live only while a caller builds or waits. The registry holds no indices
 /// and prunes expired entries, including datasets no longer used by the session.
 #[derive(Default)]
-pub(crate) struct RowIdIndexBuildLocks {
-    locks: Mutex<HashMap<(String, bool), Weak<tokio::sync::Mutex<()>>>>,
+pub struct RowIdIndexBuildLocks {
+    locks: Mutex<DatasetBuildLocks>,
 }
+
+type DatasetBuildLocks = HashMap<(String, bool), Weak<tokio::sync::Mutex<()>>>;
 
 impl RowIdIndexBuildLocks {
     fn for_dataset(&self, uri: &str, with_deletions: bool) -> Result<Arc<tokio::sync::Mutex<()>>> {
@@ -67,7 +69,7 @@ struct CachedFragment {
 /// Replacing this entry drops the cache's ownership of the previous view. Active
 /// readers may retain it, just as they may retain any evicted cache value.
 #[derive(Debug)]
-pub(crate) struct CachedRowIdIndex {
+pub struct CachedRowIdIndex {
     version: u64,
     e_tag: String,
     pub(crate) index: Arc<RowIdIndex>,
