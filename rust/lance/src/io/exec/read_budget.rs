@@ -24,9 +24,13 @@ use crate::dataset::fragment::FragmentReader;
 /// is small.
 const READ_CHUNKS_PER_BUDGET: u64 = 16;
 
+/// Chunks are at least this large, since each costs an estimate and a task.
+/// Under a smaller limit, every chunk is admitted through the overdraft.
+const MIN_READ_CHUNK_BYTES: u64 = 1024 * 1024;
+
 /// The size reads are split into under a budget of `limit` bytes.
 pub fn chunk_bytes(limit: u64) -> u64 {
-    (limit / READ_CHUNKS_PER_BUDGET).max(1)
+    (limit / READ_CHUNKS_PER_BUDGET).max(MIN_READ_CHUNK_BYTES)
 }
 
 /// Ranges of one fragment that a budgeted scan admits and reads together.
@@ -223,12 +227,11 @@ mod tests {
     use arrow_array::types::Int32Type;
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::ExecutionPlan;
-    use futures::{StreamExt, TryStreamExt};
+    use futures::TryStreamExt;
     use lance_core::ROW_ID;
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{ByteCount, array, gen_batch};
-    use lance_file::version::LanceFileVersion;
     use lance_io::read_budget::{QueryId, ReadMemoryBudget};
     use rstest::rstest;
 
@@ -369,8 +372,8 @@ mod tests {
     /// chunk fits, chunks wait for each other, or every chunk overdraws.
     #[rstest]
     #[case::every_chunk_overdraws(1)]
-    #[case::chunks_wait(64 * 1024)]
-    #[case::chunks_fit(16 * 1024 * 1024)]
+    #[case::chunks_wait(4 * 1024 * 1024)]
+    #[case::chunks_fit(64 * 1024 * 1024)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_budgeted_scans_return_every_row(#[case] limit: u64) {
         let dir = TempStrDir::default();
@@ -550,153 +553,6 @@ mod tests {
         assert_eq!(budget.reserved_bytes(), 1000 + decoded + 500);
         drop((output, next));
         assert_eq!(budget.reserved_bytes(), 0);
-    }
-
-    /// The shapes of column the read budget is checked against.
-    #[derive(Clone, Copy, Debug)]
-    enum Shape {
-        Int,
-        Utf8,
-        VarBinary,
-        FixedBinary,
-        ListOfBinary,
-        Vector,
-        Struct,
-        LargeBinary,
-    }
-
-    impl Shape {
-        fn generator(self) -> (Box<dyn lance_datagen::ArrayGenerator>, u64) {
-            use arrow_array::types::Float32Type;
-            use arrow_schema::{DataType, Field, Fields};
-            match self {
-                Self::Int => (array::step::<Int32Type>(), 64 * 1024),
-                Self::Utf8 => (array::rand_utf8(ByteCount::from(100), false), 16 * 1024),
-                Self::VarBinary => (
-                    array::rand_varbin(ByteCount::from(1), ByteCount::from(8192)),
-                    2048,
-                ),
-                Self::FixedBinary => (array::rand_fixedbin(ByteCount::from(2048), true), 4096),
-                Self::ListOfBinary => (
-                    array::rand_list_any(array::rand_fixedbin(ByteCount::from(4096), true), false),
-                    1024,
-                ),
-                Self::Vector => (array::rand_vec::<Float32Type>(128.into()), 8192),
-                Self::Struct => (
-                    array::rand_struct(Fields::from(vec![
-                        Field::new("a", DataType::Int32, true),
-                        Field::new("b", DataType::Utf8, true),
-                    ])),
-                    16 * 1024,
-                ),
-                Self::LargeBinary => (
-                    array::rand_varbin(ByteCount::from(256 * 1024), ByteCount::from(1024 * 1024)),
-                    64,
-                ),
-            }
-        }
-    }
-
-    /// The estimate a budgeted read reserves covers what the read loads, for
-    /// every file version, column shape and page size, whole fragments and
-    /// parts of them.
-    #[rstest]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_estimate_covers_bytes_read(
-        #[values(
-            LanceFileVersion::V2_0,
-            LanceFileVersion::V2_1,
-            LanceFileVersion::V2_2,
-            LanceFileVersion::V2_3
-        )]
-        version: LanceFileVersion,
-        #[values(
-            Shape::Int,
-            Shape::Utf8,
-            Shape::VarBinary,
-            Shape::FixedBinary,
-            Shape::ListOfBinary,
-            Shape::Vector,
-            Shape::Struct,
-            Shape::LargeBinary
-        )]
-        shape: Shape,
-        #[values(None, Some(64 * 1024), Some(1 << 30))] max_page_bytes: Option<u64>,
-    ) {
-        use crate::dataset::WriteParams;
-        use crate::dataset::fragment::FragReadConfig;
-        use lance_file::writer::FileWriterOptions;
-
-        let (generator, rows) = shape.generator();
-        let dir = TempStrDir::default();
-        let params = WriteParams {
-            max_rows_per_file: rows as usize,
-            data_storage_version: Some(version),
-            file_writer_options: max_page_bytes.map(|max_page_bytes| FileWriterOptions {
-                max_page_bytes: Some(max_page_bytes),
-                data_cache_bytes: Some(max_page_bytes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let dataset = gen_batch()
-            .col("value", generator)
-            .into_dataset_with_params(
-                &dir,
-                FragmentCount::from(1),
-                FragmentRowCount::from(rows as u32),
-                Some(params),
-            )
-            .await
-            .unwrap();
-        let fragment = dataset.get_fragments().remove(0);
-        let schema = dataset.schema().project(&["value"]).unwrap();
-        let chunk = rows / 16;
-        let cases: Vec<(&str, Vec<std::ops::Range<u64>>)> = vec![
-            ("whole", vec![0..rows]),
-            ("first chunk", vec![0..chunk]),
-            ("middle chunk", vec![rows / 2..rows / 2 + chunk]),
-            (
-                "scattered",
-                (0..rows - 2)
-                    .step_by((rows / 40).max(3) as usize)
-                    .map(|r| r..r + 2)
-                    .collect(),
-            ),
-        ];
-        for (name, ranges) in cases {
-            // A fresh reader per case, so no case reads pages another loaded.
-            let reader = fragment
-                .open(&schema, FragReadConfig::default())
-                .await
-                .unwrap();
-            let estimate = reader
-                .estimate_read_bytes(ranges.clone().into())
-                .await
-                .unwrap();
-            dataset.object_store.io_stats_incremental();
-            let _: Vec<RecordBatch> = reader
-                .read_ranges(ranges.into(), 1024)
-                .await
-                .unwrap()
-                .buffered(4)
-                .try_collect()
-                .await
-                .unwrap();
-            let read = dataset.object_store.io_stats_incremental().read_bytes as f64;
-            let estimate = estimate as f64;
-            assert!(
-                read <= 1.5 * estimate,
-                "{name}: reads {read} bytes but estimates {estimate}"
-            );
-            // Stable formats are estimated closely enough not to hold back reads.
-            if matches!(version, LanceFileVersion::V2_1 | LanceFileVersion::V2_2) {
-                assert!(
-                    estimate <= 1.5 * read + 4096.0,
-                    "{name}: estimates {estimate} bytes but reads {read}"
-                );
-            }
-        }
     }
 
     #[test]

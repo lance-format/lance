@@ -907,8 +907,8 @@ fn v2_blob_array(rows: usize, base: usize) -> ArrayRef {
 /// must still return every payload, whether chunks fit, wait or overdraw.
 #[rstest::rstest]
 #[case::every_chunk_overdraws(1)]
-#[case::chunks_wait(64 * 1024)]
-#[case::chunks_fit(1024 * 1024)]
+#[case::chunks_wait(4 * 1024 * 1024)]
+#[case::chunks_fit(64 * 1024 * 1024)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_read_budget_blob_v2_payloads(#[case] limit: u64) {
     use lance_core::datatypes::BlobHandling;

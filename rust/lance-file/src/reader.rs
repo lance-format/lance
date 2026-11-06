@@ -2704,10 +2704,10 @@ fn estimate_bytes_in_ranges<'a>(
                 units += to - from;
                 // The bytes between two loaded parts are read too when the
                 // parts are close enough to be read together.
-                if let Some(end) = loaded_end {
-                    if from - end <= coalesce_gap as f64 {
-                        units += from - end;
-                    }
+                if let Some(end) = loaded_end
+                    && from - end <= coalesce_gap as f64
+                {
+                    units += from - end;
                 }
                 loaded_end = Some(to);
             }
