@@ -54,6 +54,7 @@ use crate::index::statistics::{
     index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
 };
 use crate::index::vector;
+use crate::index::vector::details::needs_vector_details_inference;
 use crate::session::index_caches::DerivedIndexListingKey;
 use crate::{Dataset, Error, Result};
 
@@ -546,6 +547,14 @@ impl DatasetIndexExt for Dataset {
                 // remapped in load_all_indices().
                 0 => {}
                 1 => {
+                    // A later call may still infer the missing details; don't pin
+                    // a listing derived without them.
+                    if indices
+                        .iter()
+                        .any(|idx| needs_vector_details_inference(idx, self.schema()))
+                    {
+                        return frag_reuse_reader::load_indices(self, fri, &indices).await;
+                    }
                     // Cache the coverage-rewritten listing per snapshot identity:
                     // load_indices sits on the query-planning and merge_insert
                     // per-batch paths, and the derivation (segment_coverage plus

@@ -2555,10 +2555,19 @@ mod tests {
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::frag_reuse_reader::tests as reader_tests;
+    use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::{derive_vector_index_type, vector_index_details_default};
+    use crate::session::Session;
+    use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int32Type;
+    use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{Int32Array, RecordBatch};
+    use lance_datagen::Dimension;
+    use lance_index::INDEX_AUXILIARY_FILE_NAME;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_linalg::distance::MetricType;
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
@@ -4227,6 +4236,100 @@ mod tests {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 9);
         assert_eq!(filtered_values(&dataset, "i = 8").await, vec![8]);
         assert_eq!(filtered_values(&dataset, "i >= 9").await, Vec::<i32>::new());
+    }
+
+    /// A legacy vector index whose details cannot be inferred yet must not pin
+    /// the uninferred entry in the tagged listing: once its files are readable
+    /// again, `load_indices` serves the inferred details.
+    #[tokio::test]
+    async fn tagged_listing_is_not_cached_before_inference_succeeds() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(8)),
+            )
+            .into_dataset(
+                test_dir.as_str(),
+                crate::utils::test::FragmentCount::from(2),
+                crate::utils::test::FragmentRowCount::from(64),
+            )
+            .await
+            .unwrap();
+        reserve_fragments(&mut dataset, 20).await;
+        let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+        let mut dataset = shallow_clone::commit_stable_partition(dataset, &source_ids, 10).await;
+        dataset
+            .create_index(
+                &["vec"],
+                lance_index::IndexType::Vector,
+                Some("vec_idx".into()),
+                &VectorIndexParams::with_ivf_sq_params(
+                    MetricType::Cosine,
+                    IvfBuildParams::new(2),
+                    SQBuildParams::default(),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let vec_idx = |listing: &[IndexMetadata]| {
+            listing
+                .iter()
+                .find(|idx| idx.name == "vec_idx")
+                .cloned()
+                .unwrap()
+        };
+        let mut legacy = dataset.load_indices().await.unwrap().as_ref().clone();
+        // Inference reads the quantizer from the auxiliary file; hiding it fails
+        // inference without failing the listing.
+        let aux_file = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(vec_idx(&legacy).uuid.to_string())
+            .join(INDEX_AUXILIARY_FILE_NAME);
+        let hidden = aux_file.with_extension("hidden");
+        std::fs::rename(&aux_file, &hidden).unwrap();
+
+        // Store the index without vector details, as one built before they were
+        // recorded is. Inference fails, so the commit cannot migrate it.
+        for idx in legacy.iter_mut().filter(|idx| idx.name == "vec_idx") {
+            idx.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        let raw_key = IndexMetadataKey {
+            version: dataset.manifest.version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&raw_key, Arc::new(legacy))
+            .await;
+        dataset.delete("false").await.unwrap();
+
+        let dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert!(
+            vec_idx(&listing).index_details.unwrap().value.is_empty(),
+            "inference must fail while the auxiliary file is unreadable"
+        );
+
+        std::fs::rename(&hidden, &aux_file).unwrap();
+        let listing = dataset.load_indices().await.unwrap();
+        assert_eq!(
+            derive_vector_index_type(&vec_idx(&listing).index_details.unwrap()),
+            "IVF_SQ",
+            "the tagged listing pinned the uninferred details"
+        );
+        assert!(Arc::ptr_eq(
+            &listing,
+            &dataset.load_indices().await.unwrap()
+        ));
     }
 
     /// Shallow-cloning tagged histories. All fixtures are on-disk: base-path
