@@ -858,12 +858,23 @@ public class ScalarIndexTest {
         // The first fragment holds "Person 0" through "Person 9"; a one-character
         // pattern is answered by the index as well.
         assertEquals(
-            1, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
-        assertEquals(
             1, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
         // Every non-NULL name contains 'P'; the two NULL rows do not match.
         assertEquals(
             18, dataset.countIndexedRows("name_fm", "contains(name, 'P')", Optional.empty()));
+
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(1, dataset.countRows(spacedFilter));
+        // Explicit index selection cannot fall back to a scan for excluded patterns.
+        for (String filter : Arrays.asList(spacedFilter, "contains(name, 'Person\0')")) {
+          IllegalArgumentException error =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () -> dataset.countIndexedRows("name_fm", filter, Optional.empty()));
+          assertTrue(
+              error.getMessage().contains("Filter cannot be planned using scalar index 'name_fm'"));
+        }
+        assertEquals(0, dataset.countRows("contains(name, 'Person\0')"));
       }
     }
   }
@@ -886,7 +897,15 @@ public class ScalarIndexTest {
 
         assertEquals(1, dataset.describeIndices().get(0).getSegments().size());
         assertEquals(
-            2, dataset.countIndexedRows("name_fm", "contains(name, 'Person 7')", Optional.empty()));
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(2, dataset.countRows(spacedFilter));
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () -> dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
+        assertTrue(
+            error.getMessage().contains("Filter cannot be planned using scalar index 'name_fm'"));
       }
     }
   }
