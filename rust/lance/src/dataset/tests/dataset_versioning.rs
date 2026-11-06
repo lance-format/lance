@@ -1484,6 +1484,7 @@ async fn test_deleted_branch_during_commit_is_not_acknowledged(
     #[case] failure: Option<AmbiguousFailure>,
     #[values(false, true)] after_publish: bool,
     #[values(false, true)] detached: bool,
+    #[values(false, true)] restore: bool,
 ) {
     let mut root = Dataset::write(id_rows(0, 2), "memory://", None)
         .await
@@ -1502,7 +1503,11 @@ async fn test_deleted_branch_during_commit_is_not_acknowledged(
         .with_detached(detached)
         .execute(Transaction::new(
             1,
-            Operation::Append { fragments: vec![] },
+            if restore {
+                Operation::Restore { version: 1 }
+            } else {
+                Operation::Append { fragments: vec![] }
+            },
             None,
         ))
         .await
@@ -1512,6 +1517,8 @@ async fn test_deleted_branch_during_commit_is_not_acknowledged(
     assert!(root.list_branches().await.unwrap().is_empty());
     let error = root.checkout_branch("exp").await.unwrap_err();
     assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    // A failed restore must release history exclusion after its I/O settles.
+    root.tags().create("after_error", 1).await.unwrap();
 }
 
 #[rstest]
@@ -1667,10 +1674,10 @@ async fn test_concurrent_branch_creation_preserves_winner() {
                 assert!(successful_version.replace(version).is_none());
             }
             Err(error) => {
-                // A concurrent loser can observe either the reserved branch
-                // name or the winner's version directory first. Both paths are
-                // valid RefConflict outcomes; the winner invariants below are
-                // the contract exercised here.
+                // A concurrent loser can encounter history exclusion, the reserved
+                // branch name, or the winner's version directory. Each path is a
+                // valid RefConflict outcome; the winner invariants below are the
+                // contract exercised here.
                 assert!(matches!(error, Error::RefConflict { .. }), "{error}");
                 conflicts += 1;
             }

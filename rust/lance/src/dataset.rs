@@ -135,7 +135,7 @@ pub(crate) use take::row_offsets_to_row_addresses;
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
-use self::refs::Refs;
+use self::refs::{HistoryLock, Refs};
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
@@ -669,51 +669,60 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
         refs::check_new_branch(branch)?;
+        let guard = HistoryLock::acquire(
+            self.object_store.clone(),
+            &self.branch_location(),
+            "create branch",
+        )
+        .await?;
+        let result = async {
+            let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+            let branch_location = self.branch_location().find_branch(Some(branch))?;
+            let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
+            if self.object_store.exists(&branch_file).await? {
+                return Err(Error::RefConflict {
+                    message: format!("branch {branch} already exists"),
+                });
+            }
+            let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
+            if has_any_entry(&self.object_store, &versions_path).await? {
+                return Err(Error::RefConflict {
+                    message: format!(
+                        "Cannot create branch {branch}: {versions_path} contains leftover version data. \
+                         Use force_delete_branch to clean up the unused branch before retrying"
+                    ),
+                });
+            }
+            let source_location = self
+                .branch_location()
+                .find_branch(source_branch.as_deref())?;
+            let clone_op = Operation::Clone {
+                is_shallow: true,
+                ref_name: source_branch.clone(),
+                ref_version: version_number,
+                ref_path: source_location.uri,
+                branch_name: Some(branch.to_string()),
+            };
+            let transaction = Transaction::new(version_number, clone_op, None);
 
-        let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
-        let branch_location = self.branch_location().find_branch(Some(branch))?;
-        let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
-        if self.object_store.exists(&branch_file).await? {
-            return Err(Error::RefConflict {
-                message: format!("branch {branch} already exists"),
-            });
+            // Claim the name before the clone can write into another creator's branch.
+            self.branches()
+                .create(branch, version_number, source_branch.as_deref())
+                .await?;
+
+            CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
+                // Fall back to the dataset's own store params
+                .with_store_params(
+                    store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
+                )
+                .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+                .with_commit_handler(self.commit_handler.clone())
+                .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
+                .execute(transaction)
+                .await
         }
-        let versions_path = branch_location.path.clone().join(VERSIONS_DIR);
-        if has_any_entry(&self.object_store, &versions_path).await? {
-            return Err(Error::RefConflict {
-                message: format!(
-                    "Cannot create branch {branch}: {versions_path} contains leftover version data. \
-                     Use force_delete_branch to clean up the unused branch before retrying"
-                ),
-            });
-        }
-        let source_location = self
-            .branch_location()
-            .find_branch(source_branch.as_deref())?;
-        let clone_op = Operation::Clone {
-            is_shallow: true,
-            ref_name: source_branch.clone(),
-            ref_version: version_number,
-            ref_path: source_location.uri,
-            branch_name: Some(branch.to_string()),
-        };
-        let transaction = Transaction::new(version_number, clone_op, None);
-
-        // Claim the name before the clone can write into another creator's branch.
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
-
-        CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
-            // Fall back to the dataset's own store params
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
-            .with_commit_handler(self.commit_handler.clone())
-            .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format())
-            .execute(transaction)
-            .await
+        .await;
+        guard.finish(result).await
     }
 
     /// Deletes a branch and removes its directory when safe.
