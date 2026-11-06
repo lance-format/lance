@@ -11,9 +11,13 @@ use std::{
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, RecordBatch, StructArray, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion_common::{DataFusionError, ScalarValue, config::ConfigOptions};
+use datafusion_common::{
+    Column as DFColumn, DataFusionError, ScalarValue,
+    config::ConfigOptions,
+    tree_node::{Transformed, TreeNode},
+};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_expr::{Expr, Operator, ScalarUDF};
+use datafusion_expr::{Expr, Operator, ScalarUDF, expr::ScalarFunction};
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     expressions::{Column, Literal},
@@ -26,7 +30,9 @@ use futures::{StreamExt, stream::BoxStream};
 use lance_arrow::json::{JsonEncoding, JsonValues, json_field};
 use lance_core::deepsize::DeepSizeOf;
 use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-use lance_datafusion_exec::udf::json::JsonbType;
+use lance_datafusion_exec::udf::json::{
+    JsonbType, json_get_bool_udf, json_get_float_udf, json_get_int_udf, json_get_string_udf,
+};
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -38,8 +44,8 @@ use crate::{
     metrics::MetricsCollector,
     registry::IndexPluginRegistry,
     scalar::{
-        AnyQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex,
-        SearchOptions, SearchResult, UpdateCriteria,
+        AnyQuery, BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexStore, RowIdRemapper,
+        SargableQuery, ScalarIndex, SearchOptions, SearchResult, TextQuery, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -481,6 +487,69 @@ impl JsonQuery {
     pub fn target_query(&self) -> &Arc<dyn AnyQuery> {
         &self.target_query
     }
+
+    /// The type of the value at `path` that the wrapped query compares against.
+    ///
+    /// A JSON-wrapped predicate is routed from a typed accessor
+    /// (`json_get_int(json, 'count') = 7`) whose type the analyzer also used to
+    /// coerce the literal the target query carries. Recovering the type from
+    /// the wrapped query therefore rebuilds the accessor the original predicate
+    /// used, which is exactly what a recheck filter must evaluate. Returns
+    /// `None` for queries that carry no value type (e.g. `IS NULL`).
+    fn target_value_type(&self) -> Option<DataType> {
+        fn bound_value_type(bound: &Bound<ScalarValue>) -> Option<DataType> {
+            match bound {
+                Bound::Included(value) | Bound::Excluded(value) => Some(value.data_type()),
+                Bound::Unbounded => None,
+            }
+        }
+        let query = self.target_query.as_any();
+        if query.downcast_ref::<TextQuery>().is_some() {
+            // `json_get_string` is the only routable reference for a text target.
+            return Some(DataType::Utf8);
+        }
+        if let Some(query) = query.downcast_ref::<BloomFilterQuery>() {
+            return match query {
+                BloomFilterQuery::Equals(value) => Some(value.data_type()),
+                BloomFilterQuery::IsIn(values) => values.first().map(|v| v.data_type()),
+                BloomFilterQuery::IsNull() => None,
+            };
+        }
+        if let Some(query) = query.downcast_ref::<SargableQuery>() {
+            return match query {
+                SargableQuery::Equals(value) => Some(value.data_type()),
+                SargableQuery::IsIn(values) => values.first().map(|v| v.data_type()),
+                SargableQuery::LikePrefix(prefix) => Some(prefix.data_type()),
+                SargableQuery::FullTextSearch(_) => Some(DataType::Utf8),
+                SargableQuery::IsNull() => None,
+                SargableQuery::Range(low, high) => {
+                    bound_value_type(low).or_else(|| bound_value_type(high))
+                }
+            };
+        }
+        None
+    }
+
+    /// The typed accessor expression that evaluates the value this query's
+    /// target index keys on: `json_get_<type>(col, path)`.
+    fn accessor_expr(&self, col: &str) -> Expr {
+        let accessor = match self.target_value_type() {
+            Some(value_type) if value_type.is_integer() => json_get_int_udf(),
+            Some(value_type) if value_type.is_floating() => json_get_float_udf(),
+            Some(DataType::Boolean) => json_get_bool_udf(),
+            // String-typed targets, and queries with no recoverable value type
+            // (`IS NULL`), recheck through the string accessor, which is null
+            // exactly where the indexed value is (path missing or JSON null).
+            _ => json_get_string_udf(),
+        };
+        Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(accessor),
+            args: vec![
+                Expr::Column(DFColumn::new_unqualified(col.to_string())),
+                Expr::Literal(ScalarValue::Utf8(Some(self.path.clone())), None),
+            ],
+        })
+    }
 }
 
 impl PartialEq for JsonQuery {
@@ -498,8 +567,24 @@ impl AnyQuery for JsonQuery {
         format!("Json({}->{})", self.target_query.format(col), self.path)
     }
 
-    fn to_expr(&self, _col: String) -> Expr {
-        todo!()
+    fn to_expr(&self, col: String) -> Expr {
+        let target_expr = self.target_query.to_expr(col.clone());
+        let accessor = self.accessor_expr(&col);
+        // The target query's expression references the raw JSON column, but the
+        // index keys on the value at `path`: swap every unqualified reference to
+        // the column for the typed accessor so the recheck filter evaluates the
+        // same value the index searched.
+        target_expr
+            .transform_up(|node| match node {
+                Expr::Column(column) if column.relation.is_none() && column.name == col => {
+                    Ok(Transformed::yes(accessor.clone()))
+                }
+                other => Ok(Transformed::no(other)),
+            })
+            // The closure above never returns Err, so the only failure mode of
+            // `transform_up` (a closure error) cannot occur.
+            .expect("column substitution cannot fail")
+            .data
     }
 
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
@@ -1433,7 +1518,6 @@ mod tests {
     use crate::scalar::bitmap::{BitmapIndex, BitmapIndexPlugin};
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::lookup_test_util::lookup_pairs;
-    use crate::scalar::{SargableQuery, TextQuery};
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, record_batch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::cache::LanceCache;
@@ -1453,6 +1537,63 @@ mod tests {
     #[case::accessor_array_index("0", false)]
     fn test_path_matches_typed_accessor(#[case] path: &str, #[case] expected: bool) {
         assert_eq!(JsonQueryParser::path_matches_typed_accessor(path), expected);
+    }
+
+    /// The recheck filter of a JSON-wrapped query must evaluate the value at the
+    /// indexed path: every reference to the raw column in the target query's
+    /// expression becomes the typed accessor the original predicate used.
+    #[rstest]
+    #[case::ngram_contains(
+        Arc::new(TextQuery::StringContains("bravo".to_string())),
+        "tag",
+        "contains(json_get_string(json, Utf8(\"tag\")), Utf8(\"bravo\"))"
+    )]
+    #[case::bloom_equals(
+        Arc::new(BloomFilterQuery::Equals(ScalarValue::Int64(Some(7)))),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) = Int64(7)"
+    )]
+    #[case::is_null(
+        Arc::new(BloomFilterQuery::IsNull()),
+        "tag",
+        "json_get_string(json, Utf8(\"tag\")) IS NULL"
+    )]
+    #[case::float32_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Float32(Some(1.5)))),
+        "score",
+        "json_get_float(json, Utf8(\"score\")) = Float32(1.5)"
+    )]
+    #[case::int32_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Int32(Some(7)))),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) = Int32(7)"
+    )]
+    #[case::bool_equals(
+        Arc::new(SargableQuery::Equals(ScalarValue::Boolean(Some(true)))),
+        "flag",
+        "json_get_bool(json, Utf8(\"flag\")) = Boolean(true)"
+    )]
+    #[case::large_utf8_prefix(
+        Arc::new(SargableQuery::LikePrefix(ScalarValue::LargeUtf8(Some("ab".to_string())))),
+        "tag",
+        "json_get_string(json, Utf8(\"tag\")) LIKE LargeUtf8(\"ab%\")"
+    )]
+    #[case::range(
+        Arc::new(SargableQuery::Range(
+            Bound::Excluded(ScalarValue::Int64(Some(3))),
+            Bound::Included(ScalarValue::Int64(Some(5))),
+        )),
+        "count",
+        "json_get_int(json, Utf8(\"count\")) > Int64(3) \
+         AND json_get_int(json, Utf8(\"count\")) <= Int64(5)"
+    )]
+    fn test_json_query_to_expr_substitutes_typed_accessor(
+        #[case] target: Arc<dyn AnyQuery>,
+        #[case] path: &str,
+        #[case] expected: &str,
+    ) {
+        let query = JsonQuery::new(target, path.to_string());
+        assert_eq!(query.to_expr("json".to_string()).to_string(), expected);
     }
 
     /// Lookup keys are values of the indexed path, in the target index's
