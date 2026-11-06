@@ -2122,32 +2122,18 @@ mod tests {
 
     #[rstest::rstest]
     #[case::add_field(
-        Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true))
-                .unwrap(),
-        }),
+        Action::AddField(AddField::new(
+            0,
+            LanceCoreField::try_from(ArrowField::new("detached", DataType::Int32, true)).unwrap(),
+        )),
         false
     )]
     #[case::rename(
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        }),
+        Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed")),
         true
     )]
-    #[case::drop_field(Action::DropField(DropField { field: FieldRef::Committed(0) }), true)]
-    #[case::data_only(
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        }),
-        true
-    )]
+    #[case::drop_field(Action::DropField(DropField::new(FieldRef::Committed(0))), true)]
+    #[case::data_only(Action::SetDeletionFile(SetDeletionFile::clear(0)), true)]
     #[test]
     fn detached_composite_may_not_allocate_field_ids_once_non_reusable(
         #[case] action: Action,

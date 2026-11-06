@@ -24,11 +24,26 @@ use lance_core::{Error, Result};
 /// concurrent new segment must not be swept up in.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropIndex {
-    /// The logical index to drop.
-    pub name: String,
+    name: String,
 }
 
 impl DropIndex {
+    /// Drop the logical index `name`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`.
+    pub fn try_new(name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            name: non_empty(name.into(), "DropIndex.name")?,
+        })
+    }
+
+    /// The logical index dropped.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         reject_frag_reuse_history("DropIndex", &self.name)?;
         state.drop_index(&self.name)
@@ -63,9 +78,7 @@ impl TryFrom<pb_actions::DropIndex> for DropIndex {
     type Error = Error;
 
     fn try_from(message: pb_actions::DropIndex) -> Result<Self> {
-        Ok(Self {
-            name: non_empty(message.name, "DropIndex.name")?,
-        })
+        Self::try_new(message.name)
     }
 }
 
@@ -77,8 +90,8 @@ mod tests {
         apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddIndexSegment, CompositeOperation, FieldRef, Ref,
-        RemoveIndexSegment, UserStep,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
+        CompositeOperation, FieldRef, Ref, RemoveIndexSegment, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -87,45 +100,51 @@ mod tests {
     use uuid::Uuid;
 
     fn drop_index(name: &str) -> Action {
-        Action::DropIndex(DropIndex { name: name.into() })
+        Action::DropIndex(DropIndex::try_new(name).unwrap())
     }
 
     fn add_segment(name: &str, covered: Vec<Ref>) -> Action {
-        Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::new_v4(),
-            name: name.into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(covered),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })
+        Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::new_v4(),
+                name: name.into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(covered),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )
     }
 
     /// An append that indexes what it appended: the shape a concurrent writer
     /// keeping an index current takes.
     fn append_and_index(name: &str) -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-                base: None,
-            }),
+            })),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
             add_segment(name, vec![Ref::Local(0)]),
         ]
     }
@@ -233,11 +252,9 @@ mod tests {
     #[test]
     fn test_an_optimize_and_a_concurrent_append_and_index_do_not_conflict() {
         let optimize = footprint(vec![
-            Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: Uuid::from_u128(1),
-                name: "by_a".into(),
-                data_change: false,
-            }),
+            Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new_unchecked(Uuid::from_u128(1), "by_a", false).unwrap(),
+            ),
             add_segment("by_a", vec![Ref::Committed(0)]),
         ]);
         let append = footprint(append_and_index("by_a"));

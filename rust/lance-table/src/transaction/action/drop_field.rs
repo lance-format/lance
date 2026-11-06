@@ -21,10 +21,20 @@ use lance_core::{Error, Result};
 /// field is discarded.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropField {
-    pub field: FieldRef,
+    field: FieldRef,
 }
 
 impl DropField {
+    /// Drop `field`, which must have no children left when this applies.
+    pub fn new(field: FieldRef) -> Self {
+        Self { field }
+    }
+
+    /// The field dropped.
+    pub fn field(&self) -> FieldRef {
+        self.field
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let field_id = state.resolve_schema_field(self.field, "DropField")?;
         let field = state.schema().field_by_id(field_id).ok_or_else(|| {
@@ -131,9 +141,9 @@ impl TryFrom<pb_actions::DropField> for DropField {
     type Error = Error;
 
     fn try_from(message: pb_actions::DropField) -> Result<Self> {
-        Ok(Self {
-            field: required(message.field, "DropField.field")?.try_into()?,
-        })
+        Ok(Self::new(
+            required(message.field, "DropField.field")?.try_into()?,
+        ))
     }
 }
 
@@ -157,9 +167,7 @@ mod tests {
     fn test_drop_field_removes_it_and_its_data() {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(0),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(0)))],
             vec![sample_index_metadata("idx")],
         )
         .unwrap();
@@ -190,9 +198,7 @@ mod tests {
 
         let next = apply(
             &manifest,
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(0),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(0)))],
         )
         .unwrap();
 
@@ -243,9 +249,7 @@ mod tests {
     }
 
     fn drop_field(id: i32) -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(id),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(id)))
     }
 
     /// A drop names exactly one field, so that every field it removes is in
@@ -326,9 +330,7 @@ mod tests {
     fn test_drop_field_rejects_a_missing_field() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(7),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(7)))],
         )
         .unwrap_err();
 
@@ -341,14 +343,8 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(0),
-                }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("replacement"),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(0))),
+                Action::AddField(AddField::new(0, added_field("replacement"))),
             ],
         )
         .unwrap();
@@ -370,14 +366,8 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("transient"),
-                }),
-                Action::DropField(DropField {
-                    field: FieldRef::Local(0),
-                }),
+                Action::AddField(AddField::new(0, added_field("transient"))),
+                Action::DropField(DropField::new(FieldRef::Local(0))),
             ],
         )
         .unwrap();

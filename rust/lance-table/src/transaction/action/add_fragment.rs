@@ -12,13 +12,10 @@ use crate::rowids::version::RowDatasetVersionMeta;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
-/// Add a new, empty fragment.
-///
-/// Its data files arrive via [`AddDataFile`](super::AddDataFile) actions naming
-/// this fragment by the same [`Ref`]. A newly added fragment has no deletion
-/// vector: it has no committed rows to delete yet.
+/// The contents of an [`AddFragment`], before its caller certifies them with
+/// [`AddFragment::new_unchecked`].
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
-pub struct AddFragment {
+pub struct AddFragmentParts {
     /// The id to add the fragment at.
     ///
     /// [`Ref::Local`] is the usual form: a token standing in for an id
@@ -61,13 +58,58 @@ pub struct AddFragment {
     pub data_change: bool,
 }
 
+/// Add a new, empty fragment.
+///
+/// Its data files arrive via [`AddDataFile`](super::AddDataFile) actions naming
+/// this fragment by the same [`Ref`]. A newly added fragment has no deletion
+/// vector: it has no committed rows to delete yet.
+///
+/// The fragment's row count and lineage are claims about the files the
+/// operation binds to it, so it can only be built with
+/// [`new_unchecked`](Self::new_unchecked).
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct AddFragment {
+    parts: AddFragmentParts,
+}
+
 impl AddFragment {
+    /// Add a fragment described by `parts`.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that:
+    ///
+    /// * Every data file the operation binds to the fragment holds exactly
+    ///   `physical_rows` rows.
+    /// * A lineage sequence given as [`Column`](RowIdMeta::Column) is held by
+    ///   the file the operation binds that column to, one entry per row.
+    /// * If `data_change` is `false`, every row is one already in the dataset,
+    ///   moved here unchanged, and any lineage sequence given is the one the
+    ///   row already had.
+    ///
+    /// Breaking the contract is not undefined behavior, but it commits a table
+    /// whose reads fail or return the wrong rows.
+    pub fn new_unchecked(parts: AddFragmentParts) -> Self {
+        Self { parts }
+    }
+
+    /// What the fragment was built from.
+    pub fn parts(&self) -> &AddFragmentParts {
+        &self.parts
+    }
+
+    /// Take the parts back, e.g. to change one and certify the result again
+    /// with [`new_unchecked`](Self::new_unchecked).
+    pub fn into_parts(self) -> AddFragmentParts {
+        self.parts
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        if !self.data_change && state.uses_stable_row_ids() {
+        if !self.parts.data_change && state.uses_stable_row_ids() {
             self.check_carries_lineage()?;
         }
-        let id = state.add_fragment_id(self.id)?;
-        if !self.data_change {
+        let id = state.add_fragment_id(self.parts.id)?;
+        if !self.parts.data_change {
             state.note_rearranged(id);
         }
         state.push_fragment(Fragment {
@@ -75,10 +117,10 @@ impl AddFragment {
             files: Vec::new(),
             overlays: Vec::new(),
             deletion_file: None,
-            row_id_meta: self.row_id_meta.clone(),
-            physical_rows: Some(self.physical_rows as usize),
-            last_updated_at_version_meta: self.last_updated_at_version_meta.clone(),
-            created_at_version_meta: self.created_at_version_meta.clone(),
+            row_id_meta: self.parts.row_id_meta.clone(),
+            physical_rows: Some(self.parts.physical_rows as usize),
+            last_updated_at_version_meta: self.parts.last_updated_at_version_meta.clone(),
+            created_at_version_meta: self.parts.created_at_version_meta.clone(),
             clustering_id: None,
             metadata: Default::default(),
         });
@@ -90,13 +132,13 @@ impl AddFragment {
     /// the rows were new, with fresh row ids and this commit's version.
     fn check_carries_lineage(&self) -> Result<()> {
         let missing = [
-            (self.row_id_meta.is_none(), "row ids"),
+            (self.parts.row_id_meta.is_none(), "row ids"),
             (
-                self.last_updated_at_version_meta.is_none(),
+                self.parts.last_updated_at_version_meta.is_none(),
                 "last_updated_at versions",
             ),
             (
-                self.created_at_version_meta.is_none(),
+                self.parts.created_at_version_meta.is_none(),
                 "created_at versions",
             ),
         ]
@@ -111,13 +153,14 @@ impl AddFragment {
              not carry its {}; a fragment that only moves rows must carry their row id \
              sequence and both row version sequences, inline or as a column, or be marked as \
              a data change",
-            self.id,
+            self.parts.id,
             missing.join(", ")
         )))
     }
 
-    pub(super) fn is_data_change(&self) -> bool {
-        self.data_change
+    /// See [`AddFragmentParts::data_change`].
+    pub fn is_data_change(&self) -> bool {
+        self.parts.data_change
     }
 
     /// No coordinate for a local token: the fragment does not exist in the read
@@ -141,16 +184,16 @@ impl AddFragment {
     /// a compaction rewrite -- and brings in no new key.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.add_rows();
-        if let Some(id) = self.id.committed() {
+        if let Some(id) = self.parts.id.committed() {
             footprint.write(Coordinate::FragmentExistence(id));
         }
-        if let Some(RowIdMeta::Inline(data)) = &self.row_id_meta {
+        if let Some(RowIdMeta::Inline(data)) = &self.parts.row_id_meta {
             match read_row_ids(data) {
                 Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
                 Err(_) => footprint.take_exclusive(),
             }
         }
-        if self.data_change {
+        if self.parts.data_change {
             footprint.insert_rows();
         }
     }
@@ -159,9 +202,9 @@ impl AddFragment {
 impl From<&AddFragment> for pb_actions::AddFragment {
     fn from(value: &AddFragment) -> Self {
         Self {
-            id: Some(value.id.into()),
-            physical_rows: value.physical_rows,
-            row_id_sequence: value.row_id_meta.as_ref().map(|meta| match meta {
+            id: Some(value.parts.id.into()),
+            physical_rows: value.parts.physical_rows,
+            row_id_sequence: value.parts.row_id_meta.as_ref().map(|meta| match meta {
                 RowIdMeta::Inline(data) => {
                     pb_actions::add_fragment::RowIdSequence::InlineRowIds(data.to_vec())
                 }
@@ -170,6 +213,7 @@ impl From<&AddFragment> for pb_actions::AddFragment {
                 ),
             }),
             last_updated_at_version_sequence: value
+                .parts
                 .last_updated_at_version_meta
                 .as_ref()
                 .map(|meta| match meta {
@@ -185,6 +229,7 @@ impl From<&AddFragment> for pb_actions::AddFragment {
                     }
                 }),
             created_at_version_sequence: value
+                .parts
                 .created_at_version_meta
                 .as_ref()
                 .map(|meta| match meta {
@@ -199,7 +244,7 @@ impl From<&AddFragment> for pb_actions::AddFragment {
                         )
                     }
                 }),
-            data_change: data_change_to_wire(value.data_change),
+            data_change: data_change_to_wire(value.parts.data_change),
         }
     }
 }
@@ -208,7 +253,9 @@ impl TryFrom<pb_actions::AddFragment> for AddFragment {
     type Error = lance_core::Error;
 
     fn try_from(message: pb_actions::AddFragment) -> Result<Self> {
-        Ok(Self {
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Ok(Self::new_unchecked(AddFragmentParts {
             id: required(message.id, "AddFragment.id")?.try_into()?,
             physical_rows: message.physical_rows,
             row_id_meta: message.row_id_sequence.map(|sequence| match sequence {
@@ -240,7 +287,7 @@ impl TryFrom<pb_actions::AddFragment> for AddFragment {
                 }
             }),
             data_change: data_change_from_wire(message.data_change),
-        })
+        }))
     }
 }
 
@@ -259,14 +306,14 @@ mod tests {
     use rstest::rstest;
 
     fn add_fragment(id: Ref) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id,
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     #[test]
@@ -275,21 +322,24 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: one_column_file("data/new.lance"),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                })),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        one_column_file("data/new.lance"),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -313,7 +363,7 @@ mod tests {
         // read the high-water mark back, then name the id in the next.
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
         assert_eq!(reserved.max_fragment_id(), Some(2));
@@ -346,12 +396,12 @@ mod tests {
     /// reserves is not yet reserved for the actions beside it.
     #[rstest]
     #[case::reserve_then_claim(vec![
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(2)),
         add_fragment(Ref::Committed(1)),
     ])]
     #[case::claim_then_reserve(vec![
         add_fragment(Ref::Committed(1)),
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(2)),
     ])]
     fn test_an_id_reserved_in_the_same_operation_cannot_be_claimed(#[case] actions: Vec<Action>) {
         let error = apply(&unbacked_manifest(), actions).unwrap_err();
@@ -375,7 +425,7 @@ mod tests {
     ) {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
         let stale_index = IndexMetadata {
@@ -408,7 +458,7 @@ mod tests {
     fn test_an_id_already_in_use_is_rejected() {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
 
@@ -429,7 +479,7 @@ mod tests {
     fn test_a_reserved_id_can_back_a_data_file_in_the_same_operation() {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(1))],
         )
         .unwrap();
 
@@ -437,15 +487,18 @@ mod tests {
             &reserved,
             vec![
                 add_fragment(Ref::Committed(1)),
-                Action::AddDataFile(AddDataFile {
+                Action::AddDataFile(
                     // The same reference the AddFragment carried, so a writer
                     // does not need a local token alongside the reserved id.
-                    fragment: Ref::Committed(1),
-                    file: one_column_file("data/new.lance"),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(1),
+                        one_column_file("data/new.lance"),
+                        vec![FieldRef::Committed(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -467,14 +520,14 @@ mod tests {
             )
             .unwrap()
         };
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(0),
             physical_rows: 10,
             row_id_meta: row_ids.then(|| RowIdMeta::Inline(write_row_ids(&(0..10).into()).into())),
             last_updated_at_version_meta: last_updated.then(versions),
             created_at_version_meta: created.then(versions),
             data_change,
-        })
+        }))
     }
 
     /// A fragment that only moves rows (compaction) has to keep their
@@ -535,13 +588,16 @@ mod tests {
     }
 
     fn rearranged_data_file(data_change: bool) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment: Ref::Local(0),
-            file: one_column_file("data/moved.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Local(0),
+                one_column_file("data/moved.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                data_change,
+            )
+            .unwrap(),
+        )
     }
 
     /// A fragment added with `data_change = false` holds rows that were
@@ -553,9 +609,9 @@ mod tests {
     #[rstest]
     #[case::an_overlay(vec![
         rearranged_data_file(false),
-        Action::AddOverlays(crate::transaction::action::AddOverlays {
-            fragment: Ref::Local(0),
-            overlays: vec![crate::format::overlay::DataOverlayFile {
+        Action::AddOverlays(crate::transaction::action::AddOverlays::new_unchecked(
+            Ref::Local(0),
+            vec![crate::format::overlay::DataOverlayFile {
                 data_file: crate::format::DataFile::new(
                     "data/overlay.lance",
                     vec![0],
@@ -569,17 +625,15 @@ mod tests {
                 ),
                 committed_version: 0,
             }],
-            data_change: true,
-        }),
+        )),
     ], "AddOverlays")]
     #[case::a_changed_data_file(vec![rearranged_data_file(true)], "AddDataFile")]
     #[case::a_changing_tombstone(vec![
         rearranged_data_file(false),
-        Action::TombstoneFieldData(crate::transaction::action::TombstoneFieldData {
-            fragment: Ref::Local(0),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-        }),
+        Action::TombstoneFieldData(crate::transaction::action::TombstoneFieldData::new(
+            Ref::Local(0),
+            vec![FieldRef::Committed(0)],
+        )),
     ], "TombstoneFieldData")]
     fn test_a_rearranged_fragment_takes_no_data_change(
         #[case] writes: Vec<Action>,
@@ -587,7 +641,10 @@ mod tests {
     ) {
         let mut add = add_fragment(Ref::Local(0));
         if let Action::AddFragment(fragment) = &mut add {
-            fragment.data_change = false;
+            *fragment = AddFragment::new_unchecked(AddFragmentParts {
+                data_change: false,
+                ..fragment.parts().clone()
+            });
         }
         let mut actions = vec![add];
         actions.extend(writes);

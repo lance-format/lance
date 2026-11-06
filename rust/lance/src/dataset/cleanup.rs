@@ -8145,58 +8145,63 @@ mod tests {
             remove_sources: bool,
         ) -> Transaction {
             use lance_table::transaction::action::{
-                Action, AddDataFile, AddFragment, AppendFragReuseTransition, CompositeOperation,
-                FieldRef, Ref, RemoveFragment, UserStep,
+                Action, AddDataFile, AddFragment, AddFragmentParts, AppendFragReuseTransition,
+                CompositeOperation, FieldRef, Ref, RemoveFragment, UserStep,
             };
             let mut actions = Vec::new();
             if remove_sources {
                 actions.extend(transition.sources.iter().map(|source| {
-                    Action::RemoveFragment(RemoveFragment {
-                        fragment: Ref::Committed(source.id),
-                        data_change: false,
-                    })
+                    Action::RemoveFragment(RemoveFragment::new_unchecked(
+                        Ref::Committed(source.id),
+                        false,
+                    ))
                 }));
             }
             for destination in destinations {
-                actions.push(Action::AddFragment(AddFragment {
-                    id: Ref::Committed(destination.id),
-                    physical_rows: destination.physical_rows.unwrap() as u64,
-                    row_id_meta: None,
-                    last_updated_at_version_meta: None,
-                    created_at_version_meta: None,
-                    data_change: false,
-                }));
-                for file in &destination.files {
-                    actions.push(Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Committed(destination.id),
-                        field_ids: file
-                            .fields
-                            .iter()
-                            .copied()
-                            .map(FieldRef::Committed)
-                            .collect(),
-                        file: lance_table::format::DataFile {
-                            fields: Arc::from([]),
-                            ..file.clone()
-                        },
+                actions.push(Action::AddFragment(AddFragment::new_unchecked(
+                    AddFragmentParts {
+                        id: Ref::Committed(destination.id),
+                        physical_rows: destination.physical_rows.unwrap() as u64,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
                         data_change: false,
-                        base: None,
-                    }));
+                    },
+                )));
+                for file in &destination.files {
+                    actions.push(Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Committed(destination.id),
+                            lance_table::format::DataFile {
+                                fields: Arc::from([]),
+                                ..file.clone()
+                            },
+                            file.fields
+                                .iter()
+                                .copied()
+                                .map(FieldRef::Committed)
+                                .collect(),
+                            None,
+                            false,
+                        )
+                        .unwrap(),
+                    ));
                 }
             }
             actions.push(Action::AppendFragReuseTransition(
-                AppendFragReuseTransition {
-                    sources: transition
+                AppendFragReuseTransition::try_new_unchecked(
+                    transition
                         .sources
                         .iter()
                         .map(|source| Ref::Committed(source.id))
                         .collect(),
-                    destinations: destinations
+                    destinations
                         .iter()
                         .map(|destination| Ref::Committed(destination.id))
                         .collect(),
-                    mapping: transition.mapping.clone().unwrap(),
-                },
+                    transition.mapping.clone().unwrap(),
+                )
+                .unwrap(),
             ));
             Transaction::new(
                 0,

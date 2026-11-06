@@ -1086,7 +1086,7 @@ impl From<&CompositeOperation> for Footprint {
         if adds_field {
             for action in composite_operation.iter_actions() {
                 if let Action::DropField(drop) = action {
-                    footprint.require_no_values_written(drop.field);
+                    footprint.require_no_values_written(drop.field());
                 }
             }
         }
@@ -1100,8 +1100,8 @@ mod tests {
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
-        RemoveFragment, SetDeletionFile, TombstoneFieldData,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AlterField,
+        ConfigUpdate, DropField, RemoveFragment, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -1144,14 +1144,14 @@ mod tests {
     }
 
     fn add_fragment(id: Ref) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id,
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn add_data_file(fragment: Ref, fields: &[i32]) -> Action {
@@ -1165,76 +1165,71 @@ mod tests {
     }
 
     fn add_data_file_for(fragment: Ref, field_ids: Vec<FieldRef>) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-            field_ids,
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                field_ids,
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     /// Tombstone `field` in `fragment` and bind a new file for it, both
     /// carrying `data_change`.
     fn reencode(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
         vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(fragment),
-                field_ids: vec![FieldRef::Committed(field)],
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(fragment),
+                vec![FieldRef::Committed(field)],
                 data_change,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(fragment),
-                file: DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change,
-                base: None,
-            }),
+            )),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(fragment),
+                    DataFile::new_unstarted("data/x.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(field)],
+                    None,
+                    data_change,
+                )
+                .unwrap(),
+            ),
         ]
     }
 
     fn add_field(local: u32, name: &str, parent: Option<FieldRef>) -> Action {
-        Action::AddField(AddField {
+        let field = AddField::new(
             local,
-            parent,
-            def: Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+            Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+        );
+        Action::AddField(match parent {
+            Some(parent) => field.with_parent(parent),
+            None => field,
         })
     }
 
     fn add_non_nullable_field(local: u32, name: &str) -> Action {
-        Action::AddField(AddField {
+        Action::AddField(AddField::new(
             local,
-            parent: None,
-            def: Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
-        })
+            Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
+        ))
     }
 
     fn set_nullability(field: i32, nullable: bool) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(field),
-            name: None,
-            nullable: Some(nullable),
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(field)).with_nullable(nullable))
     }
 
     fn config_entry(key: &str) -> Action {
-        Action::ConfigUpdate(ConfigUpdate {
-            config: Some(UpdateMap {
-                update_entries: vec![(key, Some("v")).into()],
-                replace: false,
-            }),
-            table_metadata: None,
-            schema_metadata: None,
-            field_metadata: Vec::new(),
-        })
+        Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+            update_entries: vec![(key, Some("v")).into()],
+            replace: false,
+        }))
     }
 
     fn tighten_local_field(local: u32) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Local(local),
-            name: None,
-            nullable: Some(false),
-        })
+        Action::AlterField(AlterField::new(FieldRef::Local(local)).with_nullable(false))
     }
 
     fn append(field: i32) -> Vec<Action> {
@@ -1253,55 +1248,40 @@ mod tests {
     }
 
     fn rename_field(field: i32, name: &str) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(field),
-            name: Some(name.into()),
-            nullable: None,
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(field)).with_name(name))
     }
 
     fn drop_field(field: i32) -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(field),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(field)))
     }
 
     fn tombstone(fragment: u64, fields: &[i32]) -> Action {
-        Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(fragment),
-            field_ids: fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
-            data_change: true,
-        })
+        Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(fragment),
+            fields.iter().map(|id| FieldRef::Committed(*id)).collect(),
+        ))
     }
 
     fn remove_fragment(fragment: u64) -> Action {
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(fragment),
-            data_change: true,
-        })
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(fragment)))
     }
 
     fn set_deletion_file(fragment: u64) -> Action {
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        })
+        Action::SetDeletionFile(SetDeletionFile::clear(fragment))
     }
 
     fn add_base(local: u32, name: &str, path: &str) -> Action {
-        Action::AddBase(AddBase {
+        Action::AddBase(AddBase::new(
             local,
-            base: BasePath::new(0, path.into(), Some(name.into()), false),
-        })
+            BasePath::new(0, path.into(), Some(name.into()), false),
+        ))
     }
 
     fn add_unnamed_base(local: u32, path: &str) -> Action {
-        Action::AddBase(AddBase {
+        Action::AddBase(AddBase::new(
             local,
-            base: BasePath::new(0, path.into(), None, false),
-        })
+            BasePath::new(0, path.into(), None, false),
+        ))
     }
 
     #[test]
@@ -1373,17 +1353,17 @@ mod tests {
     )]
     #[case::same_field_definition(
         vec![rename_field(1, "a")],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
         true,
     )]
     #[case::different_field_definitions(
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(2), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)))],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(2)))],
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
         vec![drop_field(1)],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
         true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(
