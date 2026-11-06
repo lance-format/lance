@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// to detect in-place column rewrites even after transaction cleanup,
     /// and fields a concurrent `Merge` removed or retyped.
-    read_fragments: Option<Arc<Vec<Fragment>>>,
+    read_fragments: Option<ReadFragments>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -82,6 +82,19 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+}
+
+/// The fragments a CreateIndex read, and the data files that replacements
+/// which only moved values wrote over them since.
+#[derive(Debug)]
+struct ReadFragments {
+    fragments: Arc<Vec<Fragment>>,
+    /// The paths of the files `data_change: false` replacements wrote in this
+    /// attempt's window, by fragment id. Such a file holds the values the
+    /// index read, unless something the window's checks cannot see changed
+    /// them first, so this is `None` until the window is known to have no
+    /// gap, and again once it holds a `Merge`.
+    moved_files: Option<HashMap<u64, HashSet<String>>>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.

@@ -214,6 +214,75 @@ async fn repack_keeps_scalar_index() {
     dataset.validate().await.unwrap();
 }
 
+/// An index built before a repack and committed after it keeps its coverage,
+/// since the repack only moved the values the index read. When the repack's
+/// version has been cleaned up the rebase cannot tell, so the coverage of the
+/// files it replaced is withdrawn.
+#[rstest]
+#[case::complete_history(false, vec![0, 1])]
+#[case::cleaned_history(true, vec![])]
+#[tokio::test]
+async fn index_built_across_a_repack(#[case] clean_history: bool, #[case] coverage: Vec<u32>) {
+    use crate::dataset::cleanup::CleanupPolicyBuilder;
+    use crate::dataset::write::CommitBuilder;
+
+    let stale = write_backfilled().await;
+    let index = CreateIndexBuilder::new(
+        &mut stale.clone(),
+        &["d"],
+        IndexType::BTree,
+        &ScalarIndexParams::default(),
+    )
+    .execute_uncommitted()
+    .await
+    .unwrap();
+    let create_index = Transaction::new(
+        stale.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![index],
+            removed_indices: vec![],
+        },
+        None,
+    );
+
+    let mut latest = stale.clone();
+    compact_files(&mut latest, repack_options(Some(1)), None)
+        .await
+        .unwrap();
+    if clean_history {
+        let repacked = latest.manifest.version;
+        let latest = CommitBuilder::new(Arc::new(latest))
+            .execute(Transaction::new(
+                repacked,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions(vec![stale.manifest.version, repacked])
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    let dataset = CommitBuilder::new(Arc::new(stale))
+        .execute(create_index)
+        .await
+        .unwrap();
+    let index = dataset.load_indices().await.unwrap()[0].clone();
+    assert_eq!(
+        index.fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter(coverage)
+    );
+    assert_eq!(dataset.count_rows(Some("d = 6".into())).await.unwrap(), 1);
+}
+
 /// `drop_columns` leaves a dropped column's id in its file. A repack that
 /// moves the other columns out drops that file, as `drop_columns` would.
 #[tokio::test]

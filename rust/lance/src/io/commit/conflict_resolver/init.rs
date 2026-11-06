@@ -23,7 +23,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
+                let read_fragments = is_create_index.then(|| ReadFragments {
+                    fragments: dataset.fragments().clone(),
+                    moved_files: None,
+                });
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
@@ -320,6 +323,9 @@ impl<'a> TransactionRebase<'a> {
         latest_version: u64,
     ) -> Result<()> {
         if missing.is_empty() {
+            if let Some(read) = &mut self.read_fragments {
+                read.moved_files = Some(HashMap::new());
+            }
             return Ok(());
         }
         // A missing transaction may have changed a source fragment or inserted
