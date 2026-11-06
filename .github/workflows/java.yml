@@ -76,7 +76,7 @@ jobs:
       # tests, which run in the per-JDK jobs against the uploaded library.
       - name: Build and test lance-jni
         working-directory: java
-        run: mvn test -DskipTests -Dspotless.skip=true
+        run: mvn test -Dmaven.test.skip=true -Dspotless.skip=true
       - name: Upload native library
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
