@@ -46,6 +46,48 @@ pub struct ScalarQuantizationMetadata {
     pub bounds: Range<f64>,
 }
 
+impl ScalarQuantizationMetadata {
+    /// Validate a reusable SQ8 model before encoding new vectors.
+    /// Dimension must fit a positive Arrow list size. Both bounds and their difference
+    /// must be finite, with the lower bound no greater than the upper bound.
+    /// Equal bounds are valid for constant-valued vectors.
+    ///
+    /// ```
+    /// use lance_index::vector::sq::storage::ScalarQuantizationMetadata;
+    /// let model = ScalarQuantizationMetadata {
+    ///     dim: 128, num_bits: 8, bounds: -1.0..1.0,
+    /// };
+    /// model.validate_for_build()?;
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validate_for_build(&self) -> Result<()> {
+        if self.dim == 0 || self.dim > i32::MAX as usize {
+            return Err(Error::invalid_input(format!(
+                "SQ model dimension must be in 1..={}, got {}",
+                i32::MAX,
+                self.dim
+            )));
+        }
+        if self.num_bits != 8 {
+            return Err(Error::invalid_input(format!(
+                "SQ model num_bits must be 8, got {}",
+                self.num_bits
+            )));
+        }
+        if !self.bounds.start.is_finite()
+            || !self.bounds.end.is_finite()
+            || self.bounds.start > self.bounds.end
+            || !(self.bounds.end - self.bounds.start).is_finite()
+        {
+            return Err(Error::invalid_input(format!(
+                "SQ model bounds must be finite and ordered with a finite range, got {:?}",
+                self.bounds
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl DeepSizeOf for ScalarQuantizationMetadata {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         0
