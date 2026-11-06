@@ -904,6 +904,7 @@ pub struct TextQueryParser {
     /// say anything useful about.  Shorter patterns bypass the index entirely so
     /// they are answered by a full scan.  Use 0 for indices with no such limit.
     min_contains_chars: usize,
+    excluded_contains_bytes: Vec<u8>,
 }
 
 impl TextQueryParser {
@@ -920,7 +921,15 @@ impl TextQueryParser {
             needs_recheck,
             supports_regex,
             min_contains_chars,
+            excluded_contains_bytes: Vec::new(),
         }
+    }
+
+    /// Bypass the index for patterns containing bytes its representation cannot
+    /// match faithfully. Such predicates must be evaluated against the source.
+    pub(crate) fn with_excluded_contains_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.excluded_contains_bytes = bytes;
+        self
     }
 }
 
@@ -984,6 +993,12 @@ impl ScalarQueryParser for TextQueryParser {
                 // count is in characters because tokenizers split on characters,
                 // not bytes.
                 if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
+                    return None;
+                }
+                if pattern
+                    .bytes()
+                    .any(|byte| self.excluded_contains_bytes.contains(&byte))
+                {
                     return None;
                 }
                 TextQuery::StringContains(pattern)
@@ -2646,6 +2661,8 @@ mod tests {
     use rstest::rstest;
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::scalar::registry::ScalarIndexPlugin;
+    use datafusion_expr::{col, lit};
 
     use super::*;
 
@@ -4167,6 +4184,37 @@ mod tests {
                 )),
             ),
         )])
+    }
+
+    #[rstest]
+    #[case::nul("left\0right", false)]
+    #[case::space("left right", false)]
+    #[case::safe("left_right", true)]
+    fn test_fm_contains_eligibility(#[case] pattern: &str, #[case] eligible: bool) {
+        let fm_parser = crate::scalar::fmindex::FMIndexPlugin
+            .new_query_parser("color_idx".to_string(), &prost_types::Any::default())
+            .unwrap();
+        let index_info =
+            MockIndexInfoProvider::new(vec![("color", ColInfo::new(DataType::Utf8, fm_parser))]);
+        let expr = datafusion::functions::string::expr_fn::contains(col("color"), lit(pattern));
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let plan = plan_filter(schema.clone(), expr.clone(), &index_info);
+        assert_eq!(plan.index_query.is_some(), eligible);
+        let negated = plan_filter(schema.clone(), !expr.clone(), &index_info);
+        if !eligible {
+            assert!(negated.index_query.is_none());
+            assert!(plan.refine_expr.is_some());
+            let safe = datafusion::functions::string::expr_fn::contains(col("color"), lit("right"));
+            let combined = plan_filter(schema.clone(), expr.clone().and(safe.clone()), &index_info);
+            assert!(combined.index_query.is_some());
+            assert!(combined.refine_expr.is_some());
+            let combined = plan_filter(schema.clone(), expr.clone().or(safe), &index_info);
+            assert!(combined.index_query.is_none());
+            assert!(combined.refine_expr.is_some());
+        }
+        // NGRAM retains its existing eligibility for both normalized bytes.
+        let ngram_plan = plan_filter(schema, expr, &ngram_index_info());
+        assert!(ngram_plan.index_query.is_some());
     }
 
     fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {

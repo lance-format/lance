@@ -2343,16 +2343,21 @@ impl ScalarIndexPlugin for FMIndexPlugin {
         index_name: String,
         _details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        Some(Box::new(TextQueryParser::new(
-            index_name,
-            self.name().to_string(),
-            // needs_recheck: the FM-index returns exact substring matches.
-            false,
-            // supports_regex: regex acceleration is only implemented for ngram.
-            false,
-            // min_contains_chars: the FM-index can match any non-empty needle.
-            0,
-        )))
+        Some(Box::new(
+            TextQueryParser::new(
+                index_name,
+                self.name().to_string(),
+                // needs_recheck: the FM-index returns exact substring matches.
+                false,
+                // supports_regex: regex acceleration is only implemented for ngram.
+                false,
+                // min_contains_chars: the FM-index can match any non-empty needle.
+                0,
+            )
+            // NUL is replaced with space during indexing. Rechecking cannot recover
+            // missing NUL matches, and space matches may be false positives.
+            .with_excluded_contains_bytes(vec![0, b' ']),
+        ))
     }
     async fn load_index(
         &self,
