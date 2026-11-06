@@ -224,28 +224,22 @@ pub(super) fn phrase_matches_positions(
 /// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
 pub(super) const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
 
-/// Consumes a stream of record batches and produces token counts
+/// Produces bounded batches of token counts without retaining the input corpus
 ///
 /// The resulting batch will have three columns:
 /// - row_id: the row id of the document
 /// - all_tokens: the BM25 document length, discounting code identifier overlaps
 /// - query_token_counts: a fixed size list of the count of each query token in the document
 ///
-/// This is an unbounded accumulation, however, for most queries, the per-row
-/// growth will be fairly small.  As a result we can process millions of tokens
-/// with fairly modest memory usage.
-///
-/// However, it is unwise to do a flat search across billions of rows.  An FTS
-/// index should be created instead.
-pub(super) async fn tokenize_and_count(
-    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+pub(super) fn tokenize_and_count(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static,
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
     elapsed_compute: Option<Time>,
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
-) -> DataFusionResult<RecordBatch> {
+) -> SendableRecordBatchStream {
     let discount_overlaps = tokenizer.discount_overlaps();
     let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
     output_fields.extend((0..coordinate_rank).map(|rank| {
@@ -276,9 +270,6 @@ pub(super) async fn tokenize_and_count(
         query_tokens.as_ref(),
         phrase_slop.is_some(),
     ));
-    let bytes_accumulated = Arc::new(AtomicU64::new(0));
-    let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
-
     let batches = input
         .map(move |batch| {
             let mut tokenizer = tokenizer.box_clone();
@@ -286,8 +277,6 @@ pub(super) async fn tokenize_and_count(
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
             let query_groups = query_groups.clone();
-            let bytes_accumulated = bytes_accumulated.clone();
-            let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
             spawn_cpu(move || {
                 // Time the per-batch CPU work so callers can attribute it to
@@ -475,25 +464,15 @@ pub(super) async fn tokenize_and_count(
                     columns.push(Arc::new(builder.finish()) as ArrayRef);
                 }
                 let result_batch = RecordBatch::try_new(output_schema, columns)?;
-                let bytes_accumulated = bytes_accumulated.fetch_add(result_batch.get_array_memory_size() as u64, Ordering::Relaxed);
-                if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD && !bytes_warning_emitted.swap(true, Ordering::Relaxed) {
-                    tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
-                }
-
                 if let Some(t) = &elapsed_compute {
                     t.add_duration(start.elapsed());
                 }
                 DataFusionResult::Ok(result_batch)
             })
         })
-        .buffered(get_num_compute_intensive_cpus())
-        .try_collect::<Vec<_>>()
-        .await?;
+        .buffered(get_num_compute_intensive_cpus());
 
-    Ok(arrow::compute::concat_batches(
-        &output_schema_clone,
-        &batches,
-    )?)
+    Box::pin(RecordBatchStreamAdapter::new(output_schema_clone, batches))
 }
 
 pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
@@ -889,13 +868,15 @@ pub(super) fn flat_bm25_score(
         .values()
         .iter()
         .copied();
-    let mut query_token_counts_iter = counted_input[FLAT_QUERY_TOKEN_COUNTS_COL]
+    let query_token_counts = counted_input[FLAT_QUERY_TOKEN_COUNTS_COL]
         .as_fixed_size_list()
         .values()
         .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied();
+        .values();
+    let query_weights = query_tokens
+        .into_iter()
+        .map(|token| idf(scorer.num_docs_containing_token(token), scorer.num_docs()))
+        .collect::<Vec<_>>();
     let phrase_matches = phrase_slop
         .map(|_| {
             counted_input
@@ -911,13 +892,12 @@ pub(super) fn flat_bm25_score(
                 })
         })
         .transpose()?;
-    for input_index in 0..counted_input.num_rows() {
+    for (input_index, query_token_counts) in query_token_counts
+        .chunks_exact(query_tokens.len())
+        .enumerate()
+    {
         let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
         let row_id = row_ids_iter.next().expect_ok()?;
-        let mut query_token_counts = Vec::with_capacity(query_tokens.len());
-        for _ in query_tokens {
-            query_token_counts.push(query_token_counts_iter.next().expect_ok()?);
-        }
         if num_tokens_in_doc == 0 {
             continue;
         }
@@ -933,10 +913,9 @@ pub(super) fn flat_bm25_score(
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
-        for (token, freq) in query_tokens.into_iter().zip(query_token_counts) {
-            let freq = freq as f32;
-            let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
-            score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+        for (weight, freq) in query_weights.iter().zip(query_token_counts) {
+            let freq = *freq as f32;
+            score += weight * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         if score > 0.0 {
             row_ids_builder.append_value(row_id);
@@ -1178,7 +1157,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
     // and we are tokenizing with a whitespace tokenizer, we need to know that there are 3 tokens
     // and the token book appears once.
-    let counted_input = tokenize_and_count(
+    let mut counted_input = tokenize_and_count(
         chunked,
         tokenizer,
         query_tokens.clone(),
@@ -1186,33 +1165,90 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
         elapsed_compute.clone(),
         coordinate_rank,
         phrase_slop,
-    )
-    .await?;
-
-    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
-    // All post-await work is synchronous; time the scorer + score + slicing loop together.
-    let post_await_start = std::time::Instant::now();
-    let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
-    let scores = flat_bm25_score(
-        query_tokens.as_ref(),
-        &counted_input,
-        &scorer,
-        document_granularity,
-        operator,
-        boost,
-        phrase_slop,
-    )?;
-
-    // Finally we emit batches according to the target batch size
-    let batches = slice_into_batches(scores, target_batch_size);
-    if let Some(t) = &elapsed_compute {
-        t.add_duration(post_await_start.elapsed());
+    );
+    let mut scorer = initialize_scorer(
+        base_scorer.as_ref(),
+        &query_tokens,
+        &RecordBatch::new_empty(counted_input.schema()),
+    );
+    let mut matching_batches = Vec::new();
+    let query_groups = query_position_groups(&query_tokens, phrase_slop.is_some());
+    let mut retained_bytes = 0;
+    let mut warned = false;
+    while let Some(batch) = counted_input.try_next().await? {
+        let start = std::time::Instant::now();
+        // Nonmatching documents still contribute to the corpus length and term
+        // frequencies. Discard their per-document counts only after this update.
+        scorer = initialize_scorer(Some(&scorer), &query_tokens, &batch);
+        let counts = batch
+            .column_by_name(FLAT_QUERY_TOKEN_COUNTS_COL)
+            .ok_or_else(|| Error::internal("flat FTS counts are missing query token counts"))?
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt64Type>();
+        let phrase_matches = phrase_slop
+            .map(|_| {
+                batch
+                    .column_by_name(FLAT_PHRASE_MATCH_COL)
+                    .ok_or_else(|| Error::internal("flat phrase FTS is missing phrase matches"))
+                    .map(|column| column.as_boolean())
+            })
+            .transpose()?;
+        let matches = BooleanArray::from_iter(
+            counts
+                .values()
+                .chunks_exact(query_tokens.len())
+                .enumerate()
+                .map(|(row, counts)| {
+                    counts.iter().any(|count| *count > 0)
+                        && (operator != Operator::And
+                            || query_groups
+                                .iter()
+                                .all(|group| group.iter().any(|idx| counts[*idx] > 0)))
+                        && phrase_matches.is_none_or(|matches| matches.value(row))
+                }),
+        );
+        let batch = arrow::compute::filter_record_batch(&batch, &matches)?;
+        if batch.num_rows() > 0 {
+            retained_bytes += batch.get_array_memory_size() as u64;
+            if retained_bytes > BYTES_ACCUMULATED_WARNING_THRESHOLD && !warned {
+                tracing::warn!(
+                    "Flat full text search is retaining a large number of matching token counts. Consider using an FTS index instead."
+                );
+                warned = true;
+            }
+            matching_batches.push(batch);
+        }
+        if let Some(t) = &elapsed_compute {
+            t.add_duration(start.elapsed());
+        }
     }
+
+    // Statistics must be complete before either the indexed or flat arm scores.
+    // Score on demand, releasing each count batch as downstream top-k consumes it.
+    let stream_scorer = scorer.clone();
+    let batches = stream::iter(matching_batches)
+        .map(move |batch| {
+            let start = std::time::Instant::now();
+            let result = flat_bm25_score(
+                &query_tokens,
+                &batch,
+                &stream_scorer,
+                document_granularity,
+                operator,
+                boost,
+                phrase_slop,
+            )
+            .map(|scores| stream::iter(slice_into_batches(scores, target_batch_size)))
+            .map_err(datafusion_common::DataFusionError::from);
+            if let Some(t) = &elapsed_compute {
+                t.add_duration(start.elapsed());
+            }
+            result
+        })
+        .try_flatten();
     Ok((
-        Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            stream::iter(batches),
-        )),
+        Box::pin(RecordBatchStreamAdapter::new(output_schema, batches)),
         scorer,
     ))
 }
