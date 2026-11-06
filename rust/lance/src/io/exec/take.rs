@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -36,6 +37,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
+use lance_io::read_budget::QueryId;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use tracing::error;
 
@@ -46,7 +48,9 @@ use crate::datatypes::Schema;
 use crate::index::prefilter::DatasetPreFilter;
 
 use super::column_width::MeasuredWidths;
+use super::read_budget::{ChunkAdmission, ScanBudget};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
+use lance_io::read_budget::Reservation;
 
 pub mod batch;
 
@@ -98,11 +102,33 @@ struct TakeStream {
     readers_cache: Arc<Mutex<HashMap<u32, Arc<FragmentReader>>>>,
     /// The scan scheduler to use for reading fragments
     scan_scheduler: Arc<ScanScheduler>,
+    /// Bounds the memory of batches being taken, if the session has a budget
+    scan_budget: Option<ScanBudget>,
     /// The metrics for the stream
     metrics: TakeStreamMetrics,
 }
 
+/// The output of taking one input batch, charged until it is emitted.
+struct TakenBatches {
+    batches: Vec<RecordBatch>,
+    output_charge: Option<Reservation>,
+}
+
+/// Coalesces sorted row offsets into ranges.
+fn offset_ranges(offsets: &[u32]) -> Arc<[Range<u64>]> {
+    let mut ranges: Vec<Range<u64>> = Vec::new();
+    for &offset in offsets {
+        let offset = offset as u64;
+        match ranges.last_mut() {
+            Some(range) if range.end == offset => range.end += 1,
+            _ => ranges.push(offset..offset + 1),
+        }
+    }
+    ranges.into()
+}
+
 impl TakeStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dataset: Arc<Dataset>,
         fields_to_take: Arc<Schema>,
@@ -111,6 +137,7 @@ impl TakeStream {
         metrics: &ExecutionPlanMetricsSet,
         partition: usize,
         batch_size_bytes: Option<u64>,
+        scan_budget: Option<ScanBudget>,
     ) -> Self {
         let materialize_blob_v2_binary =
             crate::dataset::blob::schema_has_blob_v2_binary_view(fields_to_take.as_ref());
@@ -131,6 +158,7 @@ impl TakeStream {
             output_schema,
             readers_cache: Arc::new(Mutex::new(HashMap::new())),
             scan_scheduler,
+            scan_budget,
             metrics: TakeStreamMetrics::new(metrics, partition),
         }
     }
@@ -256,7 +284,8 @@ impl TakeStream {
         self: Arc<Self>,
         batch: RecordBatch,
         batch_number: u32,
-    ) -> DataFusionResult<Vec<RecordBatch>> {
+        admission: Option<ChunkAdmission>,
+    ) -> DataFusionResult<TakenBatches> {
         let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
         let (row_addrs_arr, validity_mask) = self.get_row_addrs(&batch).await?;
 
@@ -329,45 +358,50 @@ impl TakeStream {
             }
         };
 
-        let mut futures = FuturesOrdered::new();
-        let mut current_offsets = Vec::new();
-        let mut current_fragment_id = None;
-
+        // Group the addresses by fragment, keeping their (sorted) order.
+        let mut groups: Vec<(u32, Vec<u32>)> = Vec::new();
         for row_addr in unique_addrs.iter() {
             let addr = RowAddress::new_from_u64(*row_addr);
-
-            if Some(addr.fragment_id()) != current_fragment_id {
-                // Start a new group
-                if let Some(fragment_id) = current_fragment_id {
-                    let reader = self.open_reader(fragment_id).await?;
-                    let offsets = std::mem::take(&mut current_offsets);
-                    futures.push_back(
-                        async move {
-                            reader
-                                .take(&offsets, u32::MAX, Some(batch_number))
-                                .await?
-                                .buffered(get_num_compute_intensive_cpus())
-                                .try_collect::<Vec<_>>()
-                                .await
-                        }
-                        .boxed(),
-                    );
+            match groups.last_mut() {
+                Some((fragment_id, offsets)) if *fragment_id == addr.fragment_id() => {
+                    offsets.push(addr.row_offset())
                 }
-                current_fragment_id = Some(addr.fragment_id());
+                _ => groups.push((addr.fragment_id(), vec![addr.row_offset()])),
             }
-
-            current_offsets.push(addr.row_offset());
+        }
+        let mut readers = Vec::with_capacity(groups.len());
+        for (fragment_id, _) in &groups {
+            readers.push(self.open_reader(*fragment_id).await?);
         }
 
-        // Handle the last group
-        if let Some(fragment_id) = current_fragment_id {
-            let reader = self.open_reader(fragment_id).await?;
+        // The whole batch is taken and collected at once, so it is one unit of
+        // the read budget.
+        let chunk_budget = match admission {
+            Some(admission) => {
+                let mut bytes = 0;
+                for ((_, offsets), reader) in groups.iter().zip(&readers) {
+                    bytes += reader.estimate_read_bytes(offset_ranges(offsets)).await?;
+                }
+                let rows = unique_addrs.len() as u64;
+                Some(admission.reserve(rows, bytes).await)
+            }
+            None => None,
+        };
+
+        let mut futures = FuturesOrdered::new();
+        for ((_, offsets), reader) in groups.into_iter().zip(readers) {
+            let chunk_budget = chunk_budget.clone();
             futures.push_back(
                 async move {
                     reader
-                        .take(&current_offsets, u32::MAX, Some(batch_number))
+                        .take(&offsets, u32::MAX, Some(batch_number))
                         .await?
                         .buffered(get_num_compute_intensive_cpus())
+                        .inspect_ok(move |batch| {
+                            if let Some(chunk_budget) = &chunk_budget {
+                                chunk_budget.observe_decoded(batch);
+                            }
+                        })
                         .try_collect::<Vec<_>>()
                         .await
                 }
@@ -388,7 +422,10 @@ impl TakeStream {
             .collect::<Vec<_>>();
 
         if batches.is_empty() {
-            return Ok(vec![RecordBatch::new_empty(self.output_schema.clone())]);
+            return Ok(TakenBatches {
+                batches: vec![RecordBatch::new_empty(self.output_schema.clone())],
+                output_charge: None,
+            });
         }
 
         let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
@@ -449,7 +486,19 @@ impl TakeStream {
                 output.push(merged);
             }
         }
-        Ok(output)
+        // The batch's reservation ends here; until the output is emitted, the
+        // output itself is charged.
+        let output_charge = chunk_budget.map(|chunk_budget| {
+            let bytes = output
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .sum::<usize>();
+            chunk_budget.charge_output(bytes as u64)
+        });
+        Ok(TakenBatches {
+            batches: output,
+            output_charge,
+        })
     }
 
     fn apply<S: Stream<Item = Result<RecordBatch>> + Send + 'static>(
@@ -465,15 +514,24 @@ impl TakeStream {
             .map(move |(batch_index, batch)| {
                 let batch = batch?;
                 let this = self.clone();
+                // Taken in input order, the order the batches are emitted in.
+                let admission = this.scan_budget.as_ref().map(ScanBudget::admission);
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    tokio::task::spawn(this.map_batch(batch, batch_index as u32, admission))
                         .map(|res| res.unwrap()),
                 )
             })
             .boxed();
         batches
             .try_buffered(get_num_compute_intensive_cpus())
-            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .map_ok(|taken| {
+                // Released once the last of the batch's results is emitted.
+                let output_charge = taken.output_charge;
+                futures::stream::iter(taken.batches).map(move |batch| {
+                    let _ = &output_charge;
+                    Ok(batch)
+                })
+            })
             .try_flatten()
             .map(move |result| {
                 if result.is_ok() {
@@ -793,6 +851,11 @@ impl ExecutionPlan for TakeExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let scan_budget = self
+            .dataset
+            .session
+            .read_budget()
+            .map(|budget| ScanBudget::new(budget.reader(QueryId::of(&context))));
         let input_stream = self.input.execute(partition, context)?;
         let dataset = self.dataset.clone();
         let schema_to_take = self.schema_to_take.clone();
@@ -817,6 +880,7 @@ impl ExecutionPlan for TakeExec {
                 &metrics,
                 partition,
                 batch_size_bytes,
+                scan_budget,
             ));
             take_stream.apply(input_stream)
         });
@@ -1308,10 +1372,15 @@ mod tests {
             &ExecutionPlanMetricsSet::new(),
             0,
             None,
+            None,
         );
         // Exercise the production pre-concat limit without GiB allocations.
         stream.max_batch_bytes = 8;
-        let output = Arc::new(stream).map_batch(input.clone(), 0).await.unwrap();
+        let output = Arc::new(stream)
+            .map_batch(input.clone(), 0, None)
+            .await
+            .unwrap()
+            .batches;
         assert_eq!(output.len(), 4);
         for (row, batch) in output.iter().enumerate() {
             assert_eq!(batch.num_rows(), 1);

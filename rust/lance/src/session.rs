@@ -12,6 +12,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
+use lance_io::read_budget::ReadMemoryBudget;
 use lance_io::spill::{LocalSpillStore, SpillStore};
 
 pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
@@ -107,6 +108,9 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+    /// Bounds the memory that reads hold; see [`Self::with_read_memory_limit`].
+    read_budget: Option<Arc<ReadMemoryBudget>>,
 }
 
 impl DeepSizeOf for Session {
@@ -179,6 +183,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            read_budget: None,
         }
     }
 
@@ -207,6 +212,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            read_budget: None,
         }
     }
 
@@ -323,6 +329,31 @@ impl Session {
         self.rabit_scan_factory.clone()
     }
 
+    /// Bounds the memory that data reads of this session's datasets hold to
+    /// `limit_bytes`, counting the index cache against it.
+    ///
+    /// Each read reserves the bytes it is about to load and waits while read
+    /// ahead would exceed the limit. A read that holds nothing still proceeds
+    /// when its next unit does not fit, one query at a time, so the limit can
+    /// be exceeded by what that query needs at once. [`Dataset::take`] is
+    /// charged without waiting, since its caller may hold a paused scan. Size
+    /// the index cache below `limit_bytes`, or reads will rarely read ahead.
+    ///
+    /// [`Dataset::take`]: crate::Dataset::take
+    pub fn with_read_memory_limit(mut self, limit_bytes: u64) -> Self {
+        let index_cache = self.index_cache.0.clone();
+        self.read_budget = Some(Arc::new(
+            ReadMemoryBudget::new(limit_bytes)
+                .with_resident_bytes(move || index_cache.approx_size_bytes() as u64),
+        ));
+        self
+    }
+
+    /// The budget bounding the memory of this session's reads, if any.
+    pub fn read_budget(&self) -> Option<&Arc<ReadMemoryBudget>> {
+        self.read_budget.as_ref()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -387,6 +418,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            read_budget: None,
         }
     }
 

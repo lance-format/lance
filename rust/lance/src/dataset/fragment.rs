@@ -187,6 +187,16 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
 
+    /// Estimates the bytes on disk that reading `ranges` of `projection` loads.
+    /// Readers that cannot read ranges (v1) report 0.
+    fn estimate_read_bytes(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _projection: Arc<lance_core::datatypes::Schema>,
+    ) -> BoxFuture<'_, Result<u64>> {
+        futures::future::ready(Ok(0)).boxed()
+    }
+
     /// Return the number of rows in the file
     fn len(&self) -> u32;
 
@@ -685,6 +695,24 @@ mod v2_adapter {
                 batch_size,
                 projection,
             )
+            .boxed()
+        }
+
+        fn estimate_read_bytes(
+            &self,
+            ranges: Arc<[Range<u64>]>,
+            projection: Arc<Schema>,
+        ) -> BoxFuture<'_, Result<u64>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    projection.as_ref(),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .estimate_read_bytes(&ranges, Some(projection))
+                    .await
+            }
             .boxed()
         }
 
@@ -4179,6 +4207,16 @@ impl FragmentReader {
             reader.read_all_tasks(batch_size, reader.projection().clone())
         })
         .await
+    }
+
+    /// Estimates the bytes on disk that [`Self::read_ranges`] loads for `ranges`.
+    pub async fn estimate_read_bytes(&self, ranges: Arc<[Range<u64>]>) -> Result<u64> {
+        let estimates =
+            futures::future::try_join_all(self.readers.iter().map(|reader| {
+                reader.estimate_read_bytes(ranges.clone(), reader.projection().clone())
+            }))
+            .await?;
+        Ok(estimates.into_iter().sum())
     }
 
     // This method is a clone of new_read_impl but returns tasks instead of batches

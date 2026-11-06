@@ -6,6 +6,7 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
+use lance_io::read_budget::BudgetReader;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -78,6 +79,7 @@ pub fn create_scan_stream(
     offsets: Option<Range<u64>>,
     projection: Arc<Schema>,
     config: LanceScanConfig,
+    read_budget: Option<BudgetReader>,
     metrics: &ExecutionPlanMetricsSet,
     partition: usize,
 ) -> datafusion::error::Result<LanceStream> {
@@ -89,7 +91,14 @@ pub fn create_scan_stream(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => LanceStream::try_new_v2(
-            dataset, fragments, offsets, projection, config, metrics, partition,
+            dataset,
+            fragments,
+            offsets,
+            projection,
+            config,
+            read_budget,
+            metrics,
+            partition,
         ),
     }
 }
