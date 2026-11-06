@@ -9,7 +9,12 @@
 //! peak of every stage and of the whole build. Together with gauges for the
 //! process and its cgroup, these are published through the `metrics` crate
 //! facade when Lance is built with the `metrics` feature. Readings come from
-//! `/proc` and cgroupfs, so observation is available on Linux only.
+//! `/proc` and cgroupfs, so they are available on Linux only.
+//!
+//! On every platform, the same switch and feature also report how many bytes
+//! the I/O schedulers, the DataFusion memory pools that Lance builds from its
+//! execution options and the MemWAL writers of the process hold, from their
+//! own accounting.
 //!
 //! An application that installs its own recorder registers the metrics once
 //! and refreshes the gauges from its collection loop; the Python and Java
@@ -23,13 +28,15 @@
 
 #[cfg(any(test, all(feature = "metrics", target_os = "linux")))]
 mod cgroup;
+mod components;
 mod observer;
 mod proc;
 mod telemetry;
 
+pub use components::{Component, register_component};
 pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow};
 pub use telemetry::{
-    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_OPERATION_PEAK, METRIC_RSS, METRIC_RSS_PEAK,
-    METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds, record_operation_peak,
-    record_stage_peak, refresh_metrics,
+    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_OPERATION_PEAK, METRIC_RSS,
+    METRIC_RSS_PEAK, METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds,
+    record_operation_peak, record_stage_peak, refresh_metrics,
 };
