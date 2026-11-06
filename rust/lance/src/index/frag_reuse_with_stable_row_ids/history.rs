@@ -302,6 +302,12 @@ fn trimmed_versions(
 /// one cleanup's rule ([`is_index_remap_caught_up`]) finds behind it, or that
 /// the rule cannot decide for (a rewrite group split across its coverage).
 /// `chain` is every fragment the history holding `version` touches.
+///
+/// This applies the same per-version rule as `FragReuseHistory::trim`
+/// rather than calling it: refusing a proposed trim needs to name the index
+/// that blocks each version and judge it against the history and metadata
+/// the writer read as well as the ones it publishes, to tell a caller error
+/// from a retryable race. `trim` only answers what survives.
 fn index_needing<'a>(
     version: &FragReuseVersion,
     indices: &'a [IndexMetadata],
@@ -310,18 +316,6 @@ fn index_needing<'a>(
     indices
         .iter()
         .find(|index| !matches!(is_index_remap_caught_up(version, index, chain), Ok(true)))
-}
-
-/// How many of the oldest versions a cleanup of a stable-row-id table removes:
-/// those before the first version an index of `indices` still needs. The kept
-/// versions stay a complete suffix of the history, so an address they map
-/// translates through every later move.
-pub fn trimmable_versions(versions: &[FragReuseVersion], indices: &[IndexMetadata]) -> usize {
-    let chain = reuse_chain_frag_bitmap(versions);
-    versions
-        .iter()
-        .position(|version| index_needing(version, indices, &chain).is_some())
-        .unwrap_or(versions.len())
 }
 
 fn contains_version(versions: &[FragReuseVersion], version: &FragReuseVersion) -> Result<bool> {

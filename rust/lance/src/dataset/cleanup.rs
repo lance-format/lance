@@ -1372,24 +1372,11 @@ impl<'a> CleanupTask<'a> {
             let map_ids = async {
                 let history =
                     crate::index::frag_reuse::load_frag_reuse_history(self.dataset, entry).await?;
-                let ledger = history.ledger();
-                if !history.is_fully_interpretable() {
-                    return Err(Error::not_supported(
-                        "the tagged FRI history carries transitions this client cannot interpret",
-                    ));
-                }
                 Ok::<Vec<String>, Error>(
-                    ledger
-                        .transitions()
-                        .iter()
-                        .filter_map(|transition| {
-                            match transition.mapping() {
-                            lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(
-                                partition,
-                            ) => Some(partition.map_id.clone()),
-                            _ => None,
-                        }
-                        })
+                    history
+                        .referenced_files()?
+                        .into_iter()
+                        .map(|mapping| mapping.map_id().to_string())
                         .collect(),
                 )
             }
@@ -2265,8 +2252,6 @@ impl<'a> CleanupTask<'a> {
         parent_base_ids: &BTreeSet<Option<u32>>,
         entry: &IndexMetadata,
     ) -> Result<Vec<String>> {
-        use lance_table::system_index::frag_reuse::ledger::Mapping;
-
         entry
             .index_details
             .as_ref()
@@ -2332,22 +2317,15 @@ impl<'a> CleanupTask<'a> {
         let history = lance_table::system_index::frag_reuse::history::FragReuseHistory::decode(
             entry, external,
         )?;
-        let ledger = history.ledger();
-        if !history.is_fully_interpretable() {
-            return Err(Error::not_supported(
-                "the branch's tagged FRI history carries transitions this client cannot interpret",
-            ));
-        }
-        Ok(ledger
-            .transitions()
-            .iter()
-            .filter_map(|transition| match transition.mapping() {
-                Mapping::StablePartition(partition) => partition
-                    .base_id
-                    .filter(|id| parent_base_ids.contains(&Some(*id)))
-                    .map(|_| partition.map_id.clone()),
-                _ => None,
+        Ok(history
+            .referenced_files()?
+            .into_iter()
+            .filter(|mapping| {
+                mapping
+                    .base_id()
+                    .is_some_and(|id| parent_base_ids.contains(&Some(id)))
             })
+            .map(|mapping| mapping.map_id().to_string())
             .collect())
     }
 

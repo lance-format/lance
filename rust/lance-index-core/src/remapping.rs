@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Batch row-ID translation at asynchronous index loading boundaries.
+//! Row-address translation for loading and rewriting indices.
 //!
-//! Legacy consumers keep calling [`RowIdRemapper`] directly; nothing in this
-//! module participates in that path. The free helpers here serve the additive
-//! entry points that load indices under a mapping whose payload may require
-//! asynchronous reads, awaiting translation once per batch, never once per row.
+//! An index translates the addresses it stored through a [`Remapper`],
+//! awaiting translation once per batch, never once per row. The free helpers
+//! here apply one to the shapes indices store (bitmaps, record batches), and
+//! [`RowAddrTranslator`] is the translation an index rewrite applies.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -15,7 +15,6 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use arrow_array::{Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
-use async_trait::async_trait;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_select::{RowAddrTreeMap, RowSetOps};
@@ -23,36 +22,8 @@ use roaring::RoaringTreemap;
 
 use crate::scalar::RowIdRemapper;
 
-/// Translates a bounded batch of row IDs, allowing encodings to read external data.
-///
-/// Index rewrites (`remap_streaming`, [`materialize_remap`]) take it; an
-/// index load translates through a [`Remapper`] instead.
-#[async_trait]
-pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
-    /// Results correspond to input positions, including duplicates. `None` removes a row.
-    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>>;
-
-    /// The physical row count of `fragment` in the address space this
-    /// remapper translates from, when it knows it. The in-memory fallback of
-    /// `remap_streaming` ([`materialize_remap`]) enumerates every address of
-    /// the fragments an index holds; a fragment it cannot size makes the
-    /// fallback decline. `None` (the default) means unknown.
-    fn fragment_physical_rows(&self, _fragment: u32) -> Option<u64> {
-        None
-    }
-
-    /// The memory the in-memory fallback may spend, temporary buffers and
-    /// the materialized map together, before it declines with
-    /// [`RemapUnavailable::OverBudget`].
-    fn materialization_budget_bytes(&self) -> u64 {
-        DEFAULT_MATERIALIZATION_BUDGET_BYTES
-    }
-}
-
-/// The default [`BatchRowIdRemapper::materialization_budget_bytes`]: 256 MiB.
-pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-
 pub use lance_select::Remapper;
+pub use lance_select::remapper::{DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable};
 
 /// The translation of every row address in `addrs` through `remapper`,
 /// without the ones that translate to `None`.
@@ -143,175 +114,6 @@ pub async fn translate_record_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-/// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
-/// `HashMap::with_capacity(entries)` reserves.
-///
-/// hashbrown's `capacity_to_buckets` rounds the capacity up to
-/// `next_power_of_two(ceil(entries * 8 / 7))` buckets (4 below four entries, 8
-/// below eight) and lays the table out as one slot of
-/// `size_of::<(u64, Option<u64>)>()` (24) bytes plus one control byte per
-/// bucket, followed by one group width (16) of trailing control bytes. The
-/// rounding is what a flat per-entry charge misses: 7,350,000 entries adjust
-/// to 8,400,000 and round to 16,777,216 buckets, 419,430,416 bytes, where 32
-/// bytes per entry would have charged 235,200,000.
-fn hash_map_bytes(entries: u64) -> u64 {
-    const SLOT_BYTES: u64 = std::mem::size_of::<(u64, Option<u64>)>() as u64;
-    const CTRL_BYTES_PER_BUCKET: u64 = 1;
-    const GROUP_WIDTH: u64 = 16;
-    let buckets = if entries < 4 {
-        4
-    } else if entries < 8 {
-        8
-    } else {
-        entries
-            .saturating_mul(8)
-            .div_ceil(7)
-            .checked_next_power_of_two()
-            .unwrap_or(u64::MAX)
-    };
-    buckets
-        .saturating_mul(SLOT_BYTES + CTRL_BYTES_PER_BUCKET)
-        .saturating_add(GROUP_WIDTH)
-}
-
-/// Why an index could not be rewritten through a batch translator by the
-/// in-memory fallback of `remap_streaming`, as opposed to an I/O or data
-/// error: nothing is wrong with the index or the history, this build simply
-/// cannot prove a complete mapping within its means. A maintenance job
-/// leaves such a segment as it is (its files and the history it translates
-/// through stay) and moves on; the reason travels inside
-/// [`lance_core::Error::NotSupported`], see [`Self::from_error`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RemapUnavailable {
-    /// The index does not report which fragments its files hold addresses
-    /// for, so a complete mapping cannot be proven.
-    StoredFragmentsUnknown,
-    /// The translator cannot size a fragment the index holds.
-    FragmentRowsUnknown { fragment: u32 },
-    /// Materializing the mapping would exceed the translator's budget.
-    OverBudget {
-        estimated_bytes: u64,
-        budget_bytes: u64,
-    },
-}
-
-impl std::fmt::Display for RemapUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StoredFragmentsUnknown => write!(
-                f,
-                "the index does not report the fragments its files hold addresses for, so a \
-                 complete in-memory mapping cannot be built for its legacy remap"
-            ),
-            Self::FragmentRowsUnknown { fragment } => write!(
-                f,
-                "the translator cannot size fragment {fragment}, which the index holds addresses \
-                 for, so a complete in-memory mapping cannot be built for its legacy remap"
-            ),
-            Self::OverBudget {
-                estimated_bytes,
-                budget_bytes,
-            } => write!(
-                f,
-                "materializing the mapping for the index's legacy remap needs about \
-                 {estimated_bytes} bytes, above the {budget_bytes} byte budget"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RemapUnavailable {}
-
-impl RemapUnavailable {
-    /// This reason as the error `remap_streaming` returns.
-    pub fn into_error(self) -> Error {
-        Error::not_supported_source(Box::new(self))
-    }
-
-    /// The reason carried by an error `remap_streaming` returned, if it
-    /// declined for one; `None` for any other error (I/O, corrupt data, a
-    /// translation failure), which a caller must not treat as a skip.
-    pub fn from_error(error: &Error) -> Option<&Self> {
-        match error {
-            Error::NotSupported { source, .. } => source.downcast_ref::<Self>(),
-            _ => None,
-        }
-    }
-}
-
-/// The complete in-memory mapping an index whose `remap` predates batch
-/// translation needs: every address of every fragment in `stored_fragments`
-/// translated through `remapper`, with a row the translator drops mapped
-/// explicitly to `None`. The legacy `remap` treats an address missing from
-/// its map as unchanged, so the fragments listed must be every fragment the
-/// index's files may hold addresses for, retired ones included; a fragment
-/// the index no longer claims but still stores would otherwise survive with
-/// its stale addresses. An address the translator leaves as it is has the
-/// same meaning either way and is not stored.
-///
-/// The cost is bounded before anything is allocated: the fragments' row
-/// counts (from [`BatchRowIdRemapper::fragment_physical_rows`]) put an upper
-/// bound on the map, sized as the hash table really allocates it (see
-/// `hash_map_bytes`), and that plus the translation buffers must fit
-/// [`BatchRowIdRemapper::materialization_budget_bytes`]. The fallback
-/// declines with a [`RemapUnavailable`] when the fragments are unknown, a
-/// fragment cannot be sized or the estimate is over budget; translation
-/// errors propagate as they are.
-pub async fn materialize_remap(
-    remapper: &dyn BatchRowIdRemapper,
-    stored_fragments: Option<&RoaringBitmap>,
-) -> Result<RowAddrRemap> {
-    let Some(fragments) = stored_fragments else {
-        return Err(RemapUnavailable::StoredFragmentsUnknown.into_error());
-    };
-    let mut sized = Vec::with_capacity(fragments.len() as usize);
-    let mut total_rows: u64 = 0;
-    for fragment in fragments.iter() {
-        let rows = remapper
-            .fragment_physical_rows(fragment)
-            .ok_or_else(|| RemapUnavailable::FragmentRowsUnknown { fragment }.into_error())?;
-        total_rows = total_rows.saturating_add(rows);
-        sized.push((fragment, rows));
-    }
-    let budget_bytes = remapper.materialization_budget_bytes();
-    let estimated_bytes = hash_map_bytes(total_rows).saturating_add((BATCH_SIZE as u64) * (8 + 16));
-    if estimated_bytes > budget_bytes {
-        return Err(RemapUnavailable::OverBudget {
-            estimated_bytes,
-            budget_bytes,
-        }
-        .into_error());
-    }
-    let mut map: HashMap<u64, Option<u64>> =
-        HashMap::with_capacity(usize::try_from(total_rows).unwrap_or(usize::MAX));
-    let mut slice: Vec<u64> = Vec::with_capacity(BATCH_SIZE.min(total_rows as usize));
-    for (fragment, rows) in sized {
-        let base = u64::from(fragment) << 32;
-        let mut start = 0u64;
-        while start < rows {
-            let end = rows.min(start + BATCH_SIZE as u64);
-            slice.clear();
-            slice.extend((start..end).map(|offset| base | offset));
-            let translated = remapper.remap_row_ids(&slice).await?;
-            if translated.len() != slice.len() {
-                return Err(Error::internal(format!(
-                    "row-ID remapper returned {} results for {} inputs",
-                    translated.len(),
-                    slice.len()
-                )));
-            }
-            for (address, result) in slice.iter().zip(translated) {
-                if result != Some(*address) {
-                    map.insert(*address, result);
-                }
-            }
-            start = end;
-        }
-    }
-    Ok(RowAddrRemap::direct(map))
-}
-
 // Bitmap compression can hide millions of rows. Bound temporary translation buffers.
 const BATCH_SIZE: usize = 64 * 1024;
 
@@ -340,19 +142,39 @@ pub fn check_batch_remapping_entry() -> Result<()> {
 /// `remap_streaming`.
 ///
 /// `Sync` is a fully materialized map (a compaction's compact remap, or a
-/// direct map): every lookup is immediate. `Batch` is a translator whose
+/// direct map): every lookup is immediate. `Remapper` is a translator whose
 /// payload may need reads (a tagged history whose path holds stable-partition
 /// hops). Index rewrites translate the addresses of one unit of work at a
 /// time (a page, a partition, a spill batch) through [`Self::resolve`] or
-/// [`Self::remap_row_addrs`], so a batch translator never has a map sized to
-/// the source rows built for it. Both variants are shared handles, cheap to
+/// [`Self::remap_row_addrs`], so a remapper never has a map sized to the
+/// source rows built for it. Both variants are shared handles, cheap to
 /// clone into per-page tasks; [`Self::as_ref`] is the borrowed form the
 /// legacy `remap` entry points reach without copying their map.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum RowAddrTranslator {
     Sync(Arc<RowAddrRemap>),
-    Batch(Arc<dyn BatchRowIdRemapper>),
+    /// A fragment reuse history's translation, bound from the plan
+    /// `FragReuseHistory::compose` made. Whether it is ever held in memory
+    /// is the history's decision ([`Remapper::materialize`]).
+    Remapper(Remapper),
+}
+
+/// A remapper whose translation is already one in-memory map (a version 0
+/// fragment reuse history's) becomes [`RowAddrTranslator::Sync`] over that
+/// map, so the rewrite applies it exactly as the released version 0 remap
+/// did, never through batch translation.
+impl From<Remapper> for RowAddrTranslator {
+    fn from(remapper: Remapper) -> Self {
+        match remapper.row_addr_remap() {
+            // One copy per rewrite. A version 0 remap is compact (sized by
+            // rewrite groups and their changed-row bitmaps, not one entry per
+            // row), so sharing it behind an Arc in CompactFragReuseIndex is
+            // not worth widening that public type's internals.
+            Some(remap) => Self::sync(remap.clone()),
+            None => Self::Remapper(remapper),
+        }
+    }
 }
 
 impl RowAddrTranslator {
@@ -361,21 +183,16 @@ impl RowAddrTranslator {
         Self::Sync(Arc::new(remap))
     }
 
-    /// A batch translator.
-    pub fn batch(remapper: Arc<dyn BatchRowIdRemapper>) -> Self {
-        Self::Batch(remapper)
-    }
-
     /// The borrowed form.
     pub fn as_ref(&self) -> RowAddrTranslatorRef<'_> {
         match self {
             Self::Sync(remap) => RowAddrTranslatorRef::Sync(remap.as_ref()),
-            Self::Batch(remapper) => RowAddrTranslatorRef::Batch(remapper.as_ref()),
+            Self::Remapper(remapper) => RowAddrTranslatorRef::Remapper(remapper),
         }
     }
 
-    /// Whether the translator is known to move no address at all. A batch
-    /// translator is never known to be empty.
+    /// Whether the translator is known to move no address at all. A
+    /// remapper is never known to be empty.
     pub fn is_empty(&self) -> bool {
         self.as_ref().is_empty()
     }
@@ -392,6 +209,24 @@ impl RowAddrTranslator {
     ) -> Result<Cow<'_, RowAddrRemap>> {
         self.as_ref().resolve(addrs).await
     }
+
+    /// The complete in-memory map for an index whose rewrite takes one,
+    /// covering every address in `stored_fragments`. A synchronous
+    /// translator is its own map; any other is bounded and built by
+    /// [`Remapper::materialize`], which declines with a
+    /// [`RemapUnavailable`] when it cannot prove a complete map within
+    /// budget.
+    pub async fn materialize(
+        &self,
+        stored_fragments: Option<&RoaringBitmap>,
+    ) -> Result<Cow<'_, RowAddrRemap>> {
+        match self {
+            Self::Sync(remap) => Ok(Cow::Borrowed(remap.as_ref())),
+            Self::Remapper(remapper) => {
+                Ok(Cow::Owned(remapper.materialize(stored_fragments).await?))
+            }
+        }
+    }
 }
 
 /// A borrowed [`RowAddrTranslator`]: what an index rewrite works against.
@@ -402,7 +237,7 @@ impl RowAddrTranslator {
 #[non_exhaustive]
 pub enum RowAddrTranslatorRef<'a> {
     Sync(&'a RowAddrRemap),
-    Batch(&'a dyn BatchRowIdRemapper),
+    Remapper(&'a Remapper),
 }
 
 impl<'a> From<&'a RowAddrRemap> for RowAddrTranslatorRef<'a> {
@@ -412,32 +247,39 @@ impl<'a> From<&'a RowAddrRemap> for RowAddrTranslatorRef<'a> {
 }
 
 impl<'a> RowAddrTranslatorRef<'a> {
-    /// Whether the translator is known to move no address at all. A batch
-    /// translator is never known to be empty.
+    /// Whether the translator is known to move no address at all. A
+    /// remapper is never known to be empty.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Sync(remap) => remap.is_empty(),
-            Self::Batch(_) => false,
+            Self::Remapper(_) => false,
         }
     }
 
     /// Translate `addrs` in order, one result per input: `None` for a
     /// deleted row, otherwise the current address (unchanged when the
     /// translator does not touch it). At most `BATCH_SIZE` addresses are
-    /// handed to a batch translator at a time.
+    /// handed to a remapper at a time.
     pub async fn remap_row_addrs(&self, addrs: &[u64]) -> Result<Vec<Option<u64>>> {
         match self {
             Self::Sync(remap) => Ok(addrs
                 .iter()
                 .map(|&addr| remap.get(addr).unwrap_or(Some(addr)))
                 .collect()),
-            Self::Batch(remapper) => remap_row_ids_async(*remapper, addrs).await,
+            Self::Remapper(remapper) => {
+                check_batch_remapping_entry()?;
+                let mut translated: Vec<Option<u64>> = addrs.iter().copied().map(Some).collect();
+                for batch in translated.chunks_mut(BATCH_SIZE) {
+                    remapper.translate_in_place(batch).await?;
+                }
+                Ok(translated)
+            }
         }
     }
 
     /// A synchronous map covering exactly `addrs`, so an existing synchronous
     /// remap step runs unchanged over one unit of work. `Sync` borrows its
-    /// map; `Batch` translates `addrs` (deduplicated) and builds a map of
+    /// map; `Remapper` translates `addrs` (deduplicated) and builds a map of
     /// that size, released with the returned value: memory is O(one unit),
     /// never O(source rows).
     pub async fn resolve(
@@ -446,135 +288,16 @@ impl<'a> RowAddrTranslatorRef<'a> {
     ) -> Result<Cow<'a, RowAddrRemap>> {
         match self {
             Self::Sync(remap) => Ok(Cow::Borrowed(remap)),
-            Self::Batch(remapper) => {
+            Self::Remapper(_) => {
                 let mut addrs: Vec<u64> = addrs.into_iter().collect();
                 addrs.sort_unstable();
                 addrs.dedup();
-                let translated = remap_row_ids_async(*remapper, &addrs).await?;
+                let translated = self.remap_row_addrs(&addrs).await?;
                 let map: HashMap<u64, Option<u64>> = addrs.into_iter().zip(translated).collect();
                 Ok(Cow::Owned(RowAddrRemap::direct(map)))
             }
         }
     }
-}
-
-/// Translate row IDs in input order, preserving duplicates and deleted positions.
-pub async fn remap_row_ids_async(
-    remapper: &dyn BatchRowIdRemapper,
-    row_ids: &[u64],
-) -> Result<Vec<Option<u64>>> {
-    check_batch_remapping_entry()?;
-    let mut result = Vec::with_capacity(row_ids.len());
-    for batch in row_ids.chunks(BATCH_SIZE) {
-        let mapped = remapper.remap_row_ids(batch).await?;
-        if mapped.len() != batch.len() {
-            return Err(Error::internal(format!(
-                "row-ID remapper returned {} results for {} inputs",
-                mapped.len(),
-                batch.len()
-            )));
-        }
-        result.extend(mapped);
-    }
-    Ok(result)
-}
-
-/// Translate only the address column, leaving encoded columns in their original layout.
-///
-/// The returned synchronous remapper removes tombstone slots during the
-/// consumer's layout-aware decoding. No per-row lookup table is retained.
-pub async fn remap_row_ids_preserving_layout_async(
-    remapper: &dyn BatchRowIdRemapper,
-    batch: RecordBatch,
-    row_id_idx: usize,
-) -> Result<(RecordBatch, Arc<dyn RowIdRemapper>)> {
-    check_batch_remapping_entry()?;
-    let ids = batch
-        .columns()
-        .get(row_id_idx)
-        .and_then(|array| array.as_primitive_opt::<UInt64Type>())
-        .ok_or_else(|| {
-            Error::invalid_input(format!("row-ID column {row_id_idx} must have type UInt64"))
-        })?;
-    let tombstone = lance_core::utils::address::RowAddress::TOMBSTONE_ROW;
-    let mut translated = Vec::with_capacity(ids.len());
-    for start in (0..ids.len()).step_by(BATCH_SIZE) {
-        let end = (start + BATCH_SIZE).min(ids.len());
-        let inputs: Vec<_> = (start..end)
-            .map(|position| {
-                if ids.is_null(position) {
-                    tombstone
-                } else {
-                    ids.value(position)
-                }
-            })
-            .collect();
-        let mapped = remap_row_ids_async(remapper, &inputs).await?;
-        translated.extend(mapped.into_iter().enumerate().map(|(offset, id)| {
-            if ids.is_null(start + offset) {
-                tombstone
-            } else {
-                id.unwrap_or(tombstone)
-            }
-        }));
-    }
-    let mut columns = batch.columns().to_vec();
-    columns[row_id_idx] = Arc::new(UInt64Array::from(translated));
-    let batch = RecordBatch::try_new(batch.schema(), columns)?;
-    Ok((batch, Arc::new(TombstoneRowIdRemapper)))
-}
-
-/// Translate a row-ID column and remove deleted rows from every column.
-pub async fn remap_record_batch_async(
-    remapper: &dyn BatchRowIdRemapper,
-    batch: RecordBatch,
-    row_id_idx: usize,
-) -> Result<RecordBatch> {
-    check_batch_remapping_entry()?;
-    let (batch, remapper) =
-        remap_row_ids_preserving_layout_async(remapper, batch, row_id_idx).await?;
-    remapper.remap_row_ids_record_batch(batch, row_id_idx)
-}
-
-/// Translate an explicit physical row selection, dropping deleted addresses.
-pub async fn remap_row_addrs_tree_map_async(
-    remapper: &dyn BatchRowIdRemapper,
-    rows: &RowAddrTreeMap,
-) -> Result<RowAddrTreeMap> {
-    check_batch_remapping_entry()?;
-    let ids = rows.row_addrs().ok_or_else(|| Error::not_supported(
-        "batch row-ID remapping requires explicit row addresses, not whole-fragment selections"
-    ))?.map(u64::from);
-    remap_iter(remapper, ids).await
-}
-
-/// Translate a bitmap of row IDs, dropping deleted rows.
-pub async fn remap_row_ids_roaring_tree_map_async(
-    remapper: &dyn BatchRowIdRemapper,
-    rows: &RoaringTreemap,
-) -> Result<RoaringTreemap> {
-    check_batch_remapping_entry()?;
-    remap_iter(remapper, rows.iter()).await
-}
-
-async fn remap_iter<C: Default + Extend<u64>>(
-    remapper: &dyn BatchRowIdRemapper,
-    mut ids: impl Iterator<Item = u64>,
-) -> Result<C> {
-    let mut result = C::default();
-    loop {
-        let batch = ids.by_ref().take(BATCH_SIZE).collect::<Vec<_>>();
-        if batch.is_empty() {
-            break;
-        }
-        result.extend(
-            remap_row_ids_async(remapper, &batch)
-                .await?
-                .into_iter()
-                .flatten(),
-        );
-    }
-    Ok(result)
 }
 
 #[derive(Debug)]
@@ -637,227 +360,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Fragment 1 (rows move to fragment 5, offset 1 deleted), fragment 2
-    /// (untouched) and fragment 3 (excluded: every row dropped).
-    #[derive(Debug)]
-    struct Sizing {
+    /// (untouched) and every other fragment (every row dropped), counting
+    /// the batches it translates.
+    #[derive(Debug, Default)]
+    struct Moves {
         calls: AtomicUsize,
-        budget: u64,
-        rows: HashMap<u32, u64>,
-        fail: bool,
     }
 
-    impl Sizing {
-        fn new(rows: &[(u32, u64)], budget: u64) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                budget,
-                rows: rows.iter().copied().collect(),
-                fail: false,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl BatchRowIdRemapper for Sizing {
-        async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-            assert!(ids.len() <= BATCH_SIZE);
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.fail {
-                return Err(Error::io("the row map is gone"));
-            }
-            Ok(ids
-                .iter()
-                .map(|&address| {
-                    let fragment = (address >> 32) as u32;
-                    let offset = address & 0xffff_ffff;
-                    match fragment {
-                        1 if offset == 1 => None,
-                        1 => Some((5u64 << 32) | offset),
-                        2 => Some(address),
-                        _ => None,
-                    }
-                })
-                .collect())
-        }
-
-        fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
-            self.rows.get(&fragment).copied()
-        }
-
-        fn materialization_budget_bytes(&self) -> u64 {
-            self.budget
-        }
-    }
-
-    fn addr(fragment: u32, offset: u64) -> u64 {
-        (u64::from(fragment) << 32) | offset
-    }
-
-    #[test]
-    fn materialize_remap_maps_every_stored_address_explicitly() {
-        let remapper = Sizing::new(&[(1, 4), (2, 3), (3, 2)], u64::MAX);
-        let stored = RoaringBitmap::from_iter([1u32, 2, 3]);
-        let remap = block_on(materialize_remap(&remapper, Some(&stored))).unwrap();
-        // Moved rows, a deleted row and an excluded fragment are all explicit:
-        // the legacy `remap` would keep any address it cannot find.
-        assert_eq!(remap.get(addr(1, 0)), Some(Some(addr(5, 0))));
-        assert_eq!(remap.get(addr(1, 1)), Some(None));
-        assert_eq!(remap.get(addr(1, 3)), Some(Some(addr(5, 3))));
-        assert_eq!(remap.get(addr(3, 0)), Some(None));
-        assert_eq!(remap.get(addr(3, 1)), Some(None));
-        // An address the translator leaves alone means "unchanged" either way.
-        assert_eq!(remap.get(addr(2, 0)), None);
-        // Nothing beyond the stored fragments' rows.
-        assert_eq!(remap.get(addr(1, 4)), None);
-        assert_eq!(remap.get(addr(4, 0)), None);
-    }
-
-    #[test]
-    fn materialize_remap_declines_before_translating() {
-        // Unknown stored fragments.
-        let remapper = Sizing::new(&[(1, 4)], u64::MAX);
-        let error = block_on(materialize_remap(&remapper, None)).unwrap_err();
-        assert_eq!(
-            RemapUnavailable::from_error(&error),
-            Some(&RemapUnavailable::StoredFragmentsUnknown)
-        );
-        // A stored fragment the translator cannot size.
-        let stored = RoaringBitmap::from_iter([1u32, 9]);
-        let error = block_on(materialize_remap(&remapper, Some(&stored))).unwrap_err();
-        assert_eq!(
-            RemapUnavailable::from_error(&error),
-            Some(&RemapUnavailable::FragmentRowsUnknown { fragment: 9 })
-        );
-        // Over budget: the estimate is made from the row counts alone.
-        let tight = Sizing::new(&[(1, 4)], 1);
-        let stored = RoaringBitmap::from_iter([1u32]);
-        let error = block_on(materialize_remap(&tight, Some(&stored))).unwrap_err();
-        match RemapUnavailable::from_error(&error) {
-            Some(RemapUnavailable::OverBudget {
-                budget_bytes: 1, ..
-            }) => {}
-            other => panic!("expected OverBudget, got {other:?}"),
-        }
-        assert!(matches!(error, Error::NotSupported { .. }));
-        // None of these touched the translator.
-        assert_eq!(remapper.calls.load(Ordering::Relaxed), 0);
-        assert_eq!(tight.calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn materialize_remap_charges_the_rounded_hash_table() {
-        // 7,350,000 entries adjust to 8,400,000 and round to 16,777,216
-        // buckets of 25 bytes: 419,430,416 bytes, not 32 bytes per entry.
-        assert_eq!(hash_map_bytes(7_350_000), 419_430_416);
-        assert!(hash_map_bytes(7_350_000) >= 400 << 20);
-        assert_eq!(hash_map_bytes(0), 4 * 25 + 16);
-        // Under the default budget that many stored rows are declined before
-        // any translation; the flat charge (235,200,000 plus the slice
-        // buffers) would have fit.
-        let remapper = Sizing::new(&[(1, 7_350_000)], DEFAULT_MATERIALIZATION_BUDGET_BYTES);
-        let stored = RoaringBitmap::from_iter([1u32]);
-        let error = block_on(materialize_remap(&remapper, Some(&stored))).unwrap_err();
-        match RemapUnavailable::from_error(&error) {
-            Some(RemapUnavailable::OverBudget {
-                estimated_bytes,
-                budget_bytes,
-            }) => {
-                assert_eq!(*budget_bytes, DEFAULT_MATERIALIZATION_BUDGET_BYTES);
-                assert!(*estimated_bytes >= 419_430_416, "{estimated_bytes}");
-            }
-            other => panic!("expected OverBudget, got {other:?}"),
-        }
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert_eq!(remapper.calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn materialize_remap_propagates_translation_errors() {
-        let mut remapper = Sizing::new(&[(1, 4)], u64::MAX);
-        remapper.fail = true;
-        let stored = RoaringBitmap::from_iter([1u32]);
-        let error = block_on(materialize_remap(&remapper, Some(&stored))).unwrap_err();
-        // An I/O failure is an error, never a reason to skip.
-        assert!(RemapUnavailable::from_error(&error).is_none());
-        assert!(matches!(error, Error::IO { .. }), "{error}");
-    }
-
-    #[test]
-    fn materialize_remap_translates_in_bounded_slices() {
-        let rows = 2 * BATCH_SIZE as u64 + 1;
-        let remapper = Sizing::new(&[(2, rows)], u64::MAX);
-        let stored = RoaringBitmap::from_iter([2u32]);
-        let remap = block_on(materialize_remap(&remapper, Some(&stored))).unwrap();
-        assert_eq!(remapper.calls.load(Ordering::Relaxed), 3);
-        // Every address was unchanged: nothing is stored for them.
-        assert!(remap.is_empty());
-    }
-
-    #[derive(Debug)]
-    struct ExternalMapping(AtomicUsize);
-    #[async_trait]
-    impl BatchRowIdRemapper for ExternalMapping {
-        async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-            assert!(ids.len() <= 65536);
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Ok(ids
-                .iter()
-                .map(|id| match *id {
-                    1 => Some(5),
-                    3 => None,
-                    5 => Some(1),
-                    other => Some(other),
-                })
-                .collect())
-        }
-    }
-    #[test]
-    fn external_remapping_bounds_batches_and_preserves_layout() {
-        block_on(async {
-            let external = ExternalMapping(AtomicUsize::new(0));
-            let batch = record_batch!(
-                ("id", UInt64, [Some(1), Some(3), None, Some(5)]),
-                ("value", Int32, [10, 30, 40, 50])
-            )
-            .unwrap();
-            let translated = remap_record_batch_async(&external, batch, 0).await.unwrap();
-            assert_eq!(
-                translated,
-                record_batch!(
-                    ("id", UInt64, [Some(5), Some(1)]),
-                    ("value", Int32, [10, 50])
-                )
-                .unwrap()
-            );
-            let batch = RecordBatch::try_from_iter([(
-                "id",
-                Arc::new(UInt64Array::from(vec![1; 65537])) as arrow_array::ArrayRef,
-            )])
-            .unwrap();
-            let (batch, remapper) = remap_row_ids_preserving_layout_async(&external, batch, 0)
-                .await
-                .unwrap();
-            assert_eq!(batch.num_rows(), 65537);
-            assert_eq!(external.0.load(Ordering::Relaxed), 3);
-            assert_eq!(remapper.remap_row_id(5), Some(5));
-            assert_eq!(
-                remapper.remap_row_id(lance_core::utils::address::RowAddress::TOMBSTONE_ROW),
-                None
-            );
-        });
-    }
-
-    /// A [`Remapper`] following [`Sizing`]'s moves, and the calls it makes.
-    fn sizing_remapper() -> (Remapper, Arc<Sizing>) {
-        let sizing = Arc::new(Sizing::new(&[], u64::MAX));
-        let remapper = Remapper::from_backing(Arc::new(SizingBacking(sizing.clone())));
-        (remapper, sizing)
-    }
-
-    #[derive(Debug)]
-    struct SizingBacking(Arc<Sizing>);
-
-    impl lance_select::remapper::RemapperBacking for SizingBacking {
+    impl lance_select::remapper::RemapperBacking for Moves {
         fn fragment_needs_translation(&self, _fragment: u32) -> bool {
             true
         }
@@ -870,21 +380,36 @@ mod tests {
             &'a self,
             addrs: &'a mut [Option<u64>],
         ) -> lance_select::remapper::TranslateFuture<'a> {
-            Box::pin(async move {
-                let inputs: Vec<u64> = addrs.iter().flatten().copied().collect();
-                let mut translated = self.0.remap_row_ids(&inputs).await?.into_iter();
-                for slot in addrs.iter_mut().filter(|slot| slot.is_some()) {
-                    *slot = translated.next().flatten();
-                }
-                Ok(())
-            })
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            for slot in addrs.iter_mut() {
+                *slot = slot.and_then(|address| {
+                    let offset = address & 0xffff_ffff;
+                    match (address >> 32) as u32 {
+                        1 if offset == 1 => None,
+                        1 => Some(addr(5, offset)),
+                        2 => Some(address),
+                        _ => None,
+                    }
+                });
+            }
+            Box::pin(std::future::ready(Ok(())))
         }
+    }
+
+    fn addr(fragment: u32, offset: u64) -> u64 {
+        (u64::from(fragment) << 32) | offset
+    }
+
+    /// A [`Remapper`] following [`Moves`], and the calls it makes.
+    fn moves_remapper() -> (Remapper, Arc<Moves>) {
+        let moves = Arc::new(Moves::default());
+        (Remapper::from_backing(moves.clone()), moves)
     }
 
     #[test]
     fn translate_preserving_layout_keeps_every_slot() {
         block_on(async {
-            let (remapper, sizing) = sizing_remapper();
+            let (remapper, moves) = moves_remapper();
             let batch = record_batch!(
                 (
                     "addr",
@@ -923,19 +448,19 @@ mod tests {
                 Arc::new(UInt64Array::from(vec![addr(1, 0); rows])) as arrow_array::ArrayRef,
             )])
             .unwrap();
-            let before = sizing.calls.load(Ordering::Relaxed);
+            let before = moves.calls.load(Ordering::Relaxed);
             let (translated, _) = translate_preserving_layout(&remapper, batch, 0)
                 .await
                 .unwrap();
             assert_eq!(translated.num_rows(), rows);
-            assert_eq!(sizing.calls.load(Ordering::Relaxed) - before, 2);
+            assert_eq!(moves.calls.load(Ordering::Relaxed) - before, 2);
         });
     }
 
     #[test]
     fn translate_record_batch_drops_deleted_and_null_rows() {
         block_on(async {
-            let (remapper, _) = sizing_remapper();
+            let (remapper, _) = moves_remapper();
             let batch = record_batch!(
                 (
                     "addr",
@@ -967,7 +492,7 @@ mod tests {
     #[test]
     fn translate_treemap_translates_in_bounded_batches() {
         block_on(async {
-            let (remapper, sizing) = sizing_remapper();
+            let (remapper, moves) = moves_remapper();
             let addrs: RoaringTreemap = (0..=BATCH_SIZE as u64)
                 .map(|offset| addr(1, offset))
                 .collect();
@@ -977,7 +502,111 @@ mod tests {
                 .map(|offset| addr(5, offset))
                 .collect();
             assert_eq!(translated, expected);
-            assert_eq!(sizing.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(moves.calls.load(Ordering::Relaxed), 2);
         });
+    }
+
+    /// A backing that may or may not hold its translation as one map.
+    #[derive(Debug)]
+    struct MapBacking(Option<RowAddrRemap>);
+
+    impl lance_select::remapper::RemapperBacking for MapBacking {
+        fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+            true
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            _addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+            self.0.as_ref()
+        }
+    }
+
+    /// A backing moving fragment 1 to fragment 5 that records the size of
+    /// every batch it is handed.
+    #[derive(Debug, Default)]
+    struct RecordingBatches(std::sync::Mutex<Vec<usize>>);
+
+    impl lance_select::remapper::RemapperBacking for RecordingBatches {
+        fn fragment_needs_translation(&self, fragment: u32) -> bool {
+            fragment == 1
+        }
+
+        fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+            fragments.clone()
+        }
+
+        fn translate_in_place<'a>(
+            &'a self,
+            addrs: &'a mut [Option<u64>],
+        ) -> lance_select::remapper::TranslateFuture<'a> {
+            self.0.lock().unwrap().push(addrs.len());
+            for slot in addrs.iter_mut() {
+                if let Some(address) = *slot
+                    && address >> 32 == 1
+                {
+                    *slot = Some(addr(5, address & 0xffff_ffff));
+                }
+            }
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Driven through the translator, a large request reaches the
+    /// remapper in batches of at most `BATCH_SIZE` addresses with every
+    /// position kept across batch boundaries, and `resolve` builds a map of
+    /// exactly one unit of work.
+    #[test]
+    fn a_remapper_translator_bounds_batches_and_resolves_one_unit() {
+        block_on(async {
+            let backing = Arc::new(RecordingBatches::default());
+            let translator = RowAddrTranslator::from(Remapper::from_backing(backing.clone()));
+            assert!(matches!(translator, RowAddrTranslator::Remapper(_)));
+            assert!(!translator.is_empty());
+
+            let rows = 2 * BATCH_SIZE as u64 + 1;
+            let input: Vec<u64> = (0..rows).map(|offset| addr(1, offset)).collect();
+            let output = translator.remap_row_addrs(&input).await.unwrap();
+            assert_eq!(output.len(), input.len());
+            assert!(
+                output
+                    .iter()
+                    .zip(0..rows)
+                    .all(|(translated, offset)| *translated == Some(addr(5, offset)))
+            );
+            let batches = std::mem::take(&mut *backing.0.lock().unwrap());
+            assert_eq!(batches, [BATCH_SIZE, BATCH_SIZE, 1]);
+
+            let page = (10..20).map(|offset| addr(1, offset));
+            let resolved = translator.resolve(page).await.unwrap();
+            assert_eq!(resolved.get(addr(1, 15)), Some(Some(addr(5, 15))));
+            assert_eq!(resolved.get(addr(1, 25)), None, "not part of the unit");
+            assert_eq!(*backing.0.lock().unwrap(), [10]);
+        });
+    }
+
+    #[test]
+    fn an_in_memory_translation_rewrites_synchronously() {
+        let remap = RowAddrRemap::direct(HashMap::from([(1, Some(5)), (3, None)]));
+        let remapper = Remapper::from_backing(Arc::new(MapBacking(Some(remap.clone()))));
+        let RowAddrTranslator::Sync(translated) = RowAddrTranslator::from(remapper) else {
+            panic!("an in-memory translation is applied as its map");
+        };
+        assert_eq!(translated.as_ref(), &remap);
+
+        let remapper = Remapper::from_backing(Arc::new(MapBacking(None)));
+        assert!(matches!(
+            RowAddrTranslator::from(remapper),
+            RowAddrTranslator::Remapper(_)
+        ));
     }
 }

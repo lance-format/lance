@@ -3337,7 +3337,7 @@ impl<'a> TransactionRebase<'a> {
                         .map(pb_fri::Version::from)
                         .collect(),
                 )?;
-                crate::dataset::index::frag_reuse::warn_dropped_versions(&dropped);
+                lance_table::system_index::frag_reuse::warn_dropped_versions(&dropped);
                 if let Some(own) = &own {
                     history = history.append(RewriteRecord::from_legacy_version(
                         &pb_fri::Version::from(own),

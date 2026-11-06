@@ -3,6 +3,7 @@
 
 //! Exercise registration from a downstream crate, without changing the builtin registry.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -14,20 +15,24 @@ use lance::{
     Dataset,
     dataset::{
         UpdateBuilder, WriteParams,
-        optimize::{CompactionOptions, compact_files},
+        index::frag_reuse::cleanup_frag_reuse_index,
+        optimize::{CompactionOptions, compact_files, remapping::remap_column_index},
     },
     index::{DatasetIndexExt, DatasetIndexInternalExt, register_scalar_index_plugin},
 };
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_arrow::json::ARROW_JSON_EXT_NAME;
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::{
-    IndexType,
-    metrics::NoOpMetricsCollector,
+    Index, IndexType,
+    metrics::{MetricsCollector, NoOpMetricsCollector},
     progress::IndexBuildProgress,
     scalar::{
-        CreatedIndex, IndexStore, Remapper, ScalarIndex, ScalarIndexParams,
+        AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, Remapper, ScalarIndex,
+        ScalarIndexParams, SearchResult, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
@@ -60,6 +65,7 @@ const ROWS_PER_ZONE: u64 = 2;
 static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
     register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
     register_scalar_index_plugin::<StaleIndexDetails, StaleIndexPlugin>().unwrap();
+    register_scalar_index_plugin::<LegacyRemapIndexDetails, LegacyRemapPlugin>().unwrap();
 });
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -902,4 +908,259 @@ async fn fragment_reuse_keeps_listing_plugins_that_need_no_translation(#[case] t
             "{filter}"
         );
     }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct LegacyRemapIndexDetails {}
+
+impl Name for LegacyRemapIndexDetails {
+    const NAME: &'static str = "LegacyRemapIndexDetails";
+    const PACKAGE: &'static str = "example.index";
+}
+
+/// A plugin that translates through the remapper it is loaded with, but
+/// whose index is rewritten only through the legacy in-memory `remap` and
+/// does not report the fragments its files hold, so a rewrite through a
+/// tagged history cannot be proven complete.
+#[derive(Debug, Default)]
+struct LegacyRemapPlugin;
+
+/// How often the default `remap_streaming` asked a [`LegacyRemapIndex`]
+/// for its stored fragments, i.e. attempted the in-memory fallback.
+static LEGACY_REMAP_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// A zone map that keeps the default `remap_streaming` and reports no
+/// stored fragments.
+#[derive(Debug)]
+struct LegacyRemapIndex(Arc<dyn ScalarIndex>);
+
+impl DeepSizeOf for LegacyRemapIndex {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.0.deep_size_of_children(context)
+    }
+}
+
+#[async_trait]
+impl Index for LegacyRemapIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+    fn statistics(&self) -> Result<serde_json::Value> {
+        self.0.statistics()
+    }
+    async fn prewarm(&self) -> Result<()> {
+        self.0.prewarm().await
+    }
+    fn index_type(&self) -> IndexType {
+        self.0.index_type()
+    }
+    async fn calculate_included_frags(&self) -> Result<roaring::RoaringBitmap> {
+        self.0.calculate_included_frags().await
+    }
+}
+
+#[async_trait]
+impl ScalarIndex for LegacyRemapIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.0.search(query, metrics).await
+    }
+    fn results_are_row_addresses(&self) -> bool {
+        self.0.results_are_row_addresses()
+    }
+    async fn remap(
+        &self,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        self.0.remap(mapping, dest_store).await
+    }
+    fn stored_fragments(&self) -> Option<roaring::RoaringBitmap> {
+        LEGACY_REMAP_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+    async fn update(
+        &self,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        old_data_filter: Option<OldIndexDataFilter>,
+    ) -> Result<CreatedIndex> {
+        self.0.update(new_data, dest_store, old_data_filter).await
+    }
+    fn update_criteria(&self) -> UpdateCriteria {
+        self.0.update_criteria()
+    }
+    fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+        Ok(ScalarIndexParams::new("legacyremap".to_string()))
+    }
+}
+
+#[async_trait]
+impl BasicTrainer for LegacyRemapPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        ZoneMapIndexPlugin.new_training_request(params, field)
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let mut created = ZoneMapIndexPlugin
+            .train_index(data, index_store, request, fragment_ids, progress)
+            .await?;
+        created.index_details = prost_types::Any::from_msg(&LegacyRemapIndexDetails {})?;
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for LegacyRemapPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn translates_row_addrs(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        "LegacyRemap"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZoneMapIndexPlugin.version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let zone_map = ZoneMapIndexPlugin
+            .load_index(index_store, index_details, index_version, remapper, cache)
+            .await?;
+        Ok(Arc::new(LegacyRemapIndex(zone_map)))
+    }
+}
+
+/// A remap the index declines (it cannot be rewritten through a complete
+/// map this build can prove) publishes no manifest version: the segment
+/// keeps translating through the tagged history, which a later trim keeps.
+#[tokio::test]
+async fn declined_remap_commits_nothing_and_keeps_the_transition() {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(("value", Int64, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("legacy_remap_index".to_string()),
+            &ScalarIndexParams::new("legacyremap".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    // The sticky flag makes the compaction record a tagged history.
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let segment = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .find(|index| index.name == "legacy_remap_index")
+                .cloned()
+                .unwrap()
+        }
+    };
+    let before = segment(&dataset).await;
+    let version = dataset.version().version;
+
+    remap_column_index(&mut dataset, &["value"], Some("legacy_remap_index".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        LEGACY_REMAP_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the remap reached the in-memory fallback"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(segment(&dataset).await.uuid, before.uuid);
+
+    cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+    let history = dataset.frag_reuse_history().await.unwrap().unwrap();
+    assert!(!history.is_empty());
+
+    let mut full_scan = dataset.scan();
+    full_scan
+        .filter("value = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 1);
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter("value = 3").unwrap();
+    assert_eq!(indexed_scan.try_into_batch().await.unwrap(), expected);
 }

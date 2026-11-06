@@ -27,7 +27,7 @@ use crate::scalar::registry::{
     BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     TrainingRequest, VALUE_COLUMN_NAME,
 };
-use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
+use crate::scalar::{CreatedIndex, UpdateCriteria};
 use crate::{Index, IndexType};
 use arrow::array::{AsArray, UInt32Builder};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
@@ -473,7 +473,7 @@ impl NGramIndex {
         new_data: Option<SendableRecordBatchStream>,
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
@@ -487,7 +487,7 @@ impl NGramIndex {
                 new_data_spills,
                 segment_stores,
                 old_data_filters,
-                frag_reuse_index,
+                remapper,
                 dest_store,
             )
             .await?;
@@ -933,31 +933,31 @@ impl NGramIndexSpillState {
         Ok(batches)
     }
 
-    fn remap_and_filter_rows(
+    async fn remap_and_filter_rows(
         self,
-        frag_reuse_index: Option<&dyn RowIdRemapper>,
+        remapper: Option<&Remapper>,
         filter: Option<&super::OldIndexDataFilter>,
-    ) -> Self {
-        if let Some(fri) = frag_reuse_index {
-            return self.remap_then_keep(fri, filter);
+    ) -> Result<Self> {
+        if let Some(remapper) = remapper {
+            return self.remap_then_keep(remapper, filter).await;
         }
-        match filter {
+        Ok(match filter {
             None => self,
             Some(filter) => self.retain_rows(filter),
-        }
+        })
     }
 
     /// Remap stale addresses per row, keeping only rows still selected by
     /// `filter`. Used only under a pending deferred-remap compaction.
-    fn remap_then_keep(
+    async fn remap_then_keep(
         self,
-        fri: &dyn RowIdRemapper,
+        remapper: &Remapper,
         filter: Option<&super::OldIndexDataFilter>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
         let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
         for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
-            let remapped = fri.remap_row_ids_roaring_tree_map(&bitmap);
+            let remapped = translate_treemap(remapper, &bitmap).await?;
             let kept = match filter {
                 Some(filter) => RoaringTreemap::from_iter(
                     remapped
@@ -971,10 +971,10 @@ impl NGramIndexSpillState {
                 bitmaps.push(kept);
             }
         }
-        Self {
+        Ok(Self {
             tokens: tokens.finish(),
             bitmaps,
-        }
+        })
     }
 
     fn retain_rows(self, filter: &super::OldIndexDataFilter) -> Self {
@@ -1695,16 +1695,21 @@ impl NGramIndexBuilder {
 
     async fn open_segment_stream(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         filter: Option<super::OldIndexDataFilter>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>>> {
         let reader = store.open_index_file(POSTINGS_FILENAME).await?;
-        let stream =
-            Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.map(move |res| {
-                res.map(|state| {
-                    state.remap_and_filter_rows(frag_reuse_index.as_deref(), filter.as_ref())
-                })
-            });
+        let stream = Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.and_then(
+            move |state| {
+                let remapper = remapper.clone();
+                let filter = filter.clone();
+                async move {
+                    state
+                        .remap_and_filter_rows(remapper.as_ref(), filter.as_ref())
+                        .await
+                }
+            },
+        );
         Ok(Box::pin(stream))
     }
 
@@ -1715,7 +1720,7 @@ impl NGramIndexBuilder {
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         if old_data_filters.len() != segment_stores.len() {
@@ -1740,7 +1745,7 @@ impl NGramIndexBuilder {
         if segment_stores.len() == 1 {
             let seg_stream = Self::open_segment_stream(
                 segment_stores[0].clone(),
-                frag_reuse_index,
+                remapper,
                 old_data_filters[0].clone(),
             )
             .await?;
@@ -1765,7 +1770,7 @@ impl NGramIndexBuilder {
             let out = next_spill + offset;
             spills.push(out);
             let spill_store = self.spill_store.clone();
-            let fri = frag_reuse_index.clone();
+            let fri = remapper.clone();
             let s0 = stores[0].clone();
             let f0 = filters[0].clone();
             let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
@@ -2528,25 +2533,38 @@ mod tests {
     }
 
     /// Postings are translated per posting in slices of at most 64K
-    /// addresses: two trigrams with 40K rows each reach a batch translator as
+    /// addresses: two trigrams with 40K rows each reach a remapper as
     /// calls of at most 40K addresses, never as one 64K call over the spill
     /// batch's concatenated postings (which is what materializing every
     /// address of the batch first would produce), and every row comes out
     /// translated.
     #[test_log::test(tokio::test)]
     async fn test_ngram_index_remap_translates_postings_in_bounded_slices() {
-        use lance_index_core::remapping::BatchRowIdRemapper;
+        use lance_select::Remapper;
+        use lance_select::remapper::{RemapperBacking, TranslateFuture};
+        use roaring::RoaringBitmap;
         use std::sync::Mutex;
 
         #[derive(Debug)]
         struct Recording {
             calls: Mutex<Vec<usize>>,
         }
-        #[async_trait::async_trait]
-        impl BatchRowIdRemapper for Recording {
-            async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
-                self.calls.lock().unwrap().push(row_ids.len());
-                Ok(row_ids.iter().map(|id| Some(id + 1_000_000)).collect())
+        impl RemapperBacking for Recording {
+            fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+                true
+            }
+            fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+                fragments.clone()
+            }
+            fn translate_in_place<'a>(
+                &'a self,
+                addrs: &'a mut [Option<u64>],
+            ) -> TranslateFuture<'a> {
+                self.calls.lock().unwrap().push(addrs.len());
+                for slot in addrs.iter_mut() {
+                    *slot = slot.map(|id| id + 1_000_000);
+                }
+                Box::pin(std::future::ready(Ok(())))
             }
         }
 
@@ -2577,7 +2595,7 @@ mod tests {
         });
         index
             .remap_streaming(
-                &RowAddrTranslator::Batch(recording.clone()),
+                &RowAddrTranslator::Remapper(Remapper::from_backing(recording.clone())),
                 test_store.as_ref(),
             )
             .await
@@ -2726,7 +2744,10 @@ mod tests {
         valid.insert_fragment(0);
         valid.insert(addr(1, 0));
 
-        let filtered = state.remap_and_filter_rows(None, Some(&OldIndexDataFilter::RowIds(valid)));
+        let filtered = futures::executor::block_on(
+            state.remap_and_filter_rows(None, Some(&OldIndexDataFilter::RowIds(valid))),
+        )
+        .unwrap();
 
         // Token 20 lived only in retired fragment 2, so it is dropped entirely.
         assert_eq!(filtered.tokens.values().to_vec(), vec![10u32, 30]);
@@ -2747,10 +2768,8 @@ mod tests {
     fn test_remap_then_keep_relocates_and_filters() {
         use arrow_array::UInt32Array;
         use roaring::{RoaringBitmap, RoaringTreemap};
-        use uuid::Uuid;
 
         use super::NGramIndexSpillState;
-        use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
         use crate::scalar::OldIndexDataFilter;
 
         let addr = |frag: u32, local: u32| ((frag as u64) << 32) | local as u64;
@@ -2768,14 +2787,10 @@ mod tests {
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
         // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
         // map, so remap passes it through unchanged.
-        let fri = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
-            Uuid::new_v4(),
-            vec![HashMap::from([
-                (addr(0, 0), Some(addr(2, 0))),
-                (addr(0, 1), None),
-            ])],
-            FragReuseIndexDetails { versions: vec![] },
-        )));
+        let (remapper, _) = lance_select::remapper::ScriptedRemapper::new()
+            .moved(addr(0, 0), addr(2, 0))
+            .deleted(addr(0, 1))
+            .into_remapper();
 
         // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
         let filter = OldIndexDataFilter::Fragments {
@@ -2783,7 +2798,10 @@ mod tests {
             to_remove: RoaringBitmap::from_iter([1u32]),
         };
 
-        let filtered = state.remap_and_filter_rows(Some(&fri), Some(&filter));
+        let filtered = futures::executor::block_on(
+            state.remap_and_filter_rows(Some(&remapper), Some(&filter)),
+        )
+        .unwrap();
 
         // Only the relocated, still-live row survives: (0,0) -> (2,0). (0,1) was
         // dropped by remap; (1,0) was dropped by the retired-fragment filter.

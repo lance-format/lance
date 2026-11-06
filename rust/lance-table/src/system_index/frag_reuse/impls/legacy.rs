@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use bytes::{Bytes, BytesMut};
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use lance_select::Remapper;
 use lance_select::remapper::{RemapperBacking, TranslateFuture};
@@ -27,12 +28,15 @@ use crate::system_index::frag_reuse::history::{
 };
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport,
+    Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary, TranslationPlan,
+    TranslationSupport,
 };
 use crate::system_index::frag_reuse::{
     CompactFragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
 };
 use crate::system_index::is_system_index;
+
+mod compose;
 
 /// The records, and the translation built from them the first time a plan
 /// of this history is bound.
@@ -116,6 +120,17 @@ pub fn repair_versions(mut versions: Vec<pb::Version>) -> Result<(FragReuseHisto
     Ok((from_versions(kept)?, dropped))
 }
 
+/// The warning logged whenever invalid recorded versions are dropped (by a
+/// trim, or by the conflict resolver repairing the versions it rebases onto).
+pub fn warn_dropped_versions(dropped: &[u64]) {
+    if !dropped.is_empty() {
+        log::warn!(
+            "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
+             scanned until their indices are rebuilt"
+        );
+    }
+}
+
 /// Every fragment the reuse chain touches (old + new) across all versions. An
 /// index disjoint from this set holds no row address the FRI remaps, so trimming
 /// can never strand it (fragment ids are never reused).
@@ -162,9 +177,20 @@ pub fn is_index_remap_caught_up(
     )
 }
 
+/// Warn, as the v0 trim always has, about a segment whose caught-up state
+/// with the version stamped `version_stamp` cannot be determined.
+pub(super) fn warn_missing_bitmap(segment: &SegmentSummary, version_stamp: u64) {
+    if segment.fragment_bitmap.is_none() && segment.dataset_version > version_stamp {
+        log::warn!(
+            "Index segment {} missing fragment bitmap, cannot determine if it is caught up with the fragment reuse version, consider retraining the index",
+            segment.uuid
+        );
+    }
+}
+
 /// The legacy caught-up rule for one compaction version stamped
 /// `version_stamp`, whose groups consume `group_sources`.
-fn is_caught_up_with_version(
+pub(super) fn is_caught_up_with_version(
     version_stamp: u64,
     group_sources: impl IntoIterator<Item = Vec<u64>>,
     fragment_bitmap: Option<&RoaringBitmap>,
@@ -210,6 +236,63 @@ fn is_caught_up_with_version(
         }
     }
     Ok(true)
+}
+
+/// Where the live segments stand with one compaction version under the
+/// version 0 cleanup rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VersionNeed {
+    /// Every segment is caught up with the version.
+    CaughtUp,
+    /// Some segment still translates through the version.
+    Needed,
+    /// Some segment covers part of one of its rewrite groups, which only a
+    /// corrupted version records. Outranks [`Self::Needed`].
+    Corrupt,
+}
+
+/// Every fragment `versions` touch, sources and destinations: the chain
+/// [`is_caught_up_with_version`]'s disjointness rule is scoped to.
+pub(super) fn version_chain<'a>(
+    versions: impl IntoIterator<Item = &'a pb::Version>,
+) -> RoaringBitmap {
+    let mut chain = RoaringBitmap::new();
+    for version in versions {
+        for group in &version.groups {
+            chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
+            chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
+        }
+    }
+    chain
+}
+
+/// How the segments of `live` stand with `version`, warning about every
+/// segment whose state cannot be determined, as the v0 cleanup always has.
+pub(super) fn version_need(
+    version: &pb::Version,
+    live: &[Vec<SegmentSummary>],
+    chain: &RoaringBitmap,
+) -> VersionNeed {
+    let mut need = VersionNeed::CaughtUp;
+    for segment in live.iter().flatten() {
+        warn_missing_bitmap(segment, version.dataset_version);
+        match is_caught_up_with_version(
+            version.dataset_version,
+            version
+                .groups
+                .iter()
+                .map(|group| group.old_fragments.iter().map(|digest| digest.id).collect()),
+            segment.fragment_bitmap.as_ref(),
+            segment.dataset_version,
+            chain,
+        ) {
+            Ok(true) => {}
+            Ok(false) if need == VersionNeed::CaughtUp => need = VersionNeed::Needed,
+            Ok(false) => {}
+            Err(_) => need = VersionNeed::Corrupt,
+        }
+    }
+    need
 }
 
 impl LegacyHistory {
@@ -335,13 +418,7 @@ impl FriImpl for LegacyHistory {
     /// applies; a version the segment covers part of a group of is never
     /// caught up with.
     fn is_caught_up(&self, _entry_version: u64, segment: &SegmentSummary) -> bool {
-        let mut chain = RoaringBitmap::new();
-        for version in self.versions() {
-            for group in &version.groups {
-                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
-                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
-            }
-        }
+        let chain = version_chain(self.versions());
         self.versions().all(|version| {
             matches!(
                 is_caught_up_with_version(
@@ -372,6 +449,43 @@ impl FriImpl for LegacyHistory {
             .iter()
             .map(|segment| self.plan_segment(self.clone(), context, segment))
             .collect()
+    }
+
+    /// The version 0 cleanup: a version is kept while some segment is not
+    /// caught up with it, and dropped when some segment covers part of one
+    /// of its groups (only a corrupted version records that). The kept
+    /// versions are repaired as a committed history is.
+    ///
+    /// When a version goes, only the kept compaction versions are written,
+    /// so a record this build cannot interpret is dropped: the released
+    /// cleanup decoded the versions with prost and re-encoded them. This is
+    /// cleanup, not a caller-proposed rewrite, so the rule that a proposal
+    /// carries such records byte for byte does not apply.
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
+        let versions: Vec<&pb::Version> = self.versions().collect();
+        let chain = version_chain(versions.iter().copied());
+        let retained: Vec<pb::Version> = versions
+            .iter()
+            .filter(|version| version_need(version, live, &chain) == VersionNeed::Needed)
+            .map(|&version| version.clone())
+            .collect();
+        if retained.len() == versions.len() {
+            return Ok(self);
+        }
+        let (trimmed, dropped) = repair_versions(retained)?;
+        warn_dropped_versions(&dropped);
+        Ok(trimmed.imp().clone())
+    }
+
+    /// The version 0 remap: see [`compose::compose`]. Records this build
+    /// cannot interpret are ignored, as released readers ignored them.
+    fn compose(
+        self: Arc<Self>,
+        _context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        let index = self.translation().compact_index()?;
+        compose::compose(self, &index, segment)
     }
 
     /// Every plan binds to the same translation, the frozen version 0 one:
@@ -447,6 +561,10 @@ impl RemapperBacking for LegacyRemapper {
             .compact_index()
             .map(|index| index.remap_row_ids_in_place(addrs));
         Box::pin(std::future::ready(result))
+    }
+
+    fn row_addr_remap(&self) -> Option<&RowAddrRemap> {
+        self.index.as_ref().ok().map(|index| index.row_addr_remap())
     }
 }
 

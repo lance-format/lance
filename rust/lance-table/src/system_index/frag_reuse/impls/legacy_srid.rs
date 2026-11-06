@@ -17,11 +17,16 @@ use lance_core::{Error, Result};
 use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
+use super::legacy::{
+    VersionNeed, repair_versions, version_chain, version_need, warn_dropped_versions,
+};
 use super::{FriImpl, Records};
-use crate::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
+use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::system_index::frag_reuse::history::{HistoryFormat, Record, RewriteRecord};
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
+    Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary, TranslationPlan,
+    TranslationSupport,
 };
 
 #[derive(Debug)]
@@ -85,6 +90,39 @@ impl FriImpl for LegacySridHistory {
         self.0.is_caught_up(entry_version, segment)
     }
 
+    /// Only the oldest versions are removed, up to the first one a segment
+    /// is not caught up with, and every later version is kept as it is: an
+    /// address a kept version maps still translates through every later
+    /// recorded move. As in the address cleanup, a trim that removes a
+    /// version writes only the kept compaction versions, dropping records
+    /// this build cannot interpret.
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>> {
+        let versions: Vec<pb::Version> = self
+            .0
+            .records()
+            .stored
+            .iter()
+            .filter_map(|stored| match &stored.record {
+                Record::LegacyVersion(version) => Some(version.clone()),
+                _ => None,
+            })
+            .collect();
+        let chain = version_chain(&versions);
+        // Unlike the address cleanup, a corrupt version is not dropped: no
+        // segment's state with it can be proven, so it ends the removable
+        // prefix like a needed one.
+        let trimmed = versions
+            .iter()
+            .position(|version| version_need(version, live, &chain) != VersionNeed::CaughtUp)
+            .unwrap_or(versions.len());
+        if trimmed == 0 {
+            return Ok(self);
+        }
+        let (kept, dropped) = repair_versions(versions[trimmed..].to_vec())?;
+        warn_dropped_versions(&dropped);
+        kept.imp().clone().on_stable_row_ids()
+    }
+
     fn needs_translation_support(&self, _context: &ReadContext, _segment: &SegmentSummary) -> bool {
         true
     }
@@ -105,6 +143,14 @@ impl FriImpl for LegacySridHistory {
                 }
             })
             .collect()
+    }
+
+    fn compose(
+        self: Arc<Self>,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        self.0.clone().compose(context, segment)
     }
 
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {

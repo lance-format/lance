@@ -25,7 +25,9 @@ use roaring::RoaringBitmap;
 use super::history::{HistoryFormat, Record, RewriteRecord, split_records};
 use super::ledger::FragReuseLedger;
 use super::mapping::MappingSource;
-use super::plan::{ReadContext, ReadPlan, SegmentSummary, TranslationPlan};
+use super::plan::{
+    Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary, TranslationPlan,
+};
 
 /// One FRI format's rules over its records.
 pub trait FriImpl: Send + Sync + Debug {
@@ -66,6 +68,9 @@ pub trait FriImpl: Send + Sync + Debug {
     /// released writers relied on.
     fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool;
 
+    /// See [`FragReuseHistory::trim`](super::history::FragReuseHistory::trim).
+    fn trim(self: Arc<Self>, live: &[Vec<SegmentSummary>]) -> Result<Arc<dyn FriImpl>>;
+
     /// See [`FragReuseHistory::needs_translation_support`](super::history::FragReuseHistory::needs_translation_support).
     fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool;
 
@@ -73,6 +78,13 @@ pub trait FriImpl: Send + Sync + Debug {
     /// Translation plans keep the history they were planned under, so they
     /// can be bound without it.
     fn plan(self: Arc<Self>, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan>;
+
+    /// See [`FragReuseHistory::compose`](super::history::FragReuseHistory::compose).
+    fn compose(
+        self: Arc<Self>,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition>;
 
     /// See [`TranslationPlan::bind`]. `plan` was planned by this history.
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper;

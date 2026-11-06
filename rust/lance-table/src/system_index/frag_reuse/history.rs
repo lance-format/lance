@@ -42,7 +42,8 @@ use super::ledger::{
     DetailsContent, FragReuseLedger, corrupt, is_interpretable_transition, next_field,
     verify_external_content,
 };
-use super::plan::{ReadContext, ReadPlan, SegmentSummary};
+use super::mapping::MappingRef;
+use super::plan::{Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary};
 use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
 use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details as pb;
@@ -264,8 +265,8 @@ impl FragReuseHistory {
     /// loses the translation it records: rows an index reaches only through it
     /// are scanned instead.
     ///
-    /// Used by the version 0 cleanup in `lance`, which still edits
-    /// compaction versions directly; not part of the stable interface.
+    /// Used by `lance`'s conflict resolver, which still rebases version 0
+    /// rewrites as compaction versions; not part of the stable interface.
     #[doc(hidden)]
     pub fn repair_legacy_versions(versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
         legacy::repair_versions(versions)
@@ -387,6 +388,11 @@ impl FragReuseHistory {
         }
     }
 
+    /// Whether the history holds no record at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.records().stored.is_empty()
+    }
+
     /// The FRI format these records are interpreted under, which
     /// [`Self::encode`] stamps as the entry's `index_version`.
     pub fn format(&self) -> HistoryFormat {
@@ -395,8 +401,9 @@ impl FragReuseHistory {
 
     /// The lineage view used for translation.
     ///
-    /// Used by `lance`'s reader, cleanup and remapping until address
-    /// translation moves behind this type; not part of the stable interface.
+    /// Used by `lance`'s reader (segment coverage and translation
+    /// fingerprints), its row-map source (to resolve the bases row maps
+    /// live under) and tests; not part of the stable interface.
     #[doc(hidden)]
     pub fn ledger(&self) -> &Arc<FragReuseLedger> {
         &self.0.records().ledger
@@ -404,8 +411,8 @@ impl FragReuseHistory {
 
     /// Records in serialized order.
     ///
-    /// Used by `lance`'s version 0 cleanup and commit checks; not part of
-    /// the stable interface.
+    /// Used by `lance`'s conflict resolver to read back repaired version 0
+    /// versions; not part of the stable interface.
     #[doc(hidden)]
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.0.records().stored.iter().map(|stored| &stored.record)
@@ -414,8 +421,9 @@ impl FragReuseHistory {
     /// Whether every record is one this implementation interprets. Edits
     /// that reason about the whole history require it.
     ///
-    /// Used by `lance`'s cleanup and trim to refuse early; not part of the
-    /// stable interface.
+    /// Used by `lance`'s superseded-segment pruning, which reads coverage
+    /// through the lenient reader path and so must refuse before it
+    /// derives anything; not part of the stable interface.
     #[doc(hidden)]
     pub fn is_fully_interpretable(&self) -> bool {
         self.0.records().is_fully_interpretable()
@@ -467,24 +475,96 @@ impl FragReuseHistory {
         self.0.append(&rewrite).map(Self)
     }
 
-    /// Keep only the records `keep` accepts. `keep` is called exactly once
-    /// per record, in serialized order (the order of [`Self::records`]), so
-    /// a caller may decide by position.
+    /// The history without the records no live index segment needs any
+    /// more. `live` holds the table's stored index segments, one entry per
+    /// logical index (system indices left out).
     ///
-    /// Used by `lance`'s trim (`derive_tagged_trim`) until trimming moves
-    /// here; not part of the stable interface.
-    #[doc(hidden)]
-    pub fn retain(&self, keep: &mut dyn FnMut(&Record) -> bool) -> Result<Self> {
-        self.0.records().require_fully_interpretable("trim")?;
-        let records: Vec<StoredRecord> = self
-            .0
+    /// As trim input, a segment's `translation` only says whether this
+    /// build can serve the segment: one marked
+    /// [`TranslationSupport::Uninterpretable`] still pins the records its
+    /// addresses need, but its coverage does not release anyone else's;
+    /// [`TranslationSupport::Supported`] and
+    /// [`TranslationSupport::Unsupported`] are treated alike. `domain` is
+    /// not consulted.
+    ///
+    /// A record is never dropped while a segment needs it: a version 0
+    /// history keeps every version some segment is not caught up with (the
+    /// rule its cleanup always applied), a version 0 history on a table
+    /// with stable row IDs only drops versions before the first one some
+    /// segment needs, and a tagged history keeps every transition some
+    /// logical index still translates through, with every record downstream
+    /// of a kept one. Returns the history unchanged when nothing can go and
+    /// an empty one when nothing is needed. A tagged history holding records
+    /// this writer cannot interpret is refused with `NotSupported`.
+    ///
+    /// Trimming is cleanup, not a caller's proposal, so a version 0 history
+    /// keeps the released cleanup's behaviour: when it drops a version it
+    /// writes only the compaction versions it keeps, dropping any record it
+    /// cannot interpret, and when it drops nothing it returns the history
+    /// unchanged, such records included.
+    ///
+    /// ```
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// # use lance_table::system_index::frag_reuse::plan::SegmentSummary;
+    /// # fn example(
+    /// #     history: &FragReuseHistory,
+    /// #     segments_by_index: Vec<Vec<SegmentSummary>>,
+    /// # ) -> lance_core::Result<()> {
+    /// let trimmed = history.trim(&segments_by_index)?;
+    /// if trimmed == *history {
+    ///     // Every record is still needed: there is nothing to commit.
+    /// } else if trimmed.is_empty() {
+    ///     // No segment needs the history any more: the entry can go.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`TranslationSupport::Uninterpretable`]: super::plan::TranslationSupport::Uninterpretable
+    /// [`TranslationSupport::Supported`]: super::plan::TranslationSupport::Supported
+    /// [`TranslationSupport::Unsupported`]: super::plan::TranslationSupport::Unsupported
+    pub fn trim(&self, live: &[Vec<SegmentSummary>]) -> Result<Self> {
+        self.0.clone().trim(live).map(Self)
+    }
+
+    /// The row maps the history's records reference, which must outlive
+    /// it. Refused with `NotSupported` while the history holds records this
+    /// writer cannot interpret, since they may reference files too.
+    ///
+    /// ```
+    /// # use std::collections::HashSet;
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// /// The row maps on disk that no retained record still reads.
+    /// fn unreferenced(
+    ///     history: &FragReuseHistory,
+    ///     row_maps_on_disk: &[String],
+    /// ) -> lance_core::Result<Vec<String>> {
+    ///     let referenced: HashSet<String> = history
+    ///         .referenced_files()?
+    ///         .iter()
+    ///         .map(|mapping| mapping.map_id().to_string())
+    ///         .collect();
+    ///     Ok(row_maps_on_disk
+    ///         .iter()
+    ///         .filter(|map_id| !referenced.contains(*map_id))
+    ///         .cloned()
+    ///         .collect())
+    /// }
+    /// ```
+    pub fn referenced_files(&self) -> Result<Vec<MappingRef>> {
+        self.0
             .records()
-            .stored
-            .iter()
-            .filter(|stored| keep(&stored.record))
-            .cloned()
-            .collect();
-        self.0.rebuilt(concat(&records)).map(Self)
+            .require_fully_interpretable("list the files of")?;
+        Ok(self
+            .records()
+            .filter_map(|record| match record {
+                Record::Transition(pb::Transition {
+                    mapping: Some(pb::transition::Mapping::StablePartition(partition)),
+                    ..
+                }) => Some(MappingRef::of(partition)),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Restamp every stable-partition `base_id` through `remap`, as a
@@ -567,6 +647,74 @@ impl FragReuseHistory {
                 ReadPlan::Excluded => RoaringBitmap::new(),
             })
             .collect()
+    }
+
+    /// How an index rewrite catches `segment` up with the history: the
+    /// translation its stored addresses are moved through and the bitmap
+    /// the rewritten segment publishes, or why it is left as it is.
+    ///
+    /// Whether the composed translation is ever held in memory is the
+    /// history's decision, not the caller's: the bound
+    /// [`Remapper`](lance_select::Remapper) translates batches through the
+    /// recorded hops as the rewrite asks for them, and sizes and bounds
+    /// [`Remapper::materialize`](lance_select::Remapper::materialize) for an
+    /// index that needs a complete map.
+    ///
+    /// A version 0 history decides as its released remap did: every
+    /// compaction version applies to the stored bitmap in turn, a segment
+    /// built at or before a version whose destinations it already claims is
+    /// still rewritten, a segment without a bitmap is always rewritten (and
+    /// publishes none), and one covering part of a rewrite group is refused
+    /// with `InvalidInput`. Its rewrite translates through the whole history
+    /// as one in-memory map. A tagged history plans from the segment's
+    /// provenance per transition, answers
+    /// [`Composition::LineageUnknown`] for a segment without a bitmap, and
+    /// refuses with `NotSupported` while it holds transitions this build
+    /// cannot interpret.
+    ///
+    /// ```
+    /// # use std::collections::HashMap;
+    /// # use std::sync::Arc;
+    /// # use roaring::RoaringBitmap;
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// # use lance_table::system_index::frag_reuse::mapping::MappingSource;
+    /// # use lance_table::system_index::frag_reuse::plan::{
+    /// #     Composition, RewriteContext, SegmentSummary,
+    /// # };
+    /// # async fn example(
+    /// #     history: &FragReuseHistory,
+    /// #     segment: &SegmentSummary,
+    /// #     live_fragments: &RoaringBitmap,
+    /// #     entry_bitmap: &RoaringBitmap,
+    /// #     fragment_rows: &HashMap<u32, u64>,
+    /// #     mappings: Arc<dyn MappingSource>,
+    /// #     stored_addresses: &mut [Option<u64>],
+    /// # ) -> lance_core::Result<()> {
+    /// let context = RewriteContext {
+    ///     live_fragments,
+    ///     lineage: entry_bitmap,
+    ///     fragment_rows,
+    ///     served: None,
+    /// };
+    /// if let Composition::Rewrite(plan) = history.compose(&context, segment)? {
+    ///     let published = plan.published_bitmap().cloned();
+    ///     plan.bind(mappings)
+    ///         .translate_in_place(stored_addresses)
+    ///         .await?;
+    ///     // Write the translated segment, publishing `published` as its
+    ///     // fragment bitmap.
+    /// }
+    /// // Otherwise the segment is left as it is: it is caught up, or keeps
+    /// // translating through the history when read.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn compose(
+        &self,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        self.0.clone().compose(context, segment)
     }
 
     /// The records `self` adds to `base`, refusing anything else: a rewrite

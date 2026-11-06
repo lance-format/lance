@@ -3,8 +3,8 @@
 
 use crate::scalar::RowAddrTranslatorRef;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::Remapper;
 use lance_index_core::remapping::RowAddrTranslator;
-use lance_index_core::remapping::{Remapper, remap_row_addrs_tree_map_async};
 use std::{
     any::Any,
     borrow::Cow,
@@ -2234,17 +2234,18 @@ pub(crate) async fn remap_index_map(
 }
 
 /// [`remap_row_addrs`] through a [`RowAddrTranslator`]: a synchronous map
-/// remaps directly; a batch translator translates the posting in bounded
-/// batches (`remap_row_addrs_tree_map_async`) and never resolves it into a
-/// map, so one posting list is the unit of work here.
+/// remaps directly; a remapper translates the posting's addresses as one
+/// batch and never resolves them into a map, so one posting list is the
+/// unit of work here.
 pub(crate) async fn remap_row_addrs_with(
     bitmap: &RowAddrTreeMap,
     translator: RowAddrTranslatorRef<'_>,
 ) -> Result<RowAddrTreeMap> {
     match translator {
         RowAddrTranslatorRef::Sync(mapping) => remap_row_addrs(bitmap, mapping),
-        RowAddrTranslatorRef::Batch(remapper) => {
-            remap_row_addrs_tree_map_async(remapper, bitmap).await
+        RowAddrTranslatorRef::Remapper(remapper) => {
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            remapper.translate_set(bitmap).await
         }
         #[allow(unreachable_patterns)]
         _ => Err(Error::not_supported(
@@ -3804,13 +3805,14 @@ mod tests {
         );
     }
 
-    /// A built-in index streams through a batch translator itself: it never
-    /// asks the translator for fragment sizes or a budget (the in-memory
-    /// fallback of `remap_streaming` is for indices that only implement the
-    /// legacy `remap`), and it writes what the legacy `remap` writes for the
-    /// same translation.
+    /// A built-in index streams through a remapper itself: it never asks
+    /// the remapper for fragment sizes or a budget (the in-memory fallback of
+    /// `remap_streaming` is for indices that only implement the legacy
+    /// `remap`), and it writes what the legacy `remap` writes for the same
+    /// translation.
     #[tokio::test]
     async fn test_bitmap_remap_streaming_never_enters_the_fallback() {
+        use lance_select::remapper::{RemapperBacking, TranslateFuture};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Fragment 1 rows move to fragment 3 (offset 1 deleted); fragment 2
@@ -3820,21 +3822,29 @@ mod tests {
             translations: AtomicUsize,
             sizings: AtomicUsize,
         }
-        #[async_trait]
-        impl lance_index_core::remapping::BatchRowIdRemapper for Hops {
-            async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        impl RemapperBacking for Hops {
+            fn fragment_needs_translation(&self, _fragment: u32) -> bool {
+                true
+            }
+            fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+                fragments.clone()
+            }
+            fn translate_in_place<'a>(
+                &'a self,
+                addrs: &'a mut [Option<u64>],
+            ) -> TranslateFuture<'a> {
                 self.translations.fetch_add(1, Ordering::Relaxed);
-                Ok(ids
-                    .iter()
-                    .map(|&address| {
+                for slot in addrs.iter_mut() {
+                    *slot = slot.and_then(|address| {
                         let address = RowAddress::from(address);
                         match (address.fragment_id(), address.row_offset()) {
                             (1, 1) => None,
                             (1, offset) => Some(RowAddress::new_from_parts(3, offset).into()),
                             _ => None,
                         }
-                    })
-                    .collect())
+                    });
+                }
+                Box::pin(std::future::ready(Ok(())))
             }
             fn fragment_physical_rows(&self, _: u32) -> Option<u64> {
                 self.sizings.fetch_add(1, Ordering::Relaxed);
@@ -3868,7 +3878,7 @@ mod tests {
         let (_streamed_dir, streamed_store) = test_util::index_store();
         index
             .remap_streaming(
-                &RowAddrTranslator::Batch(hops.clone()),
+                &RowAddrTranslator::Remapper(Remapper::from_backing(hops.clone())),
                 streamed_store.as_ref(),
             )
             .await

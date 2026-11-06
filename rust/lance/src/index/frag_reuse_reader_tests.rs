@@ -22,6 +22,8 @@ use geo_types::line_string;
 use geoarrow_array::{GeoArrowArray, builder::LineStringBuilder};
 #[cfg(feature = "geo")]
 use geoarrow_schema::{Dimension, LineStringType};
+use lance_core::Error;
+use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::frag_reuse::row_map::ROW_MAP_CACHE_CHUNK_BYTES;
@@ -2219,7 +2221,7 @@ async fn resolver_dispatch_v0_uses_the_compact_handle() {
     .await
     .unwrap();
     // assert_legacy_metadata asserts every segment resolves to V0 with a
-    // handle equivalent to the compact legacy index.
+    // remapper equivalent to the compact legacy index.
     assert!(assert_legacy_metadata(&dataset).await.is_some());
 }
 

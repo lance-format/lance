@@ -18,13 +18,15 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
+use lance_select::Remapper;
+use lance_select::remapper::{RemapperBacking, TranslateFuture};
 use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{
-    AnyQuery, BatchRowIdRemapper, CreatedIndex, IndexStore, RemapUnavailable, RowAddrTranslator,
-    ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
+    AnyQuery, CreatedIndex, IndexStore, RemapUnavailable, RowAddrTranslator, ScalarIndex,
+    ScalarIndexParams, SearchResult, UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -117,25 +119,19 @@ struct Hops {
     budget: u64,
 }
 
-#[async_trait]
-impl BatchRowIdRemapper for Hops {
-    async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
-        self.translations.fetch_add(1, Ordering::Relaxed);
-        Ok(ids
-            .iter()
-            .map(|&address| {
-                let fragment = RowAddress::from(address).fragment_id();
-                let offset = u64::from(RowAddress::from(address).row_offset());
-                match fragment {
-                    1 if offset == 1 => None,
-                    1 => Some(u64::from(RowAddress::new_from_parts(5, offset as u32))),
-                    3 => None,
-                    _ => Some(address),
-                }
-            })
-            .collect())
+impl Hops {
+    fn remap(address: u64) -> Option<u64> {
+        let fragment = RowAddress::from(address).fragment_id();
+        let offset = RowAddress::from(address).row_offset();
+        match fragment {
+            1 if offset == 1 => None,
+            1 => Some(u64::from(RowAddress::new_from_parts(5, offset))),
+            3 => None,
+            _ => Some(address),
+        }
     }
-    fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
+
+    fn physical_rows(&self, fragment: u32) -> Option<u64> {
         self.sizings.fetch_add(1, Ordering::Relaxed);
         match fragment {
             1 => Some(4),
@@ -143,9 +139,37 @@ impl BatchRowIdRemapper for Hops {
             _ => None,
         }
     }
+}
+
+impl RemapperBacking for Hops {
+    fn fragment_needs_translation(&self, fragment: u32) -> bool {
+        matches!(fragment, 1 | 3)
+    }
+
+    fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap {
+        fragments.clone()
+    }
+
+    fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a> {
+        self.translations.fetch_add(1, Ordering::Relaxed);
+        for slot in addrs.iter_mut() {
+            *slot = slot.and_then(Self::remap);
+        }
+        Box::pin(std::future::ready(Ok(())))
+    }
+
+    fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
+        self.physical_rows(fragment)
+    }
+
     fn materialization_budget_bytes(&self) -> u64 {
         self.budget
     }
+}
+
+/// A translator that may need reads, as `remap_streaming` receives it.
+fn over(hops: &Arc<Hops>) -> RowAddrTranslator {
+    RowAddrTranslator::Remapper(Remapper::from_backing(hops.clone()))
 }
 
 fn hops_with_budget(budget: u64) -> Arc<Hops> {
@@ -192,7 +216,7 @@ async fn legacy_only_index_gets_a_complete_materialized_map_once() {
     let (_dir, store) = temp_store();
     let index = LegacyOnlyIndex::new(Some(vec![1, 3]));
     let hops = hops_with_budget(u64::MAX);
-    let translator = RowAddrTranslator::Batch(hops.clone());
+    let translator = over(&hops);
     index
         .remap_streaming(&translator, store.as_ref())
         .await
@@ -227,10 +251,7 @@ async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven() {
     // Unknown stored fragments.
     let index = LegacyOnlyIndex::new(None);
     let hops = hops_with_budget(u64::MAX);
-    let Err(error) = index
-        .remap_streaming(&RowAddrTranslator::Batch(hops.clone()), store.as_ref())
-        .await
-    else {
+    let Err(error) = index.remap_streaming(&over(&hops), store.as_ref()).await else {
         panic!("the fallback cannot run without stored fragments");
     };
     assert_eq!(
@@ -245,10 +266,7 @@ async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven() {
     // Over budget.
     let index = LegacyOnlyIndex::new(Some(vec![1, 3]));
     let hops = hops_with_budget(16);
-    let Err(error) = index
-        .remap_streaming(&RowAddrTranslator::Batch(hops.clone()), store.as_ref())
-        .await
-    else {
+    let Err(error) = index.remap_streaming(&over(&hops), store.as_ref()).await else {
         panic!("the fallback cannot run over budget");
     };
     assert!(matches!(
