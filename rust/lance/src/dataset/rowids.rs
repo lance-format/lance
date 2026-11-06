@@ -451,7 +451,12 @@ pub(crate) async fn load_row_id_index_for_fragments(
     let needs_deletions = if with_deletions {
         vec![true; fragments.len()]
     } else {
-        overlapping_id_spans(&sequences)
+        overlapping_id_spans(
+            &sequences
+                .iter()
+                .map(|sequence| sequence.row_id_range())
+                .collect::<Vec<_>>(),
+        )
     };
 
     let mut loads = Vec::with_capacity(fragments.len());
@@ -481,17 +486,17 @@ pub(crate) async fn load_row_id_index_for_fragments(
 
 /// For each sequence, whether its span of ids (lowest to highest) intersects
 /// another sequence's span. An empty sequence overlaps nothing.
-fn overlapping_id_spans(sequences: &[Arc<RowIdSequence>]) -> Vec<bool> {
-    let mut spans: Vec<(u64, u64, usize)> = sequences
+fn overlapping_id_spans(ranges: &[Option<std::ops::RangeInclusive<u64>>]) -> Vec<bool> {
+    let mut spans: Vec<(u64, u64, usize)> = ranges
         .iter()
         .enumerate()
-        .filter_map(|(index, sequence)| {
-            let span = sequence.row_id_range()?;
+        .filter_map(|(index, range)| {
+            let span = range.as_ref()?;
             Some((*span.start(), *span.end(), index))
         })
         .collect();
     spans.sort_unstable();
-    let mut overlapping = vec![false; sequences.len()];
+    let mut overlapping = vec![false; ranges.len()];
     let mut reach: Option<(u64, usize)> = None;
     for &(start, end, index) in &spans {
         if let Some((reach_end, reach_index)) = reach
@@ -515,7 +520,7 @@ mod test {
     /// sequence; the sweep must mark exactly the spans that touch another.
     #[test]
     fn test_overlapping_id_spans() {
-        let seq = |ids: Vec<u64>| Arc::new(RowIdSequence::try_from_iter(ids).unwrap());
+        let seq = |ids: Vec<u64>| RowIdSequence::try_from_iter(ids).unwrap().row_id_range();
         let contained = vec![
             seq((0..=100).collect()),
             seq(vec![1, 2]),
