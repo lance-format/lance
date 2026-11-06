@@ -50,6 +50,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_key_routed_dir: None,
                 })
             }
             Operation::Delete {
@@ -67,6 +68,21 @@ impl<'a> TransactionRebase<'a> {
                     .map(|f| f.id)
                     .chain(deleted_fragment_ids.iter().copied())
                     .collect::<HashSet<_>>();
+                let mem_wal_key_routed_dir = match mem_wal_merge_shard(&transaction) {
+                    Some((dir_id, _)) => {
+                        let filter_field_ids = match &transaction.operation {
+                            Operation::Update {
+                                inserted_rows_filter: Some(filter),
+                                ..
+                            } => Some(filter.field_ids.as_slice()),
+                            _ => None,
+                        };
+                        mem_wal_routes_by_key(dataset, dir_id, filter_field_ids)
+                            .await?
+                            .then(|| dir_id.to_string())
+                    }
+                    None => None,
+                };
 
                 // short circuit for full fragment update or delete case
                 // set affected_rows as None with non-empty modified_fragment_ids
@@ -87,6 +103,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        mem_wal_key_routed_dir,
                     });
                 }
 
@@ -108,6 +125,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_key_routed_dir,
                 })
             }
             Operation::Rewrite {
@@ -147,6 +165,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    mem_wal_key_routed_dir: None,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -170,6 +189,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_key_routed_dir: None,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -193,6 +213,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_key_routed_dir: None,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -215,6 +236,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    mem_wal_key_routed_dir: None,
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.

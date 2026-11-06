@@ -192,6 +192,27 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
+    /// Whether this update and `other` merge different shards of a MemWAL
+    /// that routes rows by primary key, so they write and delete disjoint keys.
+    ///
+    /// The inserted-rows filters cannot show it: each is a fixed-size bloom
+    /// filter, and two of them over a few thousand keys each intersect by
+    /// chance. A delete pass carries no filter at all.
+    fn merges_other_mem_wal_shard(&self, other: &Transaction) -> bool {
+        let Some(routed_dir) = self.mem_wal_key_routed_dir.as_deref() else {
+            return false;
+        };
+        match (
+            mem_wal_merge_shard(&self.transaction),
+            mem_wal_merge_shard(other),
+        ) {
+            (Some((dir, shard)), Some((other_dir, other_shard))) => {
+                dir == routed_dir && other_dir == routed_dir && shard != other_shard
+            }
+            _ => false,
+        }
+    }
+
     fn check_update_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -211,6 +232,7 @@ impl<'a> TransactionRebase<'a> {
                 inserted_rows_filter: other_inserted_rows_filter,
                 ..
             } = &other_transaction.operation
+                && !self.merges_other_mem_wal_shard(other_transaction)
             {
                 // The presence of inserted_rows_filter means this is a primary key operation
                 // and strict conflict detection should be applied.

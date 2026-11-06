@@ -24,6 +24,7 @@ use crate::dataset::write::retry::{RetryConfig, RetryExecutor, execute_with_retr
 use crate::dataset::write::{CommitBuilder, write_fragments_internal};
 use crate::index::DatasetIndexExt;
 use crate::index::scalar_logical::load_named_scalar_segments;
+use crate::io::commit::conflict_resolver::MEM_WAL_SHARD_PROPERTY;
 use crate::{
     Dataset,
     datafusion::dataframe::{LanceTableProvider, SessionContextExt},
@@ -1466,6 +1467,30 @@ impl MergeInsertJob {
     /// Build the uncommitted merge-insert transaction, using the v2 plan when
     /// it supports the source and the legacy path otherwise.
     async fn execute_uncommitted_impl(
+        self,
+        provider: Arc<dyn TableProvider>,
+        source_mode: SourceProviderMode,
+    ) -> Result<UncommittedMergeInsert> {
+        let shard_id = self.params.mem_wal_shard_id;
+        // Boxed: the undeclared build alone is close to the large-future limit.
+        let mut uncommitted =
+            Box::pin(self.execute_uncommitted_undeclared(provider, source_mode)).await?;
+        if let Some(shard_id) = shard_id {
+            let transaction = &mut uncommitted.transaction;
+            let mut properties = transaction
+                .transaction_properties
+                .as_deref()
+                .cloned()
+                .unwrap_or_default();
+            properties.insert(MEM_WAL_SHARD_PROPERTY.to_string(), shard_id.to_string());
+            transaction.transaction_properties = Some(Arc::new(properties));
+        }
+        Ok(uncommitted)
+    }
+
+    /// [`Self::execute_uncommitted_impl`] before the MemWAL shard declaration
+    /// is attached.
+    async fn execute_uncommitted_undeclared(
         self,
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,

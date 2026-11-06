@@ -73,6 +73,7 @@ impl MergeInsertBuilder {
                 retry_timeout: Duration::from_secs(30),
                 compacted_sstables: Vec::new(),
                 mem_wal_dir_id: None,
+                mem_wal_shard_id: None,
                 skip_auto_cleanup: false,
                 use_index: true,
                 write_mode: MergeInsertWriteMode::default(),
@@ -236,6 +237,23 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Declare the MemWAL shard every row this merge writes or deletes belongs
+    /// to: the shard the table's sharding spec routes each of their primary
+    /// keys to.
+    ///
+    /// Requires [`Self::mark_sstables_as_compacted`], which names the MemWAL.
+    /// Call it on every pass of a shard's compaction, including the passes
+    /// that record no progress. Concurrent merges of different shards then
+    /// commit without retrying, when the spec routes on primary-key columns
+    /// only: they touch disjoint keys, which their inserted-rows filters
+    /// cannot show once they hold more than a few thousand keys. The
+    /// declaration is not checked against the rows; a wrong one lets
+    /// conflicting inserts of one key commit.
+    pub fn mem_wal_shard(&mut self, shard_id: uuid::Uuid) -> &mut Self {
+        self.params.mem_wal_shard_id = Some(shard_id);
+        self
+    }
+
     /// Set the number of inner commit retries for manifest version conflicts.
     /// Different from `conflict_retries` which handles semantic conflicts.
     /// Default: 20
@@ -375,6 +393,11 @@ impl MergeInsertBuilder {
         {
             return Err(Error::invalid_input(
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
+            ));
+        }
+        if self.params.mem_wal_shard_id.is_some() && self.params.mem_wal_dir_id.is_none() {
+            return Err(Error::invalid_input(
+                "mem_wal_shard requires mark_sstables_as_compacted, which names the MemWAL",
             ));
         }
         validate_merge_insert_write_params(&self.write_params)?;

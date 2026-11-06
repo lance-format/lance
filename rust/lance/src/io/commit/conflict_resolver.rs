@@ -82,6 +82,101 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// For an `Update` that merges one MemWAL shard ([`mem_wal_merge_shard`]):
+    /// the `dir_id` of that MemWAL when, at the read version, it routes every
+    /// row by primary-key columns alone ([`mem_wal_routes_by_key`]). Two such
+    /// updates of different shards of this MemWAL then touch disjoint keys,
+    /// whatever their inserted-rows filters say.
+    mem_wal_key_routed_dir: Option<String>,
+}
+
+/// Transaction property naming the MemWAL shard every row of a merge belongs
+/// to, set by [`MergeInsertBuilder::mem_wal_shard`].
+///
+/// [`MergeInsertBuilder::mem_wal_shard`]: crate::dataset::MergeInsertBuilder::mem_wal_shard
+pub(crate) const MEM_WAL_SHARD_PROPERTY: &str = "lance.mem_wal.shard_id";
+
+/// The MemWAL (`dir_id`) and shard an `Update` merges, when it merges exactly
+/// one shard.
+///
+/// The shard comes from the [`MEM_WAL_SHARD_PROPERTY`] the merge declared, or
+/// else from its `compacted_sstables` when they name a single shard. Every pass
+/// of a multi-pass merge carries the declaration, while only the last one
+/// carries `compacted_sstables`. An update naming several shards, two
+/// different shards, or an unreadable shard id has none.
+fn mem_wal_merge_shard(transaction: &Transaction) -> Option<(&str, uuid::Uuid)> {
+    let Operation::Update {
+        compacted_sstables,
+        mem_wal_dir_id: Some(dir_id),
+        ..
+    } = &transaction.operation
+    else {
+        return None;
+    };
+    let declared = match transaction
+        .transaction_properties
+        .as_ref()
+        .and_then(|properties| properties.get(MEM_WAL_SHARD_PROPERTY))
+    {
+        Some(shard) => Some(uuid::Uuid::parse_str(shard).ok()?),
+        None => None,
+    };
+    let marked = match compacted_sstables.as_slice() {
+        [] => None,
+        [sstable] => Some(sstable.shard_id),
+        _ => return None,
+    };
+    let shard = match (declared, marked) {
+        (Some(declared), Some(marked)) if declared != marked => return None,
+        (declared, marked) => declared.or(marked)?,
+    };
+    Some((dir_id.as_str(), shard))
+}
+
+/// Whether the MemWAL `dir_id` of `dataset` sends every row to the shard its
+/// primary key alone decides, so one key lives in exactly one shard.
+///
+/// That holds when the MemWAL index is that incarnation (`dir_id`), has a
+/// single sharding spec, and every field of the spec is computed from
+/// primary-key columns only; a deterministic function of the key then routes
+/// equal keys to the same shard. `filter_field_ids`, the columns an
+/// inserted-rows filter was built on, must be that primary key. Without a
+/// spec (shards managed by hand) nothing ties a key to a shard; an unsharded
+/// spec reads no column at all; two specs could route one key two ways.
+async fn mem_wal_routes_by_key(
+    dataset: &Dataset,
+    dir_id: &str,
+    filter_field_ids: Option<&[i32]>,
+) -> Result<bool> {
+    let key_field_ids: HashSet<i32> = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.id)
+        .collect();
+    if key_field_ids.is_empty() {
+        return Ok(false);
+    }
+    if let Some(field_ids) = filter_field_ids
+        && (field_ids.len() != key_field_ids.len()
+            || !field_ids.iter().all(|id| key_field_ids.contains(id)))
+    {
+        return Ok(false);
+    }
+    let indices = dataset.load_indices().await?;
+    let Some(index) = indices.iter().find(|idx| idx.name == MEM_WAL_INDEX_NAME) else {
+        return Ok(false);
+    };
+    let details = load_mem_wal_index_details(index.clone())?;
+    let [spec] = details.sharding_specs.as_slice() else {
+        return Ok(false);
+    };
+    Ok(details.dir_id == dir_id
+        && !spec.fields.is_empty()
+        && spec.fields.iter().all(|field| {
+            !field.source_ids.is_empty()
+                && field.source_ids.iter().all(|id| key_field_ids.contains(id))
+        }))
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -477,3 +572,562 @@ fn sorted_ids(ids: impl Iterator<Item = u64>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests;
+
+/// Concurrent MemWAL compaction merges of different shards, in the shape
+/// LanceDB Enterprise commits them: a composite primary key
+/// `(row_index, shard_key)`, a bucket spec on `shard_key`, and each shard's
+/// merge split into a delete pass, upsert passes that record no progress, and
+/// a last upsert pass that marks the shard's SSTables compacted.
+#[cfg(test)]
+mod mem_wal_shard_merge_tests {
+    use std::collections::HashMap;
+    use std::ops::Range;
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::SendableRecordBatchStream;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_index::mem_wal::CompactedSsTable;
+    use uuid::Uuid;
+
+    use crate::Dataset;
+    use crate::dataset::mem_wal::{DatasetMemWalExt, evaluate_sharding_spec};
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::write::merge_insert::{
+        MergeInsertBuilder, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
+    };
+    use crate::dataset::write::{CommitBuilder, InsertBuilder};
+    use lance_select::RowAddrTreeMap;
+
+    /// Above the ~2-3k keys where two disjoint 8,192-key filters stop telling
+    /// themselves apart, so a conflict between upserts comes from the filter.
+    const KEYS_PER_PASS: i64 = 6_000;
+    /// Rows already in the base table for each shard, which delete passes remove.
+    const SEEDED_PER_SHARD: i64 = 100;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Sharding {
+        /// What Enterprise installs: `bucket(shard_key)`, a primary-key column.
+        KeyBucket,
+        /// A bucket spec on `grp`, which is not part of the primary key.
+        NonKeyBucket,
+        Unsharded,
+        /// No spec: shards are managed by hand.
+        Manual,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Pass {
+        /// Key-only `when_matched_delete` pass; inserts nothing.
+        Delete,
+        /// Upsert pass that records no progress (not the shard's last commit).
+        Upsert,
+        /// The shard's last upsert pass, which marks its SSTables compacted.
+        UpsertMarking,
+    }
+
+    fn primary_key(position: &str) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "lance-schema:unenforced-primary-key:position".to_string(),
+                position.to_string(),
+            ),
+        ])
+    }
+
+    /// The declared primary key in key order, which a merge must be keyed on
+    /// to carry an inserted-rows filter. Enterprise's tables write position 0
+    /// on `row_index` (read as an unpositioned, legacy key column) and 1 on
+    /// `shard_key`, so the key reads `(shard_key, row_index)`.
+    fn merge_on() -> Vec<String> {
+        vec!["shard_key".to_string(), "row_index".to_string()]
+    }
+
+    fn key_fields() -> Vec<Field> {
+        vec![
+            Field::new("row_index", DataType::Int64, false).with_metadata(primary_key("0")),
+            Field::new("shard_key", DataType::Int64, false).with_metadata(primary_key("1")),
+        ]
+    }
+
+    fn schema() -> Arc<Schema> {
+        let mut fields = key_fields();
+        fields.push(Field::new("grp", DataType::Int64, true));
+        fields.push(Field::new("text", DataType::Utf8, true));
+        Arc::new(Schema::new(fields))
+    }
+
+    fn rows(rows: Range<i64>, shard_key: i64) -> RecordBatch {
+        let n = (rows.end - rows.start) as usize;
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.clone())),
+                Arc::new(Int64Array::from(vec![shard_key; n])),
+                Arc::new(Int64Array::from(vec![shard_key; n])),
+                Arc::new(StringArray::from_iter_values(
+                    rows.map(|i| format!("document {i}")),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn keys(rows: Range<i64>, shard_key: i64) -> RecordBatch {
+        let n = (rows.end - rows.start) as usize;
+        RecordBatch::try_new(
+            Arc::new(Schema::new(key_fields())),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows)),
+                Arc::new(Int64Array::from(vec![shard_key; n])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The two shards of a test table: shard id, the `shard_key` its rows
+    /// carry, and the rows seeded for it.
+    #[derive(Clone, Copy)]
+    struct Shard {
+        id: Uuid,
+        shard_key: i64,
+        seeded: (i64, i64),
+    }
+
+    struct Table {
+        dataset: Arc<Dataset>,
+        dir_id: String,
+        a: Shard,
+        b: Shard,
+    }
+
+    /// Two `shard_key` values that the spec routes to different buckets, as
+    /// Enterprise's writers pick them.
+    async fn shard_keys(dataset: &Dataset) -> (i64, i64) {
+        let details = dataset.mem_wal_index_details().await.unwrap().unwrap();
+        let spec = &details.sharding_specs[0];
+        let candidates = rows(0..64, 0);
+        let candidates = RecordBatch::try_new(
+            candidates.schema(),
+            vec![
+                candidates.column(0).clone(),
+                Arc::new(Int64Array::from_iter_values(0..64)),
+                candidates.column(2).clone(),
+                candidates.column(3).clone(),
+            ],
+        )
+        .unwrap();
+        let buckets = evaluate_sharding_spec(&candidates, spec, dataset.schema()).unwrap();
+        let buckets = buckets
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let other = (1..buckets.len())
+            .find(|&i| buckets.value(i) != buckets.value(0))
+            .unwrap();
+        (0, other as i64)
+    }
+
+    async fn table(sharding: Sharding) -> Table {
+        let mut dataset = InsertBuilder::new(&format!("memory://shard_merge_{}", Uuid::new_v4()))
+            .execute(vec![
+                rows(0..SEEDED_PER_SHARD, 0),
+                rows(SEEDED_PER_SHARD..2 * SEEDED_PER_SHARD, 1),
+            ])
+            .await
+            .unwrap();
+        let builder = dataset.initialize_mem_wal();
+        match sharding {
+            Sharding::KeyBucket => builder.bucket_sharding("shard_key", 4),
+            Sharding::NonKeyBucket => builder.bucket_sharding("grp", 4),
+            Sharding::Unsharded => builder.unsharded(),
+            Sharding::Manual => builder,
+        }
+        .execute()
+        .await
+        .unwrap();
+        let (key_a, key_b) = if matches!(sharding, Sharding::KeyBucket) {
+            shard_keys(&dataset).await
+        } else {
+            (0, 1)
+        };
+        // Re-seed so each shard's rows carry its routed `shard_key`.
+        let pk = merge_on();
+        let mut reseed = MergeInsertBuilder::try_new(Arc::new(dataset), pk.clone()).unwrap();
+        reseed
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll);
+        let (dataset, _) = reseed
+            .try_build()
+            .unwrap()
+            .execute_reader(arrow_array::RecordBatchIterator::new(
+                vec![
+                    Ok(rows(2 * SEEDED_PER_SHARD..3 * SEEDED_PER_SHARD, key_a)),
+                    Ok(rows(3 * SEEDED_PER_SHARD..4 * SEEDED_PER_SHARD, key_b)),
+                ],
+                schema(),
+            ))
+            .await
+            .unwrap();
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        Table {
+            dataset,
+            dir_id,
+            a: Shard {
+                id: Uuid::new_v4(),
+                shard_key: key_a,
+                seeded: (2 * SEEDED_PER_SHARD, 3 * SEEDED_PER_SHARD),
+            },
+            b: Shard {
+                id: Uuid::new_v4(),
+                shard_key: key_b,
+                seeded: (3 * SEEDED_PER_SHARD, 4 * SEEDED_PER_SHARD),
+            },
+        }
+    }
+
+    /// How a pass names its shard.
+    #[derive(Clone, Copy)]
+    struct Declares {
+        /// Calls `mem_wal_shard`, as every Enterprise pass does.
+        shard: Option<Uuid>,
+        /// The shard a marking pass records progress for.
+        marks: Uuid,
+    }
+
+    impl Declares {
+        fn shard(shard: &Shard) -> Self {
+            Self {
+                shard: Some(shard.id),
+                marks: shard.id,
+            }
+        }
+    }
+
+    /// One uncommitted pass of `shard`'s merge, read from `dataset`.
+    async fn pass(
+        dataset: &Arc<Dataset>,
+        dir_id: &str,
+        shard: &Shard,
+        declares: Declares,
+        kind: Pass,
+        rows_from: i64,
+    ) -> (Transaction, Option<RowAddrTreeMap>) {
+        let data = match kind {
+            Pass::Delete => keys(shard.seeded.0..shard.seeded.1, shard.shard_key),
+            Pass::Upsert | Pass::UpsertMarking => {
+                rows(rows_from..rows_from + KEYS_PER_PASS, shard.shard_key)
+            }
+        };
+        let stream =
+            RecordBatchStreamAdapter::new(data.schema(), futures::stream::iter(vec![Ok(data)]));
+        let mut builder = MergeInsertBuilder::try_new(dataset.clone(), merge_on()).unwrap();
+        if kind == Pass::Delete {
+            builder
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing);
+        } else {
+            builder
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll);
+        }
+        let marks = if kind == Pass::UpsertMarking {
+            vec![CompactedSsTable::new(declares.marks, 1)]
+        } else {
+            Vec::new()
+        };
+        builder.mark_sstables_as_compacted(dir_id, marks);
+        if let Some(shard) = declares.shard {
+            builder.mem_wal_shard(shard);
+        }
+        let UncommittedMergeInsert {
+            transaction,
+            affected_rows,
+            ..
+        } = builder
+            .try_build()
+            .unwrap()
+            .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
+            .await
+            .unwrap();
+        if kind != Pass::Delete {
+            assert!(
+                matches!(
+                    &transaction.operation,
+                    Operation::Update {
+                        inserted_rows_filter: Some(_),
+                        ..
+                    }
+                ),
+                "an upsert on the primary key carries an inserted-rows filter"
+            );
+        }
+        (transaction, affected_rows)
+    }
+
+    async fn commit(
+        dataset: &Arc<Dataset>,
+        (transaction, affected_rows): (Transaction, Option<RowAddrTreeMap>),
+    ) -> crate::Result<Dataset> {
+        let mut builder = CommitBuilder::new(dataset.clone());
+        if let Some(affected_rows) = affected_rows {
+            builder = builder.with_affected_rows(affected_rows);
+        }
+        builder.execute(transaction).await
+    }
+
+    /// Passes of the two shards read from the same version; `b` commits over
+    /// `a`. Returns `b`'s commit.
+    async fn race(
+        table: &Table,
+        (a, a_declares, a_kind): (Shard, Declares, Pass),
+        (b, b_declares, b_kind): (Shard, Declares, Pass),
+    ) -> crate::Result<Dataset> {
+        let first = pass(
+            &table.dataset,
+            &table.dir_id,
+            &a,
+            a_declares,
+            a_kind,
+            1_000_000,
+        )
+        .await;
+        let second = pass(
+            &table.dataset,
+            &table.dir_id,
+            &b,
+            b_declares,
+            b_kind,
+            2_000_000,
+        )
+        .await;
+        commit(&table.dataset, first).await.unwrap();
+        commit(&table.dataset, second).await
+    }
+
+    #[tokio::test]
+    async fn test_passes_of_different_shards_commit_over_each_other() {
+        use Pass::*;
+        for (a_kind, b_kind) in [
+            (Upsert, Upsert),
+            (Upsert, UpsertMarking),
+            (UpsertMarking, Upsert),
+            (UpsertMarking, UpsertMarking),
+            (Delete, Upsert),
+            (Upsert, Delete),
+            (Delete, UpsertMarking),
+            (Delete, Delete),
+        ] {
+            let table = table(Sharding::KeyBucket).await;
+            let (a, b) = (table.a, table.b);
+            let committed = race(
+                &table,
+                (a, Declares::shard(&a), a_kind),
+                (b, Declares::shard(&b), b_kind),
+            )
+            .await;
+            assert!(
+                committed.is_ok(),
+                "{a_kind:?} of one shard then {b_kind:?} of another: {committed:?}"
+            );
+        }
+    }
+
+    /// Both shards run their whole merge -- delete, an upsert that records no
+    /// progress, the marking upsert -- each pass racing the other shard's.
+    #[tokio::test]
+    async fn test_multi_pass_merges_of_different_shards_interleave() {
+        let table = table(Sharding::KeyBucket).await;
+        let (a, b) = (table.a, table.b);
+        let mut dataset = table.dataset.clone();
+        let before = dataset.count_rows(None).await.unwrap() as i64;
+        for (step, kind) in [Pass::Delete, Pass::Upsert, Pass::UpsertMarking]
+            .into_iter()
+            .enumerate()
+        {
+            let rows_from = 1_000_000 * (step as i64 + 1);
+            let first = pass(
+                &dataset,
+                &table.dir_id,
+                &a,
+                Declares::shard(&a),
+                kind,
+                rows_from,
+            )
+            .await;
+            let second = pass(
+                &dataset,
+                &table.dir_id,
+                &b,
+                Declares::shard(&b),
+                kind,
+                rows_from + KEYS_PER_PASS,
+            )
+            .await;
+            commit(&dataset, first).await.unwrap();
+            dataset = Arc::new(
+                commit(&dataset, second)
+                    .await
+                    .unwrap_or_else(|e| panic!("{kind:?} pass of the second shard: {e:?}")),
+            );
+        }
+        assert_eq!(
+            dataset.count_rows(None).await.unwrap() as i64,
+            before - 2 * SEEDED_PER_SHARD + 4 * KEYS_PER_PASS
+        );
+        let mut compacted = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .compacted_sstables
+            .into_iter()
+            .map(|sstable| sstable.shard_id)
+            .collect::<Vec<_>>();
+        compacted.sort();
+        let mut expected = vec![a.id, b.id];
+        expected.sort();
+        assert_eq!(compacted, expected);
+    }
+
+    fn assert_conflict(result: crate::Result<Dataset>, case: &str) {
+        let err = result.expect_err(case);
+        assert!(
+            matches!(err, crate::Error::RetryableCommitConflict { .. }),
+            "{case}: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_passes_of_the_same_shard_still_conflict() {
+        for kind in [Pass::Upsert, Pass::UpsertMarking] {
+            let table = table(Sharding::KeyBucket).await;
+            let a = table.a;
+            assert_conflict(
+                race(
+                    &table,
+                    (a, Declares::shard(&a), Pass::Upsert),
+                    (a, Declares::shard(&a), kind),
+                )
+                .await,
+                "same shard: the filter test applies",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shards_that_do_not_route_by_key_still_conflict() {
+        for sharding in [
+            Sharding::NonKeyBucket,
+            Sharding::Unsharded,
+            Sharding::Manual,
+        ] {
+            let table = table(sharding).await;
+            let (a, b) = (table.a, table.b);
+            assert_conflict(
+                race(
+                    &table,
+                    (a, Declares::shard(&a), Pass::Upsert),
+                    (b, Declares::shard(&b), Pass::Upsert),
+                )
+                .await,
+                &format!("{sharding:?}: nothing ties a key to one shard"),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_passes_without_a_single_shard_still_conflict() {
+        // An undeclared pass that records no progress names no shard.
+        fn undeclared(shard: &Shard) -> Declares {
+            Declares {
+                shard: None,
+                marks: shard.id,
+            }
+        }
+        // A pass that declares one shard and marks another names none.
+        fn contradictory(shard: &Shard) -> Declares {
+            Declares {
+                shard: Some(shard.id),
+                marks: Uuid::new_v4(),
+            }
+        }
+        type Case = (&'static str, fn(&Table) -> [(Shard, Declares, Pass); 2]);
+        let cases: [Case; 4] = [
+            ("the committed pass names no shard", |t| {
+                [
+                    (t.a, undeclared(&t.a), Pass::Upsert),
+                    (t.b, Declares::shard(&t.b), Pass::Upsert),
+                ]
+            }),
+            ("the committing pass names no shard", |t| {
+                [
+                    (t.b, Declares::shard(&t.b), Pass::Upsert),
+                    (t.a, undeclared(&t.a), Pass::Upsert),
+                ]
+            }),
+            ("a pass declaring one shard and marking another", |t| {
+                [
+                    (t.b, Declares::shard(&t.b), Pass::Upsert),
+                    (t.a, contradictory(&t.a), Pass::UpsertMarking),
+                ]
+            }),
+            // An undeclared delete pass carries no filter, so nothing says
+            // what keys it touched.
+            ("an undeclared delete pass", |t| {
+                [
+                    (t.a, undeclared(&t.a), Pass::Delete),
+                    (t.b, Declares::shard(&t.b), Pass::Upsert),
+                ]
+            }),
+        ];
+        for (case, passes) in cases {
+            let table = table(Sharding::KeyBucket).await;
+            let [first, second] = passes(&table);
+            assert_conflict(race(&table, first, second).await, case);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_undeclared_marking_pass_still_names_its_shard() {
+        // Callers that only mark progress (a single-pass merge) keep the skip.
+        let table = table(Sharding::KeyBucket).await;
+        let (a, b) = (table.a, table.b);
+        let marking_only = |shard: &Shard| Declares {
+            shard: None,
+            marks: shard.id,
+        };
+        race(
+            &table,
+            (a, marking_only(&a), Pass::UpsertMarking),
+            (b, marking_only(&b), Pass::UpsertMarking),
+        )
+        .await
+        .expect("marking passes of different shards");
+    }
+
+    #[tokio::test]
+    async fn test_mem_wal_shard_requires_a_mem_wal() {
+        let table = table(Sharding::KeyBucket).await;
+        let mut builder = MergeInsertBuilder::try_new(table.dataset.clone(), merge_on()).unwrap();
+        builder
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .mem_wal_shard(table.a.id);
+        assert!(matches!(
+            builder.try_build(),
+            Err(crate::Error::InvalidInput { .. })
+        ));
+    }
+}
