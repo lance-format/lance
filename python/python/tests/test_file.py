@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import gc
 import os
 import threading
 
@@ -9,6 +10,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
+from lance import Session
 from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
 
 
@@ -131,6 +133,84 @@ def test_size_bytes_with_session(tmp_path):
     with session.open_writer("foo.lance") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
+
+
+def test_file_reader_uses_session_metadata_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    reader = LanceFileReader(str(path), session=session)
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    # Reading through the session populates its metadata cache.
+    assert session.size_bytes() > before
+
+
+def test_file_session_uses_session_metadata_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    file_session = LanceFileSession(tmp_path, session=session)
+    reader = file_session.open_reader("foo.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    assert session.size_bytes() > before
+
+
+def test_file_reader_without_session_does_not_touch_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    assert session.size_bytes() == before
+
+
+def test_file_reader_cache_isolates_distinct_memory_stores():
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    old = pa.table({"a": [1, 1, 1]})
+    new = pa.table({"a": [9, 9, 9]})
+    stores = [LanceFileSession("memory://", session=session) for _ in range(2)]
+    for store, table in zip(stores, [old, new]):
+        with store.open_writer("foo.lance", version="2.2") as writer:
+            writer.write_batch(table)
+    assert stores[0].open_reader("foo.lance").read_all().to_table() == old
+    assert stores[1].open_reader("foo.lance").read_all().to_table() == new
+
+
+def test_file_reader_cache_isolates_destroyed_memory_stores():
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    for value in range(200):
+        store = LanceFileSession("memory://", session=session)
+        expected = pa.table({"a": [value] * 3})
+        with store.open_writer("foo.lance", version="2.2") as writer:
+            writer.write_batch(expected)
+        actual = store.open_reader("foo.lance").read_all().to_table()
+        assert actual == expected, (value, actual.to_pydict())
+        del store, actual, expected
+        gc.collect()
+
+
+def test_file_reader_cache_refreshes_replaced_file(tmp_path):
+    path = tmp_path / "foo.lance"
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    old = pa.table({"a": [1, 1, 1]})
+    new = pa.table({"a": [9, 9, 9]})
+    with LanceFileWriter(str(path), version="2.2") as writer:
+        writer.write_batch(old)
+    assert LanceFileReader(str(path), session=session).read_all().to_table() == old
+
+    with LanceFileWriter(str(path), version="2.2") as writer:
+        writer.write_batch(new)
+    assert LanceFileReader(str(path)).read_all().to_table() == new
+    assert LanceFileReader(str(path), session=session).read_all().to_table() == new
 
 
 def test_version(tmp_path):
