@@ -92,6 +92,8 @@ pub struct Session {
     /// This prevents collisions between different datasets.
     pub(crate) metadata_cache: caches::GlobalMetadataCache,
 
+    pub(crate) row_id_index_builds: Arc<crate::dataset::rowids::cache::RowIdIndexBuildLocks>,
+
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     store_registry: Arc<ObjectStoreRegistry>,
@@ -120,6 +122,7 @@ impl DeepSizeOf for Session {
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);
         size += self.metadata_cache.deep_size_of_children(context);
+        size += self.row_id_index_builds.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -179,6 +182,7 @@ impl Session {
                 QuickCacheShardPolicy::Recommended,
                 CacheMetricsKind::Metadata,
             )),
+            row_id_index_builds: Default::default(),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -208,6 +212,7 @@ impl Session {
                 QuickCacheShardPolicy::Recommended,
                 CacheMetricsKind::Metadata,
             )),
+            row_id_index_builds: Default::default(),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
@@ -402,6 +407,7 @@ impl Session {
         Self {
             index_cache: GlobalIndexCache(index_cache),
             metadata_cache: GlobalMetadataCache(metadata_cache),
+            row_id_index_builds: Default::default(),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
