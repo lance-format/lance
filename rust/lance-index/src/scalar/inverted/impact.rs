@@ -33,7 +33,9 @@ struct ImpactSkipDataInner {
     level0_len: usize,
     // Last doc id covered by each entry (level0 entries then level1 entries),
     // decoded once at construction. Level1 markers are fully validated because
-    // WAND may use them to skip a group; u32::MAX marks malformed entries.
+    // WAND may use them to skip a group; `u32::MAX` is the unusable-frontier
+    // value (a null or unparsable entry, or a group ending at doc id
+    // `u32::MAX`).
     entry_doc_up_tos: Box<[u32]>,
     // The most recently baked bounds with a stable scorer key. Each query holds
     // its own Arc in ImpactScoreCache, so replacing this slot for another scorer
@@ -48,11 +50,20 @@ impl PartialEq for ImpactSkipData {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
-    pub entries_scanned: usize,
+    /// Number of level-0 block entries actually folded into the bound by the
+    /// walk that produced this score. Test-only: lets callers distinguish
+    /// "nothing scanned" from "scanned but not counted".
+    #[cfg(test)]
+    pub level0_entries_evaluated: usize,
+    /// Number of level-1 groups whose group bound was adopted instead of
+    /// walking their level-0 entries. Test-only: `tight < conservative` alone
+    /// cannot prove a group jump happened (a per-block walk can produce the
+    /// same value), this counter can.
+    #[cfg(test)]
+    pub level1_groups_used: usize,
 }
 
 #[derive(Debug)]
@@ -316,9 +327,19 @@ impl ImpactSkipData {
         cache.entry_score(self, self.0.level0_len + group_idx, query_weight, scorer)
     }
 
+    /// Test-only shim: builds the per-block first-doc slice a closure would
+    /// produce and forwards to [`Self::max_score_up_to_cached_slim`], so the
+    /// block-bound tests keep driving the single production walk. A `None`
+    /// first doc encodes as 0, so the block is never past `up_to` (the
+    /// closure's conservative "include the block" behaviour). A doc id above
+    /// `u32::MAX` encodes as `u32::MAX`; the walk excludes a block when its
+    /// first doc is greater than `up_to`, so this excludes the block for every
+    /// window ending below `u32::MAX` and conservatively includes it for a
+    /// window ending exactly at `u32::MAX` (the clamp cannot tell them apart).
     #[cfg(test)]
-    pub fn max_score_up_to_cached<S>(
+    pub(crate) fn max_score_up_to_cached<S>(
         &self,
+        first_doc_of_block: &dyn Fn(usize) -> Option<u64>,
         start_block_idx: usize,
         up_to: u64,
         query_weight: f32,
@@ -328,9 +349,56 @@ impl ImpactSkipData {
     where
         S: Scorer + ?Sized,
     {
+        let first_docs: Vec<u32> = (0..self.0.level0_len)
+            .map(|block| match first_doc_of_block(block) {
+                Some(doc) => u32::try_from(doc).unwrap_or(u32::MAX),
+                None => 0,
+            })
+            .collect();
+        self.max_score_up_to_cached_slim(
+            &first_docs,
+            start_block_idx,
+            up_to,
+            query_weight,
+            scorer,
+            cache,
+        )
+    }
+
+    /// Hierarchical window bound: the per-entry score array is resolved ONCE
+    /// per call and the caller's already-baked first-doc-per-block slice is
+    /// passed in directly (no `&dyn Fn` per block). `first_docs` is indexed
+    /// with `get`, so a shorter slice behaves like the closure returning
+    /// `None` (conservatively "not past `up_to`").
+    pub(crate) fn max_score_up_to_cached_slim<S>(
+        &self,
+        first_docs: &[u32],
+        start_block_idx: usize,
+        up_to: u64,
+        query_weight: f32,
+        scorer: &S,
+        cache: &mut ImpactScoreCache,
+    ) -> ImpactScore
+    where
+        S: Scorer + ?Sized,
+    {
+        // Resolve the score slab once. `entry_score` returns 0.0 for a
+        // non-positive weight without touching the slab, so do not force
+        // `compute_bounds` in that case.
+        let scores: Option<&[f32]> = if query_weight > 0.0 {
+            Some(&cache.bounds(self, scorer).per_entry)
+        } else {
+            None
+        };
+        let entry_score =
+            |idx: usize| -> f32 { scores.map_or(0.0, |slab| query_weight * slab[idx]) };
+
         let mut block_idx = start_block_idx;
         let mut max_score = 0.0_f32;
-        let mut entries_scanned = 0usize;
+        #[cfg(test)]
+        let mut level0_entries_evaluated = 0usize;
+        #[cfg(test)]
+        let mut level1_groups_used = 0usize;
 
         while block_idx < self.0.level0_len {
             let group_idx = block_idx / IMPACT_LEVEL1_BLOCKS;
@@ -342,17 +410,23 @@ impl ImpactSkipData {
                     u32::MAX => {
                         return ImpactScore {
                             score: f32::INFINITY,
-                            entries_scanned: entries_scanned + 1,
+                            // `u32::MAX` is the "no usable level-1 frontier"
+                            // sentinel: a null or unparsable entry stores it,
+                            // and so does a group whose last covered doc id is
+                            // genuinely `u32::MAX`. The two are indistinguishable
+                            // here, and an infinite bound keeps pruning safe.
+                            #[cfg(test)]
+                            level0_entries_evaluated,
+                            #[cfg(test)]
+                            level1_groups_used,
                         };
                     }
                     doc_up_to if u64::from(doc_up_to) <= up_to => {
-                        max_score = max_score.max(cache.entry_score(
-                            self,
-                            level1_entry_idx,
-                            query_weight,
-                            scorer,
-                        ));
-                        entries_scanned += 1;
+                        max_score = max_score.max(entry_score(level1_entry_idx));
+                        #[cfg(test)]
+                        {
+                            level1_groups_used += 1;
+                        }
                         block_idx = group_end;
                         continue;
                     }
@@ -360,16 +434,38 @@ impl ImpactSkipData {
                 }
             }
 
-            max_score = max_score.max(cache.entry_score(self, block_idx, query_weight, scorer));
-            entries_scanned += 1;
+            if first_docs
+                .get(block_idx)
+                .is_some_and(|first| u64::from(*first) > up_to)
+            {
+                break;
+            }
+
+            max_score = max_score.max(entry_score(block_idx));
+            #[cfg(test)]
+            {
+                level0_entries_evaluated += 1;
+            }
             match self.0.entry_doc_up_tos[block_idx] {
                 u32::MAX => {
                     return ImpactScore {
                         score: f32::INFINITY,
-                        entries_scanned,
+                        #[cfg(test)]
+                        level0_entries_evaluated,
+                        #[cfg(test)]
+                        level1_groups_used,
                     };
                 }
-                doc_up_to if u64::from(doc_up_to) >= up_to => break,
+                doc_up_to if u64::from(doc_up_to) >= up_to => {
+                    // The window ends inside this block's covered range.
+                    return ImpactScore {
+                        score: max_score,
+                        #[cfg(test)]
+                        level0_entries_evaluated,
+                        #[cfg(test)]
+                        level1_groups_used,
+                    };
+                }
                 _ => {}
             }
             block_idx += 1;
@@ -377,8 +473,190 @@ impl ImpactSkipData {
 
         ImpactScore {
             score: max_score,
-            entries_scanned,
+            #[cfg(test)]
+            level0_entries_evaluated,
+            #[cfg(test)]
+            level1_groups_used,
         }
+    }
+}
+
+#[cfg(test)]
+mod walk_bound_tests {
+    use super::*;
+    use crate::scalar::inverted::scorer::MemBM25Scorer;
+    use std::collections::HashMap;
+
+    fn scorer(num_doc: usize) -> MemBM25Scorer {
+        MemBM25Scorer::new(
+            num_doc as u64,
+            num_doc,
+            HashMap::from([(String::from("token"), 2usize)]),
+        )
+    }
+
+    /// A window ending in a document gap must not let the next block's (much
+    /// larger) bound loosen the result: the first-doc probe has to exclude a
+    /// block whose first document is above the window end.
+    #[test]
+    fn excludes_blocks_that_start_above_the_window_end() {
+        let blocks = vec![
+            (0u32..=4).map(|d| (d, 1u32, 10u32)).collect::<Vec<_>>(),
+            (10u32..=19).map(|d| (d, 10u32, 10u32)).collect::<Vec<_>>(),
+        ];
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(20);
+        let mut cache = ImpactScoreCache::default();
+        let first_docs = |block: usize| -> Option<u64> { Some(if block == 0 { 0 } else { 10 }) };
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+
+        // Window ends inside the gap between the blocks.
+        let tight = impacts
+            .max_score_up_to_cached(&first_docs, 0, 7, 1.0, &scorer, &mut cache)
+            .score;
+        let conservative = impacts
+            .max_score_up_to_cached(&no_first_doc, 0, 7, 1.0, &scorer, &mut cache)
+            .score;
+        assert!(tight <= conservative + 1e-6);
+        assert!(tight < conservative, "block 1 must be excluded");
+
+        // Walk accounting: block 0 is evaluated, no group jump (the group
+        // entry covers doc 19 which is past the window), and block 1 is
+        // excluded by the first-doc probe without being evaluated.
+        let tight_stats =
+            impacts.max_score_up_to_cached(&first_docs, 0, 7, 1.0, &scorer, &mut cache);
+        assert_eq!(tight_stats.level0_entries_evaluated, 1);
+        assert_eq!(tight_stats.level1_groups_used, 0);
+
+        // Upper-bound property: the bound covers the exact max of docs <= 7.
+        let exact = scorer.doc_weight(1, 10);
+        assert!(tight + 1e-6 >= exact);
+
+        // Boundary: up_to == block 1's first document keeps block 1.
+        let inclusive = impacts
+            .max_score_up_to_cached(&first_docs, 0, 10, 1.0, &scorer, &mut cache)
+            .score;
+        let exact_incl = scorer.doc_weight(1, 10).max(scorer.doc_weight(10, 10));
+        assert!(inclusive + 1e-6 >= exact_incl);
+        assert!(inclusive >= conservative - 1e-6);
+    }
+
+    /// The level-1 group jump must stay inside the span: a window ending at
+    /// the last document of group 0 must not pull in group 1's bound even
+    /// though the group entry is consulted first.
+    #[test]
+    fn group_jump_stays_inside_the_span() {
+        let mut blocks = Vec::new();
+        for block in 0..33usize {
+            let base = (block * 10) as u32;
+            let freq = if block < 32 { 1 } else { 10 };
+            blocks.push(vec![(base, freq, 10u32), (base + 1, freq, 10u32)]);
+        }
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(330);
+        let mut cache = ImpactScoreCache::default();
+        let first_docs = |block: usize| -> Option<u64> { Some((block * 10) as u64) };
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+
+        let up_to = 31 * 10 + 1; // last document of group 0
+        let tight = impacts
+            .max_score_up_to_cached(&first_docs, 0, up_to, 1.0, &scorer, &mut cache)
+            .score;
+        let conservative = impacts
+            .max_score_up_to_cached(&no_first_doc, 0, up_to, 1.0, &scorer, &mut cache)
+            .score;
+        assert!(tight <= conservative + 1e-6);
+        assert!(tight < conservative, "group 1 must be excluded");
+        assert!(tight + 1e-6 >= scorer.doc_weight(1, 10));
+
+        // Group accounting on valid data: the tight walk adopts group 0's
+        // bound (one group jump, zero level-0 entries) and stops at the
+        // first-doc probe; the conservative walk falls through to block 32's
+        // level-0 entry. `tight < conservative` alone could be produced by a
+        // per-block walk, these counters prove the jump happened.
+        let tight_stats =
+            impacts.max_score_up_to_cached(&first_docs, 0, up_to, 1.0, &scorer, &mut cache);
+        assert_eq!(tight_stats.level1_groups_used, 1);
+        assert_eq!(tight_stats.level0_entries_evaluated, 0);
+        let conservative_stats =
+            impacts.max_score_up_to_cached(&no_first_doc, 0, up_to, 1.0, &scorer, &mut cache);
+        assert_eq!(conservative_stats.level0_entries_evaluated, 1);
+    }
+
+    /// Scan accounting across a wide walk: with a fixed start, growing the
+    /// window end must monotonically grow the evaluated-entry count, and with
+    /// a fixed window end, advancing the start block by one must shrink it by
+    /// exactly one entry. The start block sits in the *interior* of group 1,
+    /// so the walk can never take a group shortcut and every covered block
+    /// must show up as an evaluated level-0 entry.
+    #[test]
+    fn walk_accounting_tracks_start_and_window_growth() {
+        let blocks = (0..70)
+            .map(|block| {
+                let base = (block * 10) as u32;
+                vec![(base, 1u32, 10u32), (base + 1, 1u32, 10u32)]
+            })
+            .collect::<Vec<_>>();
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(700);
+        let first_docs = |block: usize| -> Option<u64> { Some((block * 10) as u64) };
+
+        // Fixed start (block 40, group 1 interior), growing window end.
+        let mut prev_entries = 0usize;
+        for up_to in (40 * 10..50 * 10).step_by(10 * 3) {
+            let mut cache = ImpactScoreCache::default();
+            let stats =
+                impacts.max_score_up_to_cached(&first_docs, 40, up_to, 1.0, &scorer, &mut cache);
+            assert_eq!(stats.level1_groups_used, 0, "start is not a group start");
+            assert!(
+                stats.level0_entries_evaluated >= prev_entries,
+                "growing up_to must not reduce evaluated entries"
+            );
+            prev_entries = stats.level0_entries_evaluated;
+        }
+
+        // Fixed window end (last doc of block 50), advancing start block.
+        let up_to = 50 * 10 + 1;
+        let mut cache = ImpactScoreCache::default();
+        let baseline = impacts
+            .max_score_up_to_cached(&first_docs, 40, up_to, 1.0, &scorer, &mut cache)
+            .level0_entries_evaluated;
+        assert_eq!(baseline, 11, "blocks 40..=50 cover the window end");
+        for start in 41..=50usize {
+            let mut cache = ImpactScoreCache::default();
+            let entries = impacts
+                .max_score_up_to_cached(&first_docs, start, up_to, 1.0, &scorer, &mut cache)
+                .level0_entries_evaluated;
+            assert_eq!(
+                entries,
+                baseline - (start - 40),
+                "advancing the start block must drop exactly one evaluated entry"
+            );
+        }
+    }
+
+    /// A walk fully covered by one group entry must jump: the group bound is
+    /// adopted, no level-0 entry is evaluated, and the entry count stays far
+    /// below the pure level-0 baseline (the restored group-jump guarantee).
+    #[test]
+    fn group_jump_folds_whole_group_without_level0_entries() {
+        let blocks = (0..70)
+            .map(|block| {
+                let base = (block * 10) as u32;
+                vec![(base, 1u32, 10u32), (base + 1, 1u32, 10u32)]
+            })
+            .collect::<Vec<_>>();
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(700);
+        let first_docs = |block: usize| -> Option<u64> { Some((block * 10) as u64) };
+        let mut cache = ImpactScoreCache::default();
+
+        let stats =
+            impacts.max_score_up_to_cached(&first_docs, 0, 31 * 10 + 1, 1.0, &scorer, &mut cache);
+        assert_eq!(stats.level1_groups_used, 1);
+        assert_eq!(stats.level0_entries_evaluated, 0);
+        assert!(stats.level0_entries_evaluated < IMPACT_LEVEL1_BLOCKS);
+        assert!(stats.score + 1e-6 >= scorer.doc_weight(1, 10));
     }
 }
 
@@ -763,8 +1041,8 @@ mod tests {
         assert_eq!(impacts.level1_len(), 2);
         let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
         let mut cache = ImpactScoreCache::default();
-        let score = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
-        assert!(score.entries_scanned < IMPACT_LEVEL1_BLOCKS);
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+        let score = impacts.max_score_up_to_cached(&no_first_doc, 0, 31, 1.0, &scorer, &mut cache);
         assert!(score.score > 0.0);
     }
 
@@ -926,10 +1204,10 @@ mod tests {
         let impacts = ImpactSkipData::new(entries, 2).unwrap();
         let scorer = MemBM25Scorer::new(10, 10, HashMap::from([(String::from("token"), 2usize)]));
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
 
-        let score = impacts.max_score_up_to_cached(0, 0, 1.0, &scorer, &mut cache);
+        let score = impacts.max_score_up_to_cached(&no_first_doc, 0, 0, 1.0, &scorer, &mut cache);
         assert!(score.score.is_finite());
-        assert_eq!(score.entries_scanned, 1);
 
         assert_eq!(
             impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
@@ -993,12 +1271,14 @@ mod tests {
         assert_eq!(impacts.level1_doc_up_to(0), Some(767));
         let scorer = MemBM25Scorer::new(400, 768, HashMap::from([(String::from("t"), 768usize)]));
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
         assert!(
             impacts
                 .level0_score_cached(0, 1.0, &scorer, &mut cache)
                 .is_finite()
         );
-        let level1 = impacts.max_score_up_to_cached(0, 767, 1.0, &scorer, &mut cache);
+        let level1 =
+            impacts.max_score_up_to_cached(&no_first_doc, 0, 767, 1.0, &scorer, &mut cache);
         assert!(level1.score.is_finite() && level1.score > 0.0);
     }
 
@@ -1027,6 +1307,7 @@ mod tests {
         let scorer = MemBM25Scorer::new(474, 31, HashMap::from([(String::from("token"), 4usize)]));
         let query_weight = scorer.query_weight("token");
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
 
         for start_block_idx in 0..blocks.len() {
             let up_to = blocks
@@ -1038,6 +1319,7 @@ mod tests {
                 .max()
                 .unwrap();
             let upper_bound = impacts.max_score_up_to_cached(
+                &no_first_doc,
                 start_block_idx,
                 u64::from(up_to),
                 query_weight,
