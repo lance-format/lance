@@ -41,6 +41,9 @@ pub(crate) fn optimize_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<O
     if let Some(max_rows_per_segment) = kwargs.get_item("max_rows_per_segment")? {
         options.max_rows_per_segment = max_rows_per_segment.extract()?;
     }
+    if let Some(max_rows_to_consolidate) = kwargs.get_item("max_rows_to_consolidate")? {
+        options.max_rows_to_consolidate = max_rows_to_consolidate.extract()?;
+    }
     Ok(options)
 }
 
@@ -249,7 +252,8 @@ impl PyIndexSegmentResult {
 /// Index optimization as plan, execute, merge and commit, the stages
 /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` runs in one
 /// process: :py:meth:`plan`, execute every task of the plan, then every merge
-/// over the task results, and :py:meth:`commit` the merge results.
+/// over the task results, and :py:meth:`commit` the merge results with the
+/// options the plan was made with.
 #[pyclass(name = "OptimizeIndices", module = "lance.optimize")]
 pub struct PyOptimizeIndices;
 
@@ -278,9 +282,17 @@ impl PyOptimizeIndices {
 
     /// Commit the merge ``results`` in one transaction, ``None`` entries
     /// ignored; whatever they do not cover stays unindexed for the next
-    /// optimize. ``dataset`` is updated to the new version.
+    /// optimize. ``dataset`` is updated to the new version. ``options`` are
+    /// the keyword options the plan was made with: they decide how the
+    /// results are checked, as a consolidation (``max_rows_to_consolidate``)
+    /// is checked against the segments the dataset has now.
     #[staticmethod]
-    fn commit(dataset: Bound<PyAny>, results: Vec<Option<PyIndexSegmentResult>>) -> PyResult<()> {
+    fn commit(
+        dataset: Bound<PyAny>,
+        results: Vec<Option<PyIndexSegmentResult>>,
+        options: &Bound<'_, PyDict>,
+    ) -> PyResult<()> {
+        let options = optimize_options(Some(options))?;
         let dataset_ref = unwrap_dataset(dataset)?;
         // Taken before the commit, so a handle another thread is using is
         // refused with nothing committed, not after the commit went through.
@@ -292,7 +304,7 @@ impl PyOptimizeIndices {
             .map(|result| result.0)
             .collect();
         rt().block_on(None, async {
-            commit_optimize_indices(&mut new_ds, results, &OptimizeOptions::default()).await
+            commit_optimize_indices(&mut new_ds, results, &options).await
         })?
         .infer_error()?;
         dataset_mut.ds = Arc::new(new_ds);

@@ -180,5 +180,7 @@ class OptimizeIndices:
     ) -> OptimizeIndicesPlan: ...
     @staticmethod
     def commit(
-        dataset: "LanceDataset", results: List[Optional[IndexSegmentResult]]
+        dataset: "LanceDataset",
+        results: List[Optional[IndexSegmentResult]],
+        options: Dict[str, Any],
     ) -> None: ...
