@@ -32,6 +32,7 @@ use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress, stage_until_first_batch};
 use lance_index::scalar::expression::ScalarQueryParser;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{
@@ -712,8 +713,14 @@ pub async fn merge_rtree_indices(
     let (bbox_data, mut stats) =
         RTreeIndexPlugin::process_and_analyze_bbox_stream(combined, page_size, spill_store).await?;
     stats.null_map = null_map;
-    let files =
-        RTreeIndexPlugin::train_rtree_index(bbox_data, stats, page_size, dest_store).await?;
+    let files = RTreeIndexPlugin::train_rtree_index(
+        bbox_data,
+        stats,
+        page_size,
+        dest_store,
+        &NoopIndexBuildProgress,
+    )
+    .await?;
 
     Ok(CreatedIndex {
         index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
@@ -885,6 +892,7 @@ impl ScalarIndex for RTreeIndex {
             stats,
             self.metadata.page_size,
             dest_store,
+            &NoopIndexBuildProgress,
         )
         .await?;
 
@@ -1196,11 +1204,18 @@ impl RTreeIndexPlugin {
         stats: BboxStreamStats,
         page_size: u32,
         store: &dyn IndexStore,
+        progress: &dyn IndexBuildProgress,
     ) -> Result<Vec<IndexFile>> {
+        // `write_index` checks this too, but only after the sort has run.
+        validate_page_size(page_size)?;
         // new sorted stream
         let sorter = HilbertSorter::new(stats.total_bbox);
         let sorted_data = sorter.sort(bbox_data).await?;
+        let sorted_data = stage_until_first_batch(progress, "sort_bboxes", sorted_data).await?;
 
+        progress
+            .stage_start("write_rtree_index", None, "files")
+            .await?;
         let page_file = Self::write_index(
             sorted_data,
             stats.num_items,
@@ -1211,6 +1226,7 @@ impl RTreeIndexPlugin {
         .await?;
 
         let nulls_file = Self::write_nulls(store, stats.null_map).await?;
+        progress.stage_complete("write_rtree_index").await?;
 
         Ok(vec![page_file, nulls_file])
     }
@@ -1236,7 +1252,7 @@ impl BasicTrainer for RTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
+        progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         Self::validate_schema(&data.schema())?;
 
@@ -1257,11 +1273,15 @@ impl BasicTrainer for RTreeIndexPlugin {
             tmpdir.obj_path(),
             Arc::new(LanceCache::no_cache()),
         ));
+        progress.stage_start("compute_bboxes", None, "rows").await?;
         let (bbox_data, stats) =
             Self::process_and_analyze_bbox_stream(bbox_data, page_size, spill_store.clone())
                 .await?;
+        progress.stage_complete("compute_bboxes").await?;
 
-        let files = Self::train_rtree_index(bbox_data, stats, page_size, index_store).await?;
+        let files =
+            Self::train_rtree_index(bbox_data, stats, page_size, index_store, progress.as_ref())
+                .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
@@ -1974,6 +1994,7 @@ mod tests {
             },
             4,
             old_store.as_ref(),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();

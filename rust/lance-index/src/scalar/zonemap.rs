@@ -2081,14 +2081,22 @@ impl ZoneMapIndexPlugin {
         batches_source: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
         options: Option<ZoneMapIndexBuilderParams>,
+        progress: &dyn crate::progress::IndexBuildProgress,
     ) -> Result<Vec<IndexFile>> {
         let value_type = batches_source.schema().field(0).data_type().clone();
 
         let mut builder = ZoneMapIndexBuilder::try_new(options.unwrap_or_default(), value_type)?;
 
+        progress.stage_start("train_zones", None, "rows").await?;
         builder.train(batches_source).await?;
+        progress.stage_complete("train_zones").await?;
 
-        builder.write_index(index_store).await
+        progress
+            .stage_start("write_zonemap_index", None, "files")
+            .await?;
+        let files = builder.write_index(index_store).await?;
+        progress.stage_complete("write_zonemap_index").await?;
+        Ok(files)
     }
 }
 
@@ -2135,7 +2143,7 @@ impl BasicTrainer for ZoneMapIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let request = (request as Box<dyn std::any::Any>)
             .downcast::<ZoneMapIndexTrainingRequest>()
@@ -2149,7 +2157,9 @@ impl BasicTrainer for ZoneMapIndexPlugin {
         // Training a new index populates the null bitmap unless the index is
         // configured without one.
         let has_null_bitmap = request.params.store_null_bitmap;
-        let files = Self::train_zonemap_index(data, index_store, Some(request.params)).await?;
+        let files =
+            Self::train_zonemap_index(data, index_store, Some(request.params), progress.as_ref())
+                .await?;
         Ok(CreatedIndex {
             index_details: make_zone_map_index_details(rows_per_zone, use_seeds, has_null_bitmap),
             index_version: ZONEMAP_INDEX_VERSION,
