@@ -550,9 +550,11 @@ def _build_vector_search_query(
         0.5. With None, an explicitly supplied nprobes remains effective.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
-        when supported by the selected index. This currently only affects
-        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-        setting. ``fast`` favors lower latency and may reduce recall,
+        when supported by the selected index. This currently affects
+        RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+        that exclude rows (for example through a prefilter or deletions),
+        where ``fast`` enables the ACORN traversal. Other index types ignore
+        this setting. ``fast`` favors lower latency and may reduce recall,
         ``normal`` uses the default balance, and ``accurate`` favors higher
         recall and may increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
@@ -1068,9 +1070,11 @@ class ScannerBuilder:
             0.5. With None, an explicitly supplied nprobes remains effective.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
-            when supported by the selected index. This currently only affects
-            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-            setting. ``fast`` favors lower latency and may reduce recall,
+            when supported by the selected index. This currently affects
+            RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+            that exclude rows (for example through a prefilter or deletions),
+            where ``fast`` enables the ACORN traversal. Other index types ignore
+            this setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
         quantized_refine_factor: int, optional
