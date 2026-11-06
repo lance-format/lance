@@ -160,9 +160,9 @@ fn budgeted_fragment_batches(
                 // set up in parallel.
                 let admission = scan_budget.admission();
                 let read = async move {
-                    let (reader, scan_range, chunk) = chunk?;
+                    let (reader, has_scan_range, chunk) = chunk?;
                     let chunk_budget = admission.reserve(chunk.rows(), chunk.bytes).await;
-                    let batches = if scan_range {
+                    let batches = if has_scan_range {
                         // A chunk of one range is one contiguous range.
                         let range = chunk.ranges[0].start as u32
                             ..chunk.ranges[chunk.ranges.len() - 1].end as u32;

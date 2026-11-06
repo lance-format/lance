@@ -228,7 +228,7 @@ mod tests {
     use lance_core::datatypes::OnMissing;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{ByteCount, array, gen_batch};
-    use lance_io::read_budget::QueryId;
+    use lance_io::read_budget::{QueryId, ReadMemoryBudget};
     use rstest::rstest;
 
     use super::*;
@@ -525,6 +525,30 @@ mod tests {
         }
         assert_eq!(rows, 8000);
         assert_eq!(dataset.session.read_budget().unwrap().reserved_bytes(), 0);
+    }
+
+    /// A chunk reserves its pages and their decoded size, learns the decoded
+    /// size from its first batch for itself and later chunks, and its output
+    /// is charged until dropped.
+    #[tokio::test]
+    async fn test_chunk_budget_learns_decoded_size() {
+        let budget = Arc::new(ReadMemoryBudget::new(1 << 30));
+        let scan = ScanBudget::new(budget.reader(QueryId::unique()));
+        // Before any batch is decoded, decoded data is assumed as large as its pages.
+        let chunk = scan.admission().reserve(100, 1000).await;
+        assert_eq!(budget.reserved_bytes(), 2000);
+        let batch =
+            arrow_array::record_batch!(("x", Int32, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])).unwrap();
+        let decoded = (batch.get_array_memory_size() as f64 * 10.0) as u64;
+        chunk.observe_decoded(&batch);
+        assert_eq!(budget.reserved_bytes(), 1000 + decoded);
+        let next = scan.admission().reserve(100, 1000).await;
+        assert_eq!(budget.reserved_bytes(), 2 * (1000 + decoded));
+        let output = chunk.charge_output(500);
+        drop(chunk);
+        assert_eq!(budget.reserved_bytes(), 1000 + decoded + 500);
+        drop((output, next));
+        assert_eq!(budget.reserved_bytes(), 0);
     }
 
     #[test]

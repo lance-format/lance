@@ -25,6 +25,8 @@ use lance_core::utils::deletion::OffsetMapper;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use lance_io::read_budget::QueryId;
+use lance_select::bitmap_to_ranges;
+use roaring::RoaringBitmap;
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
@@ -404,32 +406,23 @@ async fn estimate_take_bytes(
     physical_schema: &Arc<Schema>,
     read_config: &FragReadConfig,
 ) -> Result<u64> {
-    let mut offsets_per_fragment: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+    let mut offsets_per_fragment: BTreeMap<u32, RoaringBitmap> = BTreeMap::new();
     for row_addr in row_addrs {
         let row_addr = RowAddress::from(*row_addr);
         offsets_per_fragment
             .entry(row_addr.fragment_id())
             .or_default()
-            .push(row_addr.row_offset() as u64);
+            .insert(row_addr.row_offset());
     }
     let ids: Vec<u32> = offsets_per_fragment.keys().copied().collect();
     let estimates = futures::stream::iter(dataset.get_fragments_from_ids(&ids)?)
         .map(|fragment| {
-            let mut offsets = offsets_per_fragment
+            let ranges = offsets_per_fragment
                 .get(&(fragment.id() as u32))
-                .cloned()
+                .map(bitmap_to_ranges)
                 .unwrap_or_default();
             let read_config = read_config.clone();
             async move {
-                offsets.sort_unstable();
-                offsets.dedup();
-                let mut ranges: Vec<Range<u64>> = Vec::new();
-                for offset in offsets {
-                    match ranges.last_mut() {
-                        Some(range) if range.end == offset => range.end += 1,
-                        _ => ranges.push(offset..offset + 1),
-                    }
-                }
                 let reader = fragment.open(physical_schema, read_config).await?;
                 reader.estimate_read_bytes(ranges.into()).await
             }

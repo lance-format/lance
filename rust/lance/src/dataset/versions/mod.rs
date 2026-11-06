@@ -6,7 +6,6 @@
 //! File grammar belongs to `lance_file::versions`. This module contains only
 //! operation-level dataset choices whose behavior actually differs by version.
 
-use lance_io::read_budget::BudgetReader;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
@@ -33,6 +32,7 @@ use lance_file::{
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::object_store::ObjectStore;
+use lance_io::read_budget::BudgetReader;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};

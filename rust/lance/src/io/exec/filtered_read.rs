@@ -91,6 +91,14 @@ type MaterializedReadBatchesFut =
 type FragmentChunk = (Arc<OpenedFragmentRead>, ReadChunk);
 type FragmentChunkStream = BoxStream<'static, Result<FragmentChunk>>;
 
+/// The chunks of a budgeted read that its partitions take from.
+struct SharedChunks {
+    chunks: Arc<AsyncMutex<FragmentChunkStream>>,
+    scan_budget: ScanBudget,
+    /// Chunks each partition admits ahead of the one it is emitting
+    readahead: usize,
+}
+
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
     let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
@@ -646,7 +654,7 @@ struct FilteredReadStream {
     /// Under a read memory budget with multiple partitions, the partitions
     /// share the chunks instead, and each admits the chunks it takes with its
     /// own budget reader (`task_stream` is then empty)
-    budgeted_chunks: Option<(Arc<AsyncMutex<FragmentChunkStream>>, ScanBudget)>,
+    budgeted_chunks: Option<SharedChunks>,
     /// The scan scheduler for the scan
     scan_scheduler: Arc<ScanScheduler>,
     /// The global metrics for the scan
@@ -879,8 +887,12 @@ impl FilteredReadStream {
                     FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => {
                         Self::budgeted_task_stream(chunks, fragment_readahead, scan_budget)
                     }
-                    FilteredReadThreadingMode::MultiplePartitions(_) => {
-                        budgeted_chunks = Some((Arc::new(AsyncMutex::new(chunks)), scan_budget));
+                    FilteredReadThreadingMode::MultiplePartitions(num_partitions) => {
+                        budgeted_chunks = Some(SharedChunks {
+                            chunks: Arc::new(AsyncMutex::new(chunks)),
+                            scan_budget,
+                            readahead: (fragment_readahead / num_partitions.max(1)).max(1),
+                        });
                         futures::stream::empty().boxed()
                     }
                 }
@@ -1715,9 +1727,7 @@ impl FilteredReadStream {
                 assert!(partition < num_partitions);
                 let output_schema = self.output_schema.clone();
                 let task_stream = match &self.budgeted_chunks {
-                    Some((chunks, scan_budget)) => Arc::new(AsyncMutex::new(
-                        Self::partition_task_stream(chunks.clone(), scan_budget.for_partition()),
-                    )),
+                    Some(shared) => Arc::new(AsyncMutex::new(Self::partition_task_stream(shared))),
                     None => self.task_stream.clone(),
                 };
                 let global_metrics_clone = global_metrics.clone();
@@ -1854,18 +1864,19 @@ impl FilteredReadStream {
     }
 
     /// One partition's tasks from the chunks its partitions share. A partition
-    /// admits a chunk when it takes it, with its own reader: partitions are
-    /// consumed independently, so one partition's held memory must never stand
-    /// in line before another's next chunk.
+    /// admits the chunks it takes with its own reader: partitions are consumed
+    /// independently, so one partition's held memory must never stand in line
+    /// before another's next chunk.
     fn partition_task_stream(
-        chunks: Arc<AsyncMutex<FragmentChunkStream>>,
-        scan_budget: ScanBudget,
+        shared: &SharedChunks,
     ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
-        futures::stream::unfold(chunks, |chunks| async move {
+        let scan_budget = shared.scan_budget.for_partition();
+        futures::stream::unfold(shared.chunks.clone(), |chunks| async move {
             let chunk = chunks.lock().await.next().await?;
             Some((chunk, chunks))
         })
-        .then(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
+        .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
+        .buffered(shared.readahead)
         .try_flatten()
         .boxed()
     }
@@ -3561,6 +3572,9 @@ impl RowStreamRead {
         let Some(budget) = self.dataset.session.read_budget() else {
             return batch_rows;
         };
+        if batch_rows == 0 {
+            return batch_rows;
+        }
         let Ok(fragments) = self.load_fragments().await else {
             return batch_rows;
         };
@@ -3904,14 +3918,11 @@ impl RowStreamRead {
         let on_result = self.clone();
         let on_done = self.clone();
         let this = self.clone();
-        let mut input = Some(input);
-        futures::stream::once(async move { this.budgeted_batch_rows(batch_target_rows).await })
-            .flat_map(move |batch_target_rows| {
-                coalesce_batches(
-                    input.take().expect("the batch size is computed once"),
-                    batch_target_rows,
-                )
-            })
+        let batches = futures::stream::once(async move {
+            coalesce_batches(input, this.budgeted_batch_rows(batch_target_rows).await)
+        })
+        .flatten();
+        batches
             .enumerate()
             .map(move |(batch_index, batch)| {
                 let batch = batch?;

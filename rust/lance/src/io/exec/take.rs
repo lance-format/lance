@@ -3,7 +3,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
@@ -37,8 +36,10 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID};
-use lance_io::read_budget::QueryId;
+use lance_io::read_budget::{QueryId, Reservation};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_select::bitmap_to_ranges;
+use roaring::RoaringBitmap;
 use tracing::error;
 
 use crate::dataset::Dataset;
@@ -50,7 +51,6 @@ use crate::index::prefilter::DatasetPreFilter;
 use super::column_width::MeasuredWidths;
 use super::read_budget::{ChunkAdmission, ScanBudget};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
-use lance_io::read_budget::Reservation;
 
 pub mod batch;
 
@@ -112,19 +112,6 @@ struct TakeStream {
 struct TakenBatches {
     batches: Vec<RecordBatch>,
     output_charge: Option<Reservation>,
-}
-
-/// Coalesces sorted row offsets into ranges.
-fn offset_ranges(offsets: &[u32]) -> Arc<[Range<u64>]> {
-    let mut ranges: Vec<Range<u64>> = Vec::new();
-    for &offset in offsets {
-        let offset = offset as u64;
-        match ranges.last_mut() {
-            Some(range) if range.end == offset => range.end += 1,
-            _ => ranges.push(offset..offset + 1),
-        }
-    }
-    ranges.into()
 }
 
 impl TakeStream {
@@ -380,7 +367,12 @@ impl TakeStream {
             Some(admission) => {
                 let mut bytes = 0;
                 for ((_, offsets), reader) in groups.iter().zip(&readers) {
-                    bytes += reader.estimate_read_bytes(offset_ranges(offsets)).await?;
+                    bytes += reader
+                        .estimate_read_bytes(
+                            bitmap_to_ranges(&offsets.iter().copied().collect::<RoaringBitmap>())
+                                .into(),
+                        )
+                        .await?;
                 }
                 let rows = unique_addrs.len() as u64;
                 Some(admission.reserve(rows, bytes).await)

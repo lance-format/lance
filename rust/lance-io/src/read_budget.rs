@@ -7,12 +7,11 @@
 //! releases them once the unit is decoded. A reader's units are admitted in
 //! order, each once it fits under the limit; this is what bounds read-ahead.
 //! Read-ahead leaves the last eighth of the limit to readers' first units, so
-//! small reads are not queued behind read-ahead. A
-//! reader that holds nothing is admitted even when its unit does not fit, by
-//! taking the overdraft, which lets one query at a time exceed the limit by
-//! what it needs to make progress. All readers of that query may use the overdraft,
-//! because a downstream reader of a query cannot wait for its own upstream to
-//! drain.
+//! small reads are not queued behind read-ahead. A reader that holds nothing is
+//! admitted even when its unit does not fit, by taking the overdraft, which
+//! lets one query at a time exceed the limit by what it needs to make progress.
+//! All readers of that query may use the overdraft, because a downstream reader
+//! of a query cannot wait for its own upstream to drain.
 //!
 //! This is deadlock-free: a reader only waits while it holds reservations that
 //! drain without anyone being admitted, and the query holding the overdraft is
@@ -72,7 +71,6 @@ struct BudgetState {
     reserved: u64,
     /// The query holding the overdraft and the number of its reservations it covers.
     overdraft: Option<(QueryId, usize)>,
-    peak_reserved: u64,
 }
 
 impl ReadMemoryBudget {
@@ -101,11 +99,6 @@ impl ReadMemoryBudget {
     /// Bytes currently reserved by readers.
     pub fn reserved_bytes(&self) -> u64 {
         self.state.lock().unwrap().reserved
-    }
-
-    /// The most bytes readers have held at once.
-    pub fn peak_reserved_bytes(&self) -> u64 {
-        self.state.lock().unwrap().peak_reserved
     }
 
     /// A reader of `query`. Each independent stream of reads (for example one
@@ -182,7 +175,6 @@ impl BudgetReader {
     pub fn charge(&self, bytes: u64) -> Reservation {
         let mut state = self.0.budget.state.lock().unwrap();
         state.reserved += bytes;
-        state.peak_reserved = state.peak_reserved.max(state.reserved);
         self.0.queue.lock().unwrap().held += bytes;
         Reservation {
             reader: self.clone(),
@@ -255,7 +247,6 @@ impl Admission {
                 };
                 if let Some(overdraft) = grant {
                     state.reserved += bytes;
-                    state.peak_reserved = state.peak_reserved.max(state.reserved);
                     queue.held += bytes;
                     if overdraft {
                         let covered = state.overdraft.map_or(0, |(_, covered)| covered);
@@ -316,7 +307,6 @@ impl Reservation {
         let mut queue = reader.queue.lock().unwrap();
         let old = self.bytes.swap(bytes, Ordering::Relaxed);
         state.reserved = state.reserved - old + bytes;
-        state.peak_reserved = state.peak_reserved.max(state.reserved);
         queue.held = queue.held - old + bytes;
         let shrunk = bytes < old;
         drop(queue);
