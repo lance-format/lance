@@ -1588,6 +1588,12 @@ impl FileScheduler {
         }
     }
 
+    /// The ranges of a request at most this many bytes apart are read as one
+    /// I/O, including the bytes between them.
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
     /// Returns a copy of this scheduler that merges the ranges of a request
     /// that are at most `block_size` bytes apart into one I/O, instead of
     /// using the object store's block size.

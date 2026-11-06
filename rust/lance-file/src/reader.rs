@@ -22,7 +22,7 @@ use lance_encoding::{
     EncodingsIo,
     decoder::{
         ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, ListReadMode, PageEncoding,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
+        PageInfo, ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
         schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
@@ -36,6 +36,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
 };
+use lance_encoding::format::metadata::page_layout;
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
 use lance_io::{
@@ -1935,7 +1936,12 @@ impl DecodeEngine {
             .enumerate()
             .filter(|(position, _)| !structure_only.get(*position).copied().unwrap_or(false))
             .filter_map(|(_, index)| prepared.column_infos.get(*index as usize));
-        Ok(estimate_bytes_in_ranges(columns, ranges, read_len))
+        Ok(estimate_bytes_in_ranges(
+            columns,
+            ranges,
+            read_len,
+            self.scheduler.coalesce_gap(),
+        ))
     }
 
     pub(crate) fn try_new(
@@ -2597,12 +2603,18 @@ fn structure_only_columns(
     }
 }
 
-/// Bytes of `columns` that `ranges` (sorted and disjoint) cover, walking each
-/// column's pages and the ranges together.
+/// Bytes of `columns` that reading `ranges` (sorted and disjoint) loads,
+/// walking each column's pages and the ranges together.
+///
+/// A range loads the encoded units holding its rows: whole chunks of a
+/// mini-block page, after the page's chunk metadata, repetition index and
+/// dictionary; a proportional share of other pages. Parts at most
+/// `coalesce_gap` bytes apart are read together with the bytes between them.
 fn estimate_bytes_in_ranges<'a>(
     columns: impl Iterator<Item = &'a Arc<ColumnInfo>>,
     ranges: &[Range<u64>],
     num_rows: u64,
+    coalesce_gap: u64,
 ) -> u64 {
     debug_assert!(
         ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
@@ -2638,22 +2650,91 @@ fn estimate_bytes_in_ranges<'a>(
             while first_range < ranges.len() && ranges[first_range].end as f64 <= start {
                 first_range += 1;
             }
-            let rows_read: f64 = ranges[first_range..]
+            let overlapping: Vec<(f64, f64)> = ranges[first_range..]
                 .iter()
                 .take_while(|range| (range.start as f64) < end)
-                .map(|range| (range.end as f64).min(end) - (range.start as f64).max(start))
-                .sum();
-            if rows_read > 0.0 {
-                let page_bytes: u64 = page
-                    .buffer_offsets_and_sizes
-                    .iter()
-                    .map(|(_, size)| size)
-                    .sum();
-                bytes += page_bytes as f64 * rows_read / page_rows;
+                .map(|range| ((range.start as f64).max(start), (range.end as f64).min(end)))
+                .filter(|(from, to)| from < to)
+                .collect();
+            if overlapping.is_empty() {
+                continue;
             }
+            let page_bytes: u64 = page
+                .buffer_offsets_and_sizes
+                .iter()
+                .map(|(_, size)| size)
+                .sum();
+            let page_bytes = page_bytes as f64;
+            // The parts of the page the ranges load, in page byte offsets.
+            let (fixed, loaded): (f64, Vec<(f64, f64)>) = match mini_block_chunks(page) {
+                Some((num_chunks, data_bytes)) => {
+                    // Chunks are assumed to hold equal shares of the page's rows.
+                    let rows_per_chunk = page_rows / num_chunks as f64;
+                    let chunk_bytes = data_bytes as f64 / num_chunks as f64;
+                    let loaded = overlapping
+                        .iter()
+                        .map(|(from, to)| {
+                            let first = ((from - start) / rows_per_chunk).floor();
+                            let last = ((to - start) / rows_per_chunk)
+                                .ceil()
+                                .min(num_chunks as f64);
+                            (first * chunk_bytes, last * chunk_bytes)
+                        })
+                        .collect();
+                    (page_bytes - data_bytes as f64, loaded)
+                }
+                None => {
+                    let bytes_per_row = page_bytes / page_rows;
+                    let loaded = overlapping
+                        .iter()
+                        .map(|(from, to)| {
+                            ((from - start) * bytes_per_row, (to - start) * bytes_per_row)
+                        })
+                        .collect();
+                    (0.0, loaded)
+                }
+            };
+            let mut units = 0.0;
+            let mut loaded_end: Option<f64> = None;
+            for (from, to) in loaded {
+                let from = loaded_end.map_or(from, |end| from.max(end));
+                if to <= from {
+                    continue;
+                }
+                units += to - from;
+                // The bytes between two loaded parts are read too when the
+                // parts are close enough to be read together.
+                if let Some(end) = loaded_end {
+                    if from - end <= coalesce_gap as f64 {
+                        units += from - end;
+                    }
+                }
+                loaded_end = Some(to);
+            }
+            // The frozen 2.0 and unstable 2.3 encodings read more around a range
+            // than its rows; allow one coalescing gap per range for them.
+            if !matches!(page.encoding, PageEncoding::Structural(_)) {
+                units += (overlapping.len() as u64).saturating_mul(coalesce_gap) as f64;
+            }
+            bytes += (fixed + units).min(page_bytes);
         }
     }
     bytes.ceil() as u64
+}
+
+/// The number of chunks of a mini-block page and the size of its chunk data,
+/// or `None` for other layouts. Each chunk has one metadata word.
+fn mini_block_chunks(page: &PageInfo) -> Option<(u64, u64)> {
+    let PageEncoding::Structural(layout) = &page.encoding else {
+        return None;
+    };
+    let Some(page_layout::Layout::MiniBlockLayout(mini_block)) = &layout.layout else {
+        return None;
+    };
+    let word_bytes = if mini_block.has_large_chunk { 4 } else { 2 };
+    let (_, metadata_bytes) = *page.buffer_offsets_and_sizes.first()?;
+    let (_, data_bytes) = *page.buffer_offsets_and_sizes.get(1)?;
+    Some(((metadata_bytes / word_bytes).max(1), data_bytes))
 }
 
 /// Inspects a page and returns a String describing the page's encoding
