@@ -136,6 +136,10 @@ async fn test_remap_partial_map_does_not_keep_index() {
     .await
     .unwrap();
     assert_ne!(result, RemapResult::Keep(index_meta.uuid));
+    let RemapResult::Remapped(remapped) = result else {
+        panic!("vector index should be remapped");
+    };
+    assert_eq!(remapped.index_details, *index_meta.index_details.unwrap());
 
     let complete_remap = RowAddrRemap::direct((0u64..256).map(|offset| (offset, None)).collect());
     let mut legacy_dataset = dataset.clone();

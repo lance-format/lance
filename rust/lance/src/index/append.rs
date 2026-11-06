@@ -49,6 +49,7 @@ use crate::index::scalar::{
     IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, load_fts_training_data,
     load_training_data, scan_training_data,
 };
+use crate::index::vector::coarse_quantizer::with_fingerprint;
 use crate::index::vector::details::vector_index_details_default;
 
 #[derive(Debug, Clone)]
@@ -1559,7 +1560,7 @@ pub async fn append_vector_segment<'a>(
     append_options.num_indices_to_merge = Some(0);
     append_options.enable_partition_rebalancing = false;
     append_options.retrain = false;
-    let (new_uuid, indices_merged, files) = optimize_vector_indices(
+    let (new_uuid, summary) = optimize_vector_indices(
         dataset.clone(),
         Some(new_data_stream),
         field_path,
@@ -1568,9 +1569,10 @@ pub async fn append_vector_segment<'a>(
     )
     .boxed()
     .await?;
-    if indices_merged != 0 {
+    if summary.indices_merged != 0 {
         return Err(Error::index(format!(
-            "Optimize vector index append unexpectedly merged {indices_merged} existing segments"
+            "Optimize vector index append unexpectedly merged {} existing segments",
+            summary.indices_merged
         )));
     }
     Ok(IndexMergeResults {
@@ -1579,12 +1581,15 @@ pub async fn append_vector_segment<'a>(
         new_fragment_bitmap: fragments.iter().map(|frag| frag.id as u32).collect(),
         new_dataset_version: dataset.manifest.version,
         new_index_version: index_type_for_segmented_optimize(reference_index.as_ref())?.version(),
-        new_index_details: reference_metadata
-            .index_details
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(vector_index_details_default),
-        files,
+        new_index_details: with_fingerprint(
+            reference_metadata
+                .index_details
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(vector_index_details_default),
+            summary.coarse_quantizer_fingerprint,
+        )?,
+        files: summary.files,
     })
 }
 
@@ -1861,7 +1866,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     vec![(selected_metadata, selected_index)],
                 )?;
                 let selected_ivf_view = selected_logical_index.as_ivf()?;
-                let (new_uuid, indices_merged, files) = Box::pin(optimize_vector_indices(
+                let (new_uuid, summary) = Box::pin(optimize_vector_indices(
                     dataset.as_ref().clone(),
                     Option::<
                         lance_io::stream::RecordBatchStreamAdapter<
@@ -1873,7 +1878,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     options,
                 ))
                 .await?;
-                if indices_merged == 0 {
+                if summary.indices_merged == 0 {
                     return Ok(None);
                 }
 
@@ -1896,13 +1901,16 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     vec![removed_segment],
                     new_fragment_bitmap,
                     CreatedIndex {
-                        index_details: removed_segment
-                            .index_details
-                            .as_deref()
-                            .cloned()
-                            .unwrap_or_else(vector_index_details_default),
+                        index_details: with_fingerprint(
+                            removed_segment
+                                .index_details
+                                .as_deref()
+                                .cloned()
+                                .unwrap_or_else(vector_index_details_default),
+                            summary.coarse_quantizer_fingerprint,
+                        )?,
                         index_version: removed_segment.index_version as u32,
-                        files: table_files_to_index(files),
+                        files: table_files_to_index(summary.files),
                     },
                     removed_segment.dataset_version,
                 ))
@@ -1940,7 +1948,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     )
                 };
 
-                let (new_uuid, indices_merged, files) = optimize_vector_indices(
+                let (new_uuid, summary) = optimize_vector_indices(
                     dataset.as_ref().clone(),
                     new_data_stream,
                     &field_path,
@@ -1950,7 +1958,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 .boxed()
                 .await?;
 
-                let removed_indices = old_indices[old_indices.len() - indices_merged..].to_vec();
+                let removed_indices =
+                    old_indices[old_indices.len() - summary.indices_merged..].to_vec();
                 let new_dataset_version = removed_indices
                     .iter()
                     .map(|index| index.dataset_version)
@@ -1990,6 +1999,8 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             .cloned()
                     })
                     .unwrap_or_else(vector_index_details_default);
+                let index_details =
+                    with_fingerprint(index_details, summary.coarse_quantizer_fingerprint)?;
                 let index_version = if let Some(metadata) = removed_indices.first() {
                     metadata.index_version as u32
                 } else {
@@ -2003,7 +2014,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     CreatedIndex {
                         index_details,
                         index_version,
-                        files: table_files_to_index(files),
+                        files: table_files_to_index(summary.files),
                     },
                     new_dataset_version,
                 ))
@@ -2305,6 +2316,7 @@ mod tests {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::coarse_quantizer::common_fingerprint;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     #[test]
@@ -3091,6 +3103,10 @@ mod tests {
             .unwrap();
         let retrained = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(retrained.len(), 1);
+        assert!(
+            common_fingerprint(&retrained).is_some(),
+            "retrain must persist the new final IVF routing identity"
+        );
         assert_eq!(
             retrained[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref(),
@@ -3836,6 +3852,10 @@ mod tests {
         assert_eq!(stats["num_unindexed_fragments"], 0);
         let appended_segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
         assert!(
+            common_fingerprint(&appended_segments).is_some(),
+            "append must persist the shared final IVF routing identity"
+        );
+        assert!(
             appended_segments
                 .iter()
                 .all(|segment| segment.index_version == index_params.index_type().version()),
@@ -3933,6 +3953,10 @@ mod tests {
             merged[0].fragment_bitmap.as_ref().unwrap(),
             dataset.fragment_bitmap.as_ref(),
             "the compatible merge must preserve exact fragment coverage"
+        );
+        assert!(
+            common_fingerprint(&merged).is_some(),
+            "merge must preserve the final IVF routing identity"
         );
     }
 
