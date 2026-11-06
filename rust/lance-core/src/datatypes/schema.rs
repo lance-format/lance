@@ -423,22 +423,37 @@ impl Schema {
         Ok(())
     }
 
-    /// Reject the blob fields `rejects` selects inside a Map or FixedSizeList:
-    /// Blob v2 supports nesting only under Struct, List and LargeList.
+    /// The blob fields nested in a Map or FixedSizeList: Blob v2 supports
+    /// nesting only under Struct, List and LargeList.
+    pub fn nested_blob_fields(&self) -> impl Iterator<Item = &Field> {
+        self.nested_blobs().into_iter().map(|(field, _, _)| field)
+    }
+
+    /// Reject the blob fields `rejects` selects among [`Self::nested_blob_fields`].
     pub fn check_blob_nesting(&self, rejects: impl Fn(&Field) -> bool) -> Result<()> {
-        fn check(
-            field: &Field,
-            path: &str,
-            container: Option<(&str, &str)>,
-            rejects: &dyn Fn(&Field) -> bool,
-        ) -> Result<()> {
-            if let Some((kind, container_path)) = container
-                && field.is_blob()
-                && rejects(field)
-            {
+        for (field, kind, container_path) in self.nested_blobs() {
+            if rejects(field) {
                 return Err(Error::not_supported(format!(
                     "Blob v2 fields nested in {kind} field '{container_path}' are not supported; Blob v2 can be nested only in Struct, List and LargeList"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each blob nested in a Map or FixedSizeList, with the kind and path of
+    /// the container, in schema order.
+    fn nested_blobs(&self) -> Vec<(&Field, &'static str, String)> {
+        fn collect<'a>(
+            field: &'a Field,
+            path: &str,
+            container: Option<(&'static str, &str)>,
+            out: &mut Vec<(&'a Field, &'static str, String)>,
+        ) {
+            if let Some((kind, container_path)) = container
+                && field.is_blob()
+            {
+                out.push((field, kind, container_path.to_string()));
             }
             // The logical type, not `data_type()`, which rebuilds the whole subtree.
             let container = if field.logical_type.is_map() {
@@ -449,14 +464,14 @@ impl Schema {
                 container
             };
             for child in &field.children {
-                check(child, &format!("{path}.{}", child.name), container, rejects)?;
+                collect(child, &format!("{path}.{}", child.name), container, out);
             }
-            Ok(())
         }
+        let mut out = Vec::new();
         for field in &self.fields {
-            check(field, &field.name, None, &rejects)?;
+            collect(field, &field.name, None, &mut out);
         }
-        Ok(())
+        out
     }
 
     /// Validate a schema before storing it in a dataset manifest.

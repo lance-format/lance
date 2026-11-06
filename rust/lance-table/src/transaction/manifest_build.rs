@@ -2243,20 +2243,18 @@ impl Transaction {
                     ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
                 )
         };
-        let already_nested = |field: &lance_core::datatypes::Field| {
-            !matches!(self.operation, Operation::Overwrite { .. })
-                && current_manifest.is_some_and(|current| {
-                    current
-                        .schema
-                        .check_blob_nesting(|prior| {
-                            prior.id == field.id && unsupported(current, prior)
-                        })
-                        .is_err()
-                })
+        let already_nested: HashSet<i32> = match current_manifest {
+            Some(current) if !matches!(self.operation, Operation::Overwrite { .. }) => current
+                .schema
+                .nested_blob_fields()
+                .filter(|prior| unsupported(current, prior))
+                .map(|prior| prior.id)
+                .collect(),
+            _ => HashSet::new(),
         };
-        manifest
-            .schema
-            .check_blob_nesting(|field| unsupported(&manifest, field) && !already_nested(field))?;
+        manifest.schema.check_blob_nesting(|field| {
+            unsupported(&manifest, field) && !already_nested.contains(&field.id)
+        })?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
