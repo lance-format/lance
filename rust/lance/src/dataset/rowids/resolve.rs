@@ -193,6 +193,7 @@ pub async fn resolve_row_ids(
         loaded_fragments,
         prepared_fragments,
         excluded_fragments,
+        preparation_parallelism = parallelism,
         requested_ids = row_ids.len(),
         "resolved row ids from prepared fragments"
     );
