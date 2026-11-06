@@ -224,7 +224,7 @@ pub(super) fn phrase_matches_positions(
 /// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
 pub(super) const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
 
-/// Produces bounded batches of token counts without retaining the input corpus
+/// Streams batches of token counts without retaining the input corpus
 ///
 /// The resulting batch will have three columns:
 /// - row_id: the row id of the document
@@ -1254,8 +1254,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
 }
 
 /// Cut one scored batch into the `target_batch_size` chunks a flat FTS scan
-/// emits. Slicing is zero-copy, so the whole scan's scores stay in one
-/// allocation.
+/// emits. Slicing is zero-copy, so the input batch's scores share one allocation.
 pub(in super::super) fn slice_into_batches(
     batch: RecordBatch,
     target_batch_size: usize,

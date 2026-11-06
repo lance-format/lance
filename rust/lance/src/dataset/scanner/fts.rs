@@ -2206,7 +2206,18 @@ impl Scanner {
         } else {
             resolved.canonical_path.clone()
         };
-        let mut plan = self
+        // FTS tokenization is slower than decoding. Keep read-ahead from holding
+        // entire large text fragments while it waits, without reducing decode
+        // concurrency. Explicit scanner and dataset byte targets take precedence.
+        let mut tail_scan = self.clone();
+        if tail_scan
+            .resolved_file_reader_options()
+            .and_then(|options| options.batch_size_bytes)
+            .is_none()
+        {
+            tail_scan.batch_size_bytes(16 * 1024 * 1024);
+        }
+        let mut plan = tail_scan
             .plan_uncovered_rows_scan(fragments, stale_rows, vec![scan_column], filter_plan)
             .await?;
         if resolved.has_lists() {
