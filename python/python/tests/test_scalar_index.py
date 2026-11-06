@@ -6076,10 +6076,10 @@ def test_fm_index(tmp_path):
             ds.to_table(filter=safe_predicate, columns=["id"])["id"].to_pylist()
         ) == [0, 1, 2]
 
-        for pattern in [" ", "left\x00right", "left right"]:
+        for pattern in [" ", "left\x00right", "left right", "left\x00 right"]:
             predicate = f"contains(text, '{pattern}')"
             plan = ds.scanner(filter=predicate).explain_plan()
-            assert f"@{index_name}" not in plan
+            assert (f"@{index_name}" in plan) == ("\x00" not in pattern)
             for expression in [
                 predicate,
                 f"NOT ({predicate})",
@@ -6093,6 +6093,7 @@ def test_fm_index(tmp_path):
                     "id"
                 ].to_pylist()
                 assert sorted(actual) == sorted(expected), expression
+                assert ds.count_rows(expression) == len(expected), expression
 
     check_patterns(ds)
     ds.create_scalar_index("text", "FM", name=index_name)

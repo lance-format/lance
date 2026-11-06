@@ -892,6 +892,17 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
+/// How an index can answer a particular substring pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainsQuerySupport {
+    /// The index returns exact matches for this pattern.
+    Exact,
+    /// The index returns candidates that must be rechecked against source values.
+    NeedsRecheck,
+    /// The index cannot produce a sound candidate set for this pattern.
+    Unsupported,
+}
+
 /// A parser for indices that handle string `contains` queries, and -- when
 /// `supports_regex` is set -- `regexp_like` / `regexp_match` queries.
 #[derive(Debug, Clone)]
@@ -904,7 +915,7 @@ pub struct TextQueryParser {
     /// say anything useful about.  Shorter patterns bypass the index entirely so
     /// they are answered by a full scan.  Use 0 for indices with no such limit.
     min_contains_chars: usize,
-    excluded_contains_bytes: Vec<u8>,
+    contains_query_support: Option<fn(&str) -> ContainsQuerySupport>,
 }
 
 impl TextQueryParser {
@@ -921,14 +932,16 @@ impl TextQueryParser {
             needs_recheck,
             supports_regex,
             min_contains_chars,
-            excluded_contains_bytes: Vec::new(),
+            contains_query_support: None,
         }
     }
 
-    /// Bypass the index for patterns containing bytes its representation cannot
-    /// match faithfully. Such predicates must be evaluated against the source.
-    pub(crate) fn with_excluded_contains_bytes(mut self, bytes: Vec<u8>) -> Self {
-        self.excluded_contains_bytes = bytes;
+    /// Override exactness or bypass the index according to its representation of a pattern.
+    pub(crate) fn with_contains_query_support(
+        mut self,
+        support: fn(&str) -> ContainsQuerySupport,
+    ) -> Self {
+        self.contains_query_support = Some(support);
         self
     }
 }
@@ -984,6 +997,7 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         };
 
+        let mut needs_recheck = self.needs_recheck;
         let query = match func.name() {
             "contains" if args.len() == 2 => {
                 // Every non-null string contains the empty pattern, so no index
@@ -995,11 +1009,12 @@ impl ScalarQueryParser for TextQueryParser {
                 if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
                     return None;
                 }
-                if pattern
-                    .bytes()
-                    .any(|byte| self.excluded_contains_bytes.contains(&byte))
-                {
-                    return None;
+                if let Some(support) = self.contains_query_support {
+                    match support(&pattern) {
+                        ContainsQuerySupport::Exact => {}
+                        ContainsQuerySupport::NeedsRecheck => needs_recheck = true,
+                        ContainsQuerySupport::Unsupported => return None,
+                    }
                 }
                 TextQuery::StringContains(pattern)
             }
@@ -1024,7 +1039,7 @@ impl ScalarQueryParser for TextQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -4187,10 +4202,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case::nul("left\0right", false)]
-    #[case::space("left right", false)]
-    #[case::safe("left_right", true)]
-    fn test_fm_contains_eligibility(#[case] pattern: &str, #[case] eligible: bool) {
+    #[case::nul("left\0right", ContainsQuerySupport::Unsupported)]
+    #[case::nul_and_space("left\0 right", ContainsQuerySupport::Unsupported)]
+    #[case::space("left right", ContainsQuerySupport::NeedsRecheck)]
+    #[case::space_only(" ", ContainsQuerySupport::NeedsRecheck)]
+    #[case::safe("left_right", ContainsQuerySupport::Exact)]
+    fn test_fm_contains_eligibility(#[case] pattern: &str, #[case] support: ContainsQuerySupport) {
         let fm_parser = crate::scalar::fmindex::FMIndexPlugin
             .new_query_parser("color_idx".to_string(), &prost_types::Any::default())
             .unwrap();
@@ -4199,22 +4216,35 @@ mod tests {
         let expr = datafusion::functions::string::expr_fn::contains(col("color"), lit(pattern));
         let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
         let plan = plan_filter(schema.clone(), expr.clone(), &index_info);
-        assert_eq!(plan.index_query.is_some(), eligible);
+        let is_supported = support != ContainsQuerySupport::Unsupported;
+        assert_eq!(plan.index_query.is_some(), is_supported);
+        if let Some(query) = plan.index_query.as_ref() {
+            assert_eq!(
+                query.needs_recheck(),
+                support == ContainsQuerySupport::NeedsRecheck
+            );
+            assert_eq!(plan.skip_recheck, support == ContainsQuerySupport::Exact);
+        }
         let negated = plan_filter(schema.clone(), !expr.clone(), &index_info);
-        if !eligible {
+        if support != ContainsQuerySupport::Exact {
             assert!(negated.index_query.is_none());
-            assert!(plan.refine_expr.is_some());
+            assert!(negated.refine_expr.is_some());
             let safe = datafusion::functions::string::expr_fn::contains(col("color"), lit("right"));
             let combined = plan_filter(schema.clone(), expr.clone().and(safe.clone()), &index_info);
             assert!(combined.index_query.is_some());
-            assert!(combined.refine_expr.is_some());
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert_eq!(combined.skip_recheck, !is_supported);
             let combined = plan_filter(schema.clone(), expr.clone().or(safe), &index_info);
-            assert!(combined.index_query.is_none());
-            assert!(combined.refine_expr.is_some());
+            assert_eq!(combined.index_query.is_some(), is_supported);
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert!(!combined.skip_recheck);
         }
         // NGRAM retains its existing eligibility for both normalized bytes.
         let ngram_plan = plan_filter(schema, expr, &ngram_index_info());
-        assert!(ngram_plan.index_query.is_some());
+        assert_eq!(
+            ngram_plan.index_query.is_some(),
+            pattern.chars().count() >= 3
+        );
     }
 
     fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {
