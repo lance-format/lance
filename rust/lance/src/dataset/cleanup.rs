@@ -539,6 +539,46 @@ fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: 
         && error.is_not_found()
 }
 
+async fn read_manifest_and_indexes(
+    object_store: &ObjectStore,
+    location: &ManifestLocation,
+) -> Result<(Manifest, Vec<IndexMetadata>)> {
+    let manifest = read_manifest(object_store, &location.path, location.size).await?;
+    ensure_can_read_manifest(&manifest)?;
+    ensure_can_write_manifest(&manifest)?;
+    let indexes = read_manifest_indexes(object_store, location, &manifest).await?;
+    Ok((manifest, indexes))
+}
+
+/// Reads the manifest listed at `location` under `base` and its index section,
+/// returning the location actually read. A detached version's staging copy is
+/// deleted once the commit is finalized, after it is copied to the canonical path,
+/// so a staging copy that is gone when read is retried at the canonical path.
+async fn read_listed_manifest(
+    object_store: &ObjectStore,
+    location: ManifestLocation,
+    base: &Path,
+) -> (ManifestLocation, Result<(Manifest, Vec<IndexMetadata>)>) {
+    let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
+    match read_manifest_and_indexes(object_store, &location).await {
+        Err(error)
+            if is_detached_version(location.version)
+                && location.path != canonical
+                && error.is_not_found() =>
+        {
+            let location = ManifestLocation {
+                path: canonical,
+                size: None,
+                e_tag: None,
+                ..location
+            };
+            let read = read_manifest_and_indexes(object_store, &location).await;
+            (location, read)
+        }
+        read => (location, read),
+    }
+}
+
 /// The data files of a fragment that hold its blob descriptors: every data file
 /// holding a blob field, `None` for one in another base.
 struct BlobDescriptorFiles {
@@ -1342,16 +1382,8 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest_and_indexes = async {
-            let manifest =
-                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
-            ensure_can_read_manifest(&manifest)?;
-            ensure_can_write_manifest(&manifest)?;
-            let indexes =
-                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-            Ok::<_, Error>((manifest, indexes))
-        }
-        .await;
+        let (location, manifest_and_indexes) =
+            read_listed_manifest(&self.dataset.object_store, location, &self.dataset.base).await;
         let (manifest, indexes) = match manifest_and_indexes {
             Ok(manifest_and_indexes) => manifest_and_indexes,
             Err(error) if is_removed_detached_version(&location, &self.dataset.base, &error) => {
@@ -2553,21 +2585,22 @@ impl<'a> CleanupTask<'a> {
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
-        let manifest =
-            match read_manifest(&self.dataset.object_store, &location.path, location.size).await {
-                Ok(manifest) => manifest,
-                Err(error) if is_removed_detached_version(&location, branch_root, &error) => {
-                    debug!(
-                        manifest_version = location.version,
-                        manifest_path = %location.path,
-                        "Skipping branch detached manifest removed after it was listed"
-                    );
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
-        ensure_can_read_manifest(&manifest)?;
-        ensure_can_write_manifest(&manifest)?;
+        // Read the index section before a checkout, which may finalize a detached
+        // version and delete the staging copy this location names.
+        let (location, manifest_and_indexes) =
+            read_listed_manifest(&self.dataset.object_store, location, branch_root).await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if is_removed_detached_version(&location, branch_root, &error) => {
+                debug!(
+                    manifest_version = location.version,
+                    manifest_path = %location.path,
+                    "Skipping branch detached manifest removed after it was listed"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let managed_referenced = if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
@@ -2578,8 +2611,6 @@ impl<'a> CleanupTask<'a> {
         } else {
             false
         };
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
         let parent_base_ids = self.parent_base_ids(&manifest);
 
         // Resolve tagged FRI references into the parent before taking the
@@ -7688,9 +7719,13 @@ mod tests {
         /// Whether `list_versions` reports that the store cannot list its records,
         /// so the manifests are listed from the object store.
         is_unlisted: bool,
-        /// A version whose first lookup finalizes it first, as a checkout by its
-        /// owner would: the recorded copy moves to the given canonical path.
+        /// A version whose first lookup moves its record off the recorded copy, as
+        /// finalizing the commit does: the copy is copied to the given canonical
+        /// path, the record is repointed and the copy is deleted.
         finalize_on_lookup: Mutex<Option<(u64, Arc<ObjectStore>, Path)>>,
+        /// Whether that lookup answers with the record as it was before the move,
+        /// as when the version is finalized between the lookup and the read.
+        answers_before_finalizing: bool,
     }
 
     #[async_trait::async_trait]
@@ -7717,19 +7752,26 @@ mod tests {
                     .then(|| finalize.take())
                     .flatten()
             };
+            let row = || {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .get(&version)
+                    .cloned()
+                    .ok_or_else(|| Error::not_found(format!("@{version}")))
+            };
+            let before = row()?;
             if let Some((_, object_store, canonical)) = finalize {
-                let staging = Path::parse(&self.rows.lock().unwrap()[&version].0).unwrap();
+                let staging = Path::parse(&before.0).unwrap();
                 object_store.copy(&staging, &canonical).await?;
                 self.rows.lock().unwrap().get_mut(&version).unwrap().0 = canonical.to_string();
                 object_store.delete(&staging).await?;
             }
-            let row = self
-                .rows
-                .lock()
-                .unwrap()
-                .get(&version)
-                .cloned()
-                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            let row = if self.answers_before_finalizing {
+                before
+            } else {
+                row()?
+            };
             Ok(ManifestLocation {
                 version,
                 path: Path::parse(&row.0).unwrap(),

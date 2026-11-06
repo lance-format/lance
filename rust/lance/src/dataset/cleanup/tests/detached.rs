@@ -3,6 +3,11 @@
 
 use super::*;
 use crate::dataset::{InsertBuilder, NewColumnTransform};
+use lance_table::format::{DataFile, DeletionFile, DeletionFileType};
+use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::external_manifest::{
+    ExternalManifestCommitHandler, ExternalManifestStore,
+};
 
 fn id_batch(start: i32) -> RecordBatch {
     RecordBatch::try_new(
@@ -332,8 +337,6 @@ async fn managed_cleanup_with_split_blob_files(
 
 #[tokio::test]
 async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
-    use lance_table::format::{DataFile, DeletionFile, DeletionFileType};
-
     let fixture = MockDatasetFixture::try_new().unwrap();
     fixture.create_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
@@ -420,20 +423,19 @@ async fn cleanup_skips_staging_detached_manifests() {
 
 /// A detached version whose external store record names its staging copy, as
 /// when the copy to the canonical path failed, keeps its files on a store that
-/// cannot list its records, also when its owner finalizes it between the listing
-/// and the record lookup.
+/// cannot list its records, also when it is finalized after the listing, before
+/// or after cleanup looks up its record.
 #[rstest]
+#[case::recorded(None)]
+#[case::finalized_before_the_lookup(Some(false))]
+#[case::finalized_before_the_read(Some(true))]
 #[tokio::test]
 async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
-    #[values(false, true)] finalized_during_cleanup: bool,
+    #[case] finalized_after_lookup: Option<bool>,
 ) {
-    use lance_table::io::commit::CommitHandler;
-    use lance_table::io::commit::external_manifest::{
-        ExternalManifestCommitHandler, ExternalManifestStore,
-    };
-
     let store = Arc::new(IdentifiedStore {
         is_unlisted: true,
+        answers_before_finalizing: finalized_after_lookup == Some(true),
         ..Default::default()
     });
     let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
@@ -485,7 +487,7 @@ async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
         .execute(vec![id_batch(200)])
         .await
         .unwrap();
-    if finalized_during_cleanup {
+    if finalized_after_lookup.is_some() {
         *store.finalize_on_lookup.lock().unwrap() =
             Some((detached, dataset.object_store.clone(), canonical.clone()));
     }
@@ -499,7 +501,7 @@ async fn cleanup_keeps_files_of_a_detached_version_recorded_at_its_staging_copy(
     .await
     .unwrap();
 
-    let kept = if finalized_during_cleanup {
+    let kept = if finalized_after_lookup.is_some() {
         assert!(store.finalize_on_lookup.lock().unwrap().is_none());
         &canonical
     } else {
