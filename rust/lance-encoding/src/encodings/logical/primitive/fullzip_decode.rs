@@ -45,19 +45,32 @@ struct FullZipRepIndexDetails {
     bytes_per_value: u64, // Will be 1, 2, 4, or 8
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PerValueDecompressor {
     Fixed(Arc<dyn FixedPerValueDecompressor>),
     Variable(Arc<dyn VariablePerValueDecompressor>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FullZipDecodeDetails {
     value_decompressor: PerValueDecompressor,
     def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
+    /// Whether each value is preceded by one zero byte that the layout does not record.
+    ///
+    /// Writers before #9018 wrote such a byte on pages whose rep/def buffers were present
+    /// but all zero, while the layout recorded no rep or def bits, so `ctrl_word_parser`
+    /// is NIL.
+    is_padded: bool,
     max_rep: u16,
     max_visible_def: u16,
+}
+
+impl FullZipDecodeDetails {
+    /// Bytes taken by each item's control word, including the padding byte when `is_padded`.
+    fn bytes_per_word(&self) -> usize {
+        self.ctrl_word_parser.bytes_per_word() + usize::from(self.is_padded)
+    }
 }
 
 /// Describes where FullZip byte ranges should be read from.
@@ -257,6 +270,18 @@ impl FullZipScheduler {
             }
         };
 
+        let is_padded = matches!(
+            &value_decompressor,
+            PerValueDecompressor::Fixed(decompressor)
+                if rep_index.is_none()
+                    && has_padded_fixed_control_words(
+                        ctrl_word_parser,
+                        decompressor.bits_per_value(),
+                        rows_in_page,
+                        data_buf_size,
+                    )
+        );
+
         let bits_per_offset = match layout.details {
             Some(metadata::full_zip_layout::Details::BitsPerValue(_)) => 32,
             Some(metadata::full_zip_layout::Details::BitsPerOffset(bits_per_offset)) => {
@@ -274,6 +299,7 @@ impl FullZipScheduler {
             value_decompressor,
             def_meaning: def_meaning.into(),
             ctrl_word_parser,
+            is_padded,
             max_rep,
             max_visible_def,
         });
@@ -342,8 +368,7 @@ impl FullZipScheduler {
                     return Err(lance_core::Error::not_supported_source("Bit-packed full-zip encoding (non-byte-aligned values) is not yet implemented".into()));
                 }
                 let bytes_per_value = bits_per_value / 8;
-                let total_bytes_per_value =
-                    bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
+                let total_bytes_per_value = bytes_per_value as usize + details.bytes_per_word();
                 // total_bytes_per_value == 0 is valid for constant-null FSL pages written by
                 // earlier encoders that produced bits_per_value=0 with no ctrl-word bytes.
                 // FixedFullZipDecoder::drain handles this case by producing AllNull output
@@ -538,7 +563,7 @@ impl FullZipScheduler {
             ));
         }
         let bytes_per_value = bits_per_value / 8;
-        let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
+        let bytes_per_cw = self.details.bytes_per_word();
         let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
         let byte_ranges = ranges
             .iter()
@@ -559,6 +584,29 @@ impl FullZipScheduler {
         );
         Ok(vec![page_load_task])
     }
+}
+
+/// Whether a fixed-width page with a NIL layout holds one zero byte before each value.
+///
+/// Writers before #9018 wrote such a byte for pages whose rep/def buffers were present but
+/// all zero (see [`FullZipDecodeDetails::is_padded`]). A NIL page holds exactly
+/// `rows_in_page * bytes_per_value` bytes, so a page one byte per value larger can only be
+/// one of those. Pages without value bytes are read as all null without looking at the
+/// buffer, so they are left alone.
+fn has_padded_fixed_control_words(
+    ctrl_word_parser: ControlWordParser,
+    bits_per_value: u64,
+    rows_in_page: u64,
+    data_buf_size: u64,
+) -> bool {
+    matches!(ctrl_word_parser, ControlWordParser::NIL)
+        && rows_in_page > 0
+        && bits_per_value > 0
+        && bits_per_value.is_multiple_of(8)
+        && (bits_per_value / 8)
+            .checked_add(1)
+            .and_then(|stride| stride.checked_mul(rows_in_page))
+            == Some(data_buf_size)
 }
 
 /// Cacheable state for FullZip encoding, storing the decoded repetition index
@@ -679,7 +727,7 @@ impl FixedFullZipDecoder {
             // We always need at least one value.  Now loop through until we have passed num_rows
             // values
             let mut num_items = 0;
-            let bytes_per_word = self.details.ctrl_word_parser.bytes_per_word();
+            let bytes_per_word = self.details.bytes_per_word();
             while self.offset_in_current < cur_buf.len() {
                 // The item walk is driven by the control words themselves, so a page that
                 // disagrees with its own layout can step past the end of the buffer.  Check
@@ -850,6 +898,53 @@ impl VariableFullZipDecoder {
         assert_eq!(in_bits_per_length % 8, 0);
         assert!(out_bits_per_offset == 32 || out_bits_per_offset == 64);
 
+        if !matches!(details.ctrl_word_parser, ControlWordParser::NIL) {
+            return Self::try_new(
+                details,
+                decompressor,
+                data,
+                num_rows,
+                in_bits_per_length,
+                out_bits_per_offset,
+            );
+        }
+        // Writers before #9018 could put one zero byte before each value of a NIL page
+        // (see `FullZipDecodeDetails::is_padded`). When the NIL walk fails, retry it with
+        // that padding and use the result only if every value then lines up. A padded page
+        // whose NIL walk happens to succeed is still read as NIL.
+        Self::try_new(
+            details.clone(),
+            decompressor.clone(),
+            data.clone(),
+            num_rows,
+            in_bits_per_length,
+            out_bits_per_offset,
+        )
+        .or_else(|error| {
+            let padded = FullZipDecodeDetails {
+                is_padded: true,
+                ..details.as_ref().clone()
+            };
+            Self::try_new(
+                Arc::new(padded),
+                decompressor,
+                data,
+                num_rows,
+                in_bits_per_length,
+                out_bits_per_offset,
+            )
+            .map_err(|_| error)
+        })
+    }
+
+    fn try_new(
+        details: Arc<FullZipDecodeDetails>,
+        decompressor: Arc<dyn VariablePerValueDecompressor>,
+        data: VecDeque<LanceBuffer>,
+        num_rows: u64,
+        in_bits_per_length: u8,
+        out_bits_per_offset: u8,
+    ) -> Result<Self> {
         let mut decoder = Self {
             details,
             decompressor,
@@ -1002,7 +1097,6 @@ impl VariableFullZipDecoder {
         let mut def = Vec::with_capacity(num_rows as usize);
         let bytes_cw = self
             .details
-            .ctrl_word_parser
             .bytes_per_word()
             .saturating_mul(num_rows as usize);
 
@@ -1039,6 +1133,15 @@ impl VariableFullZipDecoder {
                 // speed though so we only need one index into it
                 let repdef_start = rep.len().max(def.len());
                 // TODO: Kind of inefficient we parse the control word twice here
+                if self.details.is_padded && databuf[0] != 0 {
+                    return Err(Error::corrupt_file_named(
+                        "variable_full_zip",
+                        format!(
+                            "padding byte {:#04x} before an item of a NIL control-word page is not zero",
+                            databuf[0]
+                        ),
+                    ));
+                }
                 let ctrl_desc = self.details.ctrl_word_parser.parse_desc(
                     databuf,
                     self.details.max_rep,
@@ -1047,7 +1150,7 @@ impl VariableFullZipDecoder {
                 self.details
                     .ctrl_word_parser
                     .parse(databuf, &mut rep, &mut def);
-                databuf = &databuf[self.details.ctrl_word_parser.bytes_per_word()..];
+                databuf = &databuf[self.details.bytes_per_word()..];
 
                 if ctrl_desc.is_new_row {
                     self.repdef_starts.push(repdef_start);
@@ -1355,7 +1458,7 @@ struct FixedFullZipDecodeTask {
 
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        let estimated_size_bytes = if self.details.ctrl_word_parser.bytes_per_word() == 0 {
+        let estimated_size_bytes = if self.details.bytes_per_word() == 0 {
             let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
                 return Err(Error::internal(
                     "FixedFullZipDecodeTask requires a fixed-width decompressor",
@@ -1381,7 +1484,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
         };
         let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
-        if self.details.ctrl_word_parser.bytes_per_word() == 0 {
+        if self.details.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
             //
             // We decompress each buffer and add it to our output buffer
@@ -1424,16 +1527,24 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 // We will be unzipping repdef in to `rep` and `def` and the
                 // values into `values` (which contains the compressed values)
                 let mut values = Vec::with_capacity(
-                    fixed_data.data.len()
-                        - (self.details.ctrl_word_parser.bytes_per_word() * num_values),
+                    fixed_data.data.len() - (self.details.bytes_per_word() * num_values),
                 );
                 let mut visible_items = 0;
                 for _ in 0..num_values {
+                    if self.details.is_padded && buf_slice[0] != 0 {
+                        return Err(Error::corrupt_file_named(
+                            "fixed_full_zip",
+                            format!(
+                                "padding byte {:#04x} before a value of a NIL control-word page is not zero",
+                                buf_slice[0]
+                            ),
+                        ));
+                    }
                     // Extract rep/def
                     self.details
                         .ctrl_word_parser
                         .parse(buf_slice, &mut rep, &mut def);
-                    buf_slice = &buf_slice[self.details.ctrl_word_parser.bytes_per_word()..];
+                    buf_slice = &buf_slice[self.details.bytes_per_word()..];
 
                     let is_visible = def
                         .last()
@@ -1500,7 +1611,9 @@ mod tests {
     use crate::compression::{DecompressionStrategy, FixedPerValueDecompressor};
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::decoder::{DecodePageTask, LoadedPageShard, StructuralFieldDecoder};
+    use crate::decoder::{
+        DecodePageTask, LoadedPageShard, StructuralFieldDecoder, StructuralPageDecoder,
+    };
     use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
     use crate::encodings::logical::primitive::{
         StructuralPageScheduler, StructuralPrimitiveFieldDecoder,
@@ -1513,12 +1626,15 @@ mod tests {
     use crate::encodings::physical::fsst::FsstPerValueEncoder;
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::metadata::compressive_encoding::Compression;
+    use crate::repdef::ControlWordParser;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+    use lance_core::Error;
+    use rstest::rstest;
 
     use super::{
         FixedFullZipDecodeTask, FullZipCacheableState, FullZipDecodeDetails, FullZipDecodeTaskItem,
         FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler, PerValueDecompressor,
-        VariableFullZipDecoder,
+        VariableFullZipDecoder, has_padded_fixed_control_words,
     };
 
     fn decode_fixed_fullzip_no_levels(
@@ -1532,6 +1648,7 @@ mod tests {
                 value_decompressor: PerValueDecompressor::Fixed(decompressor),
                 def_meaning: Arc::from([]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
+                is_padded: false,
                 max_rep: 0,
                 max_visible_def: u16::MAX,
             }),
@@ -1865,6 +1982,7 @@ mod tests {
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                is_padded: false,
                 max_rep: 0,
                 max_visible_def: 0,
             }),
@@ -1993,6 +2111,7 @@ mod tests {
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                is_padded: false,
                 max_rep: 0,
                 max_visible_def: 0,
             }),
@@ -2120,6 +2239,7 @@ mod tests {
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
+                is_padded: false,
                 max_rep: 0,
                 max_visible_def: 0,
             }),
@@ -2264,6 +2384,7 @@ mod tests {
                 as Arc<dyn VariablePerValueDecompressor>),
             def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
             ctrl_word_parser: ControlWordParser::new(0, 0),
+            is_padded: false,
             max_rep: 0,
             max_visible_def: 0,
         })
@@ -2324,6 +2445,7 @@ mod tests {
             value_decompressor: PerValueDecompressor::Variable(Arc::from(decompressor)),
             def_meaning: vec![DefinitionInterpretation::NullableItem].into(),
             ctrl_word_parser: ControlWordParser::new(0, 0),
+            is_padded: false,
             max_rep: 0,
             max_visible_def: 0,
         });
@@ -2497,6 +2619,146 @@ mod tests {
         }
     }
 
+    /// Two 3-byte values of a NIL page, each preceded by `padding` if it is given.
+    fn nil_variable_page(padding: Option<u8>) -> Vec<u8> {
+        [b"abc", b"xyz"]
+            .into_iter()
+            .flat_map(|value| {
+                padding
+                    .into_iter()
+                    .chain(3_u32.to_le_bytes())
+                    .chain(value.iter().copied())
+            })
+            .collect()
+    }
+
+    /// Writers before #9018 could put a zero byte before each value of a NIL page.
+    #[rstest]
+    #[case::unpadded(None)]
+    #[case::padded(Some(0))]
+    fn variable_full_zip_reads_nil_page(#[case] padding: Option<u8>) {
+        let mut decoder = VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            std::collections::VecDeque::from([LanceBuffer::from(nil_variable_page(padding))]),
+            2,
+            32,
+            32,
+        )
+        .unwrap();
+        let DataBlock::VariableWidth(block) = decoder.drain(2).unwrap().decode().unwrap().data
+        else {
+            panic!("expected a variable-width block");
+        };
+        assert_eq!(block.data.as_ref(), b"abcxyz");
+        assert_eq!(
+            block.offsets.borrow_to_typed_slice::<u32>().as_ref(),
+            [0, 3, 6]
+        );
+    }
+
+    /// Only zero padding is accepted; otherwise the error from the NIL walk is reported.
+    #[test]
+    fn variable_full_zip_rejects_nonzero_padding() {
+        let err = VariableFullZipDecoder::new(
+            truncated_tail_details(),
+            std::collections::VecDeque::from([LanceBuffer::from(nil_variable_page(Some(1)))]),
+            2,
+            32,
+            32,
+        )
+        .expect_err("non-zero padding must not decode");
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// A fixed-width page read with `is_padded` set skips the zero byte before
+    /// each value and rejects any other byte there.
+    #[rstest]
+    #[case::zero_padding(0, Some(&[1_u8, 2, 3, 4, 5, 6, 7, 8][..]))]
+    #[case::nonzero_padding(1, None)]
+    fn fixed_full_zip_reads_padded_nil_page(#[case] padding: u8, #[case] expected: Option<&[u8]>) {
+        #[derive(Debug)]
+        struct IdentityFixedDecompressor;
+
+        impl FixedPerValueDecompressor for IdentityFixedDecompressor {
+            fn decompress(&self, data: FixedWidthDataBlock, _: u64) -> crate::Result<DataBlock> {
+                Ok(DataBlock::FixedWidth(data))
+            }
+
+            fn bits_per_value(&self) -> u64 {
+                32
+            }
+        }
+
+        let page = [[1_u8, 2, 3, 4], [5, 6, 7, 8]]
+            .iter()
+            .flat_map(|value| std::iter::once(padding).chain(value.iter().copied()))
+            .collect::<Vec<_>>();
+        let task = Box::new(FixedFullZipDecodeTask {
+            details: Arc::new(FullZipDecodeDetails {
+                value_decompressor: PerValueDecompressor::Fixed(Arc::new(
+                    IdentityFixedDecompressor,
+                )),
+                def_meaning: Arc::from([]),
+                ctrl_word_parser: ControlWordParser::NIL,
+                is_padded: true,
+                max_rep: 0,
+                max_visible_def: u16::MAX,
+            }),
+            data: vec![FullZipDecodeTaskItem {
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data: LanceBuffer::from(page),
+                    bits_per_value: 32,
+                    num_values: 2,
+                    block_info: BlockInfo::new(),
+                }),
+                rows_in_buf: 2,
+            }],
+            num_rows: 2,
+            bytes_per_value: 4,
+        });
+        match (task.decode(), expected) {
+            (Ok(page), Some(expected)) => {
+                assert_eq!(
+                    page.data.as_fixed_width_ref().unwrap().data.as_ref(),
+                    expected
+                );
+            }
+            (Err(err), None) => {
+                assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+                assert!(err.to_string().contains("padding byte 0x01"), "{err}");
+            }
+            (Ok(_), None) => panic!("non-zero padding must not decode"),
+            (Err(err), Some(_)) => panic!("zero padding must decode: {err}"),
+        }
+    }
+
+    #[rstest]
+    #[case::unpadded(ControlWordParser::NIL, 32, 4, 16, false)]
+    #[case::padded(ControlWordParser::NIL, 32, 4, 20, true)]
+    #[case::control_words_recorded(ControlWordParser::DEF8, 32, 4, 20, false)]
+    #[case::no_value_bytes(ControlWordParser::NIL, 0, 4, 4, false)]
+    #[case::no_rows(ControlWordParser::NIL, 32, 0, 0, false)]
+    #[case::sub_byte_values(ControlWordParser::NIL, 4, 8, 8, false)]
+    #[case::overflow(ControlWordParser::NIL, 8, 1_u64 << 63, 0, false)]
+    fn test_has_padded_fixed_control_words(
+        #[case] ctrl_word_parser: ControlWordParser,
+        #[case] bits_per_value: u64,
+        #[case] rows_in_page: u64,
+        #[case] data_buf_size: u64,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            has_padded_fixed_control_words(
+                ctrl_word_parser,
+                bits_per_value,
+                rows_in_page,
+                data_buf_size
+            ),
+            expected
+        );
+    }
+
     /// Drains `num_rows` from a single-buffer fixed full-zip page built from `buf`.
     ///
     /// `bits_rep` picks the control word width (1 -> one byte, 9 -> two bytes) and each
@@ -2527,6 +2789,7 @@ mod tests {
             )),
             def_meaning: vec![DefinitionInterpretation::AllValidList].into(),
             ctrl_word_parser: ControlWordParser::new(bits_rep, 0),
+            is_padded: false,
             max_rep: 1,
             max_visible_def: 0,
         });

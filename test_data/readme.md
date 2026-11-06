@@ -55,3 +55,10 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
   them for the null slot it appended past the last Int8 key, and for two
   chunks whose dictionaries did not fit Int8 together.
+* `v4.0.1/merge_insert_padded_control_words.lance` and
+  `v11.0.0/fullzip_padded_control_words.lance`: full-zip pages whose layout
+  records no control-word bits but which hold a zero byte before each value.
+  Lance 4.0.1 wrote them for a binary column updated by a merge_insert of some
+  columns (#6338); Lance 11.0.0 still wrote them for `FixedSizeList<Struct>`
+  columns, binary and fixed-width, in a file whose slice of the list validity
+  bitmap had no nulls.
