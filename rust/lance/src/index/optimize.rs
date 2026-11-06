@@ -67,6 +67,11 @@
 //! with a tagged fragment reuse history, a legacy (v1) vector index and a
 //! scalar index that must be rebuilt from the whole column. Naming such an
 //! index in `OptimizeOptions::index_names` refuses instead.
+//!
+//! An unfiltered pass also skips an entire index when a segment cannot be
+//! translated through tagged fragment reuse, or its optional FTS tokenizer
+//! cannot be built by this process. Naming that index refuses instead. Storage
+//! failures opening supported segments still fail the optimization.
 
 mod consolidate;
 
@@ -80,7 +85,9 @@ use itertools::Itertools;
 use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::pbold::InvertedIndexDetails;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
+use lance_index::scalar::InvertedIndexParams;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -92,7 +99,9 @@ use super::append::{
     index_field_path, is_definition_only_segment, merge_indices_with_unindexed_frags,
     partition_dormant_vector_segments, select_segments_to_merge, tagged_segment_coverage,
 };
-use super::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
+use super::frag_reuse::{
+    MissingCoverageReason, OpenPurpose, SegmentRemappingPlan, segment_coverage_reason,
+};
 use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
@@ -559,6 +568,49 @@ async fn has_unsupported_frag_reuse_history(
         .has_unsupported_transitions())
 }
 
+/// Capability checks must precede segment opens: an unavailable translator or
+/// process-local tokenizer must not prevent maintenance of the other indices.
+/// Check every sibling, since optimizing only part of a name can overlap the
+/// segment left behind. Metadata and storage errors still propagate.
+async fn optimization_unavailable_reason(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+    tagged: bool,
+) -> Result<Option<String>> {
+    for segment in segments {
+        if tagged
+            && segment_coverage_reason(dataset, segment).await?
+                == Some(MissingCoverageReason::Unsupported)
+        {
+            return Ok(Some(format!(
+                "segment {} cannot be translated by this build under the tagged fragment reuse history",
+                segment.uuid
+            )));
+        }
+        if let Some(details) = &segment.index_details
+            && segment_has_inverted_details(segment)
+        {
+            let details = details.to_msg::<InvertedIndexDetails>()?;
+            let tokenizer = details.base_tokenizer.as_deref().unwrap_or("simple");
+            // Manifest details omit custom filters such as stop words. Only
+            // probe the base tokenizer's local resources, not those filters.
+            if (tokenizer == "jieba"
+                || tokenizer.starts_with("jieba/")
+                || tokenizer.starts_with("lindera/"))
+                && let Err(error) = InvertedIndexParams::default()
+                    .base_tokenizer(tokenizer.to_string())
+                    .build()
+            {
+                return Ok(Some(format!(
+                    "segment {} requires tokenizer '{tokenizer}', which this process cannot build: {error}",
+                    segment.uuid
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The plan over `indices` (every entry of the manifest), or `None` when the
 /// table is to be left alone.
 pub(crate) async fn plan_optimize_indices_or_skip(
@@ -587,6 +639,15 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         merges: Vec::new(),
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
+        if let Some(reason) = optimization_unavailable_reason(dataset, &segments, tagged).await? {
+            if named {
+                return Err(Error::not_supported(format!(
+                    "Cannot optimize index '{name}': {reason}"
+                )));
+            }
+            log::warn!("Skipping optimization of index '{name}': {reason}");
+            continue;
+        }
         let last = *segments.last().expect("an index has at least one segment");
         if options.max_rows_to_consolidate.is_some() {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;

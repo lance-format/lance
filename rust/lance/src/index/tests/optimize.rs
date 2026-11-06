@@ -3,6 +3,15 @@
 
 use super::support::*;
 use super::*;
+use crate::dataset::index::LanceIndexStoreExt;
+use crate::dataset::transaction::RewriteGroup;
+use crate::index::frag_reuse::{
+    MissingCoverageReason, frag_reuse_entry_appending, segment_coverage_reason,
+};
+use crate::index::frag_reuse_reader::tests::prepare_partition;
+use lance_index::scalar::inverted::METADATA_FILE;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{IndexStore, index_files_to_table};
 
 #[tokio::test]
 async fn test_segmented_optimize_rebalances_only_one_segment() {
@@ -1048,6 +1057,303 @@ async fn test_optimize_reports_segment_open_errors(
             .collect();
         assert_eq!(covered, RoaringBitmap::from_iter([0, 1]));
     }
+}
+
+#[tokio::test]
+async fn test_optimize_skips_an_index_without_fragment_reuse_translation() {
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_ram_dataset(FragmentCount(2), FragmentRowCount(2))
+        .await
+        .unwrap();
+    let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Fm,
+            Some("text_idx".into()),
+            &fm_params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::ReserveFragments { num_fragments: 2 },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let old_fragments = dataset.fragments().to_vec();
+    let (transition, new_fragments) = prepare_partition(&dataset, &[0, 1], 2).await;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let appended = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+
+    // A sibling on a fragment outside the rewrite history is directly readable.
+    // It must also be preserved when the old segment cannot be translated.
+    let sibling = dataset
+        .create_index_builder(&["text"], IndexType::Fm, &fm_params)
+        .name("text_idx".into())
+        .fragments(vec![4])
+        .replace(true)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![sibling],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let before = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 2);
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
+        Some(MissingCoverageReason::Unsupported)
+    );
+    assert_eq!(
+        segment_coverage_reason(&dataset, &before[1]).await.unwrap(),
+        None
+    );
+
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "i_idx");
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        load_all_indices_by_name(&dataset, "text_idx")
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        dataset
+            .unindexed_fragments("i_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
+
+    let error = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec!["text_idx".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error.to_string().contains("cannot be translated"),
+        "{error}"
+    );
+}
+
+#[rstest]
+#[case::jieba("jieba")]
+#[case::lindera("lindera")]
+#[tokio::test]
+async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
+    #[case] tokenizer: &str,
+    #[values(false, true)] is_bounded: bool,
+) {
+    let test_dir = TempStrDir::default();
+    let mut dataset = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .col(
+            "text",
+            array::cycle_utf8_literals(&["hello world", "lance"]),
+        )
+        .into_dataset(&test_dir, FragmentCount(3), FragmentRowCount(2))
+        .await
+        .unwrap();
+    let mut segments = Vec::with_capacity(2);
+    for fragment in [0, 1] {
+        let mut segment = dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .name("text_idx".into())
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        if let Some(files) =
+            crate::index::scalar::inverted::finalize_segment_files_if_needed(&dataset, &segment)
+                .await
+                .unwrap()
+        {
+            segment.files = Some(index_files_to_table(files));
+        }
+        segments.push(segment);
+    }
+    // Model an index written by a process with a tokenizer model installed.
+    // Rewrite both persisted copies of its configuration, leaving its data
+    // files intact. This process cannot load the uniquely named model.
+    let tokenizer = format!("{tokenizer}/missing-{}", Uuid::new_v4());
+    let params = InvertedIndexParams::default().base_tokenizer(tokenizer.clone());
+    assert!(params.build().is_err());
+    let segment = &mut segments[1];
+    let store = LanceIndexStore::from_dataset_for_new(&dataset, &segment.uuid).unwrap();
+    let reader = store.open_index_file(METADATA_FILE).await.unwrap();
+    let schema = reader.schema();
+    let batch = reader.read_range(0..1, None).await.unwrap();
+    let mut metadata = schema.metadata.clone();
+    metadata.insert("params".into(), serde_json::to_string(&params).unwrap());
+    let mut writer = store
+        .new_index_file(
+            METADATA_FILE,
+            Arc::new(Schema::new(batch.schema().fields().clone())),
+        )
+        .await
+        .unwrap();
+    writer.write_record_batch(batch).await.unwrap();
+    let file = writer.finish_with_metadata(metadata).await.unwrap();
+    let recorded_file = segment
+        .files
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|existing| existing.path == file.path)
+        .unwrap();
+    recorded_file.size_bytes = file.size_bytes;
+    recorded_file.file_metadata_size_bytes = None;
+    segment.index_details = Some(Arc::new(
+        prost_types::Any::from_msg(&InvertedIndexDetails::try_from(&params).unwrap()).unwrap(),
+    ));
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: segments.clone(),
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index_builder(&["i"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("i_idx".into())
+        .fragments(vec![0])
+        .await
+        .unwrap();
+    let mut dataset = Dataset::open(&test_dir).await.unwrap();
+    let before = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap();
+    let error = dataset
+        .open_scalar_index_for_maintenance("text", &segments[1].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::InvalidInput { .. } | Error::IO { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&tokenizer), "{error}");
+
+    let options = OptimizeOptions::default().max_rows_per_task(is_bounded.then_some(2));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert!(!plan.tasks.is_empty());
+    assert!(plan.tasks.iter().all(|task| task.reference.name == "i_idx"));
+    dataset.optimize_indices(&options).await.unwrap();
+    assert_eq!(
+        load_all_indices_by_name(&dataset, "text_idx")
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        dataset
+            .unindexed_fragments("i_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
+
+    let error = dataset
+        .optimize_indices(&OptimizeOptions::default().index_names(vec!["text_idx".into()]))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("which this process cannot build"),
+        "{error}"
+    );
 }
 
 /// Optimizing a name whose segments this build cannot all read would commit
