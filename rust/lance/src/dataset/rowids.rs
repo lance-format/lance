@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub(crate) mod cache;
+pub(crate) mod resolve;
 mod spill;
 mod validate;
 
@@ -214,6 +215,8 @@ pub fn load_row_id_sequences<'a>(
 pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex>>> {
     get_row_id_index_with(dataset, true).await
 }
+
+pub(crate) use resolve::resolve_row_ids;
 
 /// The row id index, built with or without the deletion vectors.
 ///

@@ -31,7 +31,11 @@ pub struct RowIdIndexBuildLocks {
 type DatasetBuildLocks = HashMap<(String, bool), Weak<tokio::sync::Mutex<()>>>;
 
 impl RowIdIndexBuildLocks {
-    fn for_dataset(&self, uri: &str, with_deletions: bool) -> Result<Arc<tokio::sync::Mutex<()>>> {
+    pub(super) fn for_dataset(
+        &self,
+        uri: &str,
+        with_deletions: bool,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.locks.lock().map_err(|error| {
             Error::internal(format!("row id index build lock poisoned: {error}"))
         })?;
@@ -85,7 +89,7 @@ impl DeepSizeOf for CachedRowIdIndex {
 }
 
 impl CachedRowIdIndex {
-    fn matches(&self, dataset: &Dataset) -> bool {
+    pub(super) fn matches(&self, dataset: &Dataset) -> bool {
         self.version == dataset.manifest.version
             && Some(self.e_tag.as_str()) == dataset.manifest_location.e_tag.as_deref()
     }
@@ -204,6 +208,8 @@ pub(super) async fn build(
         .map(|previous| previous.index.try_reuse_fragments(&retained, &changed))
         .transpose()?
         .flatten();
+    let has_reused_index = reused.is_some();
+    let changed_fragments = changed.len();
     let index = if let Some(index) = reused {
         index
     } else {
@@ -232,6 +238,22 @@ pub(super) async fn build(
             .await?;
         RowIdIndex::new(&sources)?
     };
+    tracing::debug!(
+        event = "row_id_index_build",
+        total_fragments = fragments.len(),
+        retained_fragments = if has_reused_index { retained.len() } else { 0 },
+        loaded_fragments = if has_reused_index {
+            changed_fragments
+        } else {
+            fragments.len()
+        },
+        prepared_fragments = if has_reused_index {
+            changed_fragments
+        } else {
+            fragments.len()
+        },
+        "prepared row id index"
+    );
     Ok(CachedRowIdIndex {
         version: dataset.manifest.version,
         e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
@@ -274,7 +296,7 @@ fn deletion_identity(
         .transpose()
 }
 
-async fn load_source(
+pub(super) async fn load_source(
     dataset: &Dataset,
     fragment: &Fragment,
     sequence: Arc<RowIdSequence>,
@@ -355,7 +377,7 @@ fn sequence_identity(dataset: &Dataset, fragment: &Fragment) -> Result<InternalC
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{RecordBatchIterator, record_batch};
@@ -377,7 +399,7 @@ mod tests {
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
-    async fn dataset(spilled: bool) -> Dataset {
+    pub async fn dataset(spilled: bool) -> Dataset {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", array::step::<Int32Type>())
             .into_ram_dataset_with_params(
