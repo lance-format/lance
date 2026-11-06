@@ -19,6 +19,7 @@ mod dataset_migrations;
 mod dataset_overlay_index_masking;
 mod dataset_scanner;
 mod dataset_scanner_knn;
+mod dataset_scanner_knn_adaptive;
 mod dataset_scanner_plans;
 mod dataset_scanner_read;
 mod dataset_scanner_rows;
