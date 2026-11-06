@@ -1709,6 +1709,61 @@ mod tests {
         );
     }
 
+    /// Loaded through a remapper, an answer's null rows (the null lists, which
+    /// a `NOT` filter must leave out) come back at their current addresses
+    /// too, not only its matches.
+    #[tokio::test]
+    async fn test_load_translates_null_rows() {
+        const OLD_FRAGMENT: u64 = 1 << 32;
+        const NEW_FRAGMENT: u64 = 3 << 32;
+        const ROWS: u64 = 40;
+        // The first row is a null list.
+        let deleted = OLD_FRAGMENT;
+        let moved = |addr: u64| (addr != deleted).then_some(addr - OLD_FRAGMENT + NEW_FRAGMENT);
+
+        let rows = sample_label_list_rows(ROWS as usize, OLD_FRAGMENT);
+        let (_dir, store) = test_util::index_store();
+        train_label_list_index(sample_rows_to_stream(&rows), store.as_ref())
+            .await
+            .unwrap();
+        let script = (OLD_FRAGMENT..OLD_FRAGMENT + ROWS).fold(
+            lance_select::remapper::ScriptedRemapper::new(),
+            |script, addr| match moved(addr) {
+                Some(to) => script.moved(addr, to),
+                None => script.deleted(addr),
+            },
+        );
+        let (remapper, _) = script.into_remapper();
+        let query =
+            LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some("label-0007".to_string()))]);
+        let mut answers = Vec::new();
+        for remapper in [None, Some(remapper)] {
+            let index =
+                LabelListIndex::load(store.clone(), remapper, &LanceCache::no_cache(), true)
+                    .await
+                    .unwrap();
+            let SearchResult::Exact(rows) = index
+                .search(&query, &crate::metrics::NoOpMetricsCollector)
+                .await
+                .unwrap()
+            else {
+                panic!("a label list answers exactly");
+            };
+            answers.push(rows);
+        }
+        let [built, translated] = answers.try_into().unwrap();
+        assert!(built.null_rows().contains(deleted));
+        let current = |set: &RowAddrTreeMap| -> RowAddrTreeMap {
+            set.row_addrs()
+                .unwrap()
+                .filter_map(|addr| moved(u64::from(addr)))
+                .collect()
+        };
+        assert_eq!(translated.null_rows(), &current(built.null_rows()));
+        assert_eq!(translated.true_rows(), current(&built.true_rows()));
+        assert!(!translated.true_rows().is_empty());
+    }
+
     /// Many segments whose keys interleave without overlapping is the case key
     /// selection must handle in `log(segments)` rather than by scanning every
     /// segment for every key. Covers both shapes at once: a vocabulary unique to

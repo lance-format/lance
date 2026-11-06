@@ -404,7 +404,9 @@ fn effective_coverage_never_claims_an_untranslatable_fragment(#[case] reading: R
 }
 
 /// A segment is excluded only when it needs translation its kind cannot
-/// provide, under every format. On a table with stable row IDs the legacy
+/// provide, under every format: a kind that cannot translate keeps serving a
+/// segment built after the rewrite, or one covering only fragments no rewrite
+/// touched. On a table with stable row IDs the legacy
 /// reader applies the history to every segment it opens, so a kind that
 /// cannot apply it, or one storing stable row IDs, is excluded even when
 /// caught up. A kind whose details cannot be interpreted is still trusted by
@@ -412,12 +414,12 @@ fn effective_coverage_never_claims_an_untranslatable_fragment(#[case] reading: R
 /// they were recorded. Tagged cannot translate a segment whose coverage was
 /// never recorded; legacy translates it as covering nothing.
 #[rstest]
-#[case::legacy(Reading::Legacy, [true, false, false], false)]
-#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true], false)]
-#[case::tagged(Reading::Tagged, [true, false, false], true)]
+#[case::legacy(Reading::Legacy, [true, false, false, false], false)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true, true], false)]
+#[case::tagged(Reading::Tagged, [true, false, false, false], true)]
 fn excluded_only_when_translation_is_needed_and_unsupported(
     #[case] reading: Reading,
-    #[case] is_excluded: [bool; 3],
+    #[case] is_excluded: [bool; 4],
     #[case] excludes_unknown_coverage: bool,
 ) {
     let unsupported = TranslationSupport::Unsupported;
@@ -425,7 +427,11 @@ fn excluded_only_when_translation_is_needed_and_unsupported(
     let caught_up = segment(&[1], REWRITE_VERSION + 1, unsupported);
     let mut row_ids = segment(&[1], REWRITE_VERSION + 1, TranslationSupport::Supported);
     row_ids.domain = RowDomain::StableRowId;
-    for (segment, is_excluded) in [stale, caught_up, row_ids].into_iter().zip(is_excluded) {
+    let untouched = segment(&[2], 1, unsupported);
+    for (segment, is_excluded) in [stale, caught_up, row_ids, untouched]
+        .into_iter()
+        .zip(is_excluded)
+    {
         let plan = plan_one(reading, segment.clone());
         assert_eq!(
             plan == ReadPlan::Excluded,

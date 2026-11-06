@@ -22,15 +22,26 @@ use std::sync::Arc;
 /// A JSON index answers through its target index, so it translates only
 /// when its target's plugin does.
 pub(super) fn scalar_plugin_translates(details: &prost_types::Any) -> Option<bool> {
-    let plugin = super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-        .get_plugin_by_details(details)
-        .ok()?;
-    if !plugin.translates_row_addrs() {
+    translates_through_targets(details, &|details| {
+        super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(details)
+            .ok()
+            .map(|plugin| plugin.translates_row_addrs())
+    })
+}
+
+/// [`scalar_plugin_translates`], with `plugin_translates` answering for the
+/// plugin of one index's details.
+fn translates_through_targets(
+    details: &prost_types::Any,
+    plugin_translates: &dyn Fn(&prost_types::Any) -> Option<bool>,
+) -> Option<bool> {
+    if !plugin_translates(details)? {
         return Some(false);
     }
     if details.type_url.ends_with(&JsonIndexDetails::full_name()) {
         let json = details.to_msg::<JsonIndexDetails>().ok()?;
-        return scalar_plugin_translates(json.target_details.as_ref()?);
+        return translates_through_targets(json.target_details.as_ref()?, plugin_translates);
     }
     Some(true)
 }
@@ -131,4 +142,55 @@ pub async fn vector_supports_batch_remapping(
         })
         .await?;
     Ok(*supported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn details(type_url: &str) -> prost_types::Any {
+        prost_types::Any {
+            type_url: type_url.to_string(),
+            value: Vec::new(),
+        }
+    }
+
+    fn json_over(target: Option<prost_types::Any>) -> prost_types::Any {
+        prost_types::Any::from_msg(&JsonIndexDetails {
+            path: "x".to_string(),
+            target_details: target,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// A plain index translates when its plugin does; a JSON index answers
+    /// through its target, so it translates only when the target's plugin
+    /// does, however deeply nested. Details no plugin reads, and a JSON index
+    /// without a target, are not known to translate either way.
+    #[test]
+    fn json_indices_translate_through_their_target() {
+        let plugin_translates = |details: &prost_types::Any| match details.type_url.as_str() {
+            "translating" => Some(true),
+            "stale" => Some(false),
+            url if url.ends_with(&JsonIndexDetails::full_name()) => Some(true),
+            _ => None,
+        };
+        let translates =
+            |details: &prost_types::Any| translates_through_targets(details, &plugin_translates);
+        assert_eq!(translates(&details("translating")), Some(true));
+        assert_eq!(translates(&details("stale")), Some(false));
+        assert_eq!(translates(&details("unknown")), None);
+        assert_eq!(
+            translates(&json_over(Some(details("translating")))),
+            Some(true)
+        );
+        assert_eq!(translates(&json_over(Some(details("stale")))), Some(false));
+        assert_eq!(
+            translates(&json_over(Some(json_over(Some(details("stale")))))),
+            Some(false)
+        );
+        assert_eq!(translates(&json_over(Some(details("unknown")))), None);
+        assert_eq!(translates(&json_over(None)), None);
+    }
 }

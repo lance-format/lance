@@ -88,10 +88,14 @@ mod tests {
     use roaring::RoaringBitmap;
 
     use crate::system_index::frag_reuse::history::FragReuseHistory;
-    use crate::system_index::frag_reuse::history::tests::{address, legacy, whole};
+    use crate::system_index::frag_reuse::history::tests::{Source, address, legacy, whole};
     use crate::system_index::frag_reuse::mapping::MappingSource;
     use crate::system_index::frag_reuse::plan::{
-        Composition, RewriteContext, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
+        Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary,
+        TranslationPlan, TranslationSupport,
+    };
+    use crate::system_index::frag_reuse::{
+        CompactFragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
     };
 
     /// Fragments 0 and 1 into 2 at version 10, then 2 and 3 into 4 at 20.
@@ -294,5 +298,59 @@ mod tests {
                 None
             ]
         );
+    }
+
+    /// A version 0 read binds every segment to the released translation
+    /// itself: each address of every source, deleted rows included,
+    /// translates as [`CompactFragReuseIndex::remap_row_id`] translates it,
+    /// and the remapper hands an index rewrite that same in-memory map.
+    #[tokio::test]
+    async fn a_read_translates_as_the_released_index() {
+        let with_deleted = |id, physical_rows, deleted: &[u64]| Source {
+            id,
+            physical_rows,
+            deleted: deleted.iter().copied().collect(),
+        };
+        let versions = vec![
+            legacy(10, &[with_deleted(0, 4, &[1]), whole(1, 2)], &[(2, 5)]),
+            legacy(20, &[with_deleted(2, 5, &[0, 4]), whole(3, 1)], &[(4, 4)]),
+        ];
+        let history = FragReuseHistory::from_legacy_versions(versions.clone()).unwrap();
+        let live = RoaringBitmap::from_iter([4]);
+        let plans = history.plan(
+            &ReadContext {
+                entry_version: 20,
+                live_fragments: &live,
+            },
+            &[segment(Some(&[0, 1, 3]), 5)],
+        );
+        let [ReadPlan::Translate(plan)] = plans.as_slice() else {
+            panic!("a stale segment is translated: {plans:?}");
+        };
+        let remapper = plan.clone().bind(Arc::new(NoMappings));
+
+        let released = CompactFragReuseIndex::try_new(
+            uuid::Uuid::nil(),
+            FragReuseIndexDetails {
+                versions: versions
+                    .into_iter()
+                    .map(|version| FragReuseVersion::try_from(version).unwrap())
+                    .collect(),
+            },
+        )
+        .unwrap();
+        assert_eq!(remapper.row_addr_remap(), Some(released.row_addr_remap()));
+        let stored: Vec<u64> = [(0, 4), (1, 2), (2, 5), (3, 1), (9, 2)]
+            .into_iter()
+            .flat_map(|(fragment, rows)| (0..rows).map(move |offset| address(fragment, offset)))
+            .collect();
+        let mut translated: Vec<Option<u64>> = stored.iter().copied().map(Some).collect();
+        remapper.translate_in_place(&mut translated).await.unwrap();
+        let expected: Vec<Option<u64>> = stored
+            .iter()
+            .map(|&address| released.remap_row_id(address))
+            .collect();
+        assert_eq!(translated, expected);
+        assert!(translated.contains(&None), "the history deletes rows");
     }
 }
