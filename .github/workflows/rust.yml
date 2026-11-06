@@ -368,7 +368,7 @@ jobs:
     # Standard macOS runners are free for public repos; Warp runners are billed.
     # Only lance-io is tested here to keep PR feedback fast on 3 cores. The full
     # workspace runs nightly in nightly_run.yml.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     strategy:
       matrix:
@@ -379,11 +379,6 @@ jobs:
         working-directory: ./rust
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Select new xcode
-        # Default XCode right now is 15.0.1, which contains a bug that causes
-        # backtraces to not show properly. See:
-        # https://github.com/rust-lang/rust/issues/113783
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
         run: brew install protobuf
       - name: Set up Rust
