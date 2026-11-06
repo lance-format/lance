@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
@@ -191,6 +191,16 @@ impl DataFile {
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
+        self.schema_filtered(full_schema, |_| true)
+    }
+
+    /// [`Self::schema`] restricted to the top-level fields of `full_schema` that
+    /// `keep` accepts. Rejected fields are not cloned, except in legacy v1 files.
+    pub fn schema_filtered(
+        &self,
+        full_schema: &Schema,
+        keep: impl Fn(&lance_core::datatypes::Field) -> bool,
+    ) -> Schema {
         // Structural field IDs describe physical headers in V2.0 and may also
         // appear with column_index=-1 in older V2.1+ manifests. They do not, by
         // themselves, mean that every child in the current dataset schema is
@@ -198,13 +208,11 @@ impl DataFile {
         // schema evolution replaces its last old child with a new one.
         fn project_field(
             field: &lance_core::datatypes::Field,
-            mapped_columns: &HashMap<i32, i32>,
+            mapped_columns: &HashSet<i32>,
             is_v2_0: bool,
         ) -> Option<lance_core::datatypes::Field> {
             if field.is_blob() || field.is_packed_struct() {
-                return mapped_columns
-                    .contains_key(&field.id)
-                    .then(|| field.clone());
+                return mapped_columns.contains(&field.id).then(|| field.clone());
             }
 
             let children = field
@@ -219,7 +227,7 @@ impl DataFile {
                 });
             }
 
-            if field.children.is_empty() && mapped_columns.contains_key(&field.id) {
+            if field.children.is_empty() && mapped_columns.contains(&field.id) {
                 return Some(field.clone());
             }
 
@@ -227,7 +235,7 @@ impl DataFile {
             // header to preserve the parent's row count and validity, but leave
             // its children empty so missing descendants are null-filled by the
             // fragment reader instead of being added to this file's projection.
-            if is_v2_0 && mapped_columns.contains_key(&field.id) {
+            if is_v2_0 && mapped_columns.contains(&field.id) {
                 return Some(lance_core::datatypes::Field {
                     children: Vec::new(),
                     ..field.clone()
@@ -237,23 +245,48 @@ impl DataFile {
         }
 
         if self.uses_v1_data_file_encoding() {
-            return full_schema.project_by_ids(&self.fields, false);
+            let mut schema = full_schema.project_by_ids(&self.fields, false);
+            schema.fields.retain(|field| keep(field));
+            return schema;
         }
+        fn collect_ids(field: &lance_core::datatypes::Field, ids: &mut HashSet<i32>) {
+            ids.insert(field.id);
+            for child in &field.children {
+                collect_ids(child, ids);
+            }
+        }
+
+        let kept = full_schema
+            .fields
+            .iter()
+            .filter(|field| keep(field))
+            .collect::<Vec<_>>();
+        // Only ids under kept fields are looked up, so a narrow selection of a
+        // wide file only hashes the ids it can use.
+        let kept_ids = (kept.len() < full_schema.fields.len()).then(|| {
+            let mut ids = HashSet::new();
+            kept.iter().for_each(|field| collect_ids(field, &mut ids));
+            ids
+        });
         let mapped_columns = self
             .fields
             .iter()
-            .copied()
-            .zip(self.column_indices.iter().copied())
-            .filter(|(_, column_index)| *column_index >= 0)
-            .collect::<HashMap<_, _>>();
+            .zip(self.column_indices.iter())
+            .filter(|(field_id, column_index)| {
+                **column_index >= 0
+                    && kept_ids
+                        .as_ref()
+                        .is_none_or(|kept_ids| kept_ids.contains(field_id))
+            })
+            .map(|(field_id, _)| *field_id)
+            .collect::<HashSet<_>>();
         let is_v2_0 = matches!(
             (self.file_major_version, self.file_minor_version),
             (0, 3) | (2, 0)
         );
         Schema {
-            fields: full_schema
-                .fields
-                .iter()
+            fields: kept
+                .into_iter()
                 .filter_map(|field| project_field(field, &mapped_columns, is_v2_0))
                 .collect(),
             metadata: full_schema.metadata.clone(),
