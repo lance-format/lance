@@ -1897,6 +1897,80 @@ fn overlay_only_options(max_overlays_per_fragment: usize) -> CompactionOptions {
     }
 }
 
+// Deferred overlay compaction withdraws coverage from the stale index, so
+// its pages decoded under the history must not share the plain cache key.
+#[tokio::test]
+async fn v0_cache_key_preserves_historical_overlay_rows() {
+    let mut dataset = create_base_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let indexed_version = dataset.version().version;
+    let mut dataset = commit_n_overlays(dataset, 3).await;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..overlay_only_options(2)
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let latest_version = dataset.version().version;
+    let dataset = dataset
+        .checkout_version(indexed_version)
+        .await
+        .unwrap()
+        .checkout_version(latest_version)
+        .await
+        .unwrap();
+    let mapping = dataset.frag_reuse_index().await.unwrap().unwrap();
+    assert_ne!(mapping.remap_row_id(0), Some(0));
+    dataset.index_cache.clear().await;
+    dataset.prewarm_index("val_idx").await.unwrap();
+    assert_eq!(
+        dataset.count_rows(Some("val = 60".into())).await.unwrap(),
+        1
+    );
+
+    let historical = dataset.checkout_version(indexed_version).await.unwrap();
+    let mut oracle = historical.scan();
+    oracle.use_scalar_index(false).filter("val = 0").unwrap();
+    assert_eq!(oracle.try_into_batch().await.unwrap().num_rows(), 1);
+    let mut indexed = historical.scan();
+    indexed.filter("val = 0").unwrap().project(&["id"]).unwrap();
+    let plan = indexed.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let warm_count = indexed.try_into_batch().await.unwrap().num_rows();
+    historical.index_cache.clear().await;
+    assert_eq!(
+        historical.count_rows(Some("val = 0".into())).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        warm_count, 1,
+        "warming the current snapshot must not corrupt historical index pages"
+    );
+}
+
 /// Scan `id` and `val` and return an `id -> val` map (order-independent).
 async fn id_val_map(dataset: &Dataset) -> BTreeMap<i32, Option<i32>> {
     let mut scanner = dataset.scan();
