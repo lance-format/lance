@@ -34,7 +34,8 @@ use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::index::vector::{StageParams, VectorIndexParams};
-use crate::session::caches::{ManifestKey, RowIdIndexKey, TransactionKey};
+use crate::session::caches::{ManifestKey, TransactionKey};
+use crate::session::index_caches::RowIdIndexKey;
 use crate::utils::test::{
     AmbiguousCommitHandler, AmbiguousFailure, DatagenExt, FragmentCount, FragmentRowCount,
 };
