@@ -12,4 +12,4 @@ docs/src/format/table/ @table-spec-team
 # index specification
 protos/index.proto @index-spec-team
 protos/index_old.proto @index-spec-team
-docs/src/format/table/index/ @index-spec-team
+docs/src/format/index/ @index-spec-team
