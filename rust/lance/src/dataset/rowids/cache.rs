@@ -4,6 +4,7 @@
 //! One charged current view, with immutable fragment state reused on replacement.
 
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, Weak};
 
 use futures::{StreamExt, TryStreamExt};
@@ -59,9 +60,8 @@ impl DeepSizeOf for RowIdIndexBuildLocks {
 #[derive(Debug)]
 struct CachedFragment {
     identity: InternalCacheKey,
-    sequence: Arc<RowIdSequence>,
+    span: Option<RangeInclusive<u64>>,
     deletion_identity: Option<InternalCacheKey>,
-    deletions: Arc<DeletionVector>,
 }
 
 /// Replacing this entry drops the cache's ownership of the previous view. Active
@@ -79,14 +79,6 @@ impl DeepSizeOf for CachedRowIdIndex {
         self.e_tag.capacity()
             + self.index.deep_size_of_children(context)
             + self.fragments.capacity() * std::mem::size_of::<CachedFragment>()
-            + self
-                .fragments
-                .iter()
-                .map(|fragment| {
-                    fragment.sequence.deep_size_of_children(context)
-                        + fragment.deletions.deep_size_of_children(context)
-                })
-                .sum::<usize>()
     }
 }
 
@@ -128,7 +120,7 @@ pub(super) async fn build(
     with_deletions: bool,
     previous: Option<&CachedRowIdIndex>,
 ) -> Result<CachedRowIdIndex> {
-    let previous: HashMap<_, _> = previous
+    let previous_fragments: HashMap<_, _> = previous
         .into_iter()
         .flat_map(|cached| &cached.fragments)
         .map(|fragment| (fragment.identity, fragment))
@@ -136,13 +128,22 @@ pub(super) async fn build(
     let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
     for fragment in dataset.manifest.fragments.iter() {
         let identity = sequence_identity(dataset, fragment)?;
-        let prior = previous.get(&identity).copied();
+        let prior = previous_fragments.get(&identity).copied();
         loads.push(async move {
-            let sequence = match prior {
-                Some(prior) => prior.sequence.clone(),
-                None => Arc::new(read_row_id_sequence(dataset, fragment).await?),
+            // Prepared state owns everything needed for lookup. Unchanged
+            // fragments need neither their original IDs nor another span scan.
+            let sequence = if prior.is_some() {
+                None
+            } else {
+                Some(Arc::new(read_row_id_sequence(dataset, fragment).await?))
             };
-            Ok::<_, Error>((fragment, identity, sequence, prior))
+            let span = match prior {
+                Some(prior) => prior.span.clone(),
+                None => sequence
+                    .as_ref()
+                    .and_then(|sequence| sequence.row_id_range()),
+            };
+            Ok::<_, Error>((fragment, identity, sequence, span, prior))
         });
     }
     let loaded: Vec<_> = futures::stream::iter(loads)
@@ -155,81 +156,146 @@ pub(super) async fn build(
         overlapping_id_spans(
             &loaded
                 .iter()
-                .map(|(_, _, sequence, _)| sequence.clone())
+                .map(|(_, _, _, span, _)| span.clone())
                 .collect::<Vec<_>>(),
         )
     };
     let mut loads = Vec::with_capacity(loaded.len());
-    for ((fragment, identity, sequence, prior), needs_deletions) in
-        loaded.into_iter().zip(needs_deletions)
+    for ((fragment, identity, sequence, span, prior), needs_deletions) in
+        loaded.into_iter().zip(&needs_deletions)
     {
         loads.push(async move {
-            let deletion_file = fragment.deletion_file.as_ref().filter(|_| needs_deletions);
-            let deletion_identity = deletion_file
-                .map(|file| {
-                    let mut builder = KeyBuilder::new(
-                        CacheNamespace::root(),
-                        DeletionFileKey::stable_type_id(),
-                        DeletionFileKey::schema(),
-                    );
-                    DeletionFileKey {
-                        fragment_id: fragment.id,
-                        deletion_file: file,
-                    }
-                    .write_key(&mut builder);
-                    write_base_identity(dataset, file.base_id, &mut builder)?;
-                    Ok::<_, Error>(builder.finish())
-                })
-                .transpose()?;
-            let deletions = if let Some(prior) = prior
-                && prior.deletion_identity == deletion_identity
+            let deletion_identity = deletion_identity(dataset, fragment, *needs_deletions)?;
+            let source = if prior.is_some_and(|prior| prior.deletion_identity == deletion_identity)
             {
-                prior.deletions.clone()
-            } else if let Some(file) = deletion_file {
-                // These vectors are owned and charged by the aggregate, not
-                // simultaneously retained by the metadata cache.
-                Arc::new(
-                    read_deletion_file(
-                        fragment.id,
-                        file,
-                        &dataset.dataset_dir_for_deletion(file)?,
-                        dataset.object_store_for_deletion(file).await?.as_ref(),
-                    )
-                    .await?,
-                )
+                None
             } else {
-                Arc::new(DeletionVector::default())
+                let sequence = match sequence {
+                    Some(sequence) => sequence,
+                    None => Arc::new(read_row_id_sequence(dataset, fragment).await?),
+                };
+                Some(load_source(dataset, fragment, sequence, *needs_deletions).await?)
             };
-            Ok::<_, Error>(CachedFragment {
+            let cached = CachedFragment {
                 identity,
-                sequence,
+                span,
                 deletion_identity,
-                deletions,
-            })
+            };
+            Ok::<_, Error>((cached, source))
         });
     }
-    let fragments: Vec<CachedFragment> = futures::stream::iter(loads)
+    let loaded: Vec<_> = futures::stream::iter(loads)
         .buffered(dataset.object_store.io_parallelism())
         .try_collect()
         .await?;
-    let sources: Vec<_> = dataset
+    let (fragments, mut sources): (Vec<CachedFragment>, Vec<Option<FragmentRowIdIndex>>) =
+        loaded.into_iter().unzip();
+    let retained: Vec<_> = dataset
         .manifest
         .fragments
         .iter()
-        .zip(&fragments)
-        .map(|(fragment, cached)| FragmentRowIdIndex {
-            fragment_id: fragment.id as u32,
-            row_id_sequence: cached.sequence.clone(),
-            deletion_vector: cached.deletions.clone(),
-        })
+        .zip(&sources)
+        .filter_map(|(fragment, source)| source.is_none().then_some(fragment.id as u32))
         .collect();
+    let changed: Vec<_> = sources.iter_mut().filter_map(Option::take).collect();
+    let reused = previous
+        .map(|previous| previous.index.try_reuse_fragments(&retained, &changed))
+        .transpose()?
+        .flatten();
+    let index = if let Some(index) = reused {
+        index
+    } else {
+        // Partial changes to an inseparable merged group require reconstruction.
+        // Reload only then; retain already loaded changed sources for the build.
+        let mut changed: HashMap<_, _> = changed
+            .into_iter()
+            .map(|source| (source.fragment_id, source))
+            .collect();
+        let mut loads = Vec::with_capacity(fragments.len());
+        for (fragment, needs_deletions) in dataset.manifest.fragments.iter().zip(needs_deletions) {
+            let source = changed.remove(&(fragment.id as u32));
+            loads.push(async move {
+                match source {
+                    Some(source) => Ok(source),
+                    None => {
+                        let sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
+                        load_source(dataset, fragment, sequence, needs_deletions).await
+                    }
+                }
+            });
+        }
+        let sources: Vec<_> = futures::stream::iter(loads)
+            .buffered(dataset.object_store.io_parallelism())
+            .try_collect()
+            .await?;
+        RowIdIndex::new(&sources)?
+    };
     Ok(CachedRowIdIndex {
         version: dataset.manifest.version,
         e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
             Error::internal("cached row id index requires a manifest generation token")
         })?,
-        index: Arc::new(RowIdIndex::new(&sources)?),
+        index: Arc::new(index),
         fragments,
+    })
+}
+
+fn deletion_identity(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    needs_deletions: bool,
+) -> Result<Option<InternalCacheKey>> {
+    fragment
+        .deletion_file
+        .as_ref()
+        .filter(|_| needs_deletions)
+        .map(|file| {
+            let mut builder = KeyBuilder::new(
+                CacheNamespace::root(),
+                DeletionFileKey::stable_type_id(),
+                DeletionFileKey::schema(),
+            );
+            DeletionFileKey {
+                fragment_id: fragment.id,
+                deletion_file: file,
+            }
+            .write_key(&mut builder);
+            if let Some(inline) = &file.inline {
+                builder.write_some();
+                builder.write_bytes(inline);
+            } else {
+                builder.write_none();
+                write_base_identity(dataset, file.base_id, &mut builder)?;
+            }
+            Ok(builder.finish())
+        })
+        .transpose()
+}
+
+async fn load_source(
+    dataset: &Dataset,
+    fragment: &Fragment,
+    sequence: Arc<RowIdSequence>,
+    needs_deletions: bool,
+) -> Result<FragmentRowIdIndex> {
+    // The index owns and charges these vectors, rather than retaining them in
+    // the metadata cache as well.
+    let deletion_vector = match &fragment.deletion_file {
+        Some(file) if needs_deletions => Arc::new(
+            read_deletion_file(
+                fragment.id,
+                file,
+                &dataset.dataset_dir_for_deletion(file)?,
+                dataset.object_store_for_deletion(file).await?.as_ref(),
+            )
+            .await?,
+        ),
+        _ => Arc::new(DeletionVector::default()),
+    };
+    Ok(FragmentRowIdIndex {
+        fragment_id: fragment.id as u32,
+        row_id_sequence: sequence,
+        deletion_vector,
     })
 }
 
@@ -293,15 +359,16 @@ mod tests {
     use arrow_array::{RecordBatchIterator, record_batch};
     use lance_core::utils::address::RowAddress;
     use lance_datagen::array;
-    use lance_table::format::BasePath;
+    use lance_table::format::{BasePath, DeletionFile, DeletionFileType};
     use lance_table::rowids::version::RowDatasetVersionSequence;
     use lance_table::transaction::{Operation, Transaction};
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use super::*;
     use crate::dataset::rowids::{
         INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY,
-        get_row_id_index, place_row_lineage,
+        get_row_id_index, get_row_id_index_with, place_row_lineage,
     };
     use crate::dataset::write::CommitBuilder;
     use crate::dataset::{ProjectionRequest, WriteParams};
@@ -389,12 +456,18 @@ mod tests {
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         current.append(reader, None).await.unwrap();
 
+        let reads_before = current.object_store.io_stats_snapshot();
         let index = get_row_id_index(&current).await.unwrap().unwrap();
+        assert_eq!(
+            current.object_store.io_stats_snapshot().read_iops,
+            reads_before.read_iops
+        );
         let after = current.index_cache.get_with_key(&key).await.unwrap();
         assert_eq!(after.fragments.len(), before.fragments.len() + 1);
         for (old, new) in before.fragments.iter().zip(&after.fragments) {
-            assert!(Arc::ptr_eq(&old.sequence, &new.sequence));
-            assert!(Arc::ptr_eq(&old.deletions, &new.deletions));
+            assert_eq!(old.identity, new.identity);
+            assert_eq!(old.span, new.span);
+            assert_eq!(old.deletion_identity, new.deletion_identity);
         }
         assert!(index.get(40).unwrap().is_some());
         assert!(original_index.get(40).unwrap().is_none());
@@ -579,10 +652,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let reads_before = dataset.object_store.io_stats_snapshot();
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_iops,
+            reads_before.read_iops
+        );
         let after = dataset.index_cache.get_with_key(&key).await.unwrap();
         for (old, new) in before.fragments.iter().zip(&after.fragments) {
-            assert!(Arc::ptr_eq(&old.sequence, &new.sequence));
+            assert_eq!(old.identity, new.identity);
+            assert_eq!(old.span, new.span);
         }
         for row_id in 0..40 {
             // 23 is the multiplicative inverse of 7 modulo 40.
@@ -617,5 +696,246 @@ mod tests {
                 .is_none()
         );
         assert!(old_index.get(9).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn inline_deletion_contents_are_part_of_reuse_identity() {
+        let mut dataset = dataset(false).await;
+        let mut indices = Vec::new();
+        for deleted_offset in [0u32, 1] {
+            let mut encoded = Vec::new();
+            RoaringBitmap::from_iter([deleted_offset])
+                .serialize_into(&mut encoded)
+                .unwrap();
+            let mut fragments = dataset.manifest.fragments.as_ref().clone();
+            // Inline contents determine visibility even if the file-like
+            // identity fields are unchanged in a manifest supplied by a caller.
+            fragments[0].deletion_file = Some(DeletionFile {
+                read_version: 1,
+                id: 42,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                inline: Some(encoded.into()),
+            });
+            let transaction = Transaction::new_from_version(
+                dataset.version().version,
+                Operation::Merge {
+                    fragments,
+                    schema: dataset.schema().clone(),
+                    preserves_nullability: true,
+                },
+            );
+            dataset = CommitBuilder::new(Arc::new(dataset))
+                .execute(transaction)
+                .await
+                .unwrap();
+            let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+            for row_id in 0..3 {
+                assert_eq!(
+                    index.get(row_id).unwrap(),
+                    if row_id == u64::from(deleted_offset) {
+                        None
+                    } else {
+                        Some(RowAddress::new_from_parts(0, row_id as u32))
+                    }
+                );
+            }
+            indices.push(index);
+        }
+        assert_eq!(indices[0].get(0).unwrap(), None);
+        assert_eq!(
+            indices[1].get(0).unwrap(),
+            Some(RowAddress::new_from_parts(0, 0))
+        );
+    }
+
+    #[rstest]
+    #[case::inline(false)]
+    #[case::spilled(true)]
+    #[tokio::test]
+    async fn new_overlap_changes_effective_deletions(#[case] spilled: bool) {
+        let mut current = dataset(spilled).await;
+        current.delete("i = 7").await.unwrap();
+        let old = current.clone();
+        let old_index = get_row_id_index_with(&old, false).await.unwrap().unwrap();
+        // Without overlap this mode deliberately maps even deleted IDs.
+        assert!(old_index.get(7).unwrap().is_some());
+
+        let batch = record_batch!(("i", Int32, [400])).unwrap();
+        current
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut fragments = current.manifest.fragments.as_ref().clone();
+        let fragment = fragments.last_mut().unwrap();
+        let new_fragment_id = fragment.id as u32;
+        let lineage = RowLineage {
+            row_ids: RowIdSequence::try_from_iter([7]).unwrap(),
+            created_at: RowDatasetVersionSequence::from_uniform_row_count(1, 1),
+            last_updated_at: RowDatasetVersionSequence::from_uniform_row_count(1, 1),
+        };
+        place_row_lineage(&current, &lineage)
+            .await
+            .unwrap()
+            .apply(fragment);
+        let transaction = Transaction::new_from_version(
+            current.version().version,
+            Operation::Merge {
+                fragments,
+                schema: current.schema().clone(),
+                preserves_nullability: true,
+            },
+        );
+        current = CommitBuilder::new(Arc::new(current))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let index = get_row_id_index_with(&current, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            index.get(7).unwrap(),
+            Some(RowAddress::new_from_parts(new_fragment_id, 0))
+        );
+        let batch = current
+            .take_rows(
+                &[7, 7],
+                ProjectionRequest::from_columns(["i"], current.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+            &[400, 400]
+        );
+        let revisited = get_row_id_index_with(&old, false).await.unwrap().unwrap();
+        assert_eq!(revisited.get(7).unwrap(), old_index.get(7).unwrap());
+        assert_ne!(revisited.get(7).unwrap(), index.get(7).unwrap());
+    }
+
+    #[tokio::test]
+    async fn append_with_old_index_and_without_original_sequences() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(1),
+                FragmentRowCount::from(4096),
+                Some(WriteParams {
+                    enable_stable_row_ids: true,
+                    max_rows_per_file: 4096,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .update_config([
+                (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+                (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+            ])
+            .await
+            .unwrap();
+        let mut fragments = dataset.manifest.fragments.as_ref().clone();
+        let lineage = RowLineage {
+            row_ids: RowIdSequence::try_from_iter((0..4096).map(|position| (position * 7) % 4096))
+                .unwrap(),
+            created_at: RowDatasetVersionSequence::from_uniform_row_count(4096, 1),
+            last_updated_at: RowDatasetVersionSequence::from_uniform_row_count(4096, 1),
+        };
+        place_row_lineage(&dataset, &lineage)
+            .await
+            .unwrap()
+            .apply(&mut fragments[0]);
+        assert!(matches!(fragments[0].row_id_meta, Some(RowIdMeta::Column)));
+        let transaction = Transaction::new_from_version(
+            dataset.version().version,
+            Operation::Merge {
+                fragments,
+                schema: dataset.schema().clone(),
+                preserves_nullability: true,
+            },
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+        let compact = build(&dataset, true, None).await.unwrap();
+        // Admit one prepared graph and the small append directory, but not an
+        // additional copy of the original shuffled IDs. Hold the old view below.
+        let capacity = compact.deep_size_of() + 8192;
+        drop(compact);
+        let session = Arc::new(Session::new(
+            capacity,
+            0,
+            dataset.session().store_registry(),
+        ));
+        // A plain memory:// reopen creates another store. Keep this fixture's
+        // existing store binding while replacing both session cache scopes.
+        let mut dataset = dataset;
+        dataset.index_cache = Arc::new(session.index_cache.for_dataset(&dataset.uri));
+        dataset.metadata_cache = Arc::new(session.metadata_cache.for_dataset(&dataset.uri));
+        dataset.session = session.clone();
+        let first = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let before = dataset.object_store.io_stats_snapshot();
+        let second = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(session.index_cache_stats().await.size_bytes <= capacity);
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_iops,
+            before.read_iops
+        );
+        assert_eq!(
+            second.get_many(&[0, 7, 14, 4095, 9999, 7]).unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(0, 0)),
+                Some(RowAddress::new_from_parts(0, 1)),
+                Some(RowAddress::new_from_parts(0, 2)),
+                Some(RowAddress::new_from_parts(0, 585)),
+                None,
+                Some(RowAddress::new_from_parts(0, 1)),
+            ]
+        );
+        let batch = dataset
+            .take_rows(
+                &[7, 14, 0],
+                ProjectionRequest::from_columns(["i"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+            &[1, 2, 0]
+        );
+        let old_snapshot = dataset.clone();
+        let batch = record_batch!(("i", Int32, [4096])).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = dataset.object_store.io_stats_snapshot();
+        let appended = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_iops,
+            before.read_iops
+        );
+        assert_eq!(appended.get(7).unwrap(), first.get(7).unwrap());
+        assert!(appended.get(4096).unwrap().is_some());
+        assert_eq!(first.get(4096).unwrap(), None);
+        assert!(session.index_cache_stats().await.size_bytes <= capacity);
+        let revisited = get_row_id_index(&old_snapshot).await.unwrap().unwrap();
+        assert_eq!(
+            dataset.object_store.io_stats_snapshot().read_iops,
+            before.read_iops
+        );
+        assert_eq!(revisited.get(4096).unwrap(), None);
+        assert_eq!(revisited.get(7).unwrap(), first.get(7).unwrap());
     }
 }
