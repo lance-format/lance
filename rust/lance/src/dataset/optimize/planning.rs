@@ -575,6 +575,58 @@ pub struct CompactionPlan {
     pub options: CompactionOptions,
 }
 
+/// Source work selected by a compaction plan's hard run budgets.
+///
+/// `next_task_source_rows` identifies the first task held back. If no tasks
+/// were selected, callers can distinguish a blocked budget from no work.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceBudgetSummary {
+    /// Number of eligible tasks before applying the run budgets.
+    pub candidate_tasks: usize,
+    /// Number of tasks admitted into this plan.
+    pub selected_tasks: usize,
+    /// Live source rows admitted into this plan.
+    pub selected_source_rows: usize,
+    /// Live source rows in the first task excluded by a budget.
+    pub next_task_source_rows: Option<usize>,
+    /// Source fragments in the first task excluded by a budget.
+    pub next_task_source_fragments: Option<usize>,
+}
+
+impl SourceBudgetSummary {
+    /// Whether a hard budget left eligible work out of this plan.
+    ///
+    /// ```
+    /// use lance::dataset::optimize::SourceBudgetSummary;
+    /// assert!(!SourceBudgetSummary::default().budget_exhausted());
+    /// ```
+    pub fn budget_exhausted(&self) -> bool {
+        self.selected_tasks < self.candidate_tasks
+    }
+
+    /// Whether eligible work exists but the first task cannot fit the budgets.
+    ///
+    /// ```
+    /// use lance::dataset::optimize::SourceBudgetSummary;
+    /// assert!(!SourceBudgetSummary::default().is_blocked());
+    /// ```
+    pub fn is_blocked(&self) -> bool {
+        self.selected_tasks == 0 && self.budget_exhausted()
+    }
+}
+
+/// A compaction plan together with its source-budget admission outcome.
+///
+/// Obtained from [`DefaultCompactionPlanner::plan_with_budget`]. The ordinary
+/// [`CompactionPlan`] remains unchanged for existing callers and serialized plans.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionPlanningResult {
+    /// The tasks that fit the configured hard budgets.
+    pub plan: CompactionPlan,
+    /// Admitted work and the first task that could not fit.
+    pub source_budget: SourceBudgetSummary,
+}
+
 /// A single group of fragments to compact, which is a view into the compaction
 /// plan. We keep the `replace_range` indices so we can map the result of the
 /// compact back to the fragments it replaces.
@@ -1032,7 +1084,8 @@ impl DefaultCompactionPlanner {
         } else {
             all_tasks
         };
-        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+        let (tasks, _source_budget) =
+            limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         // Checked last, over the tasks the budgets kept: only a source that
         // will really be rewritten can refuse the plan, the same set the
@@ -1063,6 +1116,29 @@ impl DefaultCompactionPlanner {
 #[async_trait::async_trait]
 impl CompactionPlanner for DefaultCompactionPlanner {
     async fn plan(&self, dataset: &Dataset) -> Result<CompactionPlan> {
+        Ok(self.plan_with_budget(dataset).await?.plan)
+    }
+}
+
+impl DefaultCompactionPlanner {
+    /// Plan compaction and report work held back by the hard source budgets.
+    /// Unlike an empty plan alone, the summary distinguishes an idle dataset
+    /// from an oversized first task. Tasks are admitted whole.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner};
+    /// # async fn plan(dataset: &Dataset) -> Result<()> {
+    /// let result = DefaultCompactionPlanner::new(CompactionOptions {
+    ///     max_source_rows: Some(5_000_000), ..Default::default()
+    /// })?.plan_with_budget(dataset).await?;
+    /// if result.source_budget.is_blocked() {
+    ///     let minimum = result.source_budget.next_task_source_rows;
+    ///     # let _ = minimum;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn plan_with_budget(&self, dataset: &Dataset) -> Result<CompactionPlanningResult> {
         let write_version = self.options.write_version(dataset);
         versions::validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),
@@ -1321,7 +1397,8 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             })
             .collect();
 
-        let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
+        let (tasks, source_budget) =
+            limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
@@ -1329,7 +1406,10 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let mut compaction_plan = CompactionPlan::new(dataset.manifest.version, options);
         compaction_plan.extend_tasks(tasks);
 
-        Ok(compaction_plan)
+        Ok(CompactionPlanningResult {
+            plan: compaction_plan,
+            source_budget,
+        })
     }
 }
 
@@ -1444,62 +1524,49 @@ fn limit_tasks_to_source_budget(
     options: &CompactionOptions,
     schema: &lance_core::datatypes::Schema,
     all_tasks: Vec<(TaskData, usize)>,
-) -> Result<Vec<TaskData>> {
-    if options.max_source_fragments.is_none()
-        && options.max_source_rows.is_none()
-        && options.max_source_bytes.is_none()
-    {
-        return Ok(all_tasks.into_iter().map(|(task, _)| task).collect());
-    }
-
-    // Only needed for the bytes budget: files whose fields are all absent
-    // from the current schema only back dropped columns, which compaction
-    // does not read.
+) -> Result<(Vec<TaskData>, SourceBudgetSummary)> {
     let schema_field_ids: HashSet<i32> = if options.max_source_bytes.is_some() {
         schema.field_ids().into_iter().collect()
     } else {
         HashSet::new()
     };
-
-    let num_candidate_tasks = all_tasks.len();
-    let mut total_fragments = 0_usize;
-    let mut total_rows = 0_usize;
-    let mut total_bytes = 0_u64;
+    let mut summary = SourceBudgetSummary {
+        candidate_tasks: all_tasks.len(),
+        ..Default::default()
+    };
+    let mut total_fragments = 0usize;
+    let mut total_bytes = 0u64;
     let mut tasks = Vec::with_capacity(all_tasks.len());
     for (task, live_rows) in all_tasks {
-        total_fragments += task.fragments.len();
-        total_rows = total_rows.saturating_add(live_rows);
-        if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
-        }
-
-        let over_budget = options
+        let next_fragments = total_fragments.saturating_add(task.fragments.len());
+        let next_rows = summary.selected_source_rows.saturating_add(live_rows);
+        let next_bytes = if options.max_source_bytes.is_some() {
+            total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?)
+        } else {
+            total_bytes
+        };
+        if options
             .max_source_fragments
-            .is_some_and(|max| total_fragments > max)
-            || options.max_source_rows.is_some_and(|max| total_rows > max)
-            || options
-                .max_source_bytes
-                .is_some_and(|max| total_bytes > max);
-        if over_budget {
+            .is_some_and(|max| next_fragments > max)
+            || options.max_source_rows.is_some_and(|max| next_rows > max)
+            || options.max_source_bytes.is_some_and(|max| next_bytes > max)
+        {
+            summary.next_task_source_rows = Some(live_rows);
+            summary.next_task_source_fragments = Some(task.fragments.len());
             break;
         }
-
+        total_fragments = next_fragments;
+        total_bytes = next_bytes;
+        summary.selected_source_rows = next_rows;
         tasks.push(task);
     }
-
-    if tasks.is_empty() && num_candidate_tasks > 0 {
-        warn!(
-            "Compaction plan is empty: the first of {} candidate tasks already exceeds a source \
-             budget (max_source_fragments={:?}, max_source_rows={:?}, max_source_bytes={:?}); \
-             compaction cannot make progress until the budget is raised",
-            num_candidate_tasks,
-            options.max_source_fragments,
-            options.max_source_rows,
-            options.max_source_bytes
-        );
+    summary.selected_tasks = tasks.len();
+    if summary.is_blocked() {
+        warn!(first_task_source_rows = ?summary.next_task_source_rows,
+            first_task_source_fragments = ?summary.next_task_source_fragments,
+            "Compaction source budget cannot admit the first eligible task");
     }
-
-    Ok(tasks)
+    Ok((tasks, summary))
 }
 
 /// Returns the total size in bytes of a task's source data and overlay files.
