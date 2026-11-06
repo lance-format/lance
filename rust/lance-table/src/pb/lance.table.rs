@@ -1261,11 +1261,11 @@ pub struct IndexMetadata {
     #[prost(map = "string, string", tag = "13")]
     pub metadata:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Resolves references stored in index files to committed IDs.
-    /// Absent when the files already store committed IDs.
-    /// Requires reader and writer feature flags.
-    #[prost(message, optional, tag = "14")]
-    pub row_binding: ::core::option::Option<IndexRowBinding>,
+    /// Maps stored local fragment IDs to committed source fragment IDs, preserving row offsets.
+    /// Absent when the index uses its normal committed row references.
+    /// Requires both reader and writer feature flags once a feature bit is assigned.
+    #[prost(message, optional, tag = "15")]
+    pub fragment_id_map: ::core::option::Option<FragmentIdMap>,
 }
 impl ::prost::Name for IndexMetadata {
     const NAME: &'static str = "IndexMetadata";
@@ -1277,128 +1277,23 @@ impl ::prost::Name for IndexMetadata {
         "/lance.table.IndexMetadata".into()
     }
 }
-/// A segment may bind fragment addresses, stable row IDs, or both.
-/// Readers reject an empty binding and an encoding they do not recognize.
+/// Segment local mapping from stored fragment IDs to committed source fragment IDs.
+/// Must be nonempty and cover every physical fragment ID stored in the segment.
+/// Values must be unique committed fragment IDs, and keys and values must be less than 2^32 - 1.
+/// Applied before the Fragment Reuse Index (FRI).
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct IndexRowBinding {
-    #[prost(message, optional, tag = "1")]
-    pub fragments: ::core::option::Option<FragmentBinding>,
-    #[prost(message, optional, tag = "2")]
-    pub row_ids: ::core::option::Option<StableRowBinding>,
+pub struct FragmentIdMap {
+    #[prost(map = "uint32, uint32", tag = "1")]
+    pub entries: ::std::collections::HashMap<u32, u32>,
 }
-impl ::prost::Name for IndexRowBinding {
-    const NAME: &'static str = "IndexRowBinding";
+impl ::prost::Name for FragmentIdMap {
+    const NAME: &'static str = "FragmentIdMap";
     const PACKAGE: &'static str = "lance.table";
     fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.IndexRowBinding".into()
+        "lance.table.FragmentIdMap".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.IndexRowBinding".into()
-    }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FragmentBinding {
-    #[prost(oneof = "fragment_binding::Encoding", tags = "1")]
-    pub encoding: ::core::option::Option<fragment_binding::Encoding>,
-}
-/// Nested message and enum types in `FragmentBinding`.
-pub mod fragment_binding {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
-    pub enum Encoding {
-        #[prost(message, tag = "1")]
-        Array(super::FragmentArray),
-    }
-}
-impl ::prost::Name for FragmentBinding {
-    const NAME: &'static str = "FragmentBinding";
-    const PACKAGE: &'static str = "lance.table";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.FragmentBinding".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.FragmentBinding".into()
-    }
-}
-/// Fragment ordinal i resolves to committed_fragment_ids\[i\].
-/// The list is nonempty and its entries are unique.
-/// Entries remain in place when index coverage shrinks.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct FragmentArray {
-    #[prost(uint32, repeated, tag = "1")]
-    pub committed_fragment_ids: ::prost::alloc::vec::Vec<u32>,
-}
-impl ::prost::Name for FragmentArray {
-    const NAME: &'static str = "FragmentArray";
-    const PACKAGE: &'static str = "lance.table";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.FragmentArray".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.FragmentArray".into()
-    }
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct StableRowBinding {
-    #[prost(oneof = "stable_row_binding::Encoding", tags = "1")]
-    pub encoding: ::core::option::Option<stable_row_binding::Encoding>,
-}
-/// Nested message and enum types in `StableRowBinding`.
-pub mod stable_row_binding {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Encoding {
-        #[prost(message, tag = "1")]
-        Spans(super::RowIdSpans),
-    }
-}
-impl ::prost::Name for StableRowBinding {
-    const NAME: &'static str = "StableRowBinding";
-    const PACKAGE: &'static str = "lance.table";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.StableRowBinding".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.StableRowBinding".into()
-    }
-}
-/// Every stored row ID covered by this binding matches exactly one span.
-/// An empty list is corrupt.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct RowIdSpans {
-    #[prost(message, repeated, tag = "1")]
-    pub spans: ::prost::alloc::vec::Vec<RowIdSpan>,
-}
-impl ::prost::Name for RowIdSpans {
-    const NAME: &'static str = "RowIdSpans";
-    const PACKAGE: &'static str = "lance.table";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.RowIdSpans".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.RowIdSpans".into()
-    }
-}
-/// Maps [stored_base, stored_base + count) to
-/// [committed_base, committed_base + count).
-/// count must be greater than zero.
-/// Spans must not overlap in the stored ID space or the committed ID space.
-/// A span must not overflow uint64.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct RowIdSpan {
-    #[prost(uint64, tag = "1")]
-    pub stored_base: u64,
-    #[prost(uint64, tag = "2")]
-    pub committed_base: u64,
-    #[prost(uint64, tag = "3")]
-    pub count: u64,
-}
-impl ::prost::Name for RowIdSpan {
-    const NAME: &'static str = "RowIdSpan";
-    const PACKAGE: &'static str = "lance.table";
-    fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.RowIdSpan".into()
-    }
-    fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.RowIdSpan".into()
+        "/lance.table.FragmentIdMap".into()
     }
 }
 /// Metadata about a single file within an index segment.

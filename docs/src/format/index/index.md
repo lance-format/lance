@@ -105,6 +105,8 @@ Index segments are created and updated through a transactional process:
      that carries no extra columns. Declaring a column here does not by itself make it servable --
      see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
+   - `fragment_id_map`: An optional mapping from stored local fragment IDs to committed
+     source fragment IDs (see [Fragment ID Mapping](#fragment-id-mapping)).
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
@@ -230,6 +232,8 @@ The `IndexMetadata` message contains important information about the index segme
   [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
   [Covering-field contracts](#covering-field-contracts).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
+- `fragment_id_map`: an optional mapping from stored local fragment IDs to committed
+  source fragment IDs (see [Fragment ID Mapping](#fragment-id-mapping)).
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 
@@ -245,6 +249,57 @@ There are both part of the `table.proto` file in the Lance source code.
 ```
 
 </details>
+
+### Fragment ID Mapping
+
+`IndexMetadata.fragment_id_map` (field 15) maps local fragment IDs in a segment's
+physical row addresses to committed source fragment IDs, preserving row offsets.
+This lets commit retries reuse prepared index files when a concurrent append
+changes the allocation. When absent, the index keeps its normal committed row
+references.
+
+For example, stored address `(17, 5)` with entry `17 -> 42` resolves to `(42, 5)`.
+If another append takes fragment 42 first, a retry can publish `17 -> 43` without
+rewriting the files. The manifest must publish the segment, map, and new source
+fragments atomically using its fragment allocation. Each mapped value must point
+to a committed fragment containing those indexed rows.
+
+```protobuf
+%%% proto.message.FragmentIdMap %%%
+```
+
+A mapped segment must follow these rules:
+
+- **Complete physical mapping:** Map keys are scoped to the segment. The map must
+  be nonempty and cover every stored physical fragment ID, including unchanged
+  IDs as explicit `id -> id` entries. Keys and values must be less than `2^32 - 1`,
+  and distinct keys must have distinct values. Null and tombstone markers are
+  unchanged. Readers must reject invalid or unsupported maps. Only index types
+  and versions supporting physical addresses and this mapping may use it.
+  Logical row IDs and column values, including `_rowid` search keys, are unchanged.
+
+- **Resolution order:** Apply the map before the
+  [Fragment Reuse Index (FRI)](system/frag_reuse.md), then apply visibility,
+  deletion, and fragment ownership checks before ranking. With entry `17 -> 42`
+  and FRI translation `(42, 5) -> (60, 3)`, stored address `(17, 5)` resolves to
+  `(60, 3)`. Retargeting the map to fragment 60 would lose the offset change.
+  Cached translated addresses must be scoped to the effective map and FRI state.
+
+- **Coverage:** `fragment_bitmap` follows the applicable FRI coverage and
+  provenance rules. The map decodes immutable files and need not match current
+  coverage. Removing coverage must retain map entries needed to decode retained
+  files.
+
+- **Maintenance:** Operations that keep index files keep their map. Rewrites and
+  merges resolve each input segment's references exactly once. Output containing
+  committed IDs omits the map. Output containing local IDs carries a complete map
+  matching those files. Unsupported maintenance must fail before commit or
+  withdraw affected coverage so queries fall back to a scan.
+
+- **Feature flags:** Every manifest containing a mapped segment must set both
+  reader and writer [feature flags](../table/versioning.md#feature-flags). The bit
+  is unassigned. Writers must not emit field 15 until it is assigned and reader
+  and writer support, including maintenance, is available.
 
 ### Index Segment Metadata
 
@@ -342,9 +397,3 @@ logical identifier that remains constant even when rows are moved during compact
 
 This feature is currently experimental. Performance evaluation is ongoing to determine
 when the tradeoff is worthwhile.
-
-## Durable row references
-
-Index files are immutable once written. Fragment IDs, and stable row IDs for new rows, are assigned when the commit builds the manifest. A concurrent commit can change those IDs after the index file has been written.
-
-[Durable index row references](durable_row_references.md) defines an optional `row_binding` on `IndexMetadata`. A retry replaces the binding and keeps the index files. Writers must not emit the field until its feature flag bit is assigned.

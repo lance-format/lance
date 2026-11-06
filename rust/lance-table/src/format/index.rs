@@ -492,11 +492,10 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             })
             .transpose()?;
 
-        // The files may contain local ordinals or provisional row ids. Dropping
-        // the binding here would publish those numbers as committed identities.
-        if proto.row_binding.is_some() {
+        // Reject mapped segments until stored fragment IDs can be resolved.
+        if proto.fragment_id_map.is_some() {
             return Err(Error::not_supported(
-                "index segment has a row binding, which this build does not apply",
+                "index segment has a fragment ID map, which this build does not support yet",
             ));
         }
 
@@ -583,7 +582,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
-            row_binding: None,
+            fragment_id_map: None,
         }
     }
 }
@@ -665,6 +664,7 @@ pub async fn list_index_files_with_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use rstest::rstest;
     use std::collections::HashMap;
 
@@ -742,20 +742,47 @@ mod tests {
     }
 
     #[test]
-    fn test_index_metadata_rejects_a_row_binding() {
-        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
-        proto.row_binding = Some(pb::IndexRowBinding {
-            fragments: Some(pb::FragmentBinding {
-                encoding: Some(pb::fragment_binding::Encoding::Array(pb::FragmentArray {
-                    committed_fragment_ids: vec![42, 47],
-                })),
-            }),
-            row_ids: None,
-        });
+    fn test_index_metadata_without_fragment_id_map() {
+        let metadata = index_metadata_with(vec![0], vec![]);
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(proto.fragment_id_map.is_none());
 
-        let err = IndexMetadata::try_from(proto).unwrap_err();
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.fragment_id_map.is_none());
+        assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
+    }
+
+    #[rstest]
+    #[case::mapped(vec![(17, 42), (29, 47)])]
+    #[case::empty(vec![])]
+    #[case::reserved_key(vec![(u32::MAX, 42)])]
+    #[case::reserved_source(vec![(17, u32::MAX)])]
+    #[case::aliased_sources(vec![(17, 42), (29, 42)])]
+    fn test_index_metadata_rejects_fragment_id_map(#[case] entries: Vec<(u32, u32)>) {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.fragment_id_map = Some(pb::FragmentIdMap {
+            entries: entries.into_iter().collect(),
+        });
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.fragment_id_map, proto.fragment_id_map);
+
+        let err = IndexMetadata::try_from(decoded).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
-        assert!(err.to_string().contains("row binding"), "got: {err}");
+        assert!(err.to_string().contains("fragment ID map"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_rejects_unknown_fragment_id_map_content() {
+        let proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        let mut bytes = proto.encode_to_vec();
+        // Field 15 contains only an unknown field in FragmentIdMap.
+        bytes.extend_from_slice(&[0x7a, 0x02, 0x10, 0x01]);
+        let decoded = pb::IndexMetadata::decode(bytes.as_slice()).unwrap();
+        assert_eq!(decoded.fragment_id_map, Some(pb::FragmentIdMap::default()));
+
+        let err = IndexMetadata::try_from(decoded).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
+        assert!(err.to_string().contains("fragment ID map"), "got: {err}");
     }
 
     #[test]

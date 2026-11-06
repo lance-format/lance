@@ -1,7 +1,6 @@
 title: Index Formats
 nav:
   - Overview: index.md
-  - Durable row references: durable_row_references.md
   - Scalar Indices: scalar
   - Vector Indices: vector
   - System Indices: system
