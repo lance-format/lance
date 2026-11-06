@@ -18,8 +18,9 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
-    sample_row_offsets, validate_dataset_root_for_drop, write_manifest_file,
+    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
+    write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -47,6 +48,7 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
+    reader::FileReaderOptions,
     version::{ConcreteFileVersion, LanceFileVersion},
     writer::FileWriterOptions,
 };
@@ -74,6 +76,71 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[tokio::test]
+async fn test_file_reader_options_preserve_dataset_defaults() {
+    let dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    let dataset = Dataset::write(
+        reader,
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.file_reader_options().is_none());
+    Dataset::write(
+        gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1)),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let dataset = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            file_reader_options: Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    let mut per_read = dataset.file_reader_options().unwrap().clone();
+    per_read.batch_size_bytes = Some(2048);
+    assert_eq!(per_read.read_chunk_size, 1234);
+    for (snapshot, expected_rows) in [
+        (dataset.clone(), 8),
+        (dataset.checkout_version(1).await.unwrap(), 4),
+    ] {
+        let defaults = snapshot.file_reader_options().unwrap();
+        assert_eq!(defaults.read_chunk_size, 1234);
+        assert_eq!(defaults.batch_size_bytes, Some(4096));
+        let batch = snapshot
+            .scan()
+            .with_file_reader_options(per_read.clone())
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        assert_eq!(
+            snapshot.file_reader_options().unwrap().batch_size_bytes,
+            Some(4096)
+        );
+    }
 }
 
 #[rstest]

@@ -2946,6 +2946,27 @@ impl Dataset {
         self.store_params.as_deref()
     }
 
+    /// Dataset-level file-reader defaults supplied through [`ReadParams`].
+    ///
+    /// `None` means no explicit options were supplied and readers use their
+    /// defaults. Clone these options when creating a per-read override so that
+    /// unrelated settings are preserved without changing the shared dataset.
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # use lance::dataset::scanner::Scanner;
+    /// fn scan_with_byte_limit(dataset: &Dataset) -> Scanner {
+    ///     let mut options = dataset.file_reader_options().cloned().unwrap_or_default();
+    ///     options.batch_size_bytes = Some(1024 * 1024);
+    ///     let mut scanner = dataset.scan();
+    ///     scanner.with_file_reader_options(options);
+    ///     scanner
+    /// }
+    /// ```
+    pub fn file_reader_options(&self) -> Option<&FileReaderOptions> {
+        self.file_reader_options.as_deref()
+    }
+
     pub(crate) async fn object_store_for_data_file(
         &self,
         data_file: &DataFile,
