@@ -643,6 +643,13 @@ impl LanceCache {
         self.state.backend.capacity_bytes()
     }
 
+    /// Change the backend's weighted capacity, evicting entries as needed.
+    ///
+    /// Backends that cannot resize after construction return an error.
+    pub fn set_capacity(&self, capacity: usize) -> Result<()> {
+        self.state.backend.set_capacity(capacity)
+    }
+
     /// Largest admissible RAM entry, if reported by the backend. An admitted
     /// entry remains subject to ordinary cache eviction.
     ///
@@ -1563,11 +1570,12 @@ mod tests {
 
         assert_eq!(traversals(LanceCache::no_cache()).await, 0);
         assert_eq!(traversals(LanceCache::with_capacity(1024)).await, 1);
-        // The session caches use the quick backend, so it needs the same gate.
+        // The session caches use the quick backend, which is resizable and so
+        // always sizes entries, even while its capacity is zero.
         let quick = |capacity| {
             LanceCache::with_backend(Arc::new(quick::QuickCacheBackend::with_capacity(capacity)))
         };
-        assert_eq!(traversals(quick(0)).await, 0);
+        assert_eq!(traversals(quick(0)).await, 1);
         assert_eq!(traversals(quick(1024)).await, 1);
     }
 
