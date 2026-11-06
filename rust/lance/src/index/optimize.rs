@@ -574,7 +574,8 @@ async fn has_unsupported_frag_reuse_history(
         .has_unsupported_transitions())
 }
 
-/// Tokenizer resources in the planner matter only when it also executes tasks.
+/// Where optimization tasks execute. Split planning also opens reference indices
+/// on the driver.
 #[derive(Clone, Copy)]
 pub(crate) enum OptimizeExecution {
     Local,
@@ -589,7 +590,7 @@ async fn optimization_unavailable_reason(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
     tagged: bool,
-    execution: OptimizeExecution,
+    requires_local_tokenizer: bool,
 ) -> Result<Option<String>> {
     for segment in segments {
         if tagged {
@@ -612,7 +613,7 @@ async fn optimization_unavailable_reason(
                 )));
             }
         }
-        if matches!(execution, OptimizeExecution::Local)
+        if requires_local_tokenizer
             && let Some(details) = &segment.index_details
             && segment_has_inverted_details(segment)
         {
@@ -668,8 +669,22 @@ pub(crate) async fn plan_optimize_indices_or_skip(
         merges: Vec::new(),
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
+        let last = *segments.last().expect("an index has at least one segment");
+        // Without an N:1 merge the single-process optimize rebuilds the
+        // absorbed segments from scratch, and the only split that reproduces
+        // it is none. Inverted stays unsplit under stable row ids until its
+        // merge drops stale postings (issue #8085).
+        let split = bounded
+            && options.max_rows_to_consolidate.is_none()
+            && segment_has_merge_primitive(last)
+            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
+        // Split scalar planning needs the tokenizer on the driver before it
+        // can dispatch tasks. Tagged histories are refused before that open.
+        let requires_local_tokenizer =
+            matches!(execution, OptimizeExecution::Local) || (split && !tagged);
         if let Some(reason) =
-            optimization_unavailable_reason(dataset, &segments, tagged, execution).await?
+            optimization_unavailable_reason(dataset, &segments, tagged, requires_local_tokenizer)
+                .await?
         {
             if named {
                 return Err(Error::not_supported(format!(
@@ -679,19 +694,11 @@ pub(crate) async fn plan_optimize_indices_or_skip(
             log::warn!("Skipping optimization of index '{name}': {reason}");
             continue;
         }
-        let last = *segments.last().expect("an index has at least one segment");
         if options.max_rows_to_consolidate.is_some() {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
             continue;
         }
         let unindexed = dataset.unindexed_fragments(&name).await?;
-        // Without an N:1 merge the single-process optimize rebuilds the
-        // absorbed segments from scratch, and the only split that reproduces
-        // it is none. Inverted stays unsplit under stable row ids until its
-        // merge drops stale postings (issue #8085).
-        let split = bounded
-            && segment_has_merge_primitive(last)
-            && !(segment_has_inverted_details(last) && dataset.manifest.uses_stable_row_ids());
         if !split {
             if bounded {
                 log::warn!("Index '{name}' is not split, so it is optimized in one task");

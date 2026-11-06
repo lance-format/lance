@@ -1393,6 +1393,7 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
     #[case] tokenizer: &str,
     #[values(false, true)] is_bounded: bool,
     #[values(false, true)] has_manifest_tokenizer: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
 ) {
     let test_dir = TempStrDir::default();
     let mut dataset = gen_batch()
@@ -1401,7 +1402,16 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
             "text",
             array::cycle_utf8_literals(&["hello world", "lance"]),
         )
-        .into_dataset(&test_dir, FragmentCount(3), FragmentRowCount(2))
+        .into_dataset_with_params(
+            &test_dir,
+            FragmentCount(3),
+            FragmentRowCount(2),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: has_stable_row_ids,
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
     let mut segments = Vec::with_capacity(2);
@@ -1499,23 +1509,40 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
     assert!(error.to_string().contains(&tokenizer), "{error}");
 
     let options = OptimizeOptions::default().max_rows_per_task(is_bounded.then_some(2));
-    if !is_bounded {
-        // Workers may have tokenizer resources that are absent on the driver.
-        let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
-            .await
-            .unwrap();
-        assert_eq!(plan.tasks.len(), 2);
-        assert!(
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.tasks
+            .iter()
+            .filter(|task| task.reference.name == "i_idx")
+            .count(),
+        if is_bounded { 2 } else { 1 }
+    );
+    let named = options.clone().index_names(vec!["text_idx".into()]);
+    if !is_bounded || has_stable_row_ids {
+        // Unsplit tasks can use tokenizer resources installed only on workers.
+        // FTS remains unsplit with stable row IDs, even in bounded plans.
+        assert_eq!(
             plan.tasks
                 .iter()
-                .any(|task| task.reference.name == "text_idx")
+                .filter(|task| task.reference.name == "text_idx")
+                .count(),
+            1
         );
-        let named = options.clone().index_names(vec!["text_idx".into()]);
         let plan = crate::index::optimize::plan_optimize_indices(&dataset, &named)
             .await
             .unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].reference.name, "text_idx");
+    } else {
+        assert!(plan.tasks.iter().all(|task| task.reference.name == "i_idx"));
+        let error = crate::index::optimize::plan_optimize_indices(&dataset, &named)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("text_idx"), "{error}");
+        assert!(error.to_string().contains(&tokenizer), "{error}");
     }
     dataset.optimize_indices(&options).await.unwrap();
     assert_eq!(
