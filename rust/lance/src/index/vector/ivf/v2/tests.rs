@@ -41,6 +41,7 @@ use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
+use crate::index::vector::sq::build_sq_model;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{
     Dataset,
@@ -2528,11 +2529,13 @@ async fn test_distributed_vector_grouped_build_allows_concurrent_group_execution
         }
         IndexType::IvfSq => {
             let ivf_params = prepare_global_ivf(&ds_single, "vector").await;
-            VectorIndexParams::with_ivf_sq_params(
-                DistanceType::L2,
-                ivf_params,
-                SQBuildParams::default(),
-            )
+            let mut sq_params = SQBuildParams::default();
+            let sq_model = build_sq_model(&ds_single, "vector", DistanceType::L2, &sq_params)
+                .await
+                .unwrap();
+            // Physical merging requires every shard to use the same SQ bounds.
+            sq_params.model = Some(sq_model.metadata(None));
+            VectorIndexParams::with_ivf_sq_params(DistanceType::L2, ivf_params, sq_params)
         }
         other => panic!("unsupported test index type: {}", other),
     };
@@ -2952,12 +2955,20 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
                 pq_params,
             )
         }
-        "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
-            DistanceType::L2,
-            prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
-            SQBuildParams::default(),
-        ),
+        "IVF_HNSW_SQ" => {
+            let mut sq_params = SQBuildParams::default();
+            let sq_model = build_sq_model(&dataset, "vector", DistanceType::L2, &sq_params)
+                .await
+                .unwrap();
+            // Physical merging requires every shard to use the same SQ bounds.
+            sq_params.model = Some(sq_model.metadata(None));
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                HnswBuildParams::default(),
+                sq_params,
+            )
+        }
         "IVF_HNSW_RQ" => {
             // Shards merge only if they rotate vectors the same way.
             let rotation = RabitQuantizer::new_with_rotation::<Float32Type>(

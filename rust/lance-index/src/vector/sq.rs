@@ -143,6 +143,26 @@ impl Quantization for ScalarQuantizer {
             data.data_type()
         )))?;
 
+        params.validate(fsl.value_length() as usize)?;
+        if !matches!(
+            fsl.value_type(),
+            DataType::Float16 | DataType::Float32 | DataType::Float64
+        ) {
+            return Err(Error::invalid_input(format!(
+                "SQ builder: unsupported data type: {}",
+                fsl.value_type()
+            )));
+        }
+        if let Some(model) = &params.model {
+            return Ok(Self {
+                metadata: model.clone(),
+            });
+        }
+        if fsl.is_empty() {
+            return Err(Error::invalid_input(
+                "SQ training requires at least one finite, non-null vector",
+            ));
+        }
         let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
 
         match fsl.value_type() {
@@ -163,6 +183,7 @@ impl Quantization for ScalarQuantizer {
             }
         }
 
+        quantizer.metadata.validate_for_build()?;
         Ok(quantizer)
     }
 
@@ -265,6 +286,80 @@ mod tests {
     use half::f16;
 
     use super::*;
+
+    #[test]
+    fn test_reuse_sq_model_without_training() {
+        let empty =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(Vec::<f32>::new()), 2)
+                .unwrap();
+        let model = ScalarQuantizationMetadata {
+            dim: 2,
+            num_bits: 8,
+            bounds: -1.0..1.0,
+        };
+        let params = SQBuildParams {
+            model: Some(model.clone()),
+            sample_rate: 0,
+            ..Default::default()
+        };
+        let sq = ScalarQuantizer::build(&empty, DistanceType::L2, &params).unwrap();
+        assert_eq!(sq.metadata(None), model);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(vec![-1.0, 1.0]), 2)
+            .unwrap();
+        assert_eq!(
+            sq.quantize(&data)
+                .unwrap()
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<arrow_array::types::UInt8Type>()
+                .values()
+                .as_ref(),
+            &[0, 255]
+        );
+        let invalid = SQBuildParams {
+            model: Some(ScalarQuantizationMetadata { dim: 3, ..model }),
+            ..params
+        };
+        let err = ScalarQuantizer::build(&empty, DistanceType::L2, &invalid).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("requested dimension 2"));
+    }
+
+    #[rstest::rstest]
+    #[case::dimension(0, 8, 0.0, 1.0, "dimension")]
+    #[case::bits(2, 4, 0.0, 1.0, "num_bits")]
+    #[case::reversed(2, 8, 2.0, 1.0, "bounds")]
+    #[case::nan(2, 8, f64::NAN, 1.0, "bounds")]
+    #[case::infinity(2, 8, 0.0, f64::INFINITY, "bounds")]
+    #[case::overflow(2, 8, -f64::MAX, f64::MAX, "bounds")]
+    fn test_invalid_sq_model(
+        #[case] dim: usize,
+        #[case] num_bits: u16,
+        #[case] lower: f64,
+        #[case] upper: f64,
+        #[case] message: &str,
+    ) {
+        let err = ScalarQuantizationMetadata {
+            dim,
+            num_bits,
+            bounds: lower..upper,
+        }
+        .validate_for_build()
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains(message));
+    }
+
+    #[test]
+    fn test_constant_sq_model() {
+        ScalarQuantizationMetadata {
+            dim: 2,
+            num_bits: 8,
+            bounds: 1.0..1.0,
+        }
+        .validate_for_build()
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn test_f16_sq8() {

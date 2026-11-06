@@ -17,6 +17,7 @@ pub(crate) mod details;
 pub mod hamming;
 pub mod ivf;
 pub mod pq;
+pub mod sq;
 pub mod utils;
 
 #[cfg(test)]
@@ -798,6 +799,10 @@ async fn prepare_vector_segment_build(
             )));
         };
         validate_supported_rq_num_bits(rq_params.num_bits)?;
+    }
+
+    if let Some(StageParams::SQ(sq_params)) = stages.last() {
+        sq_params.validate(utils::get_vector_dim(dataset.schema(), column)?)?;
     }
 
     let num_partitions = match (ivf_params0.num_partitions, ivf_params0.centroids.as_ref()) {
@@ -2488,6 +2493,7 @@ fn derive_sq_params(sq_quantizer: &ScalarQuantizer) -> SQBuildParams {
     SQBuildParams {
         num_bits: sq_quantizer.num_bits(),
         sample_rate: 256, // Default
+        model: None,
     }
 }
 
