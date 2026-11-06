@@ -12,7 +12,7 @@
 
 use std::{borrow::Cow, ops::Deref, sync::Arc};
 
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
+use lance_core::cache::{CacheKey, CacheKeySchema, InternalCacheKey, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_select::RowAddrMask;
@@ -119,6 +119,39 @@ impl CacheKey for RowIdIndexKey {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.with_deletions as u64);
+    }
+}
+
+/// An immutable fragment's prepared row-ID lookup, including effective deletions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedRowIdFragmentKey {
+    pub source: InternalCacheKey,
+    pub deletion: Option<InternalCacheKey>,
+}
+
+impl CacheKey for PreparedRowIdFragmentKey {
+    type ValueType = crate::dataset::rowids::resolve::PreparedFragment;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment")
+    }
+
+    fn type_name() -> &'static str {
+        "PreparedRowIdFragment"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.source.as_bytes());
+        if let Some(deletion) = self.deletion {
+            builder.write_some();
+            builder.write_fixed_bytes(deletion.as_bytes());
+        } else {
+            builder.write_none();
+        }
     }
 }
 
