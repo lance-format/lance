@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -43,6 +45,8 @@ use arrow_array::{
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
@@ -55,6 +59,7 @@ use lance_file::{
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::ObjectStoreExt;
 use prost::Message;
 
@@ -69,6 +74,10 @@ use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+};
 use rand::{SeedableRng, rngs::StdRng};
 use rstest::rstest;
 
@@ -745,6 +754,181 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let _ = tracker.incremental_stats();
     cloned.index_statistics("id_idx").await.unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+/// Counts and artificially delays reads of deletion files. The delay holds
+/// concurrent cold-cache loads open long enough that they reliably overlap,
+/// so the store read count reflects cache coalescing (or its absence) rather
+/// than scheduling luck.
+#[derive(Debug, Default)]
+struct DelayedDeletionReads {
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReads {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl WrappingObjectStore for DelayedDeletionReads {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(DelayedDeletionReadStore {
+            target: original,
+            reads: self.reads.clone(),
+        })
+    }
+
+    // Deletion-file loads never list, so the pushed-down listing path can stay.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct DelayedDeletionReadStore {
+    target: Arc<dyn object_store::ObjectStore>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReadStore {
+    async fn count_and_delay(&self, location: &Path) {
+        if location.as_ref().contains(DELETIONS_DIR) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl std::fmt::Display for DelayedDeletionReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DelayedDeletionReadStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DelayedDeletionReadStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.count_and_delay(location).await;
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.count_and_delay(location).await;
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_cold_deletion_vector_loads_coalesce_to_single_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = file_object_store_uri(dir.path());
+
+    let batch = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(8))
+        .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        &uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset.delete("id < 2").await.unwrap();
+
+    // Re-open with a fresh session (cold metadata cache) on a store that counts
+    // and delays deletion-file reads.
+    let deletion_reads = Arc::new(DelayedDeletionReads::default());
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(deletion_reads.clone()),
+            ..Default::default()
+        })
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+
+    let fragment = dataset
+        .get_fragments()
+        .into_iter()
+        .find(|fragment| fragment.metadata.deletion_file.is_some())
+        .unwrap();
+    assert_eq!(
+        deletion_reads.reads(),
+        0,
+        "opening the dataset must not read the deletion file"
+    );
+
+    // 8 concurrent cold loads of the same deletion vector must not race: the
+    // metadata cache's single-flight load should let exactly one read through.
+    let deletion_vectors =
+        futures::future::join_all((0..8).map(|_| fragment.get_deletion_vector())).await;
+    for deletion_vector in deletion_vectors {
+        assert_eq!(deletion_vector.unwrap().unwrap().len(), 2);
+    }
+    assert_eq!(
+        deletion_reads.reads(),
+        1,
+        "concurrent cold deletion vector loads must coalesce into one store read"
+    );
 }
 
 #[tokio::test]
