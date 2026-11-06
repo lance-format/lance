@@ -469,11 +469,8 @@ mod tests {
 
     #[test]
     fn test_data_change_defaults_by_action_kind() {
-        let alter = Action::AlterField(AlterField {
-            field: FieldRef::Committed(1),
-            name: Some("renamed".into()),
-            nullable: None,
-        });
+        let alter =
+            Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_name("renamed"));
         assert!(!alter.is_data_change(), "a rename changes no row values");
 
         let remove = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(3)));

@@ -2997,7 +2997,7 @@ mod composite {
         // this commit publishes, not of what the actions touch.
         let dataset = commit(
             dataset,
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(1))],
         )
         .await;
 
@@ -3069,11 +3069,7 @@ mod composite {
                 .execute(composite_txn(
                     dataset.version().version,
                     vec![
-                        Action::AddField(AddField {
-                            local: 0,
-                            parent: None,
-                            def: int32_field(&format!("racer_{racer}")),
-                        }),
+                        Action::AddField(AddField::new(0, int32_field(&format!("racer_{racer}")))),
                         Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                             id: Ref::Local(0),
                             physical_rows: 5,
@@ -3095,11 +3091,7 @@ mod composite {
             .execute(composite_txn(
                 read_version,
                 vec![
-                    Action::AddField(AddField {
-                        local: 0,
-                        parent: None,
-                        def: int32_field("mine"),
-                    }),
+                    Action::AddField(AddField::new(0, int32_field("mine"))),
                     Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                         id: Ref::Local(0),
                         physical_rows: 5,
@@ -3163,15 +3155,15 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::AddBase(AddBase {
-                local: 0,
-                base: BasePath::new(
+            vec![Action::AddBase(AddBase::new(
+                0,
+                BasePath::new(
                     0,
                     "s3://elsewhere/data".into(),
                     Some("staging".into()),
                     false,
                 ),
-            })],
+            ))],
         )
         .await;
 
@@ -3240,11 +3232,11 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::AlterField(AlterField {
-                field: FieldRef::Committed(field_id),
-                name: Some("renamed".into()),
-                nullable: Some(true),
-            })],
+            vec![Action::AlterField(
+                AlterField::new(FieldRef::Committed(field_id))
+                    .with_name("renamed")
+                    .with_nullable(true),
+            )],
         )
         .await;
 
@@ -3411,16 +3403,11 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: lance_core::datatypes::Field::try_from(Field::new(
-                        "b",
-                        DataType::Int32,
-                        true,
-                    ))
-                    .unwrap(),
-                }),
+                Action::AddField(AddField::new(
+                    0,
+                    lance_core::datatypes::Field::try_from(Field::new("b", DataType::Int32, true))
+                        .unwrap(),
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(fragment_id),
@@ -3455,19 +3442,12 @@ mod composite {
         let dataset = commit(
             dataset,
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(0),
-                }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: lance_core::datatypes::Field::try_from(Field::new(
-                        "a",
-                        DataType::Int64,
-                        true,
-                    ))
-                    .unwrap(),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(0))),
+                Action::AddField(AddField::new(
+                    0,
+                    lance_core::datatypes::Field::try_from(Field::new("a", DataType::Int64, true))
+                        .unwrap(),
+                )),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(fragment_id),
@@ -3544,8 +3524,8 @@ mod composite {
         let reserved = commit(
             dataset,
             vec![
-                Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
-                Action::ReserveRowIds(ReserveRowIds { count: 5 }),
+                Action::ReserveFragmentIds(ReserveFragmentIds::new(1)),
+                Action::ReserveRowIds(ReserveRowIds::new(5)),
             ],
         )
         .await;
@@ -3750,13 +3730,16 @@ mod composite {
             ),
         ];
         if declare_read {
-            actions.push(Action::AssertCellsUnchanged(AssertCellsUnchanged {
-                fields: vec![FieldRef::Committed(source_id)],
-                rows: vec![RowSelection {
-                    fragment_id: u32::try_from(fragment_id).unwrap(),
-                    rows: SelectedRows::Full,
-                }],
-            }));
+            actions.push(Action::AssertCellsUnchanged(
+                AssertCellsUnchanged::try_new(
+                    vec![FieldRef::Committed(source_id)],
+                    vec![RowSelection {
+                        fragment_id: u32::try_from(fragment_id).unwrap(),
+                        rows: SelectedRows::Full,
+                    }],
+                )
+                .unwrap(),
+            ));
         }
         actions
     }
@@ -3898,11 +3881,10 @@ mod composite {
     }
 
     fn add_non_nullable_b_over_existing_data(dataset: &Dataset) -> Vec<Action> {
-        let mut actions = vec![Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
-        })];
+        let mut actions = vec![Action::AddField(AddField::new(
+            0,
+            LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
+        ))];
         for (index, fragment) in dataset.fragments().iter().enumerate() {
             actions.push(Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
@@ -3944,21 +3926,17 @@ mod composite {
     async fn nullable_test_dataset() -> Dataset {
         commit(
             test_dataset(false).await,
-            vec![Action::AlterField(AlterField {
-                field: FieldRef::Committed(0),
-                name: None,
-                nullable: Some(true),
-            })],
+            vec![Action::AlterField(
+                AlterField::new(FieldRef::Committed(0)).with_nullable(true),
+            )],
         )
         .await
     }
 
     fn tighten_field_zero() -> Vec<Action> {
-        vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: None,
-            nullable: Some(false),
-        })]
+        vec![Action::AlterField(
+            AlterField::new(FieldRef::Committed(0)).with_nullable(false),
+        )]
     }
 
     /// The tightening was valid against the version it read, but nulls written
@@ -3988,16 +3966,8 @@ mod composite {
         let original = test_dataset(false).await;
         let read_version = original.version().version;
         let mut add_and_tighten = vec![
-            Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: int32_field("b"),
-            }),
-            Action::AlterField(AlterField {
-                field: FieldRef::Local(0),
-                name: None,
-                nullable: Some(false),
-            }),
+            Action::AddField(AddField::new(0, int32_field("b"))),
+            Action::AlterField(AlterField::new(FieldRef::Local(0)).with_nullable(false)),
         ];
         for (index, fragment) in original.fragments().iter().enumerate() {
             add_and_tighten.push(Action::AddDataFile(
@@ -4033,11 +4003,7 @@ mod composite {
         let nullable = nullable_test_dataset().await;
         let with_b = commit(
             nullable,
-            vec![Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: int32_field("b"),
-            })],
+            vec![Action::AddField(AddField::new(0, int32_field("b")))],
         )
         .await;
         let read_version = with_b.version().version;
@@ -4088,20 +4054,17 @@ mod composite {
                 .execute(composite_txn(read_version, actions))
         };
 
-        let error = detached(vec![Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: int32_field("detached"),
-        })])
+        let error = detached(vec![Action::AddField(AddField::new(
+            0,
+            int32_field("detached"),
+        ))])
         .await
         .unwrap_err();
         assert!(error.to_string().contains("Detached"), "{error}");
 
-        detached(vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        })])
+        detached(vec![Action::AlterField(
+            AlterField::new(FieldRef::Committed(0)).with_name("renamed"),
+        )])
         .await
         .unwrap();
     }
@@ -4374,11 +4337,7 @@ mod composite {
             "{error}"
         );
 
-        let mut actions = vec![Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: int32_field("b"),
-        })];
+        let mut actions = vec![Action::AddField(AddField::new(0, int32_field("b")))];
         let mut covered = Vec::new();
         for (index, fragment) in dataset.fragments().iter().enumerate() {
             actions.push(Action::AddDataFile(
@@ -5091,12 +5050,13 @@ mod composite {
                     )
                     .unwrap(),
                 ),
-                Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-                    rows: vec![RowSelection {
+                Action::RefreshRowVersionMetadata(
+                    RefreshRowVersionMetadata::try_new(vec![RowSelection {
                         fragment_id: u32::try_from(rewritten).unwrap(),
                         rows: SelectedRows::Full,
-                    }],
-                }),
+                    }])
+                    .unwrap(),
+                ),
             ],
         )
         .await;
@@ -5462,9 +5422,7 @@ mod composite {
 
         let dropped = commit(
             dataset.clone(),
-            vec![Action::DropField(DropField {
-                field: FieldRef::Committed(0),
-            })],
+            vec![Action::DropField(DropField::new(FieldRef::Committed(0)))],
         )
         .await;
 
@@ -5755,11 +5713,7 @@ mod composite {
             let dataset = four_fragments().await;
             let read_version = dataset.version().version;
             let new_column = vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: int32_field("b"),
-                }),
+                Action::AddField(AddField::new(0, int32_field("b"))),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),

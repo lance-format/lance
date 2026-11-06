@@ -24,11 +24,26 @@ use lance_core::{Error, Result};
 /// concurrent new segment must not be swept up in.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct DropIndex {
-    /// The logical index to drop.
-    pub name: String,
+    name: String,
 }
 
 impl DropIndex {
+    /// Drop the logical index `name`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`.
+    pub fn try_new(name: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            name: non_empty(name.into(), "DropIndex.name")?,
+        })
+    }
+
+    /// The logical index dropped.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         reject_frag_reuse_history("DropIndex", &self.name)?;
         state.drop_index(&self.name)
@@ -63,9 +78,7 @@ impl TryFrom<pb_actions::DropIndex> for DropIndex {
     type Error = Error;
 
     fn try_from(message: pb_actions::DropIndex) -> Result<Self> {
-        Ok(Self {
-            name: non_empty(message.name, "DropIndex.name")?,
-        })
+        Self::try_new(message.name)
     }
 }
 
@@ -87,7 +100,7 @@ mod tests {
     use uuid::Uuid;
 
     fn drop_index(name: &str) -> Action {
-        Action::DropIndex(DropIndex { name: name.into() })
+        Action::DropIndex(DropIndex::try_new(name).unwrap())
     }
 
     fn add_segment(name: &str, covered: Vec<Ref>) -> Action {

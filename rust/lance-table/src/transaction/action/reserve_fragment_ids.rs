@@ -29,10 +29,20 @@ use lance_core::{Error, Result};
 /// belong to someone else.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct ReserveFragmentIds {
-    pub count: u32,
+    count: u32,
 }
 
 impl ReserveFragmentIds {
+    /// Reserve `count` fragment ids.
+    pub fn new(count: u32) -> Self {
+        Self { count }
+    }
+
+    /// How many fragment ids are reserved.
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         state.reserve_fragment_ids(self.count)
     }
@@ -60,9 +70,7 @@ impl TryFrom<pb_actions::ReserveFragmentIds> for ReserveFragmentIds {
     type Error = Error;
 
     fn try_from(message: pb_actions::ReserveFragmentIds) -> Result<Self> {
-        Ok(Self {
-            count: message.count,
-        })
+        Ok(Self::new(message.count))
     }
 }
 

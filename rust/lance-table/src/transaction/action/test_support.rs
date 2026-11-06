@@ -155,10 +155,10 @@ pub(super) fn replace_field_data(fragment: u64, field: i32, data_change: bool) -
 
 /// An action minting base token 0 at a location no fixture uses.
 pub(super) fn mint_base() -> Action {
-    Action::AddBase(super::AddBase {
-        local: 0,
-        base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
-    })
+    Action::AddBase(super::AddBase::new(
+        0,
+        BasePath::new(0, "s3://bucket/minted".into(), None, false),
+    ))
 }
 
 /// A v2 data file with one top-level column, as a writer hands it to

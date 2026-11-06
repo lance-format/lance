@@ -4,7 +4,7 @@
 //! Assert that the cells an operation read are unchanged.
 
 use super::apply::ApplyState;
-use super::row_selection::row_selections_from_proto;
+use super::row_selection::{reject_repeated_fragments, row_selections_from_proto};
 use super::{FieldRef, Footprint, Ref, RowSelection};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
@@ -37,27 +37,45 @@ use lance_core::{Error, Result};
 /// parent, and the reverse.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertCellsUnchanged {
-    /// The fields read. Committed only: a field minted in the same operation
-    /// has no value at the version read. Empty declares no cells.
-    pub fields: Vec<FieldRef>,
-    /// The rows read, one selection per committed fragment. Empty declares no
-    /// cells.
-    pub rows: Vec<RowSelection>,
+    fields: Vec<FieldRef>,
+    rows: Vec<RowSelection>,
 }
 
 impl AssertCellsUnchanged {
+    /// Declare that the operation read `fields` at `rows`. Either empty
+    /// declares no cells.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a field minted in the same operation, which has no value at the
+    /// version read, and a fragment selected twice.
+    pub fn try_new(fields: Vec<FieldRef>, rows: Vec<RowSelection>) -> Result<Self> {
+        if let Some(token) = fields.iter().find_map(FieldRef::local) {
+            return Err(Error::invalid_input(format!(
+                "AssertCellsUnchanged names a field minted in the same operation (local \
+                 token {token}), which has no value at the version read"
+            )));
+        }
+        reject_repeated_fragments(&rows, "AssertCellsUnchanged")?;
+        Ok(Self { fields, rows })
+    }
+
+    /// The fields read, all committed.
+    pub fn fields(&self) -> &[FieldRef] {
+        &self.fields
+    }
+
+    /// The rows read, one selection per committed fragment.
+    pub fn rows(&self) -> &[RowSelection] {
+        &self.rows
+    }
+
     /// Nothing to apply -- the assertion is checked when two operations are
     /// compared. What it names is still checked against the version it lands
     /// on, so an assertion over something that is not there fails rather than
     /// silently guarding nothing.
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         for field in &self.fields {
-            if let FieldRef::Local(token) = field {
-                return Err(Error::invalid_input(format!(
-                    "AssertCellsUnchanged names a field minted in the same operation (local \
-                     token {token}), which has no value at the version read"
-                )));
-            }
             let field_id = state.resolve_schema_field(*field, "AssertCellsUnchanged")?;
             let field = state.schema().field_by_id(field_id).ok_or_else(|| {
                 Error::invalid_input(format!(
@@ -128,14 +146,14 @@ impl TryFrom<pb_actions::AssertCellsUnchanged> for AssertCellsUnchanged {
     type Error = Error;
 
     fn try_from(message: pb_actions::AssertCellsUnchanged) -> Result<Self> {
-        Ok(Self {
-            fields: message
+        Self::try_new(
+            message
                 .fields
                 .into_iter()
                 .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
-            rows: row_selections_from_proto(message.rows, "AssertCellsUnchanged")?,
-        })
+            row_selections_from_proto(message.rows, "AssertCellsUnchanged")?,
+        )
     }
 }
 
@@ -159,16 +177,19 @@ mod tests {
     use std::sync::Arc;
 
     fn read(fields: &[i32], fragments: &[u32]) -> Action {
-        Action::AssertCellsUnchanged(AssertCellsUnchanged {
-            fields: fields.iter().copied().map(FieldRef::Committed).collect(),
-            rows: fragments
-                .iter()
-                .map(|fragment_id| RowSelection {
-                    fragment_id: *fragment_id,
-                    rows: SelectedRows::Full,
-                })
-                .collect(),
-        })
+        Action::AssertCellsUnchanged(
+            AssertCellsUnchanged::try_new(
+                fields.iter().copied().map(FieldRef::Committed).collect(),
+                fragments
+                    .iter()
+                    .map(|fragment_id| RowSelection {
+                        fragment_id: *fragment_id,
+                        rows: SelectedRows::Full,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
     }
 
     fn rewrite(fragment: u64, field: i32) -> Vec<Action> {
@@ -238,9 +259,12 @@ mod tests {
         vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))],
         true
     )]
-    #[case::dropped_the_field(vec![Action::DropField(DropField { field: FieldRef::Committed(1) })], true)]
+    #[case::dropped_the_field(
+        vec![Action::DropField(DropField::new(FieldRef::Committed(1)))],
+        true
+    )]
     #[case::redefined_the_field(
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
         true
     )]
     #[case::rewrote_the_field_elsewhere(rewrite(1, 1), false)]
@@ -309,23 +333,12 @@ mod tests {
     #[case::a_list(read(&[3], &[0]), Some("names field 3 ('tags'), which is nested or holds nested fields"))]
     #[case::a_list_item(read(&[4], &[0]), Some("names field 4 ('item'), which is nested or holds nested fields"))]
     #[case::a_reserved_id(read(&[-3], &[0]), Some("names reserved field id -3"))]
-    #[case::a_field_minted_in_the_operation(
-        Action::AssertCellsUnchanged(AssertCellsUnchanged {
-            fields: vec![FieldRef::Local(0)],
-            rows: vec![RowSelection { fragment_id: 0, rows: SelectedRows::Full }],
-        }),
-        Some("names a field minted in the same operation")
-    )]
     fn test_an_assertion_names_cells_that_exist(
         #[case] assertion: Action,
         #[case] expected_error: Option<&str>,
     ) {
         let actions = vec![
-            Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("fresh"),
-            }),
+            Action::AddField(AddField::new(0, added_field("fresh"))),
             assertion,
         ];
         let result = apply(&nested_manifest(), actions);
@@ -342,6 +355,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A field minted in the same operation has no value at the version read.
+    #[test]
+    fn test_an_assertion_rejects_a_minted_field() {
+        let error = AssertCellsUnchanged::try_new(
+            vec![FieldRef::Local(0)],
+            vec![RowSelection {
+                fragment_id: 0,
+                rows: SelectedRows::Full,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("names a field minted in the same operation"),
+            "unexpected error: {error}"
+        );
     }
 
     #[rstest]

@@ -17,17 +17,48 @@ use lance_core::{Error, Result};
 /// `AddField`s -- parent first, each child naming its parent's local token.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddField {
-    /// Token standing in for the field id until it is allocated at apply.
-    pub local: u32,
-    /// The parent field, or `None` for a top-level column.
-    pub parent: Option<FieldRef>,
-    /// The field definition. Its `id`, `parent_id`, and `children` are ignored:
-    /// `local` and `parent` carry that structure, and each child is its own
-    /// action.
-    pub def: Field,
+    local: u32,
+    parent: Option<FieldRef>,
+    def: Field,
 }
 
 impl AddField {
+    /// Mint a top-level field defined by `def` under the token `local`, which
+    /// stands in for the field id until it is allocated at apply.
+    ///
+    /// The definition's `id`, `parent_id`, and `children` are ignored: `local`
+    /// and [`with_parent`](Self::with_parent) carry that structure, and each
+    /// child is its own action.
+    pub fn new(local: u32, def: Field) -> Self {
+        Self {
+            local,
+            parent: None,
+            def,
+        }
+    }
+
+    /// Nest the field under `parent`: committed, or minted earlier in the same
+    /// operation.
+    pub fn with_parent(mut self, parent: FieldRef) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// The token later actions name the field by.
+    pub fn local(&self) -> u32 {
+        self.local
+    }
+
+    /// The parent field, or `None` for a top-level column.
+    pub fn parent(&self) -> Option<FieldRef> {
+        self.parent
+    }
+
+    /// The field definition, with its structural fields ignored.
+    pub fn def(&self) -> &Field {
+        &self.def
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let id = state.mint_field(self.local)?;
         let parent_id = self
@@ -112,10 +143,13 @@ impl TryFrom<pb_actions::AddField> for AddField {
     type Error = Error;
 
     fn try_from(message: pb_actions::AddField) -> Result<Self> {
-        Ok(Self {
-            local: message.local,
-            parent: message.parent.map(FieldRef::try_from).transpose()?,
-            def: Field::from(&required(message.def, "AddField.def")?),
+        let field = Self::new(
+            message.local,
+            Field::from(&required(message.def, "AddField.def")?),
+        );
+        Ok(match message.parent {
+            Some(parent) => field.with_parent(parent.try_into()?),
+            None => field,
         })
     }
 }
@@ -135,16 +169,8 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("a"),
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: None,
-                    def: added_field("b"),
-                }),
+                Action::AddField(AddField::new(0, added_field("a"))),
+                Action::AddField(AddField::new(1, added_field("b"))),
             ],
         )
         .unwrap();
@@ -166,11 +192,7 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 7,
-                    parent: None,
-                    def: added_field("added"),
-                }),
+                Action::AddField(AddField::new(7, added_field("added"))),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),
@@ -197,21 +219,18 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: Field::try_from(ArrowField::new(
+                Action::AddField(AddField::new(
+                    0,
+                    Field::try_from(ArrowField::new(
                         "nested",
                         DataType::Struct(Default::default()),
                         true,
                     ))
                     .unwrap(),
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: Some(FieldRef::Local(0)),
-                    def: added_field("child"),
-                }),
+                )),
+                Action::AddField(
+                    AddField::new(1, added_field("child")).with_parent(FieldRef::Local(0)),
+                ),
             ],
         )
         .unwrap();
@@ -227,11 +246,9 @@ mod tests {
         let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
-            vec![Action::AddField(AddField {
-                local: 0,
-                parent: Some(FieldRef::Committed(7)),
-                def: added_field("orphan"),
-            })],
+            vec![Action::AddField(
+                AddField::new(0, added_field("orphan")).with_parent(FieldRef::Committed(7)),
+            )],
         )
         .unwrap_err();
 
@@ -246,11 +263,7 @@ mod tests {
         let manifest = unbacked_manifest();
         let error = apply(
             &manifest,
-            vec![Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("id"),
-            })],
+            vec![Action::AddField(AddField::new(0, added_field("id")))],
         )
         .unwrap_err();
 
@@ -271,16 +284,10 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: nested.clone(),
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: Some(FieldRef::Local(0)),
-                    def: added_field("id"),
-                }),
+                Action::AddField(AddField::new(0, nested.clone())),
+                Action::AddField(
+                    AddField::new(1, added_field("id")).with_parent(FieldRef::Local(0)),
+                ),
             ],
         )
         .unwrap();
@@ -289,21 +296,13 @@ mod tests {
         let error = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: nested,
-                }),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: Some(FieldRef::Local(0)),
-                    def: added_field("child"),
-                }),
-                Action::AddField(AddField {
-                    local: 2,
-                    parent: Some(FieldRef::Local(0)),
-                    def: added_field("child"),
-                }),
+                Action::AddField(AddField::new(0, nested)),
+                Action::AddField(
+                    AddField::new(1, added_field("child")).with_parent(FieldRef::Local(0)),
+                ),
+                Action::AddField(
+                    AddField::new(2, added_field("child")).with_parent(FieldRef::Local(0)),
+                ),
             ],
         )
         .unwrap_err();
@@ -319,16 +318,8 @@ mod tests {
         let error = apply(
             &manifest,
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("a"),
-                }),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("b"),
-                }),
+                Action::AddField(AddField::new(0, added_field("a"))),
+                Action::AddField(AddField::new(0, added_field("b"))),
             ],
         )
         .unwrap_err();

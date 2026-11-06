@@ -117,11 +117,7 @@ mod tests {
             &backed_manifest(),
             vec![
                 reset(),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
                 Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
@@ -181,19 +177,11 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("early"),
-                }),
+                Action::AddField(AddField::new(0, added_field("early"))),
                 mint_fragment(0),
                 write(0, "data/early.lance"),
                 reset(),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(1, added_field("fresh"))),
                 mint_fragment(1),
                 write(1, "data/fresh.lance"),
             ],
@@ -222,11 +210,7 @@ mod tests {
     }
 
     fn mint_field(token: u32, name: &str) -> Action {
-        Action::AddField(AddField {
-            local: token,
-            parent: None,
-            def: added_field(name),
-        })
+        Action::AddField(AddField::new(token, added_field(name)))
     }
 
     /// A reset discards objects but never rewinds a counter: the committed
@@ -308,9 +292,8 @@ mod tests {
                 .unwrap(),
             ),
         ]);
-        let records_nothing = footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds {
-            count: 3,
-        })]);
+        let records_nothing =
+            footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(3))]);
         for other in [requires_only, records_nothing] {
             assert!(reset.conflicts_with(&other));
             assert!(other.conflicts_with(&reset));

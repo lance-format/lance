@@ -1086,7 +1086,7 @@ impl From<&CompositeOperation> for Footprint {
         if adds_field {
             for action in composite_operation.iter_actions() {
                 if let Action::DropField(drop) = action {
-                    footprint.require_no_values_written(drop.field);
+                    footprint.require_no_values_written(drop.field());
                 }
             }
         }
@@ -1200,27 +1200,25 @@ mod tests {
     }
 
     fn add_field(local: u32, name: &str, parent: Option<FieldRef>) -> Action {
-        Action::AddField(AddField {
+        let field = AddField::new(
             local,
-            parent,
-            def: Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+            Field::try_from(ArrowField::new(name, DataType::Int32, true)).unwrap(),
+        );
+        Action::AddField(match parent {
+            Some(parent) => field.with_parent(parent),
+            None => field,
         })
     }
 
     fn add_non_nullable_field(local: u32, name: &str) -> Action {
-        Action::AddField(AddField {
+        Action::AddField(AddField::new(
             local,
-            parent: None,
-            def: Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
-        })
+            Field::try_from(ArrowField::new(name, DataType::Int32, false)).unwrap(),
+        ))
     }
 
     fn set_nullability(field: i32, nullable: bool) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(field),
-            name: None,
-            nullable: Some(nullable),
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(field)).with_nullable(nullable))
     }
 
     fn config_entry(key: &str) -> Action {
@@ -1231,11 +1229,7 @@ mod tests {
     }
 
     fn tighten_local_field(local: u32) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Local(local),
-            name: None,
-            nullable: Some(false),
-        })
+        Action::AlterField(AlterField::new(FieldRef::Local(local)).with_nullable(false))
     }
 
     fn append(field: i32) -> Vec<Action> {
@@ -1254,17 +1248,11 @@ mod tests {
     }
 
     fn rename_field(field: i32, name: &str) -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(field),
-            name: Some(name.into()),
-            nullable: None,
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(field)).with_name(name))
     }
 
     fn drop_field(field: i32) -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(field),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(field)))
     }
 
     fn tombstone(fragment: u64, fields: &[i32]) -> Action {
@@ -1288,17 +1276,17 @@ mod tests {
     }
 
     fn add_base(local: u32, name: &str, path: &str) -> Action {
-        Action::AddBase(AddBase {
+        Action::AddBase(AddBase::new(
             local,
-            base: BasePath::new(0, path.into(), Some(name.into()), false),
-        })
+            BasePath::new(0, path.into(), Some(name.into()), false),
+        ))
     }
 
     fn add_unnamed_base(local: u32, path: &str) -> Action {
-        Action::AddBase(AddBase {
+        Action::AddBase(AddBase::new(
             local,
-            base: BasePath::new(0, path.into(), None, false),
-        })
+            BasePath::new(0, path.into(), None, false),
+        ))
     }
 
     #[test]
@@ -1370,17 +1358,17 @@ mod tests {
     )]
     #[case::same_field_definition(
         vec![rename_field(1, "a")],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
         true,
     )]
     #[case::different_field_definitions(
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(2), name: None, nullable: None })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)))],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(2)))],
         false,
     )]
     #[case::dropping_a_field_collides_with_altering_it(
         vec![drop_field(1)],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(1)).with_nullable(true))],
         true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(

@@ -363,7 +363,7 @@ mod tests {
         // read the high-water mark back, then name the id in the next.
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
         assert_eq!(reserved.max_fragment_id(), Some(2));
@@ -396,12 +396,12 @@ mod tests {
     /// reserves is not yet reserved for the actions beside it.
     #[rstest]
     #[case::reserve_then_claim(vec![
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(2)),
         add_fragment(Ref::Committed(1)),
     ])]
     #[case::claim_then_reserve(vec![
         add_fragment(Ref::Committed(1)),
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(2)),
     ])]
     fn test_an_id_reserved_in_the_same_operation_cannot_be_claimed(#[case] actions: Vec<Action>) {
         let error = apply(&unbacked_manifest(), actions).unwrap_err();
@@ -425,7 +425,7 @@ mod tests {
     ) {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
         let stale_index = IndexMetadata {
@@ -458,7 +458,7 @@ mod tests {
     fn test_an_id_already_in_use_is_rejected() {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
 
@@ -479,7 +479,7 @@ mod tests {
     fn test_a_reserved_id_can_back_a_data_file_in_the_same_operation() {
         let reserved = apply(
             &unbacked_manifest(),
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(1))],
         )
         .unwrap();
 

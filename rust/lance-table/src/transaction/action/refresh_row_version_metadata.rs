@@ -4,7 +4,7 @@
 //! Restamp the row-version metadata of rows rewritten in place.
 
 use super::apply::ApplyState;
-use super::row_selection::row_selections_from_proto;
+use super::row_selection::{reject_repeated_fragments, row_selections_from_proto};
 use super::{Coordinate, Footprint, Ref, RowSelection, SelectedRows};
 use crate::format::pb_actions;
 use crate::rowids::version::{
@@ -44,12 +44,36 @@ use lance_core::{Error, Result};
 /// nothing to restamp.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct RefreshRowVersionMetadata {
-    /// The rows to restamp, one selection per committed fragment. An offsets
-    /// selection must be non-empty and below the fragment's physical row count.
-    pub rows: Vec<RowSelection>,
+    rows: Vec<RowSelection>,
 }
 
 impl RefreshRowVersionMetadata {
+    /// Restamp `rows`, one selection per committed fragment.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a fragment selected twice, and an offsets selection with no
+    /// offsets. Apply also checks each offset is below the fragment's physical
+    /// row count.
+    pub fn try_new(rows: Vec<RowSelection>) -> Result<Self> {
+        reject_repeated_fragments(&rows, "RefreshRowVersionMetadata")?;
+        if let Some(empty) = rows.iter().find(|selection| {
+            matches!(&selection.rows, SelectedRows::Offsets(offsets) if offsets.is_empty())
+        }) {
+            return Err(Error::invalid_input(format!(
+                "RefreshRowVersionMetadata selects no rows of fragment {}; select the full \
+                 fragment or at least one row offset",
+                empty.fragment_id
+            )));
+        }
+        Ok(Self { rows })
+    }
+
+    /// The rows restamped, one selection per committed fragment.
+    pub fn rows(&self) -> &[RowSelection] {
+        &self.rows
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         if !self.rows.is_empty() && !state.uses_stable_row_ids() {
             return Err(Error::invalid_input(
@@ -72,10 +96,8 @@ impl RefreshRowVersionMetadata {
                 }
                 SelectedRows::Offsets(offsets) => {
                     let Some(max_offset) = offsets.max() else {
-                        return Err(Error::invalid_input(format!(
-                            "RefreshRowVersionMetadata selects no rows of fragment \
-                             {fragment_id}; select the full fragment or at least one row offset"
-                        )));
+                        // try_new rejects an empty selection.
+                        continue;
                     };
                     let physical_rows = fragment.physical_rows.ok_or_else(|| {
                         Error::invalid_input(format!(
@@ -152,9 +174,10 @@ impl TryFrom<pb_actions::RefreshRowVersionMetadata> for RefreshRowVersionMetadat
     type Error = Error;
 
     fn try_from(message: pb_actions::RefreshRowVersionMetadata) -> Result<Self> {
-        Ok(Self {
-            rows: row_selections_from_proto(message.rows, "RefreshRowVersionMetadata")?,
-        })
+        Self::try_new(row_selections_from_proto(
+            message.rows,
+            "RefreshRowVersionMetadata",
+        )?)
     }
 }
 
@@ -187,25 +210,29 @@ mod tests {
 
     /// Refresh every row of each fragment.
     fn refresh(fragment_ids: &[u32]) -> Action {
-        Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-            rows: fragment_ids
-                .iter()
-                .map(|fragment_id| RowSelection {
-                    fragment_id: *fragment_id,
-                    rows: SelectedRows::Full,
-                })
-                .collect(),
-        })
+        Action::RefreshRowVersionMetadata(
+            RefreshRowVersionMetadata::try_new(
+                fragment_ids
+                    .iter()
+                    .map(|fragment_id| RowSelection {
+                        fragment_id: *fragment_id,
+                        rows: SelectedRows::Full,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
     }
 
     /// Refresh the rows of fragment `fragment_id` at `offsets`.
     fn refresh_rows(fragment_id: u32, offsets: &[u32]) -> Action {
-        Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-            rows: vec![RowSelection {
+        Action::RefreshRowVersionMetadata(
+            RefreshRowVersionMetadata::try_new(vec![RowSelection {
                 fragment_id,
                 rows: SelectedRows::Offsets(offsets.iter().copied().collect()),
-            }],
-        })
+            }])
+            .unwrap(),
+        )
     }
 
     /// A stable-row-id manifest whose fragment 0 has `rows` rows, all last
@@ -309,12 +336,13 @@ mod tests {
         #[case] expected: &[u64],
     ) {
         let manifest = manifest_with_versions(has_sequence);
-        let action = Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-            rows: vec![RowSelection {
+        let action = Action::RefreshRowVersionMetadata(
+            RefreshRowVersionMetadata::try_new(vec![RowSelection {
                 fragment_id: 0,
                 rows,
-            }],
-        });
+            }])
+            .unwrap(),
+        );
 
         let out = apply(&manifest, vec![action]).unwrap();
 
@@ -392,7 +420,6 @@ mod tests {
         refresh_rows(0, &[1, 3]),
         "selects row offset 3 of fragment 0, which has 3 physical rows"
     )]
-    #[case::no_rows(Some(3), refresh_rows(0, &[]), "selects no rows of fragment 0")]
     #[case::unknown_row_count(
         None,
         refresh_rows(0, &[1]),
@@ -414,6 +441,21 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains(expected), "{message}");
         assert!(message.contains("RefreshRowVersionMetadata"), "{message}");
+    }
+
+    #[test]
+    fn test_refreshing_no_rows_is_rejected() {
+        let error = RefreshRowVersionMetadata::try_new(vec![RowSelection {
+            fragment_id: 0,
+            rows: SelectedRows::Offsets(RoaringBitmap::new()),
+        }])
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("selects no rows of fragment 0"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

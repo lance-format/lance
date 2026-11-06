@@ -24,10 +24,20 @@ use lance_core::{Error, Result};
 /// ids in its row id sequence, which apply then leaves as it finds them.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct ReserveRowIds {
-    pub count: u64,
+    count: u64,
 }
 
 impl ReserveRowIds {
+    /// Reserve `count` stable row ids.
+    pub fn new(count: u64) -> Self {
+        Self { count }
+    }
+
+    /// How many stable row ids are reserved.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         state.reserve_row_ids(self.count)
     }
@@ -58,9 +68,7 @@ impl TryFrom<pb_actions::ReserveRowIds> for ReserveRowIds {
     type Error = Error;
 
     fn try_from(message: pb_actions::ReserveRowIds) -> Result<Self> {
-        Ok(Self {
-            count: message.count,
-        })
+        Ok(Self::new(message.count))
     }
 }
 

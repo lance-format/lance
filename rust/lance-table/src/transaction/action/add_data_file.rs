@@ -391,11 +391,7 @@ mod tests {
         if mint_base_first {
             actions.push(mint_base());
         }
-        actions.push(Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: added_field("added"),
-        }));
+        actions.push(Action::AddField(AddField::new(0, added_field("added"))));
         // An embedded base_id is rejected when the action is built, the rest
         // when it is applied.
         let result = AddDataFile::try_new_unchecked(

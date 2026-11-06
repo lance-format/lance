@@ -664,11 +664,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("carried"),
-                }),
+                Action::AddField(AddField::new(0, added_field("carried"))),
                 Action::AddIndexSegment(AddIndexSegment {
                     covering_fields: vec![FieldRef::Local(0)],
                     ..segment("by_a", vec![FieldRef::Committed(0)])
@@ -994,11 +990,7 @@ mod tests {
             vec![
                 Action::AddIndexSegment(segment("early", vec![FieldRef::Committed(0)])),
                 Action::ResetTable(ResetTable),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
                 Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
@@ -1078,11 +1070,7 @@ mod tests {
     fn test_local_tokens_from_separate_operations_are_different_fields() {
         let mint_and_index = |fragment: u64| {
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("c"),
-                }),
+                Action::AddField(AddField::new(0, added_field("c"))),
                 Action::AddIndexSegment(AddIndexSegment {
                     covered_fragments: Some(vec![Ref::Committed(fragment)]),
                     ..segment("shared", vec![FieldRef::Local(0)])
@@ -1093,11 +1081,7 @@ mod tests {
         let (next, indices) = apply_with_indices(&manifest, mint_and_index(0), Vec::new()).unwrap();
 
         let mut second = mint_and_index(1);
-        second[0] = Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: added_field("d"),
-        });
+        second[0] = Action::AddField(AddField::new(0, added_field("d")));
         let error = apply_with_indices(&next, second, indices).unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
@@ -1116,10 +1100,10 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::AddBase(AddBase {
-                    local: 0,
-                    base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
-                }),
+                Action::AddBase(AddBase::new(
+                    0,
+                    BasePath::new(0, "s3://bucket/minted".into(), None, false),
+                )),
                 Action::AddIndexSegment(AddIndexSegment {
                     base: Some(Ref::Committed(3)),
                     ..segment("committed", vec![FieldRef::Committed(0)])
@@ -1277,11 +1261,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("added"),
-                }),
+                Action::AddField(AddField::new(0, added_field("added"))),
                 Action::AddIndexSegment(segment("by_added", vec![FieldRef::Local(0)])),
             ],
             Vec::new(),
@@ -1342,9 +1322,7 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(0),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(0))),
                 Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)])),
             ],
             Vec::new(),
@@ -1443,9 +1421,9 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_drop_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let drop = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })]);
+        let drop = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(0),
+        ))]);
 
         assert!(build.conflicts_with(&drop));
         assert!(!drop.conflicts_with(&build));
@@ -1466,11 +1444,7 @@ mod tests {
         let drop = footprint(
             [2, 1]
                 .into_iter()
-                .map(|field| {
-                    Action::DropField(DropField {
-                        field: FieldRef::Committed(field),
-                    })
-                })
+                .map(|field| Action::DropField(DropField::new(FieldRef::Committed(field))))
                 .collect(),
         );
 
@@ -1502,12 +1476,8 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(2),
-                }),
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(1),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(2))),
+                Action::DropField(DropField::new(FieldRef::Committed(1))),
             ],
             vec![committed_segment],
         )

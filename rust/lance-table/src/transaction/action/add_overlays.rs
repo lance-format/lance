@@ -417,14 +417,12 @@ mod tests {
     #[test]
     fn test_an_overlay_needs_its_field_defined_as_it_was() {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let altered = footprint(vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        })]);
-        let dropped = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })]);
+        let altered = footprint(vec![Action::AlterField(
+            AlterField::new(FieldRef::Committed(0)).with_name("renamed"),
+        )]);
+        let dropped = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(0),
+        ))]);
 
         assert!(overlaid.conflicts_with(&altered));
         assert!(!altered.conflicts_with(&overlaid));
@@ -643,9 +641,9 @@ mod tests {
                 vec![FieldRef::Committed(field)],
             ))])
         };
-        let drop_field_zero = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })]);
+        let drop_field_zero = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(0),
+        ))]);
 
         assert!(overlaid.conflicts_with(&rewrite(1)));
         assert!(rewrite(1).conflicts_with(&overlaid));
@@ -713,16 +711,12 @@ mod tests {
     #[rstest::rstest]
     #[case::replacement(
         vec![
-            Action::DropField(DropField { field: FieldRef::Committed(0) }),
-            Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("id"),
-            }),
+            Action::DropField(DropField::new(FieldRef::Committed(0))),
+            Action::AddField(AddField::new(0, added_field("id"))),
         ],
         true,
     )]
-    #[case::drop(vec![Action::DropField(DropField { field: FieldRef::Committed(0) })], false)]
+    #[case::drop(vec![Action::DropField(DropField::new(FieldRef::Committed(0)))], false)]
     fn test_an_overlay_on_a_minted_fragment_needs_its_field_defined_as_it_was(
         #[case] schema_change: Vec<Action>,
         #[case] schema_change_conflicts_landing_second: bool,
@@ -816,11 +810,9 @@ mod tests {
         }
         actions.push(add(fragment, vec![overlay("a.lance", &[0])]));
         let overlaid = footprint(actions);
-        let tighten = footprint(vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: None,
-            nullable: Some(false),
-        })]);
+        let tighten = footprint(vec![Action::AlterField(
+            AlterField::new(FieldRef::Committed(0)).with_nullable(false),
+        )]);
 
         assert!(tighten.conflicts_with(&overlaid));
     }

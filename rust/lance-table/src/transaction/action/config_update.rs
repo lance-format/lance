@@ -430,11 +430,7 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
                 Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
                     FieldRef::Local(0),
                     merge(&[("comment", Some("brand new"))]),
@@ -551,12 +547,12 @@ mod tests {
             ConfigUpdate::default()
                 .with_field_metadata(FieldRef::Committed(1), merge(&[("comment", Some("x"))])),
         )]);
-        let dropped = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(1),
-        })]);
-        let other = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(2),
-        })]);
+        let dropped = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(1),
+        ))]);
+        let other = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(2),
+        ))]);
 
         // Metadata landing after the drop names a field that is gone; the
         // drop landing after the metadata takes the metadata with the field.

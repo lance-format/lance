@@ -310,11 +310,7 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
                 Action::AddDataFile(
                     AddDataFile::try_new_unchecked(
                         Ref::Committed(0),

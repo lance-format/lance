@@ -1603,11 +1603,7 @@ mod tests {
     #[test]
     fn test_an_action_set_relocates_onto_a_newer_version() {
         let actions = vec![
-            Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("added"),
-            }),
+            Action::AddField(AddField::new(0, added_field("added"))),
             Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
@@ -1636,7 +1632,9 @@ mod tests {
         let Action::AddField(add_field) = &mut replayed[0] else {
             unreachable!("the first action is the AddField built above");
         };
-        add_field.def.name = "added_again".into();
+        let mut def = add_field.def().clone();
+        def.name = "added_again".into();
+        *add_field = AddField::new(add_field.local(), def);
         let second = apply(&first, replayed).unwrap();
 
         assert_eq!(
@@ -1839,10 +1837,10 @@ mod tests {
     }
 
     fn mint_field(token: u32, name: &str, parent: Option<FieldRef>) -> Action {
-        Action::AddField(AddField {
-            local: token,
-            parent,
-            def: added_field(name),
+        let field = AddField::new(token, added_field(name));
+        Action::AddField(match parent {
+            Some(parent) => field.with_parent(parent),
+            None => field,
         })
     }
 
@@ -1851,9 +1849,7 @@ mod tests {
     }
 
     fn drop_field_zero() -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(0)))
     }
 
     /// Actions apply in order, across steps as within one, so a reference is
@@ -1897,11 +1893,7 @@ mod tests {
     #[case::alter_after_drop(
         vec![vec![
             drop_field_zero(),
-            Action::AlterField(AlterField {
-                field: FieldRef::Committed(0),
-                name: Some("renamed".into()),
-                nullable: None,
-            }),
+            Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed")),
         ]],
         Some("AlterField names field 0, which does not exist"),
     )]
@@ -1984,14 +1976,10 @@ mod tests {
         Ref::Committed(0),
         vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
     )))]
-    #[case::drop(Action::DropField(DropField {
-        field: FieldRef::Committed(ROW_ID_FIELD_ID),
-    }))]
-    #[case::alter(Action::AlterField(AlterField {
-        field: FieldRef::Committed(ROW_ID_FIELD_ID),
-        name: Some("renamed".into()),
-        nullable: None,
-    }))]
+    #[case::drop(Action::DropField(DropField::new(FieldRef::Committed(ROW_ID_FIELD_ID))))]
+    #[case::alter(Action::AlterField(
+        AlterField::new(FieldRef::Committed(ROW_ID_FIELD_ID)).with_name("renamed")
+    ))]
     #[case::parent(mint_field(0, "child", Some(FieldRef::Committed(ROW_ID_FIELD_ID))))]
     #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
         FieldRef::Committed(ROW_ID_FIELD_ID),
@@ -2029,28 +2017,20 @@ mod tests {
     )]
     #[case::add_nested(
         vec![
-            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            Action::AddField(AddField::new(0, struct_field("s"))),
             mint_field(1, ROW_ID, Some(FieldRef::Local(0))),
         ],
         false
     )]
     #[case::rename_top_level(
-        vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some(ROW_ADDR.into()),
-            nullable: None,
-        })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name(ROW_ADDR))],
         true
     )]
     #[case::rename_nested(
         vec![
-            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            Action::AddField(AddField::new(0, struct_field("s"))),
             mint_field(1, "child", Some(FieldRef::Local(0))),
-            Action::AlterField(AlterField {
-                field: FieldRef::Local(1),
-                name: Some(ROW_ADDR.into()),
-                nullable: None,
-            }),
+            Action::AlterField(AlterField::new(FieldRef::Local(1)).with_name(ROW_ADDR)),
         ],
         false
     )]
@@ -2117,16 +2097,13 @@ mod tests {
     #[case::fragment(fragment_counter_at_max(), mint_fragment(0), "fragment id")]
     #[case::fragment_reservation(
         fragment_counter_at_max(),
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(1)),
         "fragment id"
     )]
     #[case::field(field_counter_at_max(), mint_field(0, "added", None), "field id")]
     #[case::base(
         base_counter_at_max(),
-        Action::AddBase(AddBase {
-            local: 0,
-            base: BasePath::new(0, "s3://bucket/new".into(), None, false),
-        }),
+        Action::AddBase(AddBase::new(0, BasePath::new(0, "s3://bucket/new".into(), None, false))),
         "base id"
     )]
     #[case::row_id(row_id_counter_at_max(), mint_fragment(0), "row id")]
@@ -2148,11 +2125,7 @@ mod tests {
     }
 
     fn rename_field_zero() -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed"))
     }
 
     #[test]
@@ -2334,7 +2307,7 @@ mod tests {
         read.max_fragment_id = Some(4);
         let current = apply(
             &read,
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
 
@@ -2402,11 +2375,7 @@ mod tests {
         manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
         apply(
             &manifest,
-            vec![Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("loose"),
-            })],
+            vec![Action::AddField(AddField::new(0, added_field("loose")))],
         )
         .unwrap()
     }
@@ -2417,17 +2386,14 @@ mod tests {
     /// claim about every row, so it checks every fragment.
     #[rstest]
     #[case::minted_fragment_without_its_data(vec![mint_fragment(0)])]
-    #[case::required_field_without_data(vec![Action::AddField(AddField {
-        local: 0,
-        parent: None,
-        def: lance_core::datatypes::Field::try_from(ArrowField::new("strict", DataType::Int32, false))
+    #[case::required_field_without_data(vec![Action::AddField(AddField::new(
+        0,
+        lance_core::datatypes::Field::try_from(ArrowField::new("strict", DataType::Int32, false))
             .unwrap(),
-    })])]
-    #[case::tightened_field_without_data(vec![Action::AlterField(AlterField {
-        field: FieldRef::Committed(1),
-        name: None,
-        nullable: Some(false),
-    })])]
+    ))])]
+    #[case::tightened_field_without_data(vec![Action::AlterField(
+        AlterField::new(FieldRef::Committed(1)).with_nullable(false)
+    )])]
     fn test_a_fragment_must_store_every_required_field(#[case] actions: Vec<Action>) {
         let error = apply(&manifest_with_an_unstored_nullable_field(), actions).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
@@ -2501,9 +2467,7 @@ mod tests {
         fields: Vec::new(),
         covering_fields: Vec::new(),
     }))]
-    #[case::drop_index(|_| Action::DropIndex(DropIndex {
-        name: FRAG_REUSE_INDEX_NAME.into(),
-    }))]
+    #[case::drop_index(|_| Action::DropIndex(DropIndex::try_new(FRAG_REUSE_INDEX_NAME).unwrap()))]
     fn test_an_index_action_may_not_name_the_fragment_reuse_history(
         #[case] action: fn(Uuid) -> Action,
     ) {

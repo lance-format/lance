@@ -226,15 +226,17 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            Action::AddField(AddField {
-                local: 3,
-                parent: Some(FieldRef::Committed(1)),
-                def: Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
-            }),
-            Action::AddBase(AddBase {
-                local: 1,
-                base: BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
-            }),
+            Action::AddField(
+                AddField::new(
+                    3,
+                    Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
+                )
+                .with_parent(FieldRef::Committed(1)),
+            ),
+            Action::AddBase(AddBase::new(
+                1,
+                BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
+            )),
             Action::TombstoneFieldData(TombstoneFieldData::new(
                 Ref::Committed(4),
                 vec![FieldRef::Committed(7), FieldRef::Committed(8)],
@@ -264,8 +266,8 @@ mod tests {
                 }],
                 data_change: true,
             }),
-            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-                rows: vec![
+            Action::RefreshRowVersionMetadata(
+                RefreshRowVersionMetadata::try_new(vec![
                     RowSelection {
                         fragment_id: 4,
                         rows: SelectedRows::Full,
@@ -274,16 +276,15 @@ mod tests {
                         fragment_id: 6,
                         rows: SelectedRows::Offsets(RoaringBitmap::from_iter([0u32, 2])),
                     },
-                ],
-            }),
-            Action::AlterField(AlterField {
-                field: FieldRef::Committed(2),
-                name: Some("renamed".into()),
-                nullable: Some(false),
-            }),
-            Action::DropField(DropField {
-                field: FieldRef::Committed(3),
-            }),
+                ])
+                .unwrap(),
+            ),
+            Action::AlterField(
+                AlterField::new(FieldRef::Committed(2))
+                    .with_name("renamed")
+                    .with_nullable(false),
+            ),
+            Action::DropField(DropField::new(FieldRef::Committed(3))),
             Action::AddIndexSegment(AddIndexSegment {
                 uuid: Uuid::from_u128(7),
                 name: "by_a".into(),
@@ -308,9 +309,7 @@ mod tests {
             Action::RemoveIndexSegment(
                 RemoveIndexSegment::try_new(Uuid::from_u128(8), "by_a").unwrap(),
             ),
-            Action::DropIndex(DropIndex {
-                name: "by_c".into(),
-            }),
+            Action::DropIndex(DropIndex::try_new("by_c").unwrap()),
             Action::AdjustIndexCoverage(AdjustIndexCoverage {
                 uuid: Uuid::from_u128(9),
                 name: "by_b".into(),
@@ -332,21 +331,24 @@ mod tests {
                     filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
                 },
             }),
-            Action::AssertCellsUnchanged(AssertCellsUnchanged {
-                fields: vec![FieldRef::Committed(1)],
-                rows: vec![
-                    RowSelection {
-                        fragment_id: 4,
-                        rows: SelectedRows::Full,
-                    },
-                    RowSelection {
-                        fragment_id: 5,
-                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
-                    },
-                ],
-            }),
-            Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
-            Action::ReserveRowIds(ReserveRowIds { count: 40 }),
+            Action::AssertCellsUnchanged(
+                AssertCellsUnchanged::try_new(
+                    vec![FieldRef::Committed(1)],
+                    vec![
+                        RowSelection {
+                            fragment_id: 4,
+                            rows: SelectedRows::Full,
+                        },
+                        RowSelection {
+                            fragment_id: 5,
+                            rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                        },
+                    ],
+                )
+                .unwrap(),
+            ),
+            Action::ReserveFragmentIds(ReserveFragmentIds::new(4)),
+            Action::ReserveRowIds(ReserveRowIds::new(40)),
             Action::ResetTable(ResetTable),
             Action::ConfigUpdate(
                 ConfigUpdate::default()
