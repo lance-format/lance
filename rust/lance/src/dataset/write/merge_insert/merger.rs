@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::inserted_rows::{KeyExistenceFilterBuilder, extract_key_value_from_batch};
+use super::inserted_rows::KeyExistenceFilterBuilder;
 use super::{
     InsertedKeyTracker, MergeInsertParams, MergeStats, SourceDedupeBehavior, WhenMatched,
     WhenNotMatchedBySource, create_duplicate_row_error, format_key_values_on_columns,
@@ -121,7 +121,7 @@ pub(super) struct Merger {
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
-    /// Inserted keys for declared primary-key conflict detection; absent otherwise.
+    /// Inserted join keys for conflict detection, independently of primary key metadata.
     pub(super) inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilterBuilder>>>,
 }
 
@@ -461,11 +461,7 @@ impl Merger {
                 .as_mut()
             {
                 for row_idx in 0..not_matched.num_rows() {
-                    if let Some(key) =
-                        extract_key_value_from_batch(&not_matched, row_idx, &self.params.on)
-                    {
-                        filter.insert(key)?;
-                    }
+                    filter.insert_row(&not_matched, row_idx, &self.params.on)?;
                 }
             }
             let not_matched = not_matched.project(&output_cols)?;

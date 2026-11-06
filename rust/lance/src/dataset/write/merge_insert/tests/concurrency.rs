@@ -679,6 +679,141 @@ async fn test_skip_auto_cleanup() {
     );
 }
 
+// https://github.com/lancedb/lancedb/issues/3377
+#[rstest::rstest]
+#[case::scan(false, false, false)]
+#[case::indexed(true, false, false)]
+#[case::partial_scan(false, true, false)]
+#[case::partial_indexed(true, true, false)]
+#[case::composite_scan(false, false, true)]
+#[case::composite_indexed(true, false, true)]
+#[tokio::test]
+async fn test_merge_insert_same_new_key_without_primary_key(
+    #[case] indexed: bool,
+    #[case] partial: bool,
+    #[case] composite: bool,
+) {
+    let initial = record_batch!(
+        ("id", Int32, [0, 2]),
+        ("value", Int32, [0, 0]),
+        ("other", Int32, [100, 200])
+    )
+    .unwrap();
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        })
+        .execute(vec![initial])
+        .await
+        .unwrap();
+    let on = if composite {
+        vec!["id", "other"]
+    } else {
+        vec!["id"]
+    };
+    if indexed {
+        for key in &on {
+            dataset
+                .create_index(
+                    &[*key],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let dataset = Arc::new(dataset);
+    let mut first = record_batch!(
+        ("id", Int32, [1]),
+        ("value", Int32, [10]),
+        ("other", Int32, [300])
+    )
+    .unwrap();
+    let mut second = record_batch!(
+        ("id", Int32, [1]),
+        ("value", Int32, [20]),
+        ("other", Int32, [300])
+    )
+    .unwrap();
+    if partial {
+        first = first.project(&[0, 1]).unwrap();
+        second = second.project(&[0, 1]).unwrap();
+    }
+    let mut builder = MergeInsertBuilder::try_new(
+        dataset.clone(),
+        on.iter().map(|name| (*name).to_string()).collect(),
+    )
+    .unwrap();
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    let job = builder.try_build().unwrap();
+    // Both match sets are computed before either transaction commits.
+    let a = job
+        .clone()
+        .execute_uncommitted_batches(vec![first])
+        .await
+        .unwrap();
+    let b = job
+        .clone()
+        .execute_uncommitted_batches(vec![second.clone()])
+        .await
+        .unwrap();
+    assert!(a.inserted_rows_filter.is_some());
+    assert!(b.inserted_rows_filter.is_some());
+    CommitBuilder::new(dataset.clone())
+        .execute(a.transaction)
+        .await
+        .unwrap();
+    let error = CommitBuilder::new(dataset.clone())
+        .execute(b.transaction)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+
+    let error = builder
+        .clone()
+        .conflict_retries(0)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![second.clone()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::TooMuchWriteContention { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("retries"), "{error}");
+
+    // Replaying a stale INSERT plan must re-match and turn it into an UPDATE.
+    let (updated, stats) = job.execute_batches(vec![second]).await.unwrap();
+    assert_eq!(stats.num_attempts, 2);
+    assert_eq!(stats.num_inserted_rows, 0);
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(updated.count_rows(None).await.unwrap(), 3);
+    let rows = updated
+        .scan()
+        .filter("id = 1")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(rows["value"].as_primitive::<Int32Type>().value(0), 20);
+    if partial {
+        assert!(rows["other"].is_null(0));
+    } else {
+        assert_eq!(rows["other"].as_primitive::<Int32Type>().value(0), 300);
+    }
+}
+
 #[rstest::rstest]
 #[case::scan(false, false, true, "id")]
 #[case::indexed(false, true, true, "id")]
@@ -757,7 +892,7 @@ async fn test_transaction_inserted_rows_filter_roundtrip(
     expected
         .insert(extract_key_value_from_batch(&new_batch, 1, &[on.to_string()]).unwrap())
         .unwrap();
-    let expected = (has_primary_key && on == "id").then(|| expected.build());
+    let expected = Some(expected.build());
 
     let UncommittedMergeInsert {
         transaction,
