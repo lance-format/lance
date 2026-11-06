@@ -4848,7 +4848,6 @@ dependencies = [
  "rand_xoshiro",
  "rstest",
  "serde_json",
- "serial_test",
  "test-log",
  "tokio",
  "tracing",
