@@ -1274,6 +1274,7 @@ mod tests {
             SQBuildParams {
                 num_bits: 8,
                 sample_rate: 128,
+                ..Default::default()
             },
         );
         params.skip_transpose = true;
@@ -1425,6 +1426,7 @@ mod tests {
         let sq = SQBuildParams {
             num_bits: 8,
             sample_rate: 128,
+            ..Default::default()
         };
 
         match combo {

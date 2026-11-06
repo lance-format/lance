@@ -8,14 +8,16 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
+use crate::sq_model::{extract_sq_build_params, serialize_sq_model};
 use arrow::array::{FixedSizeListArray, Float32Array};
 use jni::JNIEnv;
-use jni::objects::{JClass, JFloatArray, JObject, JString};
-use jni::sys::jfloatArray;
+use jni::objects::{JByteArray, JClass, JFloatArray, JObject, JString};
+use jni::sys::{jbyteArray, jfloatArray};
 use lance::index::NoopIndexBuildProgress;
 use lance::index::vector::utils::get_vector_dim;
 use lance_index::vector::ivf::builder::IvfBuildParams as RustIvfBuildParams;
 use lance_index::vector::pq::builder::PQBuildParams as RustPQBuildParams;
+use lance_index::vector::quantizer::Quantization;
 use lance_linalg::distance::MetricType;
 
 /// Flatten a FixedSizeList<Float32> into a contiguous Vec<f32>.
@@ -200,4 +202,51 @@ fn inner_train_pq_codebook<'local>(
     let jarray = env.new_float_array(flattened.len() as i32)?;
     env.set_float_array_region(&jarray, 0, &flattened)?;
     Ok(jarray)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_index_vector_VectorTrainer_nativeTrainSqModel<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    dataset_obj: JObject<'local>,
+    column_jstr: JString<'local>,
+    sq_params_obj: JObject<'local>,
+    distance_type_jstr: JString<'local>,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        inner_train_sq_model(
+            &mut env,
+            dataset_obj,
+            column_jstr,
+            sq_params_obj,
+            distance_type_jstr
+        )
+        .map(|v| v.into_raw()),
+        JByteArray::default().into_raw()
+    )
+}
+
+fn inner_train_sq_model<'local>(
+    env: &mut JNIEnv<'local>,
+    dataset_obj: JObject<'local>,
+    column_jstr: JString<'local>,
+    sq_params_obj: JObject<'local>,
+    distance_type_jstr: JString<'local>,
+) -> Result<JByteArray<'local>> {
+    let column: String = env.get_string(&column_jstr)?.into();
+    let params = extract_sq_build_params(env, sq_params_obj)?;
+    let distance_type = parse_distance_type(env, &distance_type_jstr)?;
+    let bytes = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(dataset_obj, NATIVE_DATASET) }?;
+        let model = block_on(lance::index::vector::sq::build_sq_model(
+            &dataset_guard.inner,
+            &column,
+            distance_type,
+            &params,
+        ))?;
+        serialize_sq_model(&model.metadata(None))?
+    };
+    Ok(env.byte_array_from_slice(&bytes)?)
 }

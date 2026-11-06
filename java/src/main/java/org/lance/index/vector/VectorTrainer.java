@@ -106,6 +106,42 @@ public final class VectorTrainer {
     }
   }
 
+  /**
+   * Train an SQ8 model with L2 distance. See {@link #trainSqModel(Dataset, String, SQBuildParams,
+   * DistanceType)}.
+   */
+  public static SQModel trainSqModel(Dataset dataset, String column, SQBuildParams params) {
+    return trainSqModel(dataset, column, params, DistanceType.L2);
+  }
+
+  /**
+   * Train shared scalar quantization bounds from up to {@code sampleRate * 256} vectors. Null and
+   * non-finite vectors are excluded; an empty usable sample is rejected. Cosine normalizes training
+   * vectors; L2 and dot use original values. Hamming is unsupported. The metric must match
+   * subsequent builds. A supplied model is validated and returned without sampling.
+   *
+   * @param dataset dataset to sample
+   * @param column vector column
+   * @param params SQ8 settings; defaults are 8 bits and sampleRate 256
+   * @param distanceType metric used for subsequent index builds
+   * @return serializable model to reuse on every worker
+   */
+  public static SQModel trainSqModel(
+      Dataset dataset, String column, SQBuildParams params, DistanceType distanceType) {
+    Preconditions.checkArgument(dataset != null, "dataset cannot be null");
+    Preconditions.checkArgument(
+        column != null && !column.isEmpty(), "column cannot be null or empty");
+    Preconditions.checkArgument(params != null, "params cannot be null");
+    Preconditions.checkArgument(distanceType != null, "distanceType cannot be null");
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return SQModel.fromBytes(
+          nativeTrainSqModel(dataset, column, params, distanceType.toString()));
+    }
+  }
+
+  private static native byte[] nativeTrainSqModel(
+      Dataset dataset, String column, SQBuildParams params, String distanceType);
+
   private static native float[] nativeTrainIvfCentroids(
       Dataset dataset, String column, IvfBuildParams params, String distanceType);
 
