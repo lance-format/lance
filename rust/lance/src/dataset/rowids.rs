@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub(crate) mod cache;
 mod spill;
 mod validate;
 
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
-use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
@@ -232,21 +232,12 @@ pub(crate) async fn get_row_id_index_with(
     // and recreated there restarts at version 1. Without a token for this
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
-    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
+    if dataset.manifest_location.e_tag.is_none() {
         return Ok(Some(Arc::new(
             load_row_id_index(dataset, with_deletions).await?,
         )));
-    };
-    let key = RowIdIndexKey {
-        version: dataset.manifest.version,
-        with_deletions,
-        e_tag: Some(e_tag),
-    };
-    let index = dataset
-        .index_cache
-        .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
-        .await?;
-    Ok(Some(index))
+    }
+    cache::get(dataset, with_deletions).await.map(Some)
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -525,6 +516,7 @@ mod test {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
     use crate::session::Session;
+    use crate::session::index_caches::RowIdIndexKey;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -760,18 +752,18 @@ mod test {
         // loaded indices of the same size, without touching this one's recency.
         for version in 100..132 {
             let key = RowIdIndexKey {
-                version,
                 with_deletions: true,
-                e_tag: Some("pressure"),
             };
-            dataset
+            let pressure = dataset
                 .index_cache
+                .with_key_prefix(&format!("pressure-{version}"));
+            pressure
                 .insert_with_key(
                     &key,
-                    Arc::new(load_row_id_index(&dataset, true).await.unwrap()),
+                    Arc::new(cache::build(&dataset, true, None).await.unwrap()),
                 )
                 .await;
-            assert!(dataset.index_cache.get_with_key(&key).await.is_some());
+            assert!(pressure.get_with_key(&key).await.is_some());
         }
         assert!(weak.upgrade().is_none());
         let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();

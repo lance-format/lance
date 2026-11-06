@@ -16,7 +16,7 @@ use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_select::RowAddrMask;
-use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
+use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
@@ -92,50 +92,32 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
-/// Whole-dataset row-id lookup for one manifest and deletion mode.
+/// The current whole-dataset row-id view for one deletion mode.
+///
+/// The value verifies its manifest identity before use. Replacing one entry
+/// instead of retaining one per version charges shared immutable fragments once.
 #[derive(Debug)]
-pub(crate) struct RowIdIndexKey<'a> {
-    pub version: u64,
+pub(crate) struct RowIdIndexKey {
     /// Whether the index knows the deleted rows (it then maps them to `None`).
     /// An index built without deletion vectors reads no deletion file.
     pub with_deletions: bool,
-    /// A dataset dropped and recreated at the same URI restarts its version
-    /// history at 1, so a long-lived session's cache can otherwise return the
-    /// previous incarnation's index for a version number the new incarnation
-    /// now also holds. The e-tag disambiguates generations the same way
-    /// [`super::caches::ManifestKey::e_tag`] does. Callers without one must not
-    /// share the cached index at all (see `get_row_id_index`).
-    pub e_tag: Option<&'a str>,
 }
 
-impl CacheKey for RowIdIndexKey<'_> {
-    type ValueType = RowIdIndex;
+impl CacheKey for RowIdIndexKey {
+    type ValueType = crate::dataset::rowids::cache::CachedRowIdIndex;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_index/{}/{}/{}",
-            self.version,
-            self.with_deletions,
-            self.e_tag.unwrap_or("")
-        ))
+        Cow::Owned(format!("row_id_index/current/{}", self.with_deletions))
     }
     fn type_name() -> &'static str {
-        "RowIdIndex"
+        "CachedRowIdIndex"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
         builder.write_u64(self.with_deletions as u64);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
-        }
     }
 }
 
@@ -413,45 +395,19 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 mod tests {
     use super::*;
 
-    #[rstest::rstest]
-    #[case::generation(5, true, "second-etag")]
-    #[case::version(6, true, "first-etag")]
-    #[case::deletions(5, false, "first-etag")]
-    #[tokio::test]
-    async fn row_id_index_key_separates_snapshots(
-        #[case] version: u64,
-        #[case] with_deletions: bool,
-        #[case] e_tag: &str,
-    ) {
-        let global = GlobalIndexCache(LanceCache::with_capacity(4096));
-        let cache = global.for_dataset("first");
-        let key = RowIdIndexKey {
-            version: 5,
-            with_deletions: true,
-            e_tag: Some("first-etag"),
+    #[test]
+    fn row_id_index_key_separates_deletion_modes_and_datasets() {
+        let physical_key = |dataset, with_deletions| {
+            let mut builder = KeyBuilder::new(
+                lance_core::cache::CacheNamespace::root().child(dataset),
+                RowIdIndexKey::stable_type_id(),
+                RowIdIndexKey::schema(),
+            );
+            RowIdIndexKey { with_deletions }.write_key(&mut builder);
+            builder.finish()
         };
-        cache
-            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
-            .await;
-        assert!(cache.get_with_key(&key).await.is_some());
-
-        assert!(
-            cache
-                .get_with_key(&RowIdIndexKey {
-                    version,
-                    with_deletions,
-                    e_tag: Some(e_tag),
-                })
-                .await
-                .is_none()
-        );
-        assert!(
-            global
-                .for_dataset("second")
-                .get_with_key(&key)
-                .await
-                .is_none()
-        );
+        assert_ne!(physical_key("first", true), physical_key("first", false));
+        assert_ne!(physical_key("first", true), physical_key("second", true));
     }
 
     #[test]
