@@ -89,6 +89,7 @@ use lance_index::pbold::InvertedIndexDetails;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
 use lance_index::scalar::InvertedIndexParams;
 use lance_table::format::{Fragment, IndexMetadata};
+use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -578,28 +579,40 @@ async fn optimization_unavailable_reason(
     tagged: bool,
 ) -> Result<Option<String>> {
     for segment in segments {
-        if tagged
-            && segment_coverage_reason(dataset, segment).await?
-                == Some(MissingCoverageReason::Unsupported)
-        {
-            return Ok(Some(format!(
-                "segment {} cannot be translated by this build under the tagged fragment reuse history",
-                segment.uuid
-            )));
+        if tagged {
+            let cannot_translate = match segment_coverage_reason(dataset, segment).await? {
+                Some(MissingCoverageReason::Unsupported) => true,
+                // Maintenance opens withdrawn segments with an empty remapper,
+                // which still requires the plugin's batch remapping entry point.
+                Some(MissingCoverageReason::Withdrawn) => {
+                    super::frag_reuse_reader::segment_supports_batch_remapping(dataset, segment)
+                        .await?
+                        == Some(false)
+                }
+                _ => false,
+            };
+            if cannot_translate {
+                return Ok(Some(format!(
+                    "segment {} cannot be translated by this build under the tagged fragment reuse history",
+                    segment.uuid
+                )));
+            }
         }
         if let Some(details) = &segment.index_details
             && segment_has_inverted_details(segment)
         {
-            let details = details.to_msg::<InvertedIndexDetails>()?;
+            // The registry also accepts historical type URLs for this payload.
+            let mut details = InvertedIndexDetails::decode(details.value.as_slice())?;
+            if details.base_tokenizer.is_none() {
+                let params = scalar::load_segment_params(dataset, segment).await?;
+                details = InvertedIndexDetails::try_from(&params)?;
+            }
             let tokenizer = details.base_tokenizer.as_deref().unwrap_or("simple");
             // Manifest details omit custom filters such as stop words. Only
             // probe the base tokenizer's local resources, not those filters.
-            if (tokenizer == "jieba"
-                || tokenizer.starts_with("jieba/")
-                || tokenizer.starts_with("lindera/"))
-                && let Err(error) = InvertedIndexParams::default()
-                    .base_tokenizer(tokenizer.to_string())
-                    .build()
+            if let Err(error) = InvertedIndexParams::default()
+                .base_tokenizer(tokenizer.to_string())
+                .build()
             {
                 return Ok(Some(format!(
                     "segment {} requires tokenizer '{tokenizer}', which this process cannot build: {error}",

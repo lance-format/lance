@@ -969,13 +969,15 @@ async fn test_optimize_empty_code_fts_index_preserves_params(#[case] block_size:
 }
 
 #[rstest]
-#[case::btree(IndexType::BTree, "id", "page_lookup.lance")]
-#[case::fts(IndexType::Inverted, "text", "tokens.lance")]
+#[case::btree(IndexType::BTree, "id", "page_lookup.lance", false)]
+#[case::fts(IndexType::Inverted, "text", "tokens.lance", false)]
+#[case::fts_036(IndexType::Inverted, "text", "tokens.lance", true)]
 #[tokio::test]
 async fn test_optimize_reports_segment_open_errors(
     #[case] index_type: IndexType,
     #[case] column: &str,
     #[case] file_suffix: &str,
+    #[case] has_036_type_url: bool,
     #[values(false, true)] is_missing_file: bool,
 ) {
     let test_dir = TempStrDir::default();
@@ -1003,6 +1005,27 @@ async fn test_optimize_reports_segment_open_errors(
         )
         .await
         .unwrap();
+    if has_036_type_url {
+        let original = dataset.load_indices_by_name("test_idx").await.unwrap();
+        let mut segment = original[0].clone();
+        Arc::make_mut(segment.index_details.as_mut().unwrap()).type_url =
+            "type.googleapis.com/lance.index.pb.InvertedIndexDetails".into();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![segment],
+                        removed_indices: original,
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
     let appended = gen_batch()
         .col("id", array::step::<Int32Type>())
         .col(
@@ -1016,6 +1039,11 @@ async fn test_optimize_reports_segment_open_errors(
     let mut dataset = Dataset::open(&test_dir).await.unwrap();
     let original = dataset.load_indices_by_name("test_idx").await.unwrap();
     let version = dataset.version().version;
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].reference.name, "test_idx");
 
     if is_missing_file {
         let segment = &original[0];
@@ -1059,15 +1087,21 @@ async fn test_optimize_reports_segment_open_errors(
     }
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_optimize_skips_an_index_without_fragment_reuse_translation() {
+async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
+    #[values(false, true)] is_empty: bool,
+) {
     let mut dataset = gen_batch()
         .col("i", array::step::<Int32Type>())
         .col(
             "text",
             array::cycle_utf8_literals(&["hello world", "lance"]),
         )
-        .into_ram_dataset(FragmentCount(2), FragmentRowCount(2))
+        .into_ram_dataset(
+            FragmentCount(if is_empty { 0 } else { 2 }),
+            FragmentRowCount(2),
+        )
         .await
         .unwrap();
     let fm_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
@@ -1081,6 +1115,26 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation() {
         )
         .await
         .unwrap();
+    if is_empty {
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+        let reader = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .col(
+                "text",
+                array::cycle_utf8_literals(&["hello world", "lance"]),
+            )
+            .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+        dataset
+            .append(
+                reader,
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
     dataset
         .create_index(
             &["i"],
@@ -1170,7 +1224,11 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation() {
     assert_eq!(before.len(), 2);
     assert_eq!(
         segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
-        Some(MissingCoverageReason::Unsupported)
+        Some(if is_empty {
+            MissingCoverageReason::Withdrawn
+        } else {
+            MissingCoverageReason::Unsupported
+        })
     );
     assert_eq!(
         segment_coverage_reason(&dataset, &before[1]).await.unwrap(),
@@ -1215,10 +1273,12 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation() {
 #[rstest]
 #[case::jieba("jieba")]
 #[case::lindera("lindera")]
+#[case::unknown("unknown-tokenizer")]
 #[tokio::test]
 async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
     #[case] tokenizer: &str,
     #[values(false, true)] is_bounded: bool,
+    #[values(false, true)] has_manifest_tokenizer: bool,
 ) {
     let test_dir = TempStrDir::default();
     let mut dataset = gen_batch()
@@ -1283,9 +1343,12 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
         .unwrap();
     recorded_file.size_bytes = file.size_bytes;
     recorded_file.file_metadata_size_bytes = None;
-    segment.index_details = Some(Arc::new(
-        prost_types::Any::from_msg(&InvertedIndexDetails::try_from(&params).unwrap()).unwrap(),
-    ));
+    let details = if has_manifest_tokenizer {
+        InvertedIndexDetails::try_from(&params).unwrap()
+    } else {
+        InvertedIndexDetails::default()
+    };
+    segment.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
     dataset
         .apply_commit(
             Transaction::new(
@@ -1354,6 +1417,42 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
             .contains("which this process cannot build"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn test_optimize_fts_with_legacy_tokenizer_details() {
+    let test_dir = copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let original = dataset.load_indices().await.unwrap();
+    assert_eq!(original.len(), 1);
+    assert!(
+        original[0]
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<InvertedIndexDetails>()
+            .unwrap()
+            .base_tokenizer
+            .is_none()
+    );
+    let reader = gen_batch()
+        .col("text", array::cycle_utf8_literals(&["happy puppy"]))
+        .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+    dataset.append(reader, None).await.unwrap();
+    let options = OptimizeOptions::default();
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert!(!plan.tasks.is_empty());
+    dataset.optimize_indices(&options).await.unwrap();
+    assert!(
+        dataset
+            .unindexed_fragments(&original[0].name)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// Optimizing a name whose segments this build cannot all read would commit
