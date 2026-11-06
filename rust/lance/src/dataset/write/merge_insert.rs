@@ -457,6 +457,8 @@ struct MergeInsertParams {
     compacted_sstables: Vec<CompactedSsTable>,
     // The `dir_id` of the MemWAL `compacted_sstables` belongs to.
     mem_wal_dir_id: Option<String>,
+    // The MemWAL shard every row of this merge belongs to.
+    mem_wal_shard_id: Option<uuid::Uuid>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
