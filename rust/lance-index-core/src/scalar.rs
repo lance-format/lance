@@ -20,7 +20,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_io::stream::{RecordBatchStream, RecordBatchStreamAdapter};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
-use roaring::{RoaringBitmap, RoaringTreemap};
+use roaring::RoaringBitmap;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -896,27 +896,4 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
         None
     }
-}
-
-/// Abstraction over any type that can remap row IDs during index loading.
-///
-/// This decouples scalar index plugins from the table-level frag reuse index type.
-/// The frag reuse index implements this trait, but callers may also supply custom
-/// implementations for testing or other remapping strategies.
-///
-/// A scalar index load translates through a
-/// [`Remapper`](crate::remapping::Remapper) instead.
-pub trait RowIdRemapper: Send + Sync + std::fmt::Debug {
-    /// Remap a single row id.  Returns `None` if the row was deleted.
-    fn remap_row_id(&self, row_id: u64) -> Option<u64>;
-    /// Remap all addresses in a [`RowAddrTreeMap`], dropping deleted rows.
-    fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap;
-    /// Remap all row ids in a [`RoaringTreemap`], dropping deleted rows.
-    fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap;
-    /// Remap the row-id column at `row_id_idx` inside `batch`, dropping deleted rows.
-    fn remap_row_ids_record_batch(
-        &self,
-        batch: RecordBatch,
-        row_id_idx: usize,
-    ) -> Result<RecordBatch>;
 }
