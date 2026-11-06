@@ -125,3 +125,30 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
     assert!(elapsed < expected_duration + Duration::from_millis(50));
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
 }
+
+#[tokio::test]
+async fn cleanup_deletes_a_large_orphan_sweep() {
+    let fixture = MockDatasetFixture::try_new().unwrap();
+    fixture.create_some_data().await.unwrap();
+
+    let dataset = fixture.open().await.unwrap();
+    let data_dir = dataset.data_dir();
+    for index in 0..200 {
+        let orphan = data_dir.clone().join(format!("orphan-{index:03}.lance"));
+        dataset.object_store.put(&orphan, &[0u8; 64]).await.unwrap();
+    }
+    drop(dataset);
+
+    let removed = fixture
+        .run_cleanup_with_override(
+            utc_now() + TimeDelta::try_days(1).unwrap(),
+            Some(true),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Enough unverified files to take the bulk-delete path.
+    assert_eq!(removed.data_files_removed, 200);
+    assert_eq!(removed.failed_deletes, 0);
+}
