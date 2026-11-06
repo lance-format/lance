@@ -129,7 +129,8 @@ mod tests {
     use super::*;
     use crate::transaction::action::test_support::{apply_with_indices, backed_manifest};
     use crate::transaction::action::{
-        Action, AddIndexSegment, CompositeOperation, FieldRef, Footprint, Ref, UserStep,
+        Action, AddIndexSegment, AddIndexSegmentParts, CompositeOperation, FieldRef, Footprint,
+        Ref, UserStep,
     };
     use crate::transaction::test_support::sample_index_metadata;
 
@@ -195,20 +196,23 @@ mod tests {
             &backed_manifest(),
             vec![
                 remove(old.uuid, "by_a"),
-                Action::AddIndexSegment(AddIndexSegment {
-                    uuid: new_uuid,
-                    name: "by_a".into(),
-                    fields: vec![FieldRef::Committed(0)],
-                    covering_fields: Vec::new(),
-                    index_details: None,
-                    index_version: 1,
-                    covered_fragments: Some(vec![Ref::Committed(0)]),
-                    files: Vec::new(),
-                    base: None,
-                    created_at: None,
-                    dataset_version: None,
-                    data_change: false,
-                }),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        uuid: new_uuid,
+                        name: "by_a".into(),
+                        fields: vec![FieldRef::Committed(0)],
+                        covering_fields: Vec::new(),
+                        index_details: None,
+                        index_version: 1,
+                        covered_fragments: Some(vec![Ref::Committed(0)]),
+                        files: Vec::new(),
+                        base: None,
+                        created_at: None,
+                        dataset_version: None,
+                        data_change: false,
+                    })
+                    .unwrap(),
+                ),
             ],
             vec![old],
         )
@@ -247,20 +251,23 @@ mod tests {
             )]))
         };
         let ours = footprint(vec![remove(Uuid::from_u128(1), "by_a")]);
-        let theirs = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::from_u128(2),
-            name: "by_a".into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(vec![Ref::Committed(0)]),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })]);
+        let theirs = footprint(vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::from_u128(2),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )]);
 
         assert!(!ours.conflicts_with(&theirs));
         assert!(!theirs.conflicts_with(&ours));

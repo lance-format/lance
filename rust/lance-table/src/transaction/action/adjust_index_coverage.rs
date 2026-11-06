@@ -11,6 +11,34 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use uuid::Uuid;
 
+/// The contents of an [`AdjustIndexCoverage`], before its caller certifies them with
+/// [`AdjustIndexCoverage::try_new_unchecked`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdjustIndexCoverageParts {
+    /// The segment whose coverage changes.
+    pub uuid: Uuid,
+    /// The logical index the segment belongs to. Conflict detection compares
+    /// coverage across the segments of one index, so it needs the index and not
+    /// just the segment.
+    pub name: String,
+    /// Fragments to bring into the coverage. A [`Ref::Local`] names one this
+    /// operation minted, which is how a segment follows its rows into the
+    /// fragment a rewrite in the same operation moved them to.
+    pub add_fragments: Vec<Ref>,
+    /// Committed fragment ids to drop from the coverage. Unlike the additions
+    /// these take no [`Ref`]: a fragment minted in this same operation was not
+    /// in the coverage to begin with.
+    pub remove_fragments: Vec<u64>,
+    /// The fields the segment is keyed on, declared as
+    /// [`AddIndexSegmentParts::fields`](super::AddIndexSegmentParts::fields) declares
+    /// them. Apply rejects a declaration that does not match the segment.
+    pub fields: Vec<FieldRef>,
+    /// The fields whose values the segment carries, declared as
+    /// [`AddIndexSegmentParts::covering_fields`](super::AddIndexSegmentParts::covering_fields)
+    /// declares them.
+    pub covering_fields: Vec<FieldRef>,
+}
+
 /// Adjust which fragments an existing index segment covers, without rewriting
 /// the segment.
 ///
@@ -37,41 +65,58 @@ use uuid::Uuid;
 /// served by the index would silently miss them. New rows are covered by building
 /// a segment over them ([`AddIndexSegment`](super::AddIndexSegment)), not by
 /// widening an existing one.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Widening coverage is a claim about the segment's files, so it can only be
+/// built with [`try_new_unchecked`](Self::try_new_unchecked).
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AdjustIndexCoverage {
-    /// The segment whose coverage changes.
-    pub uuid: Uuid,
-    /// The logical index the segment belongs to. Conflict detection compares
-    /// coverage across the segments of one index, so it needs the index and not
-    /// just the segment.
-    pub name: String,
-    /// Fragments to bring into the coverage. A [`Ref::Local`] names one this
-    /// operation minted, which is how a segment follows its rows into the
-    /// fragment a rewrite in the same operation moved them to.
-    pub add_fragments: Vec<Ref>,
-    /// Committed fragment ids to drop from the coverage. Unlike the additions
-    /// these take no [`Ref`]: a fragment minted in this same operation was not
-    /// in the coverage to begin with.
-    pub remove_fragments: Vec<u64>,
-    /// The fields the segment is keyed on, declared as
-    /// [`AddIndexSegment::fields`](super::AddIndexSegment::fields) declares
-    /// them. Apply rejects a declaration that does not match the segment.
-    pub fields: Vec<FieldRef>,
-    /// The fields whose values the segment carries, declared as
-    /// [`AddIndexSegment::covering_fields`](super::AddIndexSegment::covering_fields)
-    /// declares them.
-    pub covering_fields: Vec<FieldRef>,
+    parts: AdjustIndexCoverageParts,
 }
 
 impl AdjustIndexCoverage {
+    /// Adjust the coverage `parts` describes.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that the segment's
+    /// existing index files already describe every row of each fragment in
+    /// `add_fragments`, as they stand after this operation. In practice that
+    /// means a rewrite moved rows the segment already covered into the
+    /// fragment, and the segment reaches them through the fragment reuse
+    /// history. Adding a fragment of new rows breaks the contract.
+    ///
+    /// Breaking the contract is not undefined behavior, but queries the index
+    /// serves miss rows or return the wrong ones.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`.
+    pub fn try_new_unchecked(mut parts: AdjustIndexCoverageParts) -> Result<Self> {
+        parts.name = non_empty(parts.name, "AdjustIndexCoverage.name")?;
+        Ok(Self { parts })
+    }
+
+    /// What the adjustment was built from.
+    pub fn parts(&self) -> &AdjustIndexCoverageParts {
+        &self.parts
+    }
+
+    /// Take the parts back, e.g. to change one and certify the result again
+    /// with [`try_new_unchecked`](Self::try_new_unchecked).
+    pub fn into_parts(self) -> AdjustIndexCoverageParts {
+        self.parts
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        reject_frag_reuse_history("AdjustIndexCoverage", &self.name)?;
+        reject_frag_reuse_history("AdjustIndexCoverage", &self.parts.name)?;
         let added = self
+            .parts
             .add_fragments
             .iter()
             .map(|fragment| self.coverage_id(state.resolve_fragment(*fragment)?))
             .collect::<Result<Vec<_>>>()?;
         let removed = self
+            .parts
             .remove_fragments
             .iter()
             .map(|fragment| self.coverage_id(state.resolve_fragment(Ref::Committed(*fragment))?))
@@ -83,26 +128,26 @@ impl AdjustIndexCoverage {
                 .collect::<Result<Vec<_>>>()
         };
         let (fields, covering_fields) = AddIndexSegment::lower_covering(
-            &self.name,
-            resolve(&self.fields)?,
-            resolve(&self.covering_fields)?,
+            &self.parts.name,
+            resolve(&self.parts.fields)?,
+            resolve(&self.parts.covering_fields)?,
         )?;
 
-        let segment = state.index_segment_mut(self.uuid, &self.name)?;
+        let segment = state.index_segment_mut(self.parts.uuid, &self.parts.name)?;
         if segment.fields != fields || segment.covering_fields != covering_fields {
             return Err(Error::invalid_input(format!(
                 "AdjustIndexCoverage for segment {} of index '{}' declares fields {fields:?} \
                  (carried {covering_fields:?}), which does not match the segment's fields {:?} \
                  (carried {:?}); declare the segment's keyed and carried fields as an \
                  AddIndexSegment would",
-                self.uuid, self.name, segment.fields, segment.covering_fields
+                self.parts.uuid, self.parts.name, segment.fields, segment.covering_fields
             )));
         }
         let Some(bitmap) = segment.fragment_bitmap.as_mut() else {
             return Err(Error::invalid_input(format!(
                 "index segment {} records no fragment coverage, so there is nothing to adjust; \
                  rewrite the segment to give it coverage",
-                self.uuid
+                self.parts.uuid
             )));
         };
         for fragment in added {
@@ -119,7 +164,7 @@ impl AdjustIndexCoverage {
             Error::invalid_input(format!(
                 "AdjustIndexCoverage for segment {} names fragment {fragment}, which is beyond \
                  the largest fragment id an index can record ({})",
-                self.uuid,
+                self.parts.uuid,
                 u32::MAX
             ))
         })
@@ -127,7 +172,7 @@ impl AdjustIndexCoverage {
 
     /// Coverage says which fragments an index describes, never what any of them
     /// hold, so adjusting it cannot change a row a reader sees.
-    pub(super) fn is_data_change(&self) -> bool {
+    pub fn is_data_change(&self) -> bool {
         false
     }
 
@@ -148,10 +193,18 @@ impl AdjustIndexCoverage {
     /// Removals claim nothing: coverage the index gives up cannot collide with
     /// coverage another writer takes on.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::IndexSegment(self.uuid));
-        footprint.extend_index_coverage(self.name.clone(), self.add_fragments.iter().copied());
-        let dependencies = self.fields.iter().chain(self.covering_fields.iter());
+        footprint.write(Coordinate::IndexSegment(self.parts.uuid));
+        footprint.extend_index_coverage(
+            self.parts.name.clone(),
+            self.parts.add_fragments.iter().copied(),
+        );
+        let dependencies = self
+            .parts
+            .fields
+            .iter()
+            .chain(self.parts.covering_fields.iter());
         for fragment in self
+            .parts
             .add_fragments
             .iter()
             .filter_map(|fragment| fragment.committed())
@@ -162,7 +215,7 @@ impl AdjustIndexCoverage {
     }
 }
 
-impl DeepSizeOf for AdjustIndexCoverage {
+impl DeepSizeOf for AdjustIndexCoverageParts {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.uuid.as_bytes().deep_size_of_children(context)
             + self.name.deep_size_of_children(context)
@@ -176,16 +229,23 @@ impl DeepSizeOf for AdjustIndexCoverage {
 impl From<&AdjustIndexCoverage> for pb_actions::AdjustIndexCoverage {
     fn from(value: &AdjustIndexCoverage) -> Self {
         Self {
-            uuid: Some((&value.uuid).into()),
-            name: value.name.clone(),
+            uuid: Some((&value.parts.uuid).into()),
+            name: value.parts.name.clone(),
             add_fragments: value
+                .parts
                 .add_fragments
                 .iter()
                 .map(|fragment| (*fragment).into())
                 .collect(),
-            remove_fragments: value.remove_fragments.clone(),
-            fields: value.fields.iter().map(|field| (*field).into()).collect(),
+            remove_fragments: value.parts.remove_fragments.clone(),
+            fields: value
+                .parts
+                .fields
+                .iter()
+                .map(|field| (*field).into())
+                .collect(),
             covering_fields: value
+                .parts
                 .covering_fields
                 .iter()
                 .map(|field| (*field).into())
@@ -198,9 +258,11 @@ impl TryFrom<pb_actions::AdjustIndexCoverage> for AdjustIndexCoverage {
     type Error = Error;
 
     fn try_from(message: pb_actions::AdjustIndexCoverage) -> Result<Self> {
-        Ok(Self {
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(AdjustIndexCoverageParts {
             uuid: Uuid::try_from(&required(message.uuid, "AdjustIndexCoverage.uuid")?)?,
-            name: non_empty(message.name, "AdjustIndexCoverage.name")?,
+            name: message.name,
             add_fragments: message
                 .add_fragments
                 .into_iter()
@@ -229,8 +291,8 @@ mod tests {
         apply_with_indices, backed_manifest, footprint, nested_schema,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, FieldRef,
-        RemoveFragment, TombstoneFieldData,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
+        FieldRef, RemoveFragment, TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use lance_file::version::ConcreteFileVersion;
@@ -253,14 +315,17 @@ mod tests {
     }
 
     fn adjust(uuid: Uuid, name: &str, add: Vec<Ref>, remove: Vec<u64>) -> Action {
-        Action::AdjustIndexCoverage(AdjustIndexCoverage {
-            uuid,
-            name: name.into(),
-            add_fragments: add,
-            remove_fragments: remove,
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-        })
+        Action::AdjustIndexCoverage(
+            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                uuid,
+                name: name.into(),
+                add_fragments: add,
+                remove_fragments: remove,
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -426,20 +491,23 @@ mod tests {
     }
 
     fn build(name: &str, fragment: u64) -> Action {
-        Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::new_v4(),
-            name: name.into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(vec![Ref::Committed(fragment)]),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })
+        Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::new_v4(),
+                name: name.into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(fragment)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -521,17 +589,20 @@ mod tests {
     }
 
     fn widen_declaring(fields: Vec<i32>, covering_fields: Vec<i32>, onto: u64) -> Action {
-        Action::AdjustIndexCoverage(AdjustIndexCoverage {
-            uuid: Uuid::from_u128(1),
-            name: "by_a".into(),
-            add_fragments: vec![Ref::Committed(onto)],
-            remove_fragments: Vec::new(),
-            fields: fields.into_iter().map(FieldRef::Committed).collect(),
-            covering_fields: covering_fields
-                .into_iter()
-                .map(FieldRef::Committed)
-                .collect(),
-        })
+        Action::AdjustIndexCoverage(
+            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                uuid: Uuid::from_u128(1),
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(onto)],
+                remove_fragments: Vec::new(),
+                fields: fields.into_iter().map(FieldRef::Committed).collect(),
+                covering_fields: covering_fields
+                    .into_iter()
+                    .map(FieldRef::Committed)
+                    .collect(),
+            })
+            .unwrap(),
+        )
     }
 
     fn rewrite(fragment: u64, field: i32) -> Vec<Action> {

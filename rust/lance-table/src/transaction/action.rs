@@ -121,9 +121,9 @@ pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::{AddFragment, AddFragmentParts};
-pub use add_index_segment::AddIndexSegment;
+pub use add_index_segment::{AddIndexSegment, AddIndexSegmentParts};
 pub use add_overlays::AddOverlays;
-pub use adjust_index_coverage::AdjustIndexCoverage;
+pub use adjust_index_coverage::{AdjustIndexCoverage, AdjustIndexCoverageParts};
 pub use alter_field::AlterField;
 pub use append_frag_reuse_transition::{AppendFragReuseTransition, FragReuseMapping};
 pub use assert_cells_unchanged::AssertCellsUnchanged;
@@ -479,20 +479,23 @@ mod tests {
         // An index segment is derived state unless the writer says otherwise,
         // as the MemWAL index does for the rows it holds.
         for data_change in [false, true] {
-            let add = Action::AddIndexSegment(AddIndexSegment {
-                uuid: uuid::Uuid::from_u128(1),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-                index_details: None,
-                index_version: 1,
-                covered_fragments: Some(vec![Ref::Committed(0)]),
-                files: Vec::new(),
-                base: None,
-                created_at: None,
-                dataset_version: None,
-                data_change,
-            });
+            let add = Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    uuid: uuid::Uuid::from_u128(1),
+                    name: "by_a".into(),
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: Vec::new(),
+                    index_details: None,
+                    index_version: 1,
+                    covered_fragments: Some(vec![Ref::Committed(0)]),
+                    files: Vec::new(),
+                    base: None,
+                    created_at: None,
+                    dataset_version: None,
+                    data_change,
+                })
+                .unwrap(),
+            );
             assert_eq!(add.is_data_change(), data_change);
             let remove = Action::RemoveIndexSegment(
                 RemoveIndexSegment::try_new_unchecked(
@@ -505,14 +508,17 @@ mod tests {
             assert_eq!(remove.is_data_change(), data_change);
         }
 
-        let adjust = Action::AdjustIndexCoverage(AdjustIndexCoverage {
-            uuid: uuid::Uuid::from_u128(1),
-            name: "by_a".into(),
-            add_fragments: vec![Ref::Committed(1)],
-            remove_fragments: vec![0],
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-        });
+        let adjust = Action::AdjustIndexCoverage(
+            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })
+            .unwrap(),
+        );
         assert!(
             !adjust.is_data_change(),
             "coverage changes no row a reader sees"

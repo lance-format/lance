@@ -90,8 +90,8 @@ mod tests {
         apply_with_indices, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, CompositeOperation,
-        FieldRef, Ref, RemoveIndexSegment, UserStep,
+        Action, AddDataFile, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
+        CompositeOperation, FieldRef, Ref, RemoveIndexSegment, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -104,20 +104,23 @@ mod tests {
     }
 
     fn add_segment(name: &str, covered: Vec<Ref>) -> Action {
-        Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::new_v4(),
-            name: name.into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(covered),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })
+        Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::new_v4(),
+                name: name.into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(covered),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )
     }
 
     /// An append that indexes what it appended: the shape a concurrent writer

@@ -2851,11 +2851,11 @@ mod composite {
     };
     use lance_table::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
-        AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
-        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RefreshRowVersionMetadata,
-        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
-        RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
-        UserStep,
+        AddIndexSegmentParts, AddOverlays, AdjustIndexCoverage, AdjustIndexCoverageParts,
+        AlterField, AssertCellsUnchanged, AssertUniqueKeys, CompositeOperation, ConfigUpdate,
+        DropField, FieldRef, Ref, RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment,
+        ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile,
+        TombstoneFieldData, UpdateCompactedSsTables, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -4248,7 +4248,7 @@ mod composite {
     /// An index segment naming `covered`, with no files of its own -- these
     /// tests inspect the manifest's index section rather than opening the index.
     fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {
-        AddIndexSegment {
+        AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             uuid: Uuid::new_v4(),
             name: name.into(),
             fields: vec![FieldRef::Committed(0)],
@@ -4261,7 +4261,8 @@ mod composite {
             created_at: None,
             dataset_version: None,
             data_change: false,
-        }
+        })
+        .unwrap()
     }
 
     async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
@@ -4358,10 +4359,13 @@ mod composite {
             ));
             covered.push(Ref::Committed(fragment.id));
         }
-        actions.push(Action::AddIndexSegment(AddIndexSegment {
-            fields: vec![FieldRef::Local(0)],
-            ..index_segment("by_b", covered)
-        }));
+        actions.push(Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                fields: vec![FieldRef::Local(0)],
+                ..index_segment("by_b", covered).into_parts()
+            })
+            .unwrap(),
+        ));
         let dataset = commit(dataset, actions).await;
 
         let b = dataset.schema().field("b").expect("field b was added").id;
@@ -4386,11 +4390,11 @@ mod composite {
     async fn test_one_commit_replaces_an_index_segment() {
         let dataset = test_dataset(false).await;
         let old = index_segment("by_a", vec![Ref::Committed(0)]);
-        let old_uuid = old.uuid;
+        let old_uuid = old.parts().uuid;
         let dataset = commit(dataset, vec![Action::AddIndexSegment(old)]).await;
 
         let new = index_segment("by_a", vec![Ref::Committed(0), Ref::Committed(1)]);
-        let new_uuid = new.uuid;
+        let new_uuid = new.parts().uuid;
         let dataset = commit(
             dataset,
             vec![
@@ -4601,20 +4605,23 @@ mod composite {
     async fn test_a_commit_extends_an_index_segments_coverage() {
         let dataset = test_dataset(false).await;
         let segment = index_segment("by_a", vec![Ref::Committed(0)]);
-        let uuid = segment.uuid;
+        let uuid = segment.parts().uuid;
         let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
         assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
 
         let dataset = commit(
             dataset,
-            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
-                uuid,
-                name: "by_a".into(),
-                add_fragments: vec![Ref::Committed(1)],
-                remove_fragments: vec![0],
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-            })],
+            vec![Action::AdjustIndexCoverage(
+                AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                    uuid,
+                    name: "by_a".into(),
+                    add_fragments: vec![Ref::Committed(1)],
+                    remove_fragments: vec![0],
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: Vec::new(),
+                })
+                .unwrap(),
+            )],
         )
         .await;
 
@@ -4624,26 +4631,29 @@ mod composite {
     /// Commit a segment a builder staged, as the action set a writer would
     /// compose for it.
     fn add_built_segment(metadata: IndexMetadata) -> Action {
-        Action::AddIndexSegment(AddIndexSegment {
-            uuid: metadata.uuid,
-            name: metadata.name,
-            fields: metadata
-                .fields
-                .into_iter()
-                .map(FieldRef::Committed)
-                .collect(),
-            covering_fields: Vec::new(),
-            index_details: metadata.index_details,
-            index_version: metadata.index_version,
-            covered_fragments: metadata
-                .fragment_bitmap
-                .map(|ids| ids.iter().map(|id| Ref::Committed(id as u64)).collect()),
-            files: metadata.files.unwrap_or_default(),
-            base: metadata.base_id.map(|id| Ref::Committed(id as u64)),
-            created_at: metadata.created_at,
-            dataset_version: Some(metadata.dataset_version),
-            data_change: false,
-        })
+        Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: metadata.uuid,
+                name: metadata.name,
+                fields: metadata
+                    .fields
+                    .into_iter()
+                    .map(FieldRef::Committed)
+                    .collect(),
+                covering_fields: Vec::new(),
+                index_details: metadata.index_details,
+                index_version: metadata.index_version,
+                covered_fragments: metadata
+                    .fragment_bitmap
+                    .map(|ids| ids.iter().map(|id| Ref::Committed(id as u64)).collect()),
+                files: metadata.files.unwrap_or_default(),
+                base: metadata.base_id.map(|id| Ref::Committed(id as u64)),
+                created_at: metadata.created_at,
+                dataset_version: Some(metadata.dataset_version),
+                data_change: false,
+            })
+            .unwrap(),
+        )
     }
 
     /// Two segments under one name keyed on different columns would have the
@@ -4856,19 +4866,25 @@ mod composite {
         let dataset = test_dataset(false).await;
         let dataset = commit(
             dataset,
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(false, Compression::Flat(FlatCompression {}), 1024),
-                ..index_segment("shared", vec![Ref::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    index_details: details(false, Compression::Flat(FlatCompression {}), 1024),
+                    ..index_segment("shared", vec![Ref::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
         )
         .await;
 
         let result = try_commit(
             dataset,
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                index_details: details(hnsw, compression, 4096),
-                ..index_segment("shared", vec![Ref::Committed(1)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    index_details: details(hnsw, compression, 4096),
+                    ..index_segment("shared", vec![Ref::Committed(1)]).into_parts()
+                })
+                .unwrap(),
+            )],
         )
         .await;
 
@@ -5400,6 +5416,10 @@ mod composite {
         let read_version = dataset.version().version;
         // The base file is declared for `b` alone, so the conflict with dropping
         // `a` comes from the overlay, whose file carries `a`.
+        let b_only = DataFile {
+            column_indices: vec![1].into(),
+            ..existing_data_file(&dataset, 0)
+        };
         let stale_append = vec![
             Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
@@ -5412,7 +5432,7 @@ mod composite {
             Action::AddDataFile(
                 AddDataFile::try_new_unchecked(
                     Ref::Local(0),
-                    existing_data_file(&dataset, 0),
+                    b_only,
                     vec![FieldRef::Committed(1)],
                     None,
                     true,

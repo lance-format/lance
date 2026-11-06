@@ -43,7 +43,7 @@ impl AddDataFile {
     ///   earlier in the same operation. `None` for the dataset's own data
     ///   directory.
     /// * `data_change` says whether the file changes the values its fields
-    ///   hold. See [`AddFragment::data_change`](super::AddFragment::data_change).
+    ///   hold. See [`AddFragmentParts::data_change`](super::AddFragmentParts::data_change).
     ///
     /// # Contract
     ///

@@ -186,10 +186,11 @@ mod tests {
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
         AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
-        AddOverlays, AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
-        ConfigUpdate, DropField, DropIndex, RefreshRowVersionMetadata, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
-        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        AddIndexSegmentParts, AddOverlays, AdjustIndexCoverage, AdjustIndexCoverageParts,
+        AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate, DropField, DropIndex,
+        RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
+        ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData,
+        UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -287,39 +288,45 @@ mod tests {
                     .with_nullable(false),
             ),
             Action::DropField(DropField::new(FieldRef::Committed(3))),
-            Action::AddIndexSegment(AddIndexSegment {
-                uuid: Uuid::from_u128(7),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                covering_fields: vec![FieldRef::Local(3)],
-                index_details: Some(Arc::new(prost_types::Any {
-                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
-                    value: vec![1, 2, 3],
-                })),
-                index_version: 2,
-                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
-                files: vec![IndexFile {
-                    path: "index.idx".into(),
-                    size_bytes: 512,
-                    file_metadata_size_bytes: std::num::NonZero::new(128),
-                }],
-                base: Some(Ref::Local(1)),
-                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
-                dataset_version: Some(3),
-                data_change: false,
-            }),
+            Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    uuid: Uuid::from_u128(7),
+                    name: "by_a".into(),
+                    fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    covering_fields: vec![FieldRef::Local(3)],
+                    index_details: Some(Arc::new(prost_types::Any {
+                        type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                        value: vec![1, 2, 3],
+                    })),
+                    index_version: 2,
+                    covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                    files: vec![IndexFile {
+                        path: "index.idx".into(),
+                        size_bytes: 512,
+                        file_metadata_size_bytes: std::num::NonZero::new(128),
+                    }],
+                    base: Some(Ref::Local(1)),
+                    created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                    dataset_version: Some(3),
+                    data_change: false,
+                })
+                .unwrap(),
+            ),
             Action::RemoveIndexSegment(
                 RemoveIndexSegment::try_new(Uuid::from_u128(8), "by_a").unwrap(),
             ),
             Action::DropIndex(DropIndex::try_new("by_c").unwrap()),
-            Action::AdjustIndexCoverage(AdjustIndexCoverage {
-                uuid: Uuid::from_u128(9),
-                name: "by_b".into(),
-                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
-                remove_fragments: vec![2, 3],
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: vec![FieldRef::Committed(1)],
-            }),
+            Action::AdjustIndexCoverage(
+                AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                    uuid: Uuid::from_u128(9),
+                    name: "by_b".into(),
+                    add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                    remove_fragments: vec![2, 3],
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: vec![FieldRef::Committed(1)],
+                })
+                .unwrap(),
+            ),
             Action::UpdateCompactedSsTables(
                 UpdateCompactedSsTables::try_new_unchecked(vec![
                     CompactedSsTable::new(Uuid::from_u128(10), 2),

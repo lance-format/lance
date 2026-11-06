@@ -237,9 +237,9 @@ mod tests {
         added_field, apply, backed_manifest, footprint,
     };
     use crate::transaction::action::{
-        Action, AddField, AddFragment, AddFragmentParts, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, DropField, FieldRef, RemoveFragment, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        Action, AddField, AddFragment, AddFragmentParts, AddIndexSegment, AddIndexSegmentParts,
+        AdjustIndexCoverage, AdjustIndexCoverageParts, AlterField, CompositeOperation, DropField,
+        FieldRef, RemoveFragment, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
@@ -459,20 +459,23 @@ mod tests {
     /// collide with a committed partial write, only with a full one.
     #[test]
     fn test_an_index_may_be_built_over_a_committed_overlay() {
-        let build = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
-            uuid: uuid::Uuid::from_u128(1),
-            name: "by_a".into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(vec![Ref::Committed(0)]),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })]);
+        let build = footprint(vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )]);
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
 
         assert!(!build.conflicts_with(&overlaid));
@@ -846,14 +849,17 @@ mod tests {
     /// so the index never answers from the values it replaced.
     #[test]
     fn test_an_overlay_does_not_conflict_with_a_widening_onto_its_fragment() {
-        let widen = footprint(vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
-            uuid: uuid::Uuid::from_u128(1),
-            name: "by_a".into(),
-            add_fragments: vec![Ref::Committed(7)],
-            remove_fragments: Vec::new(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-        })]);
+        let widen = footprint(vec![Action::AdjustIndexCoverage(
+            AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(7)],
+                remove_fragments: Vec::new(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })
+            .unwrap(),
+        )]);
         let overlay = footprint(vec![add(Ref::Committed(7), vec![overlay("a.lance", &[0])])]);
 
         assert!(!widen.conflicts_with(&overlay));
