@@ -14,6 +14,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 
 mod batch;
 mod positions;
@@ -106,7 +107,7 @@ pub struct FragmentRowIdIndex {
     pub deletion_vector: Arc<DeletionVector>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct FragmentIdentity {
     fragment_id: u32,
     sequence: Weak<RowIdSequence>,
@@ -187,7 +188,7 @@ impl RowIdIndex {
             .flat_map(|previous| &previous.fragments)
             .map(|entry| (entry.identity.key(), entry))
             .collect();
-        let mut fragments: Vec<Arc<FragmentEntry>> = fragment_indices
+        let fragments: Vec<Arc<FragmentEntry>> = fragment_indices
             .iter()
             .zip(&sources)
             .filter_map(|(source, identity)| {
@@ -207,6 +208,113 @@ impl RowIdIndex {
                 sources,
             });
         }
+        Ok(Self::build_probe(fragments, probes, sources))
+    }
+
+    /// Reuse prepared fragments after the caller has verified unchanged content.
+    ///
+    /// Each retained id refers to a fragment in this index. The caller must
+    /// verify that its row IDs, deletions and physical addresses are unchanged;
+    /// matching a fragment id alone is insufficient. Original row-ID sequences
+    /// need not remain alive. Only `new_fragments` require preparation.
+    ///
+    /// Returns `None` when a probe-to-merged transition or a partially changed
+    /// merged source group requires original sequences. The caller can then
+    /// load those sequences and use [`Self::new`]. No previous index is retained.
+    /// Duplicate or missing retained ids, and duplicate ids across retained and
+    /// new fragments, return an invalid-input error.
+    ///
+    /// ```
+    /// # use lance_table::rowids::{RowIdIndex, FragmentRowIdIndex};
+    /// # fn example(first: &RowIdIndex, appended: &[FragmentRowIdIndex])
+    /// # -> lance_core::Result<()> {
+    /// // The caller verified that fragment 7 has unchanged content.
+    /// if let Some(next) = first.try_reuse_fragments(&[7], appended)? {
+    ///     let addresses = next.get_many(&[10, 20])?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_reuse_fragments(
+        &self,
+        retained_fragment_ids: &[u32],
+        new_fragments: &[FragmentRowIdIndex],
+    ) -> Result<Option<Self>> {
+        let previous: HashMap<_, _> = self
+            .sources
+            .iter()
+            .map(|source| (source.fragment_id, source))
+            .collect();
+        // An id cannot select one of several sources with the same address base.
+        if previous.len() != self.sources.len() {
+            return Ok(None);
+        }
+        let mut seen = RoaringBitmap::new();
+        let mut sources = Vec::with_capacity(retained_fragment_ids.len() + new_fragments.len());
+        for &id in retained_fragment_ids {
+            if !seen.insert(id) {
+                return Err(Error::invalid_input(format!(
+                    "retained_fragment_ids contains duplicate fragment_id {id}"
+                )));
+            }
+            let source = previous.get(&id).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "retained fragment_id {id} is missing from the previous row id index"
+                ))
+            })?;
+            sources.push((*source).clone());
+        }
+        for source in new_fragments {
+            if !seen.insert(source.fragment_id) {
+                return Err(Error::invalid_input(format!(
+                    "new_fragments contains duplicate fragment_id {}",
+                    source.fragment_id
+                )));
+            }
+            sources.push(FragmentIdentity::new(source));
+        }
+        if retained_fragment_ids.is_empty() {
+            return Self::new(new_fragments).map(Some);
+        }
+        if self.merged.is_some() {
+            return Ok(self
+                .reuse_merged(new_fragments, &sources)?
+                .map(|merged| Self {
+                    fragments: Vec::new(),
+                    probes: Vec::new(),
+                    end_tree: Vec::new(),
+                    merged: Some(merged),
+                    sources,
+                }));
+        }
+        let prepared: HashMap<_, _> = self
+            .fragments
+            .iter()
+            .map(|entry| (entry.fragment_id, entry))
+            .collect();
+        let fragments: Vec<_> = retained_fragment_ids
+            .iter()
+            // Empty source fragments have no prepared entry.
+            .filter_map(|id| prepared.get(id).map(|entry| Arc::clone(entry)))
+            .chain(
+                new_fragments
+                    .iter()
+                    .filter_map(FragmentEntry::new)
+                    .map(Arc::new),
+            )
+            .collect();
+        let probes = probe_entries(&fragments);
+        if !probing_beats_merging(&fragments, &probes) {
+            return Ok(None);
+        }
+        Ok(Some(Self::build_probe(fragments, probes, sources)))
+    }
+
+    fn build_probe(
+        mut fragments: Vec<Arc<FragmentEntry>>,
+        probes: Vec<ProbeEntry>,
+        sources: Vec<FragmentIdentity>,
+    ) -> Self {
         // Shared entries are already prepared. Native encodings need no work;
         // avoid even starting the CPU pool for a directory-only version change.
         let lookups: Vec<_> = fragments
@@ -230,13 +338,13 @@ impl RowIdIndex {
                 entry.build_lookups();
             }
         }
-        Ok(Self {
+        Self {
             end_tree: build_end_tree(&probes),
             probes,
             fragments,
             merged: None,
             sources,
-        })
+        }
     }
 
     /// Keep complete unchanged source groups and drop groups absent in this
@@ -282,8 +390,8 @@ impl RowIdIndex {
             .map(|(range, chunk)| (range.clone(), chunk.clone()))
             .collect();
         let mut additions = Vec::new();
-        for (source, identity) in sources.iter().zip(identities) {
-            if retained_keys.contains(&identity.key()) {
+        for source in sources {
+            if retained_keys.contains(&FragmentIdentity::new(source).key()) {
                 continue;
             }
             // Preserve the normal cost gate for additions that enumerate IDs:
@@ -1171,6 +1279,10 @@ mod tests {
             ),
         ];
         let first = Arc::new(RowIdIndex::new(&sources).unwrap());
+        let originals: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::downgrade(&source.row_id_sequence))
+            .collect();
         let old = Arc::downgrade(&first);
         sources.push(fragment(9, RowIdSequence(vec![U64Segment::Range(6..8)])));
         let appended = RowIdIndex::new_reusing(&sources, Some(&first)).unwrap();
@@ -1208,6 +1320,39 @@ mod tests {
         let error = RowIdIndex::new_reusing(&sources, Some(&deleted)).unwrap_err();
         assert!(matches!(error, Error::Internal { .. }));
         assert!(error.to_string().contains("stable row id 7"));
+
+        drop(sources);
+        assert!(originals.iter().all(|source| source.upgrade().is_none()));
+        let revisited = appended.try_reuse_fragments(&[8, 3], &[]).unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            appended.merged.as_ref().unwrap().get(&0).unwrap(),
+            revisited.merged.as_ref().unwrap().get(&0).unwrap(),
+        ));
+        assert_eq!(revisited.get(6).unwrap(), None);
+        assert_eq!(revisited.get(5).unwrap(), expected[0]);
+        assert!(appended.try_reuse_fragments(&[3], &[]).unwrap().is_none());
+        let added = fragment(10, RowIdSequence(vec![U64Segment::Range(10..12)]));
+        let next = revisited
+            .try_reuse_fragments(&[3, 8], &[added])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.get(10).unwrap(),
+            Some(RowAddress::new_from_parts(10, 0))
+        );
+        assert_eq!(next.get(5).unwrap(), expected[0]);
+        assert_eq!(revisited.get(10).unwrap(), None);
+        for ids in [&[3, 3][..], &[99][..]] {
+            let error = revisited.try_reuse_fragments(ids, &[]).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("fragment_id"));
+        }
+        let duplicate = fragment(3, RowIdSequence(vec![U64Segment::Range(20..21)]));
+        let error = revisited
+            .try_reuse_fragments(&[3, 8], &[duplicate])
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("duplicate fragment_id 3"));
     }
 
     #[test]
@@ -1299,6 +1444,59 @@ mod tests {
         assert_eq!(deleted.get(queries[0]).unwrap(), None);
         assert_eq!(appended.get_many(&queries).unwrap(), expected);
         assert_eq!(deleted.get(queries[2]).unwrap(), expected[2]);
+
+        let originals: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::downgrade(&source.row_id_sequence))
+            .collect();
+        drop(sources);
+        if !sorted {
+            assert!(
+                originals[..2]
+                    .iter()
+                    .all(|source| source.upgrade().is_none())
+            );
+        }
+        let deleted = Arc::new(deleted);
+        let previous = Arc::downgrade(&deleted);
+        let added = fragment(
+            10,
+            RowIdSequence(vec![U64Segment::Range(9_100_000..9_100_002)]),
+        );
+        let next = deleted
+            .try_reuse_fragments(&[9, 7, 8], &[added])
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&deleted.fragments[1], &next.fragments[1]));
+        let mut context = lance_core::deepsize::Context::default();
+        let old_charge = deleted.deep_size_of_children(&mut context);
+        let new_charge = next.deep_size_of_children(&mut context);
+        assert!(old_charge > 1_000_000);
+        assert!(
+            new_charge < 4096,
+            "unchanged lookup allocations must be shared"
+        );
+        assert!(deleted.try_reuse_fragments(&[7], &[]).unwrap().is_none());
+        drop(deleted);
+        assert!(previous.upgrade().is_none());
+        assert_eq!(next.get(queries[0]).unwrap(), None);
+        assert_eq!(next.get(queries[2]).unwrap(), expected[2]);
+        assert_eq!(
+            next.get(9_100_001).unwrap(),
+            Some(RowAddress::new_from_parts(10, 1))
+        );
+        assert_eq!(appended.get(9_100_001).unwrap(), None);
+        let collision = fragment(
+            11,
+            RowIdSequence(vec![U64Segment::Range(queries[2]..queries[2] + 1)]),
+        );
+        let invalid = next
+            .try_reuse_fragments(&[7, 8, 9, 10], &[collision])
+            .unwrap()
+            .unwrap();
+        let error = invalid.get(queries[2]).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(error.to_string().contains("live in multiple fragments"));
     }
 
     #[test]
