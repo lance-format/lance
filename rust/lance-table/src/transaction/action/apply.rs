@@ -1871,12 +1871,7 @@ mod tests {
     #[case::deletion_file_after_remove(
         vec![vec![
             remove_fragment_zero(),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            }),
+            Action::SetDeletionFile(SetDeletionFile::clear(0)),
         ]],
         Some("SetDeletionFile targets fragment 0, which does not exist"),
     )]
@@ -2213,12 +2208,7 @@ mod tests {
     #[case::deletion_file_on_a_minted_fragment(
         vec![
             mint_fragment(0),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 5,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            }),
+            Action::SetDeletionFile(SetDeletionFile::clear(5)),
         ],
         "fragment 5",
     )]
@@ -2253,15 +2243,7 @@ mod tests {
     /// operation applies, but a concurrent commit minted it for its own
     /// object.
     #[rstest]
-    #[case::deletion_file(
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment: 1,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        }),
-        "fragment 1",
-    )]
+    #[case::deletion_file(Action::SetDeletionFile(SetDeletionFile::clear(1)), "fragment 1")]
     #[case::remove_fragment(
         Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
         "fragment 1"

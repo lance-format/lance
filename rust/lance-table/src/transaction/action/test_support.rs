@@ -311,11 +311,14 @@ pub(super) mod frag_reuse {
     }
 
     pub fn transition(sources: &[u64], destinations: &[Ref], mapping: FragReuseMapping) -> Action {
-        Action::AppendFragReuseTransition(AppendFragReuseTransition {
-            sources: sources.iter().copied().map(Ref::Committed).collect(),
-            destinations: destinations.to_vec(),
-            mapping,
-        })
+        Action::AppendFragReuseTransition(
+            AppendFragReuseTransition::try_new_unchecked(
+                sources.iter().copied().map(Ref::Committed).collect(),
+                destinations.to_vec(),
+                mapping,
+            )
+            .unwrap(),
+        )
     }
 
     pub fn digest(id: u64, physical_rows: u64) -> pb_fri::FragmentDigest {

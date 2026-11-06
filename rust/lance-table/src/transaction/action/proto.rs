@@ -242,30 +242,32 @@ mod tests {
                 vec![FieldRef::Committed(7), FieldRef::Committed(8)],
             )),
             Action::RemoveFragment(RemoveFragment::new(Ref::Committed(5))),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 6,
-                deletion_file: Some(DeletionFile {
-                    read_version: 3,
-                    id: 9,
-                    file_type: DeletionFileType::Bitmap,
-                    num_deleted_rows: Some(4),
-                    base_id: None,
-                    inline: None,
-                }),
-                data_change: true,
-                base: Some(Ref::Committed(2)),
-            }),
-            Action::AddOverlays(AddOverlays {
-                fragment: Ref::Committed(6),
-                overlays: vec![DataOverlayFile {
+            Action::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(
+                    6,
+                    DeletionFile {
+                        read_version: 3,
+                        id: 9,
+                        file_type: DeletionFileType::Bitmap,
+                        num_deleted_rows: Some(4),
+                        base_id: None,
+                        inline: None,
+                    },
+                    Some(Ref::Committed(2)),
+                    true,
+                )
+                .unwrap(),
+            ),
+            Action::AddOverlays(AddOverlays::new_unchecked(
+                Ref::Committed(6),
+                vec![DataOverlayFile {
                     data_file: sample_data_file(),
                     coverage: OverlayCoverage::PerField(vec![Arc::new(
                         [1u32, 4].into_iter().collect::<RoaringBitmap>(),
                     )]),
                     committed_version: 11,
                 }],
-                data_change: true,
-            }),
+            )),
             Action::RefreshRowVersionMetadata(
                 RefreshRowVersionMetadata::try_new(vec![
                     RowSelection {
@@ -318,19 +320,23 @@ mod tests {
                 fields: vec![FieldRef::Committed(0)],
                 covering_fields: vec![FieldRef::Committed(1)],
             }),
-            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
-                compacted_sstables: vec![
+            Action::UpdateCompactedSsTables(
+                UpdateCompactedSsTables::try_new_unchecked(vec![
                     CompactedSsTable::new(Uuid::from_u128(10), 2),
                     CompactedSsTable::new(Uuid::from_u128(11), 5),
-                ],
-            }),
-            Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                filter: KeyExistenceFilter {
-                    field_ids: Vec::new(),
-                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
-                },
-            }),
+                ])
+                .unwrap(),
+            ),
+            Action::AssertUniqueKeys(
+                AssertUniqueKeys::try_new_unchecked(
+                    vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    KeyExistenceFilter {
+                        field_ids: Vec::new(),
+                        filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
+                    },
+                )
+                .unwrap(),
+            ),
             Action::AssertCellsUnchanged(
                 AssertCellsUnchanged::try_new(
                     vec![FieldRef::Committed(1)],

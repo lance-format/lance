@@ -1267,12 +1267,7 @@ mod tests {
     }
 
     fn set_deletion_file(fragment: u64) -> Action {
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        })
+        Action::SetDeletionFile(SetDeletionFile::clear(fragment))
     }
 
     fn add_base(local: u32, name: &str, path: &str) -> Action {

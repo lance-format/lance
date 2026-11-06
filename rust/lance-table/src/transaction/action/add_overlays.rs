@@ -22,28 +22,46 @@ use roaring::RoaringBitmap;
 /// entries take precedence.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddOverlays {
-    /// The fragment to overlay: committed, or one minted earlier in the same
-    /// operation with `data_change = true`.
-    pub fragment: Ref,
-    /// The overlays to append, in precedence order: where two cover the same
-    /// cell, the later one wins. Each one's `committed_version` is ignored and
-    /// stamped with the version this commit produces, so replaying the action
-    /// onto a newer version re-stamps rather than backdates.
-    pub overlays: Vec<DataOverlayFile>,
-    /// Must be `true`; `false` is rejected at apply, since an overlay always
-    /// changes values. See [`AddFragment::data_change`](super::AddFragment::data_change).
-    pub data_change: bool,
+    fragment: Ref,
+    overlays: Vec<DataOverlayFile>,
 }
 
 impl AddOverlays {
+    /// Append `overlays` to `fragment`.
+    ///
+    /// * `fragment` is committed, or one minted earlier in the same operation
+    ///   with `data_change = true`.
+    /// * `overlays` are in precedence order: where two cover the same cell, the
+    ///   later one wins. Each one's `committed_version` is ignored and stamped
+    ///   with the version this commit produces, so replaying the action onto a
+    ///   newer version re-stamps rather than backdates.
+    ///
+    /// An overlay always changes values, so the action is always a data change.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that each overlay's
+    /// file exists, is readable, and holds a value of its field's type for
+    /// every cell its coverage names. Apply checks the coverage stays within
+    /// the fragment's rows, not what the file holds.
+    ///
+    /// Breaking the contract is not undefined behavior, but it commits a table
+    /// whose reads fail or return the wrong rows.
+    pub fn new_unchecked(fragment: Ref, overlays: Vec<DataOverlayFile>) -> Self {
+        Self { fragment, overlays }
+    }
+
+    /// The fragment overlaid.
+    pub fn fragment(&self) -> Ref {
+        self.fragment
+    }
+
+    /// The overlays appended, in precedence order.
+    pub fn overlays(&self) -> &[DataOverlayFile] {
+        &self.overlays
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        if !self.data_change {
-            return Err(Error::invalid_input(
-                "AddOverlays cannot set data_change = false: an overlay supplies values that \
-                 differ from the ones it covers, so there is no restatement to describe, and \
-                 the flag would only hide the change from consumers that skip non-data commits",
-            ));
-        }
         // The same refusal the legacy DataOverlay meets on such a table: the
         // read path does not yet mask overlaid cells out of segments that
         // translate into the fragment.
@@ -108,9 +126,8 @@ impl AddOverlays {
     }
 
     /// An overlay supplies new cell values, so it changes what a reader sees.
-    /// `data_change = false` is rejected at apply; see there.
-    pub(super) fn is_data_change(&self) -> bool {
-        self.data_change
+    pub fn is_data_change(&self) -> bool {
+        true
     }
 
     /// A partial write of each overlaid field's data in the fragment, a
@@ -177,7 +194,7 @@ impl From<&AddOverlays> for pb_actions::AddOverlays {
                 .iter()
                 .map(pb::DataOverlayFile::from)
                 .collect(),
-            data_change: data_change_to_wire(value.data_change),
+            data_change: data_change_to_wire(true),
         }
     }
 }
@@ -186,15 +203,23 @@ impl TryFrom<pb_actions::AddOverlays> for AddOverlays {
     type Error = Error;
 
     fn try_from(message: pb_actions::AddOverlays) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "AddOverlays.fragment")?.try_into()?,
-            overlays: message
+        if !data_change_from_wire(message.data_change) {
+            return Err(Error::invalid_input(
+                "AddOverlays cannot set data_change = false: an overlay supplies values that \
+                 differ from the ones it covers, so there is no restatement to describe, and \
+                 the flag would only hide the change from consumers that skip non-data commits",
+            ));
+        }
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Ok(Self::new_unchecked(
+            required(message.fragment, "AddOverlays.fragment")?.try_into()?,
+            message
                 .overlays
                 .into_iter()
                 .map(DataOverlayFile::try_from)
                 .collect::<Result<Vec<_>>>()?,
-            data_change: data_change_from_wire(message.data_change),
-        })
+        ))
     }
 }
 
@@ -241,11 +266,7 @@ mod tests {
     }
 
     fn add(fragment: Ref, overlays: Vec<DataOverlayFile>) -> Action {
-        Action::AddOverlays(AddOverlays {
-            fragment,
-            overlays,
-            data_change: true,
-        })
+        Action::AddOverlays(AddOverlays::new_unchecked(fragment, overlays))
     }
 
     fn mint(physical_rows: u64) -> Action {
@@ -684,18 +705,18 @@ mod tests {
 
     /// An overlay always supplies values that differ from what was there, so
     /// there is no restatement for `data_change = false` to describe; it would
-    /// only hide the change from consumers that skip non-data commits.
+    /// only hide the change from consumers that skip non-data commits. The
+    /// action cannot be built that way, so only a transaction file can say it.
     #[test]
     fn test_an_overlay_cannot_be_marked_as_no_data_change() {
-        let error = apply(
-            &backed_manifest(),
-            vec![Action::AddOverlays(AddOverlays {
-                fragment: Ref::Committed(0),
-                overlays: vec![overlay("a.lance", &[0])],
-                data_change: false,
-            })],
-        )
-        .unwrap_err();
+        let message = pb_actions::AddOverlays {
+            data_change: Some(false),
+            ..pb_actions::AddOverlays::from(&AddOverlays::new_unchecked(
+                Ref::Committed(0),
+                vec![overlay("a.lance", &[0])],
+            ))
+        };
+        let error = AddOverlays::try_from(message).unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(error.to_string().contains("data_change"), "{error}");
@@ -750,12 +771,9 @@ mod tests {
     #[test]
     fn test_an_overlay_conflicts_with_a_deletion_of_the_same_fragment() {
         let delete = |fragment: u64| {
-            footprint(vec![Action::SetDeletionFile(SetDeletionFile {
+            footprint(vec![Action::SetDeletionFile(SetDeletionFile::clear(
                 fragment,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            })])
+            ))])
         };
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
 
@@ -778,12 +796,7 @@ mod tests {
             })),
             add(Ref::Local(0), vec![overlay("new.lance", &[0])]),
         ]);
-        let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        })]);
+        let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile::clear(0))]);
 
         assert!(!overlaid.conflicts_with(&delete));
         assert!(!delete.conflicts_with(&overlaid));

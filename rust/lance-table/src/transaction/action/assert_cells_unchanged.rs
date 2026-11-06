@@ -223,15 +223,14 @@ mod tests {
             DataFile::new_unstarted("data/overlay.lance", ConcreteFileVersion::V2_0);
         data_file.fields = vec![field].into();
         data_file.column_indices = vec![0].into();
-        Action::AddOverlays(AddOverlays {
-            fragment: Ref::Committed(fragment),
-            overlays: vec![DataOverlayFile {
+        Action::AddOverlays(AddOverlays::new_unchecked(
+            Ref::Committed(fragment),
+            vec![DataOverlayFile {
                 data_file,
                 coverage: OverlayCoverage::Shared(Arc::new(RoaringBitmap::from_iter([0u32]))),
                 committed_version: 0,
             }],
-            data_change: true,
-        })
+        ))
     }
 
     /// `a = b` and `b = a` from one snapshot write disjoint columns, so
@@ -270,12 +269,7 @@ mod tests {
     #[case::rewrote_the_field_elsewhere(rewrite(1, 1), false)]
     #[case::rewrote_another_field_there(rewrite(0, 2), false)]
     #[case::deleted_rows_there(
-        vec![Action::SetDeletionFile(SetDeletionFile {
-            fragment: 0,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        })],
+        vec![Action::SetDeletionFile(SetDeletionFile::clear(0))],
         false
     )]
     fn test_an_assertion_conflicts_with_a_change_to_its_cells(

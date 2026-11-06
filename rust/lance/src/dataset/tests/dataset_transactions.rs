@@ -3201,19 +3201,22 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment: fragment_id,
-                deletion_file: Some(DeletionFile {
-                    read_version,
-                    id: 1,
-                    file_type: DeletionFileType::Array,
-                    num_deleted_rows: Some(2),
-                    base_id: None,
-                    inline: None,
-                }),
-                data_change: true,
-                base: None,
-            })],
+            vec![Action::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(
+                    fragment_id,
+                    DeletionFile {
+                        read_version,
+                        id: 1,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(2),
+                        base_id: None,
+                        inline: None,
+                    },
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )],
         )
         .await;
 
@@ -3295,19 +3298,22 @@ mod composite {
         let delete = |id: u64| {
             composite_txn(
                 read_version,
-                vec![Action::SetDeletionFile(SetDeletionFile {
-                    fragment: fragment_id,
-                    deletion_file: Some(DeletionFile {
-                        read_version,
-                        id,
-                        file_type: DeletionFileType::Array,
-                        num_deleted_rows: Some(1),
-                        base_id: None,
-                        inline: None,
-                    }),
-                    data_change: true,
-                    base: None,
-                })],
+                vec![Action::SetDeletionFile(
+                    SetDeletionFile::try_new_unchecked(
+                        fragment_id,
+                        DeletionFile {
+                            read_version,
+                            id,
+                            file_type: DeletionFileType::Array,
+                            num_deleted_rows: Some(1),
+                            base_id: None,
+                            inline: None,
+                        },
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                )],
             )
         };
 
@@ -5000,16 +5006,14 @@ mod composite {
                     )
                     .unwrap(),
                 ),
-                Action::AddOverlays(AddOverlays {
-                    fragment: Ref::Committed(overlaid),
-                    overlays: vec![DataOverlayFile {
+                Action::AddOverlays(AddOverlays::new_unchecked(
+                    Ref::Committed(overlaid),
+                    vec![DataOverlayFile {
                         data_file: overlay_file,
                         coverage: OverlayCoverage::dense([0u32, 2].into_iter().collect()),
-                        // Left for the commit to stamp.
                         committed_version: 0,
                     }],
-                    data_change: true,
-                }),
+                )),
             ],
         )
         .await;
@@ -5103,9 +5107,10 @@ mod composite {
 
         let dataset = commit(
             dataset,
-            vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
-                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
-            })],
+            vec![Action::UpdateCompactedSsTables(
+                UpdateCompactedSsTables::try_new_unchecked(vec![CompactedSsTable::new(shard, 3)])
+                    .unwrap(),
+            )],
         )
         .await;
 
@@ -5148,13 +5153,16 @@ mod composite {
             ),
         ];
         if let Some(key_hashes) = key_hashes {
-            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![FieldRef::Committed(0)],
-                filter: KeyExistenceFilter {
-                    field_ids: Vec::new(),
-                    filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
-                },
-            }));
+            actions.push(Action::AssertUniqueKeys(
+                AssertUniqueKeys::try_new_unchecked(
+                    vec![FieldRef::Committed(0)],
+                    KeyExistenceFilter {
+                        field_ids: Vec::new(),
+                        filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
+                    },
+                )
+                .unwrap(),
+            ));
         }
         actions
     }
@@ -5199,15 +5207,14 @@ mod composite {
     }
 
     fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
-        Action::AddOverlays(AddOverlays {
-            fragment: Ref::Committed(fragment),
-            overlays: vec![DataOverlayFile {
+        Action::AddOverlays(AddOverlays::new_unchecked(
+            Ref::Committed(fragment),
+            vec![DataOverlayFile {
                 data_file: existing_overlay_file(dataset, 1),
                 coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
                 committed_version: 0,
             }],
-            data_change: true,
-        })
+        ))
     }
 
     /// Incremental consumers find changed rows through the last-updated
@@ -5255,19 +5262,22 @@ mod composite {
     async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
         let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
             vec![
-                Action::SetDeletionFile(SetDeletionFile {
-                    fragment,
-                    deletion_file: Some(DeletionFile {
-                        read_version,
-                        id: 1,
-                        file_type: DeletionFileType::Array,
-                        num_deleted_rows: Some(1),
-                        base_id: None,
-                        inline: None,
-                    }),
-                    data_change: true,
-                    base: None,
-                }),
+                Action::SetDeletionFile(
+                    SetDeletionFile::try_new_unchecked(
+                        fragment,
+                        DeletionFile {
+                            read_version,
+                            id: 1,
+                            file_type: DeletionFileType::Array,
+                            num_deleted_rows: Some(1),
+                            base_id: None,
+                            inline: None,
+                        },
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
                 Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 1,
@@ -5409,15 +5419,14 @@ mod composite {
                 )
                 .unwrap(),
             ),
-            Action::AddOverlays(AddOverlays {
-                fragment: Ref::Local(0),
-                overlays: vec![DataOverlayFile {
+            Action::AddOverlays(AddOverlays::new_unchecked(
+                Ref::Local(0),
+                vec![DataOverlayFile {
                     data_file: existing_overlay_file(&dataset, 1),
                     coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
                     committed_version: 0,
                 }],
-                data_change: true,
-            }),
+            )),
         ];
 
         let dropped = commit(
@@ -5547,13 +5556,14 @@ mod composite {
                 let mut changed_row_addrs = Vec::new();
                 survivors.serialize_into(&mut changed_row_addrs).unwrap();
                 actions.push(Action::AppendFragReuseTransition(
-                    AppendFragReuseTransition {
-                        sources: sources.iter().copied().map(Ref::Committed).collect(),
-                        destinations: vec![Ref::Local(0)],
-                        mapping: FragReuseMapping::OrderedCompaction(pb_fri::OrderedCompaction {
+                    AppendFragReuseTransition::try_new_unchecked(
+                        sources.iter().copied().map(Ref::Committed).collect(),
+                        vec![Ref::Local(0)],
+                        FragReuseMapping::OrderedCompaction(pb_fri::OrderedCompaction {
                             changed_row_addrs,
                         }),
-                    },
+                    )
+                    .unwrap(),
                 ));
             }
             actions

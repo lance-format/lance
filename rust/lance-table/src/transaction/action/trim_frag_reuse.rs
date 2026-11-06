@@ -189,15 +189,14 @@ mod tests {
     fn test_an_overlay_is_refused_beside_a_tagged_history() {
         let error = apply_with_indices(
             &table(3, false),
-            vec![Action::AddOverlays(AddOverlays {
-                fragment: Ref::Committed(0),
-                overlays: vec![DataOverlayFile {
+            vec![Action::AddOverlays(AddOverlays::new_unchecked(
+                Ref::Committed(0),
+                vec![DataOverlayFile {
                     data_file: DataFile::new_legacy_from_fields("o.lance", vec![0], None),
                     coverage: OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([0u32])),
                     committed_version: 1,
                 }],
-                data_change: true,
-            })],
+            ))],
             vec![history(1, Vec::new(), vec![recorded(&[7], &[0])])],
         )
         .unwrap_err();

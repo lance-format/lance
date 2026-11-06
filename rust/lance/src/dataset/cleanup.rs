@@ -8189,18 +8189,19 @@ mod tests {
                 }
             }
             actions.push(Action::AppendFragReuseTransition(
-                AppendFragReuseTransition {
-                    sources: transition
+                AppendFragReuseTransition::try_new_unchecked(
+                    transition
                         .sources
                         .iter()
                         .map(|source| Ref::Committed(source.id))
                         .collect(),
-                    destinations: destinations
+                    destinations
                         .iter()
                         .map(|destination| Ref::Committed(destination.id))
                         .collect(),
-                    mapping: transition.mapping.clone().unwrap(),
-                },
+                    transition.mapping.clone().unwrap(),
+                )
+                .unwrap(),
             ));
             Transaction::new(
                 0,
