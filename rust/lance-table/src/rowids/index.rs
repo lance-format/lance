@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 
 mod batch;
 mod positions;
+mod sparse;
 
 use positions::Positions;
 
@@ -137,9 +138,18 @@ impl FragmentIdentity {
 }
 
 impl DeepSizeOf for FragmentIdentity {
-    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // Weak identities own no sequence or deletion data.
-        0
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        // A dead Weak still retains space for T, but none of T's former heap
+        // children. Live allocations belong to their strong owners. As with
+        // DeepSizeOf for Arc, allocator/control-block overhead is excluded.
+        fn expired_size<T>(weak: &Weak<T>, context: &mut lance_core::deepsize::Context) -> usize {
+            if weak.strong_count() == 0 && context.mark_seen(weak.as_ptr() as usize) {
+                std::mem::size_of::<T>()
+            } else {
+                0
+            }
+        }
+        expired_size(&self.sequence, context) + expired_size(&self.deletion_vector, context)
     }
 }
 
@@ -919,6 +929,7 @@ impl DeepSizeOf for FragmentEntry {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.sequence.deep_size_of_children(context)
             + self.deletion_vector.deep_size_of_children(context)
+            + self.identity.deep_size_of_children(context)
             + self.segments.capacity() * std::mem::size_of::<SegmentEntry>()
             + self
                 .segments
@@ -960,7 +971,7 @@ impl DeepSizeOf for RowIdIndex {
             + merged_bytes
             + self.probes.capacity() * std::mem::size_of::<ProbeEntry>()
             + self.end_tree.capacity() * std::mem::size_of::<u64>()
-            + self.sources.capacity() * std::mem::size_of::<FragmentIdentity>()
+            + self.sources.deep_size_of_children(context)
     }
 }
 
@@ -1264,6 +1275,25 @@ mod tests {
             row_id_sequence: Arc::new(sequence),
             deletion_vector: Arc::new(DeletionVector::default()),
         }
+    }
+
+    #[test]
+    fn source_identity_counts_only_expired_allocation_storage() {
+        let source = fragment(3, sparse_sequence(1024));
+        let identity = FragmentIdentity::new(&source);
+        let mut context = lance_core::deepsize::Context::default();
+        assert_eq!(identity.deep_size_of_children(&mut context), 0);
+        let source_size = source.row_id_sequence.deep_size_of_children(&mut context);
+        assert!(source_size > 1024);
+        assert_eq!(identity.deep_size_of_children(&mut context), 0);
+        drop(source);
+
+        let mut context = lance_core::deepsize::Context::default();
+        assert_eq!(
+            identity.deep_size_of_children(&mut context),
+            std::mem::size_of::<RowIdSequence>() + std::mem::size_of::<DeletionVector>()
+        );
+        assert_eq!(identity.clone().deep_size_of_children(&mut context), 0);
     }
 
     #[test]

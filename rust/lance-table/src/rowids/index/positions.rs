@@ -20,9 +20,16 @@ pub(super) enum Positions {
         entries: Vec<u64>,
     },
     Wide {
-        keys: Vec<u64>,
-        offsets: Vec<u32>,
+        entries: Vec<WidePosition>,
     },
+}
+
+/// High word first preserves numeric ID order without padding each entry to
+/// 16 bytes. Sorting direct keys avoids random reads from the source array.
+#[derive(Debug, DeepSizeOf, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct WidePosition {
+    key: [u32; 2],
+    offset: u32,
 }
 
 impl Positions {
@@ -78,17 +85,17 @@ impl Positions {
             entries.dedup_by_key(|entry| *entry >> 32);
             Self::Packed { base, entries }
         } else {
-            // Sort only physical offsets, avoiding a padded 16-byte pair per row.
-            let mut offsets: Vec<u32> = (0..values.len()).map(|offset| offset as u32).collect();
-            offsets.sort_unstable_by_key(|&offset| (values.get(offset as usize), offset));
-            offsets.dedup_by_key(|offset| values.get(*offset as usize));
-            let mut keys = Vec::with_capacity(offsets.len());
-            keys.extend(
-                offsets
-                    .iter()
-                    .filter_map(|&offset| values.get(offset as usize)),
-            );
-            Self::Wide { keys, offsets }
+            let mut entries: Vec<_> = values
+                .iter()
+                .enumerate()
+                .map(|(offset, id)| WidePosition {
+                    key: [(id >> 32) as u32, id as u32],
+                    offset: offset as u32,
+                })
+                .collect();
+            entries.sort_unstable();
+            entries.dedup_by_key(|entry| entry.key);
+            Self::Wide { entries }
         }
     }
 
@@ -120,9 +127,10 @@ impl Positions {
                     .ok()
                     .map(|found| entries[found] as u32)
             }
-            Self::Wide { keys, offsets } => {
-                keys.binary_search(&id).ok().map(|found| offsets[found])
-            }
+            Self::Wide { entries } => entries
+                .binary_search_by_key(&[(id >> 32) as u32, id as u32], |entry| entry.key)
+                .ok()
+                .map(|found| entries[found].offset),
         }
     }
 
@@ -147,9 +155,13 @@ impl Positions {
                 queries,
                 emit,
             ),
-            Self::Wide { keys, offsets } => {
-                batch::search_sorted(keys.len(), |i| keys[i], |i| offsets[i], queries, emit)
-            }
+            Self::Wide { entries } => batch::search_sorted(
+                entries.len(),
+                |i| ((entries[i].key[0] as u64) << 32) | entries[i].key[1] as u64,
+                |i| entries[i].offset,
+                queries,
+                emit,
+            ),
         }
     }
 }
@@ -162,6 +174,7 @@ mod tests {
     #[case::dense(1, 0)]
     #[case::packed(1000, 1 << 40)]
     #[case::wide(1 << 40, 0)]
+    #[case::wide_carry(u32::MAX as u64, (1 << 32) - 1)]
     fn inverse_matches_physical_order(#[case] stride: u64, #[case] base: u64) {
         let mut ids: Vec<_> = (0..257).rev().map(|i| base + i * stride).collect();
         ids.extend_from_within(0..5);
