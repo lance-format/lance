@@ -5091,6 +5091,7 @@ dependencies = [
  "lance-core",
  "lance-namespace",
  "lance-testing",
+ "libc",
  "log",
  "metrics",
  "metrics-util",

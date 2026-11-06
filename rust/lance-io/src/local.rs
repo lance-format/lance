@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // TODO: Clean up windows/unix stuff
 #[cfg(unix)]
@@ -235,6 +236,51 @@ pub(crate) async fn join_local_io<T>(
     }
 }
 
+/// Copy `range` out of the page cache without blocking. Returns the bytes, or
+/// `None` when any part is not cached so the caller falls back to a blocking
+/// read that also reports EOF and other errors. The flag is true when the file
+/// system does not support `RWF_NOWAIT` (Linux 4.14+; not tmpfs).
+#[cfg(target_os = "linux")]
+fn read_cached(file: &File, range: &Range<usize>) -> (Option<Bytes>, bool) {
+    use std::os::fd::AsRawFd;
+    let mut buf = BytesMut::with_capacity(range.len());
+    // Safety: the capacity is reserved above and only the prefix the kernel
+    // reports as filled is ever exposed.
+    unsafe { buf.set_len(range.len()) };
+    let mut filled = 0usize;
+    while filled < range.len() {
+        let iov = libc::iovec {
+            iov_base: buf[filled..].as_mut_ptr() as *mut libc::c_void,
+            iov_len: range.len() - filled,
+        };
+        // Safety: `iov` points into `buf`, which outlives the call.
+        let n = unsafe {
+            libc::preadv2(
+                file.as_raw_fd(),
+                &iov,
+                1,
+                (range.start + filled) as libc::off64_t,
+                libc::RWF_NOWAIT,
+            )
+        };
+        if n <= 0 {
+            let unsupported = n < 0
+                && matches!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)
+                );
+            return (None, unsupported);
+        }
+        filled += n as usize;
+    }
+    (Some(buf.freeze()), false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_cached(_file: &File, _range: &Range<usize>) -> (Option<Bytes>, bool) {
+    (None, true)
+}
+
 /// Object reader for local file system.
 #[derive(Debug)]
 pub struct LocalObjectReader {
@@ -250,6 +296,10 @@ pub struct LocalObjectReader {
 
     /// Block size, in bytes.
     block_size: usize,
+
+    /// Set once the file system answers `RWF_NOWAIT` with `EOPNOTSUPP` (tmpfs,
+    /// some network file systems), so later reads skip the probe.
+    nowait_unsupported: AtomicBool,
 
     /// IO tracker for monitoring read operations.
     io_tracker: Arc<IOTracker>,
@@ -304,6 +354,7 @@ impl LocalObjectReader {
             Ok(Box::new(Self {
                 file: Arc::new(file),
                 block_size,
+                nowait_unsupported: AtomicBool::new(false),
                 size,
                 path,
                 io_tracker,
@@ -353,22 +404,39 @@ impl Reader for LocalObjectReader {
         let path = self.path.clone();
         let num_bytes = range.len() as u64;
         let range_u64 = (range.start as u64)..(range.end as u64);
+        // A page-cache hit is a memcpy, so answering it on this thread is
+        // cheaper than the blocking-pool round trip; only reads the kernel
+        // would have to wait for take that hop.
+        let cached = if self.nowait_unsupported.load(Ordering::Relaxed) {
+            None
+        } else {
+            let (bytes, unsupported) = read_cached(&file, &range);
+            if unsupported {
+                self.nowait_unsupported.store(true, Ordering::Relaxed);
+            }
+            bytes
+        };
 
         Box::pin(async move {
             let metrics = io_tracker.begin_io("get");
-            let result = join_local_io(tokio::task::spawn_blocking(move || {
-                let mut buf = BytesMut::with_capacity(range.len());
-                // Safety: `buf` is set with appropriate capacity above. It is
-                // written to below and we check all data is initialized at that point.
-                unsafe { buf.set_len(range.len()) };
-                #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
-                #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+            let result = match cached {
+                Some(bytes) => Ok(bytes),
+                None => {
+                    join_local_io(tokio::task::spawn_blocking(move || {
+                        let mut buf = BytesMut::with_capacity(range.len());
+                        // Safety: `buf` is set with appropriate capacity above. It is
+                        // written to below and we check all data is initialized at that point.
+                        unsafe { buf.set_len(range.len()) };
+                        #[cfg(unix)]
+                        file.read_exact_at(buf.as_mut(), range.start as u64)?;
+                        #[cfg(windows)]
+                        read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
-                Ok(buf.freeze())
-            }))
-            .await;
+                        Ok(buf.freeze())
+                    }))
+                    .await
+                }
+            };
 
             metrics.record(&result, num_bytes);
             if result.is_ok() {
@@ -476,5 +544,29 @@ impl Writer for tokio::fs::File {
         let size = self.seek(SeekFrom::Current(0)).await? as usize;
         tokio::io::AsyncWriteExt::shutdown(self).await?;
         Ok(WriteResult { size, e_tag: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_range_cached_and_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let reader =
+            LocalObjectReader::open(&Path::from_filesystem_path(&path).unwrap(), 4096, None)
+                .await
+                .unwrap();
+        // Freshly written, so this is served from the page cache on Linux
+        // and from the blocking path elsewhere; both must return the same bytes.
+        let bytes = reader.get_range(1000..150_000).await.unwrap();
+        assert_eq!(bytes.as_ref(), &data[1000..150_000]);
+        assert!(reader.get_range(1000..1000).await.unwrap().is_empty());
+        // Past EOF must still surface the blocking path's error, not a short buffer.
+        assert!(reader.get_range(199_000..300_000).await.is_err());
     }
 }
