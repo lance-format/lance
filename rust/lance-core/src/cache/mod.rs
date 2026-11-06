@@ -638,11 +638,6 @@ impl LanceCache {
         self.state.backend.size_bytes().await
     }
 
-    /// Weighted size in bytes without waiting for pending cache operations.
-    pub fn approx_size_bytes(&self) -> usize {
-        self.state.backend.approx_size_bytes()
-    }
-
     /// Weighted capacity in bytes, if the backend reports one.
     pub fn capacity_bytes(&self) -> Option<usize> {
         self.state.backend.capacity_bytes()

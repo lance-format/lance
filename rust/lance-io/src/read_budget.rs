@@ -42,17 +42,12 @@ impl QueryId {
     }
 }
 
-type ResidentBytesFn = Box<dyn Fn() -> u64 + Send + Sync>;
-
 /// Read-ahead may use all but `1 / FIRST_UNIT_SHARE` of the limit.
 const FIRST_UNIT_SHARE: u64 = 8;
 
 /// A memory limit shared by every reader of a session.
 pub struct ReadMemoryBudget {
     limit: u64,
-    /// Memory that the budget does not reserve but that counts against the
-    /// limit, such as the index cache.
-    resident_bytes: Option<ResidentBytesFn>,
     state: Mutex<BudgetState>,
     notify: Notify,
 }
@@ -77,19 +72,9 @@ impl ReadMemoryBudget {
     pub fn new(limit: u64) -> Self {
         Self {
             limit,
-            resident_bytes: None,
             state: Mutex::default(),
             notify: Notify::new(),
         }
-    }
-
-    /// Counts the memory reported by `resident_bytes` against the limit.
-    pub fn with_resident_bytes(
-        mut self,
-        resident_bytes: impl Fn() -> u64 + Send + Sync + 'static,
-    ) -> Self {
-        self.resident_bytes = Some(Box::new(resident_bytes));
-        self
     }
 
     pub fn limit(&self) -> u64 {
@@ -214,13 +199,10 @@ impl Admission {
             // Created before checking so a release between the check and the
             // wait still wakes us.
             let notified = budget.notify.notified();
-            let resident = budget.resident_bytes.as_ref().map_or(0, |f| f());
             {
                 let mut state = budget.state.lock().unwrap();
                 let mut queue = reader.queue.lock().unwrap();
-                let total = resident
-                    .saturating_add(state.reserved)
-                    .saturating_add(bytes);
+                let total = state.reserved.saturating_add(bytes);
                 // Read-ahead stops short of the last part of the limit, which
                 // only a reader's first unit may use, so a small read is not
                 // queued behind other readers' read-ahead.
@@ -483,22 +465,6 @@ mod tests {
             .now_or_never()
             .expect("the next unit is first in line");
         drop(held);
-    }
-
-    #[tokio::test]
-    async fn test_resident_bytes_count_against_limit() {
-        let resident = Arc::new(AtomicUsize::new(70));
-        let budget = Arc::new(ReadMemoryBudget::new(100).with_resident_bytes({
-            let resident = resident.clone();
-            move || resident.load(Ordering::Relaxed) as u64
-        }));
-        let reader = budget.reader(QueryId::unique());
-        let held = reader.admission().reserve(20).await;
-        let waiting = assert_waits(reader.admission(), 20).await;
-        resident.store(50, Ordering::Relaxed);
-        // Resident memory shrinking is noticed at the next release.
-        drop(held);
-        waiting.await.unwrap();
     }
 
     #[tokio::test]
