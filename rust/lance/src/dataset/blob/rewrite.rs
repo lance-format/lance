@@ -695,14 +695,9 @@ async fn transform_blob_v2_list_array<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
-/// How a batch carrying Blob v2 columns is rewritten before it is written back as
-/// new fragments of the same dataset.
+/// Reusable Blob v2 rewrite plan for new fragments of the same dataset.
 ///
-/// This is the rewrite compaction applies: a Blob v2 row holds a descriptor, not
-/// the payload, so rewriting the row has to either republish a reference to the
-/// payload or read the bytes back and materialize them. Building the plan inspects
-/// the schemas, so build one per (dataset schema, batch schema) pair and share it
-/// across every batch with that schema.
+/// Used by compaction to preserve payload references or materialize payload bytes.
 pub struct BlobV2BatchRewritePlan {
     row_addr_idx: usize,
     columns: Vec<(usize, BlobV2FieldRewritePlan)>,
@@ -710,33 +705,15 @@ pub struct BlobV2BatchRewritePlan {
 }
 
 impl BlobV2BatchRewritePlan {
-    /// Plan the rewrite of batches shaped like `input_schema`, scanned from the
-    /// dataset `schema` describes.
+    /// Build a plan from the dataset schema and scanned batch schema.
     ///
-    /// `input_schema` must be the schema of a scan of that same dataset taken with
-    /// [`Scanner::with_row_address`], because a descriptor is resolved to its
-    /// payload by row address; an input without `_rowaddr` is an error. Blob v2
-    /// columns must arrive as descriptors (the scanner's default) for their
-    /// references to be preserved. A dataset that still carries legacy (v1) blob
-    /// columns has to scan those as binary instead, which compaction does by
-    /// enabling [`BlobHandling::AllBinary`] only in that case, and which then also
-    /// materializes that dataset's Blob v2 payloads. `keep_row_addr` keeps
-    /// `_rowaddr` in the output.
+    /// Input must include `_rowaddr`; Struct children must be complete and in
+    /// dataset order. Scan legacy blobs as binary and Blob v2 as descriptors.
+    /// `keep_row_addr` retains `_rowaddr` in the output.
     ///
-    /// Set `preserve_managed` to `true` only when both hold: the destination files
-    /// are written at a version that can represent a prepared blob (`V2_2` or later;
-    /// compaction derives it from its write version), and managed blobs are enabled
-    /// on the dataset ([`lance_table::feature_flags::managed_blobs_enabled`]).
-    /// Compaction handles a dataset without them through an internal sidecar rewrite
-    /// that this surface does not expose, so an external caller must pass `false`
-    /// there. A managed descriptor is then kept as a reference to the source object
-    /// instead of being copied, so the source snapshot must stay alive until the
-    /// rewritten fragments are committed. With `false`, payloads are materialized.
-    /// The output is meant to be written into the same dataset's primary storage.
-    ///
-    /// [`Scanner::with_row_address`]: crate::dataset::scanner::Scanner::with_row_address
-    /// [`BlobHandling::AllBinary`]: lance_core::datatypes::BlobHandling::AllBinary
-    /// [`lance_table::feature_flags::managed_blobs_enabled`]: lance_table::feature_flags::managed_blobs_enabled
+    /// `preserve_managed` keeps payload references instead of materializing bytes.
+    /// It requires Managed blobs and a V2_2+ writer. Write output to the same
+    /// dataset's primary storage.
     pub fn try_new(
         schema: &lance_core::datatypes::Schema,
         input_schema: &ArrowSchema,
@@ -807,22 +784,18 @@ impl BlobV2BatchRewritePlan {
         self
     }
 
-    /// The schema every [`Self::transform_batch`] output has; open the writer with it.
+    /// Schema of rewritten batches, for opening the destination writer.
     pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    /// Rewrite one batch of rows scanned from `dataset`.
+    /// Rewrite a batch using Blob payloads from `dataset`.
     ///
-    /// `dataset` must be the dataset the rows were scanned from: payloads are
-    /// resolved by row address against it, and a batch from elsewhere yields wrong
-    /// payloads rather than an error. `batch` must match the planned schema exactly
-    /// (the same columns in the same order, with struct columns carrying all of the
-    /// dataset's children in dataset order, as compaction's scan produces them) and
-    /// carry a non-null `UInt64` `_rowaddr` for every row, from that same snapshot;
-    /// none of this is checked here beyond what the engine already does, so a batch
-    /// that breaks it gives wrong payloads or panics instead of an error. May read
-    /// payload bytes from storage. Batches may be transformed concurrently.
+    /// `batch` must match the planned schema and contain valid, non-null `UInt64`
+    /// row addresses from this dataset snapshot. These preconditions are not
+    /// validated. Keep the snapshot alive until the output is committed.
+    ///
+    /// May read from storage. Batches can be transformed concurrently.
     pub async fn transform_batch(
         &self,
         dataset: &Arc<Dataset>,
