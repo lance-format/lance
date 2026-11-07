@@ -1,0 +1,90 @@
+# Source of truth for the Project Management Committee (PMC) roster.
+#
+# This file drives two things, so keep it accurate:
+#   1. The roster table in `pmc.md`, rendered at docs build time by the
+#      `docs/hooks/pmc_roster.py` MkDocs hook.
+#   2. The format-specification vote gate, which only counts PR approvals from
+#      the `handle`s listed here (see `.github/workflows/format-vote-gate.yml`).
+#
+# Adding or removing a member is itself a PMC vote (roster change). After the
+# vote passes, edit this file; the docs table updates automatically.
+#
+# `handle` must match the member's GitHub login exactly (case-insensitive when
+# matched). `ecosystem_roles` is free-form markdown and may be empty.
+members:
+  - name: Yang Cen
+    handle: BubbleCal
+    affiliation: LanceDB
+    ecosystem_roles: Milvus Contributor
+  - name: Pablo Delgado
+    handle: pablete
+    affiliation: Netflix
+    ecosystem_roles: ""
+  - name: Hao Ding
+    handle: Xuanwo
+    affiliation: LanceDB
+    ecosystem_roles: Apache OpenDAL PMC Chair, Apache Iceberg Committer, Apache Member and [more](https://xuanwo.io/about/)
+  - name: Zhaowei Huang
+    handle: SaintBacchus
+    affiliation: Alibaba
+    ecosystem_roles: Apache Doris Committer
+  - name: Will Jones
+    handle: wjones127
+    affiliation: LanceDB
+    ecosystem_roles: Apache Arrow PMC Member, Apache DataFusion PMC Member, Delta Lake Maintainer
+  - name: Matt Kafonek
+    handle: kafonek
+    affiliation: Runway AI
+    ecosystem_roles: ""
+  - name: Denny Lee
+    handle: dennyglee
+    affiliation: Databricks
+    ecosystem_roles: Unity Catalog Maintainer, Delta Lake Maintainer, Apache Spark Contributor, MLflow Contributor
+  - name: Rob Meng
+    handle: chebbyChefNEQ
+    affiliation: Jump Trading
+    ecosystem_roles: ""
+  - name: Dao Mi
+    handle: dowjones226
+    affiliation: Netflix
+    ecosystem_roles: ""
+  - name: Weston Pace
+    handle: westonpace
+    affiliation: LanceDB
+    ecosystem_roles: Apache Arrow PMC Member, Substrait SMC Member
+  - name: Calvin Qi
+    handle: calvinqi
+    affiliation: Harvey.ai
+    ecosystem_roles: ""
+  - name: Prashanth Rao
+    handle: prrao87
+    affiliation: LanceDB
+    ecosystem_roles: ""
+  - name: Ethan Rosenthal
+    handle: EthanRosenthal
+    affiliation: Runway AI
+    ecosystem_roles: ""
+  - name: Tim Saucer
+    handle: timsaucer
+    affiliation: Rerun.io
+    ecosystem_roles: Apache DataFusion PMC Member
+  - name: Chang She
+    handle: changhiskhan
+    affiliation: LanceDB
+    ecosystem_roles: Pandas Co-Author
+  - name: Jasmine Wang
+    handle: onigiriisabunny
+    affiliation: LanceDB
+    ecosystem_roles: Alluxio PMC Community Manager
+  - name: Lei Xu
+    handle: eddyxu
+    affiliation: LanceDB
+    ecosystem_roles: Apache Hadoop PMC Member
+  - name: Vino Yang
+    handle: yanghua
+    affiliation: Bytedance
+    ecosystem_roles: Apache Hudi PMC Member, Apache Kyuubi PMC Member, Apache Kylin Committer, Apache Incubation Program Committer
+  - name: Jack Ye
+    handle: jackye1995
+    affiliation: LanceDB
+    ecosystem_roles: Apache Iceberg PMC Member, Apache Polaris (incubating) PPMC Member, Apache Incubation Program Committer
