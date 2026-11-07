@@ -729,7 +729,6 @@ pub mod tests {
     use lance_table::format::BasePath;
     use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
     use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-    use lance_table::io::commit::write_manifest_file_to_path;
     use lance_table::system_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME;
     use prost::Message;
     use roaring::RoaringBitmap;
@@ -751,11 +750,10 @@ pub mod tests {
     use crate::index::frag_reuse::{
         build_frag_reuse_index_metadata, build_new_frag_reuse_index, open_frag_reuse_index,
     };
-    use crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag;
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
     use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
+        DatagenExt, FragmentCount, FragmentRowCount, external_frag_reuse_session,
         padding_reuse_versions,
     };
 
@@ -763,6 +761,16 @@ pub mod tests {
     enum Storage {
         Inline,
         External,
+    }
+
+    impl Storage {
+        /// A session whose writers store the history as `self` says.
+        fn session(self) -> Arc<Session> {
+            match self {
+                Self::Inline => Arc::new(Session::default()),
+                Self::External => external_frag_reuse_session(),
+            }
+        }
     }
 
     fn external_details_file(entry: &IndexMetadata) -> Option<ExternalFile> {
@@ -852,39 +860,6 @@ pub mod tests {
         }
     }
 
-    /// Padding versions large enough to store the history externally, published
-    /// below the publication checks as an earlier writer could have.
-    async fn plant_padding_history(dataset: &mut Dataset) {
-        let count = inline_padding_capacity() + 1;
-        let details = FragReuseIndexDetails {
-            versions: padding_reuse_versions(count as u64),
-        };
-        let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
-        let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
-            .await
-            .unwrap();
-        let mut manifest = dataset.manifest.as_ref().clone();
-        manifest.version += 1;
-        manifest.transaction_file = None;
-        manifest.transaction_section = None;
-        let indices = vec![entry];
-        apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
-        let location = dataset
-            .commit_handler
-            .commit(
-                &mut manifest,
-                Some(indices),
-                &dataset.base,
-                &dataset.object_store,
-                write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
-                None,
-            )
-            .await
-            .unwrap();
-        *dataset = dataset.checkout_version(location.version).await.unwrap();
-    }
-
     fn compaction_of(dataset: &Dataset, fragment_ids: &[u64]) -> CompactionOptions {
         CompactionOptions {
             target_rows_per_fragment: 20,
@@ -902,7 +877,8 @@ pub mod tests {
 
     /// A recording table with stable row ids. Deletions in fragment 0 make row
     /// ids and addresses diverge. One recorded compaction rewrites two strict
-    /// suffix groups, behind padding versions when the history is external.
+    /// suffix groups. Writers through the returned handle's session store the
+    /// history as `storage` says.
     /// Appended fragments 6 and 7, one with a deletion, are left as the next
     /// strict suffix to rewrite.
     async fn recording_table_with_index(
@@ -919,6 +895,7 @@ pub mod tests {
                 Some(WriteParams {
                     enable_stable_row_ids: true,
                     max_rows_per_file: 10,
+                    session: Some(storage.session()),
                     ..Default::default()
                 }),
             )
@@ -926,9 +903,6 @@ pub mod tests {
             .unwrap();
         dataset.delete("i IN (1, 2, 35)").await.unwrap();
         let mut before = rows_by_addr(&dataset).await;
-        if matches!(storage, Storage::External) {
-            plant_padding_history(&mut dataset).await;
-        }
         if let Some(index_type) = index_type {
             create_address_index(&mut dataset, index_type).await;
         }
@@ -2535,7 +2509,15 @@ pub mod tests {
         } else {
             source.deep_clone(uri, version, None).await.unwrap();
         }
-        Dataset::open(uri).await.unwrap()
+        // A fresh session, but one whose writers store the history as the
+        // source's do.
+        let mut session = Session::default();
+        session.frag_reuse_inline_details_limit = source.session.frag_reuse_inline_details_limit;
+        DatasetBuilder::from_uri(uri)
+            .with_session(Arc::new(session))
+            .load()
+            .await
+            .unwrap()
     }
 
     /// A clone starts its history from the source's: stable row ids and every

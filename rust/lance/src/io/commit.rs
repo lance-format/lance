@@ -522,6 +522,7 @@ async fn do_commit_new_dataset(
                         base_remap,
                         object_store,
                         base_path,
+                        session.frag_reuse_inline_details_limit,
                     )
                     .await?;
                 index = relocated;

@@ -1555,18 +1555,23 @@ async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
 #[tokio::test]
 async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use crate::utils::test::{external_frag_reuse_session, padding_reuse_versions};
     let dir = TempStrDir::default();
     let dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
-        .into_dataset(
+        .into_dataset_with_params(
             dir.as_str(),
             FragmentCount::from(1),
             FragmentRowCount::from(10),
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                session: Some(external_frag_reuse_session()),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
-    let count = inline_padding_capacity() as u64 + 1;
+    let count = 2;
     let mut entries = Vec::new();
     for stamp in [1, 2] {
         let mut versions = padding_reuse_versions(count);
@@ -1610,18 +1615,23 @@ async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
 #[tokio::test]
 async fn test_reuse_details_cache_holds_what_a_read_decodes() {
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use crate::utils::test::{external_frag_reuse_session, padding_reuse_versions};
     let dir = TempStrDir::default();
     let dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
-        .into_dataset(
+        .into_dataset_with_params(
             dir.as_str(),
             FragmentCount::from(1),
             FragmentRowCount::from(10),
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                session: Some(external_frag_reuse_session()),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
-    let mut versions = padding_reuse_versions(inline_padding_capacity() as u64 + 1);
+    let mut versions = padding_reuse_versions(3);
     let count = versions.len() as u64;
     for (i, version) in versions.iter_mut().enumerate() {
         version.dataset_version = count - i as u64;
@@ -1668,7 +1678,19 @@ async fn test_deferred_compaction_writes_reuse_details_once(
     #[values(true, false)] external_before: bool,
     #[values(true, false)] cached: bool,
 ) {
-    use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
+    use crate::utils::test::{commit_padding_reuse_history, padding_reuse_versions};
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+    // Exactly one padding version fits inline.
+    let inline_details_limit =
+        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: padding_reuse_versions(1),
+        })
+        .encoded_len();
+    let with_limit = |mut session: crate::session::Session| {
+        session.frag_reuse_inline_details_limit = inline_details_limit;
+        Arc::new(session)
+    };
     let dir = TempStrDir::default();
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -1678,6 +1700,7 @@ async fn test_deferred_compaction_writes_reuse_details_once(
             FragmentRowCount::from(100),
             Some(WriteParams {
                 max_rows_per_file: 100,
+                session: Some(with_limit(crate::session::Session::default())),
                 ..Default::default()
             }),
         )
@@ -1686,19 +1709,11 @@ async fn test_deferred_compaction_writes_reuse_details_once(
     create_scalar_index(&mut dataset, "i", false).await;
     // Scattered deletions make the compaction's own version larger than a padding one.
     dataset.delete("i % 3 = 1").await.unwrap();
-    let capacity = inline_padding_capacity();
-    let history = commit_padding_reuse_history(
-        &mut dataset,
-        if external_before {
-            capacity + 1
-        } else {
-            capacity
-        },
-    )
-    .await;
+    let history =
+        commit_padding_reuse_history(&mut dataset, if external_before { 2 } else { 1 }).await;
     assert_eq!(stores_reuse_details_externally(&history), external_before);
 
-    let session = if cached {
+    let session = with_limit(if cached {
         crate::session::Session::default()
     } else {
         crate::session::Session::with_index_cache_backend(
@@ -1706,7 +1721,7 @@ async fn test_deferred_compaction_writes_reuse_details_once(
             128 * 1024 * 1024,
             Default::default(),
         )
-    };
+    });
     let options = CompactionOptions {
         target_rows_per_fragment: 200,
         defer_index_remap: true,
@@ -1716,7 +1731,7 @@ async fn test_deferred_compaction_writes_reuse_details_once(
     let result = plan_one_task(&dataset, &options).await;
     // Committed through a session that has read nothing yet.
     let mut dataset = crate::dataset::builder::DatasetBuilder::from_uri(dir.as_str())
-        .with_session(Arc::new(session))
+        .with_session(session)
         .load()
         .await
         .unwrap();

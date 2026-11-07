@@ -594,29 +594,11 @@ pub async fn commit_padding_reuse_history(
     entry
 }
 
-/// The most padding versions whose details still fit inline.
-pub fn inline_padding_capacity() -> usize {
-    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-    use prost::Message;
-    let versions = padding_reuse_versions(5_000);
-    let fits = |count: usize| {
-        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
-            versions: versions[..count].to_vec(),
-        })
-        .encoded_len()
-            <= 204_800
-    };
-    let (mut low, mut high) = (0, versions.len());
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        if fits(mid) {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    assert!(low < versions.len());
-    low
+/// A session that stores any non-empty fragment reuse history externally.
+pub fn external_frag_reuse_session() -> Arc<crate::session::Session> {
+    let mut session = crate::session::Session::default();
+    session.frag_reuse_inline_details_limit = 0;
+    Arc::new(session)
 }
 
 #[cfg(test)]

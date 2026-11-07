@@ -234,13 +234,19 @@ async fn v0_compaction(dataset: &Dataset, source_ids: &[u64], dest_id: u64) -> T
 /// With `external`, a history whose details live in their own file, so a
 /// session that did not build an entry has to read it from storage.
 async fn reuse_fixture(uri: &str, external: bool) -> (Dataset, usize) {
-    use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
-    let mut dataset = disk_fixture(uri, 2, 4).await;
-    let padding = if external {
-        inline_padding_capacity() + 1
+    use crate::utils::test::{commit_padding_reuse_history, external_frag_reuse_session};
+    disk_fixture(uri, 2, 4).await;
+    let session = if external {
+        external_frag_reuse_session()
     } else {
-        0
+        Arc::new(Session::default())
     };
+    let mut dataset = DatasetBuilder::from_uri(uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    let padding = usize::from(external);
     if external {
         commit_padding_reuse_history(&mut dataset, padding).await;
     }
