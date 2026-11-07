@@ -147,6 +147,21 @@ impl RowAddrMask {
         })
     }
 
+    /// [`Self::intersect`] without consuming either side: only the result is
+    /// allocated, so masks shared from caches are combined without a copy.
+    pub fn intersect_ref(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a.intersection(b)),
+            (Self::AllowList(allow), Self::BlockList(block))
+            | (Self::BlockList(block), Self::AllowList(allow)) => {
+                Self::AllowList(allow.difference(block))
+            }
+            (Self::BlockList(a), Self::BlockList(b)) => {
+                Self::BlockList(RowAddrTreeMap::union_all(&[a, b]))
+            }
+        }
+    }
+
     /// Intersect two masks: a row survives only if both select it.
     ///
     /// Lets a planner apply a caller-supplied mask at one boundary rather than
@@ -444,6 +459,62 @@ impl RowAddrSelection {
         );
 
         if is_full { Self::Full } else { res }
+    }
+}
+
+impl RowAddrTreeMap {
+    /// Rows held by both maps, allocating only the result.
+    pub fn intersection(&self, other: &Self) -> Self {
+        let inner = self
+            .inner
+            .iter()
+            .filter_map(|(fragment, lhs)| {
+                let selection = match (lhs, other.inner.get(fragment)?) {
+                    (RowAddrSelection::Full, RowAddrSelection::Full) => RowAddrSelection::Full,
+                    (RowAddrSelection::Full, RowAddrSelection::Partial(set))
+                    | (RowAddrSelection::Partial(set), RowAddrSelection::Full) => {
+                        RowAddrSelection::Partial(set.clone())
+                    }
+                    (RowAddrSelection::Partial(lhs), RowAddrSelection::Partial(rhs)) => {
+                        let set = lhs & rhs;
+                        if set.is_empty() {
+                            return None;
+                        }
+                        RowAddrSelection::Partial(set)
+                    }
+                };
+                Some((*fragment, selection))
+            })
+            .collect();
+        Self { inner }
+    }
+
+    /// Rows of `self` that `other` does not hold, allocating only the result.
+    pub fn difference(&self, other: &Self) -> Self {
+        let inner = self
+            .inner
+            .iter()
+            .filter_map(|(fragment, lhs)| {
+                let selection = match (lhs, other.inner.get(fragment)) {
+                    (_, Some(RowAddrSelection::Full)) => return None,
+                    (lhs, None) => lhs.clone(),
+                    (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => {
+                        let mut set = RoaringBitmap::full();
+                        set -= rhs;
+                        RowAddrSelection::Partial(set)
+                    }
+                    (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
+                        let set = lhs - rhs;
+                        if set.is_empty() {
+                            return None;
+                        }
+                        RowAddrSelection::Partial(set)
+                    }
+                };
+                Some((*fragment, selection))
+            })
+            .collect();
+        Self { inner }
     }
 }
 
@@ -1411,6 +1482,26 @@ mod tests {
 
     fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
+    }
+
+    /// `intersect_ref` builds the same mask as the consuming `intersect`.
+    #[test]
+    fn test_intersect_ref_matches_intersect() {
+        let allow = RowAddrMask::from_allowed(rows(&[1, 2, 3, 1 << 32 | 5, 1 << 32 | 6, 2 << 32]));
+        let mut full = RowAddrTreeMap::new();
+        full.insert_fragment(0);
+        full.insert(1 << 32 | 6);
+        let other_allow = RowAddrMask::from_allowed(full);
+        let block = RowAddrMask::from_block(rows(&[2, 1 << 32 | 5, 3 << 32 | 1]));
+        let other_block = RowAddrMask::from_block(rows(&[3, 4 << 32 | 9]));
+        for (a, b) in [
+            (&allow, &other_allow),
+            (&allow, &block),
+            (&block, &allow),
+            (&block, &other_block),
+        ] {
+            assert_eq!(a.intersect_ref(b), a.clone().intersect(b.clone()));
+        }
     }
 
     #[test]

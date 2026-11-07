@@ -1272,6 +1272,8 @@ mod tests {
             index_file_size: 1024,
             aux_file_size: 512,
             rq_search_cache: empty_rabit_search_cache_cell(),
+            quantizer: Arc::new(std::sync::OnceLock::new()),
+            scratch_pool: Arc::new(std::sync::OnceLock::new()),
         };
 
         let entry = IvfStateEntryBox(Arc::new(state));

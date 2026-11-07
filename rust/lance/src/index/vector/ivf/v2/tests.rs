@@ -406,6 +406,46 @@ fn test_balanced_query_ranges(
     }
 }
 
+/// Reopening an index from its cached state shares the query scratch pool
+/// (and, by the same cell, the quantizer) with the earlier reconstruction
+/// instead of building them again for every query.
+#[tokio::test]
+async fn test_reconstruct_shares_scratch_pool() {
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        ivf,
+        lightweight_pq_params_with_bits(8),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].uuid;
+    let open = || dataset.open_vector_index("vector", &uuid, &NoOpMetricsCollector);
+    let first = open().await.unwrap();
+    let second = open().await.unwrap();
+    let first = first.as_any().downcast_ref::<IvfPq>().unwrap();
+    let second = second.as_any().downcast_ref::<IvfPq>().unwrap();
+    assert!(Arc::ptr_eq(&first.scratch_pool, &second.scratch_pool));
+}
+
 #[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
