@@ -32,6 +32,10 @@ use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
 
+/// Most index searches that `a = b` / `a != b` between two predicates may
+/// expand to; see [`visit_predicate_equality`].
+const MAX_PREDICATE_EQUALITY_SEARCHES: usize = 64;
+
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
 /// When a user wants to filter the data returned by a scan we may be able to use
@@ -59,7 +63,7 @@ const MAX_DEPTH: usize = 500;
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
     pub scalar_query: Option<ScalarIndexExpr>,
@@ -1988,6 +1992,26 @@ impl ScalarIndexExpr {
             Self::Query(search) => search.needs_recheck,
         }
     }
+
+    /// Whether every search in the expression reports rows where its predicate
+    /// is NULL, see [`AnyQuery::reports_null_rows`].
+    pub fn reports_null_rows(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.reports_null_rows(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.reports_null_rows() && rhs.reports_null_rows()
+            }
+            Self::Query(search) => search.query.reports_null_rows(),
+        }
+    }
+
+    fn search_count(&self) -> usize {
+        match self {
+            Self::Not(inner) => inner.search_count(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.search_count() + rhs.search_count(),
+            Self::Query(_) => 1,
+        }
+    }
 }
 
 // Extract a column from the expression, if it is a column, or None
@@ -2373,17 +2397,174 @@ fn visit_or(
     })
 }
 
+/// `left = right` or `left != right` between two predicates, as
+/// `(left AND right) OR (NOT left AND NOT right)` or
+/// `(left AND NOT right) OR (NOT left AND right)`.
+///
+/// Both expansions are NULL exactly where either side is, as the comparison is,
+/// provided each side reports its NULL rows; negating a side turns the rows it
+/// reports as FALSE into TRUE.
+///
+/// Each side appears twice, so nested comparisons double the plan per level;
+/// past [`MAX_PREDICATE_EQUALITY_SEARCHES`] the comparison is left to the scan.
+fn visit_predicate_equality(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let (Some(left), Some(right)) = (
+        visit_node(&expr.left, index_info, depth + 1)?,
+        visit_node(&expr.right, index_info, depth + 1)?,
+    ) else {
+        return Ok(None);
+    };
+    let (Some(left_query), Some(right_query)) = (&left.scalar_query, &right.scalar_query) else {
+        return Ok(None);
+    };
+    let searches = 2 * (left_query.search_count() + right_query.search_count());
+    if searches > MAX_PREDICATE_EQUALITY_SEARCHES
+        || !left_query.reports_null_rows()
+        || !right_query.reports_null_rows()
+    {
+        return Ok(None);
+    }
+    let (Some(not_left), Some(not_right)) = (left.clone().maybe_not(), right.clone().maybe_not())
+    else {
+        return Ok(None);
+    };
+    Ok(if expr.op == Operator::Eq {
+        left.and(right).maybe_or(not_left.and(not_right), expr)
+    } else {
+        left.and(not_right).maybe_or(not_left.and(right), expr)
+    })
+}
+
+/// The plain column that `predicate` is NULL exactly where, when it only
+/// combines comparisons of that column against non-null literals.
+///
+/// A function of a column, such as a JSON accessor, can be NULL where the
+/// column is not, so only a plain column qualifies.
+fn null_where_column_is<'a>(
+    predicate: &'a Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<&'a Expr> {
+    let against_literals = |column: &'a Expr, literals: &[&Expr]| {
+        if !matches!(column, Expr::Column(_)) {
+            return None;
+        }
+        let (_, column_type, _) = maybe_indexed_column(column, index_info)?;
+        literals
+            .iter()
+            .all(|literal| maybe_scalar(literal, &column_type).is_some_and(|v| !v.is_null()))
+            .then_some(column)
+    };
+    match predicate {
+        Expr::Column(_) => Some(predicate),
+        Expr::Not(inner) => null_where_column_is(inner, index_info),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => {
+            let column = null_where_column_is(left, index_info)?;
+            (null_where_column_is(right, index_info)? == column).then_some(column)
+        }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op:
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq,
+            right,
+        }) => against_literals(left, &[right]),
+        Expr::Between(between) => against_literals(&between.expr, &[&between.low, &between.high]),
+        Expr::InList(in_list) => {
+            against_literals(&in_list.expr, &in_list.list.iter().collect::<Vec<_>>())
+        }
+        _ => None,
+    }
+}
+
+/// `predicate IS TRUE`, or `predicate IS FALSE` when `value` is false, for a
+/// predicate that is NULL exactly where one indexed column is, such as a
+/// Boolean column or a comparison against a non-null literal.
+///
+/// That makes `IS TRUE` the predicate with the column's NULL rows excluded,
+/// which is what tells the two apart once negated: `NOT (x = 1)` drops NULL
+/// rows, `NOT ((x = 1) IS TRUE)` keeps them.
+fn visit_is_truth_value(
+    predicate: &Expr,
+    value: bool,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let Some(column) = null_where_column_is(predicate, index_info) else {
+        return Ok(None);
+    };
+    let Some((column, _, query_parser)) = maybe_indexed_column(column, index_info) else {
+        return Ok(None);
+    };
+    let matches = match predicate {
+        Expr::Column(_) => visit_is_bool(predicate, index_info, value),
+        _ if value => visit_node(predicate, index_info, depth + 1)?,
+        _ => visit_node(predicate, index_info, depth + 1)?.and_then(IndexedExpression::maybe_not),
+    };
+    let Some(matches) = matches else {
+        return Ok(None);
+    };
+    let not_null = query_parser
+        .visit_is_null(&column)
+        .and_then(IndexedExpression::maybe_not);
+    Ok(Some(match not_null {
+        Some(not_null) => matches.and(not_null),
+        // Without an exact search for NULL rows the index can only narrow the
+        // rows down, and the predicate is rechecked on them.
+        None if value => matches.refine(predicate.clone().is_true()),
+        None => matches.refine(predicate.clone().is_false()),
+    }))
+}
+
+/// `column IS [NOT] DISTINCT FROM literal`, as `column IS [NOT] NULL` for a NULL
+/// literal and as `(column = literal) IS [NOT] TRUE` otherwise.
+fn visit_distinct_from(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let is_distinct = expr.op == Operator::IsDistinctFrom;
+    if matches!(expr.right.as_ref(), Expr::Literal(value, _) if value.is_null()) {
+        return Ok(visit_is_null(&expr.left, index_info, is_distinct));
+    }
+    let equals = (*expr.left).clone().eq((*expr.right).clone());
+    let is_true = visit_is_truth_value(&equals, true, index_info, depth)?;
+    Ok(if is_distinct {
+        is_true.and_then(IndexedExpression::maybe_not)
+    } else {
+        is_true
+    })
+}
+
 fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     match &expr.op {
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             Ok(visit_comparison(expr, index_info))
         }
-        // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
+        Operator::Eq | Operator::NotEq => match visit_comparison(expr, index_info) {
+            Some(node) if expr.op == Operator::Eq => Ok(Some(node)),
+            // visit_comparison creates an Eq query which we negate
+            Some(node) => Ok(node.maybe_not()),
+            None => visit_predicate_equality(expr, index_info, depth),
+        },
+        Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => {
+            visit_distinct_from(expr, index_info, depth)
+        }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
         _ => Ok(None),
@@ -2443,8 +2624,12 @@ fn visit_node(
         Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
-        Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
-        Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
+        Expr::IsFalse(expr) => visit_is_truth_value(expr, false, index_info, depth),
+        Expr::IsTrue(expr) => visit_is_truth_value(expr, true, index_info, depth),
+        Expr::IsNotFalse(expr) => Ok(visit_is_truth_value(expr, false, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
+        Expr::IsNotTrue(expr) => Ok(visit_is_truth_value(expr, true, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
         Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
         Expr::IsNotNull(expr) => {
             // `regexp_match(col, pat)` returns a list and is coerced to
@@ -2783,6 +2968,32 @@ mod tests {
             )),
             true,
         )
+    }
+
+    /// `on_sale = value AND NOT on_sale IS NULL`, negated when `negated`.
+    fn check_is_truth_value(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        value: bool,
+        negated: bool,
+    ) {
+        let query = |query| {
+            IndexedExpression::index_query(
+                "on_sale".to_string(),
+                "on_sale_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(query),
+            )
+        };
+        let not_null = query(SargableQuery::IsNull()).maybe_not().unwrap();
+        let is_value =
+            query(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))).and(not_null);
+        let expected = if negated {
+            is_value.maybe_not().unwrap()
+        } else {
+            is_value
+        };
+        check(index_info, expr, Some(expected), false)
     }
 
     fn check_simple_negated(
@@ -3155,30 +3366,24 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS TRUE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS TRUE", true, false);
         check_simple(
             &index_info,
             "on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
+        // NULL rows are not TRUE, so they are in the negation of `IS TRUE`.
+        check_is_truth_value(&index_info, "on_sale IS NOT TRUE", true, true);
+        check_is_truth_value(&index_info, "NOT (on_sale IS TRUE)", true, true);
+        check_is_truth_value(&index_info, "on_sale IS NOT FALSE", false, true);
         check_simple_negated(
             &index_info,
             "NOT on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS FALSE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS FALSE", false, false);
         check_simple_negated(
             &index_info,
             "aisle NOT BETWEEN 5 AND 10",
@@ -3255,18 +3460,8 @@ mod tests {
                 ScalarValue::UInt32(Some(9)),
             ]),
         );
-        check_simple(
-            &index_info,
-            "on_sale is false",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
-        check_simple(
-            &index_info,
-            "on_sale is true",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale is false", false, false);
+        check_is_truth_value(&index_info, "on_sale is true", true, false);
         check_simple(
             &index_info,
             "aisle < 10",
@@ -5465,6 +5660,114 @@ mod tests {
                             && matches!(search.sargable_query(), Some(SargableQuery::IsNull())))
             )
         }));
+    }
+
+    #[rstest]
+    #[case::not_distinct(
+        "x IS NOT DISTINCT FROM 3",
+        "AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::distinct(
+        "x IS DISTINCT FROM 3",
+        "NOT(AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::not_distinct_null("x IS NOT DISTINCT FROM NULL", "[x IS NULL]@x_idx(BTree)")]
+    #[case::distinct_null("x IS DISTINCT FROM NULL", "NOT([x IS NULL]@x_idx(BTree))")]
+    #[case::in_list_is_true(
+        "(x IN (1, 2)) IS TRUE",
+        "AND([x IN [1,2]]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_true(
+        "(x = 1) IS NOT TRUE",
+        "NOT(AND([x = 1]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::or_chain(
+        "(x = 1 OR NOT x BETWEEN 3 AND 5) IS NOT TRUE",
+        "NOT(AND(OR([x = 1]@x_idx(BTree),NOT([x >= 3 && x <= 5]@x_idx(BTree))),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::is_false(
+        "(x = 1) IS FALSE",
+        "AND(NOT([x = 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_false(
+        "(x < 1) IS NOT FALSE",
+        "NOT(AND(NOT([x < 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::xor(
+        "(x > 2) != (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),NOT([y < 6]@y_idx(BTree))),AND(NOT([x > 2]@x_idx(BTree)),[y < 6]@y_idx(BTree)))"
+    )]
+    #[case::equivalent(
+        "(x > 2) = (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),[y < 6]@y_idx(BTree)),AND(NOT([x > 2]@x_idx(BTree)),NOT([y < 6]@y_idx(BTree))))"
+    )]
+    fn test_predicate_truth_and_equality_use_index(#[case] filter: &str, #[case] expected: &str) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", false));
+        assert_eq!(indexed.refine_expr, None, "{filter}");
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+    }
+
+    #[rstest]
+    // `x IN (1, NULL)` is NULL for every row but 1, not just the NULL ones.
+    #[case::null_in_list("(x IN (1, NULL)) IS TRUE")]
+    #[case::null_literal("(x = CAST(NULL AS BIGINT)) IS NOT TRUE")]
+    #[case::computed("(x + 1 = 2) IS TRUE")]
+    #[case::two_columns("(x = 1 OR y = 2) IS NOT TRUE")]
+    #[case::computed_side("(x > 2) != (x + y > 3)")]
+    #[case::recheck_xor("(x > 2) != (y < 6)")]
+    #[case::recheck_distinct("x IS DISTINCT FROM 3")]
+    fn test_predicate_truth_and_equality_decline(#[case] filter: &str) {
+        // The last two only decline because the index needs a recheck, which
+        // cannot be negated.
+        let needs_recheck = filter.contains("!=") || filter.contains("DISTINCT");
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", needs_recheck));
+        assert_eq!(indexed.scalar_query, None, "{filter}");
+    }
+
+    /// Each side of a predicate equality appears twice in its plan, so a chain
+    /// of them grows exponentially until the budget declines it.
+    #[rstest]
+    #[case::one(2, Some(4))]
+    #[case::three(4, Some(22))]
+    #[case::four(5, Some(46))]
+    #[case::five(6, None)]
+    #[case::seventeen(18, None)]
+    fn test_nested_predicate_equality_is_bounded(
+        #[case] comparisons: usize,
+        #[case] expected_searches: Option<usize>,
+    ) {
+        let filter = (1..comparisons).fold("x > 0".to_string(), |lhs, rhs| {
+            format!("({lhs}) = (x > {rhs})")
+        });
+        let indexed = parse_int64_filter(&filter, &int64_index_info("BTree", false));
+        let searches = indexed
+            .scalar_query
+            .as_ref()
+            .map(ScalarIndexExpr::search_count);
+        assert_eq!(searches, expected_searches, "{filter}");
+    }
+
+    /// An index whose NULL search needs a recheck still narrows `IS TRUE` down,
+    /// and rechecks the predicate on what it finds.
+    #[rstest]
+    #[case::is_true("(x = 3) IS TRUE", "[x = 3]@x_idx(ZoneMap)")]
+    #[case::not_distinct("x IS NOT DISTINCT FROM 3", "[x = 3]@x_idx(ZoneMap)")]
+    fn test_is_truth_value_rechecks_without_exact_null_search(
+        #[case] filter: &str,
+        #[case] expected: &str,
+    ) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("ZoneMap", true));
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+        let refine = indexed.refine_expr.unwrap();
+        assert!(matches!(refine, Expr::IsTrue(_)), "{filter}: {refine}");
     }
 
     #[test]
