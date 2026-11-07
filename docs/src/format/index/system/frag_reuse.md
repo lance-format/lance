@@ -43,7 +43,9 @@ FRI uses one system-index entry named `__lance_frag_reuse`. Its
 
 The outer `InlineContent` / `ExternalFile` choice applies to the entire history.
 Small histories are stored inline; larger histories store the serialized
-`InlineContent` in `_indices/<FRI UUID>/details.binpb`. Updating the history
+`InlineContent` in `_indices/<FRI UUID>/details.binpb`. The table config key
+[`lance.frag_reuse.inline_details_limit`](../../table/table_config.md) sets the
+largest inline size for future writes. Updating the history
 replaces the FRI metadata. Stable-partition row maps are separate immutable files
 and are not rewritten with that history.
 

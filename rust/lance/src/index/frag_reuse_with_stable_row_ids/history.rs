@@ -729,8 +729,9 @@ pub mod tests {
     use lance_table::format::BasePath;
     use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
     use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-    use lance_table::io::commit::write_manifest_file_to_path;
-    use lance_table::system_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME;
+    use lance_table::system_index::frag_reuse::{
+        FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY,
+    };
     use prost::Message;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -751,13 +752,9 @@ pub mod tests {
     use crate::index::frag_reuse::{
         build_frag_reuse_index_metadata, build_new_frag_reuse_index, open_frag_reuse_index,
     };
-    use crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag;
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
-    use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
-        padding_reuse_versions,
-    };
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, padding_reuse_versions};
 
     #[derive(Clone, Copy, Debug)]
     enum Storage {
@@ -852,39 +849,6 @@ pub mod tests {
         }
     }
 
-    /// Padding versions large enough to store the history externally, published
-    /// below the publication checks as an earlier writer could have.
-    async fn plant_padding_history(dataset: &mut Dataset) {
-        let count = inline_padding_capacity() + 1;
-        let details = FragReuseIndexDetails {
-            versions: padding_reuse_versions(count as u64),
-        };
-        let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
-        let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
-            .await
-            .unwrap();
-        let mut manifest = dataset.manifest.as_ref().clone();
-        manifest.version += 1;
-        manifest.transaction_file = None;
-        manifest.transaction_section = None;
-        let indices = vec![entry];
-        apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
-        let location = dataset
-            .commit_handler
-            .commit(
-                &mut manifest,
-                Some(indices),
-                &dataset.base,
-                &dataset.object_store,
-                write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
-                None,
-            )
-            .await
-            .unwrap();
-        *dataset = dataset.checkout_version(location.version).await.unwrap();
-    }
-
     fn compaction_of(dataset: &Dataset, fragment_ids: &[u64]) -> CompactionOptions {
         CompactionOptions {
             target_rows_per_fragment: 20,
@@ -902,7 +866,8 @@ pub mod tests {
 
     /// A recording table with stable row ids. Deletions in fragment 0 make row
     /// ids and addresses diverge. One recorded compaction rewrites two strict
-    /// suffix groups, behind padding versions when the history is external.
+    /// suffix groups. With external storage, the table config stores any
+    /// non-empty history externally.
     /// Appended fragments 6 and 7, one with a deletion, are left as the next
     /// strict suffix to rewrite.
     async fn recording_table_with_index(
@@ -924,11 +889,14 @@ pub mod tests {
             )
             .await
             .unwrap();
+        if matches!(storage, Storage::External) {
+            dataset
+                .update_config([(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY, "0")])
+                .await
+                .unwrap();
+        }
         dataset.delete("i IN (1, 2, 35)").await.unwrap();
         let mut before = rows_by_addr(&dataset).await;
-        if matches!(storage, Storage::External) {
-            plant_padding_history(&mut dataset).await;
-        }
         if let Some(index_type) = index_type {
             create_address_index(&mut dataset, index_type).await;
         }
@@ -2555,6 +2523,18 @@ pub mod tests {
         let clone = clone_table(&mut source, &clone_uri, is_shallow).await;
         assert!(clone.manifest.uses_stable_row_ids());
         assert!(has_frag_reuse_flag(&clone));
+        assert_eq!(
+            clone
+                .config()
+                .get(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY),
+            source
+                .config()
+                .get(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY)
+        );
+        assert_eq!(
+            external_details_file(&frag_reuse_entry(&clone).await).is_some(),
+            matches!(storage, Storage::External)
+        );
         assert_same_history(&history(&clone).await, &history(&source).await);
         assert_translations_hold(&before, &clone_uri).await;
     }
