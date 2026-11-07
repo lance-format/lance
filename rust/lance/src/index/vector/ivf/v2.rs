@@ -1605,6 +1605,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         chunk: Vec<PreparedPartitionSearch<S, Q>>,
         heap: BinaryHeap<OrderedNode<u64>>,
         heap_capacity: usize,
+        max_tasks: usize,
         use_query_residual: bool,
         use_residual_scratch: bool,
         scratch_pool: Arc<QueryScratchPool>,
@@ -1614,11 +1615,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .iter()
             .map(|prepared| prepared.part_entry.size_bytes())
             .collect();
-        let ranges = balanced_byte_ranges(
-            &bytes,
-            *SCORING_TASK_BYTES,
-            get_num_compute_intensive_cpus(),
-        );
+        let ranges = balanced_byte_ranges(&bytes, *SCORING_TASK_BYTES, max_tasks);
         if ranges.is_empty() {
             return Ok(heap);
         }
@@ -3473,6 +3470,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // the waiting (#7642). The heap is threaded through each chunk so
             // chunks are scored in order, and a scored chunk is dropped before the
             // next one is scored.
+            // An explicit single worker (#6475) keeps every chunk on one task and
+            // an explicit count caps the split; automatic (0) and -1 use the pool.
+            let max_scoring_tasks = match query.query_parallelism {
+                1 => 1,
+                n if n >= 2 => (n as usize).min(get_num_compute_intensive_cpus()),
+                _ => get_num_compute_intensive_cpus(),
+            };
             let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
             while let Some(chunk) = pending {
                 let chunk = chunk?;
@@ -3480,6 +3484,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     chunk,
                     heap,
                     heap_capacity,
+                    max_scoring_tasks,
                     use_query_residual,
                     use_residual_scratch,
                     self.scratch_pool.clone(),

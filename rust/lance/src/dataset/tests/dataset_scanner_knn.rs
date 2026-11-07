@@ -3265,13 +3265,24 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
 
 /// A query whose probed partitions hold at least two scoring tasks' worth of
 /// bytes (`SCORING_TASK_BYTES`) is scored by concurrent CPU tasks that merge
-/// their heaps; the result must still be the exact top-k, here checked against
-/// a flat scan over the same rows.
+/// their heaps, unless the query asks for a single worker (#6475); either way
+/// the result must be the exact top-k, here checked against a flat scan over
+/// the same rows.
+#[rstest]
+#[case::automatic(0, true)]
+#[case::single_worker(1, false)]
 #[tokio::test]
-async fn test_knn_scores_large_chunk_on_concurrent_tasks() {
+async fn test_knn_scores_large_chunk_on_concurrent_tasks(
+    #[case] query_parallelism: i32,
+    #[case] splits: bool,
+) {
     use crate::index::vector::ivf::v2::{PARALLEL_SCORING_CHUNKS, SCORING_TASK_BYTES};
     use rand::{Rng, SeedableRng};
     use std::sync::atomic::Ordering;
+
+    // The split counter is process-wide, so the cases must not interleave.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serial = SERIAL.lock().await;
 
     const DIM: usize = 1024;
     // Two exact (flat) partitions holding three tasks' worth of vectors in
@@ -3322,6 +3333,7 @@ async fn test_knn_scores_large_chunk_on_concurrent_tasks() {
             scan.nearest("vec", &query, k).unwrap();
             scan.minimum_nprobes(2).maximum_nprobes(2);
             scan.use_index(use_index);
+            scan.query_parallelism(query_parallelism);
             scan.project(&["id"]).unwrap();
             let batch = scan.try_into_batch().await.unwrap();
             let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
@@ -3334,9 +3346,11 @@ async fn test_knn_scores_large_chunk_on_concurrent_tasks() {
     };
     let before = PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed);
     let indexed = results(true).await;
-    assert!(
+    assert_eq!(
         PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed) > before,
-        "the probed partitions should have been scored by concurrent tasks"
+        splits,
+        "query_parallelism={query_parallelism} should {}split the chunk",
+        if splits { "" } else { "not " }
     );
     let flat = results(false).await;
     assert_eq!(indexed.0, flat.0);

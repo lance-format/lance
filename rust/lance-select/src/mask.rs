@@ -102,16 +102,17 @@ impl RowAddrMask {
     /// this, where per-row [`Self::selected`] dominated the query.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
         let mut out = Vec::new();
-        self.selected_indices_into(row_ids, &mut out);
-        out
+        self.selected_offsets_into(row_ids, &mut out);
+        out.into_iter().map(u64::from).collect()
     }
 
-    /// [`Self::selected_indices`] into `out`, cleared first, so a scan over
-    /// many partitions reuses one buffer.
-    pub fn selected_indices_into<'a>(
+    /// [`Self::selected_indices`] as `u32` offsets into `out`, cleared first,
+    /// so a scan over many partitions reuses one buffer. `row_ids` must hold
+    /// fewer than `u32::MAX` rows, which an index partition always does.
+    pub fn selected_offsets_into<'a>(
         &self,
         row_ids: impl Iterator<Item = &'a u64> + 'a,
-        out: &mut Vec<u64>,
+        out: &mut Vec<u32>,
     ) {
         let (tree, allow) = match self {
             Self::AllowList(tree) => (tree, true),
@@ -122,11 +123,11 @@ impl RowAddrMask {
         let mut run_fragment = None;
         let mut run_start = 0;
         let mut ascending = true;
-        let mut flush = |fragment: Option<u32>, start: u64, run: &[u32], ascending: bool| {
+        let mut flush = |fragment: Option<u32>, start: u32, run: &[u32], ascending: bool| {
             let Some(fragment) = fragment else {
                 return;
             };
-            let all = start..start + run.len() as u64;
+            let all = start..start + run.len() as u32;
             match tree.inner.get(&fragment) {
                 None => {
                     if !allow {
@@ -153,14 +154,14 @@ impl RowAddrMask {
                         let mut next = hits.next();
                         for (offset, &row) in run.iter().enumerate() {
                             if next == Some(row) {
-                                out.push(start + offset as u64);
+                                out.push(start + offset as u32);
                                 next = hits.next();
                             }
                         }
                     } else {
                         for (offset, &row) in run.iter().enumerate() {
                             if bitmap.contains(row) == allow {
-                                out.push(start + offset as u64);
+                                out.push(start + offset as u32);
                             }
                         }
                     }
@@ -173,7 +174,7 @@ impl RowAddrMask {
                 flush(run_fragment, run_start, &run, ascending);
                 run.clear();
                 run_fragment = Some(fragment);
-                run_start = idx as u64;
+                run_start = idx as u32;
                 ascending = true;
             }
             let row = row_id as u32;
@@ -1520,9 +1521,12 @@ mod tests {
                 .collect();
             assert!(expected.len() > 1_000 && expected.len() < ids.len());
             assert_eq!(mask.selected_indices(ids.iter()), expected);
-            let mut reused = vec![u64::MAX; 3];
-            mask.selected_indices_into(ids.iter(), &mut reused);
-            assert_eq!(reused, expected);
+            let mut reused = vec![u32::MAX; 3];
+            mask.selected_offsets_into(ids.iter(), &mut reused);
+            assert_eq!(
+                reused.iter().map(|&i| u64::from(i)).collect::<Vec<_>>(),
+                expected
+            );
         }
         assert!(
             RowAddrMask::from_allowed(tree)
