@@ -53,8 +53,17 @@ impl MaskAndLoader {
 impl FilterLoader for MaskAndLoader {
     async fn load(self: Box<Self>) -> Result<RowAddrMask> {
         match self.inner {
-            Some(inner) => Ok(Arc::unwrap_or_clone(self.mask) & inner.load().await?),
+            Some(inner) => Ok(self.mask.intersect_ref(&*inner.load_shared().await?)),
             None => Ok(Arc::unwrap_or_clone(self.mask)),
+        }
+    }
+
+    async fn load_shared(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+        match self.inner {
+            Some(inner) => Ok(Arc::new(
+                self.mask.intersect_ref(&*inner.load_shared().await?),
+            )),
+            None => Ok(self.mask),
         }
     }
 }

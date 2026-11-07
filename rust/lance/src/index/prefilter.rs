@@ -80,7 +80,7 @@ impl DatasetPreFilter {
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
         let filter = filter.map(|filter| {
-            async move { filter.load().await.map(Arc::new) }
+            async move { filter.load_shared().await }
                 .in_current_span()
                 .boxed()
         });
@@ -521,29 +521,42 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            // Deletions only: `RowAddrMask::default()` selects every row, so the
-            // combined mask is the deletion mask itself. Share it instead of copying.
-            if self.only_deletions()
-                && let Some(deleted_ids) = &self.deleted_ids
-            {
-                return deleted_ids.get_ready();
-            }
-            let mut combined = RowAddrMask::default();
-            if let Some(filtered_ids) = &self.filtered_ids {
-                combined = combined & filtered_ids.get_ready().as_ref().clone();
-            }
-            if let Some(deleted_ids) = &self.deleted_ids {
-                combined = combined & (*deleted_ids.get_ready()).clone();
-            }
-            if let Some(deleted) = &self.deleted_fragments {
+            // The filter and deletion masks are shared with their caches, so
+            // they are intersected by reference and only the result is
+            // allocated; a lone mask is shared as is.
+            let filtered = self.filtered_ids.as_ref().map(|ids| ids.get_ready());
+            let deleted = self.deleted_ids.as_ref().map(|ids| ids.get_ready());
+            let deleted_fragments = self.deleted_fragments.as_ref().map(|deleted| {
                 let mut block_list = RowAddrTreeMap::new();
                 for frag_id in deleted.iter() {
                     block_list.insert_fragment(frag_id);
                 }
-                combined = combined & RowAddrMask::from_block(block_list);
+                RowAddrMask::from_block(block_list)
+            });
+            let count = filtered.is_some() as usize
+                + deleted.is_some() as usize
+                + deleted_fragments.is_some() as usize
+                + self.overlay_block.is_some() as usize;
+            if count <= 1 {
+                return filtered
+                    .or(deleted)
+                    .or_else(|| deleted_fragments.map(Arc::new))
+                    .or_else(|| self.overlay_block.clone().map(Arc::new))
+                    .unwrap_or_else(|| Arc::new(RowAddrMask::default()));
             }
-            if let Some(overlay_block) = &self.overlay_block {
-                combined = combined & overlay_block.clone();
+            let mut parts = [
+                filtered.as_deref(),
+                deleted.as_deref(),
+                deleted_fragments.as_ref(),
+                self.overlay_block.as_ref(),
+            ]
+            .into_iter()
+            .flatten();
+            let first = parts.next().expect("at least two masks");
+            let second = parts.next().expect("at least two masks");
+            let mut combined = first.intersect_ref(second);
+            for part in parts {
+                combined = combined.intersect_ref(part);
             }
             Arc::new(combined)
         });

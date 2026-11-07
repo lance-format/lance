@@ -406,6 +406,75 @@ fn test_balanced_query_ranges(
     }
 }
 
+/// A cached state carries its quantizer from the moment it is exported or
+/// decoded, so the cache charges for it on admission and a later
+/// reconstruction neither rebuilds it nor grows the entry.
+#[tokio::test]
+async fn test_state_entry_carries_quantizer_before_admission() {
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        ivf,
+        lightweight_pq_params_with_bits(8),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].uuid;
+    let index = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+    let exported = index.to_state_entry();
+    let codec = lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>();
+    let mut encoded = Vec::new();
+    codec
+        .serialize(
+            &(Arc::new(IvfStateEntryBox(exported.0.clone())) as lance_core::cache::CacheEntry),
+            &mut encoded,
+        )
+        .unwrap();
+    let decoded = codec
+        .deserialize(&bytes::Bytes::from(encoded))
+        .hit()
+        .unwrap()
+        .downcast::<IvfStateEntryBox>()
+        .unwrap();
+    for entry in [Arc::new(exported), decoded] {
+        let charged = entry.deep_size_of();
+        entry
+            .0
+            .reconstruct(
+                dataset.object_store.clone(),
+                dataset.metadata_cache.as_ref(),
+                LanceCache::no_cache(),
+                None,
+                super::IvfOpenContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.deep_size_of(), charged);
+    }
+}
+
 #[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]

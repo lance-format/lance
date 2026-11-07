@@ -352,15 +352,17 @@ fn shared_prefilter_future(
                             let result = async move {
                                 let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
-                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                    Box::new(SelectionVectorToPrefilter(stream))
+                                        .load_shared()
+                                        .await
                                 } else {
                                     Box::new(FilteredRowIdsToPrefilter::new(stream))
-                                        .load()
+                                        .load_shared()
                                         .await
                                 }
                             }
                             .await;
-                            CloneableResult::from(result.map(Arc::new))
+                            CloneableResult::from(result)
                         }
                         .boxed()
                         .shared()
@@ -456,7 +458,7 @@ fn prefilter_mask_future(
         None => prefilter_loader,
     };
     Ok(prefilter_loader.map(|loader| {
-        async move { loader.load().await.map(Arc::new) }
+        async move { loader.load_shared().await }
             .in_current_span()
             .boxed()
     }))
