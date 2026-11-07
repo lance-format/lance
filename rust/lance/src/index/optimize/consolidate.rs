@@ -5,20 +5,43 @@
 
 use super::*;
 use crate::dataset::fragment::FileFragment;
+use crate::index::vector::StageParams;
+use lance_index::vector::VectorIndex;
+use lance_index::vector::bq::builder::RabitQuantizer;
+
+pub(super) fn requested(options: &OptimizeOptions) -> bool {
+    options.max_rows_to_consolidate.is_some() || options.segments_to_consolidate.is_some()
+}
 
 pub(super) fn validate_options(options: &OptimizeOptions) -> Result<()> {
-    let Some(budget) = options.max_rows_to_consolidate else {
+    if let Some(selected) = &options.segments_to_consolidate
+        && (selected.is_empty()
+            || selected.iter().collect::<HashSet<_>>().len() != selected.len()
+            || options
+                .index_names
+                .as_ref()
+                .is_none_or(|names| names.len() != 1)
+            || options.max_rows_to_consolidate.is_some())
+    {
+        return Err(Error::invalid_input(
+            "a segment selection needs distinct segments and exactly one index name, and takes no row budget",
+        ));
+    }
+    if !requested(options) {
         return Ok(());
-    };
-    if budget == 0
+    }
+    // Only a selection packs its output into several segments.
+    let segment_limit_allowed = options.segments_to_consolidate.is_some();
+    if options.max_rows_to_consolidate == Some(0)
         || options.max_rows_per_task == Some(0)
+        || options.max_rows_per_segment == Some(0)
         || options.retrain
         || options.enable_partition_rebalancing
         || options.num_indices_to_merge.is_some()
-        || options.max_rows_per_segment.is_some()
+        || (options.max_rows_per_segment.is_some() && !segment_limit_allowed)
     {
         return Err(Error::invalid_input(
-            "consolidation requires a positive row budget and task limit, and cannot be combined with retrain, partition rebalancing, num_indices_to_merge, or max_rows_per_segment",
+            "consolidation requires positive row limits, cannot be combined with retrain, partition rebalancing or num_indices_to_merge, and takes max_rows_per_segment only with a segment selection",
         ));
     }
     Ok(())
@@ -31,9 +54,8 @@ pub(super) async fn plan_index(
     options: &OptimizeOptions,
     tagged: bool,
 ) -> Result<()> {
-    let budget = options
-        .max_rows_to_consolidate
-        .expect("consolidation requested");
+    // A selection is not bounded: the caller chose the work.
+    let budget = options.max_rows_to_consolidate.unwrap_or(u64::MAX);
     let named = options.index_names.is_some();
     let reference = segments.last().expect("nonempty index");
     if !segment_has_vector_details(reference) || tagged {
@@ -45,12 +67,31 @@ pub(super) async fn plan_index(
         return Ok(());
     }
     let (field_path, _) = index_field_path(dataset, reference).await?;
+    let explicit = options.segments_to_consolidate.as_ref();
+    let candidates = match explicit {
+        Some(uuids) => {
+            let found = segments
+                .iter()
+                .copied()
+                .filter(|segment| uuids.contains(&segment.uuid))
+                .collect::<Vec<_>>();
+            if found.len() < uuids.len() {
+                log::warn!(
+                    "Consolidation of index '{}' skips {} selected segments it no longer has",
+                    reference.name,
+                    uuids.len() - found.len()
+                );
+            }
+            found
+        }
+        None => segments.to_vec(),
+    };
     let mut selected = Vec::new();
     let mut pairs = Vec::new();
     let mut coverage = RoaringBitmap::new();
     let mut rows = 0u64;
     let mut fragment_rows = BTreeMap::new();
-    for segment in segments.iter().rev() {
+    for segment in candidates.iter().rev() {
         let effective = segment
             .effective_fragment_bitmap(&dataset.fragment_bitmap)
             .ok_or_else(|| {
@@ -103,15 +144,16 @@ pub(super) async fn plan_index(
         pairs.push(((*segment).clone(), index));
         selected.push((*segment).clone());
     }
-    if selected.len() < 2 {
+    if selected.len() < if explicit.is_some() { 1 } else { 2 } {
         return Ok(());
     }
     selected.reverse();
     pairs.reverse();
-    let reference = selected.last().expect("at least two selected segments");
-    if selected.iter().any(|segment| {
-        segment.base_id.is_some() || segment.index_version != reference.index_version
-    }) {
+    let newest = selected.last().expect("a nonempty selection").clone();
+    if selected
+        .iter()
+        .any(|segment| segment.base_id.is_some() || segment.index_version != newest.index_version)
+    {
         return Err(Error::not_supported(
             "consolidation requires local segments with matching on-disk versions",
         ));
@@ -123,57 +165,116 @@ pub(super) async fn plan_index(
             "consolidation requires pending compaction remaps to be applied first",
         ));
     }
-    let logical = LogicalVectorIndex::try_new(reference.name.clone(), field_path, pairs)?;
+    let newest_index = pairs
+        .last()
+        .expect("one index per selected segment")
+        .1
+        .clone();
+    let logical = LogicalVectorIndex::try_new(newest.name.clone(), field_path.clone(), pairs)?;
     let shared = vector_segment_compatibility(&logical.as_ivf()?, "planning consolidation")?
         == VectorSegmentCompatibility::SharedModel;
-    let group = plan.merges.len() as u32;
-    if shared {
+    if shared && explicit.is_none() {
         plan.merges.push(OptimizeIndexMerge {
             plan_id: plan.plan_id,
             read_version: plan.read_version,
-            group,
+            group: plan.merges.len() as u32,
             old_segments: selected,
             replaces: Vec::new(),
         });
         return Ok(());
     }
+    // Encoding rows under a model trained on other data loses recall, so a
+    // selection whose models differ is retrained on its own rows. A shared
+    // model is reused; re-encoding under it still drops deleted rows.
+    let reference = if shared || explicit.is_none() {
+        newest
+    } else {
+        let params = selection_params(&newest, newest_index.as_ref())?;
+        let fragments = coverage.iter().collect::<Vec<_>>();
+        train_model_segment(
+            dataset,
+            &field_path,
+            &newest,
+            &params,
+            Some(&fragments),
+            options.progress.clone(),
+        )
+        .await?
+    };
     let inputs = coverage
         .iter()
         .map(|id| (id, fragment_rows[&id]))
         .collect::<Vec<_>>();
-    if let Some(limit) = options.max_rows_per_task
+    // A task's output is never split, so it holds no more than a segment may.
+    let task_limit = [options.max_rows_per_task, options.max_rows_per_segment]
+        .into_iter()
+        .flatten()
+        .min();
+    if let Some(limit) = task_limit
         && inputs.iter().any(|(_, rows)| *rows > limit)
     {
         return Err(Error::invalid_input(
-            "a selected fragment exceeds max_rows_per_task; consolidation cannot split a fragment",
+            "a selected fragment exceeds max_rows_per_task or max_rows_per_segment; consolidation cannot split a fragment",
         ));
     }
-    for fragments in pack_next_fit(inputs, options.max_rows_per_task) {
-        plan.tasks.push(OptimizeIndexTask {
+    let replaces = selected
+        .iter()
+        .map(|segment| segment.uuid)
+        .collect::<Vec<_>>();
+    let outputs = inputs.iter().map(|input| (*input, input.1)).collect();
+    for output in pack_next_fit(outputs, options.max_rows_per_segment) {
+        let group = plan.merges.len() as u32;
+        for fragments in pack_next_fit(output, task_limit) {
+            plan.tasks.push(OptimizeIndexTask {
+                plan_id: plan.plan_id,
+                read_version: plan.read_version,
+                group,
+                fragments,
+                reference: reference.clone(),
+                old_segments: Vec::new(),
+                num_indices_to_merge: Some(0),
+                enable_partition_rebalancing: false,
+                retrain: false,
+            });
+        }
+        // Every output lists every source: together they replace them.
+        plan.merges.push(OptimizeIndexMerge {
             plan_id: plan.plan_id,
             read_version: plan.read_version,
             group,
-            fragments,
-            reference: reference.clone(),
             old_segments: Vec::new(),
-            num_indices_to_merge: Some(0),
-            enable_partition_rebalancing: false,
-            retrain: false,
+            replaces: replaces.clone(),
         });
     }
-    plan.merges.push(OptimizeIndexMerge {
-        plan_id: plan.plan_id,
-        read_version: plan.read_version,
-        group,
-        old_segments: Vec::new(),
-        replaces: selected.iter().map(|segment| segment.uuid).collect(),
-    });
     Ok(())
+}
+
+/// The build parameters of `newest`, with the partition count left for the
+/// builder to size from the rows it trains on. IVF_RQ keeps the rotation the
+/// segments of one index share.
+fn selection_params(newest: &IndexMetadata, index: &dyn VectorIndex) -> Result<VectorIndexParams> {
+    let mut params = fresh_vector_segment_params(newest, index)?;
+    for stage in &mut params.stages {
+        match stage {
+            StageParams::Ivf(ivf) => {
+                ivf.num_partitions = None;
+                ivf.centroids = None;
+            }
+            StageParams::RQ(rq) => {
+                let quantizer: RabitQuantizer = index.quantizer().try_into()?;
+                rq.rotation = Some(quantizer.metadata_ref().clone());
+            }
+            _ => {}
+        }
+    }
+    Ok(params)
 }
 
 /// Reanchor only when the same sources still own the surviving coverage. A
 /// concurrent append is disjoint; a delete may reduce coverage without making
 /// the staged files unusable. A source replaced by another merge needs replanning.
+/// The outputs of one index jointly replace its sources: together they cover
+/// every surviving source fragment exactly once.
 pub(super) async fn validate_commit(
     dataset: &Dataset,
     planned: &Dataset,
@@ -190,14 +291,20 @@ pub(super) async fn validate_commit(
         ));
     }
     let reuse = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let mut all_replaced = HashSet::new();
-    for result in results.iter_mut() {
-        let mut expected = RoaringBitmap::new();
+    let incomplete = || {
+        Error::invalid_input(
+            "consolidation result must cover every surviving source fragment exactly",
+        )
+    };
+    let mut checked = HashSet::new();
+    let mut expected: HashMap<String, RoaringBitmap> = HashMap::new();
+    for result in results.iter() {
+        if result.replaces.is_empty() {
+            return Err(incomplete());
+        }
         for uuid in &result.replaces {
-            if !all_replaced.insert(*uuid) {
-                return Err(Error::invalid_input(
-                    "consolidation results replace a source twice",
-                ));
+            if !checked.insert(*uuid) {
+                continue;
             }
             let source = original
                 .iter()
@@ -286,21 +393,32 @@ pub(super) async fn validate_commit(
                     }
                 }
             }
-            expected |= live;
+            *expected.entry(result.segment.name.clone()).or_default() |= live;
         }
-        let actual = result
+    }
+    let mut actual: HashMap<String, RoaringBitmap> = HashMap::new();
+    for result in results.iter_mut() {
+        let coverage = result
             .segment
             .effective_fragment_bitmap(&dataset.fragment_bitmap)
             .ok_or_else(|| Error::invalid_input("consolidation result has unknown coverage"))?;
-        if result.replaces.is_empty() || actual != expected {
+        let covered = actual.entry(result.segment.name.clone()).or_default();
+        if !covered.is_disjoint(&coverage) {
             return Err(Error::invalid_input(
-                "consolidation result must cover every surviving source fragment exactly",
+                "consolidation results replace a source twice",
             ));
         }
-        result.segment.fragment_bitmap = Some(actual);
+        *covered |= &coverage;
+        result.segment.fragment_bitmap = Some(coverage);
         result
             .replaces
             .retain(|uuid| current.iter().any(|source| source.uuid == *uuid));
+    }
+    if expected.keys().chain(actual.keys()).any(|name| {
+        expected.get(name).cloned().unwrap_or_default()
+            != actual.get(name).cloned().unwrap_or_default()
+    }) {
+        return Err(incomplete());
     }
     // Fully retired outputs have no work left to publish.
     results.retain(|result| {
