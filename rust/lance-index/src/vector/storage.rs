@@ -260,6 +260,12 @@ pub(crate) fn accumulate_distances_into_heap(
     let mut max_dist = res.peek().map(|node| node.dist);
 
     for (id, dist) in dists.iter().copied().enumerate() {
+        // Nearly every row of a full heap loses to its worst entry; one plain
+        // float compare settles those before the total-order compares below.
+        // A NaN fails this test and takes the ordered path unchanged.
+        if res.len() >= k && max_dist.is_some_and(|max_dist| dist >= max_dist.0) {
+            continue;
+        }
         let dist = OrderedFloat(dist);
         if dist < lower_bound || dist >= upper_bound {
             continue;
@@ -286,6 +292,8 @@ pub struct QueryScratch {
     pub u16: Vec<u16>,
     pub u8: Vec<u8>,
     pub u32: Vec<u32>,
+    /// Offsets of the rows a prefilter keeps in the partition being scanned.
+    pub selected: Vec<u64>,
 }
 
 impl QueryScratch {
@@ -296,6 +304,7 @@ impl QueryScratch {
             u16: Vec::new(),
             u8: Vec::new(),
             u32: Vec::new(),
+            selected: Vec::new(),
         }
     }
 
@@ -306,6 +315,7 @@ impl QueryScratch {
             u16: vec![0; capacity.u16],
             u8: vec![0; capacity.u8],
             u32: vec![0; capacity.u32],
+            selected: Vec::new(),
         }
     }
 }
@@ -323,6 +333,7 @@ impl DeepSizeOf for QueryScratch {
             + self.u16.capacity() * size_of::<u16>()
             + self.u8.capacity() * size_of::<u8>()
             + self.u32.capacity() * size_of::<u32>()
+            + self.selected.capacity() * size_of::<u64>()
     }
 }
 

@@ -3262,3 +3262,88 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
     assert_eq!(quantized.num_rows(), 1);
     assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
 }
+
+/// A query whose probed partitions hold at least two scoring tasks' worth of
+/// bytes (`SCORING_TASK_BYTES`) is scored by concurrent CPU tasks that merge
+/// their heaps; the result must still be the exact top-k, here checked against
+/// a flat scan over the same rows.
+#[tokio::test]
+async fn test_knn_scores_large_chunk_on_concurrent_tasks() {
+    use crate::index::vector::ivf::v2::{PARALLEL_SCORING_CHUNKS, SCORING_TASK_BYTES};
+    use rand::{Rng, SeedableRng};
+    use std::sync::atomic::Ordering;
+
+    const DIM: usize = 1024;
+    // Two exact (flat) partitions holding three tasks' worth of vectors in
+    // all, so the split happens however unevenly k-means divides them.
+    let rows = 3 * SCORING_TASK_BYTES.div_ceil(DIM * 4);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1024);
+    let vectors = Float32Array::from_iter_values((0..rows * DIM).map(|_| rng.random::<f32>()));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "vec",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows as i32)),
+            Arc::new(FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap()),
+        ],
+    )
+    .unwrap();
+    let test_dir = TempStrDir::default();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = Float32Array::from_iter_values((0..DIM).map(|_| rng.random::<f32>()));
+    let k = 5;
+    let results = |use_index: bool| {
+        let dataset = dataset.clone();
+        let query = query.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, k).unwrap();
+            scan.minimum_nprobes(2).maximum_nprobes(2);
+            scan.use_index(use_index);
+            scan.project(&["id"]).unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+            let dists = batch[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            (ids, dists)
+        }
+    };
+    let before = PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed);
+    let indexed = results(true).await;
+    assert!(
+        PARALLEL_SCORING_CHUNKS.load(Ordering::Relaxed) > before,
+        "the probed partitions should have been scored by concurrent tasks"
+    );
+    let flat = results(false).await;
+    assert_eq!(indexed.0, flat.0);
+    assert_eq!(indexed.0.len(), k);
+    // The exact index and the flat scan take different L2 kernels, which
+    // round differently in the last bits.
+    for (indexed, flat) in indexed.1.iter().zip(&flat.1) {
+        assert!((indexed - flat).abs() <= 1e-4 * flat, "{indexed} vs {flat}");
+    }
+}

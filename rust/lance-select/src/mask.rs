@@ -94,17 +94,95 @@ impl RowAddrMask {
     }
 
     /// Return the indices of the input row ids that were valid
+    ///
+    /// Rows are grouped into runs that share a fragment, so the fragment's
+    /// selection is looked up once per run instead of once per row, and a run
+    /// whose rows ascend is intersected with the fragment bitmap in bulk instead
+    /// of probed row by row. Vector search filters whole index partitions through
+    /// this, where per-row [`Self::selected`] dominated the query.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
-        row_ids
-            .enumerate()
-            .filter_map(|(idx, row_id)| {
-                if self.selected(*row_id) {
-                    Some(idx as u64)
-                } else {
-                    None
+        let mut out = Vec::new();
+        self.selected_indices_into(row_ids, &mut out);
+        out
+    }
+
+    /// [`Self::selected_indices`] into `out`, cleared first, so a scan over
+    /// many partitions reuses one buffer.
+    pub fn selected_indices_into<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        out: &mut Vec<u64>,
+    ) {
+        let (tree, allow) = match self {
+            Self::AllowList(tree) => (tree, true),
+            Self::BlockList(tree) => (tree, false),
+        };
+        out.clear();
+        let mut run: Vec<u32> = Vec::new();
+        let mut run_fragment = None;
+        let mut run_start = 0;
+        let mut ascending = true;
+        let mut flush = |fragment: Option<u32>, start: u64, run: &[u32], ascending: bool| {
+            let Some(fragment) = fragment else {
+                return;
+            };
+            let all = start..start + run.len() as u64;
+            match tree.inner.get(&fragment) {
+                None => {
+                    if !allow {
+                        out.extend(all);
+                    }
                 }
-            })
-            .collect()
+                Some(RowAddrSelection::Full) => {
+                    if allow {
+                        out.extend(all);
+                    }
+                }
+                Some(RowAddrSelection::Partial(bitmap)) => {
+                    // Bulk intersection beats per-row probes only once a run
+                    // amortizes building its own bitmap.
+                    if ascending && run.len() >= 64 {
+                        let run_set = RoaringBitmap::from_sorted_iter(run.iter().copied())
+                            .expect("run checked ascending");
+                        let hits = if allow {
+                            run_set & bitmap
+                        } else {
+                            run_set - bitmap
+                        };
+                        let mut hits = hits.iter();
+                        let mut next = hits.next();
+                        for (offset, &row) in run.iter().enumerate() {
+                            if next == Some(row) {
+                                out.push(start + offset as u64);
+                                next = hits.next();
+                            }
+                        }
+                    } else {
+                        for (offset, &row) in run.iter().enumerate() {
+                            if bitmap.contains(row) == allow {
+                                out.push(start + offset as u64);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        for (idx, &row_id) in row_ids.enumerate() {
+            let fragment = (row_id >> 32) as u32;
+            if run_fragment != Some(fragment) {
+                flush(run_fragment, run_start, &run, ascending);
+                run.clear();
+                run_fragment = Some(fragment);
+                run_start = idx as u64;
+                ascending = true;
+            }
+            let row = row_id as u32;
+            if ascending && run.last().is_some_and(|&last| last >= row) {
+                ascending = false;
+            }
+            run.push(row);
+        }
+        flush(run_fragment, run_start, &run, ascending);
     }
 
     /// Also block the given addrs
@@ -1411,6 +1489,46 @@ mod tests {
 
     fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
+    }
+
+    /// `selected_indices` intersects ascending runs of at least 64 rows in
+    /// bulk and probes shorter, unsorted or duplicated runs row by row; every
+    /// path must agree with `selected`, for allow and block lists alike.
+    #[test]
+    fn test_selected_indices_bulk_matches_per_row() {
+        let mut tree = RowAddrTreeMap::new();
+        tree.insert_fragment(2);
+        for row in (0..20_000u64).step_by(2) {
+            tree.insert(1 << 32 | row);
+        }
+        let frag1 = |row: u64| 1_u64 << 32 | row;
+        let mut ids: Vec<u64> = (0..5_000).map(|r| frag1(r * 3)).collect();
+        ids.extend((0..5).map(|r| 2_u64 << 32 | r));
+        ids.extend((0..10).map(|r| frag1(100 + r)));
+        ids.extend((0..5).map(|r| 3_u64 << 32 | r));
+        ids.extend((0..200).rev().map(frag1));
+        ids.extend((0..100).map(|r| frag1(r / 2)));
+        for mask in [
+            RowAddrMask::from_allowed(tree.clone()),
+            RowAddrMask::from_block(tree.clone()),
+        ] {
+            let expected: Vec<u64> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| mask.selected(**id))
+                .map(|(idx, _)| idx as u64)
+                .collect();
+            assert!(expected.len() > 1_000 && expected.len() < ids.len());
+            assert_eq!(mask.selected_indices(ids.iter()), expected);
+            let mut reused = vec![u64::MAX; 3];
+            mask.selected_indices_into(ids.iter(), &mut reused);
+            assert_eq!(reused, expected);
+        }
+        assert!(
+            RowAddrMask::from_allowed(tree)
+                .selected_indices([].iter())
+                .is_empty()
+        );
     }
 
     #[test]

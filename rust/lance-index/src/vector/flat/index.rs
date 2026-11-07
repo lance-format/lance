@@ -173,35 +173,33 @@ fn search_candidates_with_scratch(
             }
         }
     } else {
-        let row_addr_mask = prefilter.mask();
+        prefilter
+            .mask()
+            .selected_indices_into(row_ids, &mut scratch.selected);
         if is_range_query {
             let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
             let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-            for (offset, &row_id) in row_ids.enumerate() {
-                if !row_addr_mask.selected(row_id) {
-                    continue;
-                }
-                let distance = dist_calc.distance(offset as u32).into();
+            for &offset in &scratch.selected {
+                let offset = offset as u32;
+                let distance = dist_calc.distance(offset).into();
                 if distance < lower_bound || distance >= upper_bound {
                     continue;
                 }
                 push_candidate_local(
                     &mut candidates,
                     candidate_limit,
-                    (offset as u32, row_id),
+                    (offset, storage.row_id(offset)),
                     distance,
                 );
             }
         } else {
-            for (offset, &row_id) in row_ids.enumerate() {
-                if !row_addr_mask.selected(row_id) {
-                    continue;
-                }
+            for &offset in &scratch.selected {
+                let offset = offset as u32;
                 push_candidate_local(
                     &mut candidates,
                     candidate_limit,
-                    (offset as u32, row_id),
-                    dist_calc.distance(offset as u32).into(),
+                    (offset, storage.row_id(offset)),
+                    dist_calc.distance(offset).into(),
                 );
             }
         }
@@ -328,29 +326,25 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                let row_addr_mask = prefilter.mask();
+                prefilter
+                    .mask()
+                    .selected_indices_into(row_ids, &mut scratch.selected);
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
+                    for &id in &scratch.selected {
+                        let id = id as u32;
+                        let dist = dist_calc.distance(id).into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
-
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                    for &id in &scratch.selected {
+                        let id = id as u32;
+                        let dist = dist_calc.distance(id).into();
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 }
             }
@@ -486,13 +480,18 @@ impl IvfSubIndex for FlatIndex {
                 );
             }
             false => {
-                let row_addr_mask = prefilter.mask();
+                prefilter
+                    .mask()
+                    .selected_indices_into(row_ids, &mut scratch.selected);
                 dist_calc.accumulate_filtered_topk_with_scratch(
                     k,
                     params.lower_bound,
                     params.upper_bound,
-                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
-                    |row_id| row_addr_mask.selected(row_id),
+                    scratch
+                        .selected
+                        .iter()
+                        .map(|&id| (id as u32, storage.row_id(id as u32))),
+                    |_| true,
                     res,
                     &mut scratch.distances,
                     &mut scratch.u16,

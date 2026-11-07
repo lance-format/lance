@@ -378,6 +378,51 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
 }
 
 #[rstest]
+#[case::below_two_tasks(vec![600, 600], 1024, 8, vec![0..2])]
+#[case::one_partition(vec![5000], 1024, 8, vec![0..1])]
+#[case::even(vec![1024; 4], 1024, 8, vec![0..1, 1..2, 2..3, 3..4])]
+#[case::capped_by_tasks(vec![1024; 4], 1024, 2, vec![0..2, 2..4])]
+#[case::skewed(vec![3000, 1000, 1000, 1000], 1000, 4, vec![0..1, 1..2, 2..3, 3..4])]
+#[case::first_below_target(vec![1_400_000, 1_750_000], 1 << 20, 8, vec![0..1, 1..2])]
+#[case::concentrated(vec![3000, 1, 1, 1], 1, 4, vec![0..1, 1..4])]
+fn test_balanced_byte_ranges(
+    #[case] bytes: Vec<usize>,
+    #[case] min_task_bytes: usize,
+    #[case] max_tasks: usize,
+    #[case] expected: Vec<std::ops::Range<usize>>,
+) {
+    let ranges = super::balanced_byte_ranges(&bytes, min_task_bytes, max_tasks);
+    assert_eq!(ranges, expected);
+    assert!(ranges.len() <= max_tasks);
+    // Ranges are ordered, disjoint, and cover every partition exactly once.
+    assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+    assert_eq!(ranges.first().map(|range| range.start), Some(0));
+    assert_eq!(ranges.last().map(|range| range.end), Some(bytes.len()));
+}
+
+#[test]
+fn test_merge_topk_heaps_keeps_the_best() {
+    use crate::index::vector::ivf::v2::merge_topk_heaps;
+    use lance_index::vector::graph::{OrderedFloat, OrderedNode};
+    use std::collections::BinaryHeap;
+    let heap = |dists: &[f32]| {
+        dists
+            .iter()
+            .enumerate()
+            .map(|(id, &dist)| OrderedNode::new(id as u64 * 10 + dist as u64, OrderedFloat(dist)))
+            .collect::<BinaryHeap<_>>()
+    };
+    let merged = merge_topk_heaps(
+        vec![heap(&[5.0, 1.0, 9.0]), heap(&[2.0, 8.0]), heap(&[0.5])],
+        3,
+    );
+    let mut dists: Vec<f32> = merged.into_iter().map(|node| node.dist.0).collect();
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(dists, vec![0.5, 1.0, 2.0]);
+    assert!(merge_topk_heaps(vec![], 3).is_empty());
+}
+
+#[rstest]
 #[case::no_probes(vec![0, 0, 0], 4, vec![])]
 #[case::too_few_to_split(vec![1, 2, 3], 4, vec![0..3])]
 #[case::even(vec![8; 4], 2, vec![0..2, 2..4])]
