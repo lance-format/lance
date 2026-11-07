@@ -310,7 +310,7 @@ impl CachedFileMetadata {
 ///
 /// If users are not using the table format then they will need to figure
 /// out some way to do this themselves.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
     /// of the schema are arbitrary and ignored.
@@ -4271,102 +4271,102 @@ mod tests {
             vec!["score.y", "location", "categories"],
         ] {
             debug!("Testing round trip with projection {:?}", columns);
-            for use_field_ids in [true, false] {
-                // We can specify the projection as part of the read operation via read_stream_projected
-                let file_reader = FileReader::try_open(
-                    file_scheduler.clone(),
-                    None,
-                    Arc::<DecoderPlugins>::default(),
-                    &test_cache(),
-                    FileReaderOptions::default(),
+            // We can specify the projection as part of the read operation via read_stream_projected
+            let file_reader = FileReader::try_open(
+                file_scheduler.clone(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &test_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+
+            let projected_schema = written_file.schema.project(&columns).unwrap();
+            let projection = versions::reader_projection_from_field_ids(
+                file_reader.metadata().version(),
+                &projected_schema,
+                &field_id_mapping,
+            )
+            .unwrap();
+            // Both ways of building a projection must agree, so reading the file
+            // once per open mode covers both.
+            assert_eq!(
+                projection,
+                versions::reader_projection_from_column_names(
+                    file_reader.metadata().version(),
+                    &written_file.schema,
+                    &columns,
+                )
+                .unwrap()
+            );
+
+            let batch_stream = file_reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::RangeFull,
+                    1024,
+                    16,
+                    projection.clone(),
+                    FilterExpression::no_filter(),
                 )
                 .await
                 .unwrap();
 
-                let projected_schema = written_file.schema.project(&columns).unwrap();
-                let projection = if use_field_ids {
-                    versions::reader_projection_from_field_ids(
-                        file_reader.metadata().version(),
-                        &projected_schema,
-                        &field_id_mapping,
-                    )
-                    .unwrap()
-                } else {
-                    versions::reader_projection_from_column_names(
-                        file_reader.metadata().version(),
-                        &written_file.schema,
-                        &columns,
-                    )
-                    .unwrap()
-                };
+            let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
+            verify_expected(
+                &written_file.data,
+                batch_stream,
+                1024,
+                Some(Box::new(move |batch: &RecordBatch| {
+                    batch.project_by_schema(&projection_arrow).unwrap()
+                })),
+            )
+            .await;
 
-                let batch_stream = file_reader
+            // We can also specify the projection as a base projection when we open the file
+            let file_reader = FileReader::try_open(
+                file_scheduler.clone(),
+                Some(projection.clone()),
+                Arc::<DecoderPlugins>::default(),
+                &test_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+
+            let batch_stream = file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::RangeFull,
+                    1024,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap();
+
+            let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
+            verify_expected(
+                &written_file.data,
+                batch_stream,
+                1024,
+                Some(Box::new(move |batch: &RecordBatch| {
+                    batch.project_by_schema(&projection_arrow).unwrap()
+                })),
+            )
+            .await;
+
+            assert!(
+                file_reader
                     .read_stream_projected(
                         lance_io::ReadBatchParams::RangeFull,
                         1024,
                         16,
-                        projection.clone(),
+                        empty_projection.clone(),
                         FilterExpression::no_filter(),
                     )
                     .await
-                    .unwrap();
-
-                let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
-                verify_expected(
-                    &written_file.data,
-                    batch_stream,
-                    1024,
-                    Some(Box::new(move |batch: &RecordBatch| {
-                        batch.project_by_schema(&projection_arrow).unwrap()
-                    })),
-                )
-                .await;
-
-                // We can also specify the projection as a base projection when we open the file
-                let file_reader = FileReader::try_open(
-                    file_scheduler.clone(),
-                    Some(projection.clone()),
-                    Arc::<DecoderPlugins>::default(),
-                    &test_cache(),
-                    FileReaderOptions::default(),
-                )
-                .await
-                .unwrap();
-
-                let batch_stream = file_reader
-                    .read_stream(
-                        lance_io::ReadBatchParams::RangeFull,
-                        1024,
-                        16,
-                        FilterExpression::no_filter(),
-                    )
-                    .await
-                    .unwrap();
-
-                let projection_arrow = ArrowSchema::from(projection.schema.as_ref());
-                verify_expected(
-                    &written_file.data,
-                    batch_stream,
-                    1024,
-                    Some(Box::new(move |batch: &RecordBatch| {
-                        batch.project_by_schema(&projection_arrow).unwrap()
-                    })),
-                )
-                .await;
-
-                assert!(
-                    file_reader
-                        .read_stream_projected(
-                            lance_io::ReadBatchParams::RangeFull,
-                            1024,
-                            16,
-                            empty_projection.clone(),
-                            FilterExpression::no_filter(),
-                        )
-                        .await
-                        .is_err()
-                );
-            }
+                    .is_err()
+            );
         }
 
         assert!(
