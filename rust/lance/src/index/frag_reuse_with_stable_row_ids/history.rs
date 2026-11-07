@@ -729,7 +729,9 @@ pub mod tests {
     use lance_table::format::BasePath;
     use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
     use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
-    use lance_table::system_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME;
+    use lance_table::system_index::frag_reuse::{
+        FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY,
+    };
     use prost::Message;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -752,25 +754,12 @@ pub mod tests {
     };
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
-    use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, external_frag_reuse_session,
-        padding_reuse_versions,
-    };
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, padding_reuse_versions};
 
     #[derive(Clone, Copy, Debug)]
     enum Storage {
         Inline,
         External,
-    }
-
-    impl Storage {
-        /// A session whose writers store the history as `self` says.
-        fn session(self) -> Arc<Session> {
-            match self {
-                Self::Inline => Arc::new(Session::default()),
-                Self::External => external_frag_reuse_session(),
-            }
-        }
     }
 
     fn external_details_file(entry: &IndexMetadata) -> Option<ExternalFile> {
@@ -877,8 +866,8 @@ pub mod tests {
 
     /// A recording table with stable row ids. Deletions in fragment 0 make row
     /// ids and addresses diverge. One recorded compaction rewrites two strict
-    /// suffix groups. Writers through the returned handle's session store the
-    /// history as `storage` says.
+    /// suffix groups. With external storage, the table config stores any
+    /// non-empty history externally.
     /// Appended fragments 6 and 7, one with a deletion, are left as the next
     /// strict suffix to rewrite.
     async fn recording_table_with_index(
@@ -895,12 +884,17 @@ pub mod tests {
                 Some(WriteParams {
                     enable_stable_row_ids: true,
                     max_rows_per_file: 10,
-                    session: Some(storage.session()),
                     ..Default::default()
                 }),
             )
             .await
             .unwrap();
+        if matches!(storage, Storage::External) {
+            dataset
+                .update_config([(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY, "0")])
+                .await
+                .unwrap();
+        }
         dataset.delete("i IN (1, 2, 35)").await.unwrap();
         let mut before = rows_by_addr(&dataset).await;
         if let Some(index_type) = index_type {
@@ -2509,15 +2503,7 @@ pub mod tests {
         } else {
             source.deep_clone(uri, version, None).await.unwrap();
         }
-        // A fresh session, but one whose writers store the history as the
-        // source's do.
-        let mut session = Session::default();
-        session.frag_reuse_inline_details_limit = source.session.frag_reuse_inline_details_limit;
-        DatasetBuilder::from_uri(uri)
-            .with_session(Arc::new(session))
-            .load()
-            .await
-            .unwrap()
+        Dataset::open(uri).await.unwrap()
     }
 
     /// A clone starts its history from the source's: stable row ids and every
@@ -2537,6 +2523,18 @@ pub mod tests {
         let clone = clone_table(&mut source, &clone_uri, is_shallow).await;
         assert!(clone.manifest.uses_stable_row_ids());
         assert!(has_frag_reuse_flag(&clone));
+        assert_eq!(
+            clone
+                .config()
+                .get(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY),
+            source
+                .config()
+                .get(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY)
+        );
+        assert_eq!(
+            external_details_file(&frag_reuse_entry(&clone).await).is_some(),
+            matches!(storage, Storage::External)
+        );
         assert_same_history(&history(&clone).await, &history(&source).await);
         assert_translations_hold(&before, &clone_uri).await;
     }

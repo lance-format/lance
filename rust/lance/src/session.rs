@@ -16,7 +16,6 @@ use lance_io::spill::{LocalSpillStore, SpillStore};
 
 pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
 
-use crate::index::frag_reuse::FRAG_REUSE_INLINE_DETAILS_LIMIT;
 use crate::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
@@ -108,11 +107,6 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
-
-    /// Fragment reuse index details larger than this many bytes are written
-    /// to an external file instead of inline in the manifest. Only tests
-    /// change it, to reach external storage without a large history.
-    pub(crate) frag_reuse_inline_details_limit: usize,
 }
 
 impl DeepSizeOf for Session {
@@ -185,7 +179,6 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
-            frag_reuse_inline_details_limit: FRAG_REUSE_INLINE_DETAILS_LIMIT,
         }
     }
 
@@ -214,7 +207,6 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
-            frag_reuse_inline_details_limit: FRAG_REUSE_INLINE_DETAILS_LIMIT,
         }
     }
 
@@ -395,7 +387,6 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
-            frag_reuse_inline_details_limit: FRAG_REUSE_INLINE_DETAILS_LIMIT,
         }
     }
 

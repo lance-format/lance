@@ -19,6 +19,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
+use lance_table::system_index::frag_reuse::frag_reuse_inline_details_limit;
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
@@ -882,7 +883,7 @@ pub(crate) async fn build_frag_reuse_index_metadata(
     let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
     let proto = if new_index_details_proto.encoded_len()
-        > dataset.session.frag_reuse_inline_details_limit
+        > frag_reuse_inline_details_limit(&dataset.manifest.config)?
     {
         let file_path = dataset
             .indices_dir()
@@ -2032,7 +2033,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         dataset.indices_dir(),
         index_id,
         content,
-        dataset.session.frag_reuse_inline_details_limit,
+        frag_reuse_inline_details_limit(&dataset.manifest.config)?,
     )
     .await?;
 
@@ -2088,10 +2089,6 @@ async fn encode_tagged_frag_reuse_details(
         Ok(encode_length_delimited_field(1, &content))
     }
 }
-
-/// Details above this size spill to an external `details.binpb` file, unless
-/// the session sets another limit.
-pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
 
 /// `InlineContent.Transition.stable_partition` (proto field 4).
 const STABLE_PARTITION_FIELD: u32 = 4;
@@ -2307,7 +2304,6 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     base_remap: CloneBaseRemap,
     target_store: &ObjectStore,
     target_base: &Path,
-    inline_details_limit: usize,
 ) -> lance_core::Result<(IndexMetadata, Option<Path>)> {
     let details = entry
         .index_details
@@ -2405,6 +2401,8 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
 
     let index_id = Uuid::new_v4();
     let target_indices_dir = target_base.clone().join(crate::dataset::INDICES_DIR);
+    // The clone inherits the source's table config.
+    let inline_details_limit = frag_reuse_inline_details_limit(&source_manifest.config)?;
     let spilled = (relocated.len() > inline_details_limit).then(|| {
         target_indices_dir
             .clone()

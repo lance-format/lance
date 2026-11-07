@@ -594,13 +594,6 @@ pub async fn commit_padding_reuse_history(
     entry
 }
 
-/// A session that stores any non-empty fragment reuse history externally.
-pub fn external_frag_reuse_session() -> Arc<crate::session::Session> {
-    let mut session = crate::session::Session::default();
-    session.frag_reuse_inline_details_limit = 0;
-    Arc::new(session)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
