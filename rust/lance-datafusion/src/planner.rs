@@ -463,7 +463,7 @@ impl Planner {
         leaves
     }
 
-    fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
+    pub(crate) fn balanced_binary_expr(mut exprs: VecDeque<Expr>, op: Operator) -> Result<Expr> {
         if exprs.is_empty() {
             return Err(Error::invalid_input("Binary expression has no operands"));
         }

@@ -9,6 +9,8 @@
 //! a float. [`unwrap_widening_casts`] handles a column that is explicitly cast
 //! to a float first, and keeps the rounding of that cast.
 
+use std::collections::VecDeque;
+
 use arrow_buffer::i256;
 use arrow_schema::{DECIMAL128_MAX_PRECISION, DataType};
 use datafusion::common::DFSchema;
@@ -22,6 +24,7 @@ use lance_core::datatypes::Schema;
 
 use crate::expr::safe_coerce_scalar;
 use crate::logical_expr::{coerce_expr, resolve_column_type};
+use crate::planner::Planner;
 
 /// Inclusive lower and exclusive upper bounds, exactly representable as f64.
 fn int_bounds(data_type: &DataType) -> Option<(f64, f64)> {
@@ -574,25 +577,38 @@ fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
             list,
             negated,
         }) => {
-            // An `OR` of the values' equalities, which the simplifier gathers
-            // back into a list where they compare the column with one value.
+            // Values that one integer (or NULL) rounds to stay a list; values
+            // that a range of integers rounds to are OR'd as a balanced tree.
+            // A list can be long, and one `OR` level per value would overflow
+            // the stack in the passes that walk the filter afterwards.
             let widened = widened_column(expr, schema)?;
             let never = comparison_expr(
                 widened.column,
                 &widened.column_type,
                 Comparison::Constant(false),
             )?;
-            let matches = list
-                .iter()
-                .map(|item| {
-                    let value = widened_literal(item, &widened.float_type)?;
-                    unwrap_comparison(&widened, Operator::Eq, value)
-                })
-                .collect::<Option<Vec<_>>>()?
-                .into_iter()
-                .filter(|matches| *matches != never)
-                .reduce(Expr::or)
-                .unwrap_or(never);
+            let mut values = Vec::new();
+            let mut ranges = VecDeque::new();
+            for item in list {
+                let value = widened_literal(item, &widened.float_type)?;
+                match unwrap_comparison(&widened, Operator::Eq, value)? {
+                    matches if matches == never => {}
+                    Expr::BinaryExpr(BinaryExpr {
+                        op: Operator::Eq,
+                        right,
+                        ..
+                    }) => values.push(*right),
+                    matches => ranges.push_back(matches),
+                }
+            }
+            if !values.is_empty() {
+                ranges.push_front(widened.column.clone().in_list(values, false));
+            }
+            let matches = if ranges.is_empty() {
+                never
+            } else {
+                Planner::balanced_binary_expr(ranges, Operator::Or).ok()?
+            };
             Some(if *negated { !matches } else { matches })
         }
         _ => None,
@@ -1166,6 +1182,49 @@ mod tests {
         let expected = expected.map(Some).into_iter().chain([None]);
         let expected = expected.collect::<BooleanArray>();
         assert_eq!(result, expected, "{sql}");
+    }
+
+    /// A long list must not become one `OR` level per value, which overflows
+    /// the stack in the passes that walk the filter afterwards.
+    #[rstest]
+    #[case::values("CAST(i AS double)", "double", 0.0)]
+    // From 2^24 on, Float32 values are 2 apart and some round from three
+    // integers, so the list mixes single values and intervals.
+    #[case::intervals("CAST(i AS float)", "float", 16777216.0)]
+    fn widened_long_lists_stay_shallow(
+        #[case] operand: &str,
+        #[case] sql_type: &str,
+        #[case] start: f64,
+        #[values("IN", "NOT IN")] membership: &str,
+    ) {
+        let values = (0..10_000)
+            .map(|n| start + 2.0 * f64::from(n))
+            .collect::<Vec<_>>();
+        let list = values
+            .iter()
+            .map(|value| float_sql(*value, sql_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("{operand} {membership} ({list})");
+        let column = integers(&DataType::Int64);
+        let batch = RecordBatch::try_from_iter([("i", column.clone())]).unwrap();
+        let (expr, result) = evaluate(&batch, &sql);
+        assert!(!has_cast(&expr), "{operand} {membership} kept a cast");
+        let expected = column
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .iter()
+            .map(|x| {
+                x.map(|x| {
+                    let rounded = if sql_type == "float" {
+                        f64::from(x as f32)
+                    } else {
+                        x as f64
+                    };
+                    values.contains(&rounded) != (membership == "NOT IN")
+                })
+            })
+            .collect::<BooleanArray>();
+        assert_eq!(result, expected, "{operand} {membership}");
     }
 
     #[rstest]
