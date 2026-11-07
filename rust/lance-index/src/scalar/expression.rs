@@ -32,6 +32,10 @@ use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
 
+/// Most index searches that `a = b` / `a != b` between two predicates may
+/// expand to; see [`visit_predicate_equality`].
+const MAX_PREDICATE_EQUALITY_SEARCHES: usize = 64;
+
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
 /// When a user wants to filter the data returned by a scan we may be able to use
@@ -1988,6 +1992,26 @@ impl ScalarIndexExpr {
             Self::Query(search) => search.needs_recheck,
         }
     }
+
+    /// Whether every search in the expression reports rows where its predicate
+    /// is NULL, see [`AnyQuery::reports_null_rows`].
+    pub fn reports_null_rows(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.reports_null_rows(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.reports_null_rows() && rhs.reports_null_rows()
+            }
+            Self::Query(search) => search.query.reports_null_rows(),
+        }
+    }
+
+    fn search_count(&self) -> usize {
+        match self {
+            Self::Not(inner) => inner.search_count(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.search_count() + rhs.search_count(),
+            Self::Query(_) => 1,
+        }
+    }
 }
 
 // Extract a column from the expression, if it is a column, or None
@@ -2377,8 +2401,12 @@ fn visit_or(
 /// `(left AND right) OR (NOT left AND NOT right)` or
 /// `(left AND NOT right) OR (NOT left AND right)`.
 ///
-/// Both expansions are NULL exactly where either side is, as the comparison is.
-/// Each side is searched once per case.
+/// Both expansions are NULL exactly where either side is, as the comparison is,
+/// provided each side reports its NULL rows; negating a side turns the rows it
+/// reports as FALSE into TRUE.
+///
+/// Each side appears twice, so nested comparisons double the plan per level;
+/// past [`MAX_PREDICATE_EQUALITY_SEARCHES`] the comparison is left to the scan.
 fn visit_predicate_equality(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
@@ -2390,6 +2418,16 @@ fn visit_predicate_equality(
     ) else {
         return Ok(None);
     };
+    let (Some(left_query), Some(right_query)) = (&left.scalar_query, &right.scalar_query) else {
+        return Ok(None);
+    };
+    let searches = 2 * (left_query.search_count() + right_query.search_count());
+    if searches > MAX_PREDICATE_EQUALITY_SEARCHES
+        || !left_query.reports_null_rows()
+        || !right_query.reports_null_rows()
+    {
+        return Ok(None);
+    }
     let (Some(not_left), Some(not_right)) = (left.clone().maybe_not(), right.clone().maybe_not())
     else {
         return Ok(None);
@@ -5688,6 +5726,29 @@ mod tests {
         let needs_recheck = filter.contains("!=") || filter.contains("DISTINCT");
         let indexed = parse_int64_filter(filter, &int64_index_info("BTree", needs_recheck));
         assert_eq!(indexed.scalar_query, None, "{filter}");
+    }
+
+    /// Each side of a predicate equality appears twice in its plan, so a chain
+    /// of them grows exponentially until the budget declines it.
+    #[rstest]
+    #[case::one(2, Some(4))]
+    #[case::three(4, Some(22))]
+    #[case::four(5, Some(46))]
+    #[case::five(6, None)]
+    #[case::seventeen(18, None)]
+    fn test_nested_predicate_equality_is_bounded(
+        #[case] comparisons: usize,
+        #[case] expected_searches: Option<usize>,
+    ) {
+        let filter = (1..comparisons).fold("x > 0".to_string(), |lhs, rhs| {
+            format!("({lhs}) = (x > {rhs})")
+        });
+        let indexed = parse_int64_filter(&filter, &int64_index_info("BTree", false));
+        let searches = indexed
+            .scalar_query
+            .as_ref()
+            .map(ScalarIndexExpr::search_count);
+        assert_eq!(searches, expected_searches, "{filter}");
     }
 
     /// An index whose NULL search needs a recheck still narrows `IS TRUE` down,

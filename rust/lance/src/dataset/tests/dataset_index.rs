@@ -645,6 +645,57 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
     }
 }
 
+/// The FM index reports NULL text rows as FALSE rather than NULL, so a
+/// comparison between FM predicates must not be planned by negating them.
+#[tokio::test]
+async fn test_fm_predicate_equality_keeps_null_rows_null() {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("t", Utf8, [None, Some("needle"), Some("other")]),
+        ("u", Utf8, [Some("other"), Some("needle"), Some("needle")]),
+        ("id", UInt64, [0, 1, 2])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+    for column in ["t", "u"] {
+        dataset
+            .create_index(&[column], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+    }
+
+    // Row 0 is NULL in both comparisons, so neither keeps it.
+    for (predicate, expected) in [
+        ("contains(t, 'needle') = contains(u, 'needle')", vec![1]),
+        ("contains(t, 'needle') != contains(u, 'needle')", vec![2]),
+    ] {
+        for use_scalar_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_scalar_index)
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{predicate}, use_scalar_index={use_scalar_index}"
+            );
+        }
+    }
+}
+
 async fn create_bad_file(data_storage_version: LanceFileVersion) -> Result<Dataset> {
     let test_uri = TempStrDir::default();
 
