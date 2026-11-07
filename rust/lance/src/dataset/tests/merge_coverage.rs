@@ -1118,6 +1118,80 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
     index.fragment_bitmap.unwrap()
 }
 
+/// Older inputs and a later segment directly covering their output can index
+/// different values. Every contribution must be fresh before keeping coverage.
+#[rstest]
+#[case::partial_unchanged(false, false, false)]
+#[case::partial_updated(false, true, false)]
+#[case::partial_restored(false, true, true)]
+#[case::full_unchanged(true, false, false)]
+#[case::full_updated(true, true, false)]
+#[case::full_restored(true, true, true)]
+#[tokio::test]
+async fn test_merge_validates_every_output_contribution(
+    #[case] full_input_coverage: bool,
+    #[case] update: bool,
+    #[case] restore: bool,
+) {
+    let mut dataset = val_table("memory://", 3).await;
+    let sources = if full_input_coverage {
+        vec![0, 1, 2]
+    } else {
+        vec![0, 2]
+    };
+    let mut staged = stage_val(&dataset, sources).await;
+    let outputs = compact_into_two(&mut dataset, &[0, 1]).await;
+    let directly_covered = outputs[1] as u32;
+    let before_update = dataset.manifest.version;
+
+    if update {
+        let patch =
+            arrow_array::record_batch!(("id", Int32, [ROWS]), ("val", Int32, [999])).unwrap();
+        let schema = patch.schema();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns);
+        let (updated, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+            .await
+            .unwrap();
+        dataset = Arc::unwrap_or_clone(updated);
+    } else {
+        // Date the direct segment later without changing its indexed data.
+        dataset.update_config([("touched", "true")]).await.unwrap();
+    }
+    assert_eq!(
+        fragment_ids(&dataset),
+        vec![2, outputs[0] as u32, directly_covered]
+    );
+    staged.extend(stage_val(&dataset, vec![directly_covered]).await);
+
+    if restore {
+        dataset = dataset.checkout_version(before_update).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let mut covered = RoaringBitmap::from_iter([2]);
+    if full_input_coverage {
+        covered.insert(outputs[0] as u32);
+    }
+    if !update {
+        covered.insert(directly_covered);
+    }
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val >= 120").await;
+    assert_val_lookups_match_scan(&dataset, [60, 120, 999], "").await;
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
+}
+
 /// A group compacted while an overlay lands on a fragment outside it: only the
 /// overlaid fragment is left out of the merged coverage, and lookups stay
 /// right even though the merged index is stamped current, past the overlay.
