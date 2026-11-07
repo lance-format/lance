@@ -140,11 +140,11 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
-    /// Runtime-only: the quantizer (with its prepared targets) and the query
-    /// scratch pool, built once per cache entry rather than per reconstruction.
-    /// Both are excluded from the CacheCodec wire format.
+    /// Runtime-only: the quantizer with its prepared targets, shared by every
+    /// reconstruction of this entry. It is filled before the entry enters the
+    /// cache (on export and on decode) so the cache charges for it, and is
+    /// excluded from the CacheCodec wire format.
     pub(crate) quantizer: Arc<OnceLock<Option<Quantizer>>>,
-    pub(crate) scratch_pool: Arc<OnceLock<Arc<QueryScratchPool>>>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -685,12 +685,19 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .get()
                 .map(|quantizer| quantizer.deep_size_of_children(context))
                 .unwrap_or_default()
-            + self
-                .scratch_pool
-                .get()
-                .map(|pool| pool.deep_size_of_children(context))
-                .unwrap_or_default()
     }
+}
+
+/// The quantizer a cached state keeps for its partition storages: only the
+/// storages that retain one (PQ) get it built, so an RQ entry does not carry
+/// its rotation matrices for nothing.
+fn retained_quantizer<Q: Quantization>(
+    metadata: &<Q::Storage as QuantizerStorage>::Metadata,
+    distance_type: DistanceType,
+) -> Option<Quantizer> {
+    Q::retain_quantizer_for_partition_storage()
+        .then(|| Q::from_metadata(metadata, distance_type).ok())
+        .flatten()
 }
 
 /// Object-safe interface for a type-erased `IvfIndexState<Q>`.
@@ -785,6 +792,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
             if !extra_bytes.is_empty() {
                 metadata.parse_buffer(extra_bytes)?;
             }
+            let quantizer = retained_quantizer::<Q>(&metadata, distance_type);
             Ok(IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
                 index_file_path: header.index_file_path,
                 uuid: header.uuid,
@@ -798,8 +806,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
-                quantizer: Arc::new(OnceLock::new()),
-                scratch_pool: Arc::new(OnceLock::new()),
+                quantizer: Arc::new(OnceLock::from(quantizer)),
             })))
         }
 
@@ -2753,8 +2760,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
-            quantizer: Arc::new(OnceLock::new()),
-            scratch_pool: Arc::new(OnceLock::from(self.scratch_pool.clone())),
+            quantizer: Arc::new(OnceLock::from(retained_quantizer::<Q>(
+                self.storage.metadata(),
+                self.distance_type,
+            ))),
         }))
     }
 }
@@ -4013,16 +4022,10 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
-    // Only a storage that keeps its quantizer (PQ) needs it built; the others
-    // would just hold it in the cache for nothing.
-    let quantizer = Q::retain_quantizer_for_partition_storage()
-        .then(|| {
-            state
-                .quantizer
-                .get_or_init(|| Q::from_metadata(&state.metadata, state.distance_type).ok())
-                .clone()
-        })
-        .flatten();
+    let quantizer = state
+        .quantizer
+        .get_or_init(|| retained_quantizer::<Q>(&state.metadata, state.distance_type))
+        .clone();
     let make_storage = |legacy| {
         IvfQuantizationStorage::from_cached_with_quantizer(
             aux_reader,
@@ -4070,10 +4073,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // to the opening query's stats.
     storage.load_resident_store(io_stats.as_ref()).await?;
     let rq_search_cache = IVFIndex::<S, Q>::rq_search_cache_from_state(state, &storage)?;
-    let scratch_pool = state
-        .scratch_pool
-        .get_or_init(|| Arc::new(IVFIndex::<S, Q>::query_scratch_pool(&state.ivf, &storage)))
-        .clone();
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
         .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
@@ -4092,7 +4091,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         rq_search_cache,
         origin_latency,
     )?;
-    index.scratch_pool = scratch_pool;
     index.rabit_scan = rabit_scan;
     Ok(Arc::new(index))
 }
