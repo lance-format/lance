@@ -627,13 +627,10 @@ pub(crate) async fn fresh_fragments(
             }
             for new in &group.new_frags {
                 let new = new.id as u32;
-                // A covered fragment whose entries could not be dated stays
-                // out, though another covered fragment's sources lead to the
-                // group that produced it: those vouch for none of the group's
-                // other inputs.
-                if following.get(&new) != Some(&None) {
-                    following.insert(new, committed.filter(|_| !stale));
-                }
+                // A directly covered output keeps its segment's build version:
+                // it may have indexed different data after this compaction.
+                // An output whose entries could not be dated also stays out.
+                following.entry(new).or_insert(committed.filter(|_| !stale));
             }
         }
     }

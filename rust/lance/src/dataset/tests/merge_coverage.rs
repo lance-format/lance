@@ -1118,6 +1118,59 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
     index.fragment_bitmap.unwrap()
 }
 
+/// A later segment directly covers an output of an earlier segment's rewrite
+/// group. Its build version must survive tracing that group's other sources.
+#[rstest]
+#[case::updated(false)]
+#[case::restored(true)]
+#[tokio::test]
+async fn test_merge_preserves_direct_segment_build_version(#[case] restore: bool) {
+    let mut dataset = val_table("memory://", 3).await;
+    let mut staged = stage_val(&dataset, vec![0, 2]).await;
+    let outputs = compact_into_two(&mut dataset, &[0, 1]).await;
+    let directly_covered = outputs[1] as u32;
+    let before_update = dataset.manifest.version;
+
+    let patch = arrow_array::record_batch!(("id", Int32, [ROWS]), ("val", Int32, [999])).unwrap();
+    let schema = patch.schema();
+    let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+    merge
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns);
+    let (updated, _) = merge
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+        .await
+        .unwrap();
+    let mut dataset = Arc::unwrap_or_clone(updated);
+    assert_eq!(
+        fragment_ids(&dataset),
+        vec![2, outputs[0] as u32, directly_covered]
+    );
+    staged.extend(stage_val(&dataset, vec![directly_covered]).await);
+
+    if restore {
+        dataset = dataset.checkout_version(before_update).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let covered = if restore {
+        RoaringBitmap::from_iter([2])
+    } else {
+        RoaringBitmap::from_iter([2, directly_covered])
+    };
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val >= 120").await;
+    assert_val_lookups_match_scan(&dataset, [60, 120, 999], "").await;
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
+}
+
 /// A group compacted while an overlay lands on a fragment outside it: only the
 /// overlaid fragment is left out of the merged coverage, and lookups stay
 /// right even though the merged index is stamped current, past the overlay.
