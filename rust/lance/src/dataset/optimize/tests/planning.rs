@@ -702,85 +702,87 @@ async fn grouped_compaction_applies_ordinary_candidacy_inside_the_group() {
     assert_eq!(after[1].physical_rows, Some(300));
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1_300);
 }
-/// An index this build cannot read holds back only the sources a group
-/// actually selects: a covered member that candidacy leaves alone does not
-/// stop the rest of its group; covered members that would be rewritten
-/// refuse the plan before anything is written; a covered member split off
-/// on its own at the index boundary is left out, not rewritten.
-#[tokio::test]
-async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only() {
+/// Three fragments of 100, 200 and 1,000 rows, in that order.
+async fn three_sizes(uri: &str) -> Dataset {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let mut dataset: Option<Dataset> = None;
+    for (start, rows) in [(0_i64, 100_i64), (100, 200), (300, 1_000)] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+        )
+        .unwrap();
+        dataset = Some(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                uri,
+                Some(WriteParams {
+                    mode: if dataset.is_none() {
+                        WriteMode::Create
+                    } else {
+                        WriteMode::Append
+                    },
+                    max_rows_per_file: 1_000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    dataset.unwrap()
+}
+
+/// Replace a readable index on `column` with one of a type this build has no
+/// reader for, covering exactly `covered`.
+async fn plant_unreadable_index(dataset: &mut Dataset, column: &str, covered: &[u32]) {
     use crate::dataset::transaction::{Operation, Transaction};
     use lance_table::format::IndexMetadata;
 
-    async fn three_sizes(uri: &str) -> Dataset {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let mut dataset: Option<Dataset> = None;
-        for (start, rows) in [(0_i64, 100_i64), (100, 200), (300, 1_000)] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
-            )
-            .unwrap();
-            dataset = Some(
-                Dataset::write(
-                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-                    uri,
-                    Some(WriteParams {
-                        mode: if dataset.is_none() {
-                            WriteMode::Create
-                        } else {
-                            WriteMode::Append
-                        },
-                        max_rows_per_file: 1_000,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap(),
-            );
-        }
-        dataset.unwrap()
-    }
+    dataset
+        .create_index(
+            &[column],
+            IndexType::BTree,
+            Some("a_idx".to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    let current = dataset.load_indices().await.unwrap();
+    let unknown = IndexMetadata {
+        index_details: Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
+            value: Vec::new(),
+        })),
+        fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
+        ..current[0].clone()
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![unknown],
+                    removed_indices: current.to_vec(),
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+}
 
-    // Replace a readable index with one of a type this build has no
-    // reader for, covering exactly `covered`.
-    async fn plant_unreadable_index(dataset: &mut Dataset, covered: &[u32]) {
-        dataset
-            .create_index(
-                &["a"],
-                IndexType::BTree,
-                Some("a_idx".to_string()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
-                false,
-            )
-            .await
-            .unwrap();
-        let current = dataset.load_indices().await.unwrap();
-        let unknown = IndexMetadata {
-            index_details: Some(Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
-                value: Vec::new(),
-            })),
-            fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
-            ..current[0].clone()
-        };
-        dataset
-            .apply_commit(
-                Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![unknown],
-                        removed_indices: current.to_vec(),
-                    },
-                    None,
-                ),
-                &Default::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-    }
-
+/// A source covered by an index this build cannot read is held out of every
+/// task instead of refusing the plan: a covered member candidacy leaves alone
+/// never mattered, a covered member that would have been rewritten is simply
+/// left uncompacted, and the members on either side of the gap are not planned
+/// together. Stable row ids and deferred remapping hold nothing back: there an
+/// index's coverage is fixed up from manifest metadata alone.
+#[tokio::test]
+async fn grouped_compaction_holds_unreadable_coverage_back_from_its_group() {
     let planner = DefaultCompactionPlanner::new(CompactionOptions {
         target_rows_per_fragment: 1_000,
         ..Default::default()
@@ -792,7 +794,7 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[2]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2]).await;
     let plan = planner
         .plan_groups(
             &dataset,
@@ -814,16 +816,14 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
         vec![0, 1]
     );
 
-    // Covered members that would be rewritten: refused before anything is
-    // written. Both small members are covered so they stay one bin; a
-    // covered member on its own is split off at the index boundary and,
-    // being a lone neighbours-only fragment, is simply left out.
+    // Both members of the group are covered: the plan is empty rather than
+    // refused, and nothing is written.
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[0, 1]).await;
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
     let version = dataset.manifest.version;
-    let error = planner
+    let plan = planner
         .plan_groups(
             &dataset,
             vec![CompactionGroup {
@@ -833,16 +833,12 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
             }],
         )
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("fragment 0") && error.to_string().contains("a_idx"),
-        "{error}"
-    );
+        .unwrap();
+    assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
     assert_eq!(dataset.manifest.version, version);
 
-    // A covered task the source budget drops must not refuse the valid
-    // tasks kept before it: two groups of two small members each, the
-    // second group covered, a budget of two sources keeps only the first.
+    // The source budget drops the first group's task; the second group is
+    // fully covered and contributes nothing either way.
     let dir = TempStrDir::default();
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
@@ -861,7 +857,7 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
     .await
     .unwrap();
     let four = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[2, 3]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2, 3]).await;
     let groups = vec![
         CompactionGroup {
             fragments: four[..2].to_vec(),
@@ -893,14 +889,24 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
-    // Without the budget the covered group is selected, and refused.
-    let error = planner.plan_groups(&dataset, groups).await.unwrap_err();
-    assert!(error.to_string().contains("fragment 2"), "{error}");
+    // Without the budget the covered group is still held back, not refused.
+    let plan = planner.plan_groups(&dataset, groups).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 
+    // One of two small members is covered: the other is left alone rather
+    // than compacted on its own.
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[0]).await;
+    plant_unreadable_index(&mut dataset, "a", &[0]).await;
     let plan = planner
         .plan_groups(
             &dataset,
@@ -913,6 +919,186 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
         .await
         .unwrap();
     assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
+
+    // Stable row ids hold nothing back: coverage is fixed up from manifest
+    // metadata alone, so the same coverage plans both small members.
+    let mut dataset = stable_row_id_dataset("memory://", 3).await;
+    let before = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "i", &[0, 1]).await;
+    let plan = planner
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: before[..2].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    // Deferred remapping holds nothing back either: it remaps no index here.
+    let dir = TempStrDir::default();
+    let mut dataset = three_sizes(&dir).await;
+    let before = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        defer_index_remap: true,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![CompactionGroup {
+            fragments: before[..2].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+/// A group fully covered by an index this build cannot read does not stop an
+/// uncovered group: the plan holds exactly the uncovered group's task, and
+/// none of the covered group's fragments appear anywhere in it. The held-back
+/// index name and fragment ids go to the info log, which this test cannot
+/// observe without a log capture crate, so only the plan shape is asserted.
+#[tokio::test]
+async fn grouped_compaction_plans_an_uncovered_group_beside_a_covered_one() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..400))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let four = dataset.manifest.fragments.as_ref().clone();
+    // Group A is fragments 0 and 1, both covered; group B is 2 and 3.
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![
+            CompactionGroup {
+                fragments: four[..2].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+            CompactionGroup {
+                fragments: four[2..].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert!(
+        !plan
+            .tasks
+            .iter()
+            .flat_map(|task| &task.fragments)
+            .any(|fragment| fragment.id == 0 || fragment.id == 1),
+        "{:?}",
+        plan.tasks
+    );
+}
+/// A group that mixes covered and uncovered sources still plans the uncovered
+/// ones: the covered member is held back and the two uncovered members on one
+/// side of it compact together.
+#[tokio::test]
+async fn grouped_compaction_plans_the_uncovered_sources_of_a_mixed_group() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..400))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![CompactionGroup {
+            fragments: four.clone(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    // Fragment 0 is left alone: the gap at 1 terminates its run, and a lone
+    // neighbours-only fragment is not rewritten.
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
 }
 /// With stable row ids and deferred remapping, a non-adjacent group's
 /// moves are recorded in the fragment reuse index and every row keeps its

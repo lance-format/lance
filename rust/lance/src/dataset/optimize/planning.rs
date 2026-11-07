@@ -768,11 +768,12 @@ impl DefaultCompactionPlanner {
     ///
     /// Refused before anything is written: an empty group, a group out of
     /// ascending id order, a fragment absent from the dataset, named by two
-    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`]; and
-    /// a selected source covered by an index this build cannot read (a member
-    /// left alone may be covered). `max_source_fragments`,
-    /// `max_source_rows` and `max_source_bytes` bound the selected tasks, in
-    /// group order.
+    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
+    /// A member covered by an index this build cannot read is held back
+    /// instead of refusing the plan: it is left out of every task, logged by
+    /// index name, and the rest of its group and every other group still plan.
+    /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
+    /// the selected tasks, in group order.
     pub async fn plan_groups(
         &self,
         dataset: &Dataset,
@@ -848,16 +849,40 @@ impl DefaultCompactionPlanner {
                 }
             }
         }
-        // Coverage by an index this build cannot read is checked against the
-        // sources actually selected below, not against every named member:
-        // a member ordinary candidacy leaves alone is never rewritten, so its
-        // coverage is no obstacle to the rest of its group.
+        // A fragment covered by an index this build cannot read is held out of
+        // every group before binning, exactly as ordinary planning folds that
+        // coverage into its exclusions: the index is left addressing the rows
+        // it already addresses, and the other members of the same group and of
+        // every other group still plan. Group boundaries are untouched.
         let unreadable_coverage =
             if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
                 unremappable_index_coverage(dataset).await?
             } else {
                 Vec::new()
             };
+        let held_back =
+            unreadable_coverage
+                .iter()
+                .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
+                    covered |= fragments;
+                    covered
+                });
+        if !held_back.is_empty() {
+            // Otherwise a group that plans nothing looks like a group with
+            // nothing to do. Named index by index, since a caller that chose
+            // the groups needs to know which of its sources went unplanned.
+            for (index, covered) in &unreadable_coverage {
+                if !covered.is_empty() {
+                    log::info!(
+                        "holding fragment(s) {:?} back from grouped compaction: they are covered \
+                         by index {:?}, which this build cannot read, and so cannot be remapped \
+                         here",
+                        covered.iter().collect::<Vec<_>>(),
+                        index,
+                    );
+                }
+            }
+        }
 
         let schema_field_ids = dataset
             .schema()
@@ -900,9 +925,11 @@ impl DefaultCompactionPlanner {
         let mut bins = Vec::with_capacity(groups.len());
         let mut properties = Vec::with_capacity(groups.len());
         for (group_index, group) in groups.into_iter().enumerate() {
-            let mut fragments = Vec::new();
-            let mut candidacy = Vec::new();
-            let mut row_counts = Vec::new();
+            // A held-back member terminates the run it interrupts rather than
+            // letting the candidates on either side of the gap be planned
+            // together, the same adjacency ordinary planning's exclusions keep.
+            let mut runs: Vec<CandidateBin> = Vec::new();
+            let mut current: Option<CandidateBin> = None;
             for _ in &group.fragments {
                 let Some((measured_group, fragment, metrics)) = measured.pop() else {
                     return Err(Error::internal(
@@ -910,23 +937,32 @@ impl DefaultCompactionPlanner {
                     ));
                 };
                 debug_assert_eq!(measured_group, group_index);
+                if u32::try_from(fragment.id).is_ok_and(|id| held_back.contains(id)) {
+                    runs.extend(current.take());
+                    continue;
+                }
                 if let Some(reason) =
                     self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
                 {
-                    candidacy.push(reason);
-                    row_counts.push(metrics.num_rows());
-                    fragments.push(fragment);
+                    let current = current.get_or_insert_with(|| CandidateBin {
+                        fragments: Vec::new(),
+                        pos_range: 0..0,
+                        candidacy: Vec::new(),
+                        row_counts: Vec::new(),
+                        indices: Vec::new(),
+                    });
+                    current.candidacy.push(reason);
+                    current.row_counts.push(metrics.num_rows());
+                    current.fragments.push(fragment);
+                    current.pos_range.end = current.fragments.len();
                 }
             }
-            let len = fragments.len();
-            bins.push(CandidateBin {
-                fragments,
-                pos_range: 0..len,
-                candidacy,
-                row_counts,
-                indices: Vec::new(),
-            });
-            properties.push((group.output_clustering_id, group.output_metadata));
+            runs.extend(current);
+            let properties_of_group = (group.output_clustering_id, group.output_metadata);
+            for run in runs {
+                bins.push(run);
+                properties.push(properties_of_group.clone());
+            }
         }
 
         // Split each group at index boundaries exactly as ordinary planning
@@ -1034,9 +1070,10 @@ impl DefaultCompactionPlanner {
         };
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        // Checked last, over the tasks the budgets kept: only a source that
-        // will really be rewritten can refuse the plan, the same set the
-        // commit's safeguard checks.
+        // Defensive last check over the tasks the budgets kept: the hold-back
+        // above already keeps every covered fragment out of every task, so
+        // this should never fire, and the commit's safeguard checks the same
+        // set again.
         for (index, covered) in &unreadable_coverage {
             if let Some(fragment) = tasks
                 .iter()
