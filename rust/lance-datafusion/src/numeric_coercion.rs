@@ -381,6 +381,10 @@ pub fn rewrite(expr: &Expr, schema: &Schema) -> Option<Expr> {
     }
 }
 
+/// Most integers rounding to one value of an `IN` list that are listed
+/// individually: the spacing of doubles up to 2^57, or of Float32 up to 2^28.
+const MAX_LISTED_INTEGERS: i128 = 16;
+
 /// A column read through a cast that widens it to a float type.
 struct WidenedColumn<'a> {
     column: &'a Expr,
@@ -432,18 +436,25 @@ fn widened_literal(expr: &Expr, float_type: &DataType) -> Option<Option<f64>> {
     }
 }
 
-/// `column op value` for an integer column compared after rounding it to
-/// `float_type`.
+/// The integers `start..stop` of the column's domain `min..end`.
+struct SelectedIntegers {
+    start: i128,
+    stop: i128,
+    min: i128,
+    end: i128,
+}
+
+/// The integers whose rounding to `float_type` compares `op` `value`.
 ///
 /// Rounding is monotonic, so the integers that round above `value` (or not
 /// below it) are a suffix of the domain, found by binary search, and each
 /// comparison selects one interval. Comparisons against NaN are false, which
 /// places NaN above every integer, as float filters do regardless of its sign.
-fn unwrap_integer(widened: &WidenedColumn, op: Operator, value: f64) -> Option<Expr> {
+fn select_integers(widened: &WidenedColumn, op: Operator, value: f64) -> Option<SelectedIntegers> {
     let WidenedColumn {
-        column,
         column_type,
         float_type,
+        ..
     } = widened;
     let bits = column_type.primitive_width()? as u32 * 8;
     let (min, end) = if column_type.is_signed_integer() {
@@ -475,12 +486,34 @@ fn unwrap_integer(widened: &WidenedColumn, op: Operator, value: f64) -> Option<E
         Operator::Eq => (first(false), first(true)),
         _ => return None,
     };
+    Some(SelectedIntegers {
+        start,
+        stop,
+        min,
+        end,
+    })
+}
+
+fn integer_literal(value: i128, column_type: &DataType) -> Option<ScalarValue> {
+    let value = match i64::try_from(value) {
+        Ok(value) => ScalarValue::Int64(Some(value)),
+        Err(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+    };
+    value.cast_to(column_type).ok()
+}
+
+/// `column op value` for an integer column compared after rounding it to
+/// `float_type`, as one interval of integers.
+fn unwrap_integer(widened: &WidenedColumn, op: Operator, value: f64) -> Option<Expr> {
+    let (column, column_type) = (widened.column, &widened.column_type);
+    let SelectedIntegers {
+        start,
+        stop,
+        min,
+        end,
+    } = select_integers(widened, op, value)?;
     let compare = |op, value: i128| {
-        let value = match i64::try_from(value) {
-            Ok(value) => ScalarValue::Int64(Some(value)),
-            Err(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
-        };
-        let value = value.cast_to(column_type).ok()?;
+        let value = integer_literal(value, column_type)?;
         comparison_expr(column, column_type, Comparison::Literal(op, value))
     };
     let constant = |value| comparison_expr(column, column_type, Comparison::Constant(value));
@@ -577,10 +610,11 @@ fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
             list,
             negated,
         }) => {
-            // Values that one integer (or NULL) rounds to stay a list; values
-            // that a range of integers rounds to are OR'd as a balanced tree.
-            // A list can be long, and one `OR` level per value would overflow
-            // the stack in the passes that walk the filter afterwards.
+            // The integers that round to a value (and NULL) stay one list,
+            // which evaluates as a single hash lookup. Only values that more
+            // than `MAX_LISTED_INTEGERS` round to become ranges, OR'd as a
+            // balanced tree: a list can be long, and one `OR` level per value
+            // would overflow the stack in the passes that walk the filter.
             let widened = widened_column(expr, schema)?;
             let never = comparison_expr(
                 widened.column,
@@ -591,6 +625,15 @@ fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
             let mut ranges = VecDeque::new();
             for item in list {
                 let value = widened_literal(item, &widened.float_type)?;
+                if let (true, Some(value)) = (widened.column_type.is_integer(), value) {
+                    let selected = select_integers(&widened, Operator::Eq, value)?;
+                    if selected.stop - selected.start <= MAX_LISTED_INTEGERS {
+                        for integer in selected.start..selected.stop {
+                            values.push(lit(integer_literal(integer, &widened.column_type)?));
+                        }
+                        continue;
+                    }
+                }
                 match unwrap_comparison(&widened, Operator::Eq, value)? {
                     matches if matches == never => {}
                     Expr::BinaryExpr(BinaryExpr {
@@ -1157,8 +1200,8 @@ mod tests {
     #[case::in_list("CAST(i AS double) IN (1.0, 2.5, 9007199254740994.0)", [false, true, false, false, true])]
     #[case::not_in_list("TRY_CAST(i AS double) NOT IN (1.0, 2.5)", [true, false, true, true, true])]
     #[case::never_in("CAST(i AS double) IN (2.5, CAST('NaN' AS double))", [false; 5])]
-    // 2^53 is the rounding of two integers, which a list cannot name with one
-    // value.
+    // 2^53 is the rounding of 2^53 and 2^53 + 1, neither of which is in the
+    // batch.
     #[case::rounded_in_list("CAST(i AS double) IN (9007199254740992.0)", [false; 5])]
     #[case::in_list_rounded("CAST(i AS double) IN (1.0, 9007199254740992.0)", [false, true, false, false, false])]
     #[case::not_in_list_rounded("CAST(i AS double) NOT IN (1.0, 9007199254740992.0)", [true, false, true, true, true])]
@@ -1187,18 +1230,21 @@ mod tests {
     /// A long list must not become one `OR` level per value, which overflows
     /// the stack in the passes that walk the filter afterwards.
     #[rstest]
-    #[case::values("CAST(i AS double)", "double", 0.0)]
+    #[case::values("CAST(i AS double)", "double", 0.0, 2.0)]
     // From 2^24 on, Float32 values are 2 apart and some round from three
-    // integers, so the list mixes single values and intervals.
-    #[case::intervals("CAST(i AS float)", "float", 16777216.0)]
+    // integers, which are listed.
+    #[case::listed_intervals("CAST(i AS float)", "float", 16777216.0, 2.0)]
+    // Near 2^62, doubles are 1024 apart, so each value is a range.
+    #[case::ranges("CAST(i AS double)", "double", 4611686018427387904.0, 2048.0)]
     fn widened_long_lists_stay_shallow(
         #[case] operand: &str,
         #[case] sql_type: &str,
         #[case] start: f64,
+        #[case] step: f64,
         #[values("IN", "NOT IN")] membership: &str,
     ) {
         let values = (0..10_000)
-            .map(|n| start + 2.0 * f64::from(n))
+            .map(|n| start + step * f64::from(n))
             .collect::<Vec<_>>();
         let list = values
             .iter()
@@ -1241,6 +1287,17 @@ mod tests {
     #[case::in_list(
         "CAST(i AS double) IN (1.0, 2.5, 3.0, 4.0, 5.0)",
         col("i").in_list(vec![lit(1_i64), lit(3_i64), lit(4_i64), lit(5_i64)], false)
+    )]
+    // The integers rounding to each value are listed: 2^53 is the rounding of
+    // two integers, and 2^53 + 4 of three.
+    #[case::rounded_in_list(
+        "CAST(i AS double) IN (9007199254740992.0, 9007199254740996.0)",
+        col("i").in_list(
+            [0, 1, 3, 4, 5]
+                .map(|offset| lit(9007199254740992_i64 + offset))
+                .to_vec(),
+            false
+        )
     )]
     #[case::never("CAST(u AS double) < -1.0", col("u").lt(lit(0_u8)))]
     #[case::always("CAST(u AS float) <= CAST(255.0 AS float)", col("u").gt_eq(lit(0_u8)))]
