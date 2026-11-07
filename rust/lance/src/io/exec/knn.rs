@@ -6042,8 +6042,8 @@ mod tests {
         struct MaskLoader(RowAddrMask);
         #[async_trait::async_trait]
         impl FilterLoader for MaskLoader {
-            async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
-                Ok(Arc::new(self.0))
+            async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+                Ok(self.0)
             }
         }
         let owning = |fragments: &[u32]| {

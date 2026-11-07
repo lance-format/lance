@@ -79,8 +79,11 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
-        let filter =
-            filter.map(|filter| async move { filter.load().await }.in_current_span().boxed());
+        let filter = filter.map(|filter| {
+            async move { filter.load_shared().await }
+                .in_current_span()
+                .boxed()
+        });
         Self::new_with_filter_future(dataset, indices, filter)
     }
 

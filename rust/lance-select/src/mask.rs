@@ -1494,8 +1494,15 @@ mod tests {
         let other_allow = RowAddrMask::from_allowed(full);
         let block = RowAddrMask::from_block(rows(&[2, 1 << 32 | 5, 3 << 32 | 1]));
         let other_block = RowAddrMask::from_block(rows(&[3, 4 << 32 | 9]));
+        // Fragment 2 ends up empty and fragment 1 meets a whole fragment.
+        let mut disjoint = RowAddrTreeMap::new();
+        disjoint.insert_fragment(1);
+        disjoint.insert(2 << 32 | 1);
+        let disjoint = RowAddrMask::from_allowed(disjoint);
         for (a, b) in [
             (&allow, &other_allow),
+            (&allow, &disjoint),
+            (&disjoint, &allow),
             (&allow, &block),
             (&block, &allow),
             (&block, &other_block),

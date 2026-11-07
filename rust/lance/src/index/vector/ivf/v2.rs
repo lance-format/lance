@@ -4013,10 +4013,16 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
-    let quantizer = state
-        .quantizer
-        .get_or_init(|| Q::from_metadata(&state.metadata, state.distance_type).ok())
-        .clone();
+    // Only a storage that keeps its quantizer (PQ) needs it built; the others
+    // would just hold it in the cache for nothing.
+    let quantizer = Q::retain_quantizer_for_partition_storage()
+        .then(|| {
+            state
+                .quantizer
+                .get_or_init(|| Q::from_metadata(&state.metadata, state.distance_type).ok())
+                .clone()
+        })
+        .flatten();
     let make_storage = |legacy| {
         IvfQuantizationStorage::from_cached_with_quantizer(
             aux_reader,

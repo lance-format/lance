@@ -12,7 +12,13 @@ use lance_select::{RowAddrMask, RowAddrTreeMap};
 /// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>>;
+    async fn load(self: Box<Self>) -> Result<RowAddrMask>;
+
+    /// [`Self::load`] behind an `Arc`. A loader that already holds a shared
+    /// mask overrides this to hand it out without a copy.
+    async fn load_shared(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+        Ok(Arc::new(self.load().await?))
+    }
 }
 
 /// Filter out row ids that we know are not relevant to the query.
