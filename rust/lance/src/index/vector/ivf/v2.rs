@@ -244,6 +244,89 @@ pub(crate) static GLOBAL_TOPK_CHUNK_BYTES: LazyLock<usize> = LazyLock::new(|| {
 /// expressible as a partition count: at most the prepare window plus two chunks.
 pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 
+/// Fewest prepared-partition bytes one concurrent scoring task of a single
+/// query is given when a global-top-k chunk is split across CPU tasks.
+///
+/// A chunk is scored on one CPU thread unless it holds at least twice this
+/// many bytes, so small partitions keep the single-dispatch latency (#6475),
+/// while a query over large partitions, which otherwise ran on one core
+/// however idle the pool was, spreads its chunk over up to the compute CPUs.
+/// Each task costs a dispatch (~100µs); 1 MiB of PQ8 codes scores in several
+/// times that. Override with the `LANCE_IVF_SCORING_TASK_BYTES` environment
+/// variable.
+pub(crate) const DEFAULT_SCORING_TASK_BYTES: usize = 1024 * 1024;
+
+pub(crate) static SCORING_TASK_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    let task_bytes = std::env::var("LANCE_IVF_SCORING_TASK_BYTES")
+        .map(|value| {
+            value
+                .parse()
+                .expect("failed to parse LANCE_IVF_SCORING_TASK_BYTES")
+        })
+        .unwrap_or(DEFAULT_SCORING_TASK_BYTES);
+    assert!(
+        task_bytes > 0,
+        "LANCE_IVF_SCORING_TASK_BYTES must be greater than 0, got {task_bytes}"
+    );
+    task_bytes
+});
+
+/// Chunks scored by more than one task, for tests to observe the split.
+#[cfg(test)]
+pub(crate) static PARALLEL_SCORING_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+
+/// Split `0..bytes.len()` into at most `max_tasks` contiguous ranges of
+/// roughly equal bytes, each holding at least `min_task_bytes` where the
+/// total allows; a total below `2 * min_task_bytes` is one range.
+fn balanced_byte_ranges(
+    bytes: &[usize],
+    min_task_bytes: usize,
+    max_tasks: usize,
+) -> Vec<Range<usize>> {
+    let total: usize = bytes.iter().sum();
+    let task_count = (total / min_task_bytes.max(1))
+        .clamp(1, max_tasks.max(1))
+        .min(bytes.len().max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut sum = 0;
+    for (index, &size) in bytes.iter().enumerate() {
+        sum += size;
+        // Close the range before the next partition overshoots the target, so
+        // a partition below the target still gets a task of its own.
+        let next = bytes.get(index + 1).copied();
+        if ranges.len() + 1 < task_count && next.is_some_and(|next| sum + next > target) {
+            ranges.push(start..index + 1);
+            start = index + 1;
+            sum = 0;
+        }
+    }
+    if start < bytes.len() {
+        ranges.push(start..bytes.len());
+    }
+    ranges
+}
+
+/// Merges per-task top-k heaps into the `capacity` best entries, into the
+/// first heap.
+fn merge_topk_heaps(
+    heaps: Vec<BinaryHeap<OrderedNode<u64>>>,
+    capacity: usize,
+) -> BinaryHeap<OrderedNode<u64>> {
+    let mut heaps = heaps.into_iter();
+    let mut merged = heaps.next().unwrap_or_default();
+    for node in heaps.flatten() {
+        if merged.len() < capacity {
+            merged.push(node);
+        } else if merged.peek().is_some_and(|worst| worst.dist > node.dist) {
+            merged.pop();
+            merged.push(node);
+        }
+    }
+    merged
+}
+
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
 const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
@@ -1512,6 +1595,67 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         } else {
             Some(Ok(chunk))
         }
+    }
+
+    /// Scores `chunk` into `heap` on the CPU pool. A chunk holding enough
+    /// prepared bytes (see [`SCORING_TASK_BYTES`]) is split over concurrent
+    /// tasks with heaps of their own, merged back to the `heap_capacity` best.
+    #[allow(clippy::too_many_arguments)]
+    async fn score_chunk(
+        chunk: Vec<PreparedPartitionSearch<S, Q>>,
+        heap: BinaryHeap<OrderedNode<u64>>,
+        heap_capacity: usize,
+        max_tasks: usize,
+        use_query_residual: bool,
+        use_residual_scratch: bool,
+        scratch_pool: Arc<QueryScratchPool>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<BinaryHeap<OrderedNode<u64>>> {
+        let bytes: Vec<usize> = chunk
+            .iter()
+            .map(|prepared| prepared.part_entry.size_bytes())
+            .collect();
+        let ranges = balanced_byte_ranges(&bytes, *SCORING_TASK_BYTES, max_tasks);
+        if ranges.is_empty() {
+            return Ok(heap);
+        }
+        #[cfg(test)]
+        if ranges.len() > 1 {
+            PARALLEL_SCORING_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut chunk = chunk.into_iter();
+        let mut first_heap = Some(heap);
+        let tasks: Vec<_> = ranges
+            .into_iter()
+            .map(|range| {
+                let group: Vec<_> = chunk.by_ref().take(range.len()).collect();
+                let mut heap = first_heap
+                    .take()
+                    .unwrap_or_else(|| BinaryHeap::with_capacity(heap_capacity));
+                let scratch_pool = scratch_pool.clone();
+                let metrics = metrics.clone();
+                let queued = Instant::now();
+                spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
+                    metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                    scratch_pool.with_scratch(|scratch| -> Result<()> {
+                        for prepared in group {
+                            Self::accumulate_prepared_partition_search(
+                                use_query_residual,
+                                use_residual_scratch,
+                                prepared,
+                                &mut heap,
+                                scratch,
+                                metrics.as_ref(),
+                            )?;
+                        }
+                        Ok(())
+                    })?;
+                    Ok(heap)
+                })
+            })
+            .collect();
+        let heaps = futures::future::try_join_all(tasks).await?;
+        Ok(merge_topk_heaps(heaps, heap_capacity))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3323,32 +3467,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // Score each chunk on the CPU pool while the next chunk prepares (the
             // same overlap `search_partitions_batch` uses): `spawn_cpu` starts the
             // scoring immediately and the async task, never a CPU-pool thread, does
-            // the waiting (#7642). The heap is threaded through each dispatch so
-            // scoring stays sequential, and a scored chunk is dropped before the
+            // the waiting (#7642). The heap is threaded through each chunk so
+            // chunks are scored in order, and a scored chunk is dropped before the
             // next one is scored.
+            // An explicit single worker (#6475) keeps every chunk on one task and
+            // an explicit count caps the split; automatic (0) and -1 use the pool.
+            let max_scoring_tasks = match query.query_parallelism {
+                1 => 1,
+                n if n >= 2 => (n as usize).min(get_num_compute_intensive_cpus()),
+                _ => get_num_compute_intensive_cpus(),
+            };
             let mut pending = Self::next_scoring_chunk(&mut prepared, chunk_bytes).await;
             while let Some(chunk) = pending {
                 let chunk = chunk?;
-                let search_metrics = metrics.clone();
-                let scratch_pool = self.scratch_pool.clone();
-                let queued = Instant::now();
-                let score = spawn_cpu(move || -> Result<BinaryHeap<OrderedNode<u64>>> {
-                    search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                    scratch_pool.with_scratch(|scratch| -> Result<()> {
-                        for prepared in chunk {
-                            Self::accumulate_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                &mut heap,
-                                scratch,
-                                search_metrics.as_ref(),
-                            )?;
-                        }
-                        Ok(())
-                    })?;
-                    Ok(heap)
-                });
+                let score = Self::score_chunk(
+                    chunk,
+                    heap,
+                    heap_capacity,
+                    max_scoring_tasks,
+                    use_query_residual,
+                    use_residual_scratch,
+                    self.scratch_pool.clone(),
+                    metrics.clone(),
+                );
                 let (scored, next) =
                     futures::join!(score, Self::next_scoring_chunk(&mut prepared, chunk_bytes));
                 heap = scored?;
