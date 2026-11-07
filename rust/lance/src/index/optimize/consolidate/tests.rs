@@ -346,7 +346,7 @@ async fn incomplete_or_duplicate_results_cannot_replace_sources() {
     )
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("cover a fragment twice"));
+    assert!(error.to_string().contains("replace a source twice"));
     assert_eq!(segments(&dataset).await, before);
     commit_optimize_indices(&mut dataset, results, &options)
         .await

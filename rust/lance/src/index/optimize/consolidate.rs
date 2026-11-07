@@ -405,7 +405,7 @@ pub(super) async fn validate_commit(
         let covered = actual.entry(result.segment.name.clone()).or_default();
         if !covered.is_disjoint(&coverage) {
             return Err(Error::invalid_input(
-                "consolidation results cover a fragment twice",
+                "consolidation results replace a source twice",
             ));
         }
         *covered |= &coverage;
