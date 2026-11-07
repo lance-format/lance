@@ -548,6 +548,7 @@ async fn stage_data_replacement(
         dataset.manifest.version,
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(fragment as u64, replacement)],
+            data_change: true,
         },
     )))
 }

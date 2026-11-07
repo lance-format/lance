@@ -215,11 +215,9 @@ mod tests {
         // Force one oversized task so its writer must roll over while the
         // same task-wide source-ID map remains in use.
         let task = crate::dataset::optimize::CompactionTask {
-            task: crate::dataset::optimize::TaskData {
-                fragments: dataset.manifest.fragments.as_ref().clone(),
-                output_clustering_id: None,
-                output_metadata: HashMap::new(),
-            },
+            task: crate::dataset::optimize::TaskData::rewrite_fragments(
+                dataset.manifest.fragments.as_ref().clone(),
+            ),
             read_version: dataset.manifest.version,
             options: options.clone(),
         };
@@ -367,11 +365,9 @@ mod tests {
             ..Default::default()
         };
         let task = crate::dataset::optimize::CompactionTask {
-            task: crate::dataset::optimize::TaskData {
-                fragments: dataset.manifest.fragments.as_ref().clone(),
-                output_clustering_id: None,
-                output_metadata: HashMap::new(),
-            },
+            task: crate::dataset::optimize::TaskData::rewrite_fragments(
+                dataset.manifest.fragments.as_ref().clone(),
+            ),
             read_version: dataset.manifest.version,
             options: options.clone(),
         };

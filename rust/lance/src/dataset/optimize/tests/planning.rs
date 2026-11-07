@@ -326,6 +326,7 @@ async fn compaction_outputs_carry_the_tasks_output_properties() {
     let fragments = dataset.manifest.fragments.as_ref().clone();
     let task = TaskData {
         fragments: fragments.clone(),
+        kind: CompactionTaskKind::RewriteFragments,
         output_clustering_id: Some(1),
         output_metadata: [("k".to_string(), "v".to_string())].into(),
     };
@@ -336,6 +337,7 @@ async fn compaction_outputs_carry_the_tasks_output_properties() {
     assert_eq!(back, task);
     let plain = TaskData {
         fragments,
+        kind: CompactionTaskKind::RewriteFragments,
         output_clustering_id: None,
         output_metadata: HashMap::new(),
     };
@@ -382,6 +384,7 @@ async fn compaction_outputs_carry_the_tasks_output_properties() {
         Cow::Borrowed(&reopened),
         TaskData {
             fragments: reopened.manifest.fragments.as_ref().clone(),
+            kind: CompactionTaskKind::RewriteFragments,
             output_clustering_id: Some(1),
             output_metadata: HashMap::new(),
         },

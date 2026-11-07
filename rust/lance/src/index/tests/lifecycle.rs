@@ -3012,6 +3012,7 @@ async fn test_committing_a_compaction_an_unsupported_index_covers_is_rejected() 
                 .filter(|fragment| covered.contains(fragment.id as u32))
                 .cloned()
                 .collect(),
+            kind: Default::default(),
             output_clustering_id: None,
             output_metadata: Default::default(),
         }],

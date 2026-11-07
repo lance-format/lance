@@ -5,7 +5,7 @@ use super::{BlockingDataset, NATIVE_DATASET};
 use crate::block_on;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::utils::build_compaction_options;
+use crate::utils::{apply_repack_options, build_compaction_options};
 use chrono::{DateTime, Utc};
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValue};
@@ -199,7 +199,19 @@ fn convert_java_compaction_options_to_rust(
         )?
         .l()?;
 
-    build_compaction_options(
+    let max_data_files_per_fragment = env
+        .call_method(
+            &java_options,
+            "getMaxDataFilesPerFragment",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+    let scope = env
+        .call_method(&java_options, "getScope", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    let mut options = build_compaction_options(
         env,
         &target_rows_per_fragment,
         &max_rows_per_group,
@@ -218,7 +230,9 @@ fn convert_java_compaction_options_to_rust(
         &excluded_fragment_ids,
         &data_storage_version,
         config,
-    )
+    )?;
+    apply_repack_options(env, &mut options, &max_data_files_per_fragment, &scope)?;
+    Ok(options)
 }
 
 #[unsafe(no_mangle)]

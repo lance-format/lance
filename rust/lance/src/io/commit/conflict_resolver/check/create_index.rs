@@ -191,6 +191,11 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Merge {
                     fragments, schema, ..
                 } => {
+                    // It may have rewritten a column in place before a later
+                    // replacement moved it.
+                    if let Some(read) = self.read_fragments.as_mut() {
+                        read.moved_files = None;
+                    }
                     if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
@@ -230,7 +235,7 @@ impl<'a> TransactionRebase<'a> {
                     if let (Some(lineage), Some(live), Some(read_fragments)) = (
                         self.current_lineage.as_ref(),
                         self.current_live.as_ref(),
-                        self.read_fragments.as_ref(),
+                        self.read_fragments.as_ref().map(|read| &read.fragments),
                     ) {
                         let mut rewrites = Transaction::rewritten_physical_columns(
                             &other_transaction.operation,
@@ -435,7 +440,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                 }
                 Operation::UpdateConfig { .. } => Ok(()),
-                Operation::DataReplacement { replacements } => {
+                // Values that only moved to new files leave what the index
+                // was built from unchanged.
+                Operation::DataReplacement {
+                    replacements,
+                    data_change: false,
+                } => {
+                    if let Some(moved) = self
+                        .read_fragments
+                        .as_mut()
+                        .and_then(|read| read.moved_files.as_mut())
+                    {
+                        for replacement in replacements {
+                            moved
+                                .entry(replacement.0)
+                                .or_default()
+                                .insert(replacement.1.path.clone());
+                        }
+                    }
+                    Ok(())
+                }
+                Operation::DataReplacement { replacements, .. } => {
                     // A data replacement only conflicts if it is updating a field the
                     // index depends on -- whether keyed on or merely carried (see
                     // `IndexMetadata::dependency_fields`).

@@ -5,9 +5,13 @@
 //!
 //! An `add_columns` call that writes data files writes one per fragment, so a
 //! wide fragment can end up split across many small files. These stats, from
-//! [`Dataset::column_layout_stats`], make that layout visible. No
-//! built-in planner reads them; a custom
-//! [`CompactionPlanner`](crate::dataset::optimize::CompactionPlanner) can.
+//! [`Dataset::column_layout_stats`], make that layout visible. The default
+//! compaction planner considers repacking a fragment's columns when its
+//! `live_file_count` is above
+//! [`max_data_files_per_fragment`](crate::dataset::optimize::CompactionOptions::max_data_files_per_fragment);
+//! a custom
+//! [`CompactionPlanner`](crate::dataset::optimize::CompactionPlanner) can use
+//! the rest.
 
 use std::collections::HashSet;
 
@@ -34,7 +38,7 @@ pub struct FragmentColumnLayoutStats {
     /// least one.
     pub fields_per_file: Vec<usize>,
     /// The share of the fragment's field slots that hold no live data: slots
-    /// tombstoned by a column update, or left by a dropped column.
+    /// tombstoned by a column update or repack, or left by a dropped column.
     /// The reserved ids of spilled row lineage are not counted on either side.
     /// A fragment rewrite reclaims these slots.
     pub dead_slot_ratio: f64,

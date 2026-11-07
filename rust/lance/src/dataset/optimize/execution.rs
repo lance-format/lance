@@ -13,8 +13,10 @@ use std::sync::Arc;
 
 use super::binary_copy;
 use super::planning::{
-    CompactionMode, CompactionOptions, CompactionPlan, TaskData, has_eager_remappable_index,
+    CompactionMode, CompactionOptions, CompactionPlan, CompactionTaskKind, TaskData,
+    has_eager_remappable_index,
 };
+use super::repack;
 use crate::Dataset;
 use crate::dataset::blob::{BlobV2BatchRewritePlan, SidecarRewrite};
 use crate::dataset::index::load_indices_for_remapping;
@@ -54,8 +56,9 @@ pub struct CompactionMetrics {
     pub fragments_added: usize,
     /// The number of files that have been removed, including deletion files.
     pub files_removed: usize,
-    /// The number of files that have been added, which is always equal to the
-    /// number of fragments.
+    /// The number of files that have been added: each new fragment's data
+    /// files and deletion file for a fragment rewrite, and each new data file
+    /// for a column repack.
     pub files_added: usize,
 }
 
@@ -322,7 +325,10 @@ pub struct CompactionTask {
 }
 
 impl CompactionTask {
-    /// Run the compaction task and return the result.
+    /// Run the compaction task and return the result. A
+    /// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments
+    /// into new ones; a [`CompactionTaskKind::RepackColumns`] task writes new
+    /// data files for its fragment.
     ///
     /// This result should be later passed to
     /// [`crate::dataset::optimize::commit_compaction`] to commit
@@ -337,7 +343,14 @@ impl CompactionTask {
         } else {
             Cow::Owned(dataset.checkout_version(self.read_version).await?)
         };
-        rewrite_files(dataset, self.task.clone(), &self.options).await
+        match &self.task.kind {
+            CompactionTaskKind::RewriteFragments => {
+                rewrite_files(dataset, self.task.clone(), &self.options).await
+            }
+            CompactionTaskKind::RepackColumns { files } => {
+                repack::execute_repack(&dataset, &self.task, files, &self.options).await
+            }
+        }
     }
 }
 
@@ -390,6 +403,19 @@ pub struct RewriteResult {
     ///   deferred index remap post-processing, or (2) used with reserved
     ///   fragment IDs to build old-to-new mappings.
     pub row_addrs: Option<Vec<u8>>,
+    /// The new data files of a [`CompactionTaskKind::RepackColumns`] task.
+    /// `new_fragments` and `original_fragments` are then empty.
+    #[serde(default)]
+    pub repacked_files: Option<RepackedFiles>,
+}
+
+/// The data files a column repack wrote for one fragment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepackedFiles {
+    /// The fragment the files belong to.
+    pub fragment_id: u64,
+    /// The new files.
+    pub files: Vec<lance_table::format::DataFile>,
 }
 
 /// The old row addresses of `fragments`' live (non-deleted) rows, reconstructed
@@ -512,6 +538,7 @@ pub(super) async fn rewrite_files(
             read_version: dataset.manifest.version,
             original_fragments: task.fragments,
             row_addrs: None,
+            repacked_files: None,
         });
     }
 
@@ -884,6 +911,7 @@ pub(super) async fn rewrite_files(
         read_version: dataset.manifest.version,
         original_fragments: fragments,
         row_addrs,
+        repacked_files: None,
     })
 }
 

@@ -97,7 +97,10 @@ async fn commit(dataset: &Dataset, replacements: Vec<DataReplacementGroup>) -> R
     let read_version = dataset.manifest.version;
     Dataset::commit(
         WriteDestination::Dataset(Arc::new(dataset.clone())),
-        Operation::DataReplacement { replacements },
+        Operation::DataReplacement {
+            replacements,
+            data_change: true,
+        },
         Some(read_version),
         None,
         None,

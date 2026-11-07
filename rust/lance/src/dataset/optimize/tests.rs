@@ -14,6 +14,7 @@ mod index_remap;
 mod lineage;
 mod overlays;
 mod planning;
+mod repack;
 mod vector;
 use self::remapping::RemappedIndex;
 use super::*;

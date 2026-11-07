@@ -203,7 +203,9 @@ fn modified_fragment_ids(operation: &Operation) -> Box<dyn Iterator<Item = u64> 
                 .map(|f| f.id)
                 .chain(removed_fragment_ids.iter().copied()),
         ),
-        Operation::DataReplacement { replacements } => Box::new(replacements.iter().map(|r| r.0)),
+        Operation::DataReplacement { replacements, .. } => {
+            Box::new(replacements.iter().map(|r| r.0))
+        }
         Operation::DataOverlay { groups } => Box::new(groups.iter().map(|g| g.fragment_id)),
         Operation::Unknown { .. } => unimplemented!("modified_fragment_ids for {operation}"),
     }

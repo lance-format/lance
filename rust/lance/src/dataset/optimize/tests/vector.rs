@@ -589,11 +589,8 @@ async fn test_compaction_merges_only_connected_segments(
     };
     let mut completed = Vec::new();
     for group in groups {
-        let task = TaskData {
-            fragments: group.iter().map(|idx| fragments[*idx].clone()).collect(),
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        };
+        let task =
+            TaskData::rewrite_fragments(group.iter().map(|idx| fragments[*idx].clone()).collect());
         completed.push(
             rewrite_files(Cow::Borrowed(&dataset), task, &options)
                 .await
@@ -834,22 +831,14 @@ async fn test_stale_vector_segment_merge_requires_replan() {
     };
     let stale_merged_result = rewrite_files(
         Cow::Borrowed(&stale),
-        TaskData {
-            fragments: vec![fragments[1].clone(), fragments[2].clone()],
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        },
+        TaskData::rewrite_fragments(vec![fragments[1].clone(), fragments[2].clone()]),
         &options,
     )
     .await
     .unwrap();
     let disjoint_result = rewrite_files(
         Cow::Borrowed(&stale),
-        TaskData {
-            fragments: vec![fragments[0].clone()],
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        },
+        TaskData::rewrite_fragments(vec![fragments[0].clone()]),
         &options,
     )
     .await
@@ -1486,6 +1475,116 @@ async fn test_read_ivf_rq_index_v3_with_defer_index_remap() {
         checked += 1;
     }
     assert!(checked > 0, "expected to check at least one stored vector");
+}
+/// A column repack moves no row, so a vector index over the repacked
+/// column keeps its uuid and coverage and answers the same.
+#[tokio::test]
+async fn repack_columns_preserves_vector_index() {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float32Type, Int32Type};
+    use lance_datagen::Dimension;
+
+    const DIM: u32 = 32;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vec",
+            lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+        )
+        .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(256))
+        .await
+        .unwrap();
+    // A backfill gives each fragment a second file, so a limit of 1 repacks.
+    dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "ext".into(),
+                "id + 1".into(),
+            )]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        small_ivf(),
+        PQBuildParams {
+            max_iters: 2,
+            num_sub_vectors: 2,
+            ..Default::default()
+        },
+    );
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let before = dataset
+        .load_index_by_name("vec_idx")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A query taken from a real row, and its answer before the rewrite.
+    let query = {
+        let mut scanner = dataset.scan();
+        scanner.project(&["vec"]).unwrap();
+        scanner.limit(Some(1), None).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch["vec"]
+            .as_fixed_size_list()
+            .value(0)
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec()
+    };
+    let knn_before = vector_knn_ids(&dataset, &query, 5).await;
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            max_data_files_per_fragment: Some(1),
+            scope: CompactionScope::RepackColumns,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    for fragment in dataset.get_fragments() {
+        assert_eq!(fragment.metadata().files.len(), 1, "vec is moved");
+    }
+
+    let after = dataset
+        .load_index_by_name("vec_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.uuid, before.uuid, "index must not be rebuilt");
+    assert_eq!(
+        after.fragment_bitmap, before.fragment_bitmap,
+        "index coverage must be unchanged"
+    );
+    assert_eq!(
+        vector_knn_ids(&dataset, &query, 5).await,
+        knn_before,
+        "search must return the same rows"
+    );
+    let qa = PrimitiveArray::<Float32Type>::from_iter_values(query.iter().copied());
+    let mut scanner = dataset.scan();
+    scanner.nearest("vec", &qa, 5).unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("ANNIvfPartition"),
+        "the search uses the index: {plan}"
+    );
+    dataset.validate().await.unwrap();
 }
 #[tokio::test]
 async fn test_ivf_flat_defer_compaction_with_deletions() {

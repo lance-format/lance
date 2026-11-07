@@ -526,6 +526,7 @@ mod tests {
                         None,
                     ),
                 )],
+                data_change: true,
             },
             "data_overlay" => Operation::DataOverlay {
                 groups: vec![DataOverlayGroup {

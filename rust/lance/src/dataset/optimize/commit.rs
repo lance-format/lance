@@ -9,7 +9,7 @@
 //! `optimize/tests/commit.rs` and `optimize/tests/frag_reuse.rs`.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -122,12 +122,54 @@ async fn records_stable_row_id_moves(
 /// some of the tasks have been committed, the remainder of the tasks will not
 /// be able to be committed and should be considered cancelled.
 ///
+/// Fragment rewrites commit as one `Operation::Rewrite`, then column repacks
+/// as one `Operation::DataReplacement` that moves values without changing
+/// them. A fragment in both kinds of result is rejected before either commit.
+/// If the repack commit fails, the rewrite stays committed and `dataset` is
+/// left at its version; plan again rather than passing the same results back,
+/// since their rewrites would conflict with the commit that landed.
+///
 /// With stable row IDs, tasks that recorded their row-address moves (see
 /// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not
-/// set `defer_index_remap`; either all tasks or none must have recorded them. Tasks
-/// that did not record commit without recording, also on a table that has a fragment
-/// reuse index.
+/// set `defer_index_remap`; either all rewrite results or none must have
+/// recorded them. Results that did not record commit without recording, also
+/// on a table that has a fragment reuse index.
 pub async fn commit_compaction(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+) -> Result<CompactionMetrics> {
+    let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
+        .into_iter()
+        .partition(|task| task.repacked_files.is_some());
+    // Otherwise the rewrite commits and the repack then conflicts with it.
+    let rewritten: HashSet<u64> = rewrites
+        .iter()
+        .flat_map(|task| task.original_fragments.iter().map(|fragment| fragment.id))
+        .collect();
+    if let Some(fragment_id) = repacks
+        .iter()
+        .filter_map(|task| task.repacked_files.as_ref())
+        .map(|repacked| repacked.fragment_id)
+        .find(|id| rewritten.contains(id))
+    {
+        return Err(Error::invalid_input(format!(
+            "fragment {fragment_id} is both rewritten and repacked by this compaction; \
+             a plan may put a fragment in one kind of task only"
+        )));
+    }
+    // Commit the repacks from the handle as passed in, as the rewrites are.
+    // The one the rewrite commit moved on is past the planned version, so
+    // committing from it would load that version's manifest back, and it may
+    // have been expired since.
+    let repack_base = dataset.clone();
+    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
+    metrics += super::repack::commit_repacked_files(dataset, repack_base, repacks, options).await?;
+    Ok(metrics)
+}
+
+async fn commit_rewrites(
     dataset: &mut Dataset,
     completed_tasks: Vec<RewriteResult>,
     remap_options: Arc<dyn IndexRemapperOptions>,
