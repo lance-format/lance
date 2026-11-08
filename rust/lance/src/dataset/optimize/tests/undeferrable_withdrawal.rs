@@ -188,9 +188,44 @@ async fn run_deferred_compaction(
     committed
 }
 
-/// A brute-force k-nearest-neighbour answer over the table's current
-/// contents, computed without any index.
-async fn brute_force_knn(dataset: &Dataset, query: &Float32Array, k: usize) -> Vec<i32> {
+/// Asserts a KNN answer against brute force, tolerating ties at the cutoff:
+/// `k` rows come back, none of them further than the k-th smallest
+/// brute-force distance, and every row strictly closer than that cutoff is
+/// present. Which of several equidistant rows fills the last slot is not
+/// pinned by anything, so it is not asserted.
+async fn assert_knn_matches_brute_force(
+    dataset: &Dataset,
+    query: &Float32Array,
+    k: usize,
+    rows: &[i32],
+    plan: &str,
+) {
+    let scored = brute_force_distances(dataset, query).await;
+    assert_eq!(rows.len(), k, "a KNN query must return k rows: {plan}");
+    let cutoff = scored[k - 1].0;
+    let by_row: HashMap<i32, f32> = scored.iter().map(|(d, i)| (*i, *d)).collect();
+    for row in rows {
+        let distance = by_row[row];
+        assert!(
+            distance <= cutoff,
+            "row {row} at distance {distance} is beyond the k-th brute-force \
+             distance {cutoff}: {plan}"
+        );
+    }
+    for (distance, row) in &scored {
+        if *distance < cutoff {
+            assert!(
+                rows.contains(row),
+                "row {row} at distance {distance} is strictly closer than the \
+                 cutoff {cutoff} and must be returned: {plan}"
+            );
+        }
+    }
+}
+
+/// Every live row's squared distance to `query`, ascending, computed without
+/// any index.
+async fn brute_force_distances(dataset: &Dataset, query: &Float32Array) -> Vec<(f32, i32)> {
     let batch = dataset
         .scan()
         .project(&["i", "vector"])
@@ -214,11 +249,7 @@ async fn brute_force_knn(dataset: &Dataset, query: &Float32Array, k: usize) -> V
         })
         .collect();
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut rows: Vec<i32> = scored.into_iter().take(k).map(|(_, i)| i).collect();
-    // Compared as a set: the top-k membership is what a withdrawal can
-    // change, while the order of equal distances is not pinned.
-    rows.sort_unstable();
-    rows
+    scored
 }
 
 /// A query vector taken from a row that is live after the compaction.
@@ -360,15 +391,25 @@ async fn deferred_compaction_withdraws_the_undeferrable_segments_coverage() {
         );
     }
 
-    // Queries: the withdrawn column answers exactly, by scanning.
+    // Queries: the withdrawn column answers exactly, by scanning. Asserted
+    // positively on the flat node the fallback produces, with the
+    // substring check on the index node kept as a secondary guard.
     let query = query_vector(&dataset, 7).await;
-    let expected = brute_force_knn(&dataset, &query, 5).await;
     let (rows, plan) = indexed_knn(&dataset, &query, 5).await;
-    assert_eq!(rows, expected, "{plan}");
+    assert!(
+        plan.contains("KNNVectorDistance"),
+        "a withdrawn segment must be answered by the flat distance scan: \
+         {plan}"
+    );
     assert!(
         !plan.contains("ANN"),
         "a withdrawn segment must not serve an ANN query: {plan}"
     );
+    assert!(
+        derived_coverage(&dataset, VECTOR_INDEX).await.is_empty(),
+        "the withdrawn segment's effective coverage must be empty"
+    );
+    assert_knn_matches_brute_force(&dataset, &query, 5, &rows, &plan).await;
     // And the BTree lookup stays correct and indexed.
     let mut lookup = dataset.scan();
     lookup.filter("i = 7").unwrap().project(&["i"]).unwrap();
@@ -931,7 +972,7 @@ async fn a_create_index_at_the_current_version_withdraws_nothing() {
 /// sources, which is what the forward commit order sees.
 #[tokio::test]
 async fn a_partial_rewrite_costs_a_rebased_index_only_the_rewritten_source() {
-    partial_rewrite_coverage().await;
+    Box::pin(partial_rewrite_coverage()).await;
 }
 
 /// Builds a tagged table, stages an undeferrable segment over every live
@@ -1366,9 +1407,8 @@ async fn assert_query_exactness(dataset: &Dataset) {
     };
     assert_eq!(live, deduped, "the scan returned a duplicate row");
     let query = query_vector(dataset, live[live.len() / 2]).await;
-    let expected = brute_force_knn(dataset, &query, 5).await;
     let (rows, plan) = indexed_knn(dataset, &query, 5).await;
-    assert_eq!(rows, expected, "{plan}");
+    assert_knn_matches_brute_force(dataset, &query, 5, &rows, &plan).await;
 }
 
 /// An object store whose reads of one suffix can be failed on demand, so a

@@ -2094,22 +2094,32 @@ pub(crate) async fn undeferrable_segments_covering<'a>(
     live: &RoaringBitmap,
 ) -> lance_core::Result<Vec<Uuid>> {
     let mut undeferrable = Vec::new();
+    let mut reaches: HashMap<u32, bool> = HashMap::new();
     for index in segments {
         if lance_table::system_index::is_system_index(index) {
             continue;
         }
+        // Unknown coverage is not a candidate, as in every earlier revision
+        // of this selector: the established reader rules already refuse such
+        // a segment (no derived coverage, scan fallback), so there is nothing
+        // a withdrawal could protect, and the selector never guesses which
+        // fragments an absent bitmap would have named.
         let Some(bitmap) = index.fragment_bitmap.as_ref() else {
             continue;
         };
         let covers_directly = !bitmap.is_disjoint(fragments);
         let covers_through_history = !covers_directly
             && (bitmap - live).iter().any(|source| {
-                match lineage.and_then(|lineage| lineage.destinations_of(source)) {
-                    Some(destinations) => destinations
-                        .iter()
-                        .any(|destination| fragments.contains(*destination)),
-                    None => true,
-                }
+                // Same-name segments routinely share retired sources, and the
+                // walk is transitive; memoize it for this call.
+                *reaches.entry(source).or_insert_with(|| {
+                    match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                        Some(destinations) => destinations
+                            .iter()
+                            .any(|destination| fragments.contains(*destination)),
+                        None => true,
+                    }
+                })
             });
         if !covers_directly && !covers_through_history {
             continue;
