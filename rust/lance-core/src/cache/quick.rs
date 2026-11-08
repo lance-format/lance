@@ -331,6 +331,20 @@ impl QuickCacheBackend {
         drop((dropped, replaced));
     }
 
+    /// Whether an insertion carries a size the cache can charge for.
+    ///
+    /// [`LanceCache`](crate::cache::LanceCache) skips the deep-size traversal
+    /// while its backend reports itself size-blind, so a zero size means the
+    /// value was never measured. Admitting it would charge the entry its key
+    /// footprint alone, and a capacity growth could never reclaim the payload
+    /// it holds. This runs before admission but after the write is recorded, so
+    /// it must not consult the current capacity: that capacity can grow while
+    /// the insertion is in flight, and the entry would then be admitted
+    /// unmeasured.
+    fn admits_measured_size(&self, size_bytes: usize) -> bool {
+        size_bytes > 0
+    }
+
     fn record_write(&self, key: &InternalCacheKey, size_bytes: usize) -> u64 {
         let bytes = key_footprint(key).saturating_add(size_bytes).max(1) as u64;
         let submission_id = self.metrics.write(bytes);
@@ -364,6 +378,11 @@ impl QuickCacheBackend {
         type_name: Option<&'static str>,
     ) {
         let submission_id = self.record_write(key, size_bytes);
+        if !self.admits_measured_size(size_bytes) {
+            // `record_write` already accounts for this attempt, including the
+            // disabled-cache rejection, so only admission is skipped.
+            return;
+        }
         let item = QuickEntry {
             entry,
             size_bytes,
@@ -407,6 +426,11 @@ impl QuickCacheBackend {
             Err(guard) => {
                 let (entry, size_bytes) = loader.await?;
                 let submission_id = self.record_write(key, size_bytes);
+                if !self.admits_measured_size(size_bytes) {
+                    // Dropping the guard releases the placeholder; the loaded
+                    // value is returned uncached instead of retained uncharged.
+                    return Ok((entry, false));
+                }
                 let item = QuickEntry {
                     entry: entry.clone(),
                     size_bytes,
@@ -1469,5 +1493,133 @@ mod tests {
         assert_eq!(snapshot.size_removed_bytes, Some(u64::MAX));
         backend.insert(&key, Arc::new(()), 8, None).await;
         assert_eq!(backend.diagnostics().write_bytes, Some(u64::MAX));
+    }
+
+    struct ResizePausedKey {
+        pause: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+        priority: bool,
+    }
+
+    impl CacheKey for ResizePausedKey {
+        type ValueType = Vec<u8>;
+
+        fn key(&self) -> std::borrow::Cow<'_, str> {
+            if let Some((sized, resume)) = &self.pause {
+                sized.wait();
+                resume.wait();
+            }
+            std::borrow::Cow::Borrowed("oversized")
+        }
+
+        fn type_name() -> &'static str {
+            "test.resize.vec"
+        }
+
+        fn codec_for_key(&self) -> Option<CacheCodec> {
+            self.priority.then(|| {
+                CacheCodec::new("test.resize", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+                    .with_memory_priority(1)
+            })
+        }
+    }
+
+    #[test]
+    fn growing_disabled_cache_does_not_retain_unmeasured_entry() {
+        for priority in [false, true] {
+            let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(0)));
+            let sized = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            let loading_cache = cache.clone();
+            let paused_key = ResizePausedKey {
+                pause: Some((sized.clone(), resume.clone())),
+                priority,
+            };
+            let insertion = std::thread::spawn(move || {
+                futures::executor::block_on(
+                    loading_cache.insert_with_key(&paused_key, Arc::new(vec![1u8; 1 << 20])),
+                );
+            });
+
+            sized.wait();
+            cache.set_capacity(1024).unwrap();
+            resume.wait();
+            insertion.join().unwrap();
+
+            futures::executor::block_on(async {
+                cache.set_capacity(128).unwrap();
+                let retained = cache
+                    .get_resident_with_key(&ResizePausedKey {
+                        pause: None,
+                        priority,
+                    })
+                    .await;
+                let reported = cache.size_bytes().await;
+                assert!(
+                    retained.is_none(),
+                    "priority={priority}: retained {} payload bytes after growing to 1024 \
+                     and shrinking to 128, reported weight {reported}",
+                    retained.as_ref().map_or(0, |value| value.len())
+                );
+
+                // The rejection is about the missing size, not about the
+                // resize: a measured insertion still lands once the budget
+                // can hold it.
+                cache.set_capacity(4 << 20).unwrap();
+                cache
+                    .insert_with_key(
+                        &ResizePausedKey {
+                            pause: None,
+                            priority,
+                        },
+                        Arc::new(vec![1u8; 1 << 20]),
+                    )
+                    .await;
+                assert!(
+                    cache
+                        .get_resident_with_key(&ResizePausedKey {
+                            pause: None,
+                            priority,
+                        })
+                        .await
+                        .is_some()
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn unmeasured_insertions_are_never_retained() {
+        // The pre-insertion check cannot distinguish a disabled cache from one
+        // that grows while the insertion is in flight, so a zero size must be
+        // refused regardless of the capacity it observes.
+        for capacity in [0, 4 << 20] {
+            let cache = QuickCacheBackend::with_capacity(capacity);
+            let key = InternalCacheKey::from_bytes(11_u128.to_le_bytes());
+            let payload = || Arc::new(vec![0_u8; 8192]) as CacheEntry;
+
+            cache.insert_tagged(&key, payload(), 0, None, None).await;
+            assert!(
+                cache.get_resident(&key).await.is_none(),
+                "capacity={capacity}: an unmeasured insertion was retained"
+            );
+            let (entry, inserted) = cache
+                .get_or_insert_tagged(&key, Box::pin(async { Ok((payload(), 0)) }), None, None)
+                .await
+                .unwrap();
+            assert_eq!(*entry.downcast_ref::<Vec<u8>>().unwrap(), vec![0_u8; 8192]);
+            assert!(
+                !inserted,
+                "capacity={capacity}: a loaded value with no size was retained"
+            );
+            assert!(cache.get_resident(&key).await.is_none());
+
+            // A measured insertion still lands as soon as the budget holds it.
+            cache.insert_tagged(&key, payload(), 8192, None, None).await;
+            assert_eq!(
+                cache.get_resident(&key).await.is_some(),
+                capacity > 0,
+                "capacity={capacity}"
+            );
+        }
     }
 }
