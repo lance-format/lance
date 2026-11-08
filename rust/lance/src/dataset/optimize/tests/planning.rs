@@ -1182,12 +1182,14 @@ async fn grouped_compaction_commit_leaves_the_held_back_group_untouched() {
     assert_eq!(after[1], four[1], "the covered fragment 1 is untouched");
     assert_eq!(after[2].physical_rows, Some(200), "2 and 3 compacted");
 
-    // The index this build cannot read is still there, still addressing the
-    // fragments it addressed before: nothing of it had to be remapped.
+    // The index this build cannot read is still there, byte-for-byte the
+    // metadata that was planted: nothing of it had to be remapped.
     let indices = load_all_indices(&committer).await.unwrap();
     assert_eq!(indices.len(), 1);
-    assert_eq!(indices[0].uuid, planted[0].uuid);
-    assert_eq!(indices[0].fragment_bitmap, planted[0].fragment_bitmap);
+    assert_eq!(
+        indices[0], planted[0],
+        "the unreadable index's metadata is untouched"
+    );
 
     // Every row survives, and the uncovered group's own rows are exact.
     assert_eq!(committer.count_rows(None).await.unwrap(), 400);
@@ -1236,6 +1238,120 @@ async fn grouped_compaction_commit_leaves_the_held_back_group_untouched() {
     );
     assert_eq!(committer.manifest.fragments.as_ref(), &four);
     assert_eq!(committer.count_rows(None).await.unwrap(), 400);
+}
+/// Grouped planning leaves exactly the gap ordinary planning leaves at a
+/// source held back for unreadable index coverage. Ordinary planning folds
+/// that coverage into its own exclusions and terminates the current bin at
+/// one, so the candidates on either side are never planned together; the same
+/// group handed to `plan_groups`, with the same options, has to select the
+/// same sources.
+#[tokio::test]
+async fn grouped_planning_keeps_the_same_gap_at_a_held_back_source_as_ordinary_planning() {
+    /// A dataset of `sizes` fragments in order, one fragment per entry.
+    async fn fragments_of(dir: &TempStrDir, sizes: &[i64]) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut dataset: Option<Dataset> = None;
+        let mut start = 0_i64;
+        for rows in sizes {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+            )
+            .unwrap();
+            dataset = Some(
+                Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    dir,
+                    Some(WriteParams {
+                        mode: if dataset.is_none() {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        max_rows_per_file: 1_000,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            start += rows;
+        }
+        let dataset = dataset.unwrap();
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        assert_eq!(fragments.len(), sizes.len());
+        (dataset, fragments)
+    }
+
+    fn sources(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+        plan.tasks
+            .iter()
+            .map(|task| task.fragments.iter().map(|f| f.id).collect())
+            .collect()
+    }
+
+    // The one set of options both planners run under: the large middle
+    // fragment is over the target, so `candidacy_of` rejects it either way.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    };
+
+    // Two small, one over-target and covered, two small. Both planners plan
+    // the two sides as separate tasks and leave the covered member alone.
+    let dir = TempStrDir::default();
+    let (mut dataset, five) = fragments_of(&dir, &[100, 100, 1_000, 100, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(
+        sources(&ordinary),
+        vec![vec![0, 1], vec![3, 4]],
+        "ordinary planning splits its bin at the excluded source"
+    );
+
+    let grouped = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: five.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sources(&grouped),
+        sources(&ordinary),
+        "grouped planning selects the same sources as ordinary planning"
+    );
+
+    // One small on each side of the covered member: the gap leaves each a
+    // lone fragment that would only gain from neighbours, which neither
+    // planner rewrites.
+    let dir = TempStrDir::default();
+    let (mut dataset, three) = fragments_of(&dir, &[100, 1_000, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert!(ordinary.tasks.is_empty(), "{:?}", ordinary.tasks);
+    let grouped = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: three.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(grouped.tasks.is_empty(), "{:?}", grouped.tasks);
 }
 /// A group that mixes covered and uncovered sources still plans the uncovered
 /// ones: the covered member is held back and the two uncovered members on one
