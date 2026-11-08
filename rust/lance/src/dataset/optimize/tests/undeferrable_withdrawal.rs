@@ -1095,6 +1095,23 @@ async fn fts_count(dataset: &Dataset, word: &str) -> (usize, String) {
     (count as usize, plan)
 }
 
+/// [`fts_count`] with the queried column pinned, so the query is answerable
+/// even when no inverted index derives coverage and the scanner therefore
+/// cannot discover the column from the index list.
+async fn fts_count_on_column(dataset: &Dataset, word: &str, column: &str) -> (usize, String) {
+    let mut scan = dataset.scan();
+    scan.full_text_search(
+        FullTextSearchQuery::new(word.to_string())
+            .with_column(column.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    scan.project::<String>(&[]).unwrap().with_row_id();
+    let plan = scan.explain_plan(false).await.unwrap();
+    let count = scan.count_rows().await.unwrap();
+    (count as usize, plan)
+}
+
 /// W1: a transient read failure on the inverted metadata file is NOT a legacy
 /// format verdict. The deferred compaction attempt must not persist a
 /// narrowed bitmap from it, and nothing may be cached: once the fault clears,
@@ -1257,4 +1274,370 @@ async fn a_missing_inverted_metadata_file_is_the_legacy_verdict() {
             .any(|(name, _, _)| name == FTS_INDEX),
         "the index definition must survive the withdrawal"
     );
+}
+
+/// W2: an undeferrable segment can address a rewritten fragment one hop away.
+///
+/// `P` was partitioned into `F1` and `F2` while the segment covered `P`, so
+/// the segment's provenance names `P` and nothing else; a later rewrite of
+/// `F1` alone never names `P`. The selector must still classify the segment
+/// and the commit must withdraw `P`.
+///
+/// The manifest this test rewrites is the shape a build BEFORE this change
+/// left behind: its Rewrite commits withdrew nothing, so an undeferrable
+/// segment could survive a partition still claiming the retired source. This
+/// build can no longer produce that state (the partition's own Rewrite
+/// withdraws a direct hit, and a rebased `CreateIndex` strips retired
+/// provenance), so the older manifest is written directly through the
+/// crate-internal manifest writer the fragment-reuse reader tests use.
+#[tokio::test]
+async fn a_retired_source_reached_by_the_rewrite_is_withdrawn_one_hop_away() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_retired_provenance", dir.as_str());
+
+    // (1) Four fragments, an FTS index and a BTree index, all three built
+    // while every source fragment is live.
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("doc", lance_datagen::array::random_sentence(1, 10, false))
+        .into_dataset(
+            &path,
+            FragmentCount::from(4),
+            FragmentRowCount::from(INDEX_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some(FTS_INDEX.into()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    create_btree_index(&mut dataset).await;
+    let indexed_sources: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let fts_entry = dataset
+        .load_index_by_name(FTS_INDEX)
+        .await
+        .unwrap()
+        .expect("the FTS index must exist");
+    assert_eq!(
+        fts_entry.fragment_bitmap.as_ref().unwrap(),
+        &indexed_sources,
+        "the FTS segment must cover every source fragment"
+    );
+    let btree_stored_before = coverage_of(&stored_segments(&dataset).await, BTREE_INDEX);
+    let word = sample_word(&dataset).await;
+    let (_, plan_before) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert!(
+        !plan_before.contains("FlatMatchQuery"),
+        "the fixture's FTS index, not a flat scan, must serve the query: {plan_before}"
+    );
+
+    // One fragment of rows no index covers, appended BEFORE the partition so
+    // its id precedes the destinations': the planner only bins ADJACENT
+    // fragments, and step (4) narrows the plan to this one plus F1.
+    append_unindexed_fragment(&mut dataset).await;
+    let companion: u32 = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .max()
+        .unwrap();
+
+    // (2) A deferred (tagged) partition of P alone, through the real commit
+    // path: P retires into the two destinations F1 and F2.
+    let partitioned = dataset.fragments()[0].id;
+    dataset = make_tagged_partitioning(dataset, &[partitioned]).await;
+    let live_after_partition: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let destinations: Vec<u32> = live_after_partition
+        .iter()
+        .filter(|id| !indexed_sources.contains(*id) && *id != companion)
+        .collect();
+    assert_eq!(
+        destinations.len(),
+        2,
+        "the partition must produce exactly two destinations, got {destinations:?}"
+    );
+    let (f1, f2) = (destinations[0], destinations[1]);
+    assert_eq!(
+        f1,
+        companion + 1,
+        "F1 must sit next to the companion fragment, or the planner bins neither"
+    );
+    assert!(
+        !live_after_partition.contains(partitioned as u32),
+        "P must be retired by the partition"
+    );
+
+    // (3) Reproduce the older build's manifest: the FTS segment stores
+    // exactly {P}, a retired fragment with no live destination of its own,
+    // while the BTree segment keeps the provenance a deferrable segment is
+    // left with. Everything else, including the tagged entry, is untouched.
+    let retired_only = RoaringBitmap::from_iter([partitioned as u32]);
+    let older_build_indices: Vec<IndexMetadata> = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| {
+            let mut index = index.clone();
+            if index.name == FTS_INDEX {
+                index.fragment_bitmap = Some(retired_only.clone());
+            }
+            index
+        })
+        .collect();
+    crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, older_build_indices)
+        .await;
+    // The segment must be undeferrable for the withdrawal to apply at all;
+    // a missing inverted metadata file is the legacy verdict (see
+    // `a_missing_inverted_metadata_file_is_the_legacy_verdict`).
+    let fts_uuid = dataset
+        .load_index_by_name(FTS_INDEX)
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    let metadata_path = dataset
+        .indices_dir()
+        .join(fts_uuid.to_string())
+        .join(lance_index::scalar::inverted::METADATA_FILE);
+    dataset.object_store.delete(&metadata_path).await.unwrap();
+
+    let mut dataset = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let stored = stored_segments(&dataset).await;
+    assert_eq!(
+        coverage_of(&stored, FTS_INDEX),
+        retired_only,
+        "the fixture must leave the FTS segment covering the retired source only"
+    );
+    assert_eq!(
+        coverage_of(&stored, BTREE_INDEX),
+        btree_stored_before,
+        "the deferrable segment's stored provenance is untouched by the partition"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, BTREE_INDEX).await,
+        &live_after_partition - RoaringBitmap::from_iter([companion]),
+        "the BTree must translate to every live fragment it covers"
+    );
+
+    // A handle opened and queried BEFORE the rewrite, to prove the
+    // withdrawal is observed through `checkout_latest` rather than served
+    // from this handle's warmed caches.
+    let mut warmed = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let (count_before, _) = fts_count_on_column(&warmed, &word, "doc").await;
+    assert!(count_before > 0, "the word must match some row");
+
+    // (4) Rewrite F1 only, through the real deferred compaction commit path:
+    // every other live fragment is held out, so the one task is F1 with the
+    // uncovered companion. The rewrite never names P.
+    let options = CompactionOptions {
+        excluded_fragment_ids: dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .filter(|id| *id != f1 && *id != companion)
+            .collect(),
+        ..deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize)
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let rewritten: RoaringBitmap = plan
+        .tasks()
+        .iter()
+        .flat_map(|task| task.fragments.iter())
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        rewritten,
+        RoaringBitmap::from_iter([companion, f1]),
+        "the compaction must rewrite F1 and the uncovered companion only"
+    );
+    assert!(
+        !rewritten.contains(partitioned as u32),
+        "the rewrite must never name the retired source P itself"
+    );
+    let committed = run_deferred_compaction(&mut dataset, &options, None).await;
+    assert!(committed > 0, "the compaction must commit");
+
+    // (5) The retired source P is gone from the undeferrable segment, even
+    // though the rewrite never named it.
+    let after = stored_segments(&dataset).await;
+    let fts_after = coverage_of(&after, FTS_INDEX);
+    assert!(
+        !fts_after.contains(partitioned as u32),
+        "the undeferrable segment still covers the retired source {partitioned} \
+         the rewrite reached through the history: {:?}",
+        fts_after.iter().collect::<Vec<_>>()
+    );
+    // Withdrawing P ends this segment's acceleration of the sibling
+    // destination F2 as well: its remaining coverage would have been the
+    // live-only remainder the helper clears, so the bitmap is empty.
+    assert!(
+        fts_after.is_empty(),
+        "the withdrawal must clear the segment whole: {:?}",
+        fts_after.iter().collect::<Vec<_>>()
+    );
+    assert!(
+        after.iter().any(|(name, _, _)| name == FTS_INDEX),
+        "the FTS definition must survive so a later optimize can rebuild it"
+    );
+    assert!(
+        derived_coverage(&dataset, FTS_INDEX).await.is_empty(),
+        "the withdrawn segment must derive no coverage"
+    );
+
+    // Full-text search is still exact, now served by a flat scan: a rewrite
+    // moves rows, it never adds or drops any.
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert!(
+        plan_after.contains("FlatMatchQuery"),
+        "a withdrawn segment must not serve the full-text query; it must fall \
+         back to a flat scan: {plan_after}"
+    );
+    assert_eq!(
+        count_after, count_before,
+        "full-text search must stay exact after the withdrawal: {plan_after}"
+    );
+
+    // The deferrable control keeps its translated coverage of the untouched
+    // destination F2 and still serves a filtered query.
+    let live_after_rewrite: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        live_after_rewrite.contains(f2),
+        "F2 must be untouched by the rewrite"
+    );
+    assert_eq!(
+        coverage_of(&after, BTREE_INDEX),
+        btree_stored_before,
+        "a deferrable segment's stored provenance is never withdrawn"
+    );
+    let btree_derived = derived_coverage(&dataset, BTREE_INDEX).await;
+    assert!(
+        btree_derived.contains(f2),
+        "the BTree must keep translating to the untouched destination F2: {:?}",
+        btree_derived.iter().collect::<Vec<_>>()
+    );
+    let mut lookup = dataset.scan();
+    lookup.filter("i = 1").unwrap().project(&["i"]).unwrap();
+    let lookup_plan = lookup.explain_plan(false).await.unwrap();
+    assert!(lookup_plan.contains("ScalarIndexQuery"), "{lookup_plan}");
+    let batch = lookup.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 1);
+
+    // The handle that was warm before the rewrite sees the same withdrawal.
+    warmed.checkout_latest().await.unwrap();
+    assert_eq!(
+        coverage_of(&stored_segments(&warmed).await, FTS_INDEX),
+        fts_after,
+        "a warmed handle must not resurrect the withdrawn coverage"
+    );
+    assert!(derived_coverage(&warmed, FTS_INDEX).await.is_empty());
+    let (warmed_after, warmed_plan) = fts_count_on_column(&warmed, &word, "doc").await;
+    assert!(warmed_plan.contains("FlatMatchQuery"), "{warmed_plan}");
+    assert_eq!(warmed_after, count_after);
+}
+
+/// [`make_tagged`] over a chosen set of source fragments, so a test can
+/// partition exactly one fragment into its two destinations.
+async fn make_tagged_partitioning(mut dataset: Dataset, source_ids: &[u64]) -> Dataset {
+    let reserve = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments { num_fragments: 2 },
+        None,
+    );
+    dataset
+        .apply_commit(reserve, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let dest_base_id = dataset.manifest.max_fragment_id().unwrap() - 1;
+    let old_fragments: Vec<Fragment> = dataset
+        .fragments()
+        .iter()
+        .filter(|fragment| source_ids.contains(&fragment.id))
+        .cloned()
+        .collect();
+    assert_eq!(old_fragments.len(), source_ids.len());
+    let (transition, new_fragments) = prepare_partition(&dataset, source_ids, dest_base_id).await;
+    let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let stored = load_all_indices(&dataset).await.unwrap();
+    assert!(
+        uses_tagged_fri(
+            &dataset.manifest,
+            stored
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        ),
+        "the stable partition must make the table tagged"
+    );
+    dataset
+}
+
+/// Appends one fragment of fresh rows no index covers, so a compaction plan
+/// can be narrowed to one indexed fragment plus this one.
+async fn append_unindexed_fragment(dataset: &mut Dataset) {
+    let batch = {
+        let mut scan = dataset.scan();
+        scan.project(&["i", "doc"]).unwrap();
+        scan.limit(Some(INDEX_ROWS_PER_FRAGMENT as i64), None)
+            .unwrap();
+        scan.try_into_batch().await.unwrap()
+    };
+    let appended = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(
+                10_000..10_000 + batch.num_rows() as i32,
+            )) as ArrayRef,
+            batch["doc"].clone(),
+        ],
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(WriteParams {
+                max_rows_per_file: INDEX_ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
