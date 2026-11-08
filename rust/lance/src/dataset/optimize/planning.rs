@@ -770,8 +770,9 @@ impl DefaultCompactionPlanner {
     /// ascending id order, a fragment absent from the dataset, named by two
     /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
     /// A member covered by an index this build cannot read is held back
-    /// instead of refusing the plan: it is left out of every task, logged by
-    /// index name, and the rest of its group and every other group still plan.
+    /// instead of refusing the plan: no metric of it is read, it is left out
+    /// of every task, it is logged by index name, and the rest of its group
+    /// and every other group still plan.
     /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
     /// the selected tasks, in group order.
     pub async fn plan_groups(
@@ -894,32 +895,37 @@ impl DefaultCompactionPlanner {
             CompactionMode::ForceBinaryCopy
         );
 
-        // One candidate bin per group: its members that ordinary planning
-        // would compact, in order. A member it would leave alone stays out of
-        // the bin and untouched.
-        // Metrics for every member of every group, read with the same bounded
+        // Metrics for every measured member of every group, read with the same bounded
         // parallelism as ordinary planning; `buffered` keeps input order, so
-        // the results line up with the groups.
+        // the results line up with the groups. A held-back member is a `None`
+        // sentinel instead: no metric of it is read, since it will not be
+        // planned either way, and the sentinel keeps the gap it leaves visible
+        // to the binning below.
         let present = &present;
+        let held_back = &held_back;
         let members = groups
             .iter()
             .enumerate()
             .flat_map(|(group_index, group)| {
-                group
-                    .fragments
-                    .iter()
-                    .map(move |listed| (group_index, present[&listed.id].clone()))
+                group.fragments.iter().map(move |listed| {
+                    let held = u32::try_from(listed.id).is_ok_and(|id| held_back.contains(id));
+                    (group_index, (!held).then(|| present[&listed.id].clone()))
+                })
             })
             .collect::<Vec<_>>();
-        let mut measured: Vec<(usize, Fragment, FragmentMetrics)> = futures::stream::iter(members)
-            .map(|(group_index, fragment)| async move {
-                collect_metrics(&fragment)
-                    .await
-                    .map(|metrics| (group_index, fragment.metadata, metrics))
-            })
-            .buffered(dataset.object_store.as_ref().io_parallelism())
-            .try_collect()
-            .await?;
+        let mut measured: Vec<(usize, Option<(Fragment, FragmentMetrics)>)> =
+            futures::stream::iter(members)
+                .map(|(group_index, fragment)| async move {
+                    let Some(fragment) = fragment else {
+                        return Ok((group_index, None));
+                    };
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| (group_index, Some((fragment.metadata, metrics))))
+                })
+                .buffered(dataset.object_store.as_ref().io_parallelism())
+                .try_collect()
+                .await?;
         measured.reverse();
 
         let mut bins = Vec::with_capacity(groups.len());
@@ -931,16 +937,16 @@ impl DefaultCompactionPlanner {
             let mut runs: Vec<CandidateBin> = Vec::new();
             let mut current: Option<CandidateBin> = None;
             for _ in &group.fragments {
-                let Some((measured_group, fragment, metrics)) = measured.pop() else {
+                let Some((measured_group, measured_member)) = measured.pop() else {
                     return Err(Error::internal(
                         "grouped compaction lost a fragment's metrics",
                     ));
                 };
                 debug_assert_eq!(measured_group, group_index);
-                if u32::try_from(fragment.id).is_ok_and(|id| held_back.contains(id)) {
+                let Some((fragment, metrics)) = measured_member else {
                     runs.extend(current.take());
                     continue;
-                }
+                };
                 if let Some(reason) =
                     self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
                 {

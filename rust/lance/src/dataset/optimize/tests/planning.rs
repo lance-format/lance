@@ -1100,6 +1100,93 @@ async fn grouped_compaction_plans_the_uncovered_sources_of_a_mixed_group() {
         vec![2, 3]
     );
 }
+/// No metric of a held-back member is read: its data file is gone, so any
+/// measurement of it would fail the plan, and the manifest's cached counts are
+/// made untrustworthy so that every measured member really does open its file.
+#[tokio::test]
+async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
+    /// Four fragments of 100 rows, with fragment 1's data file removed and the
+    /// writer version cleared so that the cached counts cannot be trusted and
+    /// measuring fragment 1 must fail.
+    async fn four_with_an_unreadable_second(dir: &TempStrDir) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let four = dataset.manifest.fragments.as_ref().clone();
+        (dataset, four)
+    }
+
+    fn sabotage(dataset: &mut Dataset, fragment: &Fragment, dir: &TempStrDir) {
+        Arc::make_mut(&mut dataset.manifest).writer_version = None;
+        std::fs::remove_file(
+            std::path::Path::new(dir.as_ref())
+                .join("data")
+                .join(&fragment.files[0].path),
+        )
+        .unwrap();
+    }
+
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap();
+    let whole_group = |four: &[Fragment]| {
+        vec![CompactionGroup {
+            fragments: four.to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }]
+    };
+
+    // The control: with no index holding it back, fragment 1 is measured and
+    // its missing file fails the plan. This is what makes the case below a
+    // proof that the held-back member is never measured.
+    let dir = TempStrDir::default();
+    let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
+    sabotage(&mut dataset, &four[1], &dir);
+    assert!(
+        planner
+            .plan_groups(&dataset, whole_group(&four))
+            .await
+            .is_err()
+    );
+
+    // The same unreadable fragment, now covered by an index this build cannot
+    // read: no metric of it is read, the plan succeeds, and the uncovered
+    // members on the far side of the gap it leaves still compact together.
+    let dir = TempStrDir::default();
+    let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+    let mut dataset = Dataset::open(&dir).await.unwrap();
+    sabotage(&mut dataset, &four[1], &dir);
+    let plan = planner
+        .plan_groups(&dataset, whole_group(&four))
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}
 /// With stable row ids and deferred remapping, a non-adjacent group's
 /// moves are recorded in the fragment reuse index and every row keeps its
 /// id and value.
