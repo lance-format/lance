@@ -111,12 +111,6 @@ use super::{
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
 
-/// Chance that a split, join or explicit merge of an HNSW index lets
-/// [`choose_merge_strategy`] rebuild partitions. Otherwise every partition, the
-/// pieces of a split included, is derived from its old graph by repairing out
-/// the rows that left and batch inserting the rows that arrived, which is
-/// cheaper but leaves a worse graph for a later full merge to rebuild.
-const FULL_MERGE_PROBABILITY: f64 = 0.25;
 /// Training vectors sampled per centroid when a partition is split.
 const SPLIT_SAMPLE_RATE: usize = 256;
 /// Upper bound on the number of partitions one oversized partition is split into
@@ -1284,7 +1278,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     Arc::new(self.existing_indices.clone()),
                     Some(PartitionAdjustment::Split {
                         affected_partitions: split_result.affected_partitions,
-                        split_sources: split_result.split_sources,
                         split_shuffle_reader: split_result.shuffle_reader,
                     }),
                 )
@@ -1361,8 +1354,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             && frag_reuse_index.is_none()
             && !is_retrain
             && !merge_indices.is_empty();
-        let forced_strategy = (!rand::Rng::random_bool(&mut rand::rng(), FULL_MERGE_PROBABILITY))
-            .then_some(DeltaMergeStrategy::BatchedInsert);
         let partition_adjustment = Arc::new(partition_adjustment);
         let build_iter = (0..num_partitions).map(move |partition| {
             let output_partition_id = partition;
@@ -1390,17 +1381,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     Some(PartitionAdjustment::Join {
                         kept_partitions, ..
                     }) => kept_partitions[partition],
-                    _ => partition,
-                };
-                // Outside a full merge, a partition appended by a split starts
-                // from the graphs of the partition it was split from instead of
-                // being built.
-                let graph_source = match partition_adjustment.as_ref() {
-                    Some(PartitionAdjustment::Split { split_sources, .. })
-                        if forced_strategy.is_some() =>
-                    {
-                        split_sources.get(&partition).copied().unwrap_or(partition)
-                    }
                     _ => partition,
                 };
 
@@ -1457,7 +1437,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 }
 
                 let old_graphs = if reuse_graphs {
-                    Some(Self::load_partition_graphs(graph_source, indices.as_ref()).await?)
+                    Some(Self::load_partition_graphs(partition, indices.as_ref()).await?)
                 } else {
                     None
                 };
@@ -1479,7 +1459,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             batches,
                             column,
                             old_graphs,
-                            forced_strategy,
                         )?,
                         _ => Self::build_index(
                             distance_type,
@@ -1763,11 +1742,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     /// Old graph nodes whose rows are not in `batches`, because a split moved
     /// them away or their segment may no longer contribute them, count as
     /// deleted, and rows of `batches` in no old graph are indexed as one more
-    /// delta graph. `forced_strategy`, or [`choose_merge_strategy`] when it is
-    /// `None`, then either rebuilds the partition from scratch or repairs the
-    /// deleted nodes out of the largest old graph and batch inserts the live
-    /// rows of the others into it. A base with no live rows is always rebuilt.
-    #[allow(clippy::too_many_arguments)]
+    /// delta graph. [`choose_merge_strategy`] then either rebuilds the partition
+    /// from scratch or repairs the deleted nodes out of the largest old graph and
+    /// batch inserts the live rows of the others into it.
     fn merge_partition_graphs(
         distance_type: DistanceType,
         quantizer: Q,
@@ -1775,7 +1752,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         batches: Vec<RecordBatch>,
         column: String,
         old_graphs: Vec<OldPartitionGraph>,
-        forced_strategy: Option<DeltaMergeStrategy>,
     ) -> Result<(Q::Storage, S)> {
         let rows = arrow::compute::concat_batches(batches[0].schema_ref(), &batches)?;
         let storage_builder = StorageBuilder::new_with_remapper(
@@ -1874,12 +1850,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .zip(&deleted)
             .map(|(graph, deleted)| PartitionGraph { graph, deleted })
             .collect();
-        let base_live = partition[0].graph.len() - partition[0].deleted.len() as usize;
-        let strategy = match forced_strategy {
-            _ if base_live == 0 => DeltaMergeStrategy::Rebuild,
-            Some(strategy) => strategy,
-            None => choose_merge_strategy(&partition[0], &partition[1..], &mut rand::rng())?,
-        };
+        let strategy = choose_merge_strategy(&partition[0], &partition[1..], &mut rand::rng())?;
 
         // A batched insert keeps the base's deleted nodes, but these rows are
         // gone from the partition, so they are repaired out first.
@@ -2523,19 +2494,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .reshuffle_partitions(&affected_partitions, &new_centroids)
             .await?;
 
-        let split_sources = split_partitions
-            .iter()
-            .flat_map(|(source, pieces)| {
-                pieces
-                    .iter()
-                    .filter(move |piece| *piece != source)
-                    .map(move |piece| (*piece, *source))
-            })
-            .collect();
         Ok(Some(SplitResult {
             new_centroids,
             affected_partitions,
-            split_sources,
             shuffle_reader: split_shuffle_reader.into(),
         }))
     }
@@ -3533,8 +3494,6 @@ struct JoinResult {
 struct SplitResult {
     new_centroids: FixedSizeListArray,
     affected_partitions: HashSet<usize>,
-    /// The partition each appended partition was split from.
-    split_sources: HashMap<usize, usize>,
     shuffle_reader: Arc<dyn ShuffleReader>,
 }
 
@@ -3549,8 +3508,6 @@ enum PartitionAdjustment {
     /// shuffle reader with re-quantized data.
     Split {
         affected_partitions: HashSet<usize>,
-        /// The partition each partition appended by the split was split from.
-        split_sources: HashMap<usize, usize>,
         split_shuffle_reader: Arc<dyn ShuffleReader>,
     },
     /// Join partitions away; `kept_partitions[i]` is the old id of output
@@ -4277,24 +4234,16 @@ mod tests {
 
     #[rstest::rstest]
     // 50 of the old graph's 500 rows moved out and 100 rows moved in.
-    #[case::rows_moved(50..600, 0..500, None)]
+    #[case::rows_moved(50..600, 0..500)]
     // Nothing changed: the old graph is reused as is.
-    #[case::unchanged(0..500, 0..500, None)]
+    #[case::unchanged(0..500, 0..500)]
     // Most old rows moved out: rebuilt.
-    #[case::mostly_moved(400..600, 0..500, None)]
-    // A split piece outside a full merge: half the old graph repaired out.
-    #[case::split_piece(250..500, 0..500, Some(DeltaMergeStrategy::BatchedInsert))]
-    #[case::split_piece_with_new_rows(
-        250..600,
-        0..500,
-        Some(DeltaMergeStrategy::BatchedInsert)
-    )]
-    // No old row survives, so there is no base to insert into.
-    #[case::no_old_row_left(500..600, 0..500, Some(DeltaMergeStrategy::BatchedInsert))]
+    #[case::mostly_moved(400..600, 0..500)]
+    // No old row survives: rebuilt from the new rows alone.
+    #[case::no_old_row_left(500..600, 0..500)]
     fn test_merge_partition_graphs(
         #[case] final_rows: std::ops::Range<u64>,
         #[case] old_rows: std::ops::Range<u64>,
-        #[case] forced_strategy: Option<DeltaMergeStrategy>,
     ) {
         use lance_index::vector::hnsw::builder::HnswBuildParams;
 
@@ -4325,7 +4274,6 @@ mod tests {
             vec![partition_rows(&all, final_rows.clone())],
             "vec".to_owned(),
             old_graphs,
-            forced_strategy,
         )
         .unwrap();
 
