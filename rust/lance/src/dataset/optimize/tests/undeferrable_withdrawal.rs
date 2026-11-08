@@ -2009,6 +2009,139 @@ async fn a_read_failure_on_one_segment_does_not_fail_every_query() {
     );
 }
 
+/// Words the fixture's analyzer drops, so a test never drives full-text
+/// search with a term the index cannot match.
+const FIXTURE_STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
+    "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
+    "they", "this", "to", "was", "will", "with",
+];
+
+/// Whether `plan` contains `node` as a plan node of its own.
+///
+/// Node names nest as substrings (`FlatMatchQuery:` contains `MatchQuery:`),
+/// so "which node served this query" is only answerable at line starts.
+fn plan_has_node(plan: &str, node: &str) -> bool {
+    plan.lines().any(|line| line.trim_start().starts_with(node))
+}
+
+/// A non-stopword occurring in `column`, with the number of rows containing
+/// it counted by brute force over the table.
+///
+/// The generator joins lowercase words with single spaces and adds no
+/// punctuation, so whitespace tokens are exactly what the analyzer indexes
+/// and the count is ground truth rather than an approximation.
+async fn frequent_word_and_brute_force_count(dataset: &Dataset, column: &str) -> (String, usize) {
+    let batch = dataset
+        .scan()
+        .project(&[column])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let docs = batch[column].as_string::<i32>();
+    let mut rows_per_word: HashMap<&str, usize> = HashMap::new();
+    for row in 0..docs.len() {
+        for word in docs
+            .value(row)
+            .split_whitespace()
+            .filter(|word| !FIXTURE_STOP_WORDS.contains(word))
+            .collect::<HashSet<_>>()
+        {
+            *rows_per_word.entry(word).or_default() += 1;
+        }
+    }
+    let (word, count) = rows_per_word
+        .into_iter()
+        .max_by_key(|(word, count)| (*count, *word))
+        .expect("the fixture's documents must contain a non-stopword");
+    (word.to_string(), count)
+}
+
+/// A probe fault excludes the segment for the duration of the fault only, so
+/// the plan the first (degraded) query produced must never be reused once
+/// reads succeed. The degraded answer is exact but slow, and a cached
+/// "excluded" verdict would make every later query on the handle pay that
+/// flat scan forever; equally, a cached plan built while the segment was
+/// visible must not survive a fault. The second query on the SAME handle
+/// therefore re-probes, serves from the inverted index, and derives the
+/// segment's full coverage again.
+#[tokio::test]
+async fn a_transient_probe_outage_never_poisons_the_cached_query_plan() {
+    Box::pin(transient_probe_outage_never_poisons_the_cached_query_plan()).await;
+}
+
+async fn transient_probe_outage_never_poisons_the_cached_query_plan() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_probe_outage_plan_cache", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(
+        brute_force > 0,
+        "the chosen word {word} must match rows in the fixture"
+    );
+    drop(seed);
+
+    // The segment's provenance must be retired for the format marker to be
+    // probed at all; that probe is the only thing the fault can reach.
+    {
+        let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+        let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+        run_deferred_compaction(&mut writer, &options, None).await;
+    }
+
+    // A fresh handle, so the first probe this handle ever makes meets the
+    // fault. The wrapper fails every read of the marker while armed, for as
+    // long as it is armed.
+    let (dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    failing.store(true, Ordering::SeqCst);
+    let (count_during, plan_during) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_during, brute_force,
+        "the excluded segment's rows must still be served by the flat scan: \
+         {plan_during}"
+    );
+    assert!(
+        plan_has_node(&plan_during, "FlatMatchQuery:"),
+        "the unreadable segment must be excluded in favour of a flat scan: \
+         {plan_during}"
+    );
+    assert!(
+        !plan_has_node(&plan_during, "MatchQuery:"),
+        "an unreadable segment must not serve the query as an index: \
+         {plan_during}"
+    );
+
+    // Same handle, same manifest snapshot: with reads restored the segment is
+    // re-probed, so the index serves the query and the degraded plan is gone.
+    failing.store(false, Ordering::SeqCst);
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_after, brute_force,
+        "the index answer must equal brute force: {plan_after}"
+    );
+    assert!(
+        plan_has_node(&plan_after, "MatchQuery:"),
+        "the re-probed segment must serve the query from the inverted index, \
+         not from the outage's plan: {plan_after}"
+    );
+    assert!(
+        !plan_has_node(&plan_after, "FlatMatchQuery:"),
+        "the flat fallback must not outlive the fault: {plan_after}"
+    );
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "the re-probed segment must derive its full coverage again"
+    );
+}
+
 /// The commit-time selector treats a marker probe fault as "not
 /// classified": the deferred compaction commits, withdraws nothing from the
 /// segment it could not read, and the verdict is not cached, so once reads
