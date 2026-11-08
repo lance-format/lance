@@ -3185,7 +3185,9 @@ async fn commit_fts_delta_segment(dataset: &mut Dataset) -> Uuid {
 /// that listing without its translated coverage, so its valid coverage looks
 /// empty, the subset check passes and the prune COMMITS its removal -- losing
 /// a healthy segment to a fault that says nothing about it. The prune must
-/// refuse while the listing cannot be verified, and prune once it can.
+/// refuse while the listing cannot be verified, and prune once it can. The
+/// refusal is scoped to the logical index, so a registered healthy sibling of
+/// the unverifiable segment is refused with it, and resolves once reads do.
 #[tokio::test]
 async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
     let dir = TempStrDir::default();
@@ -3256,6 +3258,28 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         coverage_message.contains(FTS_INDEX) && coverage_message.contains("could not be read"),
         "the error must name the index whose file could not be read: {coverage_message}"
     );
+    // The refusal is scoped to the logical index, not to the unreadable file:
+    // the healthy delta segment reads fine on its own, but it shares the
+    // sibling group whose coverage decision cannot be verified.
+    let healthy_sibling: IndexMetadata = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FTS_INDEX && index.uuid == delta_uuid)
+        .expect("the fixture must hold the healthy delta segment")
+        .clone();
+    let sibling_error =
+        crate::index::append::tagged_segment_coverage(&dataset, &[&healthy_sibling], None)
+            .await
+            .expect_err(
+                "a healthy sibling of an unverifiable segment shares its logical \
+                 group, so its coverage must be refused too",
+            );
+    let sibling_message = sibling_error.to_string();
+    assert!(
+        sibling_message.contains(FTS_INDEX) && sibling_message.contains("could not be read"),
+        "the error must name the index whose file could not be read: {sibling_message}"
+    );
     dataset.checkout_latest().await.unwrap();
     assert_eq!(
         stored_segments(&dataset).await,
@@ -3276,6 +3300,15 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
     assert!(
         coverage.contains_key(&superseded.uuid),
         "every queried segment must be accounted for: {coverage:?}"
+    );
+    let sibling_coverage =
+        crate::index::append::tagged_segment_coverage(&dataset, &[&healthy_sibling], None)
+            .await
+            .expect("the sibling's coverage must resolve once the marker is readable")
+            .expect("a tagged table must report derived coverage");
+    assert!(
+        sibling_coverage.contains_key(&healthy_sibling.uuid),
+        "every queried segment must be accounted for: {sibling_coverage:?}"
     );
     assert_eq!(
         derived_coverage(&dataset, FTS_INDEX).await,
