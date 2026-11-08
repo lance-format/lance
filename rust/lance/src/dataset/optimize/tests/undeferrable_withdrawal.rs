@@ -1629,6 +1629,159 @@ async fn a_missing_inverted_metadata_file_is_the_legacy_verdict() {
 /// build can no longer produce that state (the partition's own Rewrite
 /// withdraws a direct hit, and a rebased `CreateIndex` strips retired
 /// provenance), so the older manifest is written directly through the
+/// A fault reading one segment's format marker must not take the whole table
+/// down. The marker probe runs inside `load_indices`, which every query plan
+/// calls, so propagating the error would fail vector search, scalar lookups
+/// and plain scans alike. The segment is excluded for the duration of the
+/// fault and nothing is cached, so the SAME handle serves it again afterwards.
+#[tokio::test]
+async fn a_read_failure_on_one_segment_does_not_fail_every_query() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_read_failure_queries", dir.as_str());
+    let mut seed = tagged_with_fts_index(&path).await;
+    // A second index, on another column, to prove an unrelated query is not
+    // collateral damage of the faulting segment.
+    create_btree_index(&mut seed).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let word = sample_word(&seed).await;
+    drop(seed);
+
+    // Compact first, so the segment's provenance is retired and the reader
+    // must translate it: that is the only state in which the format marker is
+    // probed at all, and therefore the only state the fault can reach.
+    {
+        let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+        let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+        run_deferred_compaction(&mut writer, &options, None).await;
+    }
+
+    // A handle whose index cache has never seen a successful probe, so the
+    // fault is what the probe meets.
+    let (dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let fts_before = coverage_of(&stored_segments(&dataset).await, FTS_INDEX);
+    failing.store(true, Ordering::SeqCst);
+    // The index list itself resolves, so planning works at all.
+    dataset
+        .load_indices()
+        .await
+        .expect("a read fault on one segment must not fail the index listing");
+    // A plain scan is unaffected.
+    let scanned = dataset
+        .scan()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .expect("a read fault on an index must not fail a scan")
+        .num_rows();
+    assert!(scanned > 0);
+    // The unrelated BTree index still plans and answers.
+    let mut lookup = dataset.scan();
+    lookup.filter("i = 1").unwrap().project(&["i"]).unwrap();
+    let lookup_plan = lookup
+        .explain_plan(false)
+        .await
+        .expect("a read fault on the FTS segment must not fail a BTree query");
+    assert!(lookup_plan.contains("ScalarIndexQuery"), "{lookup_plan}");
+    // The faulting segment is excluded rather than trusted, and the flat
+    // fallback answers.
+    let (count_during, plan_during) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert!(
+        plan_during.contains("FlatMatchQuery"),
+        "the unreadable segment must be excluded, not trusted: {plan_during}"
+    );
+    assert!(count_during > 0, "the word must match rows");
+
+    // No verdict was cached from the fault: once reads succeed the SAME
+    // handle classifies the segment as deferrable, so the selector lists
+    // nothing to withdraw. (The derived index LISTING is cached per manifest
+    // snapshot, which is why the query plan above keeps its fallback until
+    // the next version; the format verdict itself is not.)
+    failing.store(false, Ordering::SeqCst);
+    assert!(
+        crate::index::frag_reuse::undeferrable_rewrite_segments(&dataset, &fts_before)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a read fault must not be cached as the legacy verdict"
+    );
+    assert_eq!(
+        coverage_of(&stored_segments(&dataset).await, FTS_INDEX),
+        fts_before,
+        "a read fault never narrows stored provenance"
+    );
+}
+
+/// The commit-time selector treats a marker probe fault as "not
+/// classified": the deferred compaction commits, withdraws nothing from the
+/// segment it could not read, and the verdict is not cached, so once reads
+/// succeed the same handle classifies the segment again. A withdrawal is
+/// durable, so it must never rest on a transient fault.
+#[tokio::test]
+async fn a_read_failure_defers_the_withdrawal_instead_of_failing_the_commit() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_read_failure_commit", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let word = sample_word(&seed).await;
+    let fts_before = coverage_of(&stored_segments(&seed).await, FTS_INDEX);
+    assert!(!fts_before.is_empty());
+    drop(seed);
+
+    // A handle whose index cache has never probed this segment, so the fault
+    // is what the probe meets.
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let results = execute_tasks(&dataset, &plan, &options, None).await;
+    assert!(!results.is_empty(), "the compaction must have a task");
+
+    // With the read failing the selector cannot classify the segment, so the
+    // commit lands and withdraws nothing.
+    failing.store(true, Ordering::SeqCst);
+    commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .expect("a marker read fault must not fail the compaction commit");
+    assert_eq!(
+        coverage_of(&stored_segments(&dataset).await, FTS_INDEX),
+        fts_before,
+        "an unclassifiable segment must keep its provenance; a withdrawal is \
+         durable and must not rest on a transient fault"
+    );
+
+    // Nothing was cached from the fault: with reads restored the SAME handle
+    // classifies this (healthy, deferrable) segment, so the selector lists
+    // nothing to withdraw and the segment keeps translating.
+    failing.store(false, Ordering::SeqCst);
+    assert!(
+        crate::index::frag_reuse::undeferrable_rewrite_segments(&dataset, &fts_before)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a read fault must not be cached as the legacy verdict"
+    );
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "the healthy segment must translate to the rewrite's outputs"
+    );
+    let (_, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert!(
+        !plan_after.contains("FlatMatchQuery"),
+        "the retained segment must serve the query once reads succeed: \
+         {plan_after}"
+    );
+}
 /// crate-internal manifest writer the fragment-reuse reader tests use.
 #[tokio::test]
 async fn a_retired_source_reached_by_the_rewrite_is_withdrawn_one_hop_away() {

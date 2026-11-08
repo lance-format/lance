@@ -79,9 +79,24 @@ pub(super) async fn load_indices(
                 continue;
             }
             if mapping.may_need_translation(index.fragment_bitmap.as_ref()) {
-                let can_remap = segment_supports_batch_remapping(dataset, index)
-                    .await?
-                    .unwrap_or(false);
+                // A probe that cannot reach the segment's format marker says
+                // nothing about its format, and planning every query on the
+                // table must not fail for it. Treat it as unknown for THIS
+                // call only (no coverage, scan fallback, nothing cached), so
+                // the next call reclassifies once the store answers again.
+                let can_remap = match segment_supports_batch_remapping(dataset, index).await {
+                    Ok(can_remap) => can_remap.unwrap_or(false),
+                    Err(error) => {
+                        log::warn!(
+                            "index {} (segment {}): could not read its format marker ({error}); \
+                             excluding it from coverage for this query, its fragments are \
+                             scanned until the read succeeds",
+                            index.name,
+                            index.uuid,
+                        );
+                        false
+                    }
+                };
                 if index.fragment_bitmap.is_none() || !can_remap {
                     continue;
                 }

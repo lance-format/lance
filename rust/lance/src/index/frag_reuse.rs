@@ -2115,10 +2115,21 @@ pub(crate) async fn undeferrable_segments_covering<'a>(
             continue;
         }
         // TODO: Support deferred remapping for all index types.
-        if super::frag_reuse_reader::segment_supports_batch_remapping(dataset, index).await?
-            == Some(false)
-        {
-            undeferrable.push(index.uuid);
+        // Only a CONFIRMED undeferrable verdict withdraws coverage. A probe
+        // that cannot reach the segment's format marker is not a verdict: the
+        // commit proceeds without selecting the segment, so no withdrawal is
+        // persisted from a transient fault and nothing is cached. The reader
+        // refuses such a segment's coverage meanwhile, and a later commit
+        // withdraws once the probe answers.
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, index).await {
+            Ok(Some(false)) => undeferrable.push(index.uuid),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "index {} (segment {}): could not read its format marker ({error}); \
+                 not withdrawing its coverage in this commit",
+                index.name,
+                index.uuid,
+            ),
         }
     }
     Ok(undeferrable)
