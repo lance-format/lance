@@ -420,6 +420,8 @@ impl<'a> TransactionRebase<'a> {
                     dataset,
                     new_indices.iter(),
                     &retired,
+                    Some(lineage),
+                    live,
                 )
                 .await?;
                 Transaction::withdraw_undeferrable_rewrite_coverage(

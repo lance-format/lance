@@ -2018,8 +2018,9 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 
 /// The committed segments whose coverage of `rewritten` a deferred rewrite
 /// must withdraw instead of leaving behind: those that cover one of the
-/// rewritten fragments and whose type cannot translate stored addresses
-/// through the history in batches.
+/// rewritten fragments, directly or through their retired provenance, and
+/// whose type cannot translate stored addresses through the history in
+/// batches.
 ///
 /// The classification is the reader's own
 /// (`segment_supports_batch_remapping`), so a segment the reader would
@@ -2042,29 +2043,75 @@ pub(crate) async fn undeferrable_rewrite_segments(
         return Ok(Vec::new());
     }
     let stored = super::loading::load_all_indices(dataset).await?;
-    undeferrable_segments_covering(dataset, stored.iter(), rewritten).await
+    // A segment may cover `rewritten` only through a retired fragment an
+    // earlier rewrite already moved into it, so the selector needs the same
+    // history and liveness the withdrawal helper walks.
+    let lineage = match stored
+        .iter()
+        .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
+    {
+        Some(entry) => {
+            let ledger = decode_frag_reuse_ledger(dataset, entry).await?;
+            Some(
+                lance_table::system_index::frag_reuse::lineage::TaggedLineage::new(
+                    entry,
+                    Some(Arc::new(ledger)),
+                ),
+            )
+        }
+        None => None,
+    };
+    let live: RoaringBitmap = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter_map(|fragment| u32::try_from(fragment.id).ok())
+        .collect();
+    undeferrable_segments_covering(dataset, stored.iter(), rewritten, lineage.as_ref(), &live).await
 }
 
 /// [`undeferrable_rewrite_segments`] over a supplied segment list: the
-/// segments of `segments` covering one of `fragments` that cannot translate
-/// their stored addresses through the history. Used for segments the
-/// manifest does not list yet, a `CreateIndex` rebased over a committed
-/// rewrite.
+/// segments of `segments` whose coverage of `fragments` cannot be translated
+/// through the history. Used for segments the manifest does not list yet, a
+/// `CreateIndex` rebased over a committed rewrite.
+///
+/// A segment is a candidate when it covers one of `fragments` directly, or
+/// when it covers a retired fragment (outside `live`) whose rows the history
+/// moved into one of `fragments`: that coverage addresses the rewritten
+/// fragment just as much, through one more hop. The reach of a retired
+/// source mirrors the withdrawal helper's conservative rule, so selection
+/// and withdrawal agree on the same fragments: an unwalkable history
+/// (`None` lineage, or `destinations_of` returning `None`) makes every
+/// retired source a candidate rather than silently keeping coverage the
+/// withdrawal would drop.
+///
+/// Only candidates pay the capability probe.
 pub(crate) async fn undeferrable_segments_covering<'a>(
     dataset: &Dataset,
     segments: impl Iterator<Item = &'a IndexMetadata>,
     fragments: &RoaringBitmap,
+    lineage: Option<&lance_table::system_index::frag_reuse::lineage::TaggedLineage>,
+    live: &RoaringBitmap,
 ) -> lance_core::Result<Vec<Uuid>> {
     let mut undeferrable = Vec::new();
     for index in segments {
         if lance_table::system_index::is_system_index(index) {
             continue;
         }
-        if index
-            .fragment_bitmap
-            .as_ref()
-            .is_none_or(|bitmap| bitmap.is_disjoint(fragments))
-        {
+        let Some(bitmap) = index.fragment_bitmap.as_ref() else {
+            continue;
+        };
+        let covers_directly = !bitmap.is_disjoint(fragments);
+        let covers_through_history = !covers_directly
+            && (bitmap - live).iter().any(|source| {
+                match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                    Some(destinations) => destinations
+                        .iter()
+                        .any(|destination| fragments.contains(*destination)),
+                    None => true,
+                }
+            });
+        if !covers_directly && !covers_through_history {
             continue;
         }
         // TODO: Support deferred remapping for all index types.
