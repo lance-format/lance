@@ -1523,6 +1523,11 @@ impl IvfSubIndex for HNSW {
         Self::QueryParams::from_query(query, dist_q_c)
     }
 
+    /// Node ids are row numbers into the partition's vector storage.
+    fn binds_storage_positions() -> bool {
+        true
+    }
+
     fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
         let params = build_params.cloned().unwrap_or_default();
         let max_level = params.max_level;

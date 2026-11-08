@@ -5228,30 +5228,19 @@ async fn legacy_vector_format_is_undeferrable_and_scans_exactly() {
     assert_eq!(ids, truth, "the flat-scan fallback still answers exactly");
 }
 
-/// The divergence the brief asked to pin: deferred remap of an IVF_HNSW_SQ
-/// segment is NOT correct when a rewrite follows a delete on the same output.
+/// Deferred remap of an IVF_HNSW_SQ segment is exact when a rewrite follows a
+/// delete on the same output -- the history that used to fail the query with
+/// "HNSW graph has 128 nodes but its vector storage has 123 rows".
 ///
-/// Deleting 8 rows of F10/F11 and then rewriting those fragments leaves the
-/// HNSW graph with more nodes than its SQ storage has rows: the graph's node
-/// ids are row numbers into storage
-/// (`HnswQueryParams::ensure_storage_covers_graph`,
-/// `lance-index/src/vector/hnsw/builder.rs:326`), and the deferred path
-/// translates the two independently -- storage drops the deleted rows while
-/// the graph keeps its node ids. The guard added for exactly that hazard
-/// turns the query into an error instead of an out-of-bounds score, so the
-/// symptom is a failed KNN, not a wrong answer:
-///
-/// > HNSW graph has 127 nodes but its vector storage has 122 rows, so 5
-/// > node(s) have no vector to score
-///
-/// The same history serves the BTree and the flat scan exactly (`i = 5`
-/// finds its row; `use_index(false)` returns the brute-force top-k), so this
-/// is specific to HNSW's node-id/storage coupling, not to FRI translation.
-/// Ignored because it fails at this pin; unignore it when HNSW either
-/// renumbers its graph with the translation or is classified undeferrable.
+/// The graph's node ids are row numbers into its storage
+/// (`HNSW::ensure_storage_covers_graph`), so a translation that dropped the
+/// deleted rows shifted every position after them and left the graph longer
+/// than the storage. The partition of a sub-index that binds storage
+/// positions is now loaded preserving layout: an unmapped row keeps its slot
+/// under `RowAddress::TOMBSTONE_ROW`, and those slots are excluded through the
+/// prefilter, so rows equal nodes and no result carries a retired address.
 #[tokio::test]
-#[ignore = "HNSW deferred remap is broken when a rewrite follows a delete: graph nodes outrun translated SQ storage"]
-async fn hnsw_deferred_remap_breaks_when_a_rewrite_follows_a_delete() {
+async fn hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete() {
     let dataset = hnsw_tagged_fixture().await;
     let before_rows = live_rows(&dataset).await;
     let query = arrow_array::Float32Array::from(before_rows[37].1.clone());
@@ -5264,15 +5253,39 @@ async fn hnsw_deferred_remap_breaks_when_a_rewrite_follows_a_delete() {
     let rows = live_rows(&dataset).await;
     assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
 
-    // The flat scan and the scalar index both answer correctly on this very
-    // history, so only the HNSW segment is at fault.
+    // The flat scan and the scalar index both answer correctly on this
+    // history, so they bound what the HNSW segment has to match.
     let truth = brute_force_top_k(&rows, query.values());
     let (_, flat_ids, _) = ann_query(&dataset, &query, None, false).await;
     assert_eq!(flat_ids, truth, "the flat scan is exact on this history");
     assert_eq!(dataset.count_rows(Some("i = 5".into())).await.unwrap(), 1);
 
-    // The ANN path is what breaks.
-    let (plan, ids, _) = ann_query(&dataset, &query, None, true).await;
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
     assert!(plan.contains("ANN"), "{plan}");
     assert_eq!(ids, truth, "the HNSW segment must answer exactly");
+    // Neither a tombstoned slot nor a retired fragment may reach the result.
+    let retired: std::collections::HashSet<u32> = [0u32, 1, 2, 10, 11].into_iter().collect();
+    for addr in &addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot escaped"
+        );
+        let fragment = RowAddress::from(*addr).fragment_id();
+        assert!(
+            !retired.contains(&fragment),
+            "row address {addr} points at retired fragment {fragment}"
+        );
+    }
+
+    // Prefiltered: the filter's own translation and the tombstone exclusion
+    // have to compose, with `i < 128` spanning the twice-rewritten output.
+    let filtered: Vec<(i32, Vec<f32>)> = rows.iter().filter(|(i, _)| *i < 128).cloned().collect();
+    let filtered_truth = brute_force_top_k(&filtered, query.values());
+    let (filtered_plan, filtered_ids, _) = ann_query(&dataset, &query, Some("i < 128"), true).await;
+    assert!(filtered_plan.contains("ANN"), "{filtered_plan}");
+    assert_eq!(
+        filtered_ids, filtered_truth,
+        "the prefiltered HNSW search must answer exactly"
+    );
 }

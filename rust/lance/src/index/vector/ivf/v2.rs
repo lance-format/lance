@@ -41,6 +41,7 @@ use lance_core::cache::{
     CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, Result};
@@ -70,9 +71,9 @@ use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, IndexFileKey, OriginLatencyClass, QueryResidual,
     QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
-    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
-    origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
-    resident_store_fits, shares_resident_store,
+    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, RowLayout, VectorStore,
+    entry_columns_setting, origin_latency_setting, resident_columns_setting,
+    resident_lifetime_setting, resident_store_fits, shares_resident_store,
 };
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -91,7 +92,7 @@ use lance_io::{
     ReadBatchParams, object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader,
 };
 use lance_linalg::distance::DistanceType;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -963,6 +964,71 @@ async fn open_reader_cached(
     }
 }
 
+/// A prefilter that also rejects the tombstoned slots of a partition loaded
+/// under [`RowLayout::Preserved`].
+///
+/// Such a partition keeps a row the deferred remap could not map, so the
+/// sub-index's positions still address the right rows, but that slot carries
+/// [`RowAddress::TOMBSTONE_ROW`] and no live row. Reporting a non-empty filter
+/// makes the sub-index take its prefiltered path, where this selects every
+/// non-tombstone row the inner filter selects. The graph may still traverse a
+/// tombstoned node; the results cannot contain it.
+struct TombstoneAwarePreFilter {
+    inner: Arc<dyn PreFilter>,
+    /// Whether `inner` restricts nothing, in which case every non-tombstone
+    /// row is selected without consulting it.
+    inner_is_empty: bool,
+}
+
+impl TombstoneAwarePreFilter {
+    fn new(inner: Arc<dyn PreFilter>) -> Self {
+        let inner_is_empty = inner.is_empty();
+        Self {
+            inner,
+            inner_is_empty,
+        }
+    }
+}
+
+#[async_trait]
+impl PreFilter for TombstoneAwarePreFilter {
+    async fn wait_for_ready(&self) -> Result<()> {
+        self.inner.wait_for_ready().await
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn needs_partition_row_ids(&self) -> bool {
+        false
+    }
+
+    fn mask(&self) -> Arc<RowAddrMask> {
+        self.inner.mask()
+    }
+
+    fn selects_nothing(&self) -> bool {
+        self.inner.selects_nothing()
+    }
+
+    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        if self.inner_is_empty {
+            return row_ids
+                .enumerate()
+                .filter(|&(_, &row_id)| row_id != RowAddress::TOMBSTONE_ROW)
+                .map(|(index, _)| index as u64)
+                .collect();
+        }
+        let row_ids: Vec<u64> = row_ids.copied().collect();
+        self.inner
+            .filter_row_ids(Box::new(row_ids.iter()))
+            .into_iter()
+            .filter(|&index| row_ids[index as usize] != RowAddress::TOMBSTONE_ROW)
+            .collect()
+    }
+}
+
 #[derive(Debug)]
 pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     pub index: S,
@@ -976,6 +1042,13 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     /// cache entry already charges) yet keeping the whole store column
     /// alive, so such an entry must never be cached.
     cache_whole_partition: bool,
+    /// Whether the storage holds rows a deferred remap could not map, which
+    /// kept their slot under [`RowAddress::TOMBSTONE_ROW`] because the
+    /// sub-index addresses its storage by position
+    /// ([`IvfSubIndex::binds_storage_positions`]). Those slots carry no live
+    /// row, so a search must not return them; see
+    /// [`TombstoneAwarePreFilter`].
+    has_tombstones: bool,
     /// Memoized size of the immutable parts (this struct, the sub-index and the
     /// quantized storage): every query that prepares this partition needs its
     /// size to budget scoring chunks, and the walk over the storage's arrays
@@ -996,12 +1069,20 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
         } else {
             storage
         };
+        // Only a position-binding sub-index is loaded preserving layout, so
+        // only it can hold tombstoned slots; scanning the row ids of every
+        // other partition would cost a pass for a known answer.
+        let has_tombstones = S::binds_storage_positions()
+            && storage
+                .row_ids()
+                .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
         Self {
             index,
             storage,
             partition_rows: OnceLock::new(),
             partition_rows_accounted: AtomicBool::new(false),
             cache_whole_partition: true,
+            has_tombstones,
             immutable_bytes: OnceLock::new(),
             coverage_bytes: OnceLock::new(),
         }
@@ -1030,9 +1111,17 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     }
 
     fn partition_rows(&self) -> Arc<RowAddrTreeMap> {
-        let rows = self
-            .partition_rows
-            .get_or_init(|| Arc::new(self.storage.row_ids().collect()));
+        let rows = self.partition_rows.get_or_init(|| {
+            // A tombstoned slot addresses no live row and must not widen the
+            // coverage a prefilter proves emptiness against.
+            Arc::new(
+                self.storage
+                    .row_ids()
+                    .filter(|&&row_id| row_id != RowAddress::TOMBSTONE_ROW)
+                    .copied()
+                    .collect(),
+            )
+        });
         self.coverage_bytes
             .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
         rows.clone()
@@ -1275,6 +1364,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     async fn prefilter_for_partition(
+        index_cache: &WeakLanceCache,
+        partition_id: usize,
+        partition: &Arc<PartitionEntry<S, Q>>,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Arc<dyn PreFilter>> {
+        let resolved =
+            Self::resolve_prefilter(index_cache, partition_id, partition, pre_filter).await?;
+        // The slots a deferred remap could not map stay in the storage so the
+        // sub-index's positions hold; the search must still never return them.
+        Ok(if partition.has_tombstones {
+            Arc::new(TombstoneAwarePreFilter::new(resolved))
+        } else {
+            resolved
+        })
+    }
+
+    async fn resolve_prefilter(
         index_cache: &WeakLanceCache,
         partition_id: usize,
         partition: &Arc<PartitionEntry<S, Q>>,
@@ -2703,7 +2809,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
-        self.storage.load_partition(partition_id, io_stats).await
+        // A sub-index whose node ids are storage positions needs every row's
+        // slot kept across a deferred remap's translation, or its ids would
+        // address the wrong rows (and outrun the storage entirely).
+        let layout = if S::binds_storage_positions() {
+            RowLayout::Preserved
+        } else {
+            RowLayout::Compact
+        };
+        self.storage
+            .load_partition_with_layout(partition_id, io_stats, layout)
+            .await
     }
 
     /// preprocess the query vector given the partition id.
