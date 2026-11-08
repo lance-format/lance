@@ -289,9 +289,12 @@ impl CacheKey for FriQueryPlanKey<'_> {
 /// Build or fetch the snapshot's FRI query plan.
 ///
 /// Cached in the tagged (manifest-path scoped) namespace, so warm opens never
-/// recompute coverage. A plan holding an `Unverifiable` segment is returned
-/// uncached: concurrent builds may then duplicate the work, which is the cost
-/// of re-probing instead of freezing a transient fault for the snapshot.
+/// recompute coverage. A plan built from an unverifiable listing, or holding an
+/// `Unverifiable` segment, is returned uncached, so concurrent cold builds of
+/// such a snapshot each run the derivation -- the cost of re-probing instead of
+/// freezing a transient fault for the snapshot. A healthy snapshot's cold
+/// builds run the derivation concurrently too; the raw ledger, mapping and
+/// format-marker readers they go through stay cached.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
@@ -384,6 +387,13 @@ async fn fri_query_plan(
                         excluded_fragments: parts.excluded,
                         fingerprint,
                     }
+                } else if unverifiable_listing {
+                    // The listing lost a segment to an unreadable marker, so
+                    // this segment's absence says nothing about its coverage.
+                    // Re-probing could answer a definitive reason built on a
+                    // listing that is already known to be incomplete; report
+                    // the uncertainty instead (the plan is uncached below).
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
                 } else {
                     SegmentRemappingPlan::MissingCoverage(
                         missing_coverage_reason(dataset, mapping, source).await?,

@@ -2339,7 +2339,9 @@ impl object_store::ObjectStore for BudgetedFailingReadStore {
 /// assembled from those two inconsistent views freezes "no coverage" for the
 /// whole snapshot: the remap skips the segment and every later query on the
 /// handle is refused or flat-scanned, all because of a fault that is already
-/// over.
+/// over. A segment absent from an unverifiable listing is therefore reported
+/// as unverifiable without re-probing: the caller hears the fault and the
+/// plan is not cached.
 #[tokio::test]
 async fn a_probe_outage_during_maintenance_planning_does_not_poison_the_cached_query_plan() {
     Box::pin(probe_outage_during_maintenance_planning_does_not_poison_the_cached_query_plan())
@@ -2375,16 +2377,28 @@ async fn probe_outage_during_maintenance_planning_does_not_poison_the_cached_que
     let before: Vec<(String, Uuid, RoaringBitmap)> = stored_segments(&dataset).await;
     let fts_before = coverage_of(&before, FTS_INDEX);
     assert!(!fts_before.is_empty());
+    let segment_uuid = before
+        .iter()
+        .find(|(name, _, _)| name == FTS_INDEX)
+        .map(|(_, uuid, _)| *uuid)
+        .expect("the fixture must have an FTS segment");
 
-    // The maintenance plan build. It may skip the segment (that is the
-    // pre-existing `Unverifiable`/`NoDerivedCoverage` skip, not what is under
-    // test); what must not happen is that it leaves a cached verdict behind.
-    let _ = crate::dataset::optimize::remapping::remap_column_index(
+    // The maintenance plan build. The listing it planned from had lost the
+    // segment to the fault, so the caller hears that nothing was remapped --
+    // a definitive reason re-probed against that incomplete listing would be
+    // a silent skip -- and no verdict is left cached behind.
+    let error = crate::dataset::optimize::remapping::remap_column_index(
         &mut dataset,
         &["doc"],
         Some(FTS_INDEX.into()),
     )
-    .await;
+    .await
+    .expect_err("a segment absent from an unverifiable listing must not be a skipped success");
+    let message = error.to_string();
+    assert!(
+        message.contains(&segment_uuid.to_string()),
+        "the error must name the segment the caller asked about: {message}"
+    );
     assert_eq!(
         remaining.load(Ordering::SeqCst),
         0,
