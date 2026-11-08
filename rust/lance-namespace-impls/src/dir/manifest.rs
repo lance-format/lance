@@ -1020,6 +1020,7 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
         // CommitConflict: version collision retries exhausted -> Throttling (safe to retry)
         LanceError::CommitConflict { .. } => NamespaceError::Throttling {
             message: format!("Too many concurrent writes, please retry later: {:?}", e),
+            retry_after: None,
         }
         .into(),
         // TooMuchWriteContention: RetryableCommitConflict (semantic conflict) retries exhausted -> ConcurrentModification

@@ -32,13 +32,16 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::index::{
     load_indices_for_remapping, vector_segment_merge_groups_for_compaction,
 };
-use crate::dataset::versions;
+use crate::dataset::{WriteParams, versions};
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
 use crate::index::{
     loading::{DatasetIndexInternalExt, load_all_indices},
     segment::{index_is_usable, segment_has_vector_details},
 };
+
+/// Default small-file threshold as a percentage of the maximum file size.
+const DEFAULT_MIN_FILE_SIZE_PERCENT: u128 = 95;
 
 /// Controls how data is rewritten during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -105,22 +108,33 @@ impl TryFrom<&str> for IndexRemapMode {
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
     ///
-    /// This is used to determine which fragments need compaction, as any
-    /// fragments that have fewer rows than this value will be candidates for
-    /// compaction.
+    /// Fragments below this row target are candidates for ordinary consolidation
+    /// unless a reliable main data file already meets [`Self::min_bytes_per_file`].
     pub target_rows_per_fragment: usize,
     /// Max number of rows per group
     ///
     /// This does not affect which fragments need compaction, but does affect
     /// how they are re-written if selected.
     pub max_rows_per_group: usize,
-    /// Max number of bytes per file
+    /// Max number of bytes per output data file.
     ///
-    /// This does not affect which frgamnets need compaction, but does affect
-    /// how they are re-written if selected.
-    ///
-    /// If not specified then the default (see [`crate::dataset::WriteParams`]) will be used.
+    /// Defaults to [`crate::dataset::WriteParams::max_bytes_per_file`].
+    /// See [`Self::min_bytes_per_file`] for small-file selection.
     pub max_bytes_per_file: Option<usize>,
+    /// Files at or above this size are excluded from small-file compaction.
+    /// Defaults to 95% of [`Self::max_bytes_per_file`].
+    /// Must be greater than zero and no greater than that limit.
+    /// Files needing cleanup may still be compacted.
+    ///
+    /// ```
+    /// use lance::dataset::optimize::CompactionOptions;
+    /// let options = CompactionOptions {
+    ///     min_bytes_per_file: Some(512 * 1024 * 1024),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    #[serde(default)]
+    pub min_bytes_per_file: Option<usize>,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
     pub materialize_deletions: bool,
@@ -277,6 +291,7 @@ impl Default for CompactionOptions {
             materialize_deletions_threshold: 0.1,
             num_threads: None,
             max_bytes_per_file: None,
+            min_bytes_per_file: None,
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
@@ -310,6 +325,7 @@ impl CompactionOptions {
     /// - `lance.compaction.target_rows_per_fragment`
     /// - `lance.compaction.max_rows_per_group`
     /// - `lance.compaction.max_bytes_per_file`
+    /// - `lance.compaction.min_bytes_per_file`
     /// - `lance.compaction.materialize_deletions`
     /// - `lance.compaction.materialize_deletions_threshold`
     /// - `lance.compaction.defer_index_remap`
@@ -359,6 +375,14 @@ impl CompactionOptions {
                     self.max_bytes_per_file = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "min_bytes_per_file" => {
+                    self.min_bytes_per_file = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a positive integer)",
                             key, value
                         ))
                     })?);
@@ -479,6 +503,17 @@ impl CompactionOptions {
     }
 
     pub fn validate(&mut self) -> Result<()> {
+        let max_bytes = self
+            .max_bytes_per_file
+            .unwrap_or_else(|| WriteParams::default().max_bytes_per_file);
+        if let Some(min_bytes) = self.min_bytes_per_file
+            && (min_bytes == 0 || min_bytes > max_bytes)
+        {
+            return Err(Error::invalid_input(format!(
+                "CompactionOptions::min_bytes_per_file must be greater than 0 and at most max_bytes_per_file ({max_bytes}), got {min_bytes}"
+            )));
+        }
+
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
@@ -650,7 +685,7 @@ impl DefaultCompactionPlanner {
 impl DefaultCompactionPlanner {
     /// Why one fragment is a compaction candidate, if it is: the same rule for
     /// ordinary planning and for caller-chosen groups.
-    fn candidacy_of(
+    pub(super) fn candidacy_of(
         &self,
         fragment: &Fragment,
         metrics: &FragmentMetrics,
@@ -676,8 +711,22 @@ impl DefaultCompactionPlanner {
         {
             Some(CompactionCandidacy::CompactItself)
         } else if metrics.physical_rows < self.options.target_rows_per_fragment {
+            let min_bytes_per_file = self.options.min_bytes_per_file.map_or_else(
+                || {
+                    let max_bytes_per_file = self
+                        .options
+                        .max_bytes_per_file
+                        .unwrap_or_else(|| WriteParams::default().max_bytes_per_file);
+
+                    (max_bytes_per_file as u128 * DEFAULT_MIN_FILE_SIZE_PERCENT).div_ceil(100)
+                        as u64
+                },
+                |bytes| bytes as u64,
+            );
             // Worth compacting only with neighbors, to make a larger fragment.
-            Some(CompactionCandidacy::CompactWithNeighbors)
+            fragment_file_bytes(fragment, schema_field_ids)
+                .is_none_or(|bytes| bytes < min_bytes_per_file)
+                .then_some(CompactionCandidacy::CompactWithNeighbors)
         } else {
             None
         }
@@ -1286,7 +1335,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
 /// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
-struct FragmentMetrics {
+pub(super) struct FragmentMetrics {
     /// The number of original rows in the fragment
     pub physical_rows: usize,
     /// The number of rows that have been deleted
@@ -1318,6 +1367,30 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
         physical_rows,
         num_deletions,
     })
+}
+
+/// Read the main-file size when it reliably indicates whether merging can help.
+/// Multi-file, deleted, overlaid, and obsolete-column layouts return unknown.
+/// Blob sidecars are excluded because the byte cap applies to the main file.
+pub(super) fn fragment_file_bytes(
+    fragment: &Fragment,
+    schema_field_ids: &HashSet<i32>,
+) -> Option<u64> {
+    if fragment.files.len() != 1
+        || fragment.deletion_file.is_some()
+        || !fragment.overlays.is_empty()
+    {
+        return None;
+    }
+    let file = &fragment.files[0];
+    if file
+        .fields
+        .iter()
+        .any(|id| *id >= 0 && !schema_field_ids.contains(id))
+    {
+        return None;
+    }
+    file.file_size_bytes.get().map(|size| size.get())
 }
 
 /// Whether one of `fragment`'s data files is referenced only for the row

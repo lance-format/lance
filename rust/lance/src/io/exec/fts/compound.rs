@@ -71,6 +71,42 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 const WAND_TIE_COMPLETION_BUDGET: usize = 128;
 
 /// One DataFusion boundary around a posting-backed compound scorer tree.
+///
+/// Reconstruction preserves the explicit selection kind, candidate scope and
+/// either the base scorer or canonical prepared Match override. Codecs supply
+/// decoded child plans and value objects; the example reuses existing children
+/// and uses the portable prepared-state constructor from `lance-index`.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{io::exec::fts::CompoundQueryExec, Error, Result};
+/// # use lance_index::scalar::inverted::PreparedBm25Query;
+/// # fn rebuild(exec: &CompoundQueryExec) -> Result<CompoundQueryExec> {
+/// let mut rebuilt = if let Some(segments) = exec.preset_segments() {
+///     CompoundQueryExec::new_with_segments(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), segments.to_vec(),
+///     )
+/// } else {
+///     let uuids = exec.explicit_segment_uuids()
+///         .ok_or_else(|| Error::invalid_input("compound FTS needs an explicit selection"))?;
+///     CompoundQueryExec::new_with_segment_uuids(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), uuids,
+///     )
+/// }.with_external_mask(exec.external_mask().cloned());
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// if let Some(prepared) = exec.prepared_match() {
+///     rebuilt = rebuilt.with_prepared_match(Arc::new(PreparedBm25Query::from_parts(
+///         prepared.tokens().clone(), prepared.scorer().clone(),
+///         prepared.has_all_query_positions(),
+///     )));
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct CompoundQueryExec {
     dataset: Arc<Dataset>,
@@ -175,7 +211,6 @@ impl CompoundQueryExec {
     ///
     /// This is required for distributed fuzzy execution over a segment subset;
     /// a scorer alone cannot preserve the globally capped rewrite.
-    #[doc(hidden)]
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
         self.prepared_match = Some(prepared);
         self.base_scorer = None;
@@ -200,6 +235,29 @@ impl CompoundQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    /// Canonical root-Match vocabulary and scorer, or `None` for native
+    /// preparation. Restore its values with [`PreparedBm25Query::from_parts`]
+    /// so dictionary term IDs and other local preparation caches are not copied.
+    /// See [`Self`] for a reconstruction example.
+    pub fn prepared_match(&self) -> Option<&Arc<PreparedBm25Query>> {
+        self.prepared_match.as_ref()
+    }
+
+    /// Additional candidate mask in the indices' row-id domain, or `None` for
+    /// no external restriction. It does not narrow the statistics corpus.
+    /// See [`Self`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
+    /// Exact resolved metadata in its original order. `None` denotes deferred
+    /// UUID selection; use [`Self::explicit_segment_uuids`] in that case.
+    /// An empty resolved selection remains explicit and must not widen to all
+    /// committed segments. See [`Self`] for a reconstruction example.
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.segment_selection.preset_segments()
     }
 
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
@@ -459,8 +517,8 @@ impl HybridCompoundQueryExec {
     }
 
     /// The indexed segments this scorer reads. Paired with
-    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
-    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// [`Self::residual_input`], [`Self::indexed_input`] and [`Self::new`], this
+    /// lets a caller rebuild the node. The FTS top-k lives in [`Self::params`], not in a
     /// fetch node, so changing it means reconstruction.
     pub fn segments(&self) -> &[IndexMetadata] {
         &self.segments
@@ -514,6 +572,39 @@ impl HybridCompoundQueryExec {
         );
         result.indexed_input = Some((input, committed_scorer));
         Ok(result)
+    }
+
+    /// The externally computed indexed candidates and their committed-index
+    /// scorer, or `None` when this node searches its indexed segments locally.
+    ///
+    /// Preserve the pair together through [`Self::with_indexed_input`]. The
+    /// residual input remains separate, and its query-local index is rebuilt
+    /// during execution. A codec supplies decoded children; this example reuses
+    /// the existing children and reconstructs the scorer from its values.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::io::exec::fts::HybridCompoundQueryExec;
+    /// # use lance_index::scalar::inverted::MemBM25Scorer;
+    /// # fn rebuild(exec: &HybridCompoundQueryExec)
+    /// #     -> datafusion::error::Result<HybridCompoundQueryExec> {
+    /// let rebuilt = HybridCompoundQueryExec::new(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.column().to_owned(), exec.segments().to_vec(),
+    ///     exec.residual_input().clone(),
+    /// );
+    /// match exec.indexed_input() {
+    ///     Some((input, scorer)) => rebuilt.with_indexed_input(
+    ///         input.clone(), Arc::new(MemBM25Scorer::new(
+    ///             scorer.total_tokens, scorer.num_docs, scorer.token_docs.clone(),
+    ///         )),
+    ///     ),
+    ///     None => Ok(rebuilt),
+    /// }
+    /// # }
+    /// ```
+    pub fn indexed_input(&self) -> Option<&(Arc<dyn ExecutionPlan>, Arc<MemBM25Scorer>)> {
+        self.indexed_input.as_ref()
     }
 
     /// The scan over the fragments no segment covers.
@@ -1348,7 +1439,7 @@ impl ExecutionPlan for CompoundQueryExec {
 #[derive(Debug, Clone)]
 struct CompoundColumnSelection {
     column: String,
-    segment_selection: FtsSegmentSelection,
+    segments: Arc<[IndexMetadata]>,
 }
 
 /// One DataFusion boundary around a cross-column posting-backed scorer tree.
@@ -1433,7 +1524,7 @@ impl CrossColumnCompoundQueryExec {
             .into_iter()
             .map(|(column, segments)| CompoundColumnSelection {
                 column,
-                segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+                segments: Arc::from(segments),
             })
             .collect::<Vec<_>>();
         Ok(Self {
@@ -1474,6 +1565,39 @@ impl CrossColumnCompoundQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// The exact resolved segments for each column, preserving both column order
+    /// and each column's segment order. Segment ordinals across columns are not
+    /// aligned and must not be zipped together.
+    ///
+    /// These are the inputs accepted by [`Self::new_with_segments`]. Execution
+    /// still validates the selected segments' document granularity before search.
+    ///
+    /// ```
+    /// # use lance::{io::exec::fts::CrossColumnCompoundQueryExec, Result};
+    /// # fn rebuild(exec: &CrossColumnCompoundQueryExec)
+    /// #     -> Result<CrossColumnCompoundQueryExec> {
+    /// let columns = exec.column_segments()
+    ///     .map(|(column, segments)| (column.to_owned(), segments.to_vec()))
+    ///     .collect();
+    /// Ok(CrossColumnCompoundQueryExec::new_with_segments(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.prefilter_source().clone(), columns,
+    /// )?.with_external_mask(exec.external_mask().cloned()))
+    /// # }
+    /// ```
+    pub fn column_segments(&self) -> impl ExactSizeIterator<Item = (&str, &[IndexMetadata])> {
+        self.columns
+            .iter()
+            .map(|selection| (selection.column.as_str(), selection.segments.as_ref()))
+    }
+
+    /// Additional candidate restriction in the indices' row-id domain, or
+    /// `None` for no external mask. Corpus statistics remain independent of it.
+    /// See [`Self::column_segments`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
     }
 
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
@@ -1597,20 +1721,8 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let selected_segments = columns
                 .iter()
-                .flat_map(|selection| {
-                    selection
-                        .segment_selection
-                        .preset_segments()
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                })
+                .flat_map(|selection| selection.segments.iter().cloned())
                 .collect::<Vec<_>>();
-            if selected_segments.is_empty() {
-                return Err(DataFusionError::Internal(
-                    "cross-column compound FTS lost its exact segment selections".to_string(),
-                ));
-            }
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
@@ -1630,8 +1742,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 let dataset = dataset.clone();
                 let metrics = metrics.clone();
                 async move {
-                    let segments = selection
-                        .segment_selection
+                    let segments = FtsSegmentSelection::ExactResolved(selection.segments)
                         .resolve(
                             &dataset,
                             &selection.column,

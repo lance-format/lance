@@ -42,6 +42,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> targetRowsPerFragment;
   private Optional<Long> maxRowsPerGroup;
   private Optional<Long> maxBytesPerFile;
+  private Optional<Long> minBytesPerFile;
   private Optional<Boolean> materializeDeletions;
   private Optional<Float> materializeDeletionsThreshold;
   private Optional<Long> numThreads;
@@ -59,6 +60,7 @@ public class CompactionOptions implements Serializable {
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
+      Optional<Long> minBytesPerFile,
       Optional<Boolean> materializeDeletions,
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
@@ -74,6 +76,7 @@ public class CompactionOptions implements Serializable {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
+    this.minBytesPerFile = minBytesPerFile;
     this.materializeDeletions = materializeDeletions;
     this.materializeDeletionsThreshold = materializeDeletionsThreshold;
     this.numThreads = numThreads;
@@ -138,6 +141,11 @@ public class CompactionOptions implements Serializable {
     return maxBytesPerFile;
   }
 
+  /** Returns the optional file-size threshold in bytes for small-file compaction. */
+  public Optional<Long> getMinBytesPerFile() {
+    return minBytesPerFile;
+  }
+
   public Optional<Long> getMaxRowsPerGroup() {
     return maxRowsPerGroup;
   }
@@ -160,6 +168,7 @@ public class CompactionOptions implements Serializable {
         .add("targetRowsPerFragment", targetRowsPerFragment.orElse(null))
         .add("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
         .add("maxBytesPerFile", maxBytesPerFile.orElse(null))
+        .add("minBytesPerFile", minBytesPerFile.orElse(null))
         .add("materializeDeletions", materializeDeletions.orElse(null))
         .add("materializeDeletionsThreshold", materializeDeletionsThreshold.orElse(null))
         .add("numThreads", numThreads.orElse(null))
@@ -191,6 +200,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceBytes.orElse(null));
     output.writeObject(excludedFragmentIds);
     output.writeObject(getDataStorageVersion().orElse(null));
+    output.writeObject(minBytesPerFile.orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -218,6 +228,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = readTrailingLong(input);
     this.excludedFragmentIds = readTrailingLongList(input);
     this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
+    this.minBytesPerFile = readTrailingLong(input);
   }
 
   /**
@@ -268,6 +279,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> targetRowsPerFragment = Optional.empty();
     private Optional<Long> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
+    private Optional<Long> minBytesPerFile = Optional.empty();
     private Optional<Boolean> materializeDeletions = Optional.empty();
     private Optional<Float> materializeDeletionsThreshold = Optional.empty();
     private Optional<Long> numThreads = Optional.empty();
@@ -293,8 +305,26 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /**
+     * Maximum bytes per output file. Defaults to the dataset config value, or the <a
+     * href="https://docs.rs/lance/latest/lance/dataset/write/struct.WriteParams.html#structfield.max_bytes_per_file">writer's
+     * default</a>.
+     */
     public Builder withMaxBytesPerFile(long maxBytesPerFile) {
       this.maxBytesPerFile = Optional.of(maxBytesPerFile);
+      return this;
+    }
+
+    /**
+     * Files at or above this size are excluded from small-file compaction. Defaults to the dataset
+     * config value, or 95% of {@link #withMaxBytesPerFile(long) maxBytesPerFile}. Must be greater
+     * than zero and no greater than that limit. Files needing cleanup may still be compacted.
+     *
+     * <p>Example: {@code CompactionOptions.builder().withMinBytesPerFile(512L * 1024 *
+     * 1024).build()}.
+     */
+    public Builder withMinBytesPerFile(long minBytesPerFile) {
+      this.minBytesPerFile = Optional.of(minBytesPerFile);
       return this;
     }
 
@@ -420,6 +450,7 @@ public class CompactionOptions implements Serializable {
           targetRowsPerFragment,
           maxRowsPerGroup,
           maxBytesPerFile,
+          minBytesPerFile,
           materializeDeletions,
           materializeDeletionsThreshold,
           numThreads,

@@ -13,7 +13,8 @@
 //! can compact in two cases:
 //!
 //! 1. If a fragment has fewer rows than the target number of rows per fragment.
-//!    The fragment must also have neighbors that are also candidates for
+//!    A reliable main data file must also be below the configured small-file
+//!    size threshold. The fragment must have neighbors that are candidates for
 //!    compaction.
 //! 2. If a fragment has a higher percentage of deleted rows than the provided
 //!    threshold.
@@ -128,7 +129,13 @@ pub async fn compact_files(
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
     let planner =
         DefaultCompactionPlanner::new(options)?.with_index_remapper(remap_options.as_ref());
-    compact_files_with_planner(dataset, Some(remap_options), &planner).await
+    // Keep the compaction state machine from inflating callers' futures.
+    Box::pin(compact_files_with_planner(
+        dataset,
+        Some(remap_options),
+        &planner,
+    ))
+    .await
 }
 
 pub async fn compact_files_with_planner(

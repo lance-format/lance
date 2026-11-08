@@ -20,7 +20,7 @@ use roaring::RoaringBitmap;
 use serde_json::json;
 
 use crate::dataset::index::LanceIndexStoreExt;
-use crate::index::api::DatasetIndexExt;
+use crate::index::api::{DatasetIndexExt, IndexSegmentStatistics};
 use crate::index::loading::{DatasetIndexInternalExt, find_frag_reuse_index_meta};
 use crate::index::scalar::{self, IndexDetails};
 use crate::index::segment::segment_has_vector_details;
@@ -437,8 +437,67 @@ pub(super) async fn index_statistics_scalar(
     let field_id = metadatas[0].fields[0];
     let field_path = ds.schema().field_path(field_id)?;
 
-    let (indices_stats, index_uri, num_indices, updated_at) =
-        collect_regular_indices_statistics(ds, metadatas, &field_path).await?;
+    let segment_statistics =
+        collect_regular_indices_statistics(ds, &metadatas, &field_path).await?;
+    match serialize_regular_index_statistics(ds, index_name, &metadatas, segment_statistics).await?
+    {
+        Some(statistics) => Ok(statistics),
+        None => migrate_and_recompute_index_statistics(ds, index_name).await,
+    }
+}
+
+pub(super) async fn serialize_regular_index_statistics(
+    ds: &Dataset,
+    index_name: &str,
+    metadatas: &[IndexMetadata],
+    segment_statistics: Vec<IndexSegmentStatistics>,
+) -> Result<Option<String>> {
+    if segment_statistics.len() != metadatas.len() {
+        return Err(Error::invalid_input(format!(
+            "Expected {} segment statistics for index {index_name}, got {}",
+            metadatas.len(),
+            segment_statistics.len()
+        )));
+    }
+    let expected_uuids: HashSet<_> = metadatas.iter().map(|metadata| metadata.uuid).collect();
+    let mut statistics_by_uuid = HashMap::with_capacity(segment_statistics.len());
+    for statistics in segment_statistics {
+        if statistics.read_version != ds.manifest.version {
+            return Err(Error::invalid_input(format!(
+                "Index segment {} statistics are from dataset version {}, expected {}",
+                statistics.index_uuid, statistics.read_version, ds.manifest.version
+            )));
+        }
+        if !expected_uuids.contains(&statistics.index_uuid) {
+            return Err(Error::invalid_input(format!(
+                "Segment {} does not belong to index {index_name} at this snapshot",
+                statistics.index_uuid
+            )));
+        }
+        if statistics_by_uuid
+            .insert(statistics.index_uuid, statistics)
+            .is_some()
+        {
+            return Err(Error::invalid_input(format!(
+                "Duplicate segment statistics for index {index_name}"
+            )));
+        }
+    }
+    let mut indices_stats = Vec::with_capacity(metadatas.len());
+    let mut index_uri = None;
+    for metadata in metadatas {
+        let statistics = statistics_by_uuid.remove(&metadata.uuid).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Missing statistics for index segment {}",
+                metadata.uuid
+            ))
+        })?;
+        if !statistics.index_type_uri.is_empty() {
+            index_uri.get_or_insert(statistics.index_type_uri);
+        }
+        indices_stats.push(statistics.statistics);
+    }
+    let index_uri = index_uri.unwrap_or_else(|| "unknown".to_string());
 
     let index_type_hint = indices_stats
         .first()
@@ -454,9 +513,15 @@ pub(super) async fn index_statistics_scalar(
         num_unindexed_rows,
     )) = gather_fragment_statistics(ds, index_name).await?
     else {
-        return migrate_and_recompute_index_statistics(ds, index_name).await;
+        return Ok(None);
     };
 
+    let num_indices = metadatas.len();
+    let updated_at = metadatas
+        .iter()
+        .filter_map(|metadata| metadata.created_at)
+        .max()
+        .map(|timestamp| timestamp.timestamp_millis() as u64);
     let stats = json!({
         "index_type": index_type,
         "name": index_name,
@@ -472,67 +537,68 @@ pub(super) async fn index_statistics_scalar(
         "updated_at_timestamp_ms": updated_at,
     });
 
-    serialize_index_statistics(&stats)
+    serialize_index_statistics(&stats).map(Some)
 }
 
 async fn collect_regular_indices_statistics(
     ds: &Dataset,
-    metadatas: Vec<IndexMetadata>,
+    metadatas: &[IndexMetadata],
     field_path: &str,
-) -> Result<(Vec<serde_json::Value>, String, usize, Option<u64>)> {
-    let num_indices = metadatas.len();
-    let updated_at = metadatas
-        .iter()
-        .filter_map(|m| m.created_at)
-        .max()
-        .map(|dt| dt.timestamp_millis() as u64);
-
-    let mut indices_stats = Vec::with_capacity(num_indices);
-    let mut index_uri: Option<String> = None;
-
-    for meta in metadatas.iter() {
-        // Externally maintained indices can keep coverage in their own payload
-        // and deliberately declare an empty bitmap. Other empty indices carry
-        // only a definition until there is enough data to train them.
-        let is_externally_maintained = is_externally_maintained_index(meta);
-        if !is_externally_maintained
-            && meta
-                .fragment_bitmap
-                .as_ref()
-                .is_some_and(roaring::RoaringBitmap::is_empty)
-        {
-            indices_stats.push(serde_json::json!({}));
-            continue;
-        }
-        let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, meta).await?);
-        let index_details = scalar::fetch_index_details(ds, field_path, meta).await?;
-        if index_uri.is_none() {
-            index_uri = Some(index_details.type_url.clone());
-        }
-
-        let index_details_wrapper = scalar::IndexDetails(index_details.clone());
-        if let Ok(plugin) = index_details_wrapper.get_plugin()
-            && let Some(stats) = plugin
-                .load_statistics(index_store.clone(), index_details.as_ref())
-                .await?
-        {
-            indices_stats.push(stats);
-            continue;
-        }
-
-        let index = ds
-            .open_generic_index(field_path, &meta.uuid, &NoOpMetricsCollector)
-            .await?;
-
-        indices_stats.push(index.statistics()?);
+) -> Result<Vec<IndexSegmentStatistics>> {
+    let mut statistics = Vec::with_capacity(metadatas.len());
+    for metadata in metadatas {
+        statistics.push(collect_index_segment_statistics(ds, metadata, field_path).await?);
     }
+    Ok(statistics)
+}
 
-    Ok((
-        indices_stats,
-        index_uri.unwrap_or_else(|| "unknown".to_string()),
-        num_indices,
-        updated_at,
-    ))
+pub(super) async fn collect_index_segment_statistics(
+    ds: &Dataset,
+    metadata: &IndexMetadata,
+    field_path: &str,
+) -> Result<IndexSegmentStatistics> {
+    // Externally maintained indices can keep coverage in their own payload and
+    // deliberately declare an empty bitmap. Other empty indices carry only a
+    // definition until there is enough data to train them.
+    if !is_externally_maintained_index(metadata)
+        && metadata
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)
+    {
+        return Ok(IndexSegmentStatistics {
+            read_version: ds.manifest.version,
+            index_uuid: metadata.uuid,
+            index_type_uri: String::new(),
+            statistics: json!({}),
+        });
+    }
+    let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(ds, metadata).await?);
+    let index_details = scalar::fetch_index_details(ds, field_path, metadata).await?;
+    let index_details_wrapper = scalar::IndexDetails(index_details.clone());
+    let stored_statistics = match index_details_wrapper.get_plugin() {
+        Ok(plugin) => {
+            plugin
+                .load_statistics(index_store, index_details.as_ref())
+                .await?
+        }
+        Err(_) => None,
+    };
+    let statistics = match stored_statistics {
+        Some(statistics) => statistics,
+        None => {
+            let index = ds
+                .open_generic_index(field_path, &metadata.uuid, &NoOpMetricsCollector)
+                .await?;
+            index.statistics()?
+        }
+    };
+    Ok(IndexSegmentStatistics {
+        read_version: ds.manifest.version,
+        index_uuid: metadata.uuid,
+        index_type_uri: index_details.type_url.clone(),
+        statistics,
+    })
 }
 
 async fn gather_fragment_statistics(

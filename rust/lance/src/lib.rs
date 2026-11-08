@@ -80,7 +80,7 @@
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
-pub use lance_core::{Error, Result, cache};
+pub use lance_core::{Error, Result, cache, memory};
 use std::sync::LazyLock;
 
 pub mod arrow;
@@ -97,7 +97,15 @@ pub mod utils;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+    include!("pb/lance.pb.rs");
+}
+
+/// Protobuf transport used by cache diagnostics language bindings.
+///
+/// These messages are runtime API payloads and are not part of the persisted
+/// Lance file format.
+pub mod cache_diagnostics_pb {
+    include!("pb/lance.cache.rs");
 }
 
 pub use blob::{

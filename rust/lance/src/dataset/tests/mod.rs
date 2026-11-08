@@ -9,6 +9,7 @@ mod dataset_clustering_metadata;
 mod dataset_common;
 mod dataset_concurrency_store;
 mod dataset_fts_combined_fields;
+mod dataset_fts_plan_state;
 #[cfg(feature = "geo")]
 mod dataset_geo;
 mod dataset_index;
@@ -30,6 +31,7 @@ mod dataset_wide_table;
 mod dataset_zone_map_seed_reuse;
 mod dataset_zone_map_seeds;
 mod dataset_zone_map_versions;
+mod fragment_update_columns_from_stream;
 mod fragment_validate_tombstones;
 mod fragment_write_columns;
 mod merge_coverage;

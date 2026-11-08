@@ -9,6 +9,7 @@ use crate::vector::bq::planes::{EntryColumns, PlaneBatch, PlaneKey, plane_column
 use crate::vector::bq::resident::{
     ResidentColumnStore, ResidentLoadTrigger, ResidentRows, is_resident,
 };
+use crate::vector::bq::row_addresses::{TranslatedRowAddresses, TranslatedRowAddressesKey};
 use crate::vector::bq::scan_stats;
 use crate::vector::bq::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RabitQueryEstimator};
 use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
@@ -29,7 +30,9 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, ReaderProjection};
-use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
+use lance_index_core::remapping::{
+    BatchRowIdRemapper, remap_row_ids_async, remap_row_ids_preserving_layout_async,
+};
 use lance_io::ReadBatchParams;
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
@@ -156,6 +159,12 @@ pub trait DistCalculator {
     }
 
     fn prefetch(&self, _id: u32) {}
+
+    /// Whether the final score of `id`, scored `dist` by [`Self::distance`], lies
+    /// in `[lower, upper)`; [`VectorStore::rerank`] may replace `dist`.
+    fn in_range(&self, _id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        dist >= lower && dist < upper
+    }
 
     /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
     /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
@@ -661,6 +670,32 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         selected
             .iter()
             .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
+    }
+
+    /// The calculator a graph search walks with; [`Self::rerank`] corrects it.
+    fn graph_dist_calculator(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+    ) -> Self::DistanceCalculator<'_> {
+        self.dist_calculator(query, dist_q_c)
+    }
+
+    /// Prepares a partition's storage for searches over its graph.
+    fn for_graph_search(self) -> Self {
+        self
+    }
+
+    /// Re-scores and re-sorts the candidates of a graph search. Returns
+    /// `false`, the default, when the search scores are final.
+    fn rerank(&self, _query: ArrayRef, _dist_q_c: f32, _results: &mut [OrderedNode]) -> bool {
+        false
+    }
+
+    /// Gives a partition's storage its IVF `centroid` before a graph build; RQ
+    /// stages its rows for code-to-code scoring with it.
+    fn with_centroid(self, _centroid: &dyn Array) -> Result<Self> {
+        Ok(self)
     }
 }
 
@@ -1342,6 +1377,8 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     /// Asynchronous batch remapper (tagged histories).
     batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+    /// Address-only views under the current file and translation identity.
+    row_address_cache: Option<WeakLanceCache>,
     /// See [`Self::origin_latency`].
     origin_latency: OriginLatencyClass,
     /// See [`Self::resident_columns`].
@@ -1450,6 +1487,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
@@ -1494,6 +1532,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             ivf,
             frag_reuse_index,
             batch_remapper: None,
+            row_address_cache: None,
             origin_latency: OriginLatencyClass::default(),
             resident_columns: ResidentColumns::default(),
             resident_columns_enabled: false,
@@ -1511,6 +1550,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.frag_reuse_index = None;
         self.batch_remapper = Some(remapping);
         debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
+        self
+    }
+
+    /// Cache translated candidate addresses without retaining encoded columns.
+    ///
+    /// The caller must scope `cache` to both the immutable file location and
+    /// the current segment translation, including coverage and exclusions.
+    /// Query filters and current deletion masks are applied after this view.
+    pub fn with_row_address_cache(mut self, cache: WeakLanceCache) -> Self {
+        self.row_address_cache = Some(cache);
         self
     }
 
@@ -1987,10 +2036,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         for &plane in &planes {
             for part_id in 0..self.num_partitions() {
                 if plane > 0
-                    && cache
-                        .get_resident_with_key(&self.plane_key(part_id, 0))
+                    && !cache
+                        .peek_resident_with_key(&self.plane_key(part_id, 0))
                         .await
-                        .is_none()
                 {
                     continue;
                 }
@@ -2125,9 +2173,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let sign_resident = plane == 0
             || cache
-                .get_resident_with_key(&self.plane_key(part_id, 0))
-                .await
-                .is_some();
+                .peek_resident_with_key(&self.plane_key(part_id, 0))
+                .await;
         let batch = if sign_resident {
             cache
                 .get_or_insert_with_key_hit(key, || async {
@@ -2341,35 +2388,58 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                         "sign preparation requires non-null uint64 column {ROW_ID}"
                     ))
                 })?;
-            if let Some(remapper) = &self.batch_remapper {
-                remap_row_ids_preserving_layout_async(remapper.as_ref(), sign, row_id_idx)
+            let translate = || async {
+                let started = Instant::now();
+                let ids = if let Some(remapper) = &self.batch_remapper {
+                    remap_row_ids_async(remapper.as_ref(), row_ids.values())
+                        .await?
+                        .into_iter()
+                        .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                        .collect::<Vec<_>>()
+                } else if let Some(remapper) = &self.frag_reuse_index {
+                    let remapper = remapper.clone();
+                    let row_ids = row_ids.clone();
+                    spawn_cpu(move || {
+                        Ok::<_, Error>(
+                            row_ids
+                                .values()
+                                .iter()
+                                .map(|&id| {
+                                    remapper
+                                        .remap_row_id(id)
+                                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
                     .await?
-                    .0
-            } else if let Some(remapper) = &self.frag_reuse_index {
-                let remapper = remapper.clone();
-                let row_ids = row_ids.clone();
-                spawn_cpu(move || {
-                    let mut translated: Option<Vec<u64>> = None;
-                    for (offset, &id) in row_ids.values().iter().enumerate() {
-                        let mapped = remapper
-                            .remap_row_id(id)
-                            .unwrap_or(RowAddress::TOMBSTONE_ROW);
-                        if mapped != id {
-                            translated.get_or_insert_with(|| row_ids.values().to_vec())[offset] =
-                                mapped;
-                        }
+                } else {
+                    return Err(Error::internal(
+                        "candidate address translation has no remapper",
+                    ));
+                };
+                // Own precisely this partition's addresses. An identity map
+                // must not pin a slice of the whole resident file store.
+                let stats = scan_stats::counters();
+                stats.row_address_translation_rows.add(ids.len() as u64);
+                stats.row_address_translation_ns.add_elapsed(started);
+                Ok(TranslatedRowAddresses(UInt64Array::from(ids)))
+            };
+            let addresses = match &self.row_address_cache {
+                Some(cache) => {
+                    let (addresses, hit) = cache
+                        .get_or_insert_with_key_hit(TranslatedRowAddressesKey(part_id), translate)
+                        .await?;
+                    if hit {
+                        scan_stats::counters().row_address_cache_hits.incr();
+                    } else {
+                        scan_stats::counters().row_address_cache_misses.incr();
                     }
-                    match translated {
-                        Some(ids) => {
-                            sign.replace_column_by_name(ROW_ID, Arc::new(UInt64Array::from(ids)))
-                        }
-                        None => Ok(sign),
-                    }
-                })
-                .await?
-            } else {
-                sign
-            }
+                    addresses
+                }
+                None => Arc::new(translate().await?),
+            };
+            sign.replace_column_by_name(ROW_ID, Arc::new(addresses.0.clone()))?
         } else {
             sign
         };

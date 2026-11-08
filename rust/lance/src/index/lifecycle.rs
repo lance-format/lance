@@ -8,7 +8,7 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -26,7 +26,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
-use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use crate::index::append;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse;
@@ -50,8 +50,8 @@ use crate::index::segment::{
     validate_segment_params_compatible,
 };
 use crate::index::statistics::{
-    IndexDescriptionImpl, index_statistics_frag_reuse, index_statistics_mem_wal,
-    index_statistics_scalar,
+    IndexDescriptionImpl, collect_index_segment_statistics, index_statistics_frag_reuse,
+    index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
 };
 use crate::index::vector;
 use crate::index::vector::details::needs_vector_details_inference;
@@ -1142,6 +1142,70 @@ impl DatasetIndexExt for Dataset {
         index_statistics_scalar(self, index_name, metadatas)
             .boxed()
             .await
+    }
+
+    async fn index_segment_statistics(
+        &self,
+        index_name: &str,
+        index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>> {
+        if index_uuids.is_empty() {
+            return Err(Error::invalid_input(
+                "At least one index segment UUID is required".to_string(),
+            ));
+        }
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.iter().any(is_system_index) {
+            return Err(Error::invalid_input(
+                "Segment statistics are not supported for system indexes".to_string(),
+            ));
+        }
+        let metadata_by_uuid: HashMap<_, _> = metadatas
+            .iter()
+            .map(|metadata| (metadata.uuid, metadata))
+            .collect();
+        let mut seen_uuids = HashSet::with_capacity(index_uuids.len());
+        let mut statistics = Vec::with_capacity(index_uuids.len());
+        for index_uuid in index_uuids {
+            if !seen_uuids.insert(*index_uuid) {
+                return Err(Error::invalid_input(format!(
+                    "Duplicate index segment UUID: {index_uuid}"
+                )));
+            }
+            let metadata = metadata_by_uuid.get(index_uuid).ok_or_else(|| {
+                Error::index_not_found(format!("name={index_name}, uuid={index_uuid}"))
+            })?;
+            let field_id = metadata.fields.first().ok_or_else(|| {
+                Error::index(format!("Index segment {index_uuid} has no indexed field"))
+            })?;
+            let field_path = self.schema().field_path(*field_id)?;
+            statistics.push(collect_index_segment_statistics(self, metadata, &field_path).await?);
+        }
+        Ok(statistics)
+    }
+
+    async fn index_statistics_from_segments(
+        &self,
+        index_name: &str,
+        segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String> {
+        let metadatas = self.load_indices_by_name(index_name).await?;
+        if metadatas.iter().any(is_system_index) {
+            return Err(Error::invalid_input(
+                "Segment statistics are not supported for system indexes".to_string(),
+            ));
+        }
+        if metadatas.is_empty() {
+            return Err(Error::index_not_found(format!("name={index_name}")));
+        }
+        serialize_regular_index_statistics(self, index_name, &metadatas, segment_statistics)
+            .await?
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "Outdated fragment metadata for index {index_name}: collect index statistics \
+                     in non-distributed mode to migrate before retrying"
+                ))
+            })
     }
 
     async fn read_index_partition(
