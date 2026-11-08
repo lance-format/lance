@@ -64,7 +64,9 @@ impl CacheKey for InvertedFormatKey {
 /// it is a build in progress. Reporting `None` there keeps the withdrawal
 /// selector from treating a modern distributed build as untranslatable, and
 /// the non-verdict is never memoized: the finalize that publishes the root
-/// metadata makes the same call definitive.
+/// metadata makes the same call definitive. A segment being replayed into a
+/// commit carries no recorded file list, so the layout is read from its index
+/// directory rather than assumed legacy.
 ///
 /// Only a confirmed missing metadata file reports the legacy layout. Any
 /// other failure to read it propagates and nothing is cached: an
@@ -96,7 +98,7 @@ pub async fn inverted_supports_batch_remapping(
         // Only a segment that has published its layout answers for it. An
         // unfinalized build's root metadata is simply not written yet.
         Err(e) if e.is_not_found() => {
-            if segment_files_are_staged(index) {
+            if segment_files_are_staged_or_listed(dataset, index).await? {
                 return Ok(None);
             }
             false
@@ -112,13 +114,29 @@ pub async fn inverted_supports_batch_remapping(
 
 /// Whether every index file this segment records is a staged build artifact,
 /// i.e. the build has not published its final layout.
-fn segment_files_are_staged(index: &IndexMetadata) -> bool {
-    index.files.as_ref().is_some_and(|files| {
-        !files.is_empty()
-            && files
-                .iter()
-                .all(|file| lance_index::scalar::inverted::builder::is_staged_path(&file.path))
-    })
+///
+/// A segment replayed at commit time carries no file list (the commit collects
+/// the files from the index directory), so the recorded list cannot answer and
+/// the directory is listed instead. A recorded list keeps the zero-store-call
+/// shortcut; a listed directory holding no staged file is the legacy layout.
+async fn segment_files_are_staged_or_listed(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> Result<bool> {
+    if let Some(files) = index.files.as_ref() {
+        return Ok(all_staged(files));
+    }
+    let index_dir = dataset.indices_dir().join(index.uuid.to_string());
+    let files =
+        lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+    Ok(all_staged(&files))
+}
+
+fn all_staged(files: &[lance_table::format::IndexFile]) -> bool {
+    !files.is_empty()
+        && files
+            .iter()
+            .all(|file| lance_index::scalar::inverted::builder::is_staged_path(&file.path))
 }
 
 /// Legacy vector file readers keep their existing V1 behavior and scan fallback.

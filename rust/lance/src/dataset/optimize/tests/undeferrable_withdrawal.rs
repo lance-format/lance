@@ -2941,3 +2941,101 @@ async fn append_unindexed_fragment(dataset: &mut Dataset) {
         .await
         .unwrap();
 }
+
+/// A staged full-text build may be committed straight through
+/// `commit_existing_index_segments`, without the finalizing merge. The replay
+/// carries no recorded file list, so a layout decision taken from that list
+/// alone reads the absent root metadata as the legacy layout and withdraws the
+/// segment's coverage: the query then falls back to a flat scan whose bare
+/// tokenizer never reaches the configured stemmer, silently missing every row
+/// the index would have matched.
+#[rstest::rstest]
+#[case::late_merge(false, false)]
+#[case::late_direct_commit(false, true)]
+#[case::early_finalized_control(true, false)]
+#[tokio::test]
+async fn staged_fts_preserves_stemming_with_direct_commit(
+    #[case] finalize_first: bool,
+    #[case] direct_commit: bool,
+) {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .col(
+            "doc",
+            lance_datagen::array::fill_utf8("running".to_string()),
+        )
+        .into_dataset(
+            path,
+            FragmentCount::from(4),
+            FragmentRowCount::from(INDEX_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    let mut dataset = make_tagged(dataset).await;
+    create_btree_index(&mut dataset).await;
+    let sources: Vec<u32> = dataset.fragment_bitmap.iter().collect();
+    let params = InvertedIndexParams::default().stem(true);
+    let mut staged = CreateIndexBuilder::new(&mut dataset, &["doc"], IndexType::Inverted, &params)
+        .name(FTS_INDEX.to_string())
+        .fragments(sources)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    // The staged build has no published layout yet, so it is never selected
+    // for an undeferrable withdrawal, and asking twice must not memoize a
+    // verdict from the absent root metadata.
+    for _ in 0..2 {
+        assert!(
+            crate::index::frag_reuse::undeferrable_segments_covering(
+                &dataset,
+                std::iter::once(&staged),
+                dataset.fragment_bitmap.as_ref(),
+                None,
+                dataset.fragment_bitmap.as_ref(),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    }
+    if finalize_first {
+        staged = dataset
+            .merge_existing_index_segments(vec![staged])
+            .await
+            .unwrap();
+    }
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut dataset, &options, None).await;
+    let destinations = dataset.fragment_bitmap.as_ref().clone();
+    let merged = if direct_commit {
+        staged
+    } else {
+        dataset
+            .merge_existing_index_segments(vec![staged])
+            .await
+            .unwrap()
+    };
+    dataset
+        .commit_existing_index_segments(FTS_INDEX, "doc", vec![merged])
+        .await
+        .unwrap();
+    let fresh = DatasetBuilder::from_uri(path).load().await.unwrap();
+    for handle in [&dataset, &fresh] {
+        let (count, plan) = fts_count_on_column(handle, "run", "doc").await;
+        assert_eq!(
+            count,
+            4 * INDEX_ROWS_PER_FRAGMENT as usize,
+            "configured stemming must survive staged replay: {plan}"
+        );
+        assert!(plan_has_node(&plan, "MatchQuery:"), "{plan}");
+        assert!(!plan_has_node(&plan, "FlatMatchQuery:"), "{plan}");
+        assert!(!coverage_of(&stored_segments(handle).await, FTS_INDEX).is_empty());
+        assert_eq!(derived_coverage(handle, FTS_INDEX).await, destinations);
+    }
+}
