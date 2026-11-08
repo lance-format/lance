@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Dataset;
-use crate::dataset::{NewColumnTransform, WriteMode, WriteParams};
+use crate::dataset::{ColumnAlteration, NewColumnTransform, WriteMode, WriteParams};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Int32Array, ListArray, NullArray, RecordBatch,
     RecordBatchIterator, StringArray, StructArray,
@@ -10,6 +10,10 @@ use arrow_array::{
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
 };
+use lance_core::datatypes::{
+    LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
+};
+use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
 use rstest::rstest;
 use std::collections::HashMap;
@@ -913,4 +917,79 @@ async fn test_add_nested_child_reads_null_then_round_trips(
     let expected =
         arrow_select::concat::concat_batches(&expected.schema(), &[source, kept]).unwrap();
     assert_reads(&dataset, &expected, new_leaf, old_leaf).await;
+}
+
+/// A cast changes a column's type, not its membership in the primary or
+/// clustering key: `merge_insert` takes its default join keys from the schema.
+#[tokio::test]
+async fn test_alter_columns_cast_keeps_key_columns() -> crate::Result<()> {
+    let key =
+        |name: &str, position: &str| HashMap::from([(name.to_string(), position.to_string())]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("tenant", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "1")),
+        ArrowField::new("id", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, "2")),
+        ArrowField::new("region", DataType::Int32, false)
+            .with_metadata(key(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, "1")),
+        ArrowField::new("value", DataType::Int32, true),
+    ]));
+    let column = || Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+    let batch = RecordBatch::try_new(schema.clone(), vec![column(), column(), column(), column()])?;
+    let test_dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &test_dir,
+        None,
+    )
+    .await?;
+    // A manifest stores a key both as a field property and as metadata, and either
+    // can be present alone: leave `id` with its property only.
+    Arc::make_mut(&mut dataset.manifest)
+        .schema
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "id")
+        .unwrap()
+        .metadata
+        .clear();
+    dataset
+        .alter_columns(&[
+            ColumnAlteration::new("id".into()).cast_to(DataType::Int64),
+            ColumnAlteration::new("region".into()).cast_to(DataType::Int64),
+        ])
+        .await?;
+
+    for dataset in [dataset.clone(), Dataset::open(&test_dir).await?] {
+        let schema = dataset.schema();
+        assert_eq!(schema.field("id").unwrap().data_type(), DataType::Int64);
+        assert_eq!(
+            schema.field("id").unwrap().unenforced_primary_key_position,
+            Some(2)
+        );
+        assert_eq!(
+            schema
+                .field("region")
+                .unwrap()
+                .unenforced_clustering_key_position,
+            Some(1)
+        );
+        let names = |fields: Vec<&lance_core::datatypes::Field>| {
+            fields
+                .into_iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(schema.unenforced_primary_key()), ["tenant", "id"]);
+        assert_eq!(names(schema.unenforced_clustering_key()), ["region"]);
+        // The Arrow schema exposes the key to clients.
+        let arrow_schema = ArrowSchema::from(schema);
+        assert!(
+            arrow_schema
+                .field_with_name("region")?
+                .metadata()
+                .contains_key(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
+        );
+    }
+    Ok(())
 }
