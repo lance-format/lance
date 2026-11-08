@@ -432,18 +432,37 @@ impl<'a> TransactionRebase<'a> {
                             .is_none_or(|destinations| !destinations.is_empty())
                     })
                     .collect();
+                // The helper's `rewritten` must still be live in the liveness
+                // the withdrawal is measured against: that is what makes the
+                // remainder rule fire only for provenance the segment was
+                // ALREADY addressing across a rewrite when it was built. Here
+                // the rewrite is already committed, so restore the liveness of
+                // the transaction's read snapshot for exactly the sources this
+                // rewrite retired. Older provenance, retired before the build
+                // read the table, stays outside and keeps the conservative
+                // ancestor and remainder rules.
+                let pre_rewrite_live = match &self.read_fragments {
+                    Some(read_fragments) => {
+                        let read_live: RoaringBitmap = read_fragments
+                            .iter()
+                            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                            .collect();
+                        live | (&retired & read_live)
+                    }
+                    None => live.clone(),
+                };
                 let undeferrable = crate::index::frag_reuse::undeferrable_segments_covering(
                     dataset,
                     new_indices.iter(),
                     &retired,
                     Some(lineage),
-                    live,
+                    &pre_rewrite_live,
                 )
                 .await?;
                 Transaction::withdraw_undeferrable_rewrite_coverage(
                     new_indices,
                     Some(lineage),
-                    live,
+                    &pre_rewrite_live,
                     &undeferrable,
                     &retired,
                 );

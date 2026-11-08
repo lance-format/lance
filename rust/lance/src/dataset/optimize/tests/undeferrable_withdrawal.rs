@@ -918,6 +918,186 @@ async fn a_create_index_at_the_current_version_withdraws_nothing() {
     );
 }
 
+/// A PARTIAL compaction costs a rebased undeferrable segment only the
+/// fragments the rewrite actually consumed: the ones it left alone are still
+/// servable and keep their coverage.
+///
+/// The rewrite is already committed when the withdrawal is computed, so its
+/// sources are outside the manifest's live set. Measuring the remainder rule
+/// against that post-rewrite liveness reads the untouched fragments as a
+/// live-only remainder the history does not mention and clears them, which
+/// empties the segment. The withdrawal must instead be measured against the
+/// liveness of the transaction's own read snapshot for exactly those
+/// sources, which is what the forward commit order sees.
+#[tokio::test]
+async fn a_partial_rewrite_costs_a_rebased_index_only_the_rewritten_source() {
+    partial_rewrite_coverage().await;
+}
+
+/// Builds a tagged table, stages an undeferrable segment over every live
+/// fragment, and commits a deferred compaction of the lineage's two recorded
+/// destinations before the staged segment is committed, so the resolver
+/// rebases it. Returns the segment's stored coverage; the withdrawal of the
+/// rewritten sources and the survival of everything else are asserted here.
+async fn partial_rewrite_coverage() -> RoaringBitmap {
+    let mut dataset = fixture().await;
+    // Tagged through a partition of the FIRST fragment, whose two
+    // destinations the lineage records: only a recorded group may be rebased
+    // over at all (`check_create_index` refuses an unrecorded one).
+    let partitioned = dataset.fragments()[0].id;
+    dataset = make_tagged_partitioning(dataset, &[partitioned]).await;
+    // The partition's destinations carry reserved ids above every original
+    // fragment's, and they are the only live fragments the lineage records.
+    let destinations: Vec<u32> = {
+        let recorded = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .expect("the tagged entry must exist")
+            .fragment_bitmap
+            .clone()
+            .expect("the tagged entry must record its lineage");
+        dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .filter(|id| recorded.contains(*id))
+            .collect()
+    };
+    assert_eq!(destinations.len(), 2, "the partition produces two outputs");
+    let (companion, rewritten) = (destinations[0], destinations[1]);
+    // Everything else the segment covers and the rewrite leaves alone.
+    let remainder: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .filter(|id| *id != companion && *id != rewritten)
+        .collect();
+    assert!(!remainder.is_empty(), "there must be untouched coverage");
+    let covered: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+
+    // The index build reads this version and keeps its handle.
+    let mut stale = dataset.clone();
+    let segment = {
+        let mut params =
+            VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
+        params.version(IndexFileVersion::Legacy);
+        CreateIndexBuilder::new(&mut stale, &["vector"], IndexType::Vector, &params)
+            .name(VECTOR_INDEX.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        segment.fragment_bitmap.as_ref().unwrap(),
+        &covered,
+        "the staged segment must cover every fragment live at its read version"
+    );
+
+    let options = CompactionOptions {
+        excluded_fragment_ids: dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .filter(|id| *id != companion && *id != rewritten)
+            .collect(),
+        // Pinned so candidacy does not depend on the fixture's file sizes:
+        // both fragments are under the row target and under this floor, so
+        // the planner bins exactly the two.
+        min_bytes_per_file: Some(WriteParams::default().max_bytes_per_file),
+        ..deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize)
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let planned: RoaringBitmap = plan
+        .tasks()
+        .iter()
+        .flat_map(|task| task.fragments.iter())
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        planned,
+        RoaringBitmap::from_iter([companion, rewritten]),
+        "the compaction must rewrite the two recorded destinations only"
+    );
+
+    let index_transaction = Transaction::new(
+        pre_rewrite_version(&segment),
+        Operation::CreateIndex {
+            new_indices: vec![segment.clone()],
+            removed_indices: vec![],
+        },
+        None,
+    );
+    let results = execute_tasks(&dataset, &plan, &options, None).await;
+    commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+    // The index build handle is still at the pre-rewrite version, so the
+    // commit path rebases its segment over the committed rewrite.
+    let committed = CommitBuilder::new(Arc::new(stale))
+        .execute(index_transaction)
+        .await
+        .expect("the rebased index build must land");
+
+    let stored = coverage_of(&stored_segments(&committed).await, VECTOR_INDEX);
+    let live: RoaringBitmap = committed
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        !stored.contains(rewritten) && !stored.contains(companion),
+        "the rewritten sources must be withdrawn: {:?}",
+        stored.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        &stored & &remainder,
+        remainder,
+        "the fragments the rewrite left alone are still servable and must \
+         keep their coverage; the segment kept {:?} of the untouched {:?}",
+        stored.iter().collect::<Vec<_>>(),
+        remainder.iter().collect::<Vec<_>>()
+    );
+    assert!(
+        stored.is_subset(&live),
+        "a withdrawal never leaves a non-live fragment behind: {:?}",
+        (&stored - &live).iter().collect::<Vec<_>>()
+    );
+    // Row-level exactness only: this fixture's legacy IVF_PQ file is too
+    // small for its own ANN path, and the contract under test is which
+    // coverage survives, not how the index answers.
+    let scan = committed
+        .scan()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut rows: Vec<i32> = scan["i"]
+        .as_primitive::<Int32Type>()
+        .iter()
+        .map(|value| value.unwrap())
+        .collect();
+    rows.sort_unstable();
+    let deduped = {
+        let mut deduped = rows.clone();
+        deduped.dedup();
+        deduped
+    };
+    assert_eq!(rows, deduped, "a rewrite must not duplicate a row");
+    stored
+}
+
 /// The read version a staged segment was built at: its coverage names the
 /// fragments of that version, and the commit must be submitted from it so the
 /// resolver actually rebases.
@@ -1767,6 +1947,39 @@ async fn make_tagged_partitioning(mut dataset: Dataset, source_ids: &[u64]) -> D
         "the stable partition must make the table tagged"
     );
     dataset
+}
+
+/// One more fragment of fresh rows, in the vector fixture's schema, so a
+/// compaction plan has two adjacent fragments to bin.
+async fn append_unindexed_vector_fragment(dataset: &mut Dataset) {
+    let batch = {
+        let mut scan = dataset.scan();
+        scan.project(&["i", "vector"]).unwrap();
+        scan.limit(Some(INDEX_ROWS_PER_FRAGMENT as i64), None)
+            .unwrap();
+        scan.try_into_batch().await.unwrap()
+    };
+    let appended = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(
+                10_000..10_000 + batch.num_rows() as i32,
+            )) as ArrayRef,
+            batch["vector"].clone(),
+        ],
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(WriteParams {
+                max_rows_per_file: INDEX_ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 /// Appends one fragment of fresh rows no index covers, so a compaction plan
