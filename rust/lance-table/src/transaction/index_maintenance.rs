@@ -2693,3 +2693,152 @@ mod withdrawal_tests {
         );
     }
 }
+
+/// Feasibility probes for the compaction withdrawal described in
+/// planner-007: what the existing helper already decides, with no change to
+/// persisted semantics. These assert current behavior only.
+#[cfg(test)]
+mod withdrawal_feasibility {
+    use super::*;
+    use crate::system_index::frag_reuse::lineage::TaggedLineage;
+    use crate::transaction::test_support::{sample_index_metadata, tagged_entry};
+
+    fn walkable(entry: &IndexMetadata) -> TaggedLineage {
+        TaggedLineage::from_indices_with_ledger(std::slice::from_ref(entry), None)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn coverage(indices: &[IndexMetadata]) -> RoaringBitmap {
+        indices
+            .iter()
+            .find(|index| index.name == "vec_idx")
+            .unwrap()
+            .fragment_bitmap
+            .clone()
+            .unwrap()
+    }
+
+    /// Direct case: S1 stores {F1, F2}; F1 is rewritten into F1'. F1 is still
+    /// LIVE in the manifest the withdrawal is computed against (the rewrite
+    /// retires it in the same commit), so `retired = bitmap - live` is empty,
+    /// `withdrew_retired` is false, and the unsafe-raw-Identity fallback that
+    /// clears the whole remainder never fires. F2 survives.
+    #[test]
+    fn direct_withdrawal_keeps_f2_and_never_clears_the_remainder() {
+        // The history already records an unrelated transition so the table is
+        // tagged; F1(1) and F2(2) are original fragments on it.
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([1u32, 2].into_iter().collect());
+        // F1 and F2 are both live before the rewrite commits.
+        let live: RoaringBitmap = [1u32, 2, 91].into_iter().collect();
+
+        let mut indices = vec![segment];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert_eq!(
+            coverage(&indices),
+            [2u32].into_iter().collect::<RoaringBitmap>(),
+            "only F1 goes; F2's coverage is preserved"
+        );
+    }
+
+    /// Historical case: S1 stores {P}; an earlier tagged rewrite split
+    /// P -> F1 + F2; now F1 is rewritten. `destinations_of(P)` contains F1,
+    /// so P is withdrawn whole, which gives up derived coverage of F2 as
+    /// well. This is the planner-007 tradeoff, asserted rather than assumed.
+    #[test]
+    fn historical_withdrawal_of_p_gives_up_f2_as_well() {
+        // P(0) -> F1(1) + F2(2).
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        // P is retired by the earlier split; F1 and F2 are live.
+        let live: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let lineage = walkable(&entry);
+        assert_eq!(lineage.destinations_of(0), Some(vec![1, 2]));
+
+        let mut indices = vec![segment];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "withdrawing P loses F2's derived coverage too: {:?}",
+            coverage(&indices)
+        );
+    }
+
+    /// The information the existing representation lacks, as the smallest
+    /// example: {P} cannot say "P's rows reaching F2 still count, P's rows
+    /// reaching F1 do not". Removing F1 is a no-op (F1 is not in the bitmap)
+    /// and removing P takes F2 with it.
+    #[test]
+    fn removing_f1_from_a_p_bitmap_is_a_no_op() {
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        let mut projected = segment.fragment_bitmap.clone().unwrap();
+        projected.remove(1);
+        assert_eq!(
+            projected,
+            [0u32].into_iter().collect::<RoaringBitmap>(),
+            "the stored bitmap holds P, not F1, so removing F1 changes nothing"
+        );
+        let _ = walkable(&entry);
+    }
+
+    /// The whole-remainder fallback fires only when a RETIRED fragment was
+    /// withdrawn AND the live-only remainder is absent from the history, in
+    /// which case the reader would load it raw. With the remainder still on
+    /// the history it is translated and filtered, so it is retained.
+    #[test]
+    fn the_remainder_fallback_fires_only_for_an_untranslated_live_remainder() {
+        // P(0) -> F1(1); unrelated Q(5) -> F3(6). The segment stores P and an
+        // original live fragment F9 the history never mentions.
+        let entry = tagged_entry(&[(&[0], &[1]), (&[5], &[6])]);
+        let live: RoaringBitmap = [1u32, 6, 9].into_iter().collect();
+        let lineage = walkable(&entry);
+
+        let mut untranslated = sample_index_metadata("vec_idx");
+        untranslated.fragment_bitmap = Some([0u32, 9].into_iter().collect());
+        let mut indices = vec![untranslated];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "F9 is live and off the history, so the remainder would load raw \
+             and is withdrawn whole: {:?}",
+            coverage(&indices)
+        );
+
+        // The same withdrawal with the remainder ON the history keeps it.
+        let mut translated = sample_index_metadata("vec_idx");
+        translated.fragment_bitmap = Some([0u32, 5].into_iter().collect());
+        let mut indices = vec![translated];
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&lineage),
+            &live,
+            &[(1, vec![0])],
+        );
+        assert_eq!(
+            coverage(&indices),
+            [5u32].into_iter().collect::<RoaringBitmap>(),
+            "Q is retired and on the history, so it is translated and retained"
+        );
+    }
+}
