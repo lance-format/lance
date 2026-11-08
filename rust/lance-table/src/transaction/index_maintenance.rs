@@ -435,23 +435,26 @@ impl Transaction {
             };
             let retired = &*bitmap - live;
             let mut withdrawn = if let Some(rewritten_for_segment) = rewritten_for_segment {
-                let mut withdrawn = RoaringBitmap::new();
-                for rewritten in rewritten_for_segment {
-                    if bitmap.contains(rewritten) {
-                        withdrawn.insert(rewritten);
-                    }
-                    // Every retired source whose rows reach the rewritten
-                    // fragment goes; the sources of one transition all reach the
-                    // same destinations, so the transition is withdrawn whole.
-                    for source in retired.iter() {
-                        match lineage.and_then(|lineage| lineage.destinations_of(source)) {
-                            Some(destinations) if destinations.contains(&rewritten) => {
+                let rewritten_for_segment: RoaringBitmap =
+                    rewritten_for_segment.into_iter().collect();
+                let mut withdrawn = &*bitmap & &rewritten_for_segment;
+                // Every retired source whose rows reach any rewritten fragment
+                // goes; the sources of one transition all reach the same
+                // destinations, so the transition is withdrawn whole. Each
+                // source is walked once and its destinations intersected with
+                // the rewritten set, rather than once per rewritten fragment.
+                for source in retired.iter() {
+                    match lineage.and_then(|lineage| lineage.destinations_of(source)) {
+                        Some(destinations) => {
+                            if destinations
+                                .iter()
+                                .any(|destination| rewritten_for_segment.contains(*destination))
+                            {
                                 withdrawn.insert(source);
                             }
-                            Some(_) => {}
-                            None => {
-                                withdrawn.insert(source);
-                            }
+                        }
+                        None => {
+                            withdrawn.insert(source);
                         }
                     }
                 }
