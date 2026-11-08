@@ -2420,6 +2420,96 @@ async fn probe_outage_during_maintenance_planning_does_not_poison_the_cached_que
     );
 }
 
+/// A caller that names one index and asks for it to be remapped must hear
+/// that the segment could not be classified, not a success log. `Withdrawn`
+/// and `Unsupported` are verdicts about the segment and skipping is right for
+/// them; an unreadable format marker is a fault on the store, and reporting
+/// "queries are unaffected" for it hides a remap that silently did nothing
+/// from a caller that can simply retry.
+#[tokio::test]
+async fn an_explicit_remap_reports_an_unverifiable_segment_as_an_error() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_explicit_remap_unverifiable", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    drop(seed);
+
+    // Retire the segment's provenance, so the remap has translation work and
+    // the format marker is probed at all.
+    {
+        let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+        let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+        run_deferred_compaction(&mut writer, &options, None).await;
+    }
+
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let before = stored_segments(&dataset).await;
+    let fts_before = coverage_of(&before, FTS_INDEX);
+    assert!(!fts_before.is_empty());
+    let segment_uuid = before
+        .iter()
+        .find(|(name, _, _)| name == FTS_INDEX)
+        .map(|(_, uuid, _)| *uuid)
+        .expect("the fixture must have an FTS segment");
+
+    failing.store(true, Ordering::SeqCst);
+    let error = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect_err("an unverifiable segment must not be reported as a skipped success");
+    let message = error.to_string();
+    assert!(
+        message.contains(&segment_uuid.to_string()),
+        "the error must name the segment the caller asked about: {message}"
+    );
+    assert!(
+        message.contains("format marker"),
+        "the error must carry the read diagnostic, so the caller can tell a \
+         fault from a verdict: {message}"
+    );
+
+    // Nothing was published while the probe was failing.
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a refused remap must leave every segment's provenance untouched"
+    );
+
+    // The same remap, on the same handle, once reads recover.
+    failing.store(false, Ordering::SeqCst);
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect("the retry must succeed once the marker is readable");
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_after, brute_force,
+        "the remapped index must answer exactly: {plan_after}"
+    );
+    assert!(
+        plan_has_node(&plan_after, "MatchQuery:"),
+        "the remapped segment must serve the query from the index: {plan_after}"
+    );
+
+    // A verdict ABOUT the segment is still a skip, not an error: the segment
+    // the remap just rewrote needs no translation, so the second pass finds
+    // nothing to do and says so by returning success.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect("a segment with nothing to translate must still be a skip, not an error");
+}
+
 #[tokio::test]
 async fn a_read_failure_defers_the_withdrawal_instead_of_failing_the_commit() {
     let dir = TempStrDir::default();

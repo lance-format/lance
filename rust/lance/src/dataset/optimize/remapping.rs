@@ -922,8 +922,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         Some(
             reason @ (MissingCoverageReason::Withdrawn
             | MissingCoverageReason::NoDerivedCoverage
-            | MissingCoverageReason::Unsupported
-            | MissingCoverageReason::Unverifiable),
+            | MissingCoverageReason::Unsupported),
         ) => {
             log::info!(
                 "Skipping remap of index {} ({}): {reason}. A rebuild (optimize) replaces it; \
@@ -932,6 +931,17 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
                 curr_index_meta.uuid
             );
             return Ok(());
+        }
+        // Not a verdict about the segment: the store could not be read. The
+        // caller named this index, so it hears that nothing was remapped and
+        // can retry, rather than a success log for a remap that did nothing.
+        Some(reason @ MissingCoverageReason::Unverifiable) => {
+            return Err(Error::index(format!(
+                "could not classify index {} (segment {}) for remapping: {reason}. \
+                 Its format marker could not be read; retry once the index files \
+                 are readable",
+                curr_index_meta.name, curr_index_meta.uuid
+            )));
         }
         Some(MissingCoverageReason::Corrupt) => {
             return Err(Error::index(format!(
