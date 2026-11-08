@@ -1353,6 +1353,98 @@ async fn grouped_planning_keeps_the_same_gap_at_a_held_back_source_as_ordinary_p
         .unwrap();
     assert!(grouped.tasks.is_empty(), "{:?}", grouped.tasks);
 }
+/// Only a held-back source terminates a grouped run; an ordinary
+/// non-candidate does not. Ordinary planning ends its bin at every
+/// non-candidate, so an over-target fragment splits its plan too. Grouped
+/// planning skips that fragment and keeps the candidates around it in one
+/// task, because naming them in a group is an explicit request to compact
+/// them together; only coverage this build cannot remap overrides it.
+#[tokio::test]
+async fn grouped_planning_splits_at_a_held_back_source_but_not_at_an_over_target_one() {
+    /// A dataset of `sizes` fragments in order, one fragment per entry.
+    async fn fragments_of(dir: &TempStrDir, sizes: &[i64]) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut dataset: Option<Dataset> = None;
+        let mut start = 0_i64;
+        for rows in sizes {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+            )
+            .unwrap();
+            dataset = Some(
+                Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    dir,
+                    Some(WriteParams {
+                        mode: if dataset.is_none() {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        max_rows_per_file: 1_000,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            start += rows;
+        }
+        let dataset = dataset.unwrap();
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        assert_eq!(fragments.len(), sizes.len());
+        (dataset, fragments)
+    }
+
+    fn sources(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+        plan.tasks
+            .iter()
+            .map(|task| task.fragments.iter().map(|f| f.id).collect())
+            .collect()
+    }
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    };
+
+    // Fragment 2 is over the target, so neither planner rewrites it, and it is
+    // not held back. Fragment 4 is small and covered, so it is held back.
+    let dir = TempStrDir::default();
+    let (mut dataset, six) = fragments_of(&dir, &[100, 100, 1_000, 100, 100, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[4]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let grouped = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: six.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sources(&grouped),
+        vec![vec![0, 1, 3]],
+        "the over-target member 2 does not split the run, the held-back member 4 does, and \
+         fragment 5 is left alone past the split"
+    );
+
+    // The same layout through ordinary planning: its bin ends at the
+    // over-target member as well, so the run before it is a task of its own.
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(
+        sources(&ordinary),
+        vec![vec![0, 1]],
+        "ordinary planning splits at the over-target member too, leaving 3 alone between the \
+         two gaps"
+    );
+}
 /// A group that mixes covered and uncovered sources still plans the uncovered
 /// ones: the covered member is held back and the two uncovered members on one
 /// side of it compact together.

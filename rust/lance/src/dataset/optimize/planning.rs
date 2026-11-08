@@ -851,10 +851,10 @@ impl DefaultCompactionPlanner {
             }
         }
         // A fragment covered by an index this build cannot read is held out of
-        // every group before binning, exactly as ordinary planning folds that
-        // coverage into its exclusions: the index is left addressing the rows
-        // it already addresses, and the other members of the same group and of
-        // every other group still plan. Group boundaries are untouched.
+        // every group before binning, for the reason ordinary planning folds
+        // that coverage into its exclusions: the index is left addressing the
+        // rows it already addresses, and the other members of the same group
+        // and of every other group still plan. Group boundaries are untouched.
         let unreadable_coverage =
             if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
                 unremappable_index_coverage(dataset).await?
@@ -943,9 +943,15 @@ impl DefaultCompactionPlanner {
         let mut bins = Vec::with_capacity(groups.len());
         let mut properties = Vec::with_capacity(groups.len());
         for (group_index, group) in groups.into_iter().enumerate() {
-            // A held-back member terminates the run it interrupts rather than
-            // letting the candidates on either side of the gap be planned
-            // together, the same adjacency ordinary planning's exclusions keep.
+            // A held-back member is the only thing that terminates a run here:
+            // its rows stay addressed by an index this build cannot read, so
+            // the candidates on either side of it must not be planned
+            // together. Any other non-candidate - an over-target member, say -
+            // is skipped without ending the run, so the candidates around it
+            // still compact as one task. This is narrower than ordinary
+            // planning, which ends its bin at every non-candidate: a group is
+            // an explicit request to compact those fragments together, and
+            // only coverage this build cannot remap overrides it.
             let mut runs: Vec<CandidateBin> = Vec::new();
             let mut current: Option<CandidateBin> = None;
             for _ in &group.fragments {
