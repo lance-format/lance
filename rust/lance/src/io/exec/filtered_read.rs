@@ -937,6 +937,12 @@ impl FilteredReadStream {
         // fall back to read the full fragment in fragments_to_read
         // Used only when index guarantees enough rows to satisfy scan_range_after_filter
         let mut scan_push_down_fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        // True once a queued fragment has no mirror in scan_push_down_fragments_to_read.
+        // Swapping in the pushdown map would then silently drop that fragment's
+        // rows.  This cannot happen in default manifest order (index coverage is
+        // an id-prefix there) but caller-supplied fragment order can place an
+        // uncovered fragment before the covered ones.
+        let mut has_fragment_without_pushdown_mirror = false;
 
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
@@ -1001,7 +1007,17 @@ impl FilteredReadStream {
                 options.only_indexed_fragments,
             )?;
 
-            if can_push_down_scan_range_after_filter && to_take == 0 {
+            let fragment_id = fragment.id() as u32;
+            if fragments_to_read.contains_key(&fragment_id)
+                && !scan_push_down_fragments_to_read.contains_key(&fragment_id)
+            {
+                has_fragment_without_pushdown_mirror = true;
+            }
+
+            if can_push_down_scan_range_after_filter
+                && to_take == 0
+                && !has_fragment_without_pushdown_mirror
+            {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -4824,6 +4840,66 @@ mod tests {
             UInt32Array::from((30..40).collect::<Vec<_>>())
         };
         assert_eq!(batch["value"].as_ref(), &expected);
+    }
+
+    /// Limit pushdown must not discard an uncovered fragment that the caller
+    /// lists before the covered fragment satisfying the limit.  The pushdown
+    /// plan only mirrors covered fragments, so swapping it in would drop the
+    /// uncovered fragment's rows, which belong first in the caller's order.
+    #[rstest]
+    #[case::limit(0..2, vec![10, 11])]
+    #[case::offset_and_limit(1..3, vec![11, 12])]
+    #[tokio::test]
+    async fn test_limit_pushdown_keeps_preceding_uncovered_fragments(
+        #[case] scan_range: Range<u64>,
+        #[case] expected_values: Vec<u32>,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        let all_fragments = dataset.fragments().as_ref().clone();
+        let fragment = |id: u64| {
+            all_fragments
+                .iter()
+                .find(|fragment| fragment.id == id)
+                .unwrap()
+                .clone()
+        };
+        // Uncovered fragment 1 precedes covered fragment 0 in the caller's
+        // order; fragment 1 holds values 10..20, fragment 0 holds values 0..10.
+        let fragments = Arc::new(vec![fragment(1), fragment(0)]);
+
+        // Exact result covering only fragment 0, where every row matches.
+        // (Fragment 0's row addresses and initial stable row ids are both 0..10.)
+        let covered = RoaringBitmap::from_iter([0u32]);
+        let index_input = index_result_input_with_coverage(
+            IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from(0u64..10))),
+            &covered,
+        );
+
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value < 1000").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_fragments(fragments)
+            .with_filter(None, Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(scan_range)
+            .unwrap();
+
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(
+            batch["value"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .as_ref(),
+            expected_values.as_slice(),
+            "limit pushdown dropped the uncovered fragment preceding the covered one"
+        );
     }
 
     /// Take-shaped masked reads consolidate their tiny per-fragment batches;
