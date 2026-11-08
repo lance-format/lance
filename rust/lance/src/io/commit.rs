@@ -1877,7 +1877,9 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
+                    .await?
+                    .with_read_version_fragments(read_version_dataset.fragments().clone());
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()

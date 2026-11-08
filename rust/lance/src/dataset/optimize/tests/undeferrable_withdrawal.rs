@@ -975,12 +975,46 @@ async fn a_partial_rewrite_costs_a_rebased_index_only_the_rewritten_source() {
     Box::pin(partial_rewrite_coverage()).await;
 }
 
+/// As [`a_partial_rewrite_costs_a_rebased_index_only_the_rewritten_source`],
+/// but the CreateIndex is committed through a handle that has already moved
+/// past the rewrite while the transaction still names the pre-rewrite read
+/// version (what `CommitBuilder` on a URI does: it loads the latest version).
+///
+/// The withdrawal must be measured against the read-version snapshot the
+/// transaction names, not against whatever version the committing handle
+/// happens to hold. Measuring against a newer handle makes the rewrite's
+/// sources absent from it, so nothing restores their pre-rewrite liveness and
+/// the untouched fragments are read as a live-only remainder and cleared.
+#[tokio::test]
+async fn a_rebased_index_is_measured_against_its_read_version_not_the_handle() {
+    Box::pin(partial_rewrite_coverage_committed_from_latest()).await;
+}
+
+async fn partial_rewrite_coverage() -> RoaringBitmap {
+    Box::pin(partial_rewrite_coverage_from(CommittingHandle::ReadVersion)).await
+}
+
+/// Which handle commits the rebased CreateIndex.
+#[derive(Clone, Copy, PartialEq)]
+enum CommittingHandle {
+    /// The build's own handle, still at the transaction's read version.
+    ReadVersion,
+    /// A handle reloaded at the latest version, past the rewrite, as
+    /// `CommitBuilder` on a URI produces.
+    Latest,
+}
+
+async fn partial_rewrite_coverage_committed_from_latest() -> RoaringBitmap {
+    Box::pin(partial_rewrite_coverage_from(CommittingHandle::Latest)).await
+}
+
 /// Builds a tagged table, stages an undeferrable segment over every live
 /// fragment, and commits a deferred compaction of the lineage's two recorded
 /// destinations before the staged segment is committed, so the resolver
-/// rebases it. Returns the segment's stored coverage; the withdrawal of the
+/// rebases it. `handle` selects which dataset handle commits the rebased
+/// CreateIndex. Returns the segment's stored coverage; the withdrawal of the
 /// rewritten sources and the survival of everything else are asserted here.
-async fn partial_rewrite_coverage() -> RoaringBitmap {
+async fn partial_rewrite_coverage_from(handle: CommittingHandle) -> RoaringBitmap {
     let mut dataset = fixture().await;
     // Tagged through a partition of the FIRST fragment, whose two
     // destinations the lineage records: only a recorded group may be rebased
@@ -1085,7 +1119,20 @@ async fn partial_rewrite_coverage() -> RoaringBitmap {
     .unwrap();
     // The index build handle is still at the pre-rewrite version, so the
     // commit path rebases its segment over the committed rewrite.
-    let committed = CommitBuilder::new(Arc::new(stale))
+    let committing = match handle {
+        CommittingHandle::ReadVersion => stale,
+        // Past the rewrite already, while the transaction still names the
+        // pre-rewrite read version.
+        CommittingHandle::Latest => {
+            let latest = dataset.clone();
+            assert!(
+                latest.manifest.version > index_transaction.read_version,
+                "the committing handle must be newer than the read version"
+            );
+            latest
+        }
+    };
+    let committed = CommitBuilder::new(Arc::new(committing))
         .execute(index_transaction)
         .await
         .expect("the rebased index build must land");
