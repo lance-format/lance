@@ -1575,7 +1575,13 @@ async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
     let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
     plant_unreadable_index(&mut dataset, "a", &[1]).await;
     let mut dataset = Dataset::open(&dir).await.unwrap();
-    let removed = sabotage(&mut dataset, &four[1], &dir);
+    let held = dataset
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id == four[1].id)
+        .cloned()
+        .expect("the held-back fragment survives the index commit");
+    let removed = sabotage(&mut dataset, &held, &dir);
     // The sabotage only proves anything if the index the reopened manifest
     // carries is the unreadable one, and if the fragment whose file was
     // removed is exactly the fragment that index's coverage holds back.
@@ -1599,7 +1605,8 @@ async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
             .collect::<Vec<_>>(),
         vec![four[1].id as u32]
     );
-    assert!(removed.ends_with(&four[1].files[0].path), "{removed:?}");
+    assert_eq!(held.files[0].path, four[1].files[0].path);
+    assert!(removed.ends_with(&held.files[0].path), "{removed:?}");
     let plan = planner
         .plan_groups(&dataset, whole_group(&four))
         .await
