@@ -758,6 +758,166 @@ async fn an_undeferrable_index_rebased_over_a_committed_rewrite_drops_retired_co
     assert_query_exactness(&committed).await;
 }
 
+/// A whole-fragment DELETE is not a rewrite: the fragment's rows are gone,
+/// not moved, so an undeferrable segment rebased over it keeps every bit of
+/// coverage it can still serve. Only a fragment the history records as
+/// consumed is withdrawn.
+///
+/// Without the provenance constraint the deleted fragment enters the
+/// retired-provenance path, the segment is selected, and the live-only
+/// remainder rule then empties its whole coverage.
+#[tokio::test]
+async fn an_undeferrable_index_rebased_over_a_committed_delete_keeps_its_coverage() {
+    let mut dataset = fixture().await;
+    dataset = make_tagged(dataset).await;
+
+    // The index build reads this version and keeps its handle; its coverage
+    // names every fragment live here.
+    let mut stale = dataset.clone();
+    let covered: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segment = {
+        let mut params =
+            VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
+        params.version(IndexFileVersion::Legacy);
+        CreateIndexBuilder::new(&mut stale, &["vector"], IndexType::Vector, &params)
+            .name(VECTOR_INDEX.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+    assert_eq!(segment.fragment_bitmap.as_ref().unwrap(), &covered);
+
+    // A concurrent writer deletes one fragment's rows WHOLE, so the fragment
+    // leaves the manifest without any transition recording it.
+    let deleted = dataset.fragments().last().unwrap().id as u32;
+    let bounds = {
+        let mut scan = dataset.scan();
+        scan.project(&["i"]).unwrap();
+        scan.with_row_address();
+        let batch = scan.try_into_batch().await.unwrap();
+        let addresses = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
+        let values = batch["i"].as_primitive::<Int32Type>();
+        let mut rows: Vec<i32> = (0..batch.num_rows())
+            .filter(|row| (addresses.value(*row) >> 32) as u32 == deleted)
+            .map(|row| values.value(row))
+            .collect();
+        rows.sort_unstable();
+        rows
+    };
+    assert!(!bounds.is_empty(), "the fragment must hold rows");
+    dataset
+        .delete(&format!(
+            "i >= {} AND i <= {}",
+            bounds[0],
+            bounds[bounds.len() - 1]
+        ))
+        .await
+        .unwrap();
+    let live: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        !live.contains(deleted),
+        "the delete must drop fragment {deleted} whole"
+    );
+    assert_eq!(
+        live,
+        &covered - RoaringBitmap::from_iter([deleted]),
+        "nothing but {deleted} may leave the manifest"
+    );
+
+    // Now the stale handle commits its segment; the resolver rebases it.
+    let committed = CommitBuilder::new(Arc::new(stale))
+        .execute(Transaction::new(
+            pre_rewrite_version(&segment),
+            Operation::CreateIndex {
+                new_indices: vec![segment.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        ))
+        .await
+        .expect("the rebased index build must land");
+
+    let landed = stored_segments(&committed).await;
+    let vector_landed = coverage_of(&landed, VECTOR_INDEX);
+    // The staged bitmap lands exactly as it was built: no withdrawal ran, so
+    // the segment keeps every fragment, including the deleted one the rebase
+    // does not prune here (the reader filters its coverage to the live set).
+    assert_eq!(
+        vector_landed,
+        covered,
+        "a plain delete must withdraw nothing; the segment kept {:?} of the \
+         staged {:?}",
+        vector_landed.iter().collect::<Vec<_>>(),
+        covered.iter().collect::<Vec<_>>()
+    );
+    assert!(
+        (&vector_landed & &live) == live,
+        "every fragment the delete did not touch must still be covered"
+    );
+    assert_query_exactness(&committed).await;
+}
+
+/// A `CreateIndex` whose read version IS the manifest version was not
+/// rebased over anything, so no withdrawal is computed: a segment covering a
+/// fragment that left the manifest before the build started keeps its stored
+/// bitmap exactly as it was staged.
+#[tokio::test]
+async fn a_create_index_at_the_current_version_withdraws_nothing() {
+    let mut dataset = fixture().await;
+    dataset = make_tagged(dataset).await;
+    let live: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+
+    // Stage a segment that also names a fragment the partition retired, so
+    // the withdrawal would have something to take if it ran at all.
+    let retired = dataset
+        .manifest
+        .max_fragment_id()
+        .unwrap()
+        .checked_add(1)
+        .unwrap() as u32;
+    let mut segment = {
+        let mut params =
+            VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
+        params.version(IndexFileVersion::Legacy);
+        CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            .name(VECTOR_INDEX.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+    let staged = &live | RoaringBitmap::from_iter([retired]);
+    segment.fragment_bitmap = Some(staged.clone());
+
+    let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![segment],
+                removed_indices: vec![],
+            },
+            None,
+        ))
+        .await
+        .expect("a CreateIndex at the current version must land");
+    assert_eq!(
+        coverage_of(&stored_segments(&committed).await, VECTOR_INDEX),
+        staged,
+        "a CreateIndex that was never rebased must land its bitmap unchanged"
+    );
+}
+
 /// The read version a staged segment was built at: its coverage names the
 /// fragments of that version, and the commit must be submitted from it so the
 /// resolver actually rebases.

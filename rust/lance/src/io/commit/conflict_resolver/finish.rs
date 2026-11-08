@@ -407,8 +407,16 @@ impl<'a> TransactionRebase<'a> {
             // translate, so the retired part of its coverage is withdrawn
             // here, in the same commit, exactly as the rewrite's own commit
             // withdraws it in the other order.
-            if let (Some(lineage), Some(live)) =
-                (self.current_lineage.as_ref(), self.current_live.as_ref())
+            //
+            // Only a REWRITE's sources are withdrawn: a fragment the history
+            // records as consumed. A fragment that merely left the manifest
+            // (a whole-fragment delete) carries no rows anywhere, so no
+            // segment can serve them and the coverage the reader already
+            // filters to the live set needs no narrowing. Without a walkable
+            // history the whole retired set stays conservative.
+            if dataset.manifest.version != self.transaction.read_version
+                && let (Some(lineage), Some(live)) =
+                    (self.current_lineage.as_ref(), self.current_live.as_ref())
             {
                 let retired = new_indices
                     .iter()
@@ -416,6 +424,14 @@ impl<'a> TransactionRebase<'a> {
                     .fold(RoaringBitmap::new(), |retired, bitmap| {
                         retired | (bitmap - live)
                     });
+                let retired: RoaringBitmap = retired
+                    .iter()
+                    .filter(|fragment| {
+                        lineage
+                            .destinations_of(*fragment)
+                            .is_none_or(|destinations| !destinations.is_empty())
+                    })
+                    .collect();
                 let undeferrable = crate::index::frag_reuse::undeferrable_segments_covering(
                     dataset,
                     new_indices.iter(),
