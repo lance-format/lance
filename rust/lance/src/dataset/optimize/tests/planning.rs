@@ -1527,14 +1527,19 @@ async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
         (dataset, four)
     }
 
-    fn sabotage(dataset: &mut Dataset, fragment: &Fragment, dir: &TempStrDir) {
+    /// Returns the path removed, so a caller can relate it to the fragment the
+    /// planner is expected to hold back.
+    fn sabotage(
+        dataset: &mut Dataset,
+        fragment: &Fragment,
+        dir: &TempStrDir,
+    ) -> std::path::PathBuf {
         Arc::make_mut(&mut dataset.manifest).writer_version = None;
-        std::fs::remove_file(
-            std::path::Path::new(dir.as_ref())
-                .join("data")
-                .join(&fragment.files[0].path),
-        )
-        .unwrap();
+        let path = std::path::Path::new(dir.as_ref())
+            .join("data")
+            .join(&fragment.files[0].path);
+        std::fs::remove_file(&path).unwrap();
+        path
     }
 
     let planner = DefaultCompactionPlanner::new(CompactionOptions {
@@ -1570,7 +1575,29 @@ async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
     let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
     plant_unreadable_index(&mut dataset, "a", &[1]).await;
     let mut dataset = Dataset::open(&dir).await.unwrap();
-    sabotage(&mut dataset, &four[1], &dir);
+    let removed = sabotage(&mut dataset, &four[1], &dir);
+    // The sabotage only proves anything if the index the reopened manifest
+    // carries is the unreadable one, and if the fragment whose file was
+    // removed is exactly the fragment that index's coverage holds back.
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1, "{indices:?}");
+    assert!(
+        indices[0]
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("example.ForeignIndexDetails")),
+        "{indices:?}"
+    );
+    assert_eq!(
+        indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![four[1].id as u32]
+    );
+    assert!(removed.ends_with(&four[1].files[0].path), "{removed:?}");
     let plan = planner
         .plan_groups(&dataset, whole_group(&four))
         .await
