@@ -290,6 +290,16 @@ impl Dataset {
     /// plan's contents.
     pub(crate) async fn derived_index_listing(&self) -> Result<DerivedIndexListing> {
         let indices = load_all_indices(self).await?;
+        self.derive_index_listing(indices).await
+    }
+
+    /// [`Self::derived_index_listing`] for a raw listing the caller already
+    /// loaded, so a caller that must inspect the raw listing first does not
+    /// load it twice.
+    async fn derive_index_listing(
+        &self,
+        indices: Arc<Vec<IndexMetadata>>,
+    ) -> Result<DerivedIndexListing> {
         // Readers apply the fragment reuse index to every index they open.
         let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
             && indices.iter().any(is_hidden_by_frag_reuse)
@@ -314,7 +324,6 @@ impl Dataset {
             None | Some(0) => Ok(DerivedIndexListing {
                 indices: filter_unusable(indices),
                 unverifiable: false,
-                derived: false,
             }),
             Some(1) => {
                 let fri = indices
@@ -326,7 +335,6 @@ impl Dataset {
                 Ok(DerivedIndexListing {
                     indices: derived,
                     unverifiable,
-                    derived: true,
                 })
             }
             Some(version) => Err(Error::not_supported(format!(
@@ -343,9 +351,6 @@ pub struct DerivedIndexListing {
     /// A segment is absent only because its format marker could not be read,
     /// so the listing holds for this call alone.
     pub unverifiable: bool,
-    /// The listing came from the tagged reader's coverage derivation, the only
-    /// one worth caching per snapshot.
-    pub derived: bool,
 }
 
 /// Drop the segments no reader can open, keeping the input allocation when
@@ -608,6 +613,16 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
+        let indices = load_all_indices(self).await?;
+        // Only a tagged snapshot derives coverage, so only it has a derived
+        // listing to cache; an untagged snapshot must not even probe the
+        // cache, or every call takes a guaranteed miss.
+        let tagged = indices
+            .iter()
+            .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 1);
+        if !tagged {
+            return Ok(self.derive_index_listing(indices).await?.indices);
+        }
         // Cache the coverage-rewritten listing per snapshot identity:
         // load_indices sits on the query-planning and merge_insert per-batch
         // paths, and the derivation (segment_coverage plus the per-index
@@ -622,12 +637,12 @@ impl DatasetIndexExt for Dataset {
         if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
             return Ok(cached);
         }
-        let listing = self.derived_index_listing().await?;
+        let listing = self.derive_index_listing(indices).await?;
         // A listing that excludes a segment only because its format marker
         // could not be read is valid for this call alone; caching it would
         // keep the segment excluded for the whole snapshot. Return it
         // uncached so the next call re-probes.
-        if listing.derived && !listing.unverifiable {
+        if !listing.unverifiable {
             self.index_cache
                 .insert_with_key(&derived_key, listing.indices.clone())
                 .await;
