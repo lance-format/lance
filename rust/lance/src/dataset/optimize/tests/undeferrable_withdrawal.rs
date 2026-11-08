@@ -24,7 +24,7 @@ use crate::index::vector::IndexFileVersion;
 use lance_io::object_store::ObjectStoreParams;
 use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use uuid::Uuid;
 
 const INDEX_ROWS_PER_FRAGMENT: u32 = 64;
@@ -2147,6 +2147,279 @@ async fn transient_probe_outage_never_poisons_the_cached_query_plan() {
 /// segment it could not read, and the verdict is not cached, so once reads
 /// succeed the same handle classifies the segment again. A withdrawal is
 /// durable, so it must never rest on a transient fault.
+/// Reads the fault must absorb to confine itself to the FIRST of the two
+/// marker probes the maintenance plan build makes for one segment: the probe
+/// inside the build's own `load_indices`, and the one
+/// `missing_coverage_reason` makes for the segment that probe excluded. The
+/// reader retries a failed metadata read once, so each probe spends two reads
+/// and the budget is the first probe's pair.
+const PLAN_BUILD_FIRST_PROBE_READS: usize = 4;
+
+/// Reopens `path` through a store that fails reads of `suffix` only while a
+/// shared budget of failures is left, so a test can clear the fault after a
+/// known number of probes instead of on a wall-clock edge.
+///
+/// The maintenance plan build probes the marker twice for the same segment --
+/// once in its own `load_indices`, once in `missing_coverage_reason` -- and
+/// only a fault confined to the first probe produces the state this test is
+/// about.
+async fn open_with_budgeted_failing_reads(
+    path: &str,
+    suffix: String,
+    budget: usize,
+) -> (Dataset, Arc<AtomicUsize>) {
+    let remaining = Arc::new(AtomicUsize::new(budget));
+    let dataset = DatasetBuilder::from_uri(path)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(BudgetedFailingReadWrapper {
+                suffix,
+                remaining: remaining.clone(),
+            })),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    (dataset, remaining)
+}
+
+#[derive(Debug)]
+struct BudgetedFailingReadWrapper {
+    suffix: String,
+    remaining: Arc<AtomicUsize>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for BudgetedFailingReadWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(BudgetedFailingReadStore {
+            inner: original,
+            suffix: self.suffix.clone(),
+            remaining: self.remaining.clone(),
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct BudgetedFailingReadStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    suffix: String,
+    remaining: Arc<AtomicUsize>,
+}
+
+impl BudgetedFailingReadStore {
+    /// Consumes one unit of the budget when `location` matches.
+    fn fails(&self, location: &object_store::path::Path) -> bool {
+        if !location.as_ref().ends_with(&self.suffix) {
+            return false;
+        }
+        self.remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+    }
+}
+
+impl std::fmt::Display for BudgetedFailingReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BudgetedFailingReadStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for BudgetedFailingReadStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if self.fails(location) {
+            return Err(FailingReadStore::injected_error());
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        if self.fails(location) {
+            return Err(FailingReadStore::injected_error());
+        }
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, opts).await
+    }
+}
+
+/// The query path only ever builds a plan for segments the listing kept, so a
+/// probe fault there costs the segment its coverage for that one call. The
+/// MAINTENANCE path plans over the STORED segments, so a fault that drops the
+/// segment from the plan build's own listing sends it to
+/// `missing_coverage_reason` instead -- and that second probe, made after the
+/// fault cleared, returns a definitive `NoDerivedCoverage`. Caching a plan
+/// assembled from those two inconsistent views freezes "no coverage" for the
+/// whole snapshot: the remap skips the segment and every later query on the
+/// handle is refused or flat-scanned, all because of a fault that is already
+/// over.
+#[tokio::test]
+async fn a_probe_outage_during_maintenance_planning_does_not_poison_the_cached_query_plan() {
+    Box::pin(probe_outage_during_maintenance_planning_does_not_poison_the_cached_query_plan())
+        .await;
+}
+
+async fn probe_outage_during_maintenance_planning_does_not_poison_the_cached_query_plan() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_maintenance_plan_cache", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(
+        brute_force > 0,
+        "the chosen word {word} must match rows in the fixture"
+    );
+    drop(seed);
+
+    // Retire the segment's provenance, so the plan build probes the marker at
+    // all and the segment is a translation candidate rather than identity.
+    {
+        let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+        let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+        run_deferred_compaction(&mut writer, &options, None).await;
+    }
+
+    // A fresh handle with exactly one failure left in the budget: the plan
+    // build's own `load_indices` probe fails (the segment leaves its listing,
+    // uncached), and the `missing_coverage_reason` probe that follows succeeds
+    // and answers "deferrable" -- the inconsistency this test is about.
+    let (mut dataset, remaining) =
+        open_with_budgeted_failing_reads(&path, suffix, PLAN_BUILD_FIRST_PROBE_READS).await;
+    let before: Vec<(String, Uuid, RoaringBitmap)> = stored_segments(&dataset).await;
+    let fts_before = coverage_of(&before, FTS_INDEX);
+    assert!(!fts_before.is_empty());
+
+    // The maintenance plan build. It may skip the segment (that is the
+    // pre-existing `Unverifiable`/`NoDerivedCoverage` skip, not what is under
+    // test); what must not happen is that it leaves a cached verdict behind.
+    let _ = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await;
+    assert_eq!(
+        remaining.load(Ordering::SeqCst),
+        0,
+        "the maintenance plan build must have met the injected fault"
+    );
+
+    // Reads have been healthy since the second probe. The same handle must
+    // re-derive the segment's coverage and serve the query from the index.
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "a plan built from an unverifiable listing must not be cached: the \
+         segment still covers every destination once reads succeed"
+    );
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_after, brute_force,
+        "the index answer must equal brute force: {plan_after}"
+    );
+    assert!(
+        plan_has_node(&plan_after, "MatchQuery:"),
+        "the segment must serve the query from the inverted index, not from a \
+         plan cached during the outage: {plan_after}"
+    );
+    assert!(
+        !plan_has_node(&plan_after, "FlatMatchQuery:"),
+        "the flat fallback must not outlive the fault: {plan_after}"
+    );
+}
+
 #[tokio::test]
 async fn a_read_failure_defers_the_withdrawal_instead_of_failing_the_commit() {
     let dir = TempStrDir::default();

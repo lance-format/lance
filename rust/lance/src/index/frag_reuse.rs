@@ -307,13 +307,22 @@ async fn fri_query_plan(
     if let Some(cached) = cache.get_with_key(&key).await {
         return Ok(cached);
     }
+    // The listing's own `unverifiable` flag, not a guess from the plan's
+    // contents: a segment the reader dropped for an unreadable marker is
+    // simply absent here, and `missing_coverage_reason` below may then probe
+    // it successfully and return a DEFINITIVE reason. Caching a plan built
+    // from those two inconsistent views would freeze "no coverage" for the
+    // whole snapshot.
+    let mut unverifiable_listing = false;
     let plan = {
         let build = async {
             // The filtered listing carries the rewritten query coverage;
             // `stored` keeps provenance from before that rewrite. Callers
             // hold metadata returned by load_indices and cannot supply
             // this distinction.
-            let indices = dataset.load_indices().await?;
+            let listing = dataset.derived_index_listing().await?;
+            unverifiable_listing = listing.unverifiable;
+            let indices = listing.indices;
             let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
                 stored.iter().map(|entry| (entry.uuid, entry)).collect();
             // Group the filtered listing by logical index name; the
@@ -386,15 +395,18 @@ async fn fri_query_plan(
         };
         Arc::new(build.await?)
     };
-    // A reason of `Unverifiable` holds for this call alone: caching the plan
-    // would keep the segment unverifiable for the whole snapshot. Return it
+    // A reason of `Unverifiable`, or a listing that lost a segment to an
+    // unreadable marker, holds for this call alone: caching the plan would
+    // keep the segment unverifiable for the whole snapshot. Return it
     // uncached so the next call re-probes.
-    if !plan.segments.values().any(|plan| {
-        matches!(
-            plan,
-            SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
-        )
-    }) {
+    if !unverifiable_listing
+        && !plan.segments.values().any(|plan| {
+            matches!(
+                plan,
+                SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
+            )
+        })
+    {
         cache.insert_with_key(&key, plan.clone()).await;
     }
     Ok(plan)

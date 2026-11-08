@@ -278,6 +278,89 @@ impl Dataset {
         )?;
         Ok(catchup_of(&speculative)? != catchup_of(indices)?)
     }
+
+    /// The tagged reader's derived index listing for this snapshot, with the
+    /// flag telling whether a segment is absent from it only because its
+    /// format marker could not be read.
+    ///
+    /// [`DatasetIndexExt::load_indices`] drops the flag once it has decided
+    /// whether to cache; a caller that caches a SECOND derivation of its own
+    /// (the FRI query plan) needs the same flag for the same reason, so the
+    /// decision is made from one source here instead of re-derived from the
+    /// plan's contents.
+    pub(crate) async fn derived_index_listing(&self) -> Result<DerivedIndexListing> {
+        let indices = load_all_indices(self).await?;
+        // Readers apply the fragment reuse index to every index they open.
+        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+            && indices.iter().any(is_hidden_by_frag_reuse)
+        {
+            Arc::new(
+                indices
+                    .iter()
+                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            indices
+        };
+        let tagged = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .map(|fri| fri.index_version);
+        match tagged {
+            // Legacy FRI index version 0 already had its fragment coverage
+            // remapped in load_all_indices().
+            None | Some(0) => Ok(DerivedIndexListing {
+                indices: filter_unusable(indices),
+                unverifiable: false,
+                derived: false,
+            }),
+            Some(1) => {
+                let fri = indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .expect("the v1 FRI entry was just located");
+                let (derived, unverifiable) =
+                    frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                Ok(DerivedIndexListing {
+                    indices: derived,
+                    unverifiable,
+                    derived: true,
+                })
+            }
+            Some(version) => Err(Error::not_supported(format!(
+                "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+            ))),
+        }
+    }
+}
+
+/// The index listing a snapshot's readers see, with what the caller needs to
+/// decide whether to cache it.
+pub struct DerivedIndexListing {
+    pub indices: Arc<Vec<IndexMetadata>>,
+    /// A segment is absent only because its format marker could not be read,
+    /// so the listing holds for this call alone.
+    pub unverifiable: bool,
+    /// The listing came from the tagged reader's coverage derivation, the only
+    /// one worth caching per snapshot.
+    pub derived: bool,
+}
+
+/// Drop the segments no reader can open, keeping the input allocation when
+/// every segment is usable.
+fn filter_unusable(indices: Arc<Vec<IndexMetadata>>) -> Arc<Vec<IndexMetadata>> {
+    if indices.iter().all(index_is_usable) {
+        return indices;
+    }
+    Arc::new(
+        indices
+            .iter()
+            .filter(|idx| index_is_usable(idx))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -525,72 +608,31 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = load_all_indices(self).await?;
-        // Readers apply the fragment reuse index to every index they open.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
-            && indices.iter().any(is_hidden_by_frag_reuse)
-        {
-            Arc::new(
-                indices
-                    .iter()
-                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            indices
+        // Cache the coverage-rewritten listing per snapshot identity:
+        // load_indices sits on the query-planning and merge_insert per-batch
+        // paths, and the derivation (segment_coverage plus the per-index
+        // bitmap rewrites) is otherwise redone on every call. The raw ledger
+        // and mapping readers are already cached by frag_reuse_reader; this
+        // caches its derived output.
+        let derived_key = DerivedIndexListingKey {
+            version: self.manifest.version,
+            store_identity: &self.object_store.store_prefix,
+            e_tag: self.manifest_location.e_tag.as_deref(),
         };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            match fri.index_version {
-                // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
-                1 => {
-                    // Cache the coverage-rewritten listing per snapshot identity:
-                    // load_indices sits on the query-planning and merge_insert
-                    // per-batch paths, and the derivation (segment_coverage plus
-                    // the per-index bitmap rewrites) is otherwise redone on every
-                    // call. The raw ledger and mapping readers are already cached
-                    // by frag_reuse_reader; this caches its derived output.
-                    let derived_key = DerivedIndexListingKey {
-                        version: self.manifest.version,
-                        store_identity: &self.object_store.store_prefix,
-                        e_tag: self.manifest_location.e_tag.as_deref(),
-                    };
-                    if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
-                        return Ok(cached);
-                    }
-                    // A listing that excludes a segment only because its
-                    // format marker could not be read is valid for this call
-                    // alone; caching it would keep the segment excluded for
-                    // the whole snapshot. Return it uncached so the next call
-                    // re-probes.
-                    let (derived, unverifiable) =
-                        frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                    if !unverifiable {
-                        self.index_cache
-                            .insert_with_key(&derived_key, derived.clone())
-                            .await;
-                    }
-                    return Ok(derived);
-                }
-                version => {
-                    return Err(Error::not_supported(format!(
-                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
-                    )));
-                }
-            }
+        if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
+            return Ok(cached);
         }
-        if indices.iter().all(index_is_usable) {
-            return Ok(indices);
+        let listing = self.derived_index_listing().await?;
+        // A listing that excludes a segment only because its format marker
+        // could not be read is valid for this call alone; caching it would
+        // keep the segment excluded for the whole snapshot. Return it
+        // uncached so the next call re-probes.
+        if listing.derived && !listing.unverifiable {
+            self.index_cache
+                .insert_with_key(&derived_key, listing.indices.clone())
+                .await;
         }
-        Ok(Arc::new(
-            indices
-                .iter()
-                .filter(|idx| index_is_usable(idx))
-                .cloned()
-                .collect(),
-        ))
+        Ok(listing.indices)
     }
 
     async fn merge_existing_index_segments(
