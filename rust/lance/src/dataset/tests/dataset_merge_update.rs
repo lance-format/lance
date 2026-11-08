@@ -5966,3 +5966,67 @@ async fn test_merge_staged_new_fragments_concurrent_append_conflicts() {
         err
     );
 }
+
+/// An update that matches no rows leaves the table as it was: no version, no
+/// manifest, so it cannot pre-empt a concurrent writer or a compaction.
+#[rstest]
+#[tokio::test]
+async fn test_update_matching_no_rows_commits_nothing(
+    #[values(false, true)] use_stable_row_id: bool,
+) {
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<Int32Type>())
+        .col("value", array::fill_utf8("value".to_string()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(3));
+    let test_uri = TempStrDir::default();
+    let write_params = WriteParams {
+        max_rows_per_file: 10,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(data, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    let version = dataset.manifest.version;
+    let dataset = Arc::new(dataset);
+
+    let result = UpdateBuilder::new(dataset.clone())
+        .update_where("key < 0")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 0);
+    assert_eq!(result.new_dataset.manifest.version, version);
+    assert_eq!(
+        Dataset::open(&test_uri).await.unwrap().manifest.version,
+        version
+    );
+    assert_eq!(
+        result
+            .new_dataset
+            .count_rows(Some("value = 'value'".to_string()))
+            .await
+            .unwrap(),
+        30
+    );
+
+    // An update that does match still commits.
+    let result = UpdateBuilder::new(dataset)
+        .update_where("key < 5")
+        .unwrap()
+        .set("value", "'changed'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 5);
+    assert_eq!(result.new_dataset.manifest.version, version + 1);
+}

@@ -705,6 +705,21 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // An update that matched no rows changes nothing, so it must not take the
+        // manifest commit: an empty version pre-empts concurrent writers.
+
+        // An update that matched no rows changes nothing, so it must not take the
+        // manifest commit: an empty version pre-empts concurrent writers.
+        if update_data.removed_fragment_ids.is_empty()
+            && update_data.old_fragments.is_empty()
+            && update_data.new_fragments.is_empty()
+        {
+            return Ok(UpdateResult {
+                new_dataset: dataset,
+                rows_updated: 0,
+            });
+        }
+
         // Updated columns are top-level (nested references are rejected by `set`), but a
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
