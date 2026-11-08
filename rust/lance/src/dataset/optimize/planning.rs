@@ -771,8 +771,8 @@ impl DefaultCompactionPlanner {
     /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
     /// A member covered by an index this build cannot read is held back
     /// instead of refusing the plan: no metric of it is read, it is left out of
-    /// every task, one log line per group and index names a bounded sample of
-    /// the held ids, and the rest of its group and every other group still plan.
+    /// every task, one log line names a bounded sample of the held ids, and
+    /// the rest of its group and every other group still plan.
     /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
     /// the selected tasks, in group order.
     pub async fn plan_groups(
@@ -868,30 +868,43 @@ impl DefaultCompactionPlanner {
                     covered |= fragments;
                     covered
                 });
-        if !held_back.is_empty() {
-            // Otherwise a group that plans nothing looks like a group with
-            // nothing to do. One line per group and index, since a caller that
-            // chose the groups needs to know which of its own sources went
-            // unplanned and why; the ids are sampled so that wide coverage
-            // cannot turn one plan into an unbounded log.
-            for (group_index, group) in groups.iter().enumerate() {
-                for (index, covered) in &unreadable_coverage {
-                    let held: BTreeSet<u64> = group
-                        .fragments
-                        .iter()
-                        .map(|fragment| fragment.id)
-                        .filter(|id| u32::try_from(*id).is_ok_and(|id| covered.contains(id)))
-                        .collect();
-                    if !held.is_empty() {
-                        log::info!(
-                            "holding {} fragment(s) of compaction group {} back from compaction, \
-                             including {}: they are covered by index {:?}, which this build \
-                             cannot read, and so cannot be remapped here",
-                            held.len(),
-                            group_index,
-                            describe_held(&held),
-                            index,
-                        );
+        // Otherwise a group that plans nothing looks like a group with nothing
+        // to do. One summary line per plan, over the requested fragments only:
+        // coverage of fragments no group named changes nothing here. The ids
+        // are sampled, so coverage of an arbitrarily wide index cannot turn one
+        // plan into an unbounded line; which group and which index held each
+        // one is a debug detail.
+        let held: BTreeSet<u64> = groups
+            .iter()
+            .flat_map(|group| group.fragments.iter().map(|fragment| fragment.id))
+            .filter(|id| u32::try_from(*id).is_ok_and(|id| held_back.contains(id)))
+            .collect();
+        if !held.is_empty() {
+            log::info!(
+                "holding {} of this plan's {} requested fragment(s) back from compaction, \
+                 including {}: they are covered by an index this build cannot read, and so \
+                 cannot be remapped here",
+                held.len(),
+                named.len(),
+                describe_held(&held),
+            );
+            if log::log_enabled!(log::Level::Debug) {
+                for (group_index, group) in groups.iter().enumerate() {
+                    for (index, covered) in &unreadable_coverage {
+                        let held_here: BTreeSet<u64> = group
+                            .fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .filter(|id| u32::try_from(*id).is_ok_and(|id| covered.contains(id)))
+                            .collect();
+                        if !held_here.is_empty() {
+                            log::debug!(
+                                "compaction group {} holds back {}, covered by index {:?}",
+                                group_index,
+                                describe_held(&held_here),
+                                index,
+                            );
+                        }
                     }
                 }
             }
