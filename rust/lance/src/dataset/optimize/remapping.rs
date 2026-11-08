@@ -950,6 +950,18 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             )));
         }
     }
+    // Runs after the segment's own probe above, which only reports an
+    // unreadable marker for the segment it visits. Without this, a readable
+    // older segment would be replaced while an unreadable newer sibling of the
+    // same logical index is still unaccounted for.
+    let listing = dataset.derived_index_listing().await?;
+    if listing.unverifiable.contains(&curr_index_meta.name) {
+        return Err(Error::index(format!(
+            "could not verify the coverage of index {} (segment {}): a segment's index \
+             file could not be read; retry once the index files are readable",
+            curr_index_meta.name, curr_index_meta.uuid
+        )));
+    }
     let Some(stored_bitmap) = curr_index_meta.fragment_bitmap.clone() else {
         log::warn!(
             "Index {} ({}) has no stored fragment bitmap; its lineage through the tagged \

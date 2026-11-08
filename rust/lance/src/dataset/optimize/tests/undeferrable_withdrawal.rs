@@ -3188,6 +3188,10 @@ async fn commit_fts_delta_segment(dataset: &mut Dataset) -> Uuid {
 /// refuse while the listing cannot be verified, and prune once it can. The
 /// refusal is scoped to the logical index, so a registered healthy sibling of
 /// the unverifiable segment is refused with it, and resolves once reads do.
+/// The remap here meets the unreadable segment itself first, so it is the
+/// pre-existing per-segment refusal control; the sibling orientation, where
+/// the unreadable segment is visited second, is
+/// `an_explicit_remap_refuses_a_readable_segment_beside_an_unreadable_sibling`.
 #[tokio::test]
 async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
     let dir = TempStrDir::default();
@@ -3280,11 +3284,26 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         sibling_message.contains(FTS_INDEX) && sibling_message.contains("could not be read"),
         "the error must name the index whose file could not be read: {sibling_message}"
     );
+    // Manifest order puts the unreadable segment first here, so the remap
+    // meets it directly: the pre-existing per-segment refusal. The sibling
+    // orientation is covered by
+    // `an_explicit_remap_refuses_a_readable_segment_beside_an_unreadable_sibling`.
+    let remap_error = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect_err("an explicit remap must not publish a sibling of an unverifiable segment");
+    assert!(
+        remap_error.to_string().contains(FTS_INDEX),
+        "the error must name the index that could not be verified: {remap_error}"
+    );
     dataset.checkout_latest().await.unwrap();
     assert_eq!(
         stored_segments(&dataset).await,
         before,
-        "a refused prune must leave the manifest's index list untouched"
+        "a refused prune or remap must leave the manifest's index list untouched"
     );
 
     // Once reads recover the same call answers instead of refusing: the
@@ -3316,6 +3335,16 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         "the logical index still covers every destination through the delta"
     );
 
+    // And the remap the fault refused succeeds, publishing the sibling it
+    // could not verify before.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect("the remap must succeed once the marker is readable");
+
     // The same prune, once reads recover, removes the superseded segment.
     crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
         .await
@@ -3341,6 +3370,136 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
     assert!(
         !plan_has_node(&plan_after, "FlatMatchQuery:"),
         "every destination must stay covered after the prune: {plan_after}"
+    );
+}
+
+/// The explicit remap classifies and commits one segment at a time, in
+/// manifest order. When the segment whose index file cannot be read is the
+/// NEWER directly covering delta, the older translating segment is visited
+/// first and, classified from a listing that lacks the delta's direct
+/// coverage, would be translated and published over destinations the delta
+/// already covers: after reads recover every match is answered twice. The
+/// remap must refuse the whole logical index before publishing anything,
+/// and answer exactly, on the same and on a fresh handle, once it can verify.
+#[tokio::test]
+async fn an_explicit_remap_refuses_a_readable_segment_beside_an_unreadable_sibling() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_remap_unreadable_sibling", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(
+        brute_force > 0,
+        "the chosen word {word} must match rows in the fixture"
+    );
+    drop(seed);
+
+    // The compaction retires the original segment's provenance, so it only
+    // covers the destinations the ledger translates for it; the delta then
+    // covers every destination directly.
+    let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut writer, &options, None).await;
+    let delta_uuid = commit_fts_delta_segment(&mut writer).await;
+    drop(writer);
+
+    // The fault is on the DELTA: the segment the remap reaches second.
+    let suffix = format!(
+        "{delta_uuid}/{}",
+        lance_index::scalar::inverted::METADATA_FILE
+    );
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let before = stored_segments(&dataset).await;
+    assert_eq!(
+        before
+            .iter()
+            .filter(|(name, _, _)| name == FTS_INDEX)
+            .count(),
+        2,
+        "the fixture must hold a translating segment and its directly covering delta"
+    );
+    let registered: Vec<IndexMetadata> = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == FTS_INDEX)
+        .cloned()
+        .collect();
+    assert_ne!(
+        registered[0].uuid, delta_uuid,
+        "the fixture relies on the older translating segment being visited \
+         first, before the unreadable delta"
+    );
+
+    failing.store(true, Ordering::SeqCst);
+    let remap_error = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect_err(
+        "an explicit remap must not publish a readable segment while its \
+         sibling's coverage cannot be verified",
+    );
+    let remap_message = remap_error.to_string();
+    assert!(
+        remap_message.contains(FTS_INDEX) && remap_message.contains("could not"),
+        "the error must name the index whose coverage could not be verified: {remap_message}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a refused remap must publish nothing: the older segment must not be \
+         replaced over destinations the delta covers directly"
+    );
+
+    // The same handle, once reads recover: nothing of the fault is cached.
+    failing.store(false, Ordering::SeqCst);
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect("the remap must succeed once every sibling is readable");
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "the logical index must cover every destination after the remap"
+    );
+    let (count, plan) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count, brute_force,
+        "the logical index must answer exactly after the remap: {plan}"
+    );
+    assert!(
+        plan_has_node(&plan, "MatchQuery:"),
+        "the remapped segments must serve the query from the index: {plan}"
+    );
+    assert!(
+        !plan_has_node(&plan, "FlatMatchQuery:"),
+        "every destination must stay covered after the remap: {plan}"
+    );
+
+    let fresh = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let (fresh_count, fresh_plan) = fts_count_on_column(&fresh, &word, "doc").await;
+    assert_eq!(
+        fresh_count, brute_force,
+        "a reopened handle must answer exactly after the remap: {fresh_plan}"
+    );
+    assert!(
+        plan_has_node(&fresh_plan, "MatchQuery:"),
+        "a reopened handle must serve the query from the index: {fresh_plan}"
+    );
+    assert!(
+        !plan_has_node(&fresh_plan, "FlatMatchQuery:"),
+        "a reopened handle must find every destination covered: {fresh_plan}"
     );
 }
 
