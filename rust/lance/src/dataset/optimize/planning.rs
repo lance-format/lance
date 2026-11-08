@@ -1094,23 +1094,16 @@ impl DefaultCompactionPlanner {
         };
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        // Defensive last check over the tasks the budgets kept: the hold-back
-        // above already keeps every covered fragment out of every task, so
-        // this should never fire, and the commit's safeguard checks the same
-        // set again.
-        for (index, covered) in &unreadable_coverage {
-            if let Some(fragment) = tasks
+        // The hold-back above kept every covered fragment out of every bin, so
+        // no task can name one; `reject_unremappable_rewrite` checks the
+        // sources again at commit time, against the manifest of the moment.
+        debug_assert!(
+            !tasks
                 .iter()
                 .flat_map(|task| &task.fragments)
-                .find(|fragment| u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id)))
-            {
-                return Err(Error::invalid_input(format!(
-                    "compaction group selects fragment {} for rewriting, which is covered by \
-                     index '{index}' that this build cannot read and so cannot remap",
-                    fragment.id
-                )));
-            }
-        }
+                .any(|fragment| u32::try_from(fragment.id).is_ok_and(|id| held_back.contains(id))),
+            "grouped compaction selected a held-back fragment"
+        );
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
