@@ -7,7 +7,7 @@
 //! and [`TaskData`] contracts, but never rewrites data or publishes a manifest.
 //! Tests live in `optimize/tests/planning.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -770,9 +770,9 @@ impl DefaultCompactionPlanner {
     /// ascending id order, a fragment absent from the dataset, named by two
     /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
     /// A member covered by an index this build cannot read is held back
-    /// instead of refusing the plan: no metric of it is read, it is left out
-    /// of every task, it is logged by index name, and the rest of its group
-    /// and every other group still plan.
+    /// instead of refusing the plan: no metric of it is read, it is left out of
+    /// every task, one log line per group and index names a bounded sample of
+    /// the held ids, and the rest of its group and every other group still plan.
     /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
     /// the selected tasks, in group order.
     pub async fn plan_groups(
@@ -870,17 +870,29 @@ impl DefaultCompactionPlanner {
                 });
         if !held_back.is_empty() {
             // Otherwise a group that plans nothing looks like a group with
-            // nothing to do. Named index by index, since a caller that chose
-            // the groups needs to know which of its sources went unplanned.
-            for (index, covered) in &unreadable_coverage {
-                if !covered.is_empty() {
-                    log::info!(
-                        "holding fragment(s) {:?} back from grouped compaction: they are covered \
-                         by index {:?}, which this build cannot read, and so cannot be remapped \
-                         here",
-                        covered.iter().collect::<Vec<_>>(),
-                        index,
-                    );
+            // nothing to do. One line per group and index, since a caller that
+            // chose the groups needs to know which of its own sources went
+            // unplanned and why; the ids are sampled so that wide coverage
+            // cannot turn one plan into an unbounded log.
+            for (group_index, group) in groups.iter().enumerate() {
+                for (index, covered) in &unreadable_coverage {
+                    let held: BTreeSet<u64> = group
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.id)
+                        .filter(|id| u32::try_from(*id).is_ok_and(|id| covered.contains(id)))
+                        .collect();
+                    if !held.is_empty() {
+                        log::info!(
+                            "holding {} fragment(s) of compaction group {} back from compaction, \
+                             including {}: they are covered by index {:?}, which this build \
+                             cannot read, and so cannot be remapped here",
+                            held.len(),
+                            group_index,
+                            describe_held(&held),
+                            index,
+                        );
+                    }
                 }
             }
         }
@@ -1398,6 +1410,25 @@ impl FragmentMetrics {
     /// The number of rows that are still in the fragment
     fn num_rows(&self) -> usize {
         self.physical_rows - self.num_deletions
+    }
+}
+
+/// The number of held-back fragment ids a log line names before summarizing.
+pub(super) const HELD_BACK_SAMPLE_LIMIT: usize = 8;
+
+/// Render held-back fragment ids for a log line: the first
+/// [`HELD_BACK_SAMPLE_LIMIT`] in ascending order, then how many are left, so
+/// that coverage of an arbitrarily wide index cannot produce an unbounded line.
+pub(super) fn describe_held(ids: &BTreeSet<u64>) -> String {
+    let sample = ids
+        .iter()
+        .take(HELD_BACK_SAMPLE_LIMIT)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ids.len().saturating_sub(HELD_BACK_SAMPLE_LIMIT) {
+        0 => format!("fragment(s) {sample}"),
+        more => format!("fragment(s) {sample} and {more} more"),
     }
 }
 

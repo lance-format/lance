@@ -4,9 +4,44 @@
 //! Compaction tests for the planning contract area.
 
 use super::*;
+use std::collections::BTreeSet;
+
 use crate::dataset::optimize::planning::{
-    CandidateBin, CompactionCandidacy, FragmentMetrics, fragment_file_bytes,
+    CandidateBin, CompactionCandidacy, FragmentMetrics, HELD_BACK_SAMPLE_LIMIT, describe_held,
+    fragment_file_bytes,
 };
+
+/// The hold-back log names at most [`HELD_BACK_SAMPLE_LIMIT`] fragment ids,
+/// in ascending order, and summarizes the rest as a count.
+#[test]
+fn held_back_description_truncates_to_a_sample_and_a_count() {
+    assert_eq!(describe_held(&BTreeSet::new()), "fragment(s) ");
+    assert_eq!(describe_held(&BTreeSet::from([7])), "fragment(s) 7");
+    assert_eq!(
+        describe_held(&BTreeSet::from([3, 1, 2])),
+        "fragment(s) 1, 2, 3",
+        "ids are named in ascending order"
+    );
+
+    let at_limit = (0..HELD_BACK_SAMPLE_LIMIT as u64).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&at_limit),
+        "fragment(s) 0, 1, 2, 3, 4, 5, 6, 7"
+    );
+
+    let over_limit = (0..HELD_BACK_SAMPLE_LIMIT as u64 + 1).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&over_limit),
+        "fragment(s) 0, 1, 2, 3, 4, 5, 6, 7 and 1 more"
+    );
+
+    let wide = (100..1_100).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&wide),
+        "fragment(s) 100, 101, 102, 103, 104, 105, 106, 107 and 992 more",
+        "a wide index cannot produce an unbounded line"
+    );
+}
 
 #[rstest::rstest]
 #[case::below_default(Some(949), Some(1000), None, true)]
