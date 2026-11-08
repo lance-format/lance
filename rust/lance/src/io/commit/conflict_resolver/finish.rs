@@ -399,6 +399,38 @@ impl<'a> TransactionRebase<'a> {
                 );
             }
 
+            // A rewrite committed since this build started retired its source
+            // fragments; a segment landing with coverage of them relies on
+            // translating through the history at query time (the deferred
+            // rule `check_create_index` admits). A segment whose type cannot
+            // do that would land addressing provenance it can never
+            // translate, so the retired part of its coverage is withdrawn
+            // here, in the same commit, exactly as the rewrite's own commit
+            // withdraws it in the other order.
+            if let (Some(lineage), Some(live)) =
+                (self.current_lineage.as_ref(), self.current_live.as_ref())
+            {
+                let retired = new_indices
+                    .iter()
+                    .filter_map(|index| index.fragment_bitmap.as_ref())
+                    .fold(RoaringBitmap::new(), |retired, bitmap| {
+                        retired | (bitmap - live)
+                    });
+                let undeferrable = crate::index::frag_reuse::undeferrable_segments_covering(
+                    dataset,
+                    new_indices.iter(),
+                    &retired,
+                )
+                .await?;
+                Transaction::withdraw_undeferrable_rewrite_coverage(
+                    new_indices,
+                    Some(lineage),
+                    live,
+                    &undeferrable,
+                    &retired,
+                );
+            }
+
             // Handle MEM_WAL_INDEX rebasing
             let has_mem_wal = new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
 
@@ -559,7 +591,24 @@ impl<'a> TransactionRebase<'a> {
                 // proven disjoint, and disjoint transitions merge.
                 let (entry, base_entry_version) =
                     build_frag_reuse_rewrite_entry(dataset, transitions, groups).await?;
-                let assembly = TaggedRewriteAssembly::new(entry, base_entry_version, transitions)?;
+                // Established here, against the manifest THIS attempt builds
+                // on, for the same reason the entry is: a concurrent
+                // CreateIndex may have added a segment that cannot translate
+                // through the history, and the withdrawal has to cover it.
+                let rewritten: RoaringBitmap = groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter())
+                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                    .collect();
+                let undeferrable_segments =
+                    crate::index::frag_reuse::undeferrable_rewrite_segments(dataset, &rewritten)
+                        .await?;
+                let assembly = TaggedRewriteAssembly::new(
+                    entry,
+                    base_entry_version,
+                    transitions,
+                    undeferrable_segments,
+                )?;
                 return Ok((self.transaction, Some(Arc::new(assembly))));
             }
 

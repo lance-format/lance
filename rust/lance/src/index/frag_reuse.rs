@@ -2016,6 +2016,67 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     Ok((entry, base_entry_version))
 }
 
+/// The committed segments whose coverage of `rewritten` a deferred rewrite
+/// must withdraw instead of leaving behind: those that cover one of the
+/// rewritten fragments and whose type cannot translate stored addresses
+/// through the history in batches.
+///
+/// The classification is the reader's own
+/// (`segment_supports_batch_remapping`), so a segment the reader would
+/// translate keeps its provenance:
+/// - `Some(true)`: deferrable, not listed;
+/// - `Some(false)`: listed, its coverage of the rewritten sources withdrawn;
+/// - `None`: not listed. Details that cannot be interpreted are refused
+///   elsewhere (the reader derives no coverage for such a segment and the
+///   write gates refuse the shapes that would rely on one), and guessing a
+///   withdrawal from unreadable metadata would delete coverage this build
+///   cannot prove is unsound.
+///
+/// Returned in the stored listing's order so the result does not depend on
+/// map iteration.
+pub(crate) async fn undeferrable_rewrite_segments(
+    dataset: &Dataset,
+    rewritten: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    if rewritten.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stored = super::loading::load_all_indices(dataset).await?;
+    undeferrable_segments_covering(dataset, stored.iter(), rewritten).await
+}
+
+/// [`undeferrable_rewrite_segments`] over a supplied segment list: the
+/// segments of `segments` covering one of `fragments` that cannot translate
+/// their stored addresses through the history. Used for segments the
+/// manifest does not list yet, a `CreateIndex` rebased over a committed
+/// rewrite.
+pub(crate) async fn undeferrable_segments_covering<'a>(
+    dataset: &Dataset,
+    segments: impl Iterator<Item = &'a IndexMetadata>,
+    fragments: &RoaringBitmap,
+) -> lance_core::Result<Vec<Uuid>> {
+    let mut undeferrable = Vec::new();
+    for index in segments {
+        if lance_table::system_index::is_system_index(index) {
+            continue;
+        }
+        if index
+            .fragment_bitmap
+            .as_ref()
+            .is_none_or(|bitmap| bitmap.is_disjoint(fragments))
+        {
+            continue;
+        }
+        // TODO: Support deferred remapping for all index types.
+        if super::frag_reuse_reader::segment_supports_batch_remapping(dataset, index).await?
+            == Some(false)
+        {
+            undeferrable.push(index.uuid);
+        }
+    }
+    Ok(undeferrable)
+}
+
 /// Package assembled tagged FRI content bytes into a fresh manifest entry,
 /// spilling to an external details file above the inline threshold. The
 /// content must already be validated (a decodable ledger); this only encodes.

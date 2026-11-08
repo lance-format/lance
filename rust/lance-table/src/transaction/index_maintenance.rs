@@ -26,6 +26,37 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// What invalidated the coverage a withdrawal is computed for, and which
+/// segments it applies to.
+#[derive(Clone, Copy)]
+enum Withdrawal<'a> {
+    /// Every retired fragment of every non-system segment, unknown coverage
+    /// included.
+    AllRetired,
+    /// An in-place rewrite of the listed fields per live fragment; applies to
+    /// the segments indexing one of those fields.
+    Columns(&'a [(u64, Vec<u32>)]),
+    /// A compaction whose source fragments the listed segments cannot
+    /// translate through the deferred history.
+    UndeferrableSegments {
+        segments: &'a [Uuid],
+        rewritten: &'a RoaringBitmap,
+    },
+}
+
+impl Withdrawal<'_> {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::AllRetired => "transaction cleanup left retired provenance unverified",
+            Self::Columns(_) => "an in-place rewrite of an indexed column",
+            Self::UndeferrableSegments { .. } => {
+                "its type cannot translate stored addresses through the deferred history \
+                 of this compaction"
+            }
+        }
+    }
+}
+
 impl Transaction {
     pub(super) fn register_pure_rewrite_rows_update_frags_in_indices(
         indices: &mut [IndexMetadata],
@@ -285,7 +316,44 @@ impl Transaction {
         live: &RoaringBitmap,
         rewrites: &[(u64, Vec<u32>)],
     ) {
-        Self::withdraw_coverage(indices, lineage, live, Some(rewrites));
+        Self::withdraw_coverage(indices, lineage, live, Withdrawal::Columns(rewrites));
+    }
+
+    /// Withdraw, from the listed segments only, their coverage of the
+    /// fragments a compaction rewrites, when the segment's type cannot
+    /// translate its stored addresses through the deferred (tagged) history.
+    ///
+    /// The selection is by segment, not by rewritten column: a compaction
+    /// rewrites no column, and which segments can defer is a per-segment
+    /// capability the commit layer establishes (it has to open the index
+    /// details). A deferring segment is not listed and keeps its retired
+    /// provenance, which the reader translates through the history.
+    ///
+    /// `rewritten` is the compaction's source fragments, still live in the
+    /// manifest the withdrawal is computed against; the subtraction rules,
+    /// the retired-ancestor closure and the segment retirement rules are
+    /// exactly [`Self::withdraw_rewritten_coverage`]'s. The index definition
+    /// always stays: an emptied last segment of its name is kept as the
+    /// record of what to rebuild.
+    pub fn withdraw_undeferrable_rewrite_coverage(
+        indices: &mut Vec<IndexMetadata>,
+        lineage: Option<&TaggedLineage>,
+        live: &RoaringBitmap,
+        segments: &[Uuid],
+        rewritten: &RoaringBitmap,
+    ) {
+        if segments.is_empty() || rewritten.is_empty() {
+            return;
+        }
+        Self::withdraw_coverage(
+            indices,
+            lineage,
+            live,
+            Withdrawal::UndeferrableSegments {
+                segments,
+                rewritten,
+            },
+        );
     }
 
     /// Withdraw retired index provenance whose values cannot be verified after
@@ -308,31 +376,52 @@ impl Transaction {
         lineage: &TaggedLineage,
         live: &RoaringBitmap,
     ) {
-        Self::withdraw_coverage(indices, Some(lineage), live, None);
+        Self::withdraw_coverage(indices, Some(lineage), live, Withdrawal::AllRetired);
     }
 
-    /// A missing rewrite list withdraws all retired provenance. A present list
-    /// withdraws only coverage invalidated by those column rewrites.
+    /// The one withdrawal algorithm, driven by what invalidated the coverage
+    /// (see [`Withdrawal`]).
     fn withdraw_coverage(
         indices: &mut Vec<IndexMetadata>,
         lineage: Option<&TaggedLineage>,
         live: &RoaringBitmap,
-        rewrites: Option<&[(u64, Vec<u32>)]>,
+        withdrawal: Withdrawal<'_>,
     ) {
-        let reason = if rewrites.is_some() {
-            "an in-place rewrite of an indexed column"
-        } else {
-            "transaction cleanup left retired provenance unverified"
-        };
+        let reason = withdrawal.reason();
         let mut emptied = Vec::new();
         for index in indices.iter_mut().filter(|index| !is_system_index(index)) {
-            let indexed: HashSet<u32> = index
-                .dependency_fields()
-                .iter()
-                .filter_map(|field| u32::try_from(*field).ok())
-                .collect();
+            // Rewritten fragments this segment must give up, with the fields
+            // selection already applied; `None` leaves the segment alone.
+            let rewritten_for_segment: Option<Vec<u32>> = match withdrawal {
+                Withdrawal::AllRetired => None,
+                Withdrawal::Columns(rewrites) => {
+                    let indexed: HashSet<u32> = index
+                        .dependency_fields()
+                        .iter()
+                        .filter_map(|field| u32::try_from(*field).ok())
+                        .collect();
+                    Some(
+                        rewrites
+                            .iter()
+                            .filter(|(_, fields)| {
+                                fields.iter().any(|field| indexed.contains(field))
+                            })
+                            .filter_map(|(fragment, _)| u32::try_from(*fragment).ok())
+                            .collect(),
+                    )
+                }
+                Withdrawal::UndeferrableSegments {
+                    segments,
+                    rewritten,
+                } => {
+                    if !segments.contains(&index.uuid) {
+                        continue;
+                    }
+                    Some(rewritten.iter().collect())
+                }
+            };
             let Some(bitmap) = index.fragment_bitmap.as_mut() else {
-                if rewrites.is_none() {
+                if rewritten_for_segment.is_none() {
                     index.fragment_bitmap = Some(RoaringBitmap::new());
                     emptied.push(index.uuid);
                     log::warn!(
@@ -345,15 +434,9 @@ impl Transaction {
                 continue;
             };
             let retired = &*bitmap - live;
-            let mut withdrawn = if let Some(rewrites) = rewrites {
+            let mut withdrawn = if let Some(rewritten_for_segment) = rewritten_for_segment {
                 let mut withdrawn = RoaringBitmap::new();
-                for (fragment, fields) in rewrites {
-                    if !fields.iter().any(|field| indexed.contains(field)) {
-                        continue;
-                    }
-                    let Ok(rewritten) = u32::try_from(*fragment) else {
-                        continue;
-                    };
+                for rewritten in rewritten_for_segment {
                     if bitmap.contains(rewritten) {
                         withdrawn.insert(rewritten);
                     }

@@ -625,19 +625,44 @@ impl Transaction {
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
-                        frag_reuse_ledger,
+                        frag_reuse_ledger.clone(),
                     )?;
-                let live: RoaringBitmap = manifest
-                    .fragments
-                    .iter()
-                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
-                    .collect();
+                let live = Self::live_fragment_bitmap(manifest);
                 Self::withdraw_in_place_rewrites(
                     &mut prepared,
                     rewrites,
                     &manifest.schema,
                     &live,
                     lineage.as_ref(),
+                );
+            }
+            // A deferred compaction leaves every covering segment's retired
+            // provenance in place for the reader to translate through the
+            // history. A segment whose type cannot do that would be left
+            // addressing provenance it can never translate, so its coverage
+            // of this compaction's sources is withdrawn in this same commit;
+            // the commit layer, which can read the index details, decided
+            // which segments those are.
+            if let FragReuseUpdate::Rewrite(assembly) = &frag_reuse
+                && !assembly.undeferrable_segments.is_empty()
+            {
+                let lineage =
+                    crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
+                        &current_indices,
+                        frag_reuse_ledger,
+                    )?;
+                let live = Self::live_fragment_bitmap(manifest);
+                let rewritten: RoaringBitmap = self
+                    .operation
+                    .rewritten_source_fragments()
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .collect();
+                Self::withdraw_undeferrable_rewrite_coverage(
+                    &mut prepared,
+                    lineage.as_ref(),
+                    &live,
+                    &assembly.undeferrable_segments,
+                    &rewritten,
                 );
             }
         }
@@ -647,6 +672,15 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// The fragment ids `manifest` lists, as a bitmap.
+    fn live_fragment_bitmap(manifest: &Manifest) -> RoaringBitmap {
+        manifest
+            .fragments
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .collect()
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -3441,6 +3475,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: Some(7),
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -3638,6 +3673,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
