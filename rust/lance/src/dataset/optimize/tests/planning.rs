@@ -1082,6 +1082,161 @@ async fn grouped_compaction_plans_an_uncovered_group_beside_a_covered_one() {
         plan.tasks
     );
 }
+/// The uncovered group's plan actually executes and commits while the covered
+/// group is left exactly as it was: its fragments keep their ids and files, the
+/// index this build cannot read keeps its coverage, and every row of the table
+/// survives. A plan whose every source is held back writes nothing at all.
+#[tokio::test]
+async fn grouped_compaction_commit_leaves_the_held_back_group_untouched() {
+    async fn four_fragments(dir: &TempStrDir) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn values(dataset: &Dataset, predicate: Option<&str>) -> Vec<i64> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["a"]).unwrap();
+        if let Some(predicate) = predicate {
+            scanner.filter(predicate).unwrap();
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut values = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Group A is fragments 0 and 1, both covered; group B is 2 and 3.
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragments(&dir).await;
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+    let planted = load_all_indices(&Dataset::open(&dir).await.unwrap())
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    assert_eq!(planted.len(), 1);
+
+    let groups = vec![
+        CompactionGroup {
+            fragments: four[..2].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        },
+        CompactionGroup {
+            fragments: four[2..].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        },
+    ];
+    let planned = Dataset::open(&dir).await.unwrap();
+    let plan = planner.plan_groups(&planned, groups).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&planned).await.unwrap());
+    }
+    let mut committer = Dataset::open(&dir).await.unwrap();
+    commit_compaction(
+        &mut committer,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &plan.options,
+    )
+    .await
+    .unwrap();
+
+    // The covered group's fragments are byte-for-byte what they were.
+    let after = committer.manifest.fragments.as_ref().clone();
+    assert_eq!(
+        after.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0, 1, 4]
+    );
+    assert_eq!(after[0], four[0], "the covered fragment 0 is untouched");
+    assert_eq!(after[1], four[1], "the covered fragment 1 is untouched");
+    assert_eq!(after[2].physical_rows, Some(200), "2 and 3 compacted");
+
+    // The index this build cannot read is still there, still addressing the
+    // fragments it addressed before: nothing of it had to be remapped.
+    let indices = load_all_indices(&committer).await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(indices[0].uuid, planted[0].uuid);
+    assert_eq!(indices[0].fragment_bitmap, planted[0].fragment_bitmap);
+
+    // Every row survives, and the uncovered group's own rows are exact.
+    assert_eq!(committer.count_rows(None).await.unwrap(), 400);
+    assert_eq!(values(&committer, None).await, (0..400).collect::<Vec<_>>());
+    assert_eq!(
+        values(&committer, Some("a >= 200")).await,
+        (200..400).collect::<Vec<_>>(),
+        "the rewritten group's rows are preserved exactly"
+    );
+
+    // Every source held back: no task, so nothing is rewritten and the commit
+    // of the empty plan leaves the manifest where it was.
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragments(&dir).await;
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1, 2, 3]).await;
+    let planned = Dataset::open(&dir).await.unwrap();
+    let plan = planner
+        .plan_groups(
+            &planned,
+            vec![CompactionGroup {
+                fragments: four.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
+
+    let mut committer = Dataset::open(&dir).await.unwrap();
+    let version = committer.manifest.version;
+    let metrics = commit_compaction(
+        &mut committer,
+        Vec::new(),
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &plan.options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 0);
+    assert_eq!(metrics.fragments_added, 0);
+    assert_eq!(
+        committer.manifest.version, version,
+        "an empty plan commits nothing"
+    );
+    assert_eq!(committer.manifest.fragments.as_ref(), &four);
+    assert_eq!(committer.count_rows(None).await.unwrap(), 400);
+}
 /// A group that mixes covered and uncovered sources still plans the uncovered
 /// ones: the covered member is held back and the two uncovered members on one
 /// side of it compact together.
