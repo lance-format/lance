@@ -1926,12 +1926,28 @@ async fn a_read_failure_on_one_segment_does_not_fail_every_query() {
     );
     assert!(count_during > 0, "the word must match rows");
 
-    // No verdict was cached from the fault: once reads succeed the SAME
-    // handle classifies the segment as deferrable, so the selector lists
-    // nothing to withdraw. (The derived index LISTING is cached per manifest
-    // snapshot, which is why the query plan above keeps its fallback until
-    // the next version; the format verdict itself is not.)
+    // Nothing about the fault was cached: once reads succeed the SAME handle
+    // (no reopen, same manifest snapshot) re-probes the segment, so the
+    // listing carries its coverage again and the index serves the query
+    // instead of the flat fallback.
     failing.store(false, Ordering::SeqCst);
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "an unverifiable segment must be re-probed, not cached as excluded"
+    );
+    let (_, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert!(
+        !plan_after.contains("FlatMatchQuery"),
+        "the re-probed segment must serve the query once reads succeed: {plan_after}"
+    );
+    // The selector likewise classifies it as deferrable, so nothing is
+    // withdrawn.
     assert!(
         crate::index::frag_reuse::undeferrable_rewrite_segments(&dataset, &fts_before)
             .await

@@ -557,14 +557,22 @@ impl DatasetIndexExt for Dataset {
                         store_identity: &self.object_store.store_prefix,
                         e_tag: self.manifest_location.e_tag.as_deref(),
                     };
-                    return self
-                        .index_cache
-                        .get_or_insert_with_key(derived_key, || async {
-                            let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                            Ok(derived.as_ref().clone())
-                        })
-                        .await;
+                    if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
+                        return Ok(cached);
+                    }
+                    // A listing that excludes a segment only because its
+                    // format marker could not be read is valid for this call
+                    // alone; caching it would keep the segment excluded for
+                    // the whole snapshot. Return it uncached so the next call
+                    // re-probes.
+                    let (derived, unverifiable) =
+                        frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                    if !unverifiable {
+                        self.index_cache
+                            .insert_with_key(&derived_key, derived.clone())
+                            .await;
+                    }
+                    return Ok(derived);
                 }
                 version => {
                     return Err(Error::not_supported(format!(

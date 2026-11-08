@@ -33,11 +33,16 @@ fn check_reader_path() -> Result<()> {
 /// The returned coverage bitmaps are snapshot-derived query inputs and must
 /// never be persisted back to a manifest: stored segment metadata keeps its
 /// original provenance.
+///
+/// The second element is true when a segment was excluded only because its
+/// format marker could not be read. That exclusion holds for THIS call alone,
+/// so the listing must not be cached: the caller re-derives it and the next
+/// call re-probes.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
     indices: &[IndexMetadata],
-) -> Result<Arc<Vec<IndexMetadata>>> {
+) -> Result<(Arc<Vec<IndexMetadata>>, bool)> {
     let mapping = FragmentReuseIndex::open(dataset, fri).await?;
     let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
     let mut result = vec![None; indices.len()];
@@ -72,6 +77,7 @@ pub(super) async fn load_indices(
     // reports true in this state as well, so this is the same decision made
     // explicitly here without consulting the plugin registry per segment.
     let unsupported_history = mapping.ledger.has_unsupported_transitions();
+    let mut unverifiable = false;
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
@@ -94,6 +100,7 @@ pub(super) async fn load_indices(
                             index.name,
                             index.uuid,
                         );
+                        unverifiable = true;
                         false
                     }
                 };
@@ -128,7 +135,10 @@ pub(super) async fn load_indices(
             result[position] = Some(index);
         }
     }
-    Ok(Arc::new(result.into_iter().flatten().collect()))
+    Ok((
+        Arc::new(result.into_iter().flatten().collect()),
+        unverifiable,
+    ))
 }
 
 impl FragmentReuseIndex {
@@ -1518,7 +1528,8 @@ pub mod tests {
         orphan_user_index.fragment_bitmap = None;
 
         let indices = vec![fri.clone(), mem_wal.clone(), orphan_user_index.clone()];
-        let listing = load_indices(&dataset, &fri, &indices).await.unwrap();
+        let (listing, unverifiable) = load_indices(&dataset, &fri, &indices).await.unwrap();
+        assert!(!unverifiable, "every marker is readable in this fixture");
 
         assert!(
             listing.iter().any(|i| i.name == MEM_WAL_INDEX_NAME),

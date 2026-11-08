@@ -288,104 +288,116 @@ impl CacheKey for FriQueryPlanKey<'_> {
 
 /// Build or fetch the snapshot's FRI query plan.
 ///
-/// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
-/// coalesce on one build. Everything only needed to BUILD the plan (notably
-/// `load_indices` and its tagged coverage post-processing) runs inside the
-/// loader, so warm opens never recompute coverage.
+/// Cached in the tagged (manifest-path scoped) namespace, so warm opens never
+/// recompute coverage. A plan holding an `Unverifiable` segment is returned
+/// uncached: concurrent builds may then duplicate the work, which is the cost
+/// of re-probing instead of freezing a transient fault for the snapshot.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
     stored: &[IndexMetadata],
     mapping: &Arc<super::frag_reuse_reader::FragmentReuseIndex>,
 ) -> lance_core::Result<Arc<FriQueryPlan>> {
-    dataset
+    let cache = dataset
         .index_cache
-        .with_key_prefix(dataset.manifest_location.path.as_ref())
-        .get_or_insert_with_key(
-            FriQueryPlanKey {
-                fri_uuid: &fri.uuid,
-            },
-            || async {
-                // The filtered listing carries the rewritten query coverage;
-                // `stored` keeps provenance from before that rewrite. Callers
-                // hold metadata returned by load_indices and cannot supply
-                // this distinction.
-                let indices = dataset.load_indices().await?;
-                let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    stored.iter().map(|entry| (entry.uuid, entry)).collect();
-                // Group the filtered listing by logical index name; the
-                // backtrack derives each member's sibling exclusions from the
-                // stored provenance of the whole group in one pass, so
-                // "direct coverage wins" is owned by one algorithm.
-                let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    HashMap::with_capacity(indices.len());
-                let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
-                for entry in indices.iter() {
-                    filtered_by_uuid.insert(entry.uuid, entry);
-                    if entry.name != FRAG_REUSE_INDEX_NAME {
-                        groups
-                            .entry(entry.name.as_str())
-                            .or_default()
-                            .push(entry.uuid);
+        .with_key_prefix(dataset.manifest_location.path.as_ref());
+    let key = FriQueryPlanKey {
+        fri_uuid: &fri.uuid,
+    };
+    if let Some(cached) = cache.get_with_key(&key).await {
+        return Ok(cached);
+    }
+    let plan = {
+        let build = async {
+            // The filtered listing carries the rewritten query coverage;
+            // `stored` keeps provenance from before that rewrite. Callers
+            // hold metadata returned by load_indices and cannot supply
+            // this distinction.
+            let indices = dataset.load_indices().await?;
+            let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                stored.iter().map(|entry| (entry.uuid, entry)).collect();
+            // Group the filtered listing by logical index name; the
+            // backtrack derives each member's sibling exclusions from the
+            // stored provenance of the whole group in one pass, so
+            // "direct coverage wins" is owned by one algorithm.
+            let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
+                HashMap::with_capacity(indices.len());
+            let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
+            for entry in indices.iter() {
+                filtered_by_uuid.insert(entry.uuid, entry);
+                if entry.name != FRAG_REUSE_INDEX_NAME {
+                    groups
+                        .entry(entry.name.as_str())
+                        .or_default()
+                        .push(entry.uuid);
+                }
+            }
+            let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
+            for members in groups.into_values() {
+                let provenance: Vec<RoaringBitmap> = members
+                    .iter()
+                    .map(|uuid| {
+                        stored_by_uuid
+                            .get(uuid)
+                            .and_then(|source| source.fragment_bitmap.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
+                    parts_by_uuid.insert(*uuid, parts);
+                }
+            }
+            let mut segments = HashMap::with_capacity(stored.len());
+            for source in stored.iter() {
+                let plan = if source
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.is_empty())
+                {
+                    // An empty bitmap needs no translation, but its pages
+                    // may still hold the withdrawn rows: never identity.
+                    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
+                } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
+                    SegmentRemappingPlan::Identity
+                } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
+                    && let Some(bitmap) = &entry.fragment_bitmap
+                {
+                    let coverage = bitmap & dataset.fragment_bitmap.as_ref();
+                    // Other selected segments own their direct coverage.
+                    // Drop paths entering those fragments before later
+                    // mappings can merge them with this segment's
+                    // contribution.
+                    let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
+                    let fingerprint =
+                        mapping.translation_fingerprint(&coverage, &parts.excluded, &parts.path);
+                    SegmentRemappingPlan::Translate {
+                        coverage,
+                        excluded_fragments: parts.excluded,
+                        fingerprint,
                     }
-                }
-                let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
-                for members in groups.into_values() {
-                    let provenance: Vec<RoaringBitmap> = members
-                        .iter()
-                        .map(|uuid| {
-                            stored_by_uuid
-                                .get(uuid)
-                                .and_then(|source| source.fragment_bitmap.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
-                        parts_by_uuid.insert(*uuid, parts);
-                    }
-                }
-                let mut segments = HashMap::with_capacity(stored.len());
-                for source in stored.iter() {
-                    let plan = if source
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|bitmap| bitmap.is_empty())
-                    {
-                        // An empty bitmap needs no translation, but its pages
-                        // may still hold the withdrawn rows: never identity.
-                        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
-                    } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-                        SegmentRemappingPlan::Identity
-                    } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
-                        && let Some(bitmap) = &entry.fragment_bitmap
-                    {
-                        let coverage = bitmap & dataset.fragment_bitmap.as_ref();
-                        // Other selected segments own their direct coverage.
-                        // Drop paths entering those fragments before later
-                        // mappings can merge them with this segment's
-                        // contribution.
-                        let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
-                        let fingerprint = mapping.translation_fingerprint(
-                            &coverage,
-                            &parts.excluded,
-                            &parts.path,
-                        );
-                        SegmentRemappingPlan::Translate {
-                            coverage,
-                            excluded_fragments: parts.excluded,
-                            fingerprint,
-                        }
-                    } else {
-                        SegmentRemappingPlan::MissingCoverage(
-                            missing_coverage_reason(dataset, mapping, source).await?,
-                        )
-                    };
-                    segments.insert(source.uuid, plan);
-                }
-                Ok(FriQueryPlan { segments })
-            },
+                } else {
+                    SegmentRemappingPlan::MissingCoverage(
+                        missing_coverage_reason(dataset, mapping, source).await?,
+                    )
+                };
+                segments.insert(source.uuid, plan);
+            }
+            Ok::<_, Error>(FriQueryPlan { segments })
+        };
+        Arc::new(build.await?)
+    };
+    // A reason of `Unverifiable` holds for this call alone: caching the plan
+    // would keep the segment unverifiable for the whole snapshot. Return it
+    // uncached so the next call re-probes.
+    if !plan.segments.values().any(|plan| {
+        matches!(
+            plan,
+            SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
         )
-        .await
+    }) {
+        cache.insert_with_key(&key, plan.clone()).await;
+    }
+    Ok(plan)
 }
 
 /// Resolve the current fragment coverage for committed query segments.
