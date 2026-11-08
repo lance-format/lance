@@ -2870,7 +2870,7 @@ mod withdrawal_feasibility {
         let entry = tagged_entry(&[(&[0], &[1, 2])]);
         let mut segment = sample_index_metadata("vec_idx");
         segment.fragment_bitmap = Some([0u32].into_iter().collect());
-        let mut projected = segment.fragment_bitmap.clone().unwrap();
+        let mut projected = segment.fragment_bitmap.unwrap();
         projected.remove(1);
         assert_eq!(
             projected,
@@ -2922,6 +2922,105 @@ mod withdrawal_feasibility {
             coverage(&indices),
             [5u32].into_iter().collect::<RoaringBitmap>(),
             "Q is retired and on the history, so it is translated and retained"
+        );
+    }
+
+    /// The compaction entry point selects by SEGMENT, not by rewritten
+    /// column: an undeferrable segment gives up the rewritten sources while
+    /// a deferrable sibling over the SAME column and fragments keeps its
+    /// provenance for the reader to translate.
+    #[test]
+    fn undeferrable_withdrawal_touches_only_the_listed_segments() {
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut undeferrable = sample_index_metadata("vec_idx");
+        undeferrable.fragment_bitmap = Some([1u32, 2, 3].into_iter().collect());
+        let mut deferrable = sample_index_metadata("i_idx");
+        deferrable.fragment_bitmap = Some([1u32, 2, 3].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2, 3, 91].into_iter().collect();
+        let rewritten: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let mut indices = vec![undeferrable.clone(), deferrable.clone()];
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[undeferrable.uuid],
+            &rewritten,
+        );
+        assert_eq!(
+            coverage(&indices),
+            [3u32].into_iter().collect::<RoaringBitmap>(),
+            "the undeferrable segment gives up the rewritten sources only"
+        );
+        assert_eq!(
+            indices
+                .iter()
+                .find(|index| index.name == "i_idx")
+                .unwrap()
+                .fragment_bitmap,
+            deferrable.fragment_bitmap,
+            "the deferrable sibling is untouched"
+        );
+    }
+
+    /// An empty selection, or a compaction rewriting nothing, is a no-op: no
+    /// bitmap is touched and no segment is retired.
+    #[test]
+    fn undeferrable_withdrawal_of_nothing_is_a_no_op() {
+        let entry = tagged_entry(&[(&[90], &[91])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([1u32, 2].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2, 91].into_iter().collect();
+        let original = vec![segment.clone()];
+
+        let mut indices = original.clone();
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[],
+            &[1u32].into_iter().collect(),
+        );
+        assert_eq!(coverage(&indices), coverage(&original));
+
+        let mut indices = original.clone();
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[segment.uuid],
+            &RoaringBitmap::new(),
+        );
+        assert_eq!(coverage(&indices), coverage(&original));
+    }
+
+    /// The historical closure applies here too: a segment storing the
+    /// ancestor P of a now-rewritten F1 gives up P, and with it the derived
+    /// coverage of P's other destination F2. The accepted extra loss.
+    #[test]
+    fn undeferrable_withdrawal_follows_the_retired_ancestor() {
+        // P(0) -> F1(1) + F2(2); F1 is now rewritten.
+        let entry = tagged_entry(&[(&[0], &[1, 2])]);
+        let mut segment = sample_index_metadata("vec_idx");
+        segment.fragment_bitmap = Some([0u32].into_iter().collect());
+        let live: RoaringBitmap = [1u32, 2].into_iter().collect();
+
+        let mut indices = vec![segment.clone()];
+        Transaction::withdraw_undeferrable_rewrite_coverage(
+            &mut indices,
+            Some(&walkable(&entry)),
+            &live,
+            &[segment.uuid],
+            &[1u32].into_iter().collect(),
+        );
+        assert!(
+            coverage(&indices).is_empty(),
+            "P is withdrawn, giving up F2's derived coverage as well"
+        );
+        assert_eq!(
+            indices.len(),
+            1,
+            "the last segment of a name stays as the definition to rebuild"
         );
     }
 }

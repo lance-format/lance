@@ -1,0 +1,841 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! A deferred compaction on a tagged fragment reuse history leaves every
+//! covering segment's retired provenance in place for the reader to translate.
+//! A segment whose type cannot be translated in batches
+//! (`segment_supports_batch_remapping` answers `Some(false)`, today a legacy
+//! pre-(0,3) vector index file) would be left addressing provenance it can
+//! never translate, so the Rewrite commit withdraws its coverage of the
+//! rewritten sources in the same manifest version.
+//!
+//! The fixture is one table with both kinds of segment: a legacy-format
+//! IVF_PQ index (undeferrable) and a BTree index (deferrable) over the same
+//! fragments, on a table made tagged by a stable-partition commit before the
+//! indices exist.
+
+use super::*;
+use crate::dataset::CommitBuilder;
+use crate::dataset::optimize::commit::commit_compaction;
+use crate::index::frag_reuse::frag_reuse_entry_appending;
+use crate::index::frag_reuse_reader::tests::prepare_partition;
+use crate::index::vector::IndexFileVersion;
+use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
+use std::borrow::Cow;
+use uuid::Uuid;
+
+const INDEX_ROWS_PER_FRAGMENT: u32 = 64;
+const VECTOR_INDEX: &str = "vector_idx";
+const BTREE_INDEX: &str = "i_idx";
+
+/// Four fragments of `i` plus a 4-dimensional vector column.
+async fn fixture() -> Dataset {
+    lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .into_ram_dataset(
+            FragmentCount::from(4),
+            FragmentRowCount::from(INDEX_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap()
+}
+
+/// Makes `dataset` tagged by committing a stable partition of its first two
+/// fragments, then indexes `i` (BTree, deferrable) and `vector` (a legacy
+/// pre-(0,3) IVF_PQ file, undeferrable) over everything that is then live.
+///
+/// The partition commits BEFORE the indices exist, so no segment's coverage
+/// depends on it: the indices are built over the destinations and the
+/// withdrawal under test is the DIRECT case, sources still live in the
+/// manifest it is computed against.
+async fn tagged_with_both_index_kinds() -> Dataset {
+    let mut dataset = make_tagged(fixture().await).await;
+    create_legacy_vector_index(&mut dataset).await;
+    create_btree_index(&mut dataset).await;
+    dataset
+}
+
+/// A legacy (pre-(0,3)) IVF_PQ file: the one index kind
+/// `segment_supports_batch_remapping` reports as undeferrable at this pin.
+async fn create_legacy_vector_index(dataset: &mut Dataset) {
+    let mut params =
+        VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
+    params.version(IndexFileVersion::Legacy);
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some(VECTOR_INDEX.into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+}
+
+async fn create_btree_index(dataset: &mut Dataset) {
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            Some(BTREE_INDEX.into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+}
+
+/// The stored (not reader-derived) metadata of every non-system segment, by
+/// name: uuid and declared fragment coverage. Read straight from the manifest
+/// so a withdrawal is observed as the commit wrote it.
+async fn stored_segments(dataset: &Dataset) -> Vec<(String, Uuid, RoaringBitmap)> {
+    load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| !is_system_index(index))
+        .map(|index| {
+            (
+                index.name.clone(),
+                index.uuid,
+                index.fragment_bitmap.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+fn coverage_of(segments: &[(String, Uuid, RoaringBitmap)], name: &str) -> RoaringBitmap {
+    segments
+        .iter()
+        .filter(|(index_name, _, _)| index_name == name)
+        .fold(RoaringBitmap::new(), |coverage, (_, _, bitmap)| {
+            coverage | bitmap
+        })
+}
+
+/// The coverage the READER derives for `name` after translating the history.
+async fn derived_coverage(dataset: &Dataset, name: &str) -> RoaringBitmap {
+    dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == name)
+        .fold(RoaringBitmap::new(), |coverage, index| {
+            coverage | index.fragment_bitmap.clone().unwrap_or_default()
+        })
+}
+
+fn deferred_options(target_rows_per_fragment: usize) -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment,
+        defer_index_remap: true,
+        ..Default::default()
+    }
+}
+
+/// Runs the plan's tasks, keeping only the positions in `keep` (all of them
+/// when `keep` is `None`): the omitted tasks are the "failed" ones, never
+/// executed and never committed.
+async fn execute_tasks(
+    dataset: &Dataset,
+    plan: &CompactionPlan,
+    options: &CompactionOptions,
+    keep: Option<&[usize]>,
+) -> Vec<RewriteResult> {
+    let mut results = Vec::new();
+    for (position, task) in plan.tasks().iter().enumerate() {
+        if keep.is_some_and(|keep| !keep.contains(&position)) {
+            continue;
+        }
+        results.push(
+            rewrite_files(Cow::Borrowed(dataset), task.clone(), options)
+                .await
+                .unwrap(),
+        );
+    }
+    results
+}
+
+/// Plans a deferred compaction and commits `keep` of its tasks (all of them
+/// when `keep` is `None`), returning how many were committed.
+async fn run_deferred_compaction(
+    dataset: &mut Dataset,
+    options: &CompactionOptions,
+    keep: Option<&[usize]>,
+) -> usize {
+    let plan = plan_compaction(dataset, options).await.unwrap();
+    let results = execute_tasks(dataset, &plan, options, keep).await;
+    let committed = results.len();
+    if committed > 0 {
+        commit_compaction(
+            dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            options,
+        )
+        .await
+        .unwrap();
+    }
+    committed
+}
+
+/// A brute-force k-nearest-neighbour answer over the table's current
+/// contents, computed without any index.
+async fn brute_force_knn(dataset: &Dataset, query: &Float32Array, k: usize) -> Vec<i32> {
+    let batch = dataset
+        .scan()
+        .project(&["i", "vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let values = batch["i"].as_primitive::<Int32Type>();
+    let vectors = batch["vector"].as_fixed_size_list();
+    let mut scored: Vec<(f32, i32)> = (0..batch.num_rows())
+        .map(|row| {
+            let vector = vectors.value(row);
+            let vector = vector.as_primitive::<Float32Type>();
+            let distance: f32 = query
+                .values()
+                .iter()
+                .zip(vector.values().iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            (distance, values.value(row))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut rows: Vec<i32> = scored.into_iter().take(k).map(|(_, i)| i).collect();
+    // Compared as a set: the top-k membership is what a withdrawal can
+    // change, while the order of equal distances is not pinned.
+    rows.sort_unstable();
+    rows
+}
+
+/// A query vector taken from a row that is live after the compaction.
+async fn query_vector(dataset: &Dataset, i: i32) -> Float32Array {
+    let batch = dataset
+        .scan()
+        .filter(&format!("i = {i}"))
+        .unwrap()
+        .project(&["vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1, "row {i} is not live");
+    batch["vector"]
+        .as_fixed_size_list()
+        .value(0)
+        .as_primitive::<Float32Type>()
+        .clone()
+}
+
+/// The KNN answer the planner produces for `dataset`, with the plan text so a
+/// test can assert which path served it.
+async fn indexed_knn(dataset: &Dataset, query: &Float32Array, k: usize) -> (Vec<i32>, String) {
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, k).unwrap();
+    scan.project(&["i"]).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut rows: Vec<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .iter()
+        .map(|value| value.unwrap())
+        .collect();
+    rows.sort_unstable();
+    (rows, plan)
+}
+
+/// The whole contract on one commit: in the SAME committed manifest version
+/// the undeferrable segment's bitmap no longer names the rewritten sources
+/// (nor the destinations), the deferrable segment still translates to the
+/// destinations through the history, both index definitions remain, and no
+/// other segment changed. The queries afterwards: KNN on the withdrawn
+/// column equals brute force without any retired or duplicated row, and the
+/// BTree lookup stays correct.
+#[tokio::test]
+async fn deferred_compaction_withdraws_the_undeferrable_segments_coverage() {
+    let mut dataset = tagged_with_both_index_kinds().await;
+    let before = stored_segments(&dataset).await;
+    let vector_before = coverage_of(&before, VECTOR_INDEX);
+    let btree_before = coverage_of(&before, BTREE_INDEX);
+    assert_eq!(
+        vector_before, btree_before,
+        "the fixture indexes the same fragments with both kinds"
+    );
+    let version_before = dataset.manifest.version;
+
+    // Compact everything live into one fragment.
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    let sources: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let committed = run_deferred_compaction(&mut dataset, &options, None).await;
+    assert!(committed > 0, "the fixture must have something to compact");
+    // The withdrawal rides the rewrite commit: the Rewrite is the LAST
+    // version this compaction wrote (the fragment-id reservation before it is
+    // the pre-existing address-style step), and the narrowed bitmap is already
+    // in it.
+    assert!(dataset.manifest.version > version_before);
+    assert!(matches!(
+        dataset
+            .read_transaction()
+            .await
+            .unwrap()
+            .map(|transaction| transaction.operation),
+        Some(Operation::Rewrite { .. })
+    ));
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+
+    let after = stored_segments(&dataset).await;
+    // The undeferrable segment gave up the rewritten sources and claims no
+    // destination either.
+    let vector_after = coverage_of(&after, VECTOR_INDEX);
+    assert!(
+        vector_after.is_disjoint(&sources),
+        "the legacy vector segment still covers rewritten sources {:?}",
+        (&vector_after & &sources).iter().collect::<Vec<_>>()
+    );
+    assert!(
+        vector_after.is_disjoint(&destinations),
+        "a withdrawal never claims the rewrite's outputs: {:?}",
+        (&vector_after & &destinations).iter().collect::<Vec<_>>()
+    );
+    // The deferrable segment kept its provenance and translates to the
+    // destinations.
+    assert_eq!(
+        coverage_of(&after, BTREE_INDEX),
+        btree_before,
+        "a deferrable segment's stored provenance is untouched"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, BTREE_INDEX).await,
+        destinations,
+        "the BTree's coverage must translate to the rewrite's outputs"
+    );
+    assert!(
+        derived_coverage(&dataset, VECTOR_INDEX).await.is_empty(),
+        "the withdrawn segment must derive no coverage"
+    );
+    // Both definitions remain, so a later optimize can restore coverage.
+    for name in [VECTOR_INDEX, BTREE_INDEX] {
+        assert!(
+            after.iter().any(|(index_name, _, _)| index_name == name),
+            "index {name} must keep its definition"
+        );
+    }
+    // No other segment changed: every uuid present before is still present
+    // with its coverage, except the withdrawn vector segments.
+    let withdrawn: Vec<Uuid> = before
+        .iter()
+        .filter(|(name, _, _)| name == VECTOR_INDEX)
+        .map(|(_, uuid, _)| *uuid)
+        .collect();
+    for (name, uuid, bitmap) in &before {
+        if withdrawn.contains(uuid) {
+            continue;
+        }
+        assert!(
+            after
+                .iter()
+                .any(|(_, after_uuid, after_bitmap)| after_uuid == uuid && after_bitmap == bitmap),
+            "segment {uuid} of index {name} changed without being withdrawn"
+        );
+    }
+
+    // Queries: the withdrawn column answers exactly, by scanning.
+    let query = query_vector(&dataset, 7).await;
+    let expected = brute_force_knn(&dataset, &query, 5).await;
+    let (rows, plan) = indexed_knn(&dataset, &query, 5).await;
+    assert_eq!(rows, expected, "{plan}");
+    assert!(
+        !plan.contains("ANN"),
+        "a withdrawn segment must not serve an ANN query: {plan}"
+    );
+    // And the BTree lookup stays correct and indexed.
+    let mut lookup = dataset.scan();
+    lookup.filter("i = 7").unwrap().project(&["i"]).unwrap();
+    let lookup_plan = lookup.explain_plan(false).await.unwrap();
+    assert!(lookup_plan.contains("ScalarIndexQuery"), "{lookup_plan}");
+    let batch = lookup.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["i"].as_primitive::<Int32Type>().value(0), 7);
+}
+
+/// A deferred compaction of fragments the undeferrable index does not cover
+/// withdraws nothing: every index's metadata is byte-for-byte what it was.
+#[tokio::test]
+async fn a_compaction_off_the_undeferrable_coverage_withdraws_nothing() {
+    let mut dataset = tagged_with_both_index_kinds().await;
+    // Append two fragments AFTER the indices were built, so no segment covers
+    // them, then compact only those.
+    let batch = {
+        let mut scan = dataset.scan();
+        scan.project(&["i", "vector"]).unwrap();
+        scan.try_into_batch().await.unwrap()
+    };
+    let appended = RecordBatch::try_new(
+        batch.schema(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(
+                10_000..10_000 + batch.num_rows() as i32,
+            )) as ArrayRef,
+            batch["vector"].clone(),
+        ],
+    )
+    .unwrap();
+    let schema = appended.schema();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(WriteParams {
+                max_rows_per_file: INDEX_ROWS_PER_FRAGMENT as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let indexed: RoaringBitmap = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| !is_system_index(index))
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+    let unindexed: Vec<u32> = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .filter(|id| !indexed.contains(*id))
+        .collect();
+    assert!(
+        unindexed.len() >= 2,
+        "the appended fragments must be unindexed"
+    );
+
+    let before = stored_segments(&dataset).await;
+    // Hold every covered fragment out of the plan, so the compaction touches
+    // only the uncovered appended ones.
+    let options = CompactionOptions {
+        excluded_fragment_ids: indexed.iter().collect(),
+        ..deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize)
+    };
+    let committed = run_deferred_compaction(&mut dataset, &options, None).await;
+    assert!(
+        committed > 0,
+        "the appended fragments must actually be compacted"
+    );
+
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a compaction touching no covered fragment must not change any index metadata"
+    );
+}
+
+/// Committing only part of the plan withdraws only the committed tasks'
+/// sources; the omitted task's sources stay covered. The task that was never
+/// passed to the commit is the "failed" case: its fragments keep their
+/// coverage because nothing retired them.
+#[tokio::test]
+async fn a_partial_commit_withdraws_only_the_committed_tasks_sources() {
+    let mut dataset = tagged_with_both_index_kinds().await;
+    let before = stored_segments(&dataset).await;
+    let vector_before = coverage_of(&before, VECTOR_INDEX);
+
+    // One task per pair of fragments, so a subset is meaningful.
+    let options = deferred_options(2 * INDEX_ROWS_PER_FRAGMENT as usize);
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert!(
+        plan.tasks().len() >= 2,
+        "need at least two tasks to commit a subset, got {}",
+        plan.tasks().len()
+    );
+    let committed_sources: RoaringBitmap = plan.tasks()[0]
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let omitted_sources: RoaringBitmap = plan.tasks()[1..]
+        .iter()
+        .flat_map(|task| task.fragments.iter())
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(!committed_sources.is_empty() && !omitted_sources.is_empty());
+
+    let results = execute_tasks(&dataset, &plan, &options, Some(&[0])).await;
+    assert_eq!(results.len(), 1);
+    commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+
+    let vector_after = coverage_of(&stored_segments(&dataset).await, VECTOR_INDEX);
+    assert!(
+        vector_after.is_disjoint(&committed_sources),
+        "the committed task's sources must be withdrawn"
+    );
+    assert_eq!(
+        &vector_after & &omitted_sources,
+        &vector_before & &omitted_sources,
+        "an omitted (failed) task's sources keep their coverage"
+    );
+    assert!(
+        !(&vector_after & &omitted_sources).is_empty(),
+        "the omitted task's sources must still be covered"
+    );
+}
+
+/// The ordinary eager default is unchanged: `defer_index_remap = false` on
+/// this table refuses up front (the tagged history requires the deferred
+/// path), without withdrawing anything.
+#[tokio::test]
+async fn the_eager_default_is_unchanged_and_withdraws_nothing() {
+    let mut dataset = tagged_with_both_index_kinds().await;
+    let before = stored_segments(&dataset).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 4 * INDEX_ROWS_PER_FRAGMENT as usize,
+        ..Default::default()
+    };
+    let error = compact_files(&mut dataset, options, None)
+        .await
+        .expect_err("an eager compaction of a tagged history must be refused");
+    assert!(error.to_string().contains("defer_index_remap"), "{error}");
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a refused compaction must not withdraw coverage"
+    );
+}
+
+/// `None` from the capability predicate (details absent or uninterpretable)
+/// is NOT turned into a withdrawal: the commit leaves such a segment's
+/// coverage exactly as it was, and the reader's own refusal (no derived
+/// coverage, scan fallback) remains the behaviour. Pins the current refusal.
+#[tokio::test]
+async fn unknown_index_details_are_refused_rather_than_withdrawn() {
+    let mut dataset = tagged_with_both_index_kinds().await;
+    // Strip the BTree segment's details in the manifest, which is the
+    // `None` state: `segment_supports_batch_remapping` cannot classify it.
+    let stripped: Vec<IndexMetadata> = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| {
+            let mut index = index.clone();
+            if index.name == BTREE_INDEX {
+                index.index_details = None;
+            }
+            index
+        })
+        .collect();
+    let btree = stripped
+        .iter()
+        .find(|index| index.name == BTREE_INDEX)
+        .unwrap()
+        .clone();
+    let coverage_before = btree.fragment_bitmap.clone().unwrap();
+    let read_version = dataset.manifest.version;
+    let removed_indices: Vec<IndexMetadata> = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == BTREE_INDEX)
+        .cloned()
+        .collect();
+    dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::CreateIndex {
+                new_indices: vec![btree.clone()],
+                removed_indices,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == BTREE_INDEX && index.index_details.is_none()),
+        "the fixture must leave the BTree segment without details"
+    );
+
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut dataset, &options, None).await;
+
+    let after = coverage_of(&stored_segments(&dataset).await, BTREE_INDEX);
+    assert_eq!(
+        after, coverage_before,
+        "an unclassifiable segment's coverage is left alone, not withdrawn"
+    );
+    // The reader refuses it instead: no derived coverage, so queries scan.
+    assert!(
+        derived_coverage(&dataset, BTREE_INDEX).await.is_empty(),
+        "the reader must derive no coverage for an unclassifiable segment"
+    );
+}
+
+/// Concurrency, order (i): a CreateIndex of an undeferrable (legacy vector)
+/// index commits FIRST, then a deferred Rewrite planned before that index
+/// existed is rebased over it. The rebased Rewrite must withdraw the NEW
+/// index's coverage of its own sources: the classification is redone against
+/// the manifest the retrying attempt builds on, not against the snapshot the
+/// compaction was planned from.
+#[tokio::test]
+async fn a_rewrite_rebased_over_a_committed_undeferrable_index_withdraws_its_coverage() {
+    // Tagged, with only the BTree in place when the compaction is planned.
+    let mut dataset = fixture().await;
+    dataset = make_tagged(dataset).await;
+    create_btree_index(&mut dataset).await;
+
+    // Plan and execute the compaction at this version, before the vector
+    // index exists.
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let sources: RoaringBitmap = plan
+        .tasks()
+        .iter()
+        .flat_map(|task| task.fragments.iter())
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(!sources.is_empty());
+    let results = execute_tasks(&dataset, &plan, &options, None).await;
+
+    // A concurrent writer commits the legacy vector index over exactly those
+    // fragments, so the rebased rewrite meets a segment it cannot translate.
+    let mut concurrent = dataset.clone();
+    create_legacy_vector_index(&mut concurrent).await;
+    let vector_before = coverage_of(&stored_segments(&concurrent).await, VECTOR_INDEX);
+    assert!(
+        !(&vector_before & &sources).is_empty(),
+        "the concurrent index must cover the rewrite's sources"
+    );
+
+    // The compaction handle is still at the pre-index version; the commit
+    // path rebases it over the CreateIndex.
+    commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+
+    let after = stored_segments(&dataset).await;
+    let vector_after = coverage_of(&after, VECTOR_INDEX);
+    assert!(
+        after.iter().any(|(name, _, _)| name == VECTOR_INDEX),
+        "the concurrently created index must survive the rebase"
+    );
+    assert!(
+        vector_after.is_disjoint(&sources),
+        "the rebased rewrite must withdraw the new index's coverage of its sources: {:?}",
+        (&vector_after & &sources).iter().collect::<Vec<_>>()
+    );
+    assert!(
+        derived_coverage(&dataset, VECTOR_INDEX).await.is_empty(),
+        "the withdrawn segment must derive no coverage"
+    );
+    // The deferrable index is unaffected and still translates.
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, BTREE_INDEX).await,
+        destinations,
+        "the BTree keeps translating through the history"
+    );
+    assert_query_exactness(&dataset).await;
+}
+
+/// Concurrency, order (ii): the deferred Rewrite commits FIRST, then a
+/// CreateIndex of an undeferrable (legacy vector) index built at the
+/// pre-rewrite version is rebased over the committed rewrite. The new segment
+/// must not land keeping coverage of the sources the rewrite retired, since
+/// it can never translate them.
+#[tokio::test]
+async fn an_undeferrable_index_rebased_over_a_committed_rewrite_drops_retired_coverage() {
+    let mut dataset = fixture().await;
+    dataset = make_tagged(dataset).await;
+    create_btree_index(&mut dataset).await;
+
+    // The index build reads this version and keeps its handle.
+    let mut stale = dataset.clone();
+    let pre_rewrite_fragments: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segment = {
+        let mut params =
+            VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
+        params.version(IndexFileVersion::Legacy);
+        CreateIndexBuilder::new(&mut stale, &["vector"], IndexType::Vector, &params)
+            .name(VECTOR_INDEX.to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        segment.fragment_bitmap.as_ref().unwrap(),
+        &pre_rewrite_fragments,
+        "the staged segment must cover the pre-rewrite fragments"
+    );
+
+    // The compaction commits first, retiring every source.
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut dataset, &options, None).await;
+    let live: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        live.is_disjoint(&pre_rewrite_fragments),
+        "the compaction must retire every source"
+    );
+
+    // Now the stale handle commits its segment; the resolver rebases it.
+    let committed = CommitBuilder::new(Arc::new(stale))
+        .execute(Transaction::new(
+            pre_rewrite_version(&segment),
+            Operation::CreateIndex {
+                new_indices: vec![segment.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        ))
+        .await;
+    // The rebase must LAND, not refuse: the whole point is that the segment
+    // keeps its live coverage and gives up only what it cannot translate. A
+    // refusal here would make every assertion below vacuous, so it fails the
+    // test rather than being tolerated.
+    let committed = committed.expect("the rebased index build must land");
+    let landed = stored_segments(&committed).await;
+    assert!(
+        landed.iter().any(|(name, _, _)| name == VECTOR_INDEX),
+        "the index definition must land so a later optimize can rebuild it"
+    );
+    let vector_landed = coverage_of(&landed, VECTOR_INDEX);
+    assert!(
+        vector_landed.is_disjoint(&pre_rewrite_fragments),
+        "the rebased index must not keep coverage of retired sources it cannot translate: {:?}",
+        (&vector_landed & &pre_rewrite_fragments)
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        derived_coverage(&committed, VECTOR_INDEX).await.is_empty(),
+        "a segment that kept nothing translatable must derive no coverage"
+    );
+    assert_query_exactness(&committed).await;
+}
+
+/// The read version a staged segment was built at: its coverage names the
+/// fragments of that version, and the commit must be submitted from it so the
+/// resolver actually rebases.
+fn pre_rewrite_version(segment: &IndexMetadata) -> u64 {
+    segment.dataset_version
+}
+
+/// Makes `dataset` tagged with a stable partition of its first two fragments,
+/// before any user index exists.
+async fn make_tagged(mut dataset: Dataset) -> Dataset {
+    let reserve = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments { num_fragments: 2 },
+        None,
+    );
+    dataset
+        .apply_commit(reserve, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let dest_base_id = dataset.manifest.max_fragment_id().unwrap() - 1;
+    let old_fragments: Vec<Fragment> = dataset.fragments()[..2].to_vec();
+    let source_ids: Vec<u64> = old_fragments.iter().map(|fragment| fragment.id).collect();
+    let (transition, new_fragments) = prepare_partition(&dataset, &source_ids, dest_base_id).await;
+    let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let stored = load_all_indices(&dataset).await.unwrap();
+    assert!(
+        uses_tagged_fri(
+            &dataset.manifest,
+            stored
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        ),
+        "the stable partition must make the table tagged"
+    );
+    dataset
+}
+
+/// Every live row is returned exactly once by a KNN query and by a scan, with
+/// the KNN answer equal to brute force: no retired row, no duplicate.
+async fn assert_query_exactness(dataset: &Dataset) {
+    let scan = dataset
+        .scan()
+        .project(&["i"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut live: Vec<i32> = scan["i"]
+        .as_primitive::<Int32Type>()
+        .iter()
+        .map(|value| value.unwrap())
+        .collect();
+    live.sort_unstable();
+    let deduped = {
+        let mut deduped = live.clone();
+        deduped.dedup();
+        deduped
+    };
+    assert_eq!(live, deduped, "the scan returned a duplicate row");
+    let query = query_vector(dataset, live[live.len() / 2]).await;
+    let expected = brute_force_knn(dataset, &query, 5).await;
+    let (rows, plan) = indexed_knn(dataset, &query, 5).await;
+    assert_eq!(rows, expected, "{plan}");
+}
