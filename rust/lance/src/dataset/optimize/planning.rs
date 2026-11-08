@@ -1632,6 +1632,11 @@ pub(super) enum CompactionCandidacy {
 /// Internal struct used for planning compaction.
 pub(super) struct CandidateBin {
     pub fragments: Vec<Fragment>,
+    /// Where these fragments sit in the sequence this run binned, not in the
+    /// manifest: the whole-dataset planner counts the fragments it considered,
+    /// and grouped planning counts within the group's own run. Only
+    /// [`Self::split_for_size`] and the planning logs read it, both of which
+    /// just need the ranges of one run to partition that run.
     pub pos_range: Range<usize>,
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
