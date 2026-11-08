@@ -50,13 +50,21 @@ impl CacheKey for InvertedFormatKey {
     }
 }
 
-/// Whether a full-text segment can be loaded under a translating remapper.
+/// Whether a full-text segment can be loaded under a translating remapper, or
+/// `None` when the question has no answer yet.
 ///
 /// The plugin supports batch remapping, but a legacy-layout index (no
 /// `metadata.lance`; the loader's own format probe) stores per-document
 /// lengths aligned with the row ids it was built with and cannot be
 /// translated. Such a segment is excluded from coverage so the planner scans
 /// its fragments; an untouched (identity) legacy segment still loads.
+///
+/// A segment whose files are still only under `staging/` has not published
+/// its root metadata yet, so that file's absence is not the legacy layout --
+/// it is a build in progress. Reporting `None` there keeps the withdrawal
+/// selector from treating a modern distributed build as untranslatable, and
+/// the non-verdict is never memoized: the finalize that publishes the root
+/// metadata makes the same call definitive.
 ///
 /// Only a confirmed missing metadata file reports the legacy layout. Any
 /// other failure to read it propagates and nothing is cached: an
@@ -65,29 +73,52 @@ impl CacheKey for InvertedFormatKey {
 pub async fn inverted_supports_batch_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
-) -> Result<bool> {
-    let supported = dataset
+) -> Result<Option<bool>> {
+    if let Some(cached) = dataset
         .index_cache
-        .get_or_insert_with_key(InvertedFormatKey(index.uuid), || async {
-            use crate::dataset::index::LanceIndexStoreExt;
-            let store =
-                lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_existing(
-                    dataset, index,
-                )
-                .await?;
-            match lance_index::scalar::IndexStore::open_index_file(
-                &store,
-                lance_index::scalar::inverted::METADATA_FILE,
-            )
-            .await
-            {
-                Ok(_) => Ok(true),
-                Err(e) if e.is_not_found() => Ok(false),
-                Err(e) => Err(e),
+        .get_with_key(&InvertedFormatKey(index.uuid))
+        .await
+    {
+        return Ok(Some(*cached));
+    }
+    use crate::dataset::index::LanceIndexStoreExt;
+    let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_existing(
+        dataset, index,
+    )
+    .await?;
+    let supported = match lance_index::scalar::IndexStore::open_index_file(
+        &store,
+        lance_index::scalar::inverted::METADATA_FILE,
+    )
+    .await
+    {
+        Ok(_) => true,
+        // Only a segment that has published its layout answers for it. An
+        // unfinalized build's root metadata is simply not written yet.
+        Err(e) if e.is_not_found() => {
+            if segment_files_are_staged(index) {
+                return Ok(None);
             }
-        })
-        .await?;
-    Ok(*supported)
+            false
+        }
+        Err(e) => return Err(e),
+    };
+    dataset
+        .index_cache
+        .insert_with_key(&InvertedFormatKey(index.uuid), Arc::new(supported))
+        .await;
+    Ok(Some(supported))
+}
+
+/// Whether every index file this segment records is a staged build artifact,
+/// i.e. the build has not published its final layout.
+fn segment_files_are_staged(index: &IndexMetadata) -> bool {
+    index.files.as_ref().is_some_and(|files| {
+        !files.is_empty()
+            && files
+                .iter()
+                .all(|file| lance_index::scalar::inverted::builder::is_staged_path(&file.path))
+    })
 }
 
 /// Legacy vector file readers keep their existing V1 behavior and scan fallback.

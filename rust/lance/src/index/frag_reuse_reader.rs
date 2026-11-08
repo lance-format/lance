@@ -164,9 +164,8 @@ pub(super) async fn segment_supports_batch_remapping(
         ));
     }
     if details.type_url.ends_with("InvertedIndexDetails") {
-        return Ok(Some(
-            super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
-        ));
+        return super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
+            .await;
     }
     Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
         .get_plugin_by_details(details)
