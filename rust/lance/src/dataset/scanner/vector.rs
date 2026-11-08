@@ -98,7 +98,9 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self
+                        .fts(&filter_plan.expr_filter_plan, fts_query, fts_query.params())
+                        .await?;
                     if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
                         fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
                     }

@@ -479,6 +479,66 @@ async fn test_vector_filter_fts_search() {
         &[300, 255],
     )
     .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector query bounds them.
+    let phrase_query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+    ));
+    // Case 7: Case 3 with limit 2
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[299, 300],
+    )
+    .await;
+
+    // Case 8: Case 5 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(false)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 3 with limit 0
+    let batch = dataset
+        .scan()
+        .full_text_search(phrase_query)
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[tokio::test]
@@ -622,6 +682,52 @@ async fn test_fts_filter_vector_search() {
         .try_into_stream()
         .await;
     assert!(stream.is_err());
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector search picks its neighbours from them.
+    // Case 7: Case 1 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 8: Case 1 with limit 0
+    let batch = dataset
+        .scan()
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[rstest]
