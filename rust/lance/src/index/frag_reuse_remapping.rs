@@ -117,8 +117,10 @@ pub async fn inverted_supports_batch_remapping(
 ///
 /// A segment replayed at commit time carries no file list (the commit collects
 /// the files from the index directory), so the recorded list cannot answer and
-/// the directory is listed instead. A recorded list keeps the zero-store-call
-/// shortcut; a listed directory holding no staged file is the legacy layout.
+/// the segment's own index location is listed instead -- resolved through its
+/// `base_id`, the same directory and store the root metadata was probed in. A
+/// recorded list keeps the zero-store-call shortcut; a listed directory
+/// holding no staged file is the legacy layout.
 async fn segment_files_are_staged_or_listed(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -126,9 +128,11 @@ async fn segment_files_are_staged_or_listed(
     if let Some(files) = index.files.as_ref() {
         return Ok(all_staged(files));
     }
-    let index_dir = dataset.indices_dir().join(index.uuid.to_string());
-    let files =
-        lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
+    let index_dir = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string());
+    let store = dataset.object_store_for_index(index).await?;
+    let files = lance_table::format::list_index_files_with_sizes(&store, &index_dir).await?;
     Ok(all_staged(&files))
 }
 
