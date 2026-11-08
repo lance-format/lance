@@ -3338,9 +3338,8 @@ async fn an_unreadable_index_does_not_block_maintenance_of_another_index() {
     // A handle whose index cache has never seen a successful probe of the FTS
     // segment, so the fault is what every decision below meets.
     let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
-    let before = stored_segments(&dataset).await;
     let segments = load_all_indices(&dataset).await.unwrap();
-    let btree_segment: IndexMetadata = segments
+    let btree_before: IndexMetadata = segments
         .iter()
         .find(|index| index.name == BTREE_INDEX)
         .expect("the fixture must hold a BTree segment")
@@ -3361,6 +3360,17 @@ async fn an_unreadable_index_does_not_block_maintenance_of_another_index() {
     )
     .await
     .expect("an unreadable FTS segment must not block the BTree index's remap");
+    let btree_segment: IndexMetadata = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == BTREE_INDEX)
+        .expect("the BTree index must survive its own remap")
+        .clone();
+    assert_ne!(
+        btree_segment.uuid, btree_before.uuid,
+        "the BTree remap must publish a new segment, not skip"
+    );
     let mut lookup = dataset.scan();
     lookup.filter("i = 1").unwrap().project(&["i"]).unwrap();
     let lookup_plan = lookup.explain_plan(false).await.unwrap();
@@ -3386,6 +3396,7 @@ async fn an_unreadable_index_does_not_block_maintenance_of_another_index() {
         "every queried segment must be accounted for: {coverage:?}"
     );
 
+    let before = stored_segments(&dataset).await;
     // (c)/(d) The decision that DOES depend on the unreadable segment refuses,
     // naming the index the caller asked about.
     let remap_error = crate::dataset::optimize::remapping::remap_column_index(
