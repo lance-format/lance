@@ -3039,3 +3039,164 @@ async fn staged_fts_preserves_stemming_with_direct_commit(
         assert_eq!(derived_coverage(handle, FTS_INDEX).await, destinations);
     }
 }
+
+/// Commits a second segment of `FTS_INDEX` over everything live, as index
+/// maintenance does: built uncommitted under its own name, then renamed into
+/// the logical index.
+async fn commit_fts_delta_segment(dataset: &mut Dataset) -> Uuid {
+    let params = InvertedIndexParams::default();
+    let mut delta = CreateIndexBuilder::new(dataset, &["doc"], IndexType::Inverted, &params)
+        .name("doc_idx_delta".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    delta.name = FTS_INDEX.to_string();
+    let uuid = delta.uuid;
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![delta],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    uuid
+}
+
+/// Pruning superseded segments reads each segment's coverage through the
+/// translating listing. A segment whose format marker cannot be read leaves
+/// that listing without its translated coverage, so its valid coverage looks
+/// empty, the subset check passes and the prune COMMITS its removal -- losing
+/// a healthy segment to a fault that says nothing about it. The prune must
+/// refuse while the listing cannot be verified, and prune once it can.
+#[tokio::test]
+async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_prune_read_failure", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(
+        brute_force > 0,
+        "the chosen word {word} must match rows in the fixture"
+    );
+    drop(seed);
+
+    // The compaction retires the original segment's provenance, so its only
+    // valid coverage is what the ledger translates; the delta then covers
+    // every destination directly, making the original superseded.
+    let mut writer = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut writer, &options, None).await;
+    let delta_uuid = commit_fts_delta_segment(&mut writer).await;
+    let destinations: RoaringBitmap = writer
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    drop(writer);
+
+    // A handle whose index cache has never seen a successful probe, so the
+    // fault is what the prune's own listing meets.
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let before = stored_segments(&dataset).await;
+    assert_eq!(
+        before
+            .iter()
+            .filter(|(name, _, _)| name == FTS_INDEX)
+            .count(),
+        2,
+        "the fixture must hold a superseded segment and its replacement"
+    );
+    // The superseded segment, as the manifest registers it: the one the
+    // delta did not replace.
+    let superseded: IndexMetadata = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FTS_INDEX && index.uuid != delta_uuid)
+        .expect("the fixture must hold the superseded segment")
+        .clone();
+
+    failing.store(true, Ordering::SeqCst);
+    let error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .expect_err("an unverifiable listing must not justify removing a segment");
+    let message = error.to_string();
+    assert!(
+        message.contains("retry once the index files are readable"),
+        "the error must tell the caller the fault is transient: {message}"
+    );
+    // The other mutation site reading the same listing: the coverage the
+    // optimizer replaces a segment by. An unreadable marker must refuse here
+    // too, rather than report the segment as covering nothing.
+    let coverage_error =
+        crate::index::append::tagged_segment_coverage(&dataset, &[&superseded], None)
+            .await
+            .expect_err("an unverifiable listing must not report empty coverage");
+    let coverage_message = coverage_error.to_string();
+    assert!(
+        coverage_message.contains("retry once the index files are readable"),
+        "the error must tell the caller the fault is transient: {coverage_message}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a refused prune must leave the manifest's index list untouched"
+    );
+
+    // Once reads recover the same call answers instead of refusing: the
+    // segment is reported as covering nothing because the delta covers every
+    // destination DIRECTLY (direct coverage wins), which is the verdict that
+    // makes it superseded -- and is exactly what an unreadable marker must
+    // not be mistaken for.
+    failing.store(false, Ordering::SeqCst);
+    let coverage = crate::index::append::tagged_segment_coverage(&dataset, &[&superseded], None)
+        .await
+        .expect("the coverage must resolve once the marker is readable")
+        .expect("a tagged table must report derived coverage");
+    assert!(
+        coverage.contains_key(&superseded.uuid),
+        "every queried segment must be accounted for: {coverage:?}"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "the logical index still covers every destination through the delta"
+    );
+
+    // The same prune, once reads recover, removes the superseded segment.
+    crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .expect("the prune must succeed once the marker is readable");
+    let after = stored_segments(&dataset).await;
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(name, _, _)| name == FTS_INDEX)
+            .count(),
+        1,
+        "the superseded segment must be pruned once its coverage is verifiable"
+    );
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_after, brute_force,
+        "the pruned index must still answer exactly: {plan_after}"
+    );
+    assert!(
+        plan_has_node(&plan_after, "MatchQuery:"),
+        "the surviving segment must serve the query from the index: {plan_after}"
+    );
+    assert!(
+        !plan_has_node(&plan_after, "FlatMatchQuery:"),
+        "every destination must stay covered after the prune: {plan_after}"
+    );
+}

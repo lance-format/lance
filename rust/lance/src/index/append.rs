@@ -40,7 +40,7 @@ use super::vector::ivf::{
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
-use super::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
+use super::{CreateIndexBuilder, loading::DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
@@ -232,7 +232,10 @@ pub async fn build_old_data_filter(
 /// `staged` supplies the plan of segments the manifest does not list (a staged
 /// build being merged, see `plan_staged_segments`); their coverage comes from
 /// that plan. A segment that is neither staged nor registered in the manifest
-/// is an error: "not registered" is not "covers nothing".
+/// is an error: "not registered" is not "covers nothing". So is a listing that
+/// could not verify every segment: an unreadable index file is not a verdict
+/// about coverage, and the caller replaces (removes) a segment it reads as
+/// uncovered.
 pub async fn tagged_segment_coverage(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
@@ -247,7 +250,18 @@ pub async fn tagged_segment_coverage(
     {
         return Ok(None);
     }
-    let derived = dataset.load_indices().await?;
+    // A segment the reader dropped because its format marker could not be
+    // read is absent from the derived listing, and the empty coverage below
+    // would make it dormant -- replaced, i.e. removed, on a fault that is
+    // not a verdict about the segment. The listing carries that certainty.
+    let listing = dataset.derived_index_listing().await?;
+    if listing.unverifiable {
+        return Err(Error::index(
+            "could not verify every index segment's coverage before optimizing the index: \
+             an index file could not be read; retry once the index files are readable",
+        ));
+    }
+    let derived = listing.indices;
     let mut coverage = HashMap::with_capacity(segments.len());
     for segment in segments {
         if let Some(plan) = staged.and_then(|plans| plans.get(&segment.uuid)) {
