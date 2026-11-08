@@ -99,6 +99,12 @@ message FilteredReadOptionsProto {
    * but losing the optimization. These modes apply only to this read, not the dataset.
    */
   map<int32, ListReadMode> list_structure = 16;
+  /* If true, fragment_ids is an explicit fragment selection: an empty list
+   * means "read no fragments". If false or absent (older planners), an empty
+   * fragment_ids list means "no selection, read every fragment in the
+   * manifest"; a repeated field alone cannot distinguish the two.
+   */
+  optional bool has_fragment_ids = 17;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).

@@ -209,6 +209,12 @@ pub struct FilteredReadOptionsProto {
         tag = "16"
     )]
     pub list_structure: ::std::collections::HashMap<i32, i32>,
+    /// If true, fragment_ids is an explicit fragment selection: an empty list
+    /// means "read no fragments". If false or absent (older planners), an empty
+    /// fragment_ids list means "no selection, read every fragment in the
+    /// manifest"; a repeated field alone cannot distinguish the two.
+    #[prost(bool, optional, tag = "17")]
+    pub has_fragment_ids: ::core::option::Option<bool>,
 }
 /// Nested message and enum types in `FilteredReadOptionsProto`.
 pub mod filtered_read_options_proto {

@@ -194,6 +194,10 @@ fn fr_options_to_proto(
             .as_ref()
             .map(|frags| frags.iter().map(|f| f.id).collect())
             .unwrap_or_default(),
+        // A repeated field alone cannot distinguish `Some(vec![])` from
+        // `None`; this presence bit keeps an explicit empty selection from
+        // widening into a scan of every fragment on the executor.
+        has_fragment_ids: Some(options.fragments.is_some()),
         projection: Some(projection_to_proto(&options.projection)),
         refine_filter_substrait,
         full_filter_substrait,
@@ -234,8 +238,11 @@ async fn fr_options_from_proto(
     )?;
     let mut options = FilteredReadOptions::new(projection);
 
-    // Fragments
-    if !proto.fragment_ids.is_empty() {
+    // Fragments. `has_fragment_ids` marks an explicit selection, which may be
+    // empty ("read no fragments"). Messages from older planners cannot
+    // represent an explicit empty selection, so for them only a non-empty
+    // list selects fragments.
+    if proto.has_fragment_ids == Some(true) || !proto.fragment_ids.is_empty() {
         let fragments = fragments_from_proto(&proto.fragment_ids, dataset)?;
         options = options.with_fragments(Arc::new(fragments));
     }
@@ -1279,6 +1286,39 @@ mod tests {
             exec.options().projection.field_ids,
             back.options().projection.field_ids
         );
+    }
+
+    /// An explicit empty fragment selection reads nothing after decoding,
+    /// instead of every fragment in the manifest.
+    #[rstest]
+    #[case::no_filter(None)]
+    #[case::filter(Some("x > 10"))]
+    #[tokio::test]
+    async fn test_exec_roundtrip_keeps_empty_fragment_selection(#[case] filter: Option<&str>) {
+        let dataset = make_test_dataset().await;
+        let mut scanner = dataset.scan();
+        scanner.with_fragments(vec![]);
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        let plan = scanner.create_plan().await.unwrap();
+        let read =
+            crate::dataset::scanner::test_dataset::find_filtered_read(plan.as_ref()).unwrap();
+        let ctx = SessionContext::new();
+        let proto = filtered_read_exec_to_proto(read, &ctx.state())
+            .await
+            .unwrap();
+        assert!(proto.plan.is_none());
+        let decoded = filtered_read_exec_from_proto(
+            pb::FilteredReadExecProto::decode(proto.encode_to_vec().as_slice()).unwrap(),
+            Some(dataset.clone()),
+            None,
+            &ctx.state(),
+        )
+        .await
+        .unwrap();
+        let batches = collect(Arc::new(decoded), ctx.task_ctx()).await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
     }
 
     /// The synchronous encoder produces what the async one does, with the
