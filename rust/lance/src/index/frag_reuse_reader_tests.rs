@@ -5289,3 +5289,90 @@ async fn hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete() {
         "the prefiltered HNSW search must answer exactly"
     );
 }
+
+/// An eager remap of an IVF_HNSW_SQ segment whose partitions are loaded
+/// preserving layout must not carry a tombstoned slot into the new segment.
+///
+/// `IVFIndex::load_partition_storage` keeps the slot of a row the deferred
+/// remap cannot map so the graph's positions still address the right rows.
+/// Only the search addresses the storage by position, so a remap reads the
+/// live rows alone (`load_live_partition_storage`): `RowAddress::TOMBSTONE_ROW`
+/// is in no mapping, so `QuantizerStorage::remap` would have carried the slot
+/// through unchanged and `remap_hnsw_partition` would have persisted it as a
+/// graph node over no live row.
+#[tokio::test]
+async fn hnsw_eager_remap_after_deferred_remap_drops_tombstoned_slots() {
+    use lance_index::vector::storage::VectorStore as _;
+
+    let dataset = hnsw_tagged_fixture().await;
+    let before_rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(before_rows[37].1.clone());
+
+    // The same delete-then-rewrite history as
+    // `hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete`: the one
+    // that leaves unmappable rows in the segment's partitions.
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let mut dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+
+    // `defer_index_remap: false` rewrites the index through
+    // `remap_hnsw_partition`, which reads the partitions of a segment the FRI
+    // still translates.
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions {
+            target_rows_per_fragment: 1024,
+            defer_index_remap: false,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let remapped = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let mut stored: Vec<u64> = Vec::new();
+    for segment in &remapped {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswSqIndex>()
+            .expect("the remapped segment is an IVF_HNSW_SQ index");
+        for partition in 0..index.ivf_model().num_partitions() {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            stored.extend(storage.row_ids().copied());
+        }
+    }
+    for row_id in &stored {
+        assert_ne!(
+            *row_id,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot was remapped into the new segment"
+        );
+    }
+    assert_eq!(
+        stored.len(),
+        rows.len(),
+        "the remapped segment must hold exactly the live rows"
+    );
+
+    // The remapped segment answers from its own addresses, with no
+    // translation left to apply, so it must still be exact.
+    let truth = brute_force_top_k(&rows, query.values());
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(ids, truth, "the remapped HNSW segment must answer exactly");
+    for addr in &addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot escaped"
+        );
+    }
+}

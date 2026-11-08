@@ -23,7 +23,8 @@ use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+    UInt64Array, cast::AsArray, types::UInt64Type,
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -1126,6 +1127,44 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
         rows.clone()
     }
+
+    /// The entry's batches with every tombstoned slot dropped.
+    ///
+    /// A partition loaded under [`RowLayout::Preserved`] keeps the slot of a
+    /// row the deferred remap could not map so the sub-index's positions still
+    /// hold (see [`TombstoneAwarePreFilter`]). Only the search addresses the
+    /// storage by position; everyone who exports, merges or rewrites a
+    /// partition's rows must see the live ones alone, as it did before layout
+    /// was preserved.
+    pub(crate) fn live_batches(&self) -> Result<Vec<RecordBatch>> {
+        let batches = self.storage.to_batches()?;
+        if !self.has_tombstones {
+            return Ok(batches.collect());
+        }
+        batches
+            .map(|batch| drop_tombstoned_rows(&batch))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// The entry's row ids with every tombstoned slot dropped; see
+    /// [`Self::live_batches`].
+    pub(crate) fn live_row_ids(&self) -> Vec<u64> {
+        self.storage
+            .row_ids()
+            .filter(|&&row_id| row_id != RowAddress::TOMBSTONE_ROW)
+            .copied()
+            .collect()
+    }
+}
+
+/// `batch` without the rows whose [`ROW_ID`] is [`RowAddress::TOMBSTONE_ROW`].
+fn drop_tombstoned_rows(batch: &RecordBatch) -> Result<RecordBatch> {
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let keep = BooleanArray::from_unary(row_ids, |row_id| row_id != RowAddress::TOMBSTONE_ROW);
+    if keep.true_count() == batch.num_rows() {
+        return Ok(batch.clone());
+    }
+    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for PartitionEntry<S, Q> {
@@ -2822,6 +2861,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .await
     }
 
+    /// [`Self::load_partition_storage`] holding only the rows a deferred remap
+    /// could map, whatever the sub-index binds.
+    ///
+    /// The layout preserved for a position-binding sub-index exists for the
+    /// search alone. A caller that rewrites a partition's rows into a new
+    /// index (a merge, a remap) must not carry a tombstoned slot into it: the
+    /// slot addresses no live row, and persisting it would leave
+    /// [`RowAddress::TOMBSTONE_ROW`] in the written storage and, for HNSW, as
+    /// a graph node.
+    pub(crate) async fn load_live_partition_storage(
+        &self,
+        partition_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        self.storage
+            .load_partition_with_layout(partition_id, io_stats, RowLayout::Compact)
+            .await
+    }
+
     /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
@@ -3956,8 +4014,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             Arc::new(store.schema().project(&[row_id_idx])?)
         };
 
-        let batches = store
-            .to_batches()?
+        // The stream's consumers (partition split/join planning, dedup) count
+        // and route the rows they see; a tombstoned slot is not one of them.
+        let batches = partition
+            .live_batches()?
+            .into_iter()
             .map(|b| {
                 let batch = b.project_by_schema(&schema)?;
                 Ok(batch)
