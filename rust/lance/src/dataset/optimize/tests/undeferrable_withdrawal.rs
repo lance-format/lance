@@ -3241,8 +3241,8 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         .expect_err("an unverifiable listing must not justify removing a segment");
     let message = error.to_string();
     assert!(
-        message.contains("retry once the index files are readable"),
-        "the error must tell the caller the fault is transient: {message}"
+        message.contains(FTS_INDEX) && message.contains("could not be read"),
+        "the error must name the index whose file could not be read: {message}"
     );
     // The other mutation site reading the same listing: the coverage the
     // optimizer replaces a segment by. An unreadable marker must refuse here
@@ -3253,8 +3253,8 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
             .expect_err("an unverifiable listing must not report empty coverage");
     let coverage_message = coverage_error.to_string();
     assert!(
-        coverage_message.contains("retry once the index files are readable"),
-        "the error must tell the caller the fault is transient: {coverage_message}"
+        coverage_message.contains(FTS_INDEX) && coverage_message.contains("could not be read"),
+        "the error must name the index whose file could not be read: {coverage_message}"
     );
     dataset.checkout_latest().await.unwrap();
     assert_eq!(
@@ -3309,4 +3309,161 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         !plan_has_node(&plan_after, "FlatMatchQuery:"),
         "every destination must stay covered after the prune: {plan_after}"
     );
+}
+
+/// A coverage decision for one logical index is decided within that index's
+/// own sibling group (direct-coverage-wins, sibling exclusions), so an
+/// unreadable segment of ANOTHER index says nothing about it. Maintenance of
+/// the healthy index must proceed while the faulting one refuses, and the
+/// table-wide prune stays fail-closed. Nothing is cached across the fault:
+/// the same handle recovers without a reopen.
+#[tokio::test]
+async fn an_unreadable_index_does_not_block_maintenance_of_another_index() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/two_indices_one_unreadable", dir.as_str());
+    let mut seed = tagged_with_fts_index(path.as_str()).await;
+    create_btree_index(&mut seed).await;
+    // Both logical indices now carry translating coverage, so both go through
+    // the derived listing the fault degrades.
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut seed, &options, None).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(
+        brute_force > 0,
+        "the chosen word {word} must match rows in the fixture"
+    );
+    drop(seed);
+
+    // A handle whose index cache has never seen a successful probe of the FTS
+    // segment, so the fault is what every decision below meets.
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix).await;
+    let before = stored_segments(&dataset).await;
+    let segments = load_all_indices(&dataset).await.unwrap();
+    let btree_segment: IndexMetadata = segments
+        .iter()
+        .find(|index| index.name == BTREE_INDEX)
+        .expect("the fixture must hold a BTree segment")
+        .clone();
+    let fts_segment: IndexMetadata = segments
+        .iter()
+        .find(|index| index.name == FTS_INDEX)
+        .expect("the fixture must hold an FTS segment")
+        .clone();
+
+    failing.store(true, Ordering::SeqCst);
+    // (a) The BTree index's own segments were all verified, so its remap
+    // proceeds and the index still serves a filtered query.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["i"],
+        Some(BTREE_INDEX.into()),
+    )
+    .await
+    .expect("an unreadable FTS segment must not block the BTree index's remap");
+    let mut lookup = dataset.scan();
+    lookup.filter("i = 1").unwrap().project(&["i"]).unwrap();
+    let lookup_plan = lookup.explain_plan(false).await.unwrap();
+    assert!(
+        lookup_plan.contains("ScalarIndexQuery"),
+        "the BTree index must still serve the filtered query: {lookup_plan}"
+    );
+    let looked_up = lookup.try_into_batch().await.unwrap();
+    assert_eq!(looked_up.num_rows(), 1, "{lookup_plan}");
+    assert_eq!(
+        looked_up["i"].as_primitive::<Int32Type>().value(0),
+        1,
+        "{lookup_plan}"
+    );
+
+    // (b) The same listing answers the BTree segment's coverage.
+    let coverage = crate::index::append::tagged_segment_coverage(&dataset, &[&btree_segment], None)
+        .await
+        .expect("a verified index's coverage must resolve during another index's fault")
+        .expect("a tagged table must report derived coverage");
+    assert!(
+        coverage.contains_key(&btree_segment.uuid),
+        "every queried segment must be accounted for: {coverage:?}"
+    );
+
+    // (c)/(d) The decision that DOES depend on the unreadable segment refuses,
+    // naming the index the caller asked about.
+    let remap_error = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect_err("an unreadable segment must not be reported as a skipped success");
+    assert!(
+        remap_error.to_string().contains(FTS_INDEX),
+        "the error must name the index that could not be verified: {remap_error}"
+    );
+    let coverage_error =
+        crate::index::append::tagged_segment_coverage(&dataset, &[&fts_segment], None)
+            .await
+            .expect_err("an unverifiable segment must not report empty coverage");
+    assert!(
+        coverage_error.to_string().contains(FTS_INDEX),
+        "the error must name the index that could not be verified: {coverage_error}"
+    );
+
+    // (e) The prune commits one table-wide decision, so any uncertain group
+    // refuses it and the manifest's index list is untouched.
+    let prune_error = crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .expect_err("an unverifiable group must not justify a table-wide prune");
+    assert!(
+        prune_error.to_string().contains(FTS_INDEX),
+        "the error must name the index that could not be verified: {prune_error}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "a refused prune must leave the manifest's index list untouched"
+    );
+
+    // Nothing about the fault was cached: the SAME handle (no reopen) recovers
+    // every refused decision once reads succeed.
+    failing.store(false, Ordering::SeqCst);
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .expect("the remap must succeed once the marker is readable");
+    let fts_segment: IndexMetadata = load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FTS_INDEX)
+        .expect("the fixture must hold an FTS segment")
+        .clone();
+    let fts_coverage =
+        crate::index::append::tagged_segment_coverage(&dataset, &[&fts_segment], None)
+            .await
+            .expect("the coverage must resolve once the marker is readable")
+            .expect("a tagged table must report derived coverage");
+    assert!(
+        fts_coverage.contains_key(&fts_segment.uuid),
+        "every queried segment must be accounted for: {fts_coverage:?}"
+    );
+    let (count_after, plan_after) = fts_count_on_column(&dataset, &word, "doc").await;
+    assert_eq!(
+        count_after, brute_force,
+        "the recovered index must answer exactly: {plan_after}"
+    );
+    assert!(
+        plan_has_node(&plan_after, "MatchQuery:"),
+        "the re-probed segment must serve the query from the index: {plan_after}"
+    );
+    assert!(
+        !plan_has_node(&plan_after, "FlatMatchQuery:"),
+        "every destination must stay covered: {plan_after}"
+    );
+    crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .expect("the prune must succeed once the marker is readable");
 }

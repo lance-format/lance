@@ -24,7 +24,7 @@ use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -310,13 +310,13 @@ async fn fri_query_plan(
     if let Some(cached) = cache.get_with_key(&key).await {
         return Ok(cached);
     }
-    // The listing's own `unverifiable` flag, not a guess from the plan's
+    // The listing's own `unverifiable` set, not a guess from the plan's
     // contents: a segment the reader dropped for an unreadable marker is
     // simply absent here, and `missing_coverage_reason` below may then probe
     // it successfully and return a DEFINITIVE reason. Caching a plan built
     // from those two inconsistent views would freeze "no coverage" for the
     // whole snapshot.
-    let mut unverifiable_listing = false;
+    let mut unverifiable = BTreeSet::new();
     let plan = {
         let build = async {
             // The filtered listing carries the rewritten query coverage;
@@ -324,7 +324,7 @@ async fn fri_query_plan(
             // hold metadata returned by load_indices and cannot supply
             // this distinction.
             let listing = dataset.derived_index_listing().await?;
-            unverifiable_listing = listing.unverifiable;
+            unverifiable = listing.unverifiable;
             let indices = listing.indices;
             let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
                 stored.iter().map(|entry| (entry.uuid, entry)).collect();
@@ -387,12 +387,14 @@ async fn fri_query_plan(
                         excluded_fragments: parts.excluded,
                         fingerprint,
                     }
-                } else if unverifiable_listing {
-                    // The listing lost a segment to an unreadable marker, so
-                    // this segment's absence says nothing about its coverage.
-                    // Re-probing could answer a definitive reason built on a
-                    // listing that is already known to be incomplete; report
-                    // the uncertainty instead (the plan is uncached below).
+                } else if unverifiable.contains(&source.name) {
+                    // This segment's own logical group lost a segment to an
+                    // unreadable marker, so its absence here says nothing
+                    // about its coverage. Re-probing could answer a definitive
+                    // reason built on a group listing that is already known to
+                    // be incomplete; report the uncertainty instead (the plan
+                    // is uncached below). Another group's uncertainty leaves
+                    // this segment's reason to the probe.
                     SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable)
                 } else {
                     SegmentRemappingPlan::MissingCoverage(
@@ -409,7 +411,7 @@ async fn fri_query_plan(
     // unreadable marker, holds for this call alone: caching the plan would
     // keep the segment unverifiable for the whole snapshot. Return it
     // uncached so the next call re-probes.
-    if !unverifiable_listing
+    if unverifiable.is_empty()
         && !plan.segments.values().any(|plan| {
             matches!(
                 plan,

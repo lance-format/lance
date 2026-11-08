@@ -403,7 +403,9 @@ pub(crate) enum TaggedTrimOutcome {
 ///
 /// Refused outright when the derived listing could not verify every segment:
 /// an unreadable index file leaves a healthy segment's translated coverage
-/// invisible, which reads as superseded.
+/// invisible, which reads as superseded. This decision spans the whole table,
+/// so any unverifiable logical index refuses it, not only the one that cannot
+/// be verified.
 ///
 /// Deterministic fixed point for mutual redundancy: segments are confirmed
 /// newest-first (dataset_version, then uuid), and a segment is prunable only
@@ -444,14 +446,16 @@ pub(crate) async fn derive_superseded_segments(
     // the listing that carries its own certainty: a segment the reader
     // dropped because its format marker could not be read is simply absent
     // from `load_indices`, so its translated coverage would look empty and
-    // the subset check below would prune a healthy segment.
+    // the subset check below would prune a healthy segment. The prune commits
+    // one table-wide decision, so it stays fail-closed on any uncertain group.
     let listing = dataset.derived_index_listing().await?;
-    if listing.unverifiable {
-        return Err(Error::index(
-            "could not verify every index segment's coverage before pruning superseded \
-             index segments: an index file could not be read; retry once the index files \
-             are readable",
-        ));
+    if !listing.unverifiable.is_empty() {
+        let names: Vec<&str> = listing.unverifiable.iter().map(String::as_str).collect();
+        return Err(Error::index(format!(
+            "could not verify the coverage of index segments before pruning superseded \
+             segments: an index file of {} could not be read",
+            names.join(", ")
+        )));
     }
     let derived = listing.indices;
     let derived_by_uuid: HashMap<uuid::Uuid, &RoaringBitmap> = derived

@@ -232,10 +232,11 @@ pub async fn build_old_data_filter(
 /// `staged` supplies the plan of segments the manifest does not list (a staged
 /// build being merged, see `plan_staged_segments`); their coverage comes from
 /// that plan. A segment that is neither staged nor registered in the manifest
-/// is an error: "not registered" is not "covers nothing". So is a listing that
-/// could not verify every segment: an unreadable index file is not a verdict
-/// about coverage, and the caller replaces (removes) a segment it reads as
-/// uncovered.
+/// is an error: "not registered" is not "covers nothing". So is a segment whose
+/// own logical index could not be verified: an unreadable index file is not a
+/// verdict about coverage, and the caller replaces (removes) a segment it reads
+/// as uncovered. Another logical index being unverifiable says nothing about
+/// the segments asked about here.
 pub async fn tagged_segment_coverage(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
@@ -253,13 +254,18 @@ pub async fn tagged_segment_coverage(
     // A segment the reader dropped because its format marker could not be
     // read is absent from the derived listing, and the empty coverage below
     // would make it dormant -- replaced, i.e. removed, on a fault that is
-    // not a verdict about the segment. The listing carries that certainty.
+    // not a verdict about the segment. The listing carries that certainty per
+    // logical index, and these coverage decisions are decided within one
+    // logical index's sibling group, so only that group's uncertainty refuses.
     let listing = dataset.derived_index_listing().await?;
-    if listing.unverifiable {
-        return Err(Error::index(
-            "could not verify every index segment's coverage before optimizing the index: \
-             an index file could not be read; retry once the index files are readable",
-        ));
+    if let Some(unverified) = segments
+        .iter()
+        .find(|segment| listing.unverifiable.contains(&segment.name))
+    {
+        return Err(Error::index(format!(
+            "could not verify the coverage of index {}: a segment's index file could not be read",
+            unverified.name
+        )));
     }
     let derived = listing.indices;
     let mut coverage = HashMap::with_capacity(segments.len());

@@ -8,7 +8,7 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -323,7 +323,7 @@ impl Dataset {
             // remapped in load_all_indices().
             None | Some(0) => Ok(DerivedIndexListing {
                 indices: filter_unusable(indices),
-                unverifiable: false,
+                unverifiable: BTreeSet::new(),
             }),
             Some(1) => {
                 let fri = indices
@@ -348,9 +348,10 @@ impl Dataset {
 /// decide whether to cache it.
 pub struct DerivedIndexListing {
     pub indices: Arc<Vec<IndexMetadata>>,
-    /// A segment is absent only because its format marker could not be read,
-    /// so the listing holds for this call alone.
-    pub unverifiable: bool,
+    /// Logical indices with at least one segment whose format marker could not
+    /// be read; empty when every segment was verified. Those indices' listings
+    /// hold for this call alone.
+    pub unverifiable: BTreeSet<String>,
 }
 
 /// Drop the segments no reader can open, keeping the input allocation when
@@ -642,7 +643,7 @@ impl DatasetIndexExt for Dataset {
         // could not be read is valid for this call alone; caching it would
         // keep the segment excluded for the whole snapshot. Return it
         // uncached so the next call re-probes.
-        if !listing.unverifiable {
+        if listing.unverifiable.is_empty() {
             self.index_cache
                 .insert_with_key(&derived_key, listing.indices.clone())
                 .await;

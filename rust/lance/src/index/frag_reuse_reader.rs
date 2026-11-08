@@ -9,7 +9,7 @@ use lance_core::{Error, Result};
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use roaring::RoaringBitmap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 mod cache;
@@ -34,15 +34,15 @@ fn check_reader_path() -> Result<()> {
 /// never be persisted back to a manifest: stored segment metadata keeps its
 /// original provenance.
 ///
-/// The second element is true when a segment was excluded only because its
-/// format marker could not be read. That exclusion holds for THIS call alone,
-/// so the listing must not be cached: the caller re-derives it and the next
-/// call re-probes.
+/// The second element names the logical indices with a segment excluded only
+/// because its format marker could not be read. Those exclusions hold for THIS
+/// call alone, so the listing must not be cached: the caller re-derives it and
+/// the next call re-probes.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
     indices: &[IndexMetadata],
-) -> Result<(Arc<Vec<IndexMetadata>>, bool)> {
+) -> Result<(Arc<Vec<IndexMetadata>>, BTreeSet<String>)> {
     let mapping = FragmentReuseIndex::open(dataset, fri).await?;
     let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
     let mut result = vec![None; indices.len()];
@@ -77,7 +77,7 @@ pub(super) async fn load_indices(
     // reports true in this state as well, so this is the same decision made
     // explicitly here without consulting the plugin registry per segment.
     let unsupported_history = mapping.ledger.has_unsupported_transitions();
-    let mut unverifiable = false;
+    let mut unverifiable = BTreeSet::new();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
@@ -100,7 +100,7 @@ pub(super) async fn load_indices(
                             index.name,
                             index.uuid,
                         );
-                        unverifiable = true;
+                        unverifiable.insert(index.name.clone());
                         false
                     }
                 };
@@ -1528,7 +1528,10 @@ pub mod tests {
 
         let indices = vec![fri.clone(), mem_wal.clone(), orphan_user_index.clone()];
         let (listing, unverifiable) = load_indices(&dataset, &fri, &indices).await.unwrap();
-        assert!(!unverifiable, "every marker is readable in this fixture");
+        assert!(
+            unverifiable.is_empty(),
+            "every marker is readable in this fixture"
+        );
 
         assert!(
             listing.iter().any(|i| i.name == MEM_WAL_INDEX_NAME),
