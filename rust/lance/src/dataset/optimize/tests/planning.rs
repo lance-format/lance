@@ -1579,7 +1579,9 @@ async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
     // The sabotage only proves anything if the index the reopened manifest
     // carries is the unreadable one, and if the fragment whose file was
     // removed is exactly the fragment that index's coverage holds back.
-    let indices = dataset.load_indices().await.unwrap();
+    // `load_all_indices`, not `load_indices`: the latter drops exactly the
+    // unusable entry this case is about.
+    let indices = load_all_indices(&dataset).await.unwrap();
     assert_eq!(indices.len(), 1, "{indices:?}");
     assert!(
         indices[0]
