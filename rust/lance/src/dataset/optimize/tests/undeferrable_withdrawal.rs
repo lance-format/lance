@@ -3040,6 +3040,116 @@ async fn staged_fts_preserves_stemming_with_direct_commit(
     }
 }
 
+/// A finalize interrupted after copying some partitions, before it publishes
+/// the root metadata, leaves root files beside the staging directory. Reading
+/// that layout as legacy caches the verdict, so the retried direct commit
+/// withdraws the segment's compacted coverage and the query falls back to a
+/// flat scan whose bare tokenizer never reaches the configured stemmer.
+#[derive(Debug)]
+struct StopBeforeFtsRootMetadata;
+
+#[async_trait::async_trait]
+impl lance_index::progress::IndexBuildProgress for StopBeforeFtsRootMetadata {
+    async fn stage_start(&self, stage: &str, _: Option<u64>, _: &str) -> lance_core::Result<()> {
+        if stage == "write_merged_metadata" {
+            return Err(lance_core::Error::io("interrupted before root metadata"));
+        }
+        Ok(())
+    }
+    async fn stage_progress(&self, _: &str, _: u64) -> lance_core::Result<()> {
+        Ok(())
+    }
+    async fn stage_complete(&self, _: &str) -> lance_core::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn direct_staged_fts_retry_after_interrupted_finalize() {
+    let dir = TempStrDir::default();
+    let path = dir.as_str();
+    let dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .col(
+            "doc",
+            lance_datagen::array::fill_utf8("running".to_string()),
+        )
+        .into_dataset(
+            path,
+            FragmentCount::from(4),
+            FragmentRowCount::from(INDEX_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    let mut dataset = make_tagged(dataset).await;
+    create_btree_index(&mut dataset).await;
+    let sources: Vec<u32> = dataset.fragment_bitmap.iter().collect();
+    let params = InvertedIndexParams::default().stem(true);
+    let staged = CreateIndexBuilder::new(&mut dataset, &["doc"], IndexType::Inverted, &params)
+        .name(FTS_INDEX.to_string())
+        .fragments(sources)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut dataset, &options, None).await;
+
+    let index_dir = dataset.indices_dir().join(staged.uuid.to_string());
+    let store = <lance_index::scalar::lance_format::LanceIndexStore as crate::dataset::index::LanceIndexStoreExt>::from_dataset_for_new(
+        &dataset,
+        &staged.uuid,
+    )
+    .unwrap();
+    let error = lance_index::scalar::inverted::builder::merge_index_files_with_options(
+        dataset.object_store.as_ref(),
+        &index_dir,
+        Arc::new(store),
+        lance_index::scalar::inverted::builder::FinalizeOptions::default(),
+        Arc::new(StopBeforeFtsRootMetadata),
+    )
+    .await
+    .expect_err("the finalize must stop before publishing its root marker");
+    assert!(
+        error
+            .to_string()
+            .contains("interrupted before root metadata")
+    );
+    let files = lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir)
+        .await
+        .unwrap();
+    assert!(files.iter().any(|f| f.path.starts_with("staging/")));
+    assert!(files.iter().any(|f| !f.path.starts_with("staging/")));
+    assert!(
+        !files
+            .iter()
+            .any(|f| f.path == lance_index::scalar::inverted::METADATA_FILE)
+    );
+
+    dataset
+        .commit_existing_index_segments(FTS_INDEX, "doc", vec![staged])
+        .await
+        .unwrap();
+    let fresh = DatasetBuilder::from_uri(path).load().await.unwrap();
+    let (same_count, same_plan) = fts_count_on_column(&dataset, "run", "doc").await;
+    let (fresh_count, fresh_plan) = fts_count_on_column(&fresh, "run", "doc").await;
+    assert_eq!(
+        (same_count, fresh_count),
+        (
+            4 * INDEX_ROWS_PER_FRAGMENT as usize,
+            4 * INDEX_ROWS_PER_FRAGMENT as usize
+        ),
+        "retry must preserve stemming on both handles:\n{same_plan}\n{fresh_plan}"
+    );
+    for plan in [same_plan, fresh_plan] {
+        assert!(plan_has_node(&plan, "MatchQuery:"), "{plan}");
+        assert!(!plan_has_node(&plan, "FlatMatchQuery:"), "{plan}");
+    }
+}
+
 /// Commits a second segment of `FTS_INDEX` over everything live, as index
 /// maintenance does: built uncommitted under its own name, then renamed into
 /// the logical index.

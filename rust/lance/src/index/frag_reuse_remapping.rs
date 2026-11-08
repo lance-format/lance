@@ -59,14 +59,15 @@ impl CacheKey for InvertedFormatKey {
 /// translated. Such a segment is excluded from coverage so the planner scans
 /// its fragments; an untouched (identity) legacy segment still loads.
 ///
-/// A segment whose files are still only under `staging/` has not published
-/// its root metadata yet, so that file's absence is not the legacy layout --
-/// it is a build in progress. Reporting `None` there keeps the withdrawal
-/// selector from treating a modern distributed build as untranslatable, and
-/// the non-verdict is never memoized: the finalize that publishes the root
-/// metadata makes the same call definitive. A segment being replayed into a
-/// commit carries no recorded file list, so the layout is read from its index
-/// directory rather than assumed legacy.
+/// A segment holding any file under `staging/` has not published its root
+/// metadata yet, so that file's absence is not the legacy layout -- it is a
+/// build in progress, including a finalize interrupted partway that left root
+/// partitions beside the staging directory. Reporting `None` there keeps the
+/// withdrawal selector from treating a modern distributed build as
+/// untranslatable, and the non-verdict is never memoized: the finalize that
+/// publishes the root metadata makes the same call definitive. A segment being
+/// replayed into a commit carries no recorded file list, so the layout is read
+/// from its index directory rather than assumed legacy.
 ///
 /// Only a confirmed missing metadata file reports the legacy layout. Any
 /// other failure to read it propagates and nothing is cached: an
@@ -112,35 +113,35 @@ pub async fn inverted_supports_batch_remapping(
     Ok(Some(supported))
 }
 
-/// Whether every index file this segment records is a staged build artifact,
-/// i.e. the build has not published its final layout.
+/// Whether this segment holds ANY staged build artifact, i.e. its build has
+/// not published its final layout. A finalize interrupted partway leaves root
+/// partitions beside the staging directory, so only a layout with no staged
+/// file at all is the legacy one.
 ///
 /// A segment replayed at commit time carries no file list (the commit collects
 /// the files from the index directory), so the recorded list cannot answer and
 /// the segment's own index location is listed instead -- resolved through its
 /// `base_id`, the same directory and store the root metadata was probed in. A
-/// recorded list keeps the zero-store-call shortcut; a listed directory
-/// holding no staged file is the legacy layout.
+/// recorded list keeps the zero-store-call shortcut.
 async fn segment_files_are_staged_or_listed(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> Result<bool> {
     if let Some(files) = index.files.as_ref() {
-        return Ok(all_staged(files));
+        return Ok(has_staged_file(files));
     }
     let index_dir = dataset
         .indice_files_dir(index)?
         .join(index.uuid.to_string());
     let store = dataset.object_store_for_index(index).await?;
     let files = lance_table::format::list_index_files_with_sizes(&store, &index_dir).await?;
-    Ok(all_staged(&files))
+    Ok(has_staged_file(&files))
 }
 
-fn all_staged(files: &[lance_table::format::IndexFile]) -> bool {
-    !files.is_empty()
-        && files
-            .iter()
-            .all(|file| lance_index::scalar::inverted::builder::is_staged_path(&file.path))
+fn has_staged_file(files: &[lance_table::format::IndexFile]) -> bool {
+    files
+        .iter()
+        .any(|file| lance_index::scalar::inverted::builder::is_staged_path(&file.path))
 }
 
 /// Legacy vector file readers keep their existing V1 behavior and scan fallback.
