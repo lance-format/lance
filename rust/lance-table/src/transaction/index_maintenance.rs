@@ -400,15 +400,17 @@ impl Transaction {
                         .iter()
                         .filter_map(|field| u32::try_from(*field).ok())
                         .collect();
-                    Some(
-                        rewrites
-                            .iter()
-                            .filter(|(_, fields)| {
-                                fields.iter().any(|field| indexed.contains(field))
-                            })
-                            .filter_map(|(fragment, _)| u32::try_from(*fragment).ok())
-                            .collect(),
-                    )
+                    let rewritten: Vec<u32> = rewrites
+                        .iter()
+                        .filter(|(_, fields)| fields.iter().any(|field| indexed.contains(field)))
+                        .filter_map(|(fragment, _)| u32::try_from(*fragment).ok())
+                        .collect();
+                    if rewritten.is_empty() {
+                        // The segment indexes none of the rewritten columns,
+                        // so no rewrite reached its rows.
+                        continue;
+                    }
+                    Some(rewritten)
                 }
                 Withdrawal::UndeferrableSegments {
                     segments,
@@ -2760,6 +2762,39 @@ mod withdrawal_tests {
             &RoaringBitmap::from_iter([1u32, 2])
         );
         assert!(indices[2].fragment_bitmap.is_none());
+    }
+
+    /// A segment indexing none of the rewritten columns is outside the
+    /// rewrite, so an unwalkable history must not cost it its retired
+    /// coverage: the rewrite cannot have touched its rows.
+    #[test]
+    fn without_a_walkable_history_an_unindexed_field_is_untouched() {
+        let entry = history();
+        let live: RoaringBitmap = [4u32, 8, 9].into_iter().collect();
+        let on_x = segment(Some(&[1, 2]), vec![0]);
+        let on_y = segment(Some(&[1, 2]), vec![1]);
+        let mut indices = vec![on_x.clone(), on_y.clone()];
+        // The rewrite of F4 touches field 0 (column X) only.
+        Transaction::withdraw_rewritten_coverage(
+            &mut indices,
+            Some(&TaggedLineage::new(&entry, None)),
+            &live,
+            &[(4, vec![0])],
+        );
+        let kept = indices
+            .iter()
+            .find(|index| index.uuid == on_y.uuid)
+            .expect("the segment on an unrewritten column is kept");
+        assert_eq!(
+            kept.fragment_bitmap, on_y.fragment_bitmap,
+            "the segment on an unrewritten column keeps its coverage"
+        );
+        // The segment on the rewritten column gives up its retired sources,
+        // empties, and is retired because its sibling still serves.
+        assert!(
+            !indices.iter().any(|index| index.uuid == on_x.uuid),
+            "the emptied segment on the rewritten column is retired behind its sibling"
+        );
     }
 
     #[test]
