@@ -57,6 +57,11 @@ impl CacheKey for InvertedFormatKey {
 /// lengths aligned with the row ids it was built with and cannot be
 /// translated. Such a segment is excluded from coverage so the planner scans
 /// its fragments; an untouched (identity) legacy segment still loads.
+///
+/// Only a confirmed missing metadata file reports the legacy layout. Any
+/// other failure to read it propagates and nothing is cached: an
+/// unreachable object store says nothing about the format, and a coverage
+/// withdrawal derived from it would be persisted.
 pub async fn inverted_supports_batch_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -70,12 +75,16 @@ pub async fn inverted_supports_batch_remapping(
                     dataset, index,
                 )
                 .await?;
-            Ok(lance_index::scalar::IndexStore::open_index_file(
+            match lance_index::scalar::IndexStore::open_index_file(
                 &store,
                 lance_index::scalar::inverted::METADATA_FILE,
             )
             .await
-            .is_ok())
+            {
+                Ok(_) => Ok(true),
+                Err(e) if e.is_not_found() => Ok(false),
+                Err(e) => Err(e),
+            }
         })
         .await?;
     Ok(*supported)

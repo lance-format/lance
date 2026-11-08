@@ -16,12 +16,15 @@
 
 use super::*;
 use crate::dataset::CommitBuilder;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::optimize::commit::commit_compaction;
 use crate::index::frag_reuse::frag_reuse_entry_appending;
 use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::index::vector::IndexFileVersion;
+use lance_io::object_store::ObjectStoreParams;
 use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 const INDEX_ROWS_PER_FRAGMENT: u32 = 64;
@@ -838,4 +841,420 @@ async fn assert_query_exactness(dataset: &Dataset) {
     let expected = brute_force_knn(dataset, &query, 5).await;
     let (rows, plan) = indexed_knn(dataset, &query, 5).await;
     assert_eq!(rows, expected, "{plan}");
+}
+
+/// An object store whose reads of one suffix can be failed on demand, so a
+/// transient storage fault can be told apart from a missing object.
+#[derive(Debug)]
+struct FailingReadWrapper {
+    /// Reads of a path ending in this suffix fail while `failing` is set.
+    suffix: String,
+    failing: Arc<AtomicBool>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for FailingReadWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(FailingReadStore {
+            inner: original,
+            suffix: self.suffix.clone(),
+            failing: self.failing.clone(),
+        })
+    }
+
+    // The wrapper fails paths, so a pushed-down listing must not walk past it.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct FailingReadStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    suffix: String,
+    failing: Arc<AtomicBool>,
+}
+
+impl FailingReadStore {
+    fn fails(&self, location: &object_store::path::Path) -> bool {
+        self.failing.load(Ordering::SeqCst) && location.as_ref().ends_with(&self.suffix)
+    }
+
+    /// A generic error, deliberately NOT `NotFound`: the point is that a fault
+    /// that says nothing about the object's existence must not be read as a
+    /// format verdict.
+    fn injected_error() -> object_store::Error {
+        object_store::Error::Generic {
+            store: "failing-read-test-store",
+            source: "injected transient read failure".to_string().into(),
+        }
+    }
+}
+
+impl std::fmt::Display for FailingReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingReadStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FailingReadStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if self.fails(location) {
+            return Err(Self::injected_error());
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        if self.fails(location) {
+            return Err(Self::injected_error());
+        }
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, opts).await
+    }
+}
+
+const FTS_INDEX: &str = "doc_idx";
+
+/// A table on disk with `i`, a vector column and a `doc` column, made tagged
+/// and indexed with a healthy (non-legacy) inverted index on `doc`.
+///
+/// On disk rather than in RAM because the test opens it through a wrapping
+/// object store, which `into_ram_dataset` cannot carry.
+async fn tagged_with_fts_index(path: &str) -> Dataset {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(4.into()),
+        )
+        .col("doc", lance_datagen::array::random_sentence(1, 10, false))
+        .into_dataset(
+            path,
+            FragmentCount::from(4),
+            FragmentRowCount::from(INDEX_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    dataset = make_tagged(dataset).await;
+    dataset
+        .create_index(
+            &["doc"],
+            IndexType::Inverted,
+            Some(FTS_INDEX.into()),
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// Reopens `path` through a store that fails reads of `suffix` while the
+/// returned flag is set.
+async fn open_with_failing_reads(path: &str, suffix: String) -> (Dataset, Arc<AtomicBool>) {
+    let failing = Arc::new(AtomicBool::new(false));
+    let dataset = DatasetBuilder::from_uri(path)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(FailingReadWrapper {
+                suffix,
+                failing: failing.clone(),
+            })),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    (dataset, failing)
+}
+
+/// The relative path of a segment's inverted metadata file, as the index
+/// store reads it.
+async fn fts_metadata_suffix(dataset: &Dataset, name: &str) -> String {
+    let index = dataset
+        .load_index_by_name(name)
+        .await
+        .unwrap()
+        .expect("the index must exist");
+    format!(
+        "{}/{}",
+        index.uuid,
+        lance_index::scalar::inverted::METADATA_FILE
+    )
+}
+
+/// A word that occurs in the table, to drive full-text search.
+async fn sample_word(dataset: &Dataset) -> String {
+    let batch = dataset
+        .scan()
+        .project(&["doc"])
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let doc = batch["doc"].as_string::<i32>().value(0).to_string();
+    doc.split_whitespace()
+        .next()
+        .expect("a document must have a word")
+        .to_string()
+}
+
+/// The number of rows full-text search returns for `word`, with the plan so a
+/// test can assert which path served it.
+async fn fts_count(dataset: &Dataset, word: &str) -> (usize, String) {
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new(word.to_string()))
+        .unwrap();
+    scan.project::<String>(&[]).unwrap().with_row_id();
+    let plan = scan.explain_plan(false).await.unwrap();
+    let count = scan.count_rows().await.unwrap();
+    (count as usize, plan)
+}
+
+/// W1: a transient read failure on the inverted metadata file is NOT a legacy
+/// format verdict. The deferred compaction attempt must not persist a
+/// narrowed bitmap from it, and nothing may be cached: once the fault clears,
+/// the segment classifies as deferrable and keeps its provenance.
+#[tokio::test]
+async fn a_read_failure_does_not_classify_an_inverted_index_as_legacy() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_read_failure", dir.as_str());
+    let seed = tagged_with_fts_index(&path).await;
+    let suffix = fts_metadata_suffix(&seed, FTS_INDEX).await;
+    let fts_before = coverage_of(&stored_segments(&seed).await, FTS_INDEX);
+    assert!(
+        !fts_before.is_empty(),
+        "the fixture's FTS segment must cover fragments"
+    );
+    let word = sample_word(&seed).await;
+    let (count_before, plan_before) = fts_count(&seed, &word).await;
+    assert!(
+        plan_before.contains("MatchQuery"),
+        "the fixture's FTS index must serve the query: {plan_before}"
+    );
+    drop(seed);
+
+    let (mut dataset, failing) = open_with_failing_reads(&path, suffix.clone()).await;
+    let sources: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        !(&fts_before & &sources).is_empty(),
+        "the FTS segment must cover what the compaction rewrites, or the \
+         withdrawal under test could not happen at all"
+    );
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+
+    // Reads of the metadata file fail with a generic (not NotFound) error.
+    failing.store(true, Ordering::SeqCst);
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let results = execute_tasks(&dataset, &plan, &options, None).await;
+    let outcome = commit_compaction(
+        &mut dataset,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await;
+    failing.store(false, Ordering::SeqCst);
+
+    // Whatever the existing error rules did with the fault (surfaced it, or
+    // retried until it committed), no coverage may have been withdrawn from
+    // the FTS segment on the strength of an unreadable file. This is the
+    // assertion that fails on the collapsed `is_ok()`.
+    let reopened = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    assert_eq!(
+        coverage_of(&stored_segments(&reopened).await, FTS_INDEX),
+        fts_before,
+        "a read fault must not narrow the FTS segment's provenance (commit {})",
+        if outcome.is_ok() { "landed" } else { "failed" }
+    );
+
+    // Nothing was cached: the SAME handle, whose index cache saw the fault,
+    // classifies the segment as deferrable now that reads succeed. Observed
+    // through the selector, which lists exactly the `Some(false)` segments.
+    let index = dataset
+        .load_index_by_name(FTS_INDEX)
+        .await
+        .unwrap()
+        .expect("the FTS index definition must survive");
+    let covered = index.fragment_bitmap.clone().unwrap();
+    assert!(
+        crate::index::frag_reuse::undeferrable_rewrite_segments(&dataset, &covered)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a read failure must not be cached as the legacy verdict"
+    );
+
+    // With reads restored the compaction runs to completion and the FTS
+    // segment keeps its provenance and still serves the query.
+    let mut dataset = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    if dataset.manifest.version == reopened.manifest.version {
+        run_deferred_compaction(&mut dataset, &options, None).await;
+    }
+    let fts_final = coverage_of(&stored_segments(&dataset).await, FTS_INDEX);
+    assert_eq!(
+        fts_final, fts_before,
+        "the healthy FTS segment's stored provenance is never withdrawn"
+    );
+    let destinations: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        derived_coverage(&dataset, FTS_INDEX).await,
+        destinations,
+        "the FTS segment must translate to the rewrite's outputs"
+    );
+    let (count_after, plan_after) = fts_count(&dataset, &word).await;
+    assert!(
+        plan_after.contains("MatchQuery"),
+        "the retained FTS segment must still serve the query: {plan_after}"
+    );
+    assert_eq!(
+        count_after, count_before,
+        "full-text search must stay exact after the deferred compaction"
+    );
+}
+
+/// W1 control: a positively MISSING metadata file is the legacy layout, and
+/// the deferred compaction does withdraw that segment's coverage of the
+/// rewritten sources.
+#[tokio::test]
+async fn a_missing_inverted_metadata_file_is_the_legacy_verdict() {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_missing_metadata", dir.as_str());
+    let dataset = tagged_with_fts_index(&path).await;
+    let fts_before = coverage_of(&stored_segments(&dataset).await, FTS_INDEX);
+    assert!(!fts_before.is_empty());
+    let sources: RoaringBitmap = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert!(
+        !(&fts_before & &sources).is_empty(),
+        "the FTS segment must cover what the compaction rewrites"
+    );
+
+    // Delete the metadata file: now the object genuinely is not there.
+    let index = dataset
+        .load_index_by_name(FTS_INDEX)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata_path = dataset
+        .indices_dir()
+        .join(index.uuid.to_string())
+        .join(lance_index::scalar::inverted::METADATA_FILE);
+    dataset.object_store.delete(&metadata_path).await.unwrap();
+    // Reopened so the classification reads storage rather than the handle's
+    // caches, as a fresh writer would.
+    let mut dataset = DatasetBuilder::from_uri(&path).load().await.unwrap();
+
+    let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
+    let committed = run_deferred_compaction(&mut dataset, &options, None).await;
+    assert!(committed > 0, "the compaction must commit");
+
+    let fts_after = coverage_of(&stored_segments(&dataset).await, FTS_INDEX);
+    assert!(
+        fts_after.is_disjoint(&sources),
+        "a legacy inverted segment's coverage of the rewritten sources is withdrawn: {:?}",
+        (&fts_after & &sources).iter().collect::<Vec<_>>()
+    );
+    assert!(
+        stored_segments(&dataset)
+            .await
+            .iter()
+            .any(|(name, _, _)| name == FTS_INDEX),
+        "the index definition must survive the withdrawal"
+    );
 }
