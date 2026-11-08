@@ -922,7 +922,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         Some(
             reason @ (MissingCoverageReason::Withdrawn
             | MissingCoverageReason::NoDerivedCoverage
-            | MissingCoverageReason::Unsupported),
+            | MissingCoverageReason::Unsupported
+            | MissingCoverageReason::Unverifiable),
         ) => {
             log::info!(
                 "Skipping remap of index {} ({}): {reason}. A rebuild (optimize) replaces it; \

@@ -1911,6 +1911,12 @@ async fn a_read_failure_on_one_segment_does_not_fail_every_query() {
         .await
         .expect("a read fault on the FTS segment must not fail a BTree query");
     assert!(lookup_plan.contains("ScalarIndexQuery"), "{lookup_plan}");
+    let looked_up = lookup
+        .try_into_batch()
+        .await
+        .expect("a read fault on the FTS segment must not fail a BTree query")
+        .num_rows();
+    assert_eq!(looked_up, 1, "the BTree query must answer during the fault");
     // The faulting segment is excluded rather than trusted, and the flat
     // fallback answers.
     let (count_during, plan_during) = fts_count_on_column(&dataset, &word, "doc").await;

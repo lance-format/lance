@@ -205,6 +205,10 @@ pub(crate) enum MissingCoverageReason {
     /// The stored metadata cannot be interpreted (no or undecodable index
     /// details). Maintenance fails.
     Corrupt,
+    /// The segment's format marker could not be read, so whether this build
+    /// can translate it is unknown. Not a verdict on the segment: maintenance
+    /// skips it and a later call reclassifies it once the read succeeds.
+    Unverifiable,
 }
 
 impl std::fmt::Display for MissingCoverageReason {
@@ -216,6 +220,7 @@ impl std::fmt::Display for MissingCoverageReason {
             }
             Self::Unsupported => "this build cannot translate it",
             Self::Corrupt => "its metadata cannot be interpreted",
+            Self::Unverifiable => "its format marker could not be read",
         })
     }
 }
@@ -504,11 +509,25 @@ async fn missing_coverage_reason(
     if source.index_details.is_none() {
         return Ok(MissingCoverageReason::Corrupt);
     }
+    // A probe that cannot reach the format marker says nothing about the
+    // segment's format, and the snapshot plan this reason goes into is built
+    // for every segment: failing here would fail every query on the table.
+    // Report it as unverifiable for THIS plan, so a later snapshot
+    // reclassifies once the store answers again.
     Ok(
-        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await? {
-            Some(true) => MissingCoverageReason::NoDerivedCoverage,
-            Some(false) => MissingCoverageReason::Unsupported,
-            None => MissingCoverageReason::Corrupt,
+        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await {
+            Ok(Some(true)) => MissingCoverageReason::NoDerivedCoverage,
+            Ok(Some(false)) => MissingCoverageReason::Unsupported,
+            Ok(None) => MissingCoverageReason::Corrupt,
+            Err(error) => {
+                log::warn!(
+                    "index {} (segment {}): could not read its format marker ({error}); \
+                     reporting its coverage as unverifiable for this snapshot",
+                    source.name,
+                    source.uuid,
+                );
+                MissingCoverageReason::Unverifiable
+            }
         },
     )
 }
@@ -672,6 +691,13 @@ pub(super) async fn open_row_id_remapping_with_plan(
             Err(Error::not_supported(format!(
                 "segment {} cannot be translated by this build under the tagged fragment reuse \
                  history; leave it for a rebuild or a newer version of Lance",
+                index.uuid
+            )))
+        }
+        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unverifiable) => {
+            Err(Error::not_supported(format!(
+                "segment {}'s format marker could not be read, so whether this build can \
+                 translate it is unknown; retry once the store answers",
                 index.uuid
             )))
         }
