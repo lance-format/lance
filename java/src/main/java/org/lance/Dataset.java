@@ -1929,7 +1929,12 @@ public class Dataset implements Closeable {
    * Read zonemap statistics for a column.
    *
    * <p>Returns per-zone min/max/null_count statistics for the given column, if a zonemap index
-   * exists. Returns an empty list if no zonemap index exists for the column.
+   * exists. Returns an empty list if no zonemap index exists for the column, or if the column's
+   * type has no faithful {@link Comparable} representation: decimal, binary and nested types, or an
+   * unsigned 64-bit column holding a value above {@link Long#MAX_VALUE}. A null min or max means
+   * the zone has no comparable value: every value is null or, for a floating-point column, every
+   * non-null value is NaN. A zone is known to be all null only when its null count equals its zone
+   * length.
    *
    * <p>The zonemap index file is typically small (one row per zone), so this is a lightweight
    * metadata-only operation suitable for calling on the driver during scan planning.

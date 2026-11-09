@@ -23,6 +23,7 @@ import org.lance.index.scalar.ZoneStats;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -31,6 +32,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
@@ -290,6 +292,49 @@ public class ZonemapStatsTest {
         List<ZoneStats> stats = dataset.getZonemapStats("id");
         assertNotNull(stats);
         assertTrue(stats.isEmpty(), "Expected empty for non-indexed column");
+      }
+    }
+  }
+
+  @Test
+  public void testGetZonemapStatsUnsupportedTypeReturnsEmpty(@TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("decimal_col").toString();
+    Schema schema =
+        new Schema(
+            Collections.singletonList(Field.nullable("amount", new ArrowType.Decimal(10, 2, 128))),
+            null);
+    try (BufferAllocator allocator = new RootAllocator()) {
+      try (Dataset ds =
+          Dataset.create(allocator, path, schema, new WriteParams.Builder().build())) {
+        // empty
+      }
+      List<FragmentMetadata> metas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        DecimalVector amounts = (DecimalVector) root.getVector("amount");
+        for (int i = 0; i < 100; i++) {
+          amounts.setSafe(i, new BigDecimal(i).movePointLeft(2));
+        }
+        root.setRowCount(100);
+        metas = Fragment.create(path, allocator, root, new WriteParams.Builder().build());
+      }
+      Dataset.commit(allocator, path, new FragmentOperation.Append(metas), Optional.of(1L)).close();
+
+      try (Dataset dataset = Dataset.open(path, allocator)) {
+        ScalarIndexParams params = ScalarIndexParams.create("zonemap", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(params).build();
+        dataset.createIndex(
+            Collections.singletonList("amount"),
+            IndexType.ZONEMAP,
+            Optional.of("amount_zm"),
+            indexParams,
+            true);
+
+        // Decimal bounds have no Comparable representation: no stats, rather
+        // than null bounds that would read as "all null".
+        assertTrue(dataset.listIndexes().contains("amount_zm"));
+        assertTrue(dataset.getZonemapStats("amount").isEmpty());
       }
     }
   }

@@ -20,7 +20,9 @@ import java.io.Serializable;
  *
  * <p>Each zone covers a contiguous range of row offsets within a single fragment. The min/max
  * values are represented as {@link Comparable} objects (Long, Double, String, etc.) matching the
- * column's data type.
+ * column's data type. Columns whose type has no such representation yield no {@code ZoneStats} at
+ * all, so a null min or max always means the zone has no comparable value: every value is null or,
+ * for a floating-point column, every non-null value is NaN.
  *
  * <p>A zone never spans fragment boundaries: if a fragment has more rows than the zone size,
  * multiple zones are created within that fragment.
@@ -45,8 +47,8 @@ public class ZoneStats implements Serializable {
    * @param zoneStart the starting row offset within the fragment
    * @param zoneLength the span of row offsets (last_offset - first_offset + 1); may differ from
    *     physical row count if rows have been deleted
-   * @param min the minimum value in the zone, or null if all values are null
-   * @param max the maximum value in the zone, or null if all values are null
+   * @param min the minimum value in the zone, or null if the zone has no comparable value
+   * @param max the maximum value in the zone, or null if the zone has no comparable value
    * @param nullCount the number of null values in the zone
    */
   public ZoneStats(
@@ -87,7 +89,8 @@ public class ZoneStats implements Serializable {
   /**
    * Returns the minimum value in the zone.
    *
-   * @return the min value, or null if all values in the zone are null
+   * @return the min value, or null if the zone has no comparable value (every value is null or, for
+   *     a floating-point column, every non-null value is NaN)
    */
   public Comparable<?> getMin() {
     return min;
@@ -96,7 +99,8 @@ public class ZoneStats implements Serializable {
   /**
    * Returns the maximum value in the zone.
    *
-   * @return the max value, or null if all values in the zone are null
+   * @return the max value, or null if the zone has no comparable value (every value is null or, for
+   *     a floating-point column, every non-null value is NaN)
    */
   public Comparable<?> getMax() {
     return max;
