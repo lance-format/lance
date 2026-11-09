@@ -2585,6 +2585,35 @@ mod tests {
         assert_eq!(loads.0.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn test_prewarm_applies_runtime_remapping() {
+        use crate::scalar::lookup_test_util::CompactedToFragmentOne;
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (stored_index, _merges, _tmpdir) = do_train(builder, simple_data_with_nulls()).await;
+        let remapper = CompactedToFragmentOne {
+            deleted: HashSet::from([4]),
+        };
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = NGramIndex::load(stored_index.store.clone(), Some(Arc::new(remapper)), &cache)
+            .await
+            .unwrap();
+
+        index.prewarm().await.unwrap();
+
+        let loads = PartLoads::default();
+        let result = index
+            .search(&TextQuery::StringContains("cat".to_string()), &loads)
+            .await
+            .unwrap();
+        let moved = CompactedToFragmentOne::moved;
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([moved(0)]))
+        );
+        assert_eq!(loads.0.load(Ordering::Relaxed), 0);
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_ngram_regex_search() {
         // Same corpus as test_basic_ngram_index.
