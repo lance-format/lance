@@ -38,7 +38,9 @@ use rand::seq::index::sample;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, filter_index_segments_by_ids};
+use crate::index::{
+    DatasetIndexExt, loading::DatasetIndexInternalExt, prewarm::filter_index_segments_by_ids,
+};
 
 use super::ivf::v2::IVFIndex;
 

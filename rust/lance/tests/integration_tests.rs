@@ -4,8 +4,10 @@
 // NOTE: we only create one integration test binary, to keep compilation overhead down.
 
 mod count_pushdown;
+mod fts_plan_reconstruction;
 mod mem_wal;
 #[cfg(feature = "slow_tests")]
 mod query;
+mod topk_late_materialization;
 #[cfg(feature = "slow_tests")]
 mod utils;

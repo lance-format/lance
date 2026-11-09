@@ -24,3 +24,4 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 - Document the semantic meaning of both present and absent states for `optional` fields — explain when each case applies.
 - Use precise domain terminology in field descriptions — avoid ambiguous abbreviations or terms that collide with domain concepts.
+- Write multi-line comments as `/* text` / ` * text` / ` */` blocks so editors can fold them; keep single-line comments as `//`. The `ci/check_proto_comments.py` check (pre-commit hook and the `Protobuf lint` workflow) enforces this and can rewrite offenders with `--fix`.

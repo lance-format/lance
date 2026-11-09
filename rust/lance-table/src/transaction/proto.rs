@@ -22,6 +22,7 @@ use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -225,6 +226,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows,
                 updated_fragment_offsets,
                 updated_fragment_offset_bitmaps,
+                mem_wal_dir_id,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -240,6 +242,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
@@ -372,8 +375,10 @@ impl TryFrom<pb::Transaction> for Transaction {
                     }
                 }
             }
+            // `data_change` is not acted on yet: every replacement is still
+            // applied as a data change.
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement { replacements, .. },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
@@ -381,12 +386,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { compacted_sstables },
+                pb::transaction::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
+                dir_id,
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -401,11 +410,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            None => {
-                return Err(Error::internal(
-                    "Transaction message did not contain an operation".to_string(),
-                ));
-            }
+            // prost drops unrecognized oneof fields, so an operation from a
+            // newer writer is indistinguishable from a missing one.
+            None => Operation::Unknown {},
         };
         Ok(Self {
             read_version: message.read_version,
@@ -462,6 +469,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         .map(|f| IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                         })
                         .collect(),
                 )
@@ -489,8 +497,10 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
-impl From<&Transaction> for pb::Transaction {
-    fn from(value: &Transaction) -> Self {
+impl TryFrom<&Transaction> for pb::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -596,6 +606,7 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -612,6 +623,7 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(pb::CompactedSsTable::from)
                     .collect(),
+                mem_wal_dir_id: mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
                     .as_ref()
@@ -679,6 +691,7 @@ impl From<&Transaction> for pb::Transaction {
                         .iter()
                         .map(pb::transaction::DataReplacementGroup::from)
                         .collect(),
+                    data_change: None,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -689,12 +702,16 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
+                    dir_id: dir_id.clone(),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -706,6 +723,13 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::Unknown { .. } => {
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be re-encoded by this version",
+                    value.uuid
+                )));
+            }
         };
 
         let transaction_properties = value
@@ -713,13 +737,13 @@ impl From<&Transaction> for pb::Transaction {
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-        }
+        })
     }
 }
 
@@ -739,6 +763,9 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
                         .map(|f| pb::IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: f
+                                .file_metadata_size_bytes
+                                .map_or(0, NonZero::get),
                         })
                         .collect()
                 })
@@ -796,12 +823,13 @@ impl From<&pb::transaction::UpdateMap> for UpdateMap {
     }
 }
 
-impl From<&Transaction> for crate::format::Transaction {
-    fn from(value: &Transaction) -> Self {
-        let pb_transaction: pb::Transaction = value.into();
-        Self {
-            inner: pb_transaction,
-        }
+impl TryFrom<&Transaction> for crate::format::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
+        Ok(Self {
+            inner: pb::Transaction::try_from(value)?,
+        })
     }
 }
 
@@ -810,6 +838,35 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+
+    #[test]
+    fn test_rewrite_frag_reuse_update_stays_in_memory() {
+        // The fragment reuse update never enters the transaction file:
+        // other writers' conflict decisions only need the fragment sets in
+        // `groups`.
+        let entry = crate::transaction::test_support::sample_index_metadata(
+            crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME,
+        );
+        let transaction = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+            },
+            None,
+        );
+        let decoded =
+            Transaction::try_from(pb::Transaction::try_from(&transaction).unwrap()).unwrap();
+        match decoded.operation {
+            Operation::Rewrite {
+                frag_reuse_index, ..
+            } => {
+                assert!(frag_reuse_index.is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {
@@ -853,5 +910,30 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_rewritten_index_roundtrips() {
+        let rewritten_index = RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any::default(),
+            new_index_version: 1,
+            new_index_files: Some(vec![
+                IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 4_096,
+                    file_metadata_size_bytes: NonZero::new(256),
+                },
+                IndexFile {
+                    path: "auxiliary.idx".to_string(),
+                    size_bytes: 1_024,
+                    file_metadata_size_bytes: None,
+                },
+            ]),
+        };
+
+        let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
+        assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
     }
 }

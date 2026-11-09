@@ -12,16 +12,17 @@ import pyarrow as pa
 def safe_data_storage_version(version_str):
     """Return a data_storage_version safe for the given lance version.
 
-    Versions 0.30 and older use "2.0", newer versions use "stable".
+    Versions before 0.38 use "2.0"; newer released versions use "2.1".
+
+    Do not return a moving alias here: compatibility tests create data with the
+    current Lance build and then read it with the requested older release.
     """
     parts = version_str.split(".")
     major = int(parts[0])
-    if major > 0:
-        return "stable"
     minor = int(parts[1]) if len(parts) > 1 else 0
-    if minor <= 30:
+    if major == 0 and minor < 38:
         return "2.0"
-    return "stable"
+    return "2.1"
 
 
 def build_basic_types():

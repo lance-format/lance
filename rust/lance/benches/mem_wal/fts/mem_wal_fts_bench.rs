@@ -23,7 +23,6 @@
 //! Emits one `result ...` human line and one JSON line tagged
 //! `impl=lance_fts`, matching the `mem_wal_hnsw_bench` output convention.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::HashMap;

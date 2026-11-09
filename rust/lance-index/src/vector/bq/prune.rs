@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! lower_bound = (binary_ip - 0.5 * sum_q) * scale_factor
-//!             + add_factor + query_factor
+//!             + add_factor_scale * (add_factor - add_factor_offset) + query_factor
 //!             - error_factor * query_error
 //! ```
 //!
@@ -41,12 +41,57 @@ use std::sync::LazyLock;
 /// Rows classified per kernel invocation.
 pub const PRUNE_LANES: usize = 16;
 
-/// Per-query constants of the lower-bound formula, mirroring
-/// `RabitDistCalculator::raw_query_lower_bound` term by term.
+/// Per-query constants for the unscaled raw-query lower bound.
 #[derive(Debug, Clone, Copy)]
 pub struct LowerBoundTerms {
     /// `0.5 * sum_q`, subtracted from the binary inner product.
     pub half_sum_q: f32,
+    pub query_factor: f32,
+    pub query_error: f32,
+}
+
+/// Classify rows using the stored additive factors without rescaling them.
+pub type PruneMaskFn = fn(
+    &[f32; PRUNE_LANES],
+    &[f32; PRUNE_LANES],
+    &[f32; PRUNE_LANES],
+    &[f32; PRUNE_LANES],
+    LowerBoundTerms,
+    f32,
+    Option<f32>,
+) -> (u16, u16);
+
+/// Resolve the unscaled prune-mask kernel, preserving the public kernel API.
+pub fn prune_mask_kernel() -> PruneMaskFn {
+    |dists, scales, adds, errors, terms, upper, heap| {
+        scaled_prune_mask_kernel()(
+            dists,
+            scales,
+            adds,
+            errors,
+            ScaledLowerBoundTerms {
+                half_sum_q: terms.half_sum_q,
+                add_factor_scale: 1.0,
+                add_factor_offset: 0.0,
+                query_factor: terms.query_factor,
+                query_error: terms.query_error,
+            },
+            upper,
+            heap,
+        )
+    }
+}
+
+/// Per-query constants of the lower-bound formula, mirroring
+/// `RabitDistCalculator::raw_query_lower_bound` term by term.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScaledLowerBoundTerms {
+    /// `0.5 * sum_q`, subtracted from the binary inner product.
+    pub half_sum_q: f32,
+    /// Scales the stored centroid correction for dot queries; one for L2.
+    pub add_factor_scale: f32,
+    /// Removes the constant one from dot factors before projection scaling.
+    pub add_factor_offset: f32,
     pub query_factor: f32,
     pub query_error: f32,
 }
@@ -63,24 +108,24 @@ pub struct LowerBoundTerms {
 /// `i` of `pruned_heap` is set when the row is not already pruned by the
 /// upper bound and `lower_bound[i] >= heap_threshold`. Surviving rows are the
 /// zero bits of the OR of both masks.
-pub type PruneMaskFn = fn(
+pub(crate) type ScaledPruneMaskFn = fn(
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
-    LowerBoundTerms,
+    ScaledLowerBoundTerms,
     f32,
     Option<f32>,
 ) -> (u16, u16);
 
 /// Resolve the prune-mask kernel for the running CPU once; the result can be
 /// cached by the caller for per-partition use.
-pub fn prune_mask_kernel() -> PruneMaskFn {
-    static KERNEL: LazyLock<PruneMaskFn> = LazyLock::new(select_prune_mask_kernel);
+pub(crate) fn scaled_prune_mask_kernel() -> ScaledPruneMaskFn {
+    static KERNEL: LazyLock<ScaledPruneMaskFn> = LazyLock::new(select_scaled_prune_mask_kernel);
     *KERNEL
 }
 
-fn select_prune_mask_kernel() -> PruneMaskFn {
+fn select_scaled_prune_mask_kernel() -> ScaledPruneMaskFn {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx512f") {
@@ -101,14 +146,14 @@ fn prune_masks_portable(
     scale_factors: &[f32; PRUNE_LANES],
     add_factors: &[f32; PRUNE_LANES],
     error_factors: &[f32; PRUNE_LANES],
-    terms: LowerBoundTerms,
+    terms: ScaledLowerBoundTerms,
     upper_bound: f32,
     heap_threshold: Option<f32>,
 ) -> (u16, u16) {
     let mut lower_bounds = [0.0f32; PRUNE_LANES];
     for lane in 0..PRUNE_LANES {
         lower_bounds[lane] = ((dists[lane] - terms.half_sum_q) * scale_factors[lane]
-            + add_factors[lane]
+            + terms.add_factor_scale * (add_factors[lane] - terms.add_factor_offset)
             + terms.query_factor)
             - error_factors[lane] * terms.query_error;
     }
@@ -128,11 +173,12 @@ fn prune_masks_portable(
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{LowerBoundTerms, PRUNE_LANES};
+    use super::{PRUNE_LANES, ScaledLowerBoundTerms};
     use std::arch::x86_64::*;
 
     /// Lower bounds for 8 lanes with the scalar operation order (no FMA).
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "avx")]
     fn lower_bounds_avx(
         dists: __m256,
@@ -140,13 +186,18 @@ mod x86 {
         add_factors: __m256,
         error_factors: __m256,
         half_sum_q: __m256,
+        add_factor_scale: __m256,
+        add_factor_offset: __m256,
         query_factor: __m256,
         query_error: __m256,
     ) -> __m256 {
         let binary_distance = _mm256_add_ps(
             _mm256_add_ps(
                 _mm256_mul_ps(_mm256_sub_ps(dists, half_sum_q), scale_factors),
-                add_factors,
+                _mm256_mul_ps(
+                    add_factor_scale,
+                    _mm256_sub_ps(add_factors, add_factor_offset),
+                ),
             ),
             query_factor,
         );
@@ -168,7 +219,7 @@ mod x86 {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
     ) -> (u16, u16) {
@@ -183,6 +234,8 @@ mod x86 {
                 _mm256_loadu_ps(add_factors.as_ptr()),
                 _mm256_loadu_ps(error_factors.as_ptr()),
                 half_sum_q,
+                _mm256_set1_ps(terms.add_factor_scale),
+                _mm256_set1_ps(terms.add_factor_offset),
                 query_factor,
                 query_error,
             )
@@ -194,6 +247,8 @@ mod x86 {
                 _mm256_loadu_ps(add_factors.as_ptr().add(8)),
                 _mm256_loadu_ps(error_factors.as_ptr().add(8)),
                 half_sum_q,
+                _mm256_set1_ps(terms.add_factor_scale),
+                _mm256_set1_ps(terms.add_factor_offset),
                 query_factor,
                 query_error,
             )
@@ -213,7 +268,7 @@ mod x86 {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
     ) -> (u16, u16) {
@@ -237,7 +292,7 @@ mod x86 {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
     ) -> (u16, u16) {
@@ -256,7 +311,10 @@ mod x86 {
                     _mm512_sub_ps(dists, _mm512_set1_ps(terms.half_sum_q)),
                     scale_factors,
                 ),
-                add_factors,
+                _mm512_mul_ps(
+                    _mm512_set1_ps(terms.add_factor_scale),
+                    _mm512_sub_ps(add_factors, _mm512_set1_ps(terms.add_factor_offset)),
+                ),
             ),
             _mm512_set1_ps(terms.query_factor),
         );
@@ -281,7 +339,7 @@ mod x86 {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
     ) -> (u16, u16) {
@@ -306,12 +364,12 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
-    fn available_kernels() -> Vec<(&'static str, PruneMaskFn)> {
+    fn available_kernels() -> Vec<(&'static str, ScaledPruneMaskFn)> {
         // `mut` is only exercised on x86_64 where extra kernels may be pushed.
         #[allow(unused_mut)]
         let mut kernels = vec![
-            ("portable", prune_masks_portable as PruneMaskFn),
-            ("dispatched", prune_mask_kernel()),
+            ("portable", prune_masks_portable as ScaledPruneMaskFn),
+            ("dispatched", scaled_prune_mask_kernel()),
         ];
         #[cfg(target_arch = "x86_64")]
         {
@@ -332,7 +390,7 @@ mod tests {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
     ) -> (u16, u16) {
@@ -340,7 +398,7 @@ mod tests {
         let mut pruned_heap = 0u16;
         for lane in 0..PRUNE_LANES {
             let lower_bound = (dists[lane] - terms.half_sum_q) * scale_factors[lane]
-                + add_factors[lane]
+                + terms.add_factor_scale * (add_factors[lane] - terms.add_factor_offset)
                 + terms.query_factor
                 - error_factors[lane] * terms.query_error;
             if lower_bound >= upper_bound {
@@ -358,7 +416,7 @@ mod tests {
         scale_factors: &[f32; PRUNE_LANES],
         add_factors: &[f32; PRUNE_LANES],
         error_factors: &[f32; PRUNE_LANES],
-        terms: LowerBoundTerms,
+        terms: ScaledLowerBoundTerms,
         upper_bound: f32,
         heap_threshold: Option<f32>,
         case: &str,
@@ -389,6 +447,46 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    fn test_centered_dot_factor_keeps_constant(#[values(-1e8, 1e8)] add_factor_scale: f32) {
+        for (name, kernel) in available_kernels() {
+            let masks = kernel(
+                &[0.0; PRUNE_LANES],
+                &[0.0; PRUNE_LANES],
+                &[1.0; PRUNE_LANES],
+                &[0.0; PRUNE_LANES],
+                ScaledLowerBoundTerms {
+                    half_sum_q: 0.0,
+                    add_factor_scale,
+                    add_factor_offset: 1.0,
+                    query_factor: 1.0 - 6.4e-7,
+                    query_error: 0.0,
+                },
+                0.5,
+                Some(0.5),
+            );
+            assert_eq!(masks, (u16::MAX, 0), "kernel={name}");
+        }
+    }
+
+    #[test]
+    fn test_public_prune_kernel_keeps_unscaled_factors() {
+        let result = prune_mask_kernel()(
+            &[0.0; PRUNE_LANES],
+            &[0.0; PRUNE_LANES],
+            &[2.0; PRUNE_LANES],
+            &[0.0; PRUNE_LANES],
+            LowerBoundTerms {
+                half_sum_q: 0.0,
+                query_factor: 0.0,
+                query_error: 0.0,
+            },
+            3.0,
+            Some(1.0),
+        );
+        assert_eq!(result, (0, u16::MAX));
+    }
+
     #[test]
     fn test_prune_masks_match_reference_on_random_inputs() {
         let mut rng = SmallRng::seed_from_u64(42);
@@ -403,8 +501,10 @@ mod tests {
                 add_factors[lane] = rng.random_range(-10.0f32..10.0);
                 error_factors[lane] = rng.random_range(0.0f32..5.0);
             }
-            let terms = LowerBoundTerms {
+            let terms = ScaledLowerBoundTerms {
                 half_sum_q: rng.random_range(-50.0f32..50.0),
+                add_factor_scale: rng.random_range(-3.0f32..3.0),
+                add_factor_offset: rng.random_range(-1.0f32..1.0),
                 query_factor: rng.random_range(-10.0f32..10.0),
                 query_error: rng.random_range(0.0f32..2.0),
             };
@@ -435,8 +535,10 @@ mod tests {
         let scale_factors = [1.0f32; PRUNE_LANES];
         let add_factors = [0.0f32; PRUNE_LANES];
         let error_factors = [0.0f32; PRUNE_LANES];
-        let terms = LowerBoundTerms {
+        let terms = ScaledLowerBoundTerms {
             half_sum_q: 0.0,
+            add_factor_scale: 1.0,
+            add_factor_offset: 0.0,
             query_factor: 0.0,
             query_error: 1.0,
         };
@@ -488,8 +590,10 @@ mod tests {
         let add_factors = [0.0f32; PRUNE_LANES];
         let mut error_factors = [0.0f32; PRUNE_LANES];
         error_factors[5] = f32::INFINITY;
-        let terms = LowerBoundTerms {
+        let terms = ScaledLowerBoundTerms {
             half_sum_q: 0.0,
+            add_factor_scale: 1.0,
+            add_factor_offset: 0.0,
             query_factor: 0.0,
             query_error: 1.0,
         };

@@ -15,7 +15,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, SendableRecordBatchStream, streaming::PartitionStream},
 };
 use lance_arrow::SchemaExt;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
@@ -38,6 +38,7 @@ pub struct LanceTableProvider {
     full_schema: Arc<Schema>,
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
+    row_created_at_idx: Option<usize>,
     ordered: bool,
     blob_handling: Option<lance_core::datatypes::BlobHandling>,
     batch_size: Option<usize>,
@@ -71,6 +72,7 @@ impl LanceTableProvider {
             full_schema: Arc::new(full_schema),
             row_id_idx,
             row_addr_idx,
+            row_created_at_idx: None,
             ordered,
             blob_handling: None,
             batch_size: None,
@@ -94,9 +96,30 @@ impl LanceTableProvider {
         if self.row_addr_idx.is_some() {
             full_schema = full_schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
+        if let Some(idx) = self.row_created_at_idx {
+            full_schema.fields = full_schema
+                .fields
+                .iter()
+                .cloned()
+                .chain([self.full_schema.fields[idx].clone()])
+                .collect();
+        }
         self.full_schema = Arc::new(full_schema);
         self.blob_handling = Some(handling);
         self
+    }
+
+    /// Exposes the target rows' creation versions for rewrite operations that
+    /// carry their lineage into new fragments.
+    pub(crate) fn with_row_created_at_version(mut self) -> crate::Result<Self> {
+        if self.row_created_at_idx.is_none() {
+            let schema = self
+                .full_schema
+                .try_with_column(ROW_CREATED_AT_VERSION_FIELD.clone())?;
+            self.row_created_at_idx = Some(schema.fields.len() - 1);
+            self.full_schema = Arc::new(schema);
+        }
+        Ok(self)
     }
 
     /// Overrides the maximum number of rows produced by each dataset scan batch.
@@ -147,7 +170,24 @@ impl TableProvider for LanceTableProvider {
             scan.batch_size_bytes(batch_size_bytes);
         }
 
-        if let Some(projection) = projection {
+        if self.row_created_at_idx.is_some() {
+            // Project all system columns by name to preserve DataFusion's
+            // requested order. The legacy row-id/address setters move those
+            // columns to the end, past the creation versions appended here.
+            let columns = match projection {
+                Some(indices) => indices
+                    .iter()
+                    .map(|i| self.full_schema.field(*i).name())
+                    .collect::<Vec<_>>(),
+                None => self
+                    .full_schema
+                    .fields
+                    .iter()
+                    .map(|field| field.name())
+                    .collect(),
+            };
+            scan.project(&columns)?;
+        } else if let Some(projection) = projection {
             let mut columns = Vec::with_capacity(projection.len());
             for field_idx in projection {
                 if Some(*field_idx) == self.row_id_idx {
@@ -282,16 +322,74 @@ mod tests {
 
     use arrow::{
         array::AsArray,
-        datatypes::{Int32Type, Int64Type},
+        datatypes::{Int32Type, Int64Type, UInt64Type},
     };
+    use arrow_array::record_batch;
+    use datafusion::datasource::TableProvider;
+    use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
+    use lance_core::datatypes::BlobHandling;
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
     use lance_datagen::array;
+    use rstest::rstest;
 
     use crate::{
         datafusion::LanceTableProvider,
+        dataset::write::{InsertBuilder, WriteParams},
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
     };
+
+    #[rstest]
+    #[case::all(None)]
+    #[case::schema_order(Some(vec![0, 1, 2, 3]))]
+    #[case::permuted(Some(vec![3, 1, 0, 2]))]
+    #[case::lineage_only(Some(vec![1, 3]))]
+    #[tokio::test]
+    async fn table_provider_created_at_projection_preserves_order(
+        #[case] projection: Option<Vec<usize>>,
+    ) {
+        let batch = record_batch!(("key", UInt32, [10, 11])).unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 1,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let provider = LanceTableProvider::new(Arc::new(dataset), true, true)
+            .with_row_created_at_version()
+            .unwrap()
+            .with_blob_handling(BlobHandling::default());
+        let context = SessionContext::new();
+        let plan = provider
+            .scan(&context.state(), projection.as_ref(), &[], None)
+            .await
+            .unwrap();
+        let expected_schema = match &projection {
+            Some(projection) => provider.schema().project(projection).unwrap(),
+            None => provider.schema().as_ref().clone(),
+        };
+        assert_eq!(plan.schema().fields(), expected_schema.fields());
+        let batches = collect(plan, context.task_ctx()).await.unwrap();
+        let batch =
+            arrow_select::concat::concat_batches(&Arc::new(expected_schema), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        for (name, expected) in [
+            (ROW_ID, vec![0, 1]),
+            (ROW_ADDR, vec![0, 1_u64 << 32]),
+            (ROW_CREATED_AT_VERSION, vec![1, 1]),
+        ] {
+            if let Some(column) = batch.column_by_name(name) {
+                assert_eq!(
+                    column.as_primitive::<UInt64Type>().values().as_ref(),
+                    expected
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     pub async fn test_table_provider() {

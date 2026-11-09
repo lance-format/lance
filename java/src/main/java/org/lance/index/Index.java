@@ -18,7 +18,9 @@ import com.google.common.base.MoreObjects;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -39,7 +41,10 @@ public class Index {
   private final Instant createdAt;
   private final Integer baseId;
   private final Long sizeBytes;
+  private final List<IndexFile> files;
   private final IndexType indexType;
+  private final Long clusteringId;
+  private final Map<String, String> metadata;
 
   private Index(
       UUID uuid,
@@ -53,7 +58,15 @@ public class Index {
       Instant createdAt,
       Integer baseId,
       Long sizeBytes,
-      IndexType indexType) {
+      List<IndexFile> files,
+      IndexType indexType,
+      Long clusteringId,
+      Map<String, String> metadata) {
+    this.clusteringId = clusteringId;
+    this.metadata =
+        metadata == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(metadata));
     this.uuid = uuid;
     this.fields = fields;
     this.coveringFields = coveringFields;
@@ -64,7 +77,22 @@ public class Index {
     this.indexVersion = indexVersion;
     this.createdAt = createdAt;
     this.baseId = baseId;
-    this.sizeBytes = sizeBytes;
+    boolean hasFiles = files != null && !files.isEmpty();
+    if (hasFiles && sizeBytes == null) {
+      long derivedSizeBytes = 0;
+      try {
+        for (IndexFile file : files) {
+          derivedSizeBytes = Math.addExact(derivedSizeBytes, file.getSizeBytes());
+        }
+      } catch (ArithmeticException e) {
+        throw new IllegalArgumentException(
+            "index file sizes cannot be represented by Java long", e);
+      }
+      this.sizeBytes = derivedSizeBytes;
+    } else {
+      this.sizeBytes = !hasFiles && Long.valueOf(0).equals(sizeBytes) ? null : sizeBytes;
+    }
+    this.files = hasFiles ? files : null;
     this.indexType = indexType;
   }
 
@@ -136,6 +164,11 @@ public class Index {
     return Optional.ofNullable(sizeBytes);
   }
 
+  /** Files and sizes for this index segment, or empty when older writers did not record them. */
+  public Optional<List<IndexFile>> getFiles() {
+    return Optional.ofNullable(files);
+  }
+
   /**
    * Get the index version.
    *
@@ -163,6 +196,28 @@ public class Index {
     return indexType;
   }
 
+  /**
+   * The clustering definition this segment was built under, by its id in the manifest. Changes to
+   * the same segment keep it; a segment built from this one does not inherit it. The value is
+   * within the unsigned 32-bit range.
+   *
+   * @return the clustering definition id, or empty when the segment has none
+   */
+  public Optional<Long> clusteringId() {
+    return Optional.ofNullable(clusteringId);
+  }
+
+  /**
+   * Generic metadata attached to this segment, like the dataset's table metadata. Changes to the
+   * same segment preserve every entry, including keys this library does not understand; new
+   * segments carry only what their creator sets.
+   *
+   * @return the metadata, never null; empty when there is none
+   */
+  public Map<String, String> metadata() {
+    return metadata;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -179,7 +234,10 @@ public class Index {
         && Objects.equals(createdAt, index.createdAt)
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
-        && indexType == index.indexType;
+        && Objects.equals(files, index.files)
+        && indexType == index.indexType
+        && Objects.equals(clusteringId, index.clusteringId)
+        && Objects.equals(metadata, index.metadata);
   }
 
   @Override
@@ -195,8 +253,11 @@ public class Index {
             createdAt,
             baseId,
             sizeBytes,
+            files,
             fragments,
-            indexType);
+            indexType,
+            clusteringId,
+            metadata);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -214,6 +275,9 @@ public class Index {
         .add("createdAt", createdAt)
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
+        .add("files", files)
+        .add("clusteringId", clusteringId)
+        .add("metadata", metadata)
         .toString();
   }
 
@@ -239,7 +303,10 @@ public class Index {
     private Instant createdAt;
     private Integer baseId;
     private Long sizeBytes;
+    private List<IndexFile> files;
     private IndexType indexType;
+    private Long clusteringId;
+    private Map<String, String> metadata = Collections.emptyMap();
 
     private Builder() {}
 
@@ -298,8 +365,28 @@ public class Index {
       return this;
     }
 
+    public Builder files(List<IndexFile> files) {
+      this.files = files;
+      return this;
+    }
+
     public Builder indexType(IndexType indexType) {
       this.indexType = indexType;
+      return this;
+    }
+
+    /**
+     * The clustering definition id this segment was built under, or null for none. Must be within
+     * the unsigned 32-bit range.
+     */
+    public Builder clusteringId(Long clusteringId) {
+      this.clusteringId = clusteringId;
+      return this;
+    }
+
+    /** Generic metadata attached to this segment; null is treated as empty. */
+    public Builder metadata(Map<String, String> metadata) {
+      this.metadata = metadata;
       return this;
     }
 
@@ -316,7 +403,10 @@ public class Index {
           createdAt,
           baseId,
           sizeBytes,
-          indexType);
+          files,
+          indexType,
+          clusteringId,
+          metadata);
     }
   }
 }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerBuildParams;
 use arrow::array::PrimitiveBuilder;
+use arrow::compute::cast;
 use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::Float32Type};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
@@ -16,9 +17,11 @@ use lance_arrow::FixedSizeListArrayExt;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, L2, Normalize};
+use rayon::prelude::*;
 
 use super::ProductQuantizer;
 use super::utils::divide_to_subvectors;
+use super::validate_supplied_codebook;
 use crate::vector::kmeans::{KMeansParams, train_kmeans};
 
 /// Parameters for building product quantizer.
@@ -144,8 +147,9 @@ impl PQBuildParams {
         let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
+        // One independent k-means per sub-vector, run side by side.
         let d = sub_vectors
-            .into_iter()
+            .into_par_iter()
             .enumerate()
             .map(|(sub_vec_idx, sub_vec)| {
                 let params = KMeansParams::new(
@@ -194,6 +198,45 @@ impl PQBuildParams {
         ))
     }
 
+    /// f16 k-means is scalar and accumulates in half precision: train on a
+    /// widened copy of the training rows and store the codebook narrowed back.
+    fn build_from_f16(
+        &self,
+        fsl: &FixedSizeListArray,
+        distance_type: DistanceType,
+    ) -> Result<ProductQuantizer> {
+        let f32_list = DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+            fsl.value_length(),
+        );
+        let params = Self {
+            codebook: self
+                .codebook
+                .as_ref()
+                .map(|codebook| cast(codebook, &f32_list))
+                .transpose()?,
+            ..self.clone()
+        };
+        // The same leading rows `build_from_fsl` trains on (see
+        // `divide_to_subvectors`), so only the rows that are used get widened.
+        let training_rows = fsl.len().min(self.try_sample_size()?);
+        let training = cast(&fsl.slice(0, training_rows), &f32_list)?;
+        let pq =
+            params.build_from_fsl::<Float32Type>(training.as_fixed_size_list(), distance_type)?;
+        let codebook = cast(pq.codebook.values(), &DataType::Float16)?;
+        let codebook = FixedSizeListArray::try_new_from_values(
+            codebook.as_primitive::<Float16Type>().clone(),
+            pq.codebook.value_length(),
+        )?;
+        Ok(ProductQuantizer::new(
+            pq.num_sub_vectors,
+            pq.num_bits,
+            pq.dimension,
+            codebook,
+            pq.distance_type,
+        ))
+    }
+
     /// Build a [ProductQuantizer] from the given data.
     ///
     /// If the [`DistanceType`] is [`DistanceType::Cosine`], the input data will be normalized.
@@ -203,6 +246,25 @@ impl PQBuildParams {
             "PQ builder: input is not a FixedSizeList: {}",
             data.data_type()
         )))?;
+
+        if let Some(codebook) = self.codebook.as_ref() {
+            // build_from_fsl slices this buffer with offsets derived from the
+            // column dimension, so a size that disagrees with the column reads
+            // the sub-vector boundaries at the wrong offsets or slices out of
+            // bounds.
+            let codebook = codebook.as_fixed_size_list_opt().ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "PQ builder: codebook is not a FixedSizeList: {}",
+                    codebook.data_type()
+                ))
+            })?;
+            validate_supplied_codebook(
+                codebook.values().len(),
+                fsl.value_length() as usize,
+                self.num_sub_vectors,
+                self.num_bits,
+            )?;
+        }
 
         let num_centroids = self.num_centroids()?;
         if data.len() < num_centroids {
@@ -214,7 +276,7 @@ impl PQBuildParams {
 
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),
+            DataType::Float16 => self.build_from_f16(fsl, distance_type),
             DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
             DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
             _ => Err(Error::index(format!(
@@ -294,6 +356,69 @@ mod tests {
         );
     }
 
+    /// An f16 column is trained on a widened copy and gets an f16 codebook back:
+    /// the same values as training on the f32 copy and narrowing the result.
+    #[test]
+    fn test_build_f16_trains_widened_and_narrows_codebook() {
+        const N: usize = 1024;
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+        const SUB_DIM: usize = DIM / NUM_SUB_VECTORS;
+
+        let values = Float32Array::from_iter((0..N).flat_map(|row| {
+            let cluster = row % K;
+            (0..DIM).map(move |col| (cluster * 100 + col) as f32 + (row % 7) as f32 * 0.25)
+        }));
+        let f16_values = cast(&values, &DataType::Float16).unwrap();
+        let f16_data = FixedSizeListArray::try_new_from_values(
+            f16_values.as_primitive::<Float16Type>().clone(),
+            DIM as i32,
+        )
+        .unwrap();
+        let widened = cast(&f16_values, &DataType::Float32).unwrap();
+        let f32_data = FixedSizeListArray::try_new_from_values(
+            widened.as_primitive::<Float32Type>().clone(),
+            DIM as i32,
+        )
+        .unwrap();
+
+        let init_values: Vec<f32> = (0..NUM_SUB_VECTORS * K)
+            .flat_map(|i| (0..SUB_DIM).map(move |col| (i % K * 100 + col) as f32))
+            .collect();
+        let init_f32: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(init_values), DIM as i32)
+                .unwrap(),
+        );
+        let init_f16 = cast(
+            &init_f32,
+            &DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+        )
+        .unwrap();
+
+        let pq_f16 = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, init_f16)
+            .build(&f16_data, DistanceType::L2)
+            .unwrap();
+        let pq_f32 = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, init_f32)
+            .build(&f32_data, DistanceType::L2)
+            .unwrap();
+
+        assert_eq!(pq_f16.codebook.value_type(), DataType::Float16);
+        let narrowed = cast(pq_f32.codebook.values(), &DataType::Float16).unwrap();
+        assert_eq!(
+            pq_f16
+                .codebook
+                .values()
+                .as_primitive::<Float16Type>()
+                .values(),
+            narrowed.as_primitive::<Float16Type>().values()
+        );
+    }
+
     #[test]
     fn test_try_sample_size_rejects_overflow() {
         let mut params = PQBuildParams::new(2, 2);
@@ -336,5 +461,40 @@ mod tests {
         );
         assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    /// A supplied codebook is sliced with offsets derived from the column, so a
+    /// size that disagrees with the column used to pass through here: oversized
+    /// read the sub-vector boundaries at the wrong offsets and trained a garbage
+    /// quantizer, undersized sliced out of bounds and panicked.
+    #[test]
+    fn test_build_rejects_mismatched_codebook() {
+        const DIM: usize = 8;
+        const NUM_SUB_VECTORS: usize = 2;
+        const NUM_BITS: usize = 2;
+        const K: usize = 1 << NUM_BITS;
+
+        let values = Float32Array::from_iter((0..64 * DIM).map(|v| v as f32));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook = |num_centroids: usize| -> ArrayRef {
+            let values = Float32Array::from_iter((0..num_centroids * DIM).map(|v| v as f32));
+            Arc::new(FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap())
+        };
+
+        PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, codebook(K))
+            .build(&fsl, DistanceType::L2)
+            .expect("a codebook sized for the column must still be accepted");
+
+        for supplied in [K * 2, K / 2] {
+            let error = PQBuildParams::with_codebook(NUM_SUB_VECTORS, NUM_BITS, codebook(supplied))
+                .build(&fsl, DistanceType::L2)
+                .unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(&(supplied * DIM).to_string())
+                    && error.to_string().contains(&(K * DIM).to_string()),
+                "the error must give the supplied and the required size: {error}"
+            );
+        }
     }
 }

@@ -52,6 +52,7 @@ public class CompactionTask implements Serializable {
           compactionOptions.getTargetRowsPerFragment(),
           compactionOptions.getMaxRowsPerGroup(),
           compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMinBytesPerFile(),
           compactionOptions.getMaterializeDeletions(),
           compactionOptions.getMaterializeDeletionsThreshold(),
           compactionOptions.getNumThreads(),
@@ -62,7 +63,8 @@ public class CompactionTask implements Serializable {
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
-          compactionOptions.getExcludedFragmentIds());
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getDataStorageVersion());
     }
   }
 
@@ -73,6 +75,7 @@ public class CompactionTask implements Serializable {
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
+      Optional<Long> minBytesPerFile,
       Optional<Boolean> materializeDeletions,
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
@@ -83,7 +86,8 @@ public class CompactionTask implements Serializable {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;
