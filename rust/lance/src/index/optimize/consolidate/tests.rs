@@ -702,6 +702,50 @@ async fn a_selection_packs_its_output_and_splits_a_segment() {
 }
 
 #[tokio::test]
+async fn deleted_rows_do_not_count_toward_the_segment_limit() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let half = SMALL / 2;
+    dataset
+        .delete(&format!(
+            "(id >= {BASE} AND id < {}) OR (id >= {} AND id < {})",
+            BASE + half,
+            BASE + SMALL,
+            BASE + SMALL + half
+        ))
+        .await
+        .unwrap();
+    // Two fragments of SMALL physical rows hold SMALL live rows: one output.
+    let options = select(&[&old[1], &old[2]]).max_rows_per_segment(Some(SMALL as u64));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert_eq!(indexed_rows(&dataset, &new[1]).await, SMALL as u64);
+    assert_query(&dataset, BASE + SMALL).await;
+}
+
+#[tokio::test]
+async fn an_unsatisfiable_limit_is_rejected_before_training() {
+    let dir = TempStrDir::default();
+    let dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let index_dirs = || {
+        std::fs::read_dir(format!("{}/_indices", dir.as_str()))
+            .unwrap()
+            .count()
+    };
+    let before = index_dirs();
+    // The models differ, so a valid request would train one.
+    let options = select(&[&old[1], &old[2]]).max_rows_per_task(Some(1));
+    let error = plan_optimize_indices(&dataset, &options).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert_eq!(index_dirs(), before);
+}
+
+#[tokio::test]
 async fn a_selected_segment_already_removed_is_skipped() {
     let dir = TempStrDir::default();
     let mut dataset = fixture(&dir, false).await;

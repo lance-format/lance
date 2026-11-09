@@ -106,7 +106,8 @@ pub(super) async fn plan_index(
             segment_rows = segment_rows
                 .checked_add(count)
                 .ok_or_else(|| Error::invalid_input("consolidation physical row count overflow"))?;
-            fragment_rows.insert(fragment.id() as u32, count);
+            let live = count.saturating_sub(fragment.count_deletions().await? as u64);
+            fragment_rows.insert(fragment.id() as u32, (count, live));
             if segment_rows > budget - rows {
                 break;
             }
@@ -183,6 +184,25 @@ pub(super) async fn plan_index(
         });
         return Ok(());
     }
+    // A task reads physical rows and an output holds live ones, so deleted
+    // rows don't shrink outputs. Checked before training so an unsatisfiable
+    // request trains nothing.
+    let inputs = coverage
+        .iter()
+        .map(|id| (id, fragment_rows[&id]))
+        .collect::<Vec<_>>();
+    if inputs.iter().any(|(_, (physical, live))| {
+        options
+            .max_rows_per_task
+            .is_some_and(|limit| *physical > limit)
+            || options
+                .max_rows_per_segment
+                .is_some_and(|limit| *live > limit)
+    }) {
+        return Err(Error::invalid_input(
+            "a selected fragment exceeds max_rows_per_task or max_rows_per_segment; consolidation cannot split a fragment",
+        ));
+    }
     // Encoding rows under a model trained on other data loses recall, so a
     // selection whose models differ is retrained on its own rows. A shared
     // model is reused; re-encoding under it still drops deleted rows.
@@ -201,27 +221,18 @@ pub(super) async fn plan_index(
         )
         .await?
     };
-    let inputs = coverage
-        .iter()
-        .map(|id| (id, fragment_rows[&id]))
-        .collect::<Vec<_>>();
-    // A task's output is never split, so it holds no more than a segment may.
-    let task_limit = [options.max_rows_per_task, options.max_rows_per_segment]
-        .into_iter()
-        .flatten()
-        .min();
-    if let Some(limit) = task_limit
-        && inputs.iter().any(|(_, rows)| *rows > limit)
-    {
-        return Err(Error::invalid_input(
-            "a selected fragment exceeds max_rows_per_task or max_rows_per_segment; consolidation cannot split a fragment",
-        ));
-    }
     let replaces = selected
         .iter()
         .map(|segment| segment.uuid)
         .collect::<Vec<_>>();
-    let outputs = inputs.iter().map(|input| (*input, input.1)).collect();
+    let outputs = inputs
+        .iter()
+        .map(|&(id, (physical, live))| ((id, physical), live))
+        .collect();
+    let task_limit = [options.max_rows_per_task, options.max_rows_per_segment]
+        .into_iter()
+        .flatten()
+        .min();
     for output in pack_next_fit(outputs, options.max_rows_per_segment) {
         let group = plan.merges.len() as u32;
         for fragments in pack_next_fit(output, task_limit) {
