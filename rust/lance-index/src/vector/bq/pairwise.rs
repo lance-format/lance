@@ -1309,6 +1309,45 @@ mod tests {
         }
     }
 
+    /// `bind` relies on `simd = false` to keep dims past the i32 bound off
+    /// the SIMD kernels.
+    #[test]
+    fn test_select_without_simd_is_portable() {
+        fn portable<F: Copy>(dispatch: &Dispatch<F>) -> F {
+            dispatch
+                .candidates()
+                .last()
+                .unwrap()
+                .kernel()
+                .unwrap()
+                .as_fn()
+        }
+        assert!(std::ptr::fn_addr_eq(
+            select(&SIGN_DOTS, false).as_fn(),
+            portable(&SIGN_DOTS)
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            select(&SIGN_DOTS, true).as_fn(),
+            SIGN_DOTS.get().as_fn()
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            select(&U8_DOTS, false).as_fn(),
+            portable(&U8_DOTS)
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            select(&U8_DOTS, true).as_fn(),
+            U8_DOTS.get().as_fn()
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            select(&U16_DOTS, false).as_fn(),
+            portable(&U16_DOTS)
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            select(&U16_DOTS, true).as_fn(),
+            U16_DOTS.get().as_fn()
+        ));
+    }
+
     #[test]
     fn test_centered_fits_i32() {
         assert!(centered_fits_i32(33024, 8));
