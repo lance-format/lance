@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import random
 from pathlib import Path
 
 import lance
@@ -355,6 +356,58 @@ def write_multifragment_dataset(tmp_path):
         return dataset
 
     return write
+
+
+@pytest.mark.parametrize("max_takes", [1, 4, 9])
+@pytest.mark.parametrize(
+    "n,valid_every",
+    [(40, 1), (40, 2), (40, 3), (37, 1), (7, 1), (40, None), (0, 1)],
+    ids=[
+        "quota-met",
+        "exhausted-partial-batch",
+        "exhausted-sparse",
+        "quota-partial-batch",
+        "smaller-than-batch",
+        "no-matches",
+        "zero-requested",
+    ],
+)
+def test_maybe_sample_filtered(
+    write_multifragment_dataset, monkeypatch, max_takes, n, valid_every
+):
+    values = [
+        i if valid_every is not None and i % valid_every == 0 else None
+        for i in range(50)
+    ]
+    dataset = write_multifragment_dataset(
+        pa.table({"value": pa.array(values, type=pa.int64())}),
+        "filtered.lance",
+        max_rows_per_file=10,
+    )
+    monkeypatch.setattr("lance.sampler.random.shuffle", random.Random(0).shuffle)
+    batches = list(
+        maybe_sample(
+            dataset,
+            n,
+            ["value"],
+            batch_size=10,
+            max_takes=max_takes,
+            filt="value is not null",
+        )
+    )
+
+    eligible = {value for value in values if value is not None}
+    expected_count = min(n, len(eligible))
+    expected_batch_sizes = [10] * (expected_count // 10)
+    if expected_count % 10:
+        expected_batch_sizes.append(expected_count % 10)
+    assert all(isinstance(batch, pa.RecordBatch) for batch in batches)
+    assert [batch.num_rows for batch in batches] == expected_batch_sizes
+    sampled = [value for batch in batches for value in batch["value"].to_pylist()]
+    assert len(sampled) == len(set(sampled)) == expected_count
+    assert set(sampled) <= eligible
+    if len(eligible) <= n:
+        assert set(sampled) == eligible
 
 
 def _patch_small_torch_sampler(monkeypatch, max_takes):

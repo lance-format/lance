@@ -120,6 +120,9 @@ def _filtered_efficient_sample(
     target_takes: int,
     filter: str,
 ) -> Generator[pa.RecordBatch, None, None]:
+    if n == 0:
+        return
+
     total_records = len(dataset)
     shard_size = math.ceil(n / target_takes)
     num_shards = math.ceil(total_records / shard_size)
@@ -129,7 +132,7 @@ def _filtered_efficient_sample(
 
     tables = []
     remaining_rows = n
-    remaining_in_batch = min(batch_size, n)
+    buffered_rows = 0
     for shard in shards:
         start = shard * shard_size
         end = min(start + shard_size, total_records)
@@ -148,20 +151,24 @@ def _filtered_efficient_sample(
                 table = table.slice(0, remaining_rows)
             tables.append(table)
             remaining_rows -= table.num_rows
-            remaining_in_batch = remaining_in_batch - table.num_rows
-            if remaining_in_batch <= 0:
+            buffered_rows += table.num_rows
+            if buffered_rows >= batch_size:
                 combined = pa.concat_tables(tables).combine_chunks()
-                batch = combined.slice(0, batch_size).to_batches()[0]
-                yield batch
-                remaining_in_batch = min(batch_size, remaining_rows)
-                if len(combined) > batch_size:
-                    leftover = combined.slice(batch_size)
-                    tables = [leftover]
-                    remaining_in_batch -= len(leftover)
-                else:
-                    tables = []
+                full_batch_rows = buffered_rows // batch_size * batch_size
+                yield from combined.slice(0, full_batch_rows).to_batches(
+                    max_chunksize=batch_size
+                )
+                buffered_rows -= full_batch_rows
+                tables = [combined.slice(full_batch_rows)] if buffered_rows else []
             if remaining_rows <= 0:
                 break
+
+    if buffered_rows:
+        yield from (
+            pa.concat_tables(tables)
+            .combine_chunks()
+            .to_batches(max_chunksize=batch_size)
+        )
 
 
 def maybe_sample(
