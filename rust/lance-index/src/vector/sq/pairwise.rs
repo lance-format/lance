@@ -221,7 +221,9 @@ type DotFn =
     unsafe fn(anchor: &[u8], codes: &[u8], sums: &[u64], terms: &DotTerms, out: &mut [f32]);
 
 // Every candidate but the portable last one is batched: it needs the staged
-// code statistics and `dim <= MAX_BATCHED_DIM`.
+// code statistics and `dim <= MAX_BATCHED_DIM`. `SQ_L2` and `SQ_DOT` must list
+// candidates with the same features in the same order: one `batched` flag,
+// derived from `SQ_L2`, decides whether both get staged statistics.
 lance_core::dispatch! {
     static SQ_L2: Dispatch<L2Fn> = {
         #[cfg(target_arch = "x86_64")]
@@ -512,7 +514,7 @@ mod x86 {
         #[target_features("avx512f", "avx512bw", "avx512vnni")]
         #[candidate(pub(super) L2_AVX512_VNNI: L2Fn)]
         /// Squared L2 times `scale` of the anchor against every candidate row.
-        fn l2_distances(
+        fn l2_distances_avx512_vnni(
             anchor: &[u8],
             anchor_squares: u64,
             codes: &[u8],
@@ -560,7 +562,7 @@ mod x86 {
         #[target_features("avx512f", "avx512bw", "avx512vnni")]
         #[candidate(pub(super) DOT_AVX512_VNNI: DotFn)]
         /// Dot distances of the anchor against every candidate row.
-        fn dot_distances(
+        fn dot_distances_avx512_vnni(
             anchor: &[u8],
             codes: &[u8],
             sums: &[u64],
