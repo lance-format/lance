@@ -64,6 +64,7 @@ impl Scanner {
             physical_row_addr_prefilter: None,
             materialization_style: MaterializationStyle::Heuristic,
             filter: LanceFilter::default(),
+            planned_filter: Default::default(),
             full_text_query: None,
             minhash_query: None,
             batch_size: None,

@@ -403,7 +403,7 @@ pub enum QueryFilter {
 }
 
 /// Expr filter for filtering rows
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExprFilter {
     /// The filter is an SQL string
     Sql(String),
@@ -486,6 +486,33 @@ impl ExprFilter {
     }
 }
 
+/// The last expression filter a scanner or its clones converted, with its inputs.
+///
+/// Planning a scan converts the filter several times. Filterable schemas are
+/// cached per manifest and extra columns, so the identity of the one held here
+/// stands for both.
+#[derive(Default)]
+struct PlannedFilter(std::sync::Mutex<Option<(ExprFilter, SchemaRef, Expr)>>);
+
+impl PlannedFilter {
+    fn get_or_try_insert(
+        &self,
+        filter: &ExprFilter,
+        schema: &SchemaRef,
+        convert: impl FnOnce() -> Result<Expr>,
+    ) -> Result<Expr> {
+        if let Some((planned, planned_schema, expr)) = self.0.lock().unwrap().as_ref()
+            && planned == filter
+            && Arc::ptr_eq(planned_schema, schema)
+        {
+            return Ok(expr.clone());
+        }
+        let expr = convert()?;
+        *self.0.lock().unwrap() = Some((filter.clone(), schema.clone(), expr.clone()));
+        Ok(expr)
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -540,6 +567,8 @@ pub struct Scanner {
 
     /// Filter.
     filter: LanceFilter,
+
+    planned_filter: Arc<PlannedFilter>,
 
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,

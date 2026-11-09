@@ -58,8 +58,8 @@ use super::aggregate::AggregateExpr;
 use super::filterable_schema::FilterableSchema;
 use super::source::TakeOperation;
 use super::{
-    ColumnOrdering, DatasetRecordBatchStream, FilterPlan, MaterializationStyle, QueryFilter,
-    ScanRangePlan, Scanner, validate_batch_size,
+    ColumnOrdering, DatasetRecordBatchStream, ExprFilter, FilterPlan, MaterializationStyle,
+    QueryFilter, ScanRangePlan, Scanner, validate_batch_size,
 };
 
 impl Scanner {
@@ -78,14 +78,31 @@ impl Scanner {
     pub fn get_expr_filter(&self) -> Result<Option<Expr>> {
         if let Some(filter) = &self.filter.expr_filter {
             let filter_schema = self.filterable_schema()?;
-            Ok(Some(filter.to_datafusion_with_arrow(
-                self.dataset.schema(),
-                &filter_schema.schema,
-                filter_schema.arrow,
-            )?))
+            Ok(Some(self.convert_expr_filter(filter, &filter_schema)?))
         } else {
             Ok(None)
         }
+    }
+
+    /// Converts `filter` against `filter_schema`, reusing the last conversion
+    /// of the same filter against the same schema.
+    fn convert_expr_filter(
+        &self,
+        filter: &ExprFilter,
+        filter_schema: &FilterableSchema,
+    ) -> Result<Expr> {
+        let convert = || {
+            filter.to_datafusion_with_arrow(
+                self.dataset.schema(),
+                &filter_schema.schema,
+                filter_schema.arrow.clone(),
+            )
+        };
+        if matches!(filter, ExprFilter::Datafusion(_)) {
+            return convert();
+        }
+        self.planned_filter
+            .get_or_try_insert(filter, &filter_schema.arrow, convert)
     }
 
     fn extra_columns(
@@ -550,11 +567,7 @@ impl Scanner {
 
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
-            let expr = planner.optimize_expr(filter.to_datafusion_with_arrow(
-                self.dataset.schema(),
-                &filter_schema.schema,
-                filter_schema.arrow.clone(),
-            )?)?;
+            let expr = planner.optimize_expr(self.convert_expr_filter(filter, &filter_schema)?)?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
@@ -1889,5 +1902,43 @@ mod tests {
         let edited = Arc::new(dataset).scan().filterable_schema().unwrap().schema;
         assert!(!cached.metadata.contains_key("edited"));
         assert_eq!(edited.metadata["edited"], "yes");
+    }
+
+    #[tokio::test]
+    async fn test_expr_filter_conversion_is_reused_for_same_inputs() {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("a", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        let mut scan = dataset.scan();
+        scan.filter("a > 1").unwrap();
+        let converted = scan.get_expr_filter().unwrap().unwrap();
+
+        // A recorded conversion for the same filter and schema is returned as is.
+        let sentinel = datafusion::logical_expr::lit(true);
+        {
+            let mut planned = scan.planned_filter.0.lock().unwrap();
+            let (filter, _, expr) = planned.as_mut().unwrap();
+            assert_eq!(*filter, ExprFilter::Sql("a > 1".into()));
+            assert_eq!(*expr, converted);
+            *expr = sentinel.clone();
+        }
+        assert_eq!(scan.get_expr_filter().unwrap(), Some(sentinel.clone()));
+        // Clones share it.
+        assert_eq!(
+            scan.clone().get_expr_filter().unwrap(),
+            Some(sentinel.clone())
+        );
+
+        // A different filter is converted afresh.
+        scan.filter("a > 2").unwrap();
+        let other = scan.get_expr_filter().unwrap().unwrap();
+        assert_ne!(other, sentinel);
+        assert_ne!(other, converted);
+        scan.filter("a > 1").unwrap();
+        assert_eq!(scan.get_expr_filter().unwrap(), Some(converted));
     }
 }
