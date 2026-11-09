@@ -48,10 +48,10 @@ use lance_io::stream::RecordBatchStream;
 use tracing::instrument;
 
 use crate::datatypes::Schema;
-use crate::io::exec::filtered_read::filter_read_columns;
+use crate::io::exec::filtered_read::{FilteredReadExec, filter_read_columns};
 use crate::io::exec::knn::{QUERY_INDEX_COL, query_index_field};
 use crate::io::exec::{
-    AddRowOffsetExec, FilterPlan as ExprFilterPlan, Planner, get_physical_optimizer,
+    AddRowOffsetExec, FilterPlan as ExprFilterPlan, LanceScanExec, Planner, get_physical_optimizer,
 };
 use crate::{Error, Result};
 
@@ -1016,6 +1016,10 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
+        // Fold in measured widths before any rule reads statistics off the plan.
+        // Done here because resolving them is async and building a node is not.
+        plan = self.fold_in_measured_widths(plan).await;
+
         let optimizer = get_physical_optimizer();
         let mut options = ConfigOptions::default();
         options.execution.target_partitions = self
@@ -1059,6 +1063,63 @@ impl Scanner {
         }
 
         Ok(plan)
+    }
+
+    /// Replaces the Lance read nodes in `plan` with ones that know the widths
+    /// earlier scans measured for this dataset version.
+    async fn fold_in_measured_widths(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+
+        use crate::io::exec::column_width;
+
+        // Resolve against the fields the Lance nodes actually output: a width
+        // describes one Arrow layout, and a projection can give the same column a
+        // different one.
+        let mut fields: Vec<Arc<ArrowField>> = Vec::new();
+        plan.apply(|node| {
+            if node.downcast_ref::<LanceScanExec>().is_some()
+                || node.downcast_ref::<FilteredReadExec>().is_some()
+            {
+                fields.extend(node.schema().fields().iter().cloned());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .ok();
+        let measured = column_width::resolve(
+            &self.dataset.metadata_cache,
+            self.dataset.manifest().version,
+            self.dataset.manifest_location.e_tag.as_deref(),
+            fields.iter().map(|field| field.as_ref()),
+        )
+        .await;
+        if measured.is_empty() {
+            return plan;
+        }
+
+        let original = plan.clone();
+        plan.transform_up(|node| {
+            if let Some(scan) = node.downcast_ref::<LanceScanExec>() {
+                return Ok(Transformed::yes(Arc::new(
+                    scan.with_measured_widths(&measured),
+                )));
+            }
+            if let Some(read) = node.downcast_ref::<FilteredReadExec>() {
+                return Ok(Transformed::yes(Arc::new(
+                    read.with_measured_widths(&measured),
+                )));
+            }
+            // `TakeExec` is excluded on purpose: it carries payload columns it
+            // does not declare, so a width over its output schema under-reports.
+            // `test_take_statistics_suppress_a_carried_blob_payload` fails if it
+            // is ever added here.
+            Ok(Transformed::no(node))
+        })
+        .map(|transformed| transformed.data)
+        // The plan without the widths is still correct.
+        .unwrap_or(original)
     }
 
     // Check if a filter plan references version columns
@@ -1129,10 +1190,12 @@ mod tests {
 
     use arrow::datatypes::Int32Type;
     use arrow_schema::Fields;
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::LanceFileVersion;
 
     use crate::dataset::Dataset;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::scanner::test_dataset::{
         TestVectorDataset, assert_scan_slice_matches, batch_knn_two_queries, find_filtered_read,
     };
@@ -1386,5 +1449,346 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(eager_children, Some(vec!["count"]), "{schema:?}");
+    }
+
+    /// A rebuilt read keeps the width an earlier scan measured. `with_fetch` and
+    /// `with_new_children` both re-derive the node through `try_new`, which seeds
+    /// the width from the schema alone, so a limit pushed down would otherwise
+    /// hand back `Absent` despite a warm cache.
+    #[tokio::test]
+    async fn a_rebuilt_read_keeps_its_measured_width() {
+        use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::ExecutionPlan;
+        use futures::TryStreamExt;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        use crate::io::exec::filtered_read::FilteredReadExec;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let written = lance_datagen::gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(256),
+            )
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap();
+
+        // Warm the cache.
+        dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let plan = dataset.scan().create_plan().await.unwrap();
+        let read = find_read(plan.as_ref()).expect("a filtered read");
+        let before = StatisticsContext::new()
+            .compute(read, &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size;
+        assert!(
+            matches!(before, Precision::Inexact(n) if n > 0),
+            "the warm cache must give the read a width, got {before:?}"
+        );
+
+        let rebuilt = read
+            .with_fetch(Some(10))
+            .expect("the read accepts a pushed-down limit");
+        let after = StatisticsContext::new()
+            .compute(rebuilt.as_ref(), &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size;
+        assert!(
+            matches!(after, Precision::Inexact(n) if n > 0),
+            "a rebuilt read must keep the measured width, got {after:?}"
+        );
+
+        fn find_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec> {
+            if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+                return Some(read);
+            }
+            plan.children()
+                .into_iter()
+                .find_map(|child| find_read(child.as_ref()))
+        }
+    }
+
+    /// A filtered or row-selected read sees a subset of the rows, not the column.
+    /// If it publishes a width, the next full scan inherits it: here ten narrow
+    /// rows would speak for ninety 4 KB ones, under-reporting by two orders of
+    /// magnitude and inviting DataFusion to collect the larger side.
+    #[rstest::rstest]
+    #[case::sql_filter(|scan: &mut Scanner, _: &Dataset| {
+        scan.filter("id < 10").unwrap();
+    })]
+    #[case::physical_rows(|scan: &mut Scanner, dataset: &Dataset| {
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+        let start = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            fragment_id,
+            0,
+        ));
+        let end = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            fragment_id,
+            10,
+        ));
+        scan.with_physical_row_addr_prefilter(lance_select::RowAddrTreeMap::from_iter(start..end));
+    })]
+    #[tokio::test]
+    async fn a_restricted_read_does_not_publish_a_width_for_the_column(
+        #[case] restrict: fn(&mut Scanner, &Dataset),
+    ) {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use lance_core::utils::tempfile::TempStrDir;
+
+        let tmp = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false),
+        ]));
+        let wide = "x".repeat(4_096);
+        let names: Vec<&str> = (0..100)
+            .map(|i| if i < 10 { "a" } else { wide.as_str() })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap();
+        let actual = batch.get_array_memory_size();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let written = Dataset::write(
+            reader,
+            tmp.as_str(),
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 10,
+                max_rows_per_group: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap();
+
+        let full_plan_size = async || {
+            let plan = dataset.scan().create_plan().await.unwrap();
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .total_byte_size
+        };
+        let before = full_plan_size().await;
+
+        // Read only the ten narrow rows.
+        let mut restricted = dataset.scan();
+        restrict(&mut restricted, &dataset);
+        assert_eq!(restricted.try_into_batch().await.unwrap().num_rows(), 10);
+
+        assert_eq!(
+            full_plan_size().await,
+            before,
+            "a restricted read measured 10 narrow rows of a column whose 100 rows \
+             occupy {actual} bytes; publishing that as the column's width would \
+             under-report a later full scan by two orders of magnitude"
+        );
+    }
+
+    /// Asserts `Absent` before the measuring scan as well as a size after it: the
+    /// second half alone would pass against a post-pass that never ran.
+    #[tokio::test]
+    async fn a_plan_reports_a_byte_size_once_an_earlier_scan_measured_it() {
+        use datafusion::common::stats::Precision;
+        use futures::TryStreamExt;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let written = lance_datagen::gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(256),
+            )
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap();
+
+        let byte_size = async || {
+            let plan = dataset.scan().create_plan().await.unwrap();
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .total_byte_size
+        };
+
+        // Nothing has measured the string column yet, so it reports the decoder's
+        // seed: 64 bytes a value against the 1-5 these actually hold.
+        let Precision::Inexact(seeded) = byte_size().await else {
+            panic!("an unmeasured string column still reports the seed");
+        };
+
+        let scanned: usize = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert_eq!(scanned, 256, "fixture no longer emits what it claims");
+
+        let after = byte_size().await;
+        let Precision::Inexact(measured) = after else {
+            panic!("expected a measured byte size, got {after:?}");
+        };
+        assert!(measured > 0, "256 rows of text cannot cost nothing");
+        assert!(
+            measured < seeded,
+            "the measurement must replace the seed, not sit beside it: \
+             seeded={seeded}, measured={measured}"
+        );
+    }
+
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1. A long-lived session must not answer the new dataset's
+    /// version-1 lookups with the previous generation's measured width.
+    #[tokio::test]
+    async fn a_recreated_dataset_does_not_inherit_measured_widths() {
+        use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+        use futures::TryStreamExt;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        use crate::dataset::WriteParams;
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::io::exec::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str().to_string();
+        let first = lance_datagen::gen_batch()
+            .col("name", array::cycle_utf8_literals(&["a"]))
+            .into_dataset(&uri, FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        let session = first.session();
+        let narrow = DatasetBuilder::from_uri(&uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let narrow_schema: ArrowSchema = narrow.schema().into();
+        let name = narrow_schema.field_with_name("name").unwrap().clone();
+
+        narrow
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let narrow_width = column_width::resolve(
+            &narrow.metadata_cache,
+            narrow.version().version,
+            narrow.manifest_location.e_tag.as_deref(),
+            [&name].into_iter(),
+        )
+        .await
+        .get(&name)
+        .expect("the first scan must measure a width");
+        assert!(
+            narrow_width < 100.0,
+            "fixture stopped being narrow: {narrow_width} bytes per row"
+        );
+
+        std::fs::remove_dir_all(&uri).unwrap();
+        let wide_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+        let wide_value = "x".repeat(4_096);
+        let batch = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![wide_value.as_str(); 100]))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], wide_schema),
+            &uri,
+            Some(WriteParams {
+                enable_v2_manifest_paths: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let wide = DatasetBuilder::from_uri(&uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(wide.version().version, narrow.version().version);
+        assert_ne!(wide.manifest_location.e_tag, narrow.manifest_location.e_tag);
+        assert_eq!(
+            column_width::resolve(
+                &wide.metadata_cache,
+                wide.version().version,
+                wide.manifest_location.e_tag.as_deref(),
+                [&name].into_iter(),
+            )
+            .await
+            .get(&name),
+            None,
+            "the recreated generation must not inherit the old measured width"
+        );
+
+        wide.scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let wide_width = column_width::resolve(
+            &wide.metadata_cache,
+            wide.version().version,
+            wide.manifest_location.e_tag.as_deref(),
+            [&name].into_iter(),
+        )
+        .await
+        .get(&name)
+        .expect("the recreated dataset must measure its own width");
+        assert!(
+            wide_width > 1_000.0,
+            "the recreated dataset's 4 KB values must measure as wide, got {wide_width}"
+        );
     }
 }

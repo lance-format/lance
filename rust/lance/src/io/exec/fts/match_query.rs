@@ -43,6 +43,52 @@ use super::segments::{
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
+/// Indexed Match search with an explicit document boundary and candidate scope.
+///
+/// Codecs must preserve the resolved granularity independently of the logical
+/// query, as well as the kind of segment selection, masks and scoring override.
+/// The example reuses value objects and child plans; a transport codec supplies
+/// their decoded equivalents from the same pinned dataset snapshot.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{io::exec::fts::MatchQueryExec, Error, Result};
+/// # use lance_index::scalar::inverted::PreparedBm25Query;
+/// # fn rebuild(exec: &MatchQueryExec) -> Result<MatchQueryExec> {
+/// if exec.has_shared_scorer() {
+///     return Err(Error::invalid_input("reconstruct the enclosing corpus owner"));
+/// }
+/// let mut rebuilt = if let Some(segments) = exec.preset_segments() {
+///     MatchQueryExec::new_with_segments_and_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), segments.to_vec(), exec.document_granularity(),
+///     )
+/// } else if let Some(uuids) = exec.explicit_segment_uuids() {
+///     MatchQueryExec::new_with_segment_uuids_and_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), uuids, exec.document_granularity(),
+///     )
+/// } else {
+///     MatchQueryExec::new_with_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), exec.document_granularity(),
+///     )
+/// }.with_external_mask(exec.external_mask().cloned());
+/// if let Some(mask) = exec.overlay_block() {
+///     rebuilt = rebuilt.with_overlay_block(mask.clone());
+/// }
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// if let Some(prepared) = exec.prepared_query() {
+///     rebuilt = rebuilt.with_prepared_query(Arc::new(PreparedBm25Query::from_parts(
+///         prepared.tokens().clone(), prepared.scorer().clone(),
+///         prepared.has_all_query_positions(),
+///     )));
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct MatchQueryExec {
     dataset: Arc<Dataset>,
@@ -241,6 +287,30 @@ impl MatchQueryExec {
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::invalid_input("MatchQuery document granularity must be resolved".to_string())
         })?;
+        Ok(Self::new_with_segment_uuids_and_document_granularity(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            segment_uuids,
+            document_granularity,
+        ))
+    }
+
+    /// Bind an exact ordered UUID selection with an already resolved document
+    /// granularity, retaining the logical query unchanged.
+    ///
+    /// This supports reconstruction when the logical query leaves granularity
+    /// unset. UUID resolution remains deferred until execution, with the same
+    /// validation as [`Self::new_with_segment_uuids`]. See [`Self`] for an example.
+    pub fn new_with_segment_uuids_and_document_granularity(
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+        document_granularity: DocumentGranularity,
+    ) -> Self {
         let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -249,7 +319,7 @@ impl MatchQueryExec {
             Boundedness::Bounded,
         ));
         let params = Self::effective_params(&query, params);
-        Ok(Self {
+        Self {
             dataset,
             query,
             tokenized_query: Arc::new(OnceLock::new()),
@@ -265,7 +335,7 @@ impl MatchQueryExec {
             schema,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-        })
+        }
     }
 
     /// Override the BM25 scorer used by `execute()`. When set, the local
@@ -295,7 +365,6 @@ impl MatchQueryExec {
     /// Distributed fuzzy callers must use this instead of
     /// [`Self::with_base_scorer`], because worker-local expansion can select a
     /// different capped vocabulary from the one used to build the scorer.
-    #[doc(hidden)]
     pub fn with_prepared_query(mut self, query: Arc<PreparedBm25Query>) -> Self {
         self.prepared_query = Some(query);
         self.base_scorer = None;
@@ -305,6 +374,18 @@ impl MatchQueryExec {
     pub(crate) fn with_shared_scorer(mut self, scorer: Arc<SharedFtsScorer>) -> Self {
         self.shared_scorer = Some(scorer);
         self
+    }
+
+    /// Whether reconstruction must reconnect this leaf to its enclosing corpus
+    /// owner. Process-local scorer coordination is not exported.
+    pub fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
+    }
+
+    /// Resolved document boundary, which may differ from an unset logical query
+    /// option. See [`Self`] for reconstruction preserving this distinction.
+    pub fn document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
     }
 
     pub(super) fn uses_shared_scorer(&self, scorer: &Arc<SharedFtsScorer>) -> bool {
@@ -337,7 +418,9 @@ impl MatchQueryExec {
     }
 
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
-    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+    /// The mask uses the index's row-id domain, including stable row IDs when
+    /// enabled. Preserve it separately from the candidate prefilter.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
         self
     }
@@ -369,6 +452,24 @@ impl MatchQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    /// Overlay exclusion in the index's row-id domain; `None` adds no exclusion.
+    pub fn overlay_block(&self) -> Option<&RowAddrMask> {
+        self.overlay_block.as_ref()
+    }
+
+    /// Additional candidate restriction in the index's row-id domain, or `None`.
+    /// This mask does not narrow the statistics corpus.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
+    /// Canonical vocabulary/scorer override, or `None` for native preparation.
+    /// Reconstruct its values with [`PreparedBm25Query::from_parts`], preserving
+    /// token groups and completeness while discarding local dictionary caches.
+    pub fn prepared_query(&self) -> Option<&Arc<PreparedBm25Query>> {
+        self.prepared_query.as_ref()
     }
 
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {

@@ -131,3 +131,130 @@ async fn test_indexed_merge_insert_overlay_staleness(
         1
     );
 }
+
+/// Stale writers must detect an overlapping insert regardless of which
+/// writer uses the scalar index, then re-run the merge if retries are enabled.
+#[rstest::rstest]
+#[case::single_key(false, false)]
+#[case::composite_key(true, false)]
+#[case::partial_source(false, true)]
+#[case::partial_composite_source(true, true)]
+#[tokio::test]
+async fn test_concurrent_insert_same_new_key(
+    #[case] is_composite: bool,
+    #[case] is_partial: bool,
+    #[values(false, true)] first_uses_index: bool,
+    #[values(false, true)] second_uses_index: bool,
+    #[values(0, 1)] conflict_retries: u32,
+) {
+    let key_metadata = HashMap::from([(
+        "lance-schema:unenforced-primary-key".to_string(),
+        "true".to_string(),
+    )]);
+    let mut fields = vec![
+        Field::new("id", DataType::UInt32, false).with_metadata(key_metadata.clone()),
+        Field::new("value", DataType::UInt32, false),
+        Field::new("extra", DataType::UInt32, true),
+    ];
+    let mut on = vec!["id".to_string()];
+    if is_composite {
+        fields.push(Field::new("key2", DataType::UInt32, false).with_metadata(key_metadata));
+        on.push("key2".to_string());
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let make_batch = |ids: Vec<u32>, value: u32| {
+        let len = ids.len();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt32Array::from(ids)),
+            Arc::new(UInt32Array::from(vec![value; len])),
+            Arc::new(UInt32Array::from(vec![None; len])),
+        ];
+        if is_composite {
+            columns.push(Arc::new(UInt32Array::from(vec![7; len])));
+        }
+        RecordBatch::try_new(schema.clone(), columns).unwrap()
+    };
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        })
+        .execute(vec![make_batch(vec![0, 1, 2, 3], 0)])
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    for key in &on {
+        dataset
+            .create_index(
+                &[key.as_str()],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let dataset = Arc::new(dataset);
+    let source_batch = |value| {
+        let batch = make_batch(vec![100], value);
+        if is_partial {
+            let columns = if is_composite {
+                vec![1, 3, 0]
+            } else {
+                vec![1, 0]
+            };
+            batch.project(&columns).unwrap()
+        } else {
+            batch
+        }
+    };
+    let build_job = |use_index, retries| {
+        MergeInsertBuilder::try_new(dataset.clone(), on.clone())
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
+            .conflict_retries(retries)
+            .try_build()
+            .unwrap()
+    };
+
+    // Both jobs read the same version, making the conflict deterministic.
+    let b1 = build_job(first_uses_index, 0);
+    let b2 = build_job(second_uses_index, conflict_retries);
+    assert_eq!(
+        b1.can_use_create_plan(source_batch(1).schema().as_ref())
+            .await
+            .unwrap(),
+        !first_uses_index,
+    );
+    assert_eq!(
+        b2.can_use_create_plan(source_batch(2).schema().as_ref())
+            .await
+            .unwrap(),
+        !second_uses_index,
+    );
+    let (_, stats) = b1.execute_batches(vec![source_batch(1)]).await.unwrap();
+    assert_eq!(stats.num_inserted_rows, 1);
+    let result = b2.execute_batches(vec![source_batch(2)]).await;
+    if conflict_retries == 0 {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::TooMuchWriteContention { .. }));
+        assert!(error.to_string().contains("Attempted 0 retries"));
+    } else {
+        let (dataset, stats) = result.unwrap();
+        assert_eq!(stats.num_attempts, 2);
+        assert_eq!(stats.num_inserted_rows, 0);
+        assert_eq!(stats.num_updated_rows, 1);
+        let found = dataset
+            .scan()
+            .filter("id = 100")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(found.num_rows(), 1);
+        assert_eq!(found["value"].as_primitive::<UInt32Type>().value(0), 2);
+    }
+}

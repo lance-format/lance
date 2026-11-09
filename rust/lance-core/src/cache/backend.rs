@@ -40,7 +40,10 @@ use futures::Future;
 use crate::Result;
 use crate::deepsize::Context;
 
-use super::{CacheCodec, InternalCacheKey};
+use super::{
+    CacheBackendDiagnostics, CacheCodec, CacheLoadOutcome, CacheOccupancyByType,
+    CacheOperationContext, CacheSnapshotMode, InternalCacheKey,
+};
 
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
@@ -59,6 +62,17 @@ pub enum CacheTier {
     Absent,
 }
 
+/// A cache read that can finish without allocating or polling a future.
+pub enum ImmediateCacheRead {
+    /// The complete result of a read, including a definitive cache miss.
+    Ready(Option<CacheEntry>),
+    /// The caller must use [`CacheBackend::get`] to finish the read.
+    Deferred,
+}
+
+/// Boxed loader accepted by cache backends.
+pub type CacheLoader<'a> = Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>;
+
 /// Low-level pluggable cache backend.
 ///
 /// Implementations store entries keyed by [`InternalCacheKey`] and return
@@ -67,6 +81,43 @@ pub enum CacheTier {
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Complete a read synchronously when the backend supports it.
+    ///
+    /// A ready result must have the same access/priority accounting as
+    /// [`get`](Self::get). Return `Deferred` if reading a lower tier or any
+    /// asynchronous work may be necessary; `Ready(None)` is a final miss.
+    /// The default preserves the asynchronous path for existing backends.
+    ///
+    /// ```
+    /// # use lance_core::cache::{CacheBackend, CacheEntry, ImmediateCacheRead, InternalCacheKey};
+    /// # async fn read(backend: &dyn CacheBackend, key: &InternalCacheKey) -> Option<CacheEntry> {
+    /// match backend.get_immediate(key, None) {
+    ///     ImmediateCacheRead::Ready(value) => value,
+    ///     ImmediateCacheRead::Deferred => backend.get(key, None).await,
+    /// }
+    /// # }
+    /// ```
+    fn get_immediate(
+        &self,
+        _key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+    ) -> ImmediateCacheRead {
+        ImmediateCacheRead::Deferred
+    }
+
+    /// Whether this backend consumes the entry sizes passed to
+    /// [`insert`](Self::insert) and [`get_or_insert`](Self::get_or_insert)
+    /// for eviction accounting. Backends that drop entries without
+    /// accounting (e.g. a zero-capacity cache) return `false` so loaders can
+    /// skip the deep-size traversal.
+    ///
+    /// Returning `false` also gives up per-entry size reporting, since the
+    /// traversal that registers a type's deep-size accessor is what gets
+    /// skipped. Only return `false` from a backend that retains nothing.
+    fn uses_entry_sizes(&self) -> bool {
+        true
+    }
+
     /// Look up RAM only, without reading or promoting a persistent entry.
     /// Backends without a resident lookup return a miss safely.
     async fn get_resident(&self, _key: &InternalCacheKey) -> Option<CacheEntry> {
@@ -134,6 +185,19 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// at which point the `Option` will be removed.
     async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry>;
 
+    /// Context-aware lookup used by typed cache wrappers.
+    ///
+    /// The compatibility default delegates to [`get`](Self::get). Override it
+    /// only when the backend needs the stable type identity during lookup.
+    async fn get_with_context(
+        &self,
+        key: &InternalCacheKey,
+        codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) -> Option<CacheEntry> {
+        self.get(key, codec).await
+    }
+
     /// Store an entry. `size_bytes` is used for eviction accounting.
     ///
     /// See [`get`](Self::get) for codec semantics.
@@ -144,6 +208,20 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         size_bytes: usize,
         codec: Option<CacheCodec>,
     );
+
+    /// Context-aware insertion used by typed cache wrappers.
+    ///
+    /// The compatibility default delegates to [`insert`](Self::insert).
+    async fn insert_with_context(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) {
+        self.insert(key, entry, size_bytes, codec).await;
+    }
 
     /// Get an existing entry or compute it from `loader`.
     ///
@@ -158,7 +236,7 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     async fn get_or_insert<'a>(
         &self,
         key: &InternalCacheKey,
-        loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
+        loader: CacheLoader<'a>,
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
@@ -168,6 +246,45 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Admission never guarantees that an entry will remain cached.
     fn max_entry_bytes(&self) -> Option<u64> {
         self.capacity_bytes().map(|bytes| bytes as u64)
+    }
+
+    /// Context-aware get-or-load used by typed cache wrappers.
+    ///
+    /// The compatibility default delegates to
+    /// [`get_or_insert`](Self::get_or_insert).
+    async fn get_or_insert_with_context<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) -> Result<(CacheEntry, bool)> {
+        self.get_or_insert(key, loader, codec).await
+    }
+
+    /// Outcome-aware get-or-load used by typed cache wrappers.
+    ///
+    /// The compatibility default preserves custom backends and reports a
+    /// skipped loader as [`CacheLoadOutcome::LoaderSkippedUnknown`]. Backends
+    /// should override this only when their synchronization primitive can
+    /// positively distinguish resident and shared results.
+    async fn get_or_insert_with_context_outcome<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: CacheLoader<'a>,
+        codec: Option<CacheCodec>,
+        context: CacheOperationContext,
+    ) -> Result<(CacheEntry, CacheLoadOutcome)> {
+        self.get_or_insert_with_context(key, loader, codec, context)
+            .await
+            .map(|(entry, was_cached)| {
+                let outcome = if was_cached {
+                    CacheLoadOutcome::LoaderSkippedUnknown
+                } else {
+                    CacheLoadOutcome::Loaded
+                };
+                (entry, outcome)
+            })
     }
 
     /// Remove all entries.
@@ -200,6 +317,43 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// could never be retained.
     fn capacity_bytes(&self) -> Option<usize> {
         None
+    }
+
+    /// Cheap diagnostics, with conservative absence for unsupported accounting.
+    /// Override this to advertise cheap occupancy and lifecycle measurements.
+    /// Custom backends implementing only the original trait remain supported.
+    fn diagnostics(&self) -> CacheBackendDiagnostics {
+        let capacity_bytes = self.capacity_bytes().map(|capacity| capacity as u64);
+        CacheBackendDiagnostics {
+            capacity_bytes,
+            enabled: capacity_bytes.map(|capacity| capacity > 0),
+            ..Default::default()
+        }
+    }
+
+    /// Request maintenance when collecting a refreshed snapshot. This does not
+    /// prevent concurrent writes or make the returned fields atomic.
+    async fn diagnostics_with_mode(&self, mode: CacheSnapshotMode) -> CacheBackendDiagnostics {
+        if mode == CacheSnapshotMode::Approximate {
+            return self.diagnostics();
+        }
+        let num_entries = self.num_entries().await as u64;
+        let size_bytes = self.size_bytes().await as u64;
+        let mut snapshot = self.diagnostics();
+        snapshot.num_entries = Some(num_entries);
+        snapshot.size_bytes = Some(size_bytes);
+        snapshot
+    }
+
+    /// Collect aggregate diagnostics and optional per-type occupancy.
+    ///
+    /// The compatibility default keeps custom backends source-compatible and
+    /// reports per-type occupancy as unavailable.
+    async fn diagnostics_with_types(
+        &self,
+        mode: CacheSnapshotMode,
+    ) -> (CacheBackendDiagnostics, Option<CacheOccupancyByType>) {
+        (self.diagnostics_with_mode(mode).await, None)
     }
 
     /// Computes the size of the entries currently held in memory.

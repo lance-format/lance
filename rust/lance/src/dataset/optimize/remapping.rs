@@ -335,7 +335,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result = index::remap_index(
+    let remap_result = index::remap::remap_index(
         dataset,
         index_id,
         &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
@@ -363,7 +363,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let new_index_meta = match remap_result {
         // Nothing to commit: either the composed remap emptied the index (every
         // row deleted), matching the prior per-version behavior, or
-        // `index::remap_index` withdrew a covered index it cannot carry payload
+        // `index::remap::remap_index` withdrew a covered index it cannot carry payload
         // through. Either way the existing entry is left untouched.
         //
         // The withdrawal case is unreachable here today: the only caller is
@@ -932,12 +932,35 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             );
             return Ok(());
         }
+        // Not a verdict about the segment: the store could not be read. The
+        // caller named this index, so it hears that nothing was remapped and
+        // can retry, rather than a success log for a remap that did nothing.
+        Some(reason @ MissingCoverageReason::Unverifiable) => {
+            return Err(Error::index(format!(
+                "could not classify index {} (segment {}) for remapping: {reason}. \
+                 Its format marker could not be read; retry once the index files \
+                 are readable",
+                curr_index_meta.name, curr_index_meta.uuid
+            )));
+        }
         Some(MissingCoverageReason::Corrupt) => {
             return Err(Error::index(format!(
                 "index {} ({}) has metadata this build cannot interpret; rebuild the index",
                 curr_index_meta.name, curr_index_meta.uuid
             )));
         }
+    }
+    // Runs after the segment's own probe above, which only reports an
+    // unreadable marker for the segment it visits. Without this, a readable
+    // older segment would be replaced while an unreadable newer sibling of the
+    // same logical index is still unaccounted for.
+    let listing = dataset.derived_index_listing().await?;
+    if listing.unverifiable.contains(&curr_index_meta.name) {
+        return Err(Error::index(format!(
+            "could not verify the coverage of index {} (segment {}): a segment's index \
+             file could not be read; retry once the index files are readable",
+            curr_index_meta.name, curr_index_meta.uuid
+        )));
     }
     let Some(stored_bitmap) = curr_index_meta.fragment_bitmap.clone() else {
         log::warn!(
@@ -993,12 +1016,10 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // actually holds those rows. (For types that stream raw pages, e.g.
         // BTree, the rows the reader cedes are dropped by the translator's
         // claim filter below, so file and bitmap agree.)
-        use crate::index::DatasetIndexExt;
-        if let Some(listed) = dataset
-            .load_indices()
-            .await?
-            .iter()
-            .find(|idx| idx.uuid == *index_id)
+        // The narrowing reads the same listing the guard above verified, so a
+        // read outage between the two steps cannot change the published
+        // ownership.
+        if let Some(listed) = listing.indices.iter().find(|idx| idx.uuid == *index_id)
             && let Some(servable) = &listed.fragment_bitmap
         {
             coverage &= servable;
@@ -1028,7 +1049,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // is dropped.
         let translator =
             materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
-        match index::remap_index(dataset, index_id, &translator, None).await {
+        match index::remap::remap_index(dataset, index_id, &translator, None).await {
             Ok(result) => result,
             // The index only knows the legacy in-memory remap and this build
             // cannot prepare a complete mapping for it within budget: not an
@@ -1154,12 +1175,12 @@ pub async fn remap_column_index(
     // re-reads the manifest by uuid, so the uuids taken here stay valid.
     // Tagged tables resolve from the stored list: the query listing may
     // exclude a straddled segment that maintenance must still reach.
-    let tagged = crate::index::load_all_indices(dataset)
+    let tagged = crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0);
     let segments: Vec<IndexMetadata> = if tagged {
-        crate::index::load_all_indices_by_name(dataset, &index_name).await?
+        crate::index::loading::load_all_indices_by_name(dataset, &index_name).await?
     } else {
         dataset
             .load_indices()
@@ -1178,7 +1199,7 @@ pub async fn remap_column_index(
     for index in &segments {
         // The real question is "does this index belong to this column",
         // i.e. its one keyed field is `field.id`. Carried fields are
-        // irrelevant here, same as in `index::remap_index`.
+        // irrelevant here, same as in `index::remap::remap_index`.
         if index.keyed_field() != Some(field.id) {
             return Err(Error::index(format!(
                 "Index name {} already exists with fields {:?} (carried fields {:?}); \
@@ -1214,8 +1235,8 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::DatasetIndexInternalExt;
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    use crate::index::loading::DatasetIndexInternalExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
     use lance_core::utils::tempfile::TempStrDir;
@@ -2008,7 +2029,7 @@ mod tests {
         /// returns for `i = value`, read straight from its files (no
         /// planner, no bitmap filter): what the remapped file holds.
         async fn segment_fragments_for(dataset: &Dataset, value: i32) -> Vec<u32> {
-            use crate::index::DatasetIndexInternalExt;
+            use crate::index::loading::DatasetIndexInternalExt;
             use lance_index::metrics::NoOpMetricsCollector;
             use lance_index::scalar::{SargableQuery, SearchResult};
             let segment = stored_index(dataset, "i_idx").await;
@@ -3567,7 +3588,7 @@ mod tests {
         /// The bitmap of `name` as `load_all_indices` serves it: on a v0
         /// table the bitmap a deferred compaction swapped in memory.
         async fn loaded_bitmap(dataset: &Dataset, name: &str) -> RoaringBitmap {
-            crate::index::load_all_indices(dataset)
+            crate::index::loading::load_all_indices(dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -5006,7 +5027,7 @@ mod tests {
     /// that covers nothing with no indication why.
     ///
     /// Asserting on committed metadata here would prove nothing: the flow is
-    /// `remap_column_index` -> the private `remap_index` -> `index::remap_index`,
+    /// `remap_column_index` -> the private `remap_index` -> `index::remap::remap_index`,
     /// which withdraws a covered index before the fully-deleted `Keep` check, and
     /// the `Drop` arm returns without committing. The `Keep`/`Remapped` arms are
     /// therefore unreachable for a covered index, so a "declaration preserved"
@@ -5130,7 +5151,7 @@ mod tests {
         let cloned_index = clone.load_index_by_name("i_idx").await.unwrap().unwrap();
         assert!(cloned_index.base_id.is_some());
 
-        // Dropping every indexed row makes `index::remap_index` return `Keep`.
+        // Dropping every indexed row makes `index::remap::remap_index` return `Keep`.
         let mut no_survivors = Vec::new();
         RoaringTreemap::new()
             .serialize_into(&mut no_survivors)

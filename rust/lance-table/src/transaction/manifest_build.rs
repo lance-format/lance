@@ -32,8 +32,7 @@ use crate::format::{
     overlay::DataOverlayFile,
 };
 use crate::format::{
-    apply_complete_clustering_definitions, merge_clustering_definitions,
-    refuse_key_fields_that_changed_identity,
+    apply_complete_clustering_definitions, refuse_key_fields_that_changed_identity,
 };
 use crate::io::{
     commit::CommitHandler,
@@ -255,19 +254,18 @@ impl Transaction {
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // So are clustering ids: rewinding would hand an old id to a new definition
         // while objects on other versions still mean the old one by it. The
-        // restored objects reference the historical definitions; the current ones
-        // are kept too, so every id this lineage has handed out stays defined.
+        // definitions themselves are the target's: a restore brings back that
+        // snapshot's definitions, specs, fragments and index segments as they
+        // were. A detached restore can use a handle older than the target,
+        // so neither counter alone necessarily covers the other's history.
+        // Keep their maximum; a mark above every present definition is the
+        // normal state after a restore and is never read as a selection.
         manifest.max_clustering_id = manifest
             .max_clustering_id
             .max(current_manifest.max_clustering_id);
-        merge_clustering_definitions(&mut manifest.clustering, &current_manifest.clustering)
-            .map_err(|error| {
-                Error::invalid_input(format!("Cannot restore version {version}: {error}"))
-            })?;
         // A restore republishes objects that already existed, so their labels
         // are not new writes: an old label may outlive its definition and must
-        // not make the restore fail. The definition set itself is still merged
-        // and checked above.
+        // not make the restore fail.
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
@@ -627,19 +625,44 @@ impl Transaction {
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
-                        frag_reuse_ledger,
+                        frag_reuse_ledger.clone(),
                     )?;
-                let live: RoaringBitmap = manifest
-                    .fragments
-                    .iter()
-                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
-                    .collect();
+                let live = Self::live_fragment_bitmap(manifest);
                 Self::withdraw_in_place_rewrites(
                     &mut prepared,
                     rewrites,
                     &manifest.schema,
                     &live,
                     lineage.as_ref(),
+                );
+            }
+            // A deferred compaction leaves every covering segment's retired
+            // provenance in place for the reader to translate through the
+            // history. A segment whose type cannot do that would be left
+            // addressing provenance it can never translate, so its coverage
+            // of this compaction's sources is withdrawn in this same commit;
+            // the commit layer, which can read the index details, decided
+            // which segments those are.
+            if let FragReuseUpdate::Rewrite(assembly) = &frag_reuse
+                && !assembly.undeferrable_segments.is_empty()
+            {
+                let lineage =
+                    crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
+                        &current_indices,
+                        frag_reuse_ledger,
+                    )?;
+                let live = Self::live_fragment_bitmap(manifest);
+                let rewritten: RoaringBitmap = self
+                    .operation
+                    .rewritten_source_fragments()
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .collect();
+                Self::withdraw_undeferrable_rewrite_coverage(
+                    &mut prepared,
+                    lineage.as_ref(),
+                    &live,
+                    &assembly.undeferrable_segments,
+                    &rewritten,
                 );
             }
         }
@@ -649,6 +672,15 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// The fragment ids `manifest` lists, as a bitmap.
+    fn live_fragment_bitmap(manifest: &Manifest) -> RoaringBitmap {
+        manifest
+            .fragments
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .collect()
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -1615,9 +1647,10 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path / size / base to the fragment
+                            // assign the new file path / size / metadata size / base to the fragment
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
+                            file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
                             file.base_id = new_file.base_id;
                             replaced_in_place = true;
                         }
@@ -1893,7 +1926,11 @@ impl Transaction {
         final_fragments.sort_by_key(|frag| frag.id);
 
         // Clean up data files that only contain tombstoned fields
-        Self::remove_tombstoned_data_files(&mut final_fragments);
+        let cleaned_fragment_ids = Self::remove_tombstoned_data_files(&mut final_fragments);
+        let changed_fragment_ids = self.changed_fragment_ids().map(|mut ids| {
+            ids.extend(cleaned_fragment_ids);
+            ids
+        });
 
         // Enforce the newest-last overlay ordering invariant at the write
         // boundary. Load normalizes with a sort; this rejects any commit path
@@ -1979,6 +2016,11 @@ impl Transaction {
             // So we always use new_from_previous which preserves base_paths
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            // A later `Arc::make_mut` of the fragment list (range segment
+            // re-encoding) moves it and so drops what is carried over here.
+            if let Some(changed_fragment_ids) = &changed_fragment_ids {
+                prev_manifest.reuse_encoded_fragments(current_manifest, changed_fragment_ids);
+            }
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -2345,14 +2387,96 @@ impl Transaction {
         None
     }
 
-    /// Remove data files that only contain tombstoned fields (-2)
-    /// These files no longer contain any live data and can be safely dropped
-    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
+    /// Remove data files whose fields are all tombstoned (-2); they hold no
+    /// live data. Returns the ids of the fragments that lost a file.
+    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) -> Vec<u64> {
+        let mut cleaned_fragment_ids = Vec::new();
         for fragment in fragments {
+            let num_files = fragment.files.len();
             fragment.files.retain(|file| {
                 // Keep file if it has at least one non-tombstoned field
                 file.fields.iter().any(|&field_id| field_id != -2)
             });
+            if fragment.files.len() != num_files {
+                cleaned_fragment_ids.push(fragment.id);
+            }
+        }
+        cleaned_fragment_ids
+    }
+
+    /// Ids of every fragment whose content [`Self::build_manifest`] may change
+    /// relative to the manifest it builds on: fragments the operation adds,
+    /// replaces, modifies or removes. Every other fragment is carried over
+    /// unchanged, so its encoded bytes can be reused.
+    ///
+    /// New fragments with id 0 are left out: they are assigned fresh ids,
+    /// which no fragment of the previous manifest has.
+    ///
+    /// `None` for operations that may rewrite any fragment; those re-encode
+    /// every fragment.
+    fn changed_fragment_ids(&self) -> Option<Vec<u64>> {
+        let ids = |fragments: &[Fragment]| {
+            fragments
+                .iter()
+                .map(|f| f.id)
+                .filter(|&id| id != 0)
+                .collect::<Vec<_>>()
+        };
+        match &self.operation {
+            Operation::Append { fragments } => Some(ids(fragments)),
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => {
+                let mut changed: Vec<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                changed.extend(deleted_fragment_ids);
+                Some(changed)
+            }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                updated_fragment_offsets,
+                ..
+            } => {
+                let mut changed: Vec<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                changed.extend(removed_fragment_ids);
+                changed.extend(ids(new_fragments));
+                if let Some(UpdatedFragmentOffsets(offsets)) = updated_fragment_offsets {
+                    changed.extend(offsets.keys());
+                }
+                Some(changed)
+            }
+            Operation::Rewrite { groups, .. } => Some(
+                groups
+                    .iter()
+                    .flat_map(|group| {
+                        let old = group.old_fragments.iter().map(|f| f.id);
+                        old.chain(ids(&group.new_fragments))
+                    })
+                    .collect(),
+            ),
+            Operation::DataReplacement { replacements } => Some(
+                replacements
+                    .iter()
+                    .map(|DataReplacementGroup(fragment_id, _)| *fragment_id)
+                    .collect(),
+            ),
+            Operation::DataOverlay { groups } => {
+                Some(groups.iter().map(|group| group.fragment_id).collect())
+            }
+            Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateBases { .. }
+            | Operation::UpdateMemWalState { .. } => Some(vec![]),
+            Operation::Overwrite { .. }
+            | Operation::Merge { .. }
+            | Operation::Project { .. }
+            | Operation::Restore { .. }
+            | Operation::Clone { .. }
+            | Operation::Unknown { .. } => None,
         }
     }
 
@@ -2407,6 +2531,7 @@ mod tests {
     use rstest::rstest;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::num::NonZero;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -3352,6 +3477,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: Some(7),
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -3549,6 +3675,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -5830,6 +5957,51 @@ mod tests {
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
     }
 
+    #[rstest]
+    #[case::new_file_has_a_hint(NonZero::new(512))]
+    #[case::new_file_has_no_hint(None)]
+    fn test_data_replacement_takes_metadata_size_hint_from_new_file(
+        #[case] new_hint: Option<NonZero<u64>>,
+    ) {
+        let data_file = |path: &str, hint: Option<NonZero<u64>>| {
+            let mut file = DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            );
+            file.file_metadata_size_bytes = hint;
+            file
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![data_file("v.lance", NonZero::new(1024))];
+        let schema = ArrowSchema::new(vec![ArrowField::new("v", DataType::Int32, true)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, data_file("v-new.lance", new_hint))],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let files = &result.fragments[0].files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "v-new.lance");
+        assert_eq!(files[0].file_metadata_size_bytes, new_hint);
+    }
+
     /// Replace `fields` in `fragment` at `read_version`, against a manifest
     /// at `manifest_version` whose schema declares field ids 3 ("x"), 4 ("a"),
     /// 5 ("v") and 6 ("y").
@@ -7641,5 +7813,242 @@ mod tests {
         .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
         .unwrap();
         assert_eq!(plain.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    /// A fragment with two data files of known size, as current writers produce.
+    fn sized_fragment(id: u64) -> Fragment {
+        let mut fragment = Fragment::new(id).with_physical_rows(100);
+        for field_id in 0..2 {
+            fragment.add_file(
+                format!("{id}-{field_id}.lance"),
+                vec![field_id],
+                vec![field_id],
+                ConcreteFileVersion::V2_0,
+                std::num::NonZero::new(1000 + id),
+            );
+        }
+        fragment
+    }
+
+    fn manifest_with_sized_fragments(ids: std::ops::Range<u64>) -> Manifest {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]);
+        Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(ids.map(sized_fragment).collect()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    /// Write `manifest` as a manifest file and return the manifest message in
+    /// it, without its length prefix.
+    async fn write_manifest_message(manifest: &mut Manifest) -> Vec<u8> {
+        use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
+        use lance_io::object_store::ObjectStore;
+        use lance_io::traits::{WriteExt, Writer};
+        use object_store::path::Path;
+
+        let store = ObjectStore::memory();
+        let path = Path::from("manifest");
+        let mut writer = store.create(&path).await.unwrap();
+        let pos = crate::io::manifest::write_manifest(writer.as_mut(), manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, crate::format::MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let file = store.read_one_all(&path).await.unwrap();
+        let footer = file.len() - 16;
+        let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(pos + 4 + len, footer);
+        file[pos + 4..footer].to_vec()
+    }
+
+    /// Ids of the fragments of `manifest` that carry reusable encoded bytes.
+    fn cached_fragment_ids(manifest: &Manifest) -> Vec<u64> {
+        let Some(encoded) = manifest.encoded_fragments() else {
+            return vec![];
+        };
+        manifest
+            .fragments
+            .iter()
+            .zip(encoded)
+            .filter(|(_, encoded)| encoded.is_some())
+            .map(|(fragment, _)| fragment.id)
+            .collect()
+    }
+
+    /// Build the next manifest, check which fragments it reuses encoded bytes
+    /// for, and check that the message written for it is byte-identical to
+    /// encoding the whole manifest from scratch.
+    async fn apply_and_check(
+        manifest: &Manifest,
+        operation: Operation,
+        expected_reused: &[u64],
+    ) -> Manifest {
+        use prost::Message;
+
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let (mut next, _) = transaction
+            .build_manifest(Some(manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(cached_fragment_ids(&next), expected_reused);
+
+        let written = write_manifest_message(&mut next).await;
+        assert_eq!(written, pb::Manifest::from(&next).encode_to_vec());
+        next
+    }
+
+    fn deletion_file(read_version: u64, id: u64) -> DeletionFile {
+        DeletionFile {
+            read_version,
+            id,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(10),
+            base_id: None,
+            inline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_manifest_reuses_encoded_bytes_of_unchanged_fragments() {
+        use prost::Message;
+
+        // Cold start: nothing is cached, so every fragment is encoded.
+        let mut manifest = manifest_with_sized_fragments(0..6);
+        assert!(manifest.encoded_fragments().is_none());
+        assert_eq!(
+            write_manifest_message(&mut manifest).await,
+            pb::Manifest::from(&manifest).encode_to_vec()
+        );
+        assert_eq!(cached_fragment_ids(&manifest), (0..6).collect::<Vec<_>>());
+
+        // Append: every existing fragment is reused; the new one (id 6) is not.
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Append {
+                fragments: vec![sized_fragment(0)],
+            },
+            &[0, 1, 2, 3, 4, 5],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), (0..7).collect::<Vec<_>>());
+
+        // Update: fragment 1 removed, fragment 2 updated, fragment 7 added.
+        let mut updated = manifest.fragments[2].clone();
+        updated.deletion_file = Some(deletion_file(manifest.version, 1));
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                updated_fragments: vec![updated],
+                new_fragments: vec![sized_fragment(0)],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+                mem_wal_dir_id: None,
+            },
+            &[0, 3, 4, 5, 6],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 3, 4, 5, 6, 7]);
+
+        // Delete: fragment 3 deleted, fragment 4 updated.
+        let mut updated = manifest.fragments[3].clone();
+        assert_eq!(updated.id, 4);
+        updated.deletion_file = Some(deletion_file(manifest.version, 2));
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Delete {
+                updated_fragments: vec![updated],
+                deleted_fragment_ids: vec![3],
+                predicate: "a < 0".to_string(),
+            },
+            &[0, 2, 5, 6, 7],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 5, 6, 7]);
+
+        // Rewrite: fragments 5 and 6 compacted into a new fragment (id 8).
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments[3..5].to_vec(),
+                    new_fragments: vec![sized_fragment(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            &[0, 2, 4, 7],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 7, 8]);
+
+        // A fragment with a file of unknown size is encoded on every write,
+        // since the size may be filled in later without the list changing.
+        let mut unsized_fragment = Fragment::new(0).with_physical_rows(100);
+        unsized_fragment.add_file(
+            "unsized.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Append {
+                fragments: vec![unsized_fragment],
+            },
+            &[0, 2, 4, 7, 8],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 7, 8]);
+
+        // Operations that can rewrite any fragment carry nothing over.
+        let project_schema = manifest.schema.project(&["a"]).unwrap();
+        apply_and_check(
+            &manifest,
+            Operation::Project {
+                schema: project_schema,
+                preserves_nullability: true,
+            },
+            &[],
+        )
+        .await;
+    }
+
+    /// A fragment that loses a data file to tombstone cleanup is re-encoded
+    /// even when the operation did not name it.
+    #[tokio::test]
+    async fn test_build_manifest_reencodes_fragments_cleaned_of_tombstoned_files() {
+        let mut manifest = manifest_with_sized_fragments(0..3);
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[1].files[1].fields = vec![-2].into();
+        manifest.fragments = Arc::new(fragments);
+        write_manifest_message(&mut manifest).await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 1, 2]);
+
+        let next = apply_and_check(
+            &manifest,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            &[0, 2],
+        )
+        .await;
+        assert_eq!(next.fragments[1].files.len(), 1);
     }
 }

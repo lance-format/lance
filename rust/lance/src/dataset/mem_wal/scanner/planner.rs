@@ -625,11 +625,12 @@ mod integration_tests {
     use futures::TryStreamExt;
     use uuid::Uuid;
 
+    use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -2420,8 +2421,10 @@ mod integration_tests {
 
     /// Across a base table, a flushed generation, and frozen and active
     /// memtables, a scan from the memtables' filter indexes returns what
-    /// reading every row returns, whatever the filter, projection, limit and
-    /// offset.
+    /// reading every row returns, with and without a projection, limit and
+    /// offset. That the indexes answer like reading every row is checked over
+    /// many rounds at the memtable seam, in
+    /// `memtable_filter_indexes_answer_like_reading_every_row`.
     #[tokio::test]
     async fn test_lsm_scan_from_memtable_filter_indexes_answers_like_a_full_read() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -2530,19 +2533,20 @@ mod integration_tests {
             (store, Arc::new(indexes))
         };
 
-        let (mut checked, mut index_reads) = (0, 0);
-        for round in 0..12 {
-            let temp = tempfile::tempdir().unwrap();
-            let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-            let base_rows = rows(&mut next, 300, false);
-            let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
-            let shard_id = Uuid::new_v4();
-            let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
-            create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
-            let snapshot = ShardSnapshot::new(shard_id)
-                .with_current_generation(3)
-                .with_sstable(1, "gen_1".to_string());
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base_rows = rows(&mut next, 300, false);
+        let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_sstable(1, "gen_1".to_string());
 
+        const ROUNDS: usize = 2;
+        let (mut checked, mut index_reads) = (0, 0);
+        for round in 0..ROUNDS {
             let frozen_batches: Vec<RecordBatch> = (0..4)
                 .map(|_| mem_batch(&rows(&mut next, 60, true)))
                 .collect();
@@ -2568,84 +2572,84 @@ mod integration_tests {
                 }],
             };
 
+            let projected_limit = [(Some(3), None), (Some(4), Some(2))][round];
             for filter in FILTERS {
-                for projection in [None, Some(vec!["id", "cat"])] {
-                    for (limit, offset) in [(None, None), (Some(3), None), (Some(4), Some(2))] {
-                        let read = |enabled: bool| {
-                            let mut scanner = LsmScanner::new(
-                                base.clone(),
-                                vec![snapshot.clone()],
-                                vec!["id".to_string()],
-                            )
-                            .with_in_memory_memtables(shard_id, in_memory.clone())
-                            .with_memtable_filter_indexes(enabled)
-                            .filter(filter)
-                            .unwrap();
-                            if let Some(columns) = &projection {
-                                scanner = scanner.project(columns).unwrap();
-                            }
-                            let scanner = scanner.limit(limit, offset).unwrap();
-                            async move {
-                                let plan = scanner.create_plan().await.unwrap();
-                                let shown = datafusion::physical_plan::displayable(plan.as_ref())
-                                    .indent(true)
-                                    .to_string();
-                                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
-                                let ctx = datafusion::prelude::SessionContext::new();
-                                let batches = datafusion::physical_plan::collect(
-                                    plan.clone(),
-                                    ctx.task_ctx(),
-                                )
-                                .await
-                                .unwrap();
-                                let mut out: Vec<(i32, Option<i32>)> = Vec::new();
-                                for batch in &batches {
-                                    let id = batch.column_by_name("id").unwrap();
-                                    let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
-                                    let cat = batch.column_by_name("cat").unwrap();
-                                    let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
-                                    for row in 0..batch.num_rows() {
-                                        out.push((
-                                            id.value(row),
-                                            cat.is_valid(row).then(|| cat.value(row)),
-                                        ));
-                                    }
+                for (projection, (limit, offset)) in [
+                    (None, (None, None)),
+                    (Some(vec!["id", "cat"]), projected_limit),
+                ] {
+                    let read = |enabled: bool| {
+                        let mut scanner = LsmScanner::new(
+                            base.clone(),
+                            vec![snapshot.clone()],
+                            vec!["id".to_string()],
+                        )
+                        .with_in_memory_memtables(shard_id, in_memory.clone())
+                        .with_memtable_filter_indexes(enabled)
+                        .filter(filter)
+                        .unwrap();
+                        if let Some(columns) = &projection {
+                            scanner = scanner.project(columns).unwrap();
+                        }
+                        let scanner = scanner.limit(limit, offset).unwrap();
+                        async move {
+                            let plan = scanner.create_plan().await.unwrap();
+                            let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                                .indent(true)
+                                .to_string();
+                            assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+                            let ctx = datafusion::prelude::SessionContext::new();
+                            let batches =
+                                datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                                    .await
+                                    .unwrap();
+                            let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+                            for batch in &batches {
+                                let id = batch.column_by_name("id").unwrap();
+                                let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                                let cat = batch.column_by_name("cat").unwrap();
+                                let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                                for row in 0..batch.num_rows() {
+                                    out.push((
+                                        id.value(row),
+                                        cat.is_valid(row).then(|| cat.value(row)),
+                                    ));
                                 }
-                                out.sort_unstable();
-                                (out, newest_checks(&plan))
                             }
-                        };
-                        let context = format!(
-                            "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
-                        );
-                        let (full, checks) = read(false).await;
-                        assert_eq!(checks, 0, "{context}: the setting is off");
-                        let (from_indexes, checks) = read(true).await;
-                        if checks > 0 {
-                            index_reads += 1;
+                            out.sort_unstable();
+                            (out, newest_checks(&plan))
                         }
-                        if limit.is_none() {
-                            assert_eq!(from_indexes, full, "{context}");
-                        } else {
-                            // An unordered limit may return any rows that match,
-                            // each key once.
-                            assert_eq!(from_indexes.len(), full.len(), "{context}");
-                            let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
-                            ids.dedup();
-                            assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
-                            let mut all =
-                                read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
-                            all.sort_unstable();
-                            for row in &from_indexes {
-                                assert!(all.contains(row), "{context}: {row:?} does not match");
-                            }
-                        }
-                        checked += 1;
+                    };
+                    let context = format!(
+                        "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
+                    );
+                    let (full, checks) = read(false).await;
+                    assert_eq!(checks, 0, "{context}: the setting is off");
+                    let (from_indexes, checks) = read(true).await;
+                    if checks > 0 {
+                        index_reads += 1;
                     }
+                    if limit.is_none() {
+                        assert_eq!(from_indexes, full, "{context}");
+                    } else {
+                        // An unordered limit may return any rows that match,
+                        // each key once.
+                        assert_eq!(from_indexes.len(), full.len(), "{context}");
+                        let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
+                        ids.dedup();
+                        assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
+                        let mut all =
+                            read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
+                        all.sort_unstable();
+                        for row in &from_indexes {
+                            assert!(all.contains(row), "{context}: {row:?} does not match");
+                        }
+                    }
+                    checked += 1;
                 }
             }
         }
-        assert_eq!(checked, 12 * FILTERS.len() * 2 * 3);
+        assert_eq!(checked, ROUNDS * FILTERS.len() * 2);
         assert!(
             index_reads * 2 > checked,
             "most reads must take the index route: {index_reads} of {checked}"

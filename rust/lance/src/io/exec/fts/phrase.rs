@@ -39,8 +39,45 @@ use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_
 use super::segments::{open_fts_segments, search_segments, segments_the_prefilter_may_match};
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
+/// Indexed phrase search with an explicit document boundary and candidate scope.
+///
+/// Codecs must preserve the resolved granularity independently of the logical
+/// query, as well as the kind of segment selection, masks and scoring override.
+/// The example reuses value objects and child plans; a transport codec supplies
+/// their decoded equivalents from the same pinned dataset snapshot.
+///
+/// ```
+/// # use lance::{io::exec::fts::PhraseQueryExec, Error, Result};
+/// # fn rebuild(exec: &PhraseQueryExec) -> Result<PhraseQueryExec> {
+/// if exec.has_shared_scorer() {
+///     return Err(Error::invalid_input("reconstruct the enclosing corpus owner"));
+/// }
+/// let mut rebuilt = if let Some(segments) = exec.preset_segments() {
+///     PhraseQueryExec::new_with_segments_and_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), segments.to_vec(), exec.document_granularity(),
+///     )
+/// } else if let Some(uuids) = exec.explicit_segment_uuids() {
+///     PhraseQueryExec::new_with_segment_uuids_and_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), uuids, exec.document_granularity(),
+///     )
+/// } else {
+///     PhraseQueryExec::new_with_document_granularity(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), exec.document_granularity(),
+///     )
+/// }.with_external_mask(exec.external_mask().cloned());
+/// if let Some(mask) = exec.overlay_block() {
+///     rebuilt = rebuilt.with_overlay_block(mask.clone());
+/// }
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
 #[derive(Debug)]
-
 pub struct PhraseQueryExec {
     dataset: Arc<Dataset>,
     query: PhraseQuery,
@@ -208,13 +245,37 @@ impl PhraseQueryExec {
     pub fn new_with_segment_uuids(
         dataset: Arc<Dataset>,
         query: PhraseQuery,
-        mut params: FtsSearchParams,
+        params: FtsSearchParams,
         prefilter_source: PreFilterSource,
         segment_uuids: Vec<Uuid>,
     ) -> Result<Self> {
         let document_granularity = query.document_granularity.ok_or_else(|| {
             Error::invalid_input("PhraseQuery document granularity must be resolved".to_string())
         })?;
+        Ok(Self::new_with_segment_uuids_and_document_granularity(
+            dataset,
+            query,
+            params,
+            prefilter_source,
+            segment_uuids,
+            document_granularity,
+        ))
+    }
+
+    /// Bind an exact ordered UUID selection with an already resolved document
+    /// granularity, retaining the logical query unchanged.
+    ///
+    /// This supports reconstruction when the logical query leaves granularity
+    /// unset. UUID resolution remains deferred until execution, with the same
+    /// validation as [`Self::new_with_segment_uuids`]. See [`Self`] for an example.
+    pub fn new_with_segment_uuids_and_document_granularity(
+        dataset: Arc<Dataset>,
+        query: PhraseQuery,
+        params: FtsSearchParams,
+        prefilter_source: PreFilterSource,
+        segment_uuids: Vec<Uuid>,
+        document_granularity: DocumentGranularity,
+    ) -> Self {
         let schema = fts_schema(document_granularity);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
@@ -222,9 +283,9 @@ impl PhraseQueryExec {
             EmissionType::Final,
             Boundedness::Bounded,
         ));
-        params = params.with_phrase_slop(Some(query.slop));
+        let params = params.with_phrase_slop(Some(query.slop));
 
-        Ok(Self {
+        Self {
             dataset,
             query,
             tokenized_query: Arc::new(OnceLock::new()),
@@ -239,7 +300,7 @@ impl PhraseQueryExec {
             external_mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-        })
+        }
     }
 
     /// Override the local BM25 scorer; see
@@ -254,8 +315,38 @@ impl PhraseQueryExec {
         self
     }
 
+    pub(super) fn uses_shared_scorer(&self, scorer: &Arc<SharedFtsScorer>) -> bool {
+        self.shared_scorer
+            .as_ref()
+            .is_some_and(|shared| Arc::ptr_eq(shared, scorer))
+    }
+
+    pub(super) fn rebuilt_with_shared_scorer(
+        &self,
+        scorer: Arc<SharedFtsScorer>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params: self.params.clone(),
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            shared_scorer: Some(scorer),
+            segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
+            document_granularity: self.document_granularity,
+            schema: self.schema.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
     /// Exclude rows whose indexed text was superseded by a newer data overlay.
-    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+    /// The mask uses the index's row-id domain, including stable row IDs when
+    /// enabled. Preserve it separately from the candidate prefilter.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
         self
     }
@@ -264,6 +355,18 @@ impl PhraseQueryExec {
     pub fn with_external_mask(mut self, mask: Option<Arc<RowAddrMask>>) -> Self {
         self.external_mask = mask;
         self
+    }
+
+    /// Whether reconstruction must reconnect this leaf to its enclosing corpus
+    /// owner. Process-local scorer coordination is not exported.
+    pub fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
+    }
+
+    /// Resolved document boundary, independent of the logical query option.
+    /// See [`Self`] for a reconstruction example.
+    pub fn document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
     }
 
     pub fn query(&self) -> &PhraseQuery {
@@ -284,6 +387,17 @@ impl PhraseQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    /// Overlay exclusion in the index's row-id domain; `None` adds no exclusion.
+    pub fn overlay_block(&self) -> Option<&RowAddrMask> {
+        self.overlay_block.as_ref()
+    }
+
+    /// Additional candidate restriction in the index's row-id domain, or `None`.
+    /// This mask does not narrow the statistics corpus.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
     }
 
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {

@@ -28,10 +28,11 @@ pub use boolean::{
 };
 pub use combined_fields::CombinedFieldsQueryExec;
 pub use compound::{CompoundQueryExec, CrossColumnCompoundQueryExec, HybridCompoundQueryExec};
-pub(crate) use corpus::{SharedFtsScorer, SharedFtsScorerExec};
+pub(crate) use corpus::SharedFtsScorer;
+pub use corpus::{FtsCorpusBinding, SharedFtsScorerExec};
 pub use document::FtsDocumentExec;
 pub use flat_combined_fields::{FlatCombinedFieldsExec, FlatStatsCoverage, FlatStatsScope};
-pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec};
+pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec, FtsFilterDocumentBinding};
 pub use match_query::MatchQueryExec;
 pub use phrase::PhraseQueryExec;
 pub use selection::{FTS_SEGMENT_BIND_DURATION_METRIC, FtsIndexMetrics};
@@ -104,7 +105,7 @@ mod tests {
         dataset::index::{DatasetIndexRemapperOptions, frag_reuse::cleanup_frag_reuse_index},
         dataset::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction},
         dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };
@@ -257,11 +258,37 @@ mod tests {
         )
     }
 
+    fn reconstruct_hybrid(
+        exec: &HybridCompoundQueryExec,
+        residual: Arc<dyn ExecutionPlan>,
+    ) -> DataFusionResult<HybridCompoundQueryExec> {
+        let rebuilt = HybridCompoundQueryExec::new(
+            exec.dataset().clone(),
+            exec.query().clone(),
+            exec.params().clone(),
+            exec.column().to_owned(),
+            exec.segments().to_vec(),
+            residual,
+        );
+        match exec.indexed_input() {
+            Some((input, scorer)) => rebuilt.with_indexed_input(
+                input.clone(),
+                Arc::new(MemBM25Scorer::new(
+                    scorer.total_tokens,
+                    scorer.num_docs,
+                    scorer.token_docs.clone(),
+                )),
+            ),
+            None => Ok(rebuilt),
+        }
+    }
+
     #[rstest::rstest]
     #[tokio::test]
     async fn test_hybrid_indexed_input_matches_native(
         #[values("quick", "fresh")] term: &str,
         #[values(1, 4)] limit: usize,
+        #[values(false, true)] is_reconstructed: bool,
     ) {
         let (hybrid, scorer, indexed) = create_hybrid_indexed_input_fixture(term, limit).await;
         let expected = hybrid
@@ -295,6 +322,13 @@ mod tests {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )
             .unwrap();
+        let rewritten = if is_reconstructed {
+            let exec = rewritten.downcast_ref::<HybridCompoundQueryExec>().unwrap();
+            Arc::new(reconstruct_hybrid(exec, exec.residual_input().clone()).unwrap())
+                as Arc<dyn ExecutionPlan>
+        } else {
+            rewritten
+        };
         let actual = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -355,6 +389,7 @@ mod tests {
     async fn test_hybrid_indexed_input_rejects_invalid_results(
         #[case] null_score: bool,
         #[case] message: &str,
+        #[values(false, true)] is_reconstructed: bool,
     ) {
         let (hybrid, scorer, _) = create_hybrid_indexed_input_fixture("quick", 3).await;
         let scores = if null_score {
@@ -385,6 +420,13 @@ mod tests {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )
             .unwrap();
+        let rewritten = if is_reconstructed {
+            let exec = rewritten.downcast_ref::<HybridCompoundQueryExec>().unwrap();
+            Arc::new(reconstruct_hybrid(exec, exec.residual_input().clone()).unwrap())
+                as Arc<dyn ExecutionPlan>
+        } else {
+            rewritten
+        };
         let error = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -393,6 +435,105 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, DataFusionError::Execution(_)));
         assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_hybrid_composition_state_preserves_corpus(
+        #[values(false, true)] has_indexed_input: bool,
+    ) {
+        let (fixture, _, _) = create_hybrid_indexed_input_fixture("quick", 4).await;
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("quick".into())
+                    .with_column(Some("text".into()))
+                    .with_fuzziness(Some(0))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                MatchQuery::new("fresh".into())
+                    .with_column(Some("text".into()))
+                    .with_fuzziness(Some(0))
+                    .into(),
+            ),
+        ])
+        .into();
+        let metrics = IndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let indices = open_fts_segments(fixture.dataset(), "text", fixture.segments(), &metrics)
+            .await
+            .unwrap();
+        let tokens = Tokens::new(
+            vec!["quick".into(), "fresh".into()],
+            indices[0].tokenizer().doc_type(),
+        );
+        let committed = Arc::new(
+            build_global_bm25_scorer(&indices, &tokens, fixture.params(), None)
+                .await
+                .unwrap(),
+        );
+        let selected = vec![fixture.segments()[1].clone()];
+        let indexed: Arc<dyn ExecutionPlan> = Arc::new(
+            CompoundQueryExec::new_with_segments(
+                fixture.dataset().clone(),
+                query.clone(),
+                fixture.params().clone(),
+                PreFilterSource::None,
+                selected.clone(),
+            )
+            .with_base_scorer(committed.clone()),
+        );
+        let residual = |dataset: Arc<Dataset>| async move {
+            let mut scan = dataset.scan();
+            scan.project(&["text"])
+                .unwrap()
+                .with_row_id()
+                .with_fragments(vec![dataset.fragments().last().unwrap().clone()]);
+            scan.create_plan().await.unwrap()
+        };
+        let mut original = HybridCompoundQueryExec::new(
+            fixture.dataset().clone(),
+            query.clone(),
+            fixture.params().clone(),
+            "text".into(),
+            selected.clone(),
+            residual(fixture.dataset().clone()).await,
+        );
+        if has_indexed_input {
+            original = original.with_indexed_input(indexed, committed).unwrap();
+        }
+        let restored =
+            reconstruct_hybrid(&original, residual(fixture.dataset().clone()).await).unwrap();
+        assert_eq!(restored.indexed_input().is_some(), has_indexed_input);
+        let actual = execute_results(&restored).await.unwrap();
+        assert_eq!(actual, execute_results(&original).await.unwrap());
+        assert_eq!(actual.len(), 4);
+
+        if has_indexed_input {
+            // The worker searches one segment, but its supplied scorer describes
+            // every committed segment. Dropping the pair changes real scores.
+            let local = HybridCompoundQueryExec::new(
+                fixture.dataset().clone(),
+                query,
+                fixture.params().clone(),
+                "text".into(),
+                selected,
+                residual(fixture.dataset().clone()).await,
+            );
+            let mut local = execute_results(&local).await.unwrap();
+            let mut actual = actual;
+            local.sort_by_key(|row| row.0);
+            actual.sort_by_key(|row| row.0);
+            assert_eq!(
+                local.iter().map(|row| row.0).collect::<Vec<_>>(),
+                actual.iter().map(|row| row.0).collect::<Vec<_>>()
+            );
+            assert_ne!(
+                actual, local,
+                "a supplied corpus scorer must not become worker-local statistics"
+            );
+        }
     }
 
     fn tokenized_query_index_params() -> InvertedIndexParams {
@@ -1306,25 +1447,13 @@ mod tests {
             arrow_schema::Field::new("title", DataType::Utf8, true),
             arrow_schema::Field::new("body", DataType::Utf8, true),
         ]));
-        let resolved_fields = query
-            .column_names()
-            .map(|column| {
-                crate::index::scalar::inverted::resolve_fts_field(
-                    dataset.schema(),
-                    column,
-                    DocumentGranularity::Row,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let num_columns = resolved_fields.len();
+        let num_columns = query.column_names().len();
         let flat = FlatCombinedFieldsExec::try_new(
             dataset.clone(),
             query.clone(),
             params.clone(),
             Arc::new(EmptyExec::new(flat_schema)),
             roaring::RoaringBitmap::new(),
-            resolved_fields,
             FlatStatsScope::PerColumn(vec![FlatStatsCoverage::default(); num_columns]),
             PreFilterSource::None,
         )
