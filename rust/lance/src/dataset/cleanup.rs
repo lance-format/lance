@@ -43,7 +43,8 @@ pub mod retention;
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
-use super::refs::{TagContents, normalize_branch};
+use super::mem_wal::util::is_mem_wal_dir_name;
+use super::refs::{REFS_DIR, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -1542,7 +1543,7 @@ impl<'a> CleanupTask<'a> {
         // never be referenced, even inside a retained index or blob directory.
         // Scan without the retained-manifest cutoff: an orphan can be newer than
         // every retained manifest and still age past the unverified threshold.
-        let local_staging_files = stream::iter([
+        let mut local_staging_roots = vec![
             (
                 self.dataset.versions_dir(),
                 CleanupFileKind::TemporaryManifest,
@@ -1562,23 +1563,46 @@ impl<'a> CleanupTask<'a> {
                 self.dataset.base.clone().join("_fri"),
                 CleanupFileKind::Index,
             ),
-        ])
-        .flat_map(|(dir, kind)| {
-            self.dataset
+            // Refs do not have a dedicated cleanup accounting kind.
+            (
+                self.dataset.base.clone().join(REFS_DIR),
+                CleanupFileKind::Data,
+            ),
+        ];
+        // Avoid listing every dataset root on remote stores that cannot expose
+        // hidden local staging files.
+        if self.dataset.object_store.is_local()
+            || self.dataset.object_store.scheme() == "file-object-store"
+        {
+            for name in self
+                .dataset
                 .object_store
-                .read_local_staging_files(&dir)
-                .try_filter_map(move |meta| {
-                    let can_remove = self.policy.delete_unverified
-                        || meta.last_modified < verification_threshold;
-                    future::ready(Ok(can_remove.then_some(CleanupFile {
-                        path: meta.location,
-                        kind,
-                        unverified: true,
-                        size_bytes: meta.size,
-                    })))
-                })
-        })
-        .boxed();
+                .read_dir(self.dataset.base.clone())
+                .await?
+            {
+                if is_mem_wal_dir_name(&name) {
+                    local_staging_roots
+                        .push((self.dataset.base.clone().join(name), CleanupFileKind::Index));
+                }
+            }
+        }
+        let local_staging_files = stream::iter(local_staging_roots)
+            .flat_map(|(dir, kind)| {
+                self.dataset
+                    .object_store
+                    .read_local_staging_files(&dir)
+                    .try_filter_map(move |meta| {
+                        let can_remove = self.policy.delete_unverified
+                            || meta.last_modified < verification_threshold;
+                        future::ready(Ok(can_remove.then_some(CleanupFile {
+                            path: meta.location,
+                            kind,
+                            unverified: true,
+                            size_bytes: meta.size,
+                        })))
+                    })
+            })
+            .boxed();
 
         let old_manifests = inspection.old_manifests.clone();
         let manifest_files = stream::iter(old_manifests)

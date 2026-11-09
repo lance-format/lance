@@ -999,6 +999,9 @@ async fn cleanup_local_object_store_staging_files(
     assert_eq!(dataset.manifest.fragments.len(), 2);
     let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
     let data_file = &dataset.manifest.fragments[0].files[0].path;
+    let legacy_mem_wal = crate::dataset::mem_wal::util::mem_wal_dir_name("");
+    let dynamic_mem_wal = crate::dataset::mem_wal::util::mem_wal_dir_name("0a1b2c3d");
+    let shard_id = "7a20a9d1-3e0d-4b70-8b41-927e5bd8f2ab";
     let temporary_paths = [
         "_versions/18446744073709548312.manifest#1".to_string(),
         "_transactions/abandoned.txn#2".to_string(),
@@ -1011,17 +1014,24 @@ async fn cleanup_local_object_store_staging_files(
         "_deletions/abandoned.arrow#6".to_string(),
         "_blobs/abandoned.blob#7".to_string(),
         "_fri/abandoned/row_map.bin#8".to_string(),
+        "_refs/tags/abandoned.json#9".to_string(),
+        format!("{legacy_mem_wal}/{shard_id}/manifest/abandoned.binpb#10"),
+        // The dynamic directory contains only this hidden candidate.
+        format!("{dynamic_mem_wal}/{shard_id}/deadbeef_gen_1/_pk_index/index.idx#11"),
     ];
     let preserved_paths = [
-        "data/unrelated#suffix",
-        "data/unrelated#",
-        "_versions/unrelated.manifest#1x",
-        "user/notes#1",
+        "data/unrelated#suffix".to_string(),
+        "data/unrelated#".to_string(),
+        "_versions/unrelated.manifest#1x".to_string(),
+        "_refs/tags/unrelated.json#suffix".to_string(),
+        "_mem_wal_backup/abandoned.bin#12".to_string(),
+        format!("{legacy_mem_wal}/unrelated#"),
+        "user/notes#1".to_string(),
     ];
     for path in temporary_paths
         .iter()
         .map(String::as_str)
-        .chain(preserved_paths)
+        .chain(preserved_paths.iter().map(String::as_str))
     {
         let path = std::path::Path::new(tmpdir.as_str()).join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1075,8 +1085,8 @@ async fn cleanup_local_object_store_staging_files(
     let removed = dataset.cleanup(policy).execute().await.unwrap();
     assert_eq!(removed, explanation.stats);
     assert_eq!(removed.old_versions, 0);
-    assert_eq!(removed.data_files_removed, u64::from(should_remove) * 3);
-    assert_eq!(removed.index_files_removed, u64::from(should_remove) * 2);
+    assert_eq!(removed.data_files_removed, u64::from(should_remove) * 4);
+    assert_eq!(removed.index_files_removed, u64::from(should_remove) * 4);
     assert_eq!(removed.transaction_files_removed, u64::from(should_remove));
     assert_eq!(removed.deletion_files_removed, u64::from(should_remove));
     for path in &temporary_paths {
