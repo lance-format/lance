@@ -216,9 +216,8 @@ impl<F: Copy> Dispatch<F> {
 
     /// The last candidate, which every host supports.
     pub fn fallback(&self) -> Kernel<F> {
-        let fallback = self.candidates[self.candidates.len() - 1];
-        debug_assert!(fallback.features.is_empty());
-        Kernel(fallback.kernel)
+        // `new` rejects a last candidate that needs any feature.
+        Kernel(self.candidates[self.candidates.len() - 1].kernel)
     }
 
     /// The candidate [`Self::get`] returns.
