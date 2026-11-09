@@ -887,8 +887,9 @@ impl MapIndexExec {
         }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            // The deletion mask is shared by every batch of the stream; apply it
-            // by reference instead of copying it for each batch.
+            // The deletion mask is shared by every batch of the stream, so apply
+            // it to an allow-list probe in place instead of copying it per batch.
+            // Other probes keep the by-value intersection.
             row_addr_mask = match row_addr_mask {
                 RowAddrMask::AllowList(mut rows) => {
                     rows.mask(deletion_mask);
@@ -1343,6 +1344,7 @@ mod tests {
     };
     use futures::TryStreamExt;
     use lance_core::{
+        ROW_ID,
         deepsize::DeepSizeOf,
         utils::{address::RowAddress, tempfile::TempStrDir},
     };
@@ -1913,17 +1915,9 @@ mod tests {
             .unwrap();
         dataset.delete("key % 2 = 0").await.unwrap();
 
-        let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
-            "key",
-            arrow_schema::DataType::UInt64,
-            false,
-        )]));
-        let batches = [vec![0_u64, 1, 2, 3], vec![10, 11, 12, 13]].map(|keys| {
-            Ok(
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt64Array::from(keys))])
-                    .unwrap(),
-            )
-        });
+        let batches = [vec![0_u64, 1, 2, 3], vec![10, 11, 12, 13]]
+            .map(|keys| Ok(record_batch!(("key", UInt64, keys)).unwrap()));
+        let schema = batches[0].as_ref().unwrap().schema();
         let input = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(batches),
@@ -1942,13 +1936,7 @@ mod tests {
             .unwrap();
         let mut row_ids = batches
             .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_primitive::<UInt64Type>()
-                    .values()
-                    .to_vec()
-            })
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
             .collect::<Vec<_>>();
         row_ids.sort_unstable();
         assert_eq!(row_ids, vec![1, 3, 11, 13]);
