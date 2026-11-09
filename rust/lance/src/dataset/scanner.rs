@@ -428,7 +428,7 @@ impl ExprFilter {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter(sql)?;
+                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
