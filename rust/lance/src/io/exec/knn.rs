@@ -3275,47 +3275,62 @@ impl ExecutionPlan for MultivectorScoringExec {
             .map(|input| input.execute(partition, context.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        // collect the top k results from each stream,
+        // Collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
-        let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
-            stream.map(|batch| {
-                let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let dists = batch[DIST_COL].as_primitive::<Float32Type>();
-                debug_assert_eq!(dists.null_count(), 0);
+        //
+        // Each query stream is pre-reduced on its own: all of a stream's batches
+        // are folded into a single (row id -> best similarity) map plus that
+        // stream's own worst similarity, and only then do the streams merge.
+        // The sort feeding this node chunks its top-fetch output at the session
+        // batch size, and multivector indexes repeat a parent row id once per
+        // sub-vector, so the same row id can appear in several batches of one
+        // stream; the merge below adds one similarity per (row id, query), so
+        // each stream must present each row id exactly once.
+        let reduced_futures = inputs
+            .into_iter()
+            .map(|mut stream| async move {
+                let mut best_sim_by_row_id: HashMap<u64, f32> = HashMap::new();
+                let mut stream_min_sim: Option<f32> = None;
+                while let Some(batch) = stream.try_next().await? {
+                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let dists = batch[DIST_COL].as_primitive::<Float32Type>();
+                    debug_assert_eq!(dists.null_count(), 0);
 
-                // max-reduce for the same row id
-                let min_sim = dists
-                    .values()
-                    .last()
-                    .map(|dist| 1.0 - *dist)
-                    .unwrap_or_default();
-                let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_sims = Vec::with_capacity(row_ids.len());
-                let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
-
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
-                    // the results are sorted by distance, so we can skip if we have seen this row id before
-                    if visited_row_ids.contains(row_id) {
-                        continue;
+                    // The batches are sorted by distance, so the last row of
+                    // each batch carries that batch's worst similarity.
+                    if let Some(&worst_dist) = dists.values().last() {
+                        let batch_min_sim = 1.0 - worst_dist;
+                        stream_min_sim = Some(match stream_min_sim {
+                            Some(current) => current.min(batch_min_sim),
+                            None => batch_min_sim,
+                        });
                     }
-                    visited_row_ids.insert(row_id);
-                    new_row_ids.push(*row_id);
-                    // it's cosine distance, so we need to convert it to similarity
-                    new_sims.push(1.0 - *dist);
+                    for (&row_id, &dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                        // it's cosine distance, so we need to convert it to similarity
+                        let sim = 1.0 - dist;
+                        match best_sim_by_row_id.get_mut(&row_id) {
+                            // max-reduce: keep the best similarity when the same
+                            // row id appears in another batch of this stream
+                            Some(best) => *best = best.max(sim),
+                            None => {
+                                best_sim_by_row_id.insert(row_id, sim);
+                            }
+                        }
+                    }
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
-                let new_dists = Float32Array::from(new_sims);
-
+                let (row_ids, sims): (Vec<_>, Vec<_>) = best_sim_by_row_id.into_iter().unzip();
                 let batch = RecordBatch::try_new(
                     KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
+                    vec![
+                        Arc::new(Float32Array::from(sims)),
+                        Arc::new(UInt64Array::from(row_ids)),
+                    ],
                 )?;
 
-                Ok::<_, DataFusionError>((min_sim, batch))
+                Ok::<_, DataFusionError>((stream_min_sim.unwrap_or_default(), batch))
             })
-        }));
+            .collect::<Vec<_>>();
 
         let k = self.query.k;
         let refactor = self.query.refine_factor.unwrap_or(1) as usize;
@@ -3324,7 +3339,8 @@ impl ExecutionPlan for MultivectorScoringExec {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
-            while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
+            let reduced_inputs = futures::future::try_join_all(reduced_futures).await?;
+            for (min_sim, batch) in reduced_inputs {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
 
@@ -5383,6 +5399,62 @@ mod tests {
                 res = Some(new_res);
             }
         }
+
+        // A query stream can span multiple batches: the sort feeding this node
+        // chunks its top-fetch output at the session batch size, and multivector
+        // indexes legitimately repeat a parent row id per sub-vector, so the
+        // same row id can straddle a batch boundary. Each row id must still
+        // contribute once per query stream, keeping its best similarity.
+        let batch_42_best = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.1])),
+                Arc::new(UInt64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let batch_42_worse = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.2])),
+                Arc::new(UInt64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let batch_99 = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.5])),
+                Arc::new(UInt64Array::from(vec![99])),
+            ],
+        )
+        .unwrap();
+
+        // One stream split over two batches: row 42 keeps its best similarity
+        // (1.0 - 0.1) instead of accumulating (1.0 - 0.1) + (1.0 - 0.2).
+        let one_stream: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![
+            batch_42_best.clone(),
+            batch_42_worse.clone(),
+        ]));
+        let res = multivector_scoring(vec![one_stream], query.clone())
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[&42], 1.0f32 - (1.0f32 - 0.1f32));
+
+        // Two streams, one of them multi-batch: the multi-batch stream
+        // contributes one entry per row id and one min_sim, matching a
+        // single-batch stream that holds the same rows.
+        let two_streams = vec![
+            Arc::new(TestingExec::new(vec![batch_42_best])) as Arc<dyn ExecutionPlan>,
+            Arc::new(TestingExec::new(vec![batch_42_worse, batch_99])) as Arc<dyn ExecutionPlan>,
+        ];
+        let res = multivector_scoring(two_streams, query.clone())
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[&42], 2.0f32 - ((1.0f32 - 0.1f32) + (1.0f32 - 0.2f32)));
+        assert_eq!(res[&99], 2.0f32 - ((1.0f32 - 0.5f32) + (1.0f32 - 0.1f32)));
     }
 
     /// A test dataset for testing the nprobes parameter.
