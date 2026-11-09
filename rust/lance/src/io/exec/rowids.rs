@@ -427,10 +427,9 @@ impl AddRowOffsetExec {
     async fn compute_frag_id_to_offset(
         dataset: Arc<Dataset>,
     ) -> LanceResult<Arc<HashMap<u32, FragInfo>>> {
-        // The deletion vector fetch is a real object-store read on metadata-cache
-        // miss, so fetch the fragments concurrently instead of one at a time.
-        // `buffered` keeps fragment order, which the row-offset accumulation
-        // below depends on.
+        // On a metadata-cache miss, a deletion vector stored in a file costs an
+        // object-store read, so load all fragments concurrently. `buffered`
+        // keeps fragment order, which the row-offset accumulation below needs.
         let frag_infos = futures::stream::iter(dataset.get_fragments())
             .map(|frag| async move {
                 let deletion_vector = frag.get_deletion_vector().await?;
@@ -1010,8 +1009,8 @@ mod test {
 
     /// Planning a `_rowoffset` scan fetches one deletion file per fragment that
     /// has one. Those reads must overlap instead of going out one fragment at a
-    /// time, or planning latency scales linearly with the number of deleted
-    /// fragments.
+    /// time, or planning pays one read latency per fragment with a deletion
+    /// file.
     #[tokio::test]
     async fn test_row_offset_planning_overlaps_deletion_reads() {
         const NUM_FRAGMENTS: usize = 32;
@@ -1048,8 +1047,7 @@ mod test {
         scan.project(&[ROW_OFFSET]).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
 
-        // Behavior guard alongside the concurrency assertion: one survivor per
-        // fragment, so the live row offsets are exactly 0..NUM_FRAGMENTS.
+        // One survivor per fragment, so the live row offsets are 0..NUM_FRAGMENTS.
         let offsets = batch[ROW_OFFSET].as_primitive::<UInt64Type>().values();
         assert_eq!(offsets, &(0..NUM_FRAGMENTS as u64).collect::<Vec<_>>()[..]);
 
