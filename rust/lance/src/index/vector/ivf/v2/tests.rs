@@ -7453,6 +7453,7 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
     assert_ge!(recall, 0.5);
 }
 
+mod native_prewarm_tests;
 mod native_resident_tests;
 mod native_scan_tests;
 mod native_share_tests;
