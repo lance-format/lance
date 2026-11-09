@@ -1017,6 +1017,48 @@ async fn test_scan_order(
     assert_eq!(output[1], batch1);
 }
 
+/// Paging through an index-answered filter over an explicit fragment order
+/// must return every matching row once, in that order. The fragment listed
+/// first was appended after the index was built, so it is not covered.
+#[tokio::test]
+async fn test_scan_limit_offset_with_uncovered_fragment_first() {
+    let mut dataset = gen_batch()
+        .col("value", array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col("value", array::step_custom::<Int32Type>(10, 1))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    dataset.append(appended, None).await.unwrap();
+
+    let fragments = dataset.fragments().as_ref().clone();
+    let reversed = vec![fragments[1].clone(), fragments[0].clone()];
+    let mut values = Vec::new();
+    for offset in (0..20).step_by(2) {
+        let mut scan = dataset.scan();
+        scan.with_fragments(reversed.clone())
+            .filter("value < 1000")
+            .unwrap()
+            .limit(Some(2), Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        values.extend_from_slice(batch["value"].as_primitive::<Int32Type>().values());
+    }
+    let expected = (10..20).chain(0..10).collect::<Vec<i32>>();
+    assert_eq!(values, expected);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_scan_sort(
