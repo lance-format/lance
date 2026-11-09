@@ -12,8 +12,8 @@ This lets compaction and cleanup run while a holder builds an index or another
 result from the leased version. Unlike a tag, which retains a snapshot
 indefinitely, a lease can be renewed and expires if its holder stops renewing.
 The next attached commit removes an expired lease; until then, cleanup still
-honors it. The holder can explicitly release a lease when its work finishes or
-is abandoned.
+honors it. Committing the transaction the lease was acquired for releases it; the holder
+can also explicitly release a lease when its work is abandoned.
 
 Leases retain resources. The holder remains responsible for validating and
 publishing its result and protecting uncommitted output. Leases cannot cancel
@@ -41,7 +41,7 @@ values, and duplicate IDs. A corrupt list blocks lease mutations, including
 release, and affected destructive maintenance; it requires administrator repair.
 A valid lease can still be released if its leased version is unreadable.
 
-Acquisition and transactions carrying `release_lease_id` **must set** writer
+Lease operations **must set** writer
 flag 20 (`FLAG_RETENTION_LEASES`). A nonempty list without it is invalid.
 Once set, the flag **must remain set**, including when all leases are removed and
 through restore or clone. Leases require no additional reader flag; readers may
@@ -49,16 +49,13 @@ ignore the list.
 
 ## Identity and time
 
-A lease's ID is the UUID of its acquisition transaction. Distinct acquisitions
-**must use distinct IDs**, even after a lease is removed or a table or branch is
-recreated. Retries keep the same ID. The lease belongs to one table and branch;
-its `version` is the version created by its successful acquisition commit.
-
-Requests and handles **must stay bound** to that table and branch, including
-the existing [branch identifier](branch_tag.md#branch-identity) for named branches.
-The identifier's legacy recreation limits still apply. The owning service or
-catalog must prevent reuse across whole-table deletion and recreation at the
-same path; leases cannot detect that replacement.
+A lease's ID is the UUID of the transaction its holder intends to publish.
+Acquiring a lease declares that intent: retain the leased version until a
+transaction with that UUID commits, the lease is released, or it expires.
+The holder generates a fresh UUID for each acquisition; it **must differ** from
+the acquisition transaction's own UUID. Retries keep the same ID. The lease
+belongs to one table and branch; its `version` is the version created by its
+successful acquisition commit.
 
 `created_at` and `expires_at` are absolute UTC times. Holders choose both before
 the first acquisition attempt and preserve them on retries. A renewal likewise
@@ -73,15 +70,13 @@ format specifies no default duration, renewal schedule, or maximum lifetime.
 Lease decisions use the [authoritative current head](versioning.md#current-state-for-lease-decisions).
 To acquire lease P:
 
-1. Validate the target table and branch identity. If P is already listed,
-   recover its stored version, expiration, and label without changing them.
+1. If P is already listed, recover its stored version, expiration, and label without changing them.
 2. For a fresh submission, require an unexpired request. Resolve head H, build
    version H+1 from it, and add P with `version = H+1`.
 3. Publish atomically. A definitively lost attempt may retry against a newer
    head with the same ID and times. Recompute the version on each uncommitted
    attempt; once acquisition succeeds, the version stays fixed.
-4. Before confirming acquisition, verify the named-branch identity, current
-   unexpired membership with its stored version V, and a readable manifest for
+4. Before confirming acquisition, verify current unexpired membership with its stored version V, and a readable manifest for
    V. Return V. The holder **must wait for confirmation** before planning or
    reading V.
 
@@ -133,20 +128,20 @@ table, protection remains until another attached commit or explicit release.
 
 ## Publication and release
 
-An ordinary attached transaction may set `Transaction.release_lease_id` (field 5)
-to remove one lease atomically with its operation. The publication transaction has
-its own UUID. An absent field requests no release; an absent target makes only
-the release a no-op. The field is invalid on lease operations, Clone, and detached commits.
+An ordinary attached commit whose `Transaction.uuid`, parsed as a UUID, equals a listed lease ID
+removes that lease atomically with its operation. Lease operations, Clone, and
+detached commits never release a lease this way. If no listed lease matches,
+the commit proceeds unchanged.
 
 Apply the operation's existing validation and conflict rules. Its result and
-release **must commit together or neither commits**; a conflict rechecks both
-against the new predecessor. Intermediate publications keep their lease unless
-explicit release or expiration removes it.
+release **must commit together or neither commits**; a retry keeps its UUID and
+rechecks both against the new predecessor. Publications with other UUIDs keep
+the lease unless explicit release or expiration removes it.
 
 Once removal commits, the lease's retention guarantee ends. Publication validation
-and recovery belong to the holder and publication machinery. An absent lease
-is not proof that results were published. A holder using standalone release
-must separately confirm publication first, or abandon the work.
+and recovery belong to the holder and publication machinery. A retained
+transaction with the lease's UUID shows that the holder's result was published;
+an absent lease alone does not.
 
 ## Retention and data operations
 
@@ -161,9 +156,9 @@ all referenced resources: data, deletion files, overlays, indices, FRI metadata,
 mapping files, and transaction files. These must remain readable versions,
 not manifests whose data has been deleted. Shared files are retained once.
 
-Every attached commit whose result lists leases, or which carries
-`release_lease_id`, **must record its [transaction](transaction.md)** with its
-manifest. This includes release of the last lease or an already absent lease.
+Every attached commit whose result lists leases, or which releases a lease,
+**must record its [transaction](transaction.md)** with its manifest. This
+includes release of the last lease.
 Reject the commit if the transaction cannot be recorded. Retain the transactions
 of versions after F through H; the transaction that created F is not required
 solely by this retention rule.
@@ -229,9 +224,9 @@ FRI transition does not reclaim mappings referenced by retained versions.
 
 New branches and clones start with empty lease lists and preserve an inherited
 capability flag. Detached versions likewise serialize an empty list and inherited
-flag, without changing branch membership. They cannot contain lease operations or
-`release_lease_id`. Normal and force branch deletion must follow the
-[lease checks](branch_tag.md#deletion-with-retention-leases).
+flag, without changing branch membership. They cannot contain lease operations
+or release leases. Branch deletion does not check leases; deleting a branch
+ends its leases.
 
 ## Compatibility and implementation boundary
 
@@ -254,7 +249,4 @@ the file. Applications coordinating restore and cleanup can finish running
 cleanup first and pause new cleanup until lease confirmation; leases do not
 enforce that ordering.
 
-Branch deletion has the same inspection/deletion gap. It can miss a later lease,
-and delayed deletion after recovery and branch-name reuse can damage a replacement
-branch. Leases inherit these existing races and do not change branch-name reuse.
 Holders should acquire before reading and preserve ordinary cleanup grace protections.

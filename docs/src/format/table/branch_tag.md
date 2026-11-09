@@ -45,44 +45,6 @@ Each branch metadata file is a JSON file with the following fields:
 | `createAt`       | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
 | `manifestSize`   | number |          | Size of the initial manifest file in bytes.                                    |
 | `metadata`       | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object.    |
-| `identifier`     | object | Yes      | Branch identity. Older files may omit it; see [Branch identity](#branch-identity). |
-
-### Branch Identity
-
-`identifier.version_mapping` is an ordered JSON array of pairs. Each pair
-contains an unsigned 64-bit parent version and a UUID string. A new branch
-copies its parent's mapping and appends its own pair: the parent version it
-branched from and a fresh UUID. Newly generated UUIDs use 32 lowercase
-hexadecimal digits without hyphens. Main's mapping is empty.
-
-Compare the complete ordered mapping by value. Preserve an existing identifier
-when updating branch metadata. Lease requests retain the identifier read during
-acquisition and reject a different identifier on later inspection. This
-documents the existing branch representation; leases add no identity field.
-
-For an older file without `identifier`, derive a stable identifier from its
-branch name, `parentBranch`, `parentVersion`, and `createAt`. Apply the same
-fallback to the placeholder mapping containing one pair with version zero and
-the string `00000000000000000000000000000000`. The existing derivation is:
-
-1. Encode four lines as UTF-8, separated by a single LF byte, with no trailing
-   newline: `branch_name=<name>`, `parent_branch=<parent>`,
-   `parent_version=<version>`, and `create_at=<time>`. Use the unescaped branch
-   names, an empty parent for absent/null `parentBranch`, and unsigned decimal
-   integers without leading zeros.
-2. Hash those bytes twice. Start the first hash at `0xcbf29ce484222325`; start
-   the second at that value XOR `0x9e3779b97f4a7c15`. For each byte, XOR it into
-   the hash, then multiply by `0x100000001b3`, modulo `2^64`.
-3. Concatenate the two 8-byte hash values in big-endian order and encode the
-   resulting 16 bytes as 32 lowercase hexadecimal digits. The derived mapping
-   contains one pair: version zero and that string.
-
-The fallback is stable across reads, not a unique record of each creation.
-Recreating an older branch with identical inputs produces the same identifier.
-Applications must coordinate such recreation and must not reuse old lease
-requests or handles across it. Main's empty mapping likewise does not identify
-a particular creation of the whole table. No branch names are retired and no
-stored metadata needs migration.
 
 ### Branch Dataset Layout
 
@@ -121,26 +83,6 @@ which means `/` would create a logical subdirectory (e.g., `bugfix/issue-123`, `
                 _versions/
                     1.manifest
 ```
-
-### Deletion with retention leases
-
-Normal and force deletion **must resolve the
-[authoritative head](versioning.md#current-state-for-lease-decisions)**, validate
-its writer capabilities and lease list, and reject any listed leases, identifying
-the blocking IDs. Expired records still block
-deletion until a commit removes them. On an idle table, use explicit ReleaseLease;
-deletion does not expire leases itself. Existing tag and dependent-branch checks
-also apply.
-
-For an orphan with no branch reference, skip the lease check only when authoritative
-resolution proves there is no attached manifest. An unreadable or invalid head,
-or a resolution failure, **must fail deletion**. If the selected head disappears,
-resolve again rather than infer absence. Corrupt metadata requires administrator
-repair; force deletion cannot bypass the check.
-
-Inspection is separate from physical deletion. A later acquisition cannot stop
-a deletion already approved, and delayed deletion after recovery and name reuse
-may affect a replacement branch. See [cleanup and deletion races](retention_leases.md#cleanup-and-deletion-races).
 
 ## Tagging
 

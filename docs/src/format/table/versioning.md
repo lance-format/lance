@@ -53,8 +53,8 @@ Committing schema metadata `lance.blob.managed = "true"` activates the Managed B
 
 ## Current state for lease decisions
 
-Lease operations and recovery, transactions carrying `release_lease_id`, restore,
-overwrite, rewrite/trim checks, retention planning, and branch deletion through
+Lease operations and recovery, commits that release a lease, restore,
+overwrite, rewrite/trim checks, and retention planning through
 a lease-capable handler **must resolve the authoritative current attached head**.
 This includes maintenance triggered through an old or unflagged Dataset handle.
 A cached version or a hint that stops at a reclaimed gap is insufficient.

@@ -37,15 +37,6 @@ message Transaction {
    */
   map<string, string> transaction_properties = 4;
 
-  /* Optional lease to release atomically with this transaction's operation.
-   * Absent means no explicit release. Present requires exactly 16 UUID bytes;
-   * a missing target is a no-op for release, not for the accompanying operation.
-   * Valid only on an ordinary attached operation, not a lease operation or Clone.
-   * Apply normal publication checks before removal; set sticky writer bit 20.
-   * The transaction must be recorded with its manifest, even when no leases remain.
-   */
-  UUID release_lease_id = 5;
-
   // Add new rows to the dataset.
   message Append {
     /* The new fragments to append.
@@ -434,11 +425,16 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
-  /* Acquire a lease on the version this commit creates. Transaction.uuid
-   * must parse as a UUID and supplies the lease ID. Acquisition may rebase;
+  /* Acquire a lease on the version this commit creates. Acquisition may rebase;
    * the successful publishing version becomes the fixed leased version.
    */
   message AcquireLease {
+    /* The UUID of the transaction the holder intends to publish. Committing an
+     * ordinary attached transaction with this UUID releases the lease.
+     * Absent, any length other than 16 bytes, or equal to this transaction's
+     * own UUID is invalid. Retries preserve it.
+     */
+    UUID lease_id = 1;
     /* UTC request creation time, fixed before the first send.
      * Absent is invalid. The lease retains this value through retries/renewals.
      */

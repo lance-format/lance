@@ -41,10 +41,9 @@ message UUID {
  * are compared by those bytes.
  */
 message RetentionLease {
-  /* The acquiring Transaction.uuid parsed into its 16-byte UUID value.
-   * Absent or any length other than 16 bytes is invalid.
-   * Distinct logical acquisitions must use distinct IDs, including after reuse
-   * of a branch name or table path. Retries preserve the original ID.
+  /* The UUID of the transaction the holder intends to publish, as 16 bytes.
+   * Committing an ordinary attached transaction with this UUID releases the
+   * lease. Absent or any length other than 16 bytes is invalid.
    */
   UUID id = 1;
   /* The leased version: the version created by the successful acquisition commit.

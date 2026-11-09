@@ -608,14 +608,14 @@ same id, name, or path.
 ## Retention Lease Transactions
 
 `AcquireLease` (field 116), `RenewLease` (117), and `ReleaseLease` (118) update the
-current lease list. `Transaction.release_lease_id` (field 5) removes one lease
-atomically with an ordinary attached operation. None may be used in detached
-commits; the release field is also invalid on lease operations and Clone.
+current lease list. An ordinary attached operation whose `Transaction.uuid`, parsed as a UUID,
+equals a listed lease ID removes that lease atomically. Lease operations cannot
+be used in detached commits, and lease operations, Clone, and detached commits
+never release a lease by UUID.
 
 The [Retention Leases specification](retention_leases.md) defines acquisition,
 confirmation, expiration, transaction recording, and retention. Lease changes
-**must not bypass** existing data conflicts, writer-capability checks, or
-branch identity. Unknown operations retain their fail-closed conflict behavior.
+**must not bypass** existing data conflicts or writer-capability checks. Unknown operations retain their fail-closed conflict behavior.
 Config and metadata maps cannot mutate leases.
 
 ### Directional conflict rules
@@ -629,9 +629,9 @@ For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLe
 
 | Incoming operation | Required behavior |
 | --- | --- |
-| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, apply any explicit release, and preserve the rest. |
+| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, release the lease matching the transaction UUID if listed, and preserve the rest. |
 | Rewrite | Recheck current lease requirements before committing. Missing required transitions require replanning, even if planning preceded acquisition. |
-| Restore, Overwrite | Use current leases and the sticky capability, apply expiration and release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
+| Restore, Overwrite | Use current leases and the sticky capability, apply expiration and UUID-matched release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
 | Clone | Start the destination with no leases and preserve the inherited capability. Do not transfer lease mutations or ownership to the destination. |
 | AcquireLease | Recover a listed ID without changing it. Otherwise, a fresh or definitively lost attempt uses the new head and an unexpired request. Uncertain recovery stays read-only. |
 | RenewLease | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |

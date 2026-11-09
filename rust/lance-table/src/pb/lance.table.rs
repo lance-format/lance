@@ -809,10 +809,9 @@ impl ::prost::Name for Uuid {
 /// are compared by those bytes.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetentionLease {
-    /// The acquiring Transaction.uuid parsed into its 16-byte UUID value.
-    /// Absent or any length other than 16 bytes is invalid.
-    /// Distinct logical acquisitions must use distinct IDs, including after reuse
-    /// of a branch name or table path. Retries preserve the original ID.
+    /// The UUID of the transaction the holder intends to publish, as 16 bytes.
+    /// Committing an ordinary attached transaction with this UUID releases the
+    /// lease. Absent or any length other than 16 bytes is invalid.
     #[prost(message, optional, tag = "1")]
     pub id: ::core::option::Option<Uuid>,
     /// The leased version: the version created by the successful acquisition commit.
@@ -1987,14 +1986,6 @@ pub struct Transaction {
     #[prost(map = "string, string", tag = "4")]
     pub transaction_properties:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Optional lease to release atomically with this transaction's operation.
-    /// Absent means no explicit release. Present requires exactly 16 UUID bytes;
-    /// a missing target is a no-op for release, not for the accompanying operation.
-    /// Valid only on an ordinary attached operation, not a lease operation or Clone.
-    /// Apply normal publication checks before removal; set sticky writer bit 20.
-    /// The transaction must be recorded with its manifest, even when no leases remain.
-    #[prost(message, optional, tag = "5")]
-    pub release_lease_id: ::core::option::Option<Uuid>,
     /// The operation of this transaction.
     ///
     /// Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -2720,11 +2711,16 @@ pub mod transaction {
             "/lance.table.Transaction.UpdateBases".into()
         }
     }
-    /// Acquire a lease on the version this commit creates. Transaction.uuid
-    /// must parse as a UUID and supplies the lease ID. Acquisition may rebase;
+    /// Acquire a lease on the version this commit creates. Acquisition may rebase;
     /// the successful publishing version becomes the fixed leased version.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct AcquireLease {
+        /// The UUID of the transaction the holder intends to publish. Committing an
+        /// ordinary attached transaction with this UUID releases the lease.
+        /// Absent, any length other than 16 bytes, or equal to this transaction's
+        /// own UUID is invalid. Retries preserve it.
+        #[prost(message, optional, tag = "1")]
+        pub lease_id: ::core::option::Option<super::Uuid>,
         /// UTC request creation time, fixed before the first send.
         /// Absent is invalid. The lease retains this value through retries/renewals.
         #[prost(message, optional, tag = "2")]
