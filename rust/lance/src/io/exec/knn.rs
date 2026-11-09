@@ -3285,8 +3285,8 @@ impl ExecutionPlan for MultivectorScoringExec {
         let reduced_futures = inputs
             .into_iter()
             .map(|mut stream| async move {
-                let mut best_sim_by_row_id: HashMap<u64, f32> = HashMap::new();
-                let mut stream_min_sim: Option<f32> = None;
+                let mut query_results: HashMap<u64, f32> = HashMap::new();
+                let mut min_sim = 0.0;
                 while let Some(batch) = stream.try_next().await? {
                     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                     let dists = batch[DIST_COL].as_primitive::<Float32Type>();
@@ -3294,30 +3294,18 @@ impl ExecutionPlan for MultivectorScoringExec {
 
                     // the results are sorted by distance, so the last row is the worst
                     if let Some(&worst_dist) = dists.values().last() {
-                        let batch_min_sim = 1.0 - worst_dist;
-                        stream_min_sim = Some(
-                            stream_min_sim.map_or(batch_min_sim, |sim| sim.min(batch_min_sim)),
-                        );
+                        min_sim = 1.0 - worst_dist;
                     }
                     for (&row_id, &dist) in row_ids.values().iter().zip(dists.values().iter()) {
                         // it's cosine distance, so we need to convert it to similarity
                         let sim = 1.0 - dist;
-                        best_sim_by_row_id
+                        query_results
                             .entry(row_id)
                             .and_modify(|best| *best = best.max(sim))
                             .or_insert(sim);
                     }
                 }
-                let (row_ids, sims): (Vec<_>, Vec<_>) = best_sim_by_row_id.into_iter().unzip();
-                let batch = RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![
-                        Arc::new(Float32Array::from(sims)),
-                        Arc::new(UInt64Array::from(row_ids)),
-                    ],
-                )?;
-
-                Ok::<_, DataFusionError>((stream_min_sim.unwrap_or_default(), batch))
+                Ok::<_, DataFusionError>((min_sim, query_results))
             })
             .collect::<Vec<_>>();
 
@@ -3329,17 +3317,7 @@ impl ExecutionPlan for MultivectorScoringExec {
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
             let reduced_inputs = futures::future::try_join_all(reduced_futures).await?;
-            for (min_sim, batch) in reduced_inputs {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let sims = batch[DIST_COL].as_primitive::<Float32Type>();
-
-                let query_results = row_ids
-                    .values()
-                    .iter()
-                    .copied()
-                    .zip(sims.values().iter().copied())
-                    .collect::<HashMap<_, _>>();
-
+            for (min_sim, query_results) in reduced_inputs {
                 // for a row `r`:
                 // if `r` is in only `results``, then `results[r] += min_sim`
                 // if `r` is in only `query_results`, then `results[r] = query_results[r] + missed_similarities`,
@@ -5428,19 +5406,28 @@ mod tests {
         assert_eq!(res.len(), 1);
         assert_eq!(res[&42], 1.0f32 - (1.0f32 - 0.1f32));
 
-        // Two streams, one of them multi-batch: the multi-batch stream
-        // contributes one entry per row id and one min_sim, matching a
-        // single-batch stream that holds the same rows.
+        // Two streams, the second split over two batches. Row 7 is missing
+        // from the second stream, so it is charged that stream's min_sim, which
+        // comes from its last batch.
+        let batch_42_and_7 = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.1, 0.3])),
+                Arc::new(UInt64Array::from(vec![42, 7])),
+            ],
+        )
+        .unwrap();
         let two_streams = vec![
-            Arc::new(TestingExec::new(vec![batch_42_best])) as Arc<dyn ExecutionPlan>,
+            Arc::new(TestingExec::new(vec![batch_42_and_7])) as Arc<dyn ExecutionPlan>,
             Arc::new(TestingExec::new(vec![batch_42_worse, batch_99])) as Arc<dyn ExecutionPlan>,
         ];
         let res = multivector_scoring(two_streams, query.clone())
             .await
             .unwrap();
-        assert_eq!(res.len(), 2);
+        assert_eq!(res.len(), 3);
         assert_eq!(res[&42], 2.0f32 - ((1.0f32 - 0.1f32) + (1.0f32 - 0.2f32)));
-        assert_eq!(res[&99], 2.0f32 - ((1.0f32 - 0.5f32) + (1.0f32 - 0.1f32)));
+        assert_eq!(res[&7], 2.0f32 - ((1.0f32 - 0.3f32) + (1.0f32 - 0.5f32)));
+        assert_eq!(res[&99], 2.0f32 - ((1.0f32 - 0.5f32) + (1.0f32 - 0.3f32)));
     }
 
     /// A test dataset for testing the nprobes parameter.
