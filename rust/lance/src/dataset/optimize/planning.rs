@@ -7,7 +7,7 @@
 //! and [`TaskData`] contracts, but never rewrites data or publishes a manifest.
 //! Tests live in `optimize/tests/planning.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -768,11 +768,13 @@ impl DefaultCompactionPlanner {
     ///
     /// Refused before anything is written: an empty group, a group out of
     /// ascending id order, a fragment absent from the dataset, named by two
-    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`]; and
-    /// a selected source covered by an index this build cannot read (a member
-    /// left alone may be covered). `max_source_fragments`,
-    /// `max_source_rows` and `max_source_bytes` bound the selected tasks, in
-    /// group order.
+    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
+    /// A member covered by an index this build cannot read is held back
+    /// instead of refusing the plan: no metric of it is read, it is left out of
+    /// every task, one log line names a bounded sample of the held ids, and
+    /// the rest of its group and every other group still plan.
+    /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
+    /// the selected tasks, in group order.
     pub async fn plan_groups(
         &self,
         dataset: &Dataset,
@@ -848,16 +850,65 @@ impl DefaultCompactionPlanner {
                 }
             }
         }
-        // Coverage by an index this build cannot read is checked against the
-        // sources actually selected below, not against every named member:
-        // a member ordinary candidacy leaves alone is never rewritten, so its
-        // coverage is no obstacle to the rest of its group.
+        // A fragment covered by an index this build cannot read is held out of
+        // every group before binning, for the reason ordinary planning folds
+        // that coverage into its exclusions: the index is left addressing the
+        // rows it already addresses, and the other members of the same group
+        // and of every other group still plan. Group boundaries are untouched.
         let unreadable_coverage =
             if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
                 unremappable_index_coverage(dataset).await?
             } else {
                 Vec::new()
             };
+        let held_back =
+            unreadable_coverage
+                .iter()
+                .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
+                    covered |= fragments;
+                    covered
+                });
+        // Otherwise a group that plans nothing looks like a group with nothing
+        // to do. One summary line per plan, over the requested fragments only:
+        // coverage of fragments no group named changes nothing here. The ids
+        // are sampled, so coverage of an arbitrarily wide index cannot turn one
+        // plan into an unbounded line; which group and which index held each
+        // one is a debug detail.
+        let held: BTreeSet<u64> = groups
+            .iter()
+            .flat_map(|group| group.fragments.iter().map(|fragment| fragment.id))
+            .filter(|id| u32::try_from(*id).is_ok_and(|id| held_back.contains(id)))
+            .collect();
+        if !held.is_empty() {
+            log::info!(
+                "holding {} of this plan's {} requested fragment(s) back from compaction, \
+                 including {}: they are covered by an index this build cannot read, and so \
+                 cannot be remapped here",
+                held.len(),
+                named.len(),
+                describe_held(&held),
+            );
+            if log::log_enabled!(log::Level::Debug) {
+                for (group_index, group) in groups.iter().enumerate() {
+                    for (index, covered) in &unreadable_coverage {
+                        let held_here: BTreeSet<u64> = group
+                            .fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .filter(|id| u32::try_from(*id).is_ok_and(|id| covered.contains(id)))
+                            .collect();
+                        if !held_here.is_empty() {
+                            log::debug!(
+                                "compaction group {} holds back {}, covered by index {:?}",
+                                group_index,
+                                describe_held(&held_here),
+                                index,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let schema_field_ids = dataset
             .schema()
@@ -869,64 +920,86 @@ impl DefaultCompactionPlanner {
             CompactionMode::ForceBinaryCopy
         );
 
-        // One candidate bin per group: its members that ordinary planning
-        // would compact, in order. A member it would leave alone stays out of
-        // the bin and untouched.
-        // Metrics for every member of every group, read with the same bounded
+        // Metrics for every measured member of every group, read with the same bounded
         // parallelism as ordinary planning; `buffered` keeps input order, so
-        // the results line up with the groups.
+        // the results line up with the groups. A held-back member is a `None`
+        // sentinel instead: no metric of it is read, since it will not be
+        // planned either way, and the sentinel keeps the gap it leaves visible
+        // to the binning below.
         let present = &present;
+        let held_back = &held_back;
         let members = groups
             .iter()
             .enumerate()
             .flat_map(|(group_index, group)| {
-                group
-                    .fragments
-                    .iter()
-                    .map(move |listed| (group_index, present[&listed.id].clone()))
+                group.fragments.iter().map(move |listed| {
+                    let held = u32::try_from(listed.id).is_ok_and(|id| held_back.contains(id));
+                    (group_index, (!held).then(|| present[&listed.id].clone()))
+                })
             })
             .collect::<Vec<_>>();
-        let mut measured: Vec<(usize, Fragment, FragmentMetrics)> = futures::stream::iter(members)
-            .map(|(group_index, fragment)| async move {
-                collect_metrics(&fragment)
-                    .await
-                    .map(|metrics| (group_index, fragment.metadata, metrics))
-            })
-            .buffered(dataset.object_store.as_ref().io_parallelism())
-            .try_collect()
-            .await?;
+        let mut measured: Vec<(usize, Option<(Fragment, FragmentMetrics)>)> =
+            futures::stream::iter(members)
+                .map(|(group_index, fragment)| async move {
+                    let Some(fragment) = fragment else {
+                        return Ok((group_index, None));
+                    };
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| (group_index, Some((fragment.metadata, metrics))))
+                })
+                .buffered(dataset.object_store.as_ref().io_parallelism())
+                .try_collect()
+                .await?;
         measured.reverse();
 
         let mut bins = Vec::with_capacity(groups.len());
         let mut properties = Vec::with_capacity(groups.len());
         for (group_index, group) in groups.into_iter().enumerate() {
-            let mut fragments = Vec::new();
-            let mut candidacy = Vec::new();
-            let mut row_counts = Vec::new();
+            // A held-back member is the only thing that terminates a run here:
+            // its rows stay addressed by an index this build cannot read, so
+            // the candidates on either side of it must not be planned
+            // together. Any other non-candidate - an over-target member, say -
+            // is skipped without ending the run, so the candidates around it
+            // still compact as one task. This is narrower than ordinary
+            // planning, which ends its bin at every non-candidate: a group is
+            // an explicit request to compact those fragments together, and
+            // only coverage this build cannot remap overrides it.
+            let mut runs: Vec<CandidateBin> = Vec::new();
+            let mut current: Option<CandidateBin> = None;
             for _ in &group.fragments {
-                let Some((measured_group, fragment, metrics)) = measured.pop() else {
+                let Some((measured_group, measured_member)) = measured.pop() else {
                     return Err(Error::internal(
                         "grouped compaction lost a fragment's metrics",
                     ));
                 };
                 debug_assert_eq!(measured_group, group_index);
+                let Some((fragment, metrics)) = measured_member else {
+                    runs.extend(current.take());
+                    continue;
+                };
                 if let Some(reason) =
                     self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
                 {
-                    candidacy.push(reason);
-                    row_counts.push(metrics.num_rows());
-                    fragments.push(fragment);
+                    let current = current.get_or_insert_with(|| CandidateBin {
+                        fragments: Vec::new(),
+                        pos_range: 0..0,
+                        candidacy: Vec::new(),
+                        row_counts: Vec::new(),
+                        indices: Vec::new(),
+                    });
+                    current.candidacy.push(reason);
+                    current.row_counts.push(metrics.num_rows());
+                    current.fragments.push(fragment);
+                    current.pos_range.end = current.fragments.len();
                 }
             }
-            let len = fragments.len();
-            bins.push(CandidateBin {
-                fragments,
-                pos_range: 0..len,
-                candidacy,
-                row_counts,
-                indices: Vec::new(),
-            });
-            properties.push((group.output_clustering_id, group.output_metadata));
+            runs.extend(current);
+            let properties_of_group = (group.output_clustering_id, group.output_metadata);
+            for run in runs {
+                bins.push(run);
+                properties.push(properties_of_group.clone());
+            }
         }
 
         // Split each group at index boundaries exactly as ordinary planning
@@ -1034,22 +1107,16 @@ impl DefaultCompactionPlanner {
         };
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        // Checked last, over the tasks the budgets kept: only a source that
-        // will really be rewritten can refuse the plan, the same set the
-        // commit's safeguard checks.
-        for (index, covered) in &unreadable_coverage {
-            if let Some(fragment) = tasks
+        // The hold-back above kept every covered fragment out of every bin, so
+        // no task can name one; `reject_unremappable_rewrite` checks the
+        // sources again at commit time, against the manifest of the moment.
+        debug_assert!(
+            !tasks
                 .iter()
                 .flat_map(|task| &task.fragments)
-                .find(|fragment| u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id)))
-            {
-                return Err(Error::invalid_input(format!(
-                    "compaction group selects fragment {} for rewriting, which is covered by \
-                     index '{index}' that this build cannot read and so cannot remap",
-                    fragment.id
-                )));
-            }
-        }
+                .any(|fragment| u32::try_from(fragment.id).is_ok_and(|id| held_back.contains(id))),
+            "grouped compaction selected a held-back fragment"
+        );
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
@@ -1358,6 +1425,25 @@ impl FragmentMetrics {
     }
 }
 
+/// The number of held-back fragment ids a log line names before summarizing.
+pub(super) const HELD_BACK_SAMPLE_LIMIT: usize = 8;
+
+/// Render held-back fragment ids for a log line: the first
+/// [`HELD_BACK_SAMPLE_LIMIT`] in ascending order, then how many are left, so
+/// that coverage of an arbitrarily wide index cannot produce an unbounded line.
+pub(super) fn describe_held(ids: &BTreeSet<u64>) -> String {
+    let sample = ids
+        .iter()
+        .take(HELD_BACK_SAMPLE_LIMIT)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ids.len().saturating_sub(HELD_BACK_SAMPLE_LIMIT) {
+        0 => format!("fragment(s) {sample}"),
+        more => format!("fragment(s) {sample} and {more} more"),
+    }
+}
+
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     let physical_rows = fragment.physical_rows();
     let num_deletions = fragment.count_deletions();
@@ -1546,6 +1632,11 @@ pub(super) enum CompactionCandidacy {
 /// Internal struct used for planning compaction.
 pub(super) struct CandidateBin {
     pub fragments: Vec<Fragment>,
+    /// Where these fragments sit in the sequence this run binned, not in the
+    /// manifest: the whole-dataset planner counts the fragments it considered,
+    /// and grouped planning counts within the group's own run. Only
+    /// [`Self::split_for_size`] and the planning logs read it, both of which
+    /// just need the ranges of one run to partition that run.
     pub pos_range: Range<usize>,
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
