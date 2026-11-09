@@ -2308,7 +2308,7 @@ mod tests {
     use crate::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
     use crate::index::CreateIndexBuilder;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::vector::coarse_quantizer::common_fingerprint;
+    use crate::index::vector::coarse_quantizer::{CoarseQuantizerFingerprint, common_fingerprint};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     #[test]
@@ -2803,6 +2803,17 @@ mod tests {
                 .open_logical_vector_index("vector", "vector_idx")
                 .await
                 .unwrap();
+            for (metadata, index) in logical.iter() {
+                let expected =
+                    CoarseQuantizerFingerprint::from_model(index.ivf_model(), index.metric_type())
+                        .unwrap();
+                assert_eq!(
+                    CoarseQuantizerFingerprint::from_metadata(metadata),
+                    Some(expected),
+                    "segment {} must describe its final model after rebalancing round {round}",
+                    metadata.uuid
+                );
+            }
             let partitions = logical.as_ivf().unwrap().num_partitions_per_segment();
             assert_eq!(partitions[0].1, num_partitions);
             assert_eq!(
@@ -3095,9 +3106,19 @@ mod tests {
             .unwrap();
         let retrained = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
         assert_eq!(retrained.len(), 1);
-        assert!(
-            common_fingerprint(&retrained).is_some(),
-            "retrain must persist the new final IVF routing identity"
+        let retrained_index = dataset
+            .open_vector_index("vector", &retrained[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected = CoarseQuantizerFingerprint::from_model(
+            retrained_index.ivf_model(),
+            retrained_index.metric_type(),
+        )
+        .unwrap();
+        assert_eq!(
+            CoarseQuantizerFingerprint::from_metadata(&retrained[0]),
+            Some(expected),
+            "retrain must persist the identity of the reopened final IVF model"
         );
         assert_eq!(
             retrained[0].fragment_bitmap.as_ref().unwrap(),

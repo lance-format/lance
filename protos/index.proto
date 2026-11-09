@@ -235,7 +235,9 @@ message VectorIndexDetails {
    * Content-derived identity of this segment's final IVF coarse-routing state.
    * Readers may reuse routing only for identical, well-formed values. It is
    * absent for legacy or unsupported routers. The current encoding is a
-   * 32-byte BLAKE3 digest.
+   * 32-byte BLAKE3 digest. Its canonical input encoding and lifecycle are
+   * defined in docs/src/format/index/vector/index.md under
+   * "Coarse-routing fingerprint".
    */
   optional bytes coarse_quantizer_fingerprint = 10;
 }
