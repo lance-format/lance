@@ -41,7 +41,10 @@ use crate::io::{
 use crate::rowids::version::build_version_meta;
 use crate::rowids::{read_row_ids, write_row_ids};
 use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
-use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use crate::system_index::frag_reuse::{
+    FRAG_REUSE_INDEX_NAME, FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY,
+    frag_reuse_inline_details_limit, is_frag_reuse_index_entry,
+};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
     CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, check_mem_wal_dir_id,
@@ -94,23 +97,16 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .is_some_and(|value| str_is_truthy(value))
 }
 
-fn changes_auto_cleanup_config(operation: &Operation) -> bool {
-    let is_auto_cleanup_key = |key: &str| key.starts_with("lance.auto_cleanup.");
+fn changes_config(operation: &Operation, is_key: impl Fn(&str) -> bool) -> bool {
     match operation {
         Operation::Overwrite {
             config_upsert_values: Some(values),
             ..
-        } => values.keys().any(|key| is_auto_cleanup_key(key)),
+        } => values.keys().any(|key| is_key(key)),
         Operation::UpdateConfig {
             config_updates: Some(update),
             ..
-        } => {
-            update.replace
-                || update
-                    .update_entries
-                    .iter()
-                    .any(|entry| is_auto_cleanup_key(&entry.key))
-        }
+        } => update.replace || update.update_entries.iter().any(|entry| is_key(&entry.key)),
         _ => false,
     }
 }
@@ -2239,8 +2235,15 @@ impl Transaction {
             _ => {}
         }
 
-        if changes_auto_cleanup_config(&self.operation) {
+        if changes_config(&self.operation, |key| {
+            key.starts_with("lance.auto_cleanup.")
+        }) {
             validate_auto_cleanup_config(&manifest)?;
+        }
+        if changes_config(&self.operation, |key| {
+            key == FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY
+        }) {
+            frag_reuse_inline_details_limit(&manifest.config)?;
         }
 
         apply_range_segments(&mut manifest, current_manifest)?;

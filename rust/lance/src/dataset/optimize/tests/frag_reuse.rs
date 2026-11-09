@@ -1551,13 +1551,42 @@ async fn test_concurrent_cleanup_and_compaction_rebase_compaction() {
     let new_frags2 = frag_reuse_details.versions[0].new_frag_ids();
     assert!(new_frags2.iter().all(|id| *id != 0));
 }
+/// An invalid inline details limit is refused when it is set, not only when a
+/// writer reads it.
+#[tokio::test]
+async fn test_invalid_reuse_details_limit_is_refused_when_set() {
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    let version = dataset.manifest.version;
+    let error = dataset
+        .update_config([(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY, "-1")])
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY) && message.contains("`-1`"),
+        "{message}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.manifest.version, version);
+    assert!(
+        !dataset
+            .config()
+            .contains_key(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY)
+    );
+}
 /// Two external entries of the same size each load their own details from one session.
 #[tokio::test]
 async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use crate::utils::test::padding_reuse_versions;
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY;
     let dir = TempStrDir::default();
-    let dataset = lance_datagen::gen_batch()
+    let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
         .into_dataset(
             dir.as_str(),
@@ -1566,7 +1595,11 @@ async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
         )
         .await
         .unwrap();
-    let count = inline_padding_capacity() as u64 + 1;
+    dataset
+        .update_config([(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY, "0")])
+        .await
+        .unwrap();
+    let count = 2;
     let mut entries = Vec::new();
     for stamp in [1, 2] {
         let mut versions = padding_reuse_versions(count);
@@ -1610,9 +1643,10 @@ async fn test_reuse_details_cache_keeps_entries_of_one_size_apart() {
 #[tokio::test]
 async fn test_reuse_details_cache_holds_what_a_read_decodes() {
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
-    use crate::utils::test::{inline_padding_capacity, padding_reuse_versions};
+    use crate::utils::test::padding_reuse_versions;
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY;
     let dir = TempStrDir::default();
-    let dataset = lance_datagen::gen_batch()
+    let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
         .into_dataset(
             dir.as_str(),
@@ -1621,7 +1655,11 @@ async fn test_reuse_details_cache_holds_what_a_read_decodes() {
         )
         .await
         .unwrap();
-    let mut versions = padding_reuse_versions(inline_padding_capacity() as u64 + 1);
+    dataset
+        .update_config([(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY, "0")])
+        .await
+        .unwrap();
+    let mut versions = padding_reuse_versions(3);
     let count = versions.len() as u64;
     for (i, version) in versions.iter_mut().enumerate() {
         version.dataset_version = count - i as u64;
@@ -1668,7 +1706,10 @@ async fn test_deferred_compaction_writes_reuse_details_once(
     #[values(true, false)] external_before: bool,
     #[values(true, false)] cached: bool,
 ) {
-    use crate::utils::test::{commit_padding_reuse_history, inline_padding_capacity};
+    use crate::utils::test::{commit_padding_reuse_history, padding_reuse_versions};
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY;
+    use prost::Message;
     let dir = TempStrDir::default();
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -1683,19 +1724,25 @@ async fn test_deferred_compaction_writes_reuse_details_once(
         )
         .await
         .unwrap();
+    // Exactly one padding version fits inline.
+    let inline_details_limit =
+        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: padding_reuse_versions(1),
+        })
+        .encoded_len()
+        .to_string();
+    dataset
+        .update_config([(
+            FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY,
+            inline_details_limit.as_str(),
+        )])
+        .await
+        .unwrap();
     create_scalar_index(&mut dataset, "i", false).await;
     // Scattered deletions make the compaction's own version larger than a padding one.
     dataset.delete("i % 3 = 1").await.unwrap();
-    let capacity = inline_padding_capacity();
-    let history = commit_padding_reuse_history(
-        &mut dataset,
-        if external_before {
-            capacity + 1
-        } else {
-            capacity
-        },
-    )
-    .await;
+    let history =
+        commit_padding_reuse_history(&mut dataset, if external_before { 2 } else { 1 }).await;
     assert_eq!(stores_reuse_details_externally(&history), external_before);
 
     let session = if cached {

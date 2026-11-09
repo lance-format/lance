@@ -19,6 +19,7 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 };
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
+use lance_table::system_index::frag_reuse::frag_reuse_inline_details_limit;
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
@@ -881,7 +882,9 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         .sort_by_key(|version| version.dataset_version);
     let index_id = uuid::Uuid::new_v4();
     let new_index_details_proto = InlineContent::from(&new_index_details);
-    let proto = if new_index_details_proto.encoded_len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
+    let proto = if new_index_details_proto.encoded_len()
+        > frag_reuse_inline_details_limit(&dataset.manifest.config)?
+    {
         let file_path = dataset
             .indices_dir()
             .join(index_id.to_string())
@@ -2030,6 +2033,7 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         dataset.indices_dir(),
         index_id,
         content,
+        frag_reuse_inline_details_limit(&dataset.manifest.config)?,
     )
     .await?;
 
@@ -2056,15 +2060,16 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
 }
 
 /// Encode validated tagged FRI content bytes as an `index_details` value,
-/// spilling to `<indices_dir>/<index_id>/details.binpb` above the inline
-/// threshold.
+/// spilling to `<indices_dir>/<index_id>/details.binpb` above
+/// `inline_details_limit` bytes.
 async fn encode_tagged_frag_reuse_details(
     object_store: &ObjectStore,
     indices_dir: Path,
     index_id: Uuid,
     content: Vec<u8>,
+    inline_details_limit: usize,
 ) -> lance_core::Result<Vec<u8>> {
-    if content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
+    if content.len() > inline_details_limit {
         let file_path = indices_dir
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME);
@@ -2084,9 +2089,6 @@ async fn encode_tagged_frag_reuse_details(
         Ok(encode_length_delimited_field(1, &content))
     }
 }
-
-/// Details above this size spill to an external `details.binpb` file.
-pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
 
 /// `InlineContent.Transition.stable_partition` (proto field 4).
 const STABLE_PARTITION_FIELD: u32 = 4;
@@ -2399,15 +2401,22 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
 
     let index_id = Uuid::new_v4();
     let target_indices_dir = target_base.clone().join(crate::dataset::INDICES_DIR);
-    let spilled = (relocated.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT).then(|| {
+    // The clone inherits the source's table config.
+    let inline_details_limit = frag_reuse_inline_details_limit(&source_manifest.config)?;
+    let spilled = (relocated.len() > inline_details_limit).then(|| {
         target_indices_dir
             .clone()
             .join(index_id.to_string())
             .join(FRAG_REUSE_DETAILS_FILE_NAME)
     });
-    let details_value =
-        encode_tagged_frag_reuse_details(target_store, target_indices_dir, index_id, relocated)
-            .await?;
+    let details_value = encode_tagged_frag_reuse_details(
+        target_store,
+        target_indices_dir,
+        index_id,
+        relocated,
+        inline_details_limit,
+    )
+    .await?;
     Ok((
         IndexMetadata {
             uuid: index_id,

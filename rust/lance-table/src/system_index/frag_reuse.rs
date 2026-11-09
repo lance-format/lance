@@ -26,6 +26,45 @@ use crate::format::{ExternalFile, Fragment, IndexMetadata, pb};
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
 
+/// Table config key: the largest encoded size, in bytes, of fragment reuse
+/// index details that writers keep inline in the manifest. Larger details go
+/// to an external [`FRAG_REUSE_DETAILS_FILE_NAME`] file. This affects new
+/// writes only; readers load either layout.
+pub const FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY: &str =
+    "lance.frag_reuse.inline_details_limit";
+
+/// The inline details limit when
+/// [`FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY`] is unset.
+pub const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
+
+/// The inline details limit a table `config` sets, or
+/// [`FRAG_REUSE_INLINE_DETAILS_LIMIT`] when unset.
+///
+/// ```
+/// # use std::collections::HashMap;
+/// # use lance_table::system_index::frag_reuse::*;
+/// let config = HashMap::from([(
+///     FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY.to_string(),
+///     "0".to_string(),
+/// )]);
+/// assert_eq!(frag_reuse_inline_details_limit(&config).unwrap(), 0);
+/// assert_eq!(
+///     frag_reuse_inline_details_limit(&HashMap::new()).unwrap(),
+///     FRAG_REUSE_INLINE_DETAILS_LIMIT
+/// );
+/// ```
+pub fn frag_reuse_inline_details_limit(config: &HashMap<String, String>) -> Result<usize> {
+    let Some(value) = config.get(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY) else {
+        return Ok(FRAG_REUSE_INLINE_DETAILS_LIMIT);
+    };
+    value.parse().map_err(|err| {
+        Error::invalid_input(format!(
+            "table config {FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY} must be a non-negative \
+             number of bytes, got `{value}`: {err}"
+        ))
+    })
+}
+
 /// Whether `index` is the fragment reuse index itself, not a user index that
 /// borrows its name.
 pub fn is_frag_reuse_index_entry(index: &IndexMetadata) -> bool {
@@ -572,6 +611,26 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::non_numeric("200KB")]
+    #[case::negative("-1")]
+    #[case::overflowing("18446744073709551616")]
+    #[case::empty("")]
+    fn test_invalid_inline_details_limit_is_rejected(#[case] value: &str) {
+        let config = HashMap::from([(
+            FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY.to_string(),
+            value.to_string(),
+        )]);
+        let error = frag_reuse_inline_details_limit(&config).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(FRAG_REUSE_INLINE_DETAILS_LIMIT_CONFIG_KEY),
+            "{message}"
+        );
+        assert!(message.contains(&format!("`{value}`")), "{message}");
+    }
 
     fn addr(fragment_id: u32, offset: u32) -> u64 {
         u64::from(lance_core::utils::address::RowAddress::new_from_parts(
