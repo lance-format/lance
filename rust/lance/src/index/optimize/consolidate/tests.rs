@@ -788,21 +788,23 @@ async fn deleted_rows_do_not_count_toward_the_segment_limit() {
 }
 
 #[tokio::test]
-async fn an_unsatisfiable_limit_is_rejected_before_training() {
+async fn a_fragment_larger_than_the_limits_is_an_output_of_its_own() {
     let dir = TempStrDir::default();
-    let dataset = fixture(&dir, false).await;
+    let mut dataset = fixture(&dir, false).await;
     let old = segments(&dataset).await;
-    let index_dirs = || {
-        std::fs::read_dir(format!("{}/_indices", dir.as_str()))
-            .unwrap()
-            .count()
-    };
-    let before = index_dirs();
-    // The models differ, so a valid request would train one.
-    let options = select(&[&old[1], &old[2]]).max_rows_per_task(Some(1));
-    let error = plan_optimize_indices(&dataset, &options).await.unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    assert_eq!(index_dirs(), before);
+    let limit = Some(SMALL as u64 / 2);
+    let options = select(&[&old[1], &old[2]])
+        .max_rows_per_task(limit)
+        .max_rows_per_segment(limit);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 2);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 3);
+    for output in &new[1..] {
+        assert_eq!(indexed_rows(&dataset, output).await, SMALL as u64);
+    }
+    assert_query(&dataset, BASE + 2 * SMALL).await;
 }
 
 #[tokio::test]

@@ -9,7 +9,8 @@ use crate::index::vector::StageParams;
 use lance_index::vector::VectorIndex;
 use lance_index::vector::bq::builder::RabitQuantizer;
 
-pub(super) fn requested(options: &OptimizeOptions) -> bool {
+/// Whether `options` ask for a consolidation, bounded or of selected segments.
+pub(super) fn is_consolidation(options: &OptimizeOptions) -> bool {
     options.max_rows_to_consolidate.is_some() || options.segments_to_consolidate.is_some()
 }
 
@@ -27,7 +28,7 @@ pub(super) fn validate_options(options: &OptimizeOptions) -> Result<()> {
             "a segment selection needs distinct segments and exactly one index name, and takes no row budget",
         ));
     }
-    if !requested(options) {
+    if !is_consolidation(options) {
         return Ok(());
     }
     // Only a selection packs its output into several segments.
@@ -184,23 +185,18 @@ pub(super) async fn plan_index(
         });
         return Ok(());
     }
-    // An output is sized by the live rows it holds, a task by the physical rows
-    // it reads. Checked before training, so an unsatisfiable request trains
-    // nothing.
     let inputs = coverage
         .iter()
         .map(|id| (id, fragment_rows[&id]))
         .collect::<Vec<_>>();
-    if inputs.iter().any(|(_, (physical, live))| {
-        options
-            .max_rows_per_task
-            .is_some_and(|limit| *physical > limit)
-            || options
-                .max_rows_per_segment
-                .is_some_and(|limit| *live > limit)
-    }) {
+    // A selection gives a fragment larger than a limit a task, or an output, of
+    // its own.
+    if explicit.is_none()
+        && let Some(limit) = options.max_rows_per_task
+        && inputs.iter().any(|(_, (physical, _))| *physical > limit)
+    {
         return Err(Error::invalid_input(
-            "a selected fragment exceeds max_rows_per_task or max_rows_per_segment; consolidation cannot split a fragment",
+            "a selected fragment exceeds max_rows_per_task; consolidation cannot split a fragment",
         ));
     }
     // Encoding rows under a model trained on other data loses recall, so a
@@ -225,6 +221,8 @@ pub(super) async fn plan_index(
         .iter()
         .map(|segment| segment.uuid)
         .collect::<Vec<_>>();
+    // An output is sized by the live rows it holds, a task by the physical
+    // rows it reads.
     let outputs = inputs
         .iter()
         .map(|&(id, (physical, live))| ((id, physical), live))
@@ -284,8 +282,9 @@ fn selection_params(newest: &IndexMetadata, index: &dyn VectorIndex) -> Result<V
 /// Reanchor only when the same sources still own the surviving coverage. A
 /// concurrent append is disjoint; a delete may reduce coverage without making
 /// the staged files unusable. A source replaced by another merge needs replanning.
-/// The outputs of one index jointly replace its sources: together they cover
-/// every surviving source fragment exactly once.
+///
+/// The outputs of one index jointly replace its sources: together they must
+/// cover every surviving source fragment exactly once.
 pub(super) async fn validate_commit(
     dataset: &Dataset,
     planned: &Dataset,

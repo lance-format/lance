@@ -153,8 +153,9 @@ impl OptimizeOptions {
     /// one model keep it; otherwise a new model is trained on the selected
     /// rows, since encoding data under a model trained on other data loses
     /// recall. Output is one segment, or segments of at most
-    /// [`Self::max_rows_per_segment`] live rows. The selection is not bounded
-    /// by a row budget, and segments the index no longer has are skipped.
+    /// [`Self::max_rows_per_segment`] live rows; a fragment larger than that is
+    /// an output of its own. The selection is not bounded by a row budget, and
+    /// segments the index no longer has are skipped.
     pub fn consolidate_selected(index_name: impl Into<String>, segments: Vec<Uuid>) -> Self {
         Self {
             index_names: Some(vec![index_name.into()]),

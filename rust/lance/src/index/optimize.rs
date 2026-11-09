@@ -38,7 +38,7 @@
 //! the newest selected model, then merged into one output. A segment selection
 //! ([`OptimizeOptions::consolidate_selected`]) instead trains a model on its own
 //! rows when the models differ, and may pack its output into several segments
-//! of at most `max_rows_per_segment` rows. All selected coverage
+//! of at most `max_rows_per_segment` live rows. All selected coverage
 //! must be present before committing. A caller may retry the same results on a
 //! refreshed dataset after a concurrent append or delete; a changed source owner
 //! or restored source rows require replanning. Tagged fragment reuse is not
@@ -591,7 +591,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
-        if consolidate::requested(options) {
+        if consolidate::is_consolidation(options) {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
             continue;
         }
@@ -937,13 +937,13 @@ async fn plan_split_rebuild(
     }))
 }
 
-/// Train a model for the index `like` belongs to, from `fragment_ids` or the
-/// whole table, and describe it as a segment outside the manifest that build
-/// tasks encode against.
+/// Train a model for `segment`'s index, from `fragment_ids` or the whole
+/// table, and describe it as a segment outside the manifest that build tasks
+/// encode against.
 async fn train_model_segment(
     dataset: &Dataset,
     field_path: &str,
-    like: &IndexMetadata,
+    segment: &IndexMetadata,
     params: &VectorIndexParams,
     fragment_ids: Option<&[u32]>,
     progress: Arc<dyn IndexBuildProgress>,
@@ -953,7 +953,7 @@ async fn train_model_segment(
     let built = build_vector_model_segment(
         dataset,
         field_path,
-        &like.name,
+        &segment.name,
         uuid,
         params,
         frag_reuse_index,
@@ -963,8 +963,8 @@ async fn train_model_segment(
     .await?;
     Ok(IndexMetadata {
         uuid,
-        name: like.name.clone(),
-        fields: like.fields.clone(),
+        name: segment.name.clone(),
+        fields: segment.fields.clone(),
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
@@ -1420,7 +1420,7 @@ pub async fn commit_optimize_indices(
     }
     let planned = dataset_at_version(dataset, read_version).await?;
     let mut results = results;
-    let read_version = if consolidate::requested(options) {
+    let read_version = if consolidate::is_consolidation(options) {
         consolidate::validate_commit(dataset, &planned, &mut results).await?;
         if results.is_empty() {
             return Ok(());
@@ -1429,7 +1429,7 @@ pub async fn commit_optimize_indices(
     } else {
         read_version
     };
-    let committed_segments = if consolidate::requested(options) {
+    let committed_segments = if consolidate::is_consolidation(options) {
         load_all_indices(dataset).await?
     } else {
         load_all_indices(&planned).await?
