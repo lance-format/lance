@@ -313,18 +313,7 @@ impl FullSchemaMergeInsertExec {
         ));
 
         // Check if ON columns match the schema's unenforced primary key
-        let field_ids: Vec<i32> = params
-            .on
-            .iter()
-            .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
-            .collect();
-        let pk_field_ids: Vec<i32> = dataset
-            .schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
+        let is_primary_key = params.primary_key_field_ids(dataset.schema()).is_some();
 
         Ok(Self {
             input,
@@ -755,6 +744,7 @@ impl FullSchemaMergeInsertExec {
                         false,
                         false,
                         Some(created_blob_payloads.clone()),
+                        None,
                     )
                     .await?;
                     Ok(fragments)

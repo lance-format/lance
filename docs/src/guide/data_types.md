@@ -30,6 +30,16 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `LargeBinary` | Large binary data (64-bit offsets) | Large blobs |
 | `FixedSizeBinary(n)` | Fixed-length binary data | UUIDs, hashes |
 
+String and binary columns can opt in to general compression with the field metadata
+`lance-encoding:compression` (`zstd`, `lz4`, `fsst` or `none`) and `lance-encoding:compression-level`.
+Values of 32 KiB or more are compressed one value at a time (the full-zip layout) so that a random read
+decodes only the values it needs. In the stable 2.1 and 2.2 formats that per-value path honors only
+`zstd`: an `lz4` request on such a column falls back to the default `zstd`, because released readers
+cannot decode nullable `lz4` full-zip pages, and the writer logs a warning. Lance 2.3 honors the
+requested scheme. `compression-level` applies on the per-value path only together with an explicit
+`zstd`; on large text and JSON values level 1 compresses as well as the default level 3 and roughly
+twice as fast.
+
 ### Blob Type for Large Binary Objects
 
 Lance provides a specialized **Blob** type for efficiently storing and retrieving very large binary objects such as videos, images, audio files, or other multimedia content. Blob columns support planned full-payload reads as well as lazy file-like access for streaming, seeking, and partial reads.

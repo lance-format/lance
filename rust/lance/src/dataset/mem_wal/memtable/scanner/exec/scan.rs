@@ -26,8 +26,8 @@ use datafusion_physical_expr::{EquivalenceProperties, PhysicalExprRef};
 use futures::stream::{self, StreamExt};
 
 use crate::dataset::blob::prepared_blob_batch_to_descriptors;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::take_projected_columns;
-use crate::dataset::mem_wal::write::BatchStore;
 
 /// Column name for row address (consistent with base table scanner).
 pub const ROW_ADDRESS_COLUMN: &str = "_rowaddr";

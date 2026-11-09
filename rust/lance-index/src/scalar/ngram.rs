@@ -25,8 +25,8 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -354,7 +354,7 @@ impl NGramPostingListReader {
 /// Note that it cannot return false negatives.
 pub struct NGramIndex {
     /// The mapping from tokens to row offsets
-    tokens: HashMap<u32, u32>,
+    tokens: Arc<HashMap<u32, u32>>,
     /// The reader for the posting lists
     list_reader: Arc<NGramPostingListReader>,
     /// The tokenizer used to tokenize text.  Note: not all tokenizers can be used with this index.  For
@@ -413,7 +413,7 @@ impl NGramIndex {
 
         Ok(Self {
             io_parallelism: store.io_parallelism(),
-            tokens: tokens_map,
+            tokens: Arc::new(tokens_map),
             list_reader: posting_reader,
             tokenizer: NGRAM_TOKENIZER.clone(),
             store,
@@ -1892,6 +1892,64 @@ impl NGramIndexBuilder {
     }
 }
 
+/// Token positions are immutable; readers and remappers belong to a request.
+#[derive(Debug, DeepSizeOf)]
+struct NGramIndexState {
+    tokens: Arc<HashMap<u32, u32>>,
+}
+
+impl NGramIndexState {
+    fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let index = index
+            .as_any()
+            .downcast_ref::<NGramIndex>()
+            .ok_or_else(|| Error::internal("NGram cache received a non-NGram index"))?;
+        Ok(Self {
+            tokens: index.tokens.clone(),
+        })
+    }
+
+    async fn reconstruct(
+        &self,
+        store: Arc<dyn IndexStore>,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let reader = store.open_index_file(POSTINGS_FILENAME).await?;
+        Ok(Arc::new(NGramIndex {
+            tokens: self.tokens.clone(),
+            list_reader: Arc::new(NGramPostingListReader {
+                reader,
+                frag_reuse_index: remapper,
+                batch_remapper: None,
+                index_cache: WeakLanceCache::from(cache),
+            }),
+            tokenizer: NGRAM_TOKENIZER.clone(),
+            io_parallelism: store.io_parallelism(),
+            store,
+        }))
+    }
+}
+
+struct NGramIndexStateKey;
+
+impl CacheKey for NGramIndexStateKey {
+    type ValueType = NGramIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+    fn type_name() -> &'static str {
+        "NGramIndexState"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.ngram-index-state-key", 1)
+    }
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NGramIndexPlugin;
 
@@ -1948,6 +2006,54 @@ impl BasicTrainer for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&NGramIndexStateKey).await else {
+            return Ok(None);
+        };
+        Ok(Some(
+            state
+                .reconstruct(index_store, frag_reuse_index, cache)
+                .await?,
+        ))
+    }
+
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        cache
+            .insert_with_key(
+                &NGramIndexStateKey,
+                Arc::new(NGramIndexState::from_index(index.as_ref())?),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let state = cache
+            .get_or_insert_with_key(NGramIndexStateKey, || async {
+                NGramIndexState::from_index(load.await?.as_ref())
+            })
+            .await?;
+        state
+            .reconstruct(index_store, frag_reuse_index, cache)
+            .await
+    }
+
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
     }
