@@ -451,6 +451,22 @@ mod tests {
         assert_eq!(UNSUPPORTED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 6.0);
     }
 
+    // SAFETY: the kernel is a plain Rust function without target features.
+    const DOUBLED_SUM: Candidate<SumFn> =
+        unsafe { Candidate::new("doubled", CpuFeatures::empty(), doubled_sum) };
+
+    crate::dispatch! {
+        static DOUBLED_FIRST: Dispatch<SumFn> = &[DOUBLED_SUM, PORTABLE_SUM];
+    }
+
+    #[test]
+    fn fallback_is_the_last_candidate() {
+        assert_eq!(DOUBLED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 12.0);
+        assert_eq!(DOUBLED_FIRST.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
+        assert_eq!(UNSUPPORTED_FIRST.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
+        assert_eq!(PORTABLE_ONLY.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
+    }
+
     #[test]
     fn new_rejects_candidate_lists_without_a_portable_fallback() {
         static SELECTED: Selection<SumFn> = Selection::new();
