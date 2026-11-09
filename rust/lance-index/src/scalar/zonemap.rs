@@ -851,8 +851,8 @@ impl ZoneMapIndex {
 
     /// Read a segment's zones without loading it as an index: the null bitmap
     /// is not read and nothing is cached. The file is decoded and validated
-    /// under `version` exactly as [`Self::load`] does, and the batch has the
-    /// [`Self::zones_as_batch`] schema.
+    /// under `version` exactly as loading the index does, and the batch has
+    /// the [`Self::zones_as_batch`] schema.
     pub async fn load_zone_statistics(
         store: &dyn IndexStore,
         version: ZoneMapIndexVersion,
