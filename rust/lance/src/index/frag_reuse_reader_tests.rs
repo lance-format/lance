@@ -5379,6 +5379,287 @@ async fn hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots() {
     }
 }
 
+fn ivf_hnsw_pq_params() -> crate::index::vector::VectorIndexParams {
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::builder::PQBuildParams;
+    crate::index::vector::VectorIndexParams::with_ivf_hnsw_pq_params(
+        lance_linalg::distance::MetricType::L2,
+        IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        },
+        HnswBuildParams {
+            max_level: 4,
+            m: 8,
+            ef_construction: 32,
+            prefetch_distance: None,
+        },
+        PQBuildParams {
+            // More than one sub-vector, so a row's code is several bytes wide
+            // and strided across the transposed column: a byte taken from the
+            // wrong row is visible as a mismatch.
+            num_sub_vectors: PQ_SUB_VECTORS,
+            num_bits: 8,
+            ..Default::default()
+        },
+    )
+}
+
+/// Sub-vectors of the PQ code in `ivf_hnsw_pq_params`; `HNSW_DIM` must divide
+/// by it, and at 8 bits each sub-vector is one byte of the code.
+const PQ_SUB_VECTORS: usize = 4;
+
+/// [`hnsw_tagged_fixture`] with an IVF_HNSW_PQ index instead of IVF_HNSW_SQ.
+async fn hnsw_pq_tagged_fixture() -> Dataset {
+    use arrow_array::types::Float32Type;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(HNSW_DIM.into()),
+        )
+        .into_ram_dataset(
+            FragmentCount::from(HNSW_FRAGMENTS),
+            FragmentRowCount::from(HNSW_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !dataset.manifest.uses_stable_row_ids(),
+        "the deferred-remap path under test is the address-style one"
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &ivf_hnsw_pq_params(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// One row's PQ code, read from the transposed `PQ_CODE_COLUMN` layout.
+///
+/// `ProductQuantizationStorage` stores the codes transposed: byte `s` of the
+/// row at position `row` lives at `s * num_rows + row`, not at
+/// `row * num_bytes + s`. Slicing the FSL row at `row` therefore yields bytes
+/// belonging to `num_bytes` different rows, which is exactly the corruption
+/// this test is here to catch, so the extraction below must stride.
+fn transposed_pq_code(batch: &RecordBatch, row: usize, num_bytes: usize) -> Vec<u8> {
+    let codes = batch[lance_index::vector::PQ_CODE_COLUMN]
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<arrow_array::types::UInt8Type>()
+        .values();
+    let num_rows = codes.len() / num_bytes;
+    assert_eq!(
+        codes.len() % num_bytes,
+        0,
+        "a transposed PQ column holds whole codes"
+    );
+    (0..num_bytes)
+        .map(|sub_vector| codes[sub_vector * num_rows + row])
+        .collect()
+}
+
+/// A live read of an IVF_HNSW_PQ partition loaded preserving layout must keep
+/// every surviving row's PQ code bytes, not just its row id.
+///
+/// `PartitionEntry::live_batches` has to drop the slots a deferred remap could
+/// not map. Row-filtering the exported batches cannot do that for PQ: the
+/// codes are stored transposed, so the `PQ_CODE_COLUMN` "row" at position `i`
+/// is not row `i`'s code but one byte from each of `num_sub_vectors` rows.
+/// Dropping FSL rows by a row-id predicate would leave every surviving row
+/// holding a blend of its neighbours' codes — row ids intact, vectors
+/// silently wrong. Dropping the slots through the storage's own
+/// `QuantizerStorage::remap`, which re-extracts and re-transposes each
+/// retained code, is what keeps a code with its row; this test pins that by
+/// comparing against the codes read out of the tombstone-bearing storage
+/// before any live read happens.
+#[tokio::test]
+async fn hnsw_pq_live_read_keeps_each_rows_codes_after_deferred_remap() {
+    use lance_index::vector::quantizer::QuantizerStorage as _;
+    use lance_index::vector::storage::VectorStore as _;
+
+    let dataset = hnsw_pq_tagged_fixture().await;
+
+    // The delete-then-rewrite history that leaves tombstoned slots, same as
+    // `hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots`.
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let mut dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+
+    // The ground truth, taken before any live read: the layout-preserving
+    // loader keeps the tombstoned slots, so each live row's code is read at
+    // its own position in the untouched transposed column.
+    let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let num_partitions = {
+        let index = dataset
+            .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        index.ivf_model().num_partitions()
+    };
+    let mut expected_codes: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut tombstoned_slots = 0usize;
+    let mut num_bytes_in_code = 0usize;
+    for segment in &segments {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswPqIndex>()
+            .expect("the segment is an IVF_HNSW_PQ index");
+        for partition in 0..num_partitions {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            let metadata = storage.metadata();
+            assert_eq!(
+                metadata.nbits, 8,
+                "an 8-bit code is one byte per sub-vector"
+            );
+            num_bytes_in_code = metadata.num_sub_vectors;
+            let batch = storage.batch().clone();
+            let row_ids: Vec<u64> = storage.row_ids().copied().collect();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                if *row_id == RowAddress::TOMBSTONE_ROW {
+                    tombstoned_slots += 1;
+                    continue;
+                }
+                let code = transposed_pq_code(&batch, position, num_bytes_in_code);
+                assert!(
+                    expected_codes.insert(*row_id, code).is_none(),
+                    "row {row_id} appears twice in the index"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        num_bytes_in_code, PQ_SUB_VECTORS,
+        "the code must stay multi-byte for a mis-strided read to be visible"
+    );
+    assert!(
+        tombstoned_slots > 0,
+        "the history must leave tombstoned slots, or the test passes vacuously"
+    );
+    assert!(!expected_codes.is_empty(), "the index must hold live rows");
+
+    // The public live-read path, which must return the live rows alone with
+    // each code still attached to its own row.
+    let logical_index = dataset
+        .open_logical_vector_index("vector", "vector_idx")
+        .await
+        .unwrap();
+    let ivf_view = logical_index.as_ivf().unwrap();
+    let mut remaining = expected_codes.clone();
+    for partition in 0..num_partitions {
+        let batches: Vec<RecordBatch> = ivf_view
+            .read_partition(partition, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        for batch in &batches {
+            let row_ids = batch[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                assert_ne!(
+                    *row_id,
+                    RowAddress::TOMBSTONE_ROW,
+                    "a tombstoned slot escaped the live read"
+                );
+                let expected = remaining.remove(row_id).unwrap_or_else(|| {
+                    panic!("row {row_id} is not a live indexed row, or was returned twice")
+                });
+                assert_eq!(
+                    &transposed_pq_code(batch, position, num_bytes_in_code),
+                    &expected,
+                    "row {row_id} came back holding another row's PQ code bytes"
+                );
+            }
+        }
+    }
+    assert!(
+        remaining.is_empty(),
+        "the live read omitted live indexed rows: {:?}",
+        remaining.keys().collect::<Vec<_>>()
+    );
+
+    // The eager path: an explicit remap must store exactly the live rows, each
+    // with its own code, as the SQ twin asserts.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["vector"],
+        Some("vector_idx".into()),
+    )
+    .await
+    .unwrap();
+    let remapped = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let mut remaining = expected_codes.clone();
+    let mut stored = 0usize;
+    for segment in &remapped {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswPqIndex>()
+            .expect("the remapped segment is an IVF_HNSW_PQ index");
+        for partition in 0..index.ivf_model().num_partitions() {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            let batch = storage.batch().clone();
+            let row_ids: Vec<u64> = storage.row_ids().copied().collect();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                assert_ne!(
+                    *row_id,
+                    RowAddress::TOMBSTONE_ROW,
+                    "a tombstoned slot was remapped into the new segment"
+                );
+                let expected = remaining.remove(row_id).unwrap_or_else(|| {
+                    panic!("remapped row {row_id} is not a live indexed row, or appears twice")
+                });
+                assert_eq!(
+                    &transposed_pq_code(&batch, position, num_bytes_in_code),
+                    &expected,
+                    "row {row_id} was remapped holding another row's PQ code bytes"
+                );
+                stored += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stored,
+        rows.len(),
+        "the remapped segment must hold exactly the live rows"
+    );
+    assert!(
+        remaining.is_empty(),
+        "the explicit remap dropped live indexed rows: {:?}",
+        remaining.keys().collect::<Vec<_>>()
+    );
+}
+
 /// The delete-then-rewrite history of
 /// `hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete`, with the
 /// deleted rows chosen by the caller: `F0 -> F10/F11`, `F1,F2 -> F20/F21`,

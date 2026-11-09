@@ -23,8 +23,7 @@ use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{
-    ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
-    UInt64Array, cast::AsArray, types::UInt64Type,
+    ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -1136,14 +1135,23 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     /// storage by position; everyone who exports, merges or rewrites a
     /// partition's rows must see the live ones alone, as it did before layout
     /// was preserved.
+    ///
+    /// The tombstoned slots are dropped through the storage's own
+    /// [`QuantizerStorage::remap`] rather than by row-filtering the exported
+    /// batches: a layout-specific encoding (the transposed PQ codes, whose
+    /// bytes for one row are strided across the whole column) only stays
+    /// associated with its row when the storage itself rebuilds the encoding.
     pub(crate) fn live_batches(&self) -> Result<Vec<RecordBatch>> {
-        let batches = self.storage.to_batches()?;
         if !self.has_tombstones {
-            return Ok(batches.collect());
+            return Ok(self.storage.to_batches()?.collect());
         }
-        batches
-            .map(|batch| drop_tombstoned_rows(&batch))
-            .collect::<Result<Vec<_>>>()
+        let drop_tombstones =
+            RowAddrRemap::direct(HashMap::from([(RowAddress::TOMBSTONE_ROW, None)]));
+        Ok(self
+            .storage
+            .remap(&drop_tombstones)?
+            .to_batches()?
+            .collect())
     }
 
     /// The entry's row ids with every tombstoned slot dropped; see
@@ -1155,16 +1163,6 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             .copied()
             .collect()
     }
-}
-
-/// `batch` without the rows whose [`ROW_ID`] is [`RowAddress::TOMBSTONE_ROW`].
-fn drop_tombstoned_rows(batch: &RecordBatch) -> Result<RecordBatch> {
-    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-    let keep = BooleanArray::from_unary(row_ids, |row_id| row_id != RowAddress::TOMBSTONE_ROW);
-    if keep.true_count() == batch.num_rows() {
-        return Ok(batch.clone());
-    }
-    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for PartitionEntry<S, Q> {
@@ -1215,7 +1213,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.ivf-partition-key", 1)
+        CacheKeySchema::new("lance.index.ivf-partition-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
