@@ -3334,7 +3334,7 @@ mod tests {
     #[case::btree("btree", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
     #[case::bitmap("bitmap", TrainingOrdering::None, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
     #[case::zonemap("zonemap", TrainingOrdering::Addresses, &[r#"{"v": 1}"#, r#"{"v": 2}"#], true)]
-    #[case::ngram("ngram", TrainingOrdering::None, &[r#"{"v": "alpha"}"#, r#"{"v": "bravo"}"#], false)]
+    #[case::ngram("ngram", TrainingOrdering::None, &[r#"{"v": "alpha"}"#, r#"{"v": "bravo"}"#], true)]
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_json_index_version_tracks_target_domain(

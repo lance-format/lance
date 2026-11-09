@@ -139,6 +139,9 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
     let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
     let is_label_list_addr_domain =
         IndexMetadata::is_label_list_addr_domain(details, index_version);
+    let is_ngram_addr_domain = IndexMetadata::is_ngram_addr_domain(details, index_version);
+    let is_rtree_addr_domain = IndexMetadata::is_rtree_addr_domain(details, index_version);
+    let is_minhash_addr_domain = IndexMetadata::is_minhash_addr_domain(details, index_version);
     // A JSON index takes its domain from the target index it wraps. It is
     // stamped with format version 1
     // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
@@ -152,6 +155,9 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
         || is_btree_addr_domain
         || is_bitmap_addr_domain
         || is_label_list_addr_domain
+        || is_ngram_addr_domain
+        || is_rtree_addr_domain
+        || is_minhash_addr_domain
         || is_json_addr_domain
 }
 
@@ -223,12 +229,9 @@ impl IndexMetadata {
     /// likely turn from an allow-list into a block-list.
     /// A false result does not prove that an unrecognized plugin stores stable row IDs.
     pub fn results_are_row_addrs(&self) -> bool {
-        self.index_details.as_ref().is_some_and(|details| {
-            index_details_are_row_addrs(details, self.index_version)
-                || Self::is_ngram_addr_domain(details, self.index_version)
-                || Self::is_rtree_addr_domain(details, self.index_version)
-                || Self::is_minhash_addr_domain(details, self.index_version)
-        })
+        self.index_details
+            .as_ref()
+            .is_some_and(|details| index_details_are_row_addrs(details, self.index_version))
     }
 
     /// Whether the metadata proves that stored identifiers survive a physical
