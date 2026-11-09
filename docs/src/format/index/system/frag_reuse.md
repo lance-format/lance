@@ -207,14 +207,14 @@ An FRI history may be trimmed to reduce its size. Trimming must not remove any e
 For example, consider:
 
 ```
-retention lease: 12 (fragments at version 12: {3, 4, 5})
+leased version: 12 (fragments: {3, 4, 5})
 current indexes: {1, 3}
 
 Transitions:
 
   {1, 2} -> {5}  keep: an index references fragment 1
-  {4}    -> {6}  keep: the retention lease references fragment 4
-  {6}    -> {7}  keep: translating leased fragment 4 to 7 passes through 6
+  {4}    -> {6}  keep: the leased version contains fragment 4
+  {6}    -> {7}  keep: translating fragment 4 to 7 passes through 6
   {8}    -> {9}  trim: no index or retention lease references fragment 8
 ```
 

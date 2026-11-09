@@ -34,26 +34,27 @@ message UUID {
   bytes uuid = 1;
 }
 
-/* An active resource lease owned by the branch whose current manifest contains it.
+/* A retention lease that belongs to the branch whose current manifest lists it.
  * Historical copies do not impose retention requirements. All fields except
- * job_label are required by the lease contract; protobuf presence permits
+ * label are required by the lease contract; protobuf presence permits
  * detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
  * are compared by those bytes.
  */
 message RetentionLease {
-  /* The registering Transaction.uuid parsed into its 16-byte UUID value.
+  /* The acquiring Transaction.uuid parsed into its 16-byte UUID value.
    * Absent or any length other than 16 bytes is invalid.
-   * Distinct logical registrations must use distinct IDs, including after reuse
+   * Distinct logical acquisitions must use distinct IDs, including after reuse
    * of a branch name or table path. Retries preserve the original ID.
    */
   UUID id = 1;
-  /* The version created by the successful registration commit. Absent or zero is invalid.
-   * Renewal never changes this version. Active leases retain complete attached
-   * versions from their oldest source version through the current branch head,
-   * including committed transaction history, as specified in Retention Leases.
+  /* The leased version: the version created by the successful acquisition commit.
+   * Absent or zero is invalid. Renewal never changes it. Listed leases retain
+   * complete attached versions from the oldest leased version through the
+   * current branch head, including their transactions, as specified in
+   * Retention Leases.
    */
-  optional uint64 source_version = 2;
-  /* Creation time chosen before the first registration attempt, in UTC.
+  optional uint64 version = 2;
+  /* Creation time chosen before the first acquisition attempt, in UTC.
    * Absent is invalid. Retries preserve it; it need not equal commit time.
    */
   google.protobuf.Timestamp created_at = 4;
@@ -65,7 +66,7 @@ message RetentionLease {
   /* Optional human-readable context. Absent or empty means no label.
    * It has no retention or authorization meaning and is immutable for this lease.
    */
-  optional string job_label = 6;
+  optional string label = 6;
 }
 
 // Manifest is a global section shared between all the files.
@@ -217,7 +218,7 @@ message Manifest {
    *   seeds. Writers must preserve the seed contract and the required bits
    *   during data writes, index maintenance, cleanup, clone, and restore.
    * * 1 << 20: retention leases. Writer-only and sticky; maintenance must honor
-   *   the current active-lease list. Reserved until the lease contract is implemented.
+   *   the current lease list. Reserved until the lease contract is implemented.
    */
   uint64 writer_feature_flags = 10;
 
@@ -352,13 +353,13 @@ message Manifest {
    */
   uint32 max_clustering_id = 26;
 
-  /* The authoritative active leases when this is the current attached manifest.
-   * Absent/empty means no active leases. Order is insignificant; IDs must be
+  /* The authoritative lease list when this is the current attached manifest.
+   * Absent/empty means no listed leases. Order is insignificant; IDs must be
    * unique. A nonempty list requires writer bit 20. Once set, that bit remains
    * set even when this list becomes empty. Attached commits remove expired leases.
    * Restore/overwrite start from current leases, never a historical list;
    * new clones/branches start with an empty list. Detached manifests cannot own
-   * or mutate active leases. No reader capability is required solely for leases.
+   * or mutate listed leases. No reader capability is required solely for leases.
    */
   repeated RetentionLease retention_leases = 27;
 

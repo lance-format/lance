@@ -474,7 +474,7 @@ impl Manifest {
     /// (see [`InlineRowIds`]), and a slice keeps the whole allocation alive.
     /// That is the right trade when the row ids are most of the manifest, as
     /// they are for a compacted stable-row-id table, but a manifest whose row
-    /// ids are a few percent of its bytes would lease the rest for nothing.
+    /// ids are a few percent of its bytes would pin the rest for nothing.
     /// `buffer_len` is the size of the decoded buffer.
     pub fn detach_sparse_inline_row_ids(&mut self, buffer_len: usize) {
         let inline_bytes: usize = self

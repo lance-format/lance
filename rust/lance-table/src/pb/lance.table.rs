@@ -802,26 +802,27 @@ impl ::prost::Name for Uuid {
         "/lance.table.UUID".into()
     }
 }
-/// An active resource lease owned by the branch whose current manifest contains it.
+/// A retention lease that belongs to the branch whose current manifest lists it.
 /// Historical copies do not impose retention requirements. All fields except
-/// job_label are required by the lease contract; protobuf presence permits
+/// label are required by the lease contract; protobuf presence permits
 /// detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
 /// are compared by those bytes.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetentionLease {
-    /// The registering Transaction.uuid parsed into its 16-byte UUID value.
+    /// The acquiring Transaction.uuid parsed into its 16-byte UUID value.
     /// Absent or any length other than 16 bytes is invalid.
-    /// Distinct logical registrations must use distinct IDs, including after reuse
+    /// Distinct logical acquisitions must use distinct IDs, including after reuse
     /// of a branch name or table path. Retries preserve the original ID.
     #[prost(message, optional, tag = "1")]
     pub id: ::core::option::Option<Uuid>,
-    /// The version created by the successful registration commit. Absent or zero is invalid.
-    /// Renewal never changes this version. Active leases retain complete attached
-    /// versions from their oldest source version through the current branch head,
-    /// including committed transaction history, as specified in Retention Leases.
+    /// The leased version: the version created by the successful acquisition commit.
+    /// Absent or zero is invalid. Renewal never changes it. Listed leases retain
+    /// complete attached versions from the oldest leased version through the
+    /// current branch head, including their transactions, as specified in
+    /// Retention Leases.
     #[prost(uint64, optional, tag = "2")]
-    pub source_version: ::core::option::Option<u64>,
-    /// Creation time chosen before the first registration attempt, in UTC.
+    pub version: ::core::option::Option<u64>,
+    /// Creation time chosen before the first acquisition attempt, in UTC.
     /// Absent is invalid. Retries preserve it; it need not equal commit time.
     #[prost(message, optional, tag = "4")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
@@ -833,7 +834,7 @@ pub struct RetentionLease {
     /// Optional human-readable context. Absent or empty means no label.
     /// It has no retention or authorization meaning and is immutable for this lease.
     #[prost(string, optional, tag = "6")]
-    pub job_label: ::core::option::Option<::prost::alloc::string::String>,
+    pub label: ::core::option::Option<::prost::alloc::string::String>,
 }
 impl ::prost::Name for RetentionLease {
     const NAME: &'static str = "RetentionLease";
@@ -953,7 +954,7 @@ pub struct Manifest {
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
     /// * 1 << 20: retention leases. Writer-only and sticky; maintenance must honor
-    ///    the current active-lease list. Reserved until the lease contract is implemented.
+    ///    the current lease list. Reserved until the lease contract is implemented.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.
@@ -1057,13 +1058,13 @@ pub struct Manifest {
     /// u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
     #[prost(uint32, tag = "26")]
     pub max_clustering_id: u32,
-    /// The authoritative active leases when this is the current attached manifest.
-    /// Absent/empty means no active leases. Order is insignificant; IDs must be
+    /// The authoritative lease list when this is the current attached manifest.
+    /// Absent/empty means no listed leases. Order is insignificant; IDs must be
     /// unique. A nonempty list requires writer bit 20. Once set, that bit remains
     /// set even when this list becomes empty. Attached commits remove expired leases.
     /// Restore/overwrite start from current leases, never a historical list;
     /// new clones/branches start with an empty list. Detached manifests cannot own
-    /// or mutate active leases. No reader capability is required solely for leases.
+    /// or mutate listed leases. No reader capability is required solely for leases.
     #[prost(message, repeated, tag = "27")]
     pub retention_leases: ::prost::alloc::vec::Vec<RetentionLease>,
 }
@@ -1991,8 +1992,7 @@ pub struct Transaction {
     /// a missing target is a no-op for release, not for the accompanying operation.
     /// Valid only on an ordinary attached operation, not a lease operation or Clone.
     /// Apply normal publication checks before removal; set sticky writer bit 20.
-    /// Persist this transaction inline or in a referenced sidecar before publication,
-    /// even when no leases remain. Reject if neither representation can be stored.
+    /// The transaction must be recorded with its manifest, even when no leases remain.
     #[prost(message, optional, tag = "5")]
     pub release_lease_id: ::core::option::Option<Uuid>,
     /// The operation of this transaction.
@@ -2720,33 +2720,33 @@ pub mod transaction {
             "/lance.table.Transaction.UpdateBases".into()
         }
     }
-    /// Register retention of the version this commit creates. Transaction.uuid
-    /// must parse as a UUID and supplies the lease ID. Registration may rebase;
-    /// the successful publishing version becomes the fixed source_version.
+    /// Acquire a lease on the version this commit creates. Transaction.uuid
+    /// must parse as a UUID and supplies the lease ID. Acquisition may rebase;
+    /// the successful publishing version becomes the fixed leased version.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct RegisterLease {
+    pub struct AcquireLease {
         /// UTC request creation time, fixed before the first send.
         /// Absent is invalid. The lease retains this value through retries/renewals.
         #[prost(message, optional, tag = "2")]
         pub created_at: ::core::option::Option<::prost_types::Timestamp>,
         /// Absolute UTC expiry time fixed before the first send.
         /// Absent or not later than created_at is invalid.
-        /// Fresh registration requires a future deadline at each attempt's validation.
+        /// Fresh acquisition requires a future deadline at each attempt's validation.
         #[prost(message, optional, tag = "3")]
         pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
         /// Optional immutable context. Absent or empty means no label.
-        /// Recovering an active registration returns its existing label.
+        /// Recovering a listed lease returns its existing label.
         #[prost(string, optional, tag = "4")]
-        pub job_label: ::core::option::Option<::prost::alloc::string::String>,
+        pub label: ::core::option::Option<::prost::alloc::string::String>,
     }
-    impl ::prost::Name for RegisterLease {
-        const NAME: &'static str = "RegisterLease";
+    impl ::prost::Name for AcquireLease {
+        const NAME: &'static str = "AcquireLease";
         const PACKAGE: &'static str = "lance.table";
         fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.RegisterLease".into()
+            "lance.table.Transaction.AcquireLease".into()
         }
         fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.RegisterLease".into()
+            "/lance.table.Transaction.AcquireLease".into()
         }
     }
     /// Extend an existing lease; this operation never creates a missing lease.
@@ -2861,7 +2861,7 @@ pub mod transaction {
         #[prost(message, tag = "115")]
         DataOverlay(DataOverlay),
         #[prost(message, tag = "116")]
-        RegisterLease(RegisterLease),
+        AcquireLease(AcquireLease),
         #[prost(message, tag = "117")]
         RenewLease(RenewLease),
         #[prost(message, tag = "118")]

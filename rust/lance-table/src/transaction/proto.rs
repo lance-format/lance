@@ -418,7 +418,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             // Reserved format operations remain unsupported until runtime
             // handling is implemented. Unknown operations fail closed.
-            Some(pb::transaction::Operation::RegisterLease(_))
+            Some(pb::transaction::Operation::AcquireLease(_))
             | Some(pb::transaction::Operation::RenewLease(_))
             | Some(pb::transaction::Operation::ReleaseLease(_)) => Operation::Unknown {},
             // prost drops unrecognized oneof fields, so an operation from a
@@ -853,7 +853,7 @@ mod tests {
     use prost::Message;
 
     #[rstest::rstest]
-    #[case::register(pb::transaction::Operation::RegisterLease(Default::default()))]
+    #[case::acquire(pb::transaction::Operation::AcquireLease(Default::default()))]
     #[case::renew(pb::transaction::Operation::RenewLease(Default::default()))]
     #[case::release(pb::transaction::Operation::ReleaseLease(Default::default()))]
     fn test_retention_lease_operations_remain_unsupported(

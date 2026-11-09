@@ -1,28 +1,31 @@
 # Retention Leases
 
-A writer can add a **retention lease** to protect work in progress. While the lease
-remains in the current manifest:
+A **retention lease** keeps a version and everything needed to reach the current
+head from it. While the lease is listed in the current manifest:
 
-1. File cleanup **must retain** every version from the lease source through
-   the current head, including the files and transaction history those versions need.
-2. Fragment Reuse Index (FRI) cleanup **must retain** the movement records needed
-   to connect the lease source fragments to the current layout.
+1. File cleanup **must retain** every version from the leased version through
+   the current head, including the files and transactions those versions need.
+2. Fragment Reuse Index (FRI) cleanup **must retain** the transitions needed
+   to connect the leased version's fragments to the current layout.
 
-This lets compaction and cleanup run while an index or another result is being
-built. Unlike a tag, which retains a snapshot indefinitely, a lease can be renewed
-and expires if its writer stops renewing. The next attached commit removes an
-expired lease; until then, cleanup still honors it. The writer can explicitly
-release a lease when its work finishes or is abandoned.
+This lets compaction and cleanup run while a holder builds an index or another
+result from the leased version. Unlike a tag, which retains a snapshot
+indefinitely, a lease can be renewed and expires if its holder stops renewing.
+The next attached commit removes an expired lease; until then, cleanup still
+honors it. The holder can explicitly release a lease when its work finishes or
+is abandoned.
 
-Leases retain resources. The consumer remains responsible for validating and
+Leases retain resources. The holder remains responsible for validating and
 publishing its result and protecting uncommitted output. Leases cannot cancel
 [deletion already in progress](#cleanup-and-deletion-races).
 
 ## Persisted state
 
-`Manifest.retention_leases` (field 27) stores the leases. Only the current attached
-manifest's list is authoritative; historical lists cannot revive ended leases.
-Missing or empty means no leases, and list order has no meaning.
+`Manifest.retention_leases` (field 27) stores the lease list. Only the current
+attached manifest's list is authoritative; historical lists cannot revive
+removed leases. Missing or empty means no leases, and list order has no meaning.
+A lease is **listed** while its record is in the current list, including after
+it expires; listed leases retain resources.
 
 <details>
 <summary>Lease protobuf message</summary>
@@ -36,19 +39,20 @@ Missing or empty means no leases, and list order has no meaning.
 Writers and maintenance **must reject** incomplete records, invalid field
 values, and duplicate IDs. A corrupt list blocks lease mutations, including
 release, and affected destructive maintenance; it requires administrator repair.
-A valid lease can still be released if its source is unreadable.
+A valid lease can still be released if its leased version is unreadable.
 
-Registration and transactions carrying `release_lease_id` **must set** writer
+Acquisition and transactions carrying `release_lease_id` **must set** writer
 flag 20 (`FLAG_RETENTION_LEASES`). A nonempty list without it is invalid.
-Once set, the flag **must remain set**, including when all leases end and through
-restore or clone. Leases require no additional reader flag; readers may ignore the list.
+Once set, the flag **must remain set**, including when all leases are removed and
+through restore or clone. Leases require no additional reader flag; readers may
+ignore the list.
 
 ## Identity and time
 
-A lease's ID is the UUID of its registration transaction. Distinct registrations
-**must use distinct IDs**, even after a lease ends or a table or branch is recreated.
-Retries keep the same ID. The lease belongs to one table and branch; its
-`source_version` is the version created by its successful registration commit.
+A lease's ID is the UUID of its acquisition transaction. Distinct acquisitions
+**must use distinct IDs**, even after a lease is removed or a table or branch is
+recreated. Retries keep the same ID. The lease belongs to one table and branch;
+its `version` is the version created by its successful acquisition commit.
 
 Requests and handles **must stay bound** to that table and branch, including
 the existing [branch identifier](branch_tag.md#branch-identity) for named branches.
@@ -56,48 +60,53 @@ The identifier's legacy recreation limits still apply. The owning service or
 catalog must prevent reuse across whole-table deletion and recreation at the
 same path; leases cannot detect that replacement.
 
-`created_at` and `expires_at` are absolute UTC times. Writers choose both before
-the first registration attempt and preserve them on retries. A renewal likewise
+`created_at` and `expires_at` are absolute UTC times. Holders choose both before
+the first acquisition attempt and preserve them on retries. A renewal likewise
 fixes its requested `expires_at` once. Times must be valid protobuf timestamps,
 compared at full precision, and expiration must be later than creation.
 
-Clients use reasonably synchronized clocks and renew before expiration. The
+Holders use reasonably synchronized clocks and renew before expiration. The
 format specifies no default duration, renewal schedule, or maximum lifetime.
 
-## Registration and recovery
+## Acquisition and recovery
 
 Lease decisions use the [authoritative current head](versioning.md#current-state-for-lease-decisions).
-To register lease P:
+To acquire lease P:
 
 1. Validate the target table and branch identity. If P is already listed,
-   recover its stored source, expiration, and label without changing them.
+   recover its stored version, expiration, and label without changing them.
 2. For a fresh submission, require an unexpired request. Resolve head H, build
-   version H+1 from it, and add P with `source_version = H+1`.
+   version H+1 from it, and add P with `version = H+1`.
 3. Publish atomically. A definitively lost attempt may retry against a newer
-   head with the same ID and times. Recompute the source on each uncommitted
-   attempt; once registration succeeds, the source stays fixed.
+   head with the same ID and times. Recompute the version on each uncommitted
+   attempt; once acquisition succeeds, the version stays fixed.
 4. Before confirming acquisition, verify the named-branch identity, current
-   unexpired membership with its stored source V, and a readable source manifest
-   matching V. Return V. The job **must wait for confirmation** before planning
-   or reading its source.
+   unexpired membership with its stored version V, and a readable manifest for
+   V. Return V. The holder **must wait for confirmation** before planning or
+   reading V.
 
-After an uncertain response, recovery **must not submit the registration again**.
+The leased version is the one the acquisition commit creates, not one the
+holder chooses. An older version's files or FRI transitions could already be
+removed or approved for deletion; the newly created head cannot be.
+
+After an uncertain response, recovery **must not submit the acquisition again**.
 A current unexpired record can be confirmed using step 4. A listed expired record,
-or evidence of earlier registration followed by current absence, means the lease
-has ended for starting work. Otherwise report an indeterminate outcome. Missing
-historical evidence or an absent current ID does not prove the attempt failed.
+or evidence of earlier acquisition followed by current absence, means the lease
+can no longer be used to start work. Otherwise report an indeterminate outcome.
+Missing historical evidence or an absent current ID does not prove the attempt
+failed.
 
 A timeout followed by an absent read-back is indeterminate. Do not delete its
-transaction evidence as failed-attempt cleanup: the manifest may still arrive.
+transaction file as failed-attempt cleanup: the manifest may still arrive.
 A local clock before expiration or a foreign transaction in a reclaimed slot
-also cannot prove that earlier registration never succeeded and ended.
-Clients needing restart recovery must save the original request and target
+also cannot prove that earlier acquisition never succeeded and was removed.
+Holders needing restart recovery must save the original request and target
 identity before submission and bound their retry attempts.
 
-Before explicit release, the owner or operator **must stop** the job's
-registration and retry loop. Release does not cancel storage writes already in
-flight or fence a worker that continues submitting. Starting a new registration
-requires a fresh ID and its newly confirmed source.
+Before explicit release, the holder or operator **must stop** the holder's
+acquisition and retry loop. Release does not cancel storage writes already in
+flight or fence a holder that continues submitting. Starting a new acquisition
+requires a fresh ID and its newly confirmed version.
 
 ## Renewal, release, and expiration
 
@@ -105,13 +114,13 @@ Every attached commit **must derive lease state from its attempt's predecessor**
 Sample current UTC time, remove records with `expires_at` at or before that time,
 apply explicit lease changes, and preserve all remaining fields. After conflicts,
 repeat against the new predecessor; an old removal decision must not overwrite
-a renewal. Restore and overwrite use current membership, never a historical list.
+a renewal. Restore and overwrite use the current list, never a historical list.
 
 - **RenewLease** requires a listed, unexpired target at each attempt's validation.
   Change only `expires_at`, and only to a later value. An already satisfied
   request is a no-op; an absent or expired target is an error.
 - **ReleaseLease** removes its target ID. An absent ID is a successful no-op.
-  Different jobs' IDs are independent, even when their source files overlap.
+  Different leases are independent, even when their retained files overlap.
 
 Commit order settles renewal versus expiration. If renewal extends the deadline
 first, a competing commit must honor it. If removal commits first, renewal
@@ -135,88 +144,88 @@ against the new predecessor. Intermediate publications keep their lease unless
 explicit release or expiration removes it.
 
 Once removal commits, the lease's retention guarantee ends. Publication validation
-and recovery belong to the consumer and publication machinery. An absent lease
-is not proof that results were published. A caller using standalone release
+and recovery belong to the holder and publication machinery. An absent lease
+is not proof that results were published. A holder using standalone release
 must separately confirm publication first, or abandon the work.
 
 ## Retention and data operations
 
 ### Retained versions
 
-Let F be the oldest source among the current leases and H the current head.
-Cleanup **must retain every attached version from F through H**, including
-expired leases still listed. Detached versions are outside this window.
+Let F be the oldest leased version among the listed leases and H the current
+head. Cleanup **must retain every attached version from F through H**, including
+for expired leases still listed. Detached versions are outside this window.
 
 Keep each retained manifest, its required commit-store discovery records, and
 all referenced resources: data, deletion files, overlays, indices, FRI metadata,
-mapping files, and transaction sidecars. These must remain readable versions,
+mapping files, and transaction files. These must remain readable versions,
 not manifests whose data has been deleted. Shared files are retained once.
 
-Every attached commit whose result contains leases, or which carries
-`release_lease_id`, **must publish transaction evidence with its manifest**, inline
-or in an already stored referenced sidecar. This includes release of the last
-lease or an already absent lease. Reject the commit if neither representation is available. Retain
-transaction evidence after F through H; the transaction that created F is not
-required solely by this retention rule.
+Every attached commit whose result lists leases, or which carries
+`release_lease_id`, **must record its [transaction](transaction.md)** with its
+manifest. This includes release of the last lease or an already absent lease.
+Reject the commit if the transaction cannot be recorded. Retain the transactions
+of versions after F through H; the transaction that created F is not required
+solely by this retention rule.
 
-Cleanup must validate required manifests and FRI metadata and establish the
-presence of required transactions. For inline evidence, check the offset and
-length-prefixed section bounds without decoding its payload; prefer inline
-when both representations exist. For sidecars, use a complete authoritative
-listing or an existence check. An age-filtered or partial listing, or an earlier
-cached read, is insufficient. Present but malformed payloads may be discovered
-later when a consumer reads them; cleanup does not audit every transaction.
+Cleanup must validate required manifests and FRI metadata and establish that
+each required transaction is present. A transaction file's presence requires a
+complete authoritative listing or an existence check; an age-filtered or partial
+listing, or an earlier cached read, is insufficient. Cleanup does not decode or
+audit every transaction.
 
-Missing required versions or carriers, invalid metadata, or unresolved reads
+Missing required versions or transactions, invalid metadata, or unresolved reads
 **must stop affected destructive cleanup** and report a protection failure.
-Unresolvable source fragments must also stop affected rewrites and FRI trimming.
+An unresolvable leased version must also stop affected rewrites and FRI trimming.
 These failures do not release the lease; release by a valid ID remains available.
 
 Cleanup preview and execution must report each branch's listed lease count,
-expired count awaiting removal, and oldest protected source. Byte attribution
+expired count awaiting removal, and oldest leased version. Byte attribution
 among overlapping requirements is unnecessary. After committed removal,
 re-resolve current retention before reclaiming files; other leases, tags, retained
-versions, and consumers may still need them. This full-version policy can retain
-intermediate data generations as well as metadata.
+versions, and FRI consumers may still need them. This full-version policy can
+retain intermediate data generations as well as metadata.
 
-### Required FRI history
+### Required transitions
 
-Resolve each lease source's complete fragment metadata and use all its fragment
-IDs. Read a fragment tree when the source declares one; an empty inline fragment
+Resolve each leased version's complete fragment metadata and use all its fragment
+IDs. Read a fragment tree when the version declares one; an empty inline fragment
 list is not empty coverage. No row-data scan is needed. Reject acquisition for
 unsupported layouts and refuse affected maintenance if required metadata cannot
 be resolved.
 
-Retain the union of lease and existing-consumer requirements. An index catching
-up or a consumer-check error **must not discard** lease-required history.
+Retain the union of the transitions that leases and existing FRI consumers
+require. An index catching up or a consumer-check error **must not discard**
+transitions a lease requires.
 
 - **Legacy-only FRI (`index_version = 0`):** retain applicable current-chain
-  records stamped at or after the oldest lease source, including that boundary.
-  Stamp new records with their successful publishing version minus one;
-  restamp on retry and preserve existing stamps.
-- **FRI version 1:** start with the lease source fragment IDs. Select each
-  current-history record whose source intersects the set, add its destination
-  IDs, and repeat until no more records are selected. Keep whole selected
-  records. If one is a legacy record, include every group's destinations and
-  their downstream records. Version 1 transitions have no dataset-version stamp.
+  reuse versions stamped at or after the oldest leased version, including that
+  boundary. Stamp new reuse versions with their successful publishing version
+  minus one; restamp on retry and preserve existing stamps.
+- **FRI version 1:** start with the leased versions' fragment IDs. Select each
+  current-history transition whose sources intersect the set, add its
+  destination IDs, and repeat until no more transitions are selected. Keep whole
+  selected transitions. If one is a legacy reuse version, include every group's
+  destinations and their downstream transitions. Version 1 transitions have no
+  dataset-version stamp.
 
-Compaction **must record** the movements required by surviving leases, even when
+Compaction **must record** the transitions required by listed leases, even when
 no published index needs them. Every rewrite or trim **must recheck** current
 requirements before committing, including after conflicts. Exclude only leases
 whose removal that same commit will publish. Reject a result lacking required
-mappings and replan; planning before registration is not an exemption.
+transitions and replan; planning before acquisition is not an exemption.
 
-Mapping files remain protected while any retained version or required history
-references them, including files added after registration. Replacing FRI metadata
+Mapping files remain protected while any retained version or required transition
+references them, including files added after acquisition. Replacing FRI metadata
 does not release those files. Existing overlay and index correctness rules still apply.
 
 ### Restore, branches, and detached versions
 
-Restore and overwrite preserve surviving leases and their full retention windows.
+Restore and overwrite preserve listed leases and their full retention windows.
 Apply FRI retention to the resulting current history; these operations need not
-reconstruct discarded translation paths. Retention does not guarantee that a
-job can still translate or publish after these operations. Removing a current
-FRI record does not reclaim mappings referenced by retained versions.
+reconstruct discarded transitions. Retention does not guarantee that a holder
+can still translate or publish after these operations. Removing a current
+FRI transition does not reclaim mappings referenced by retained versions.
 
 New branches and clones start with empty lease lists and preserve an inherited
 capability flag. Detached versions likewise serialize an empty list and inherited
@@ -238,13 +247,14 @@ their embedded core revision and verify other maintenance clients separately.
 
 ## Cleanup and deletion races
 
-Registration does not cancel deletion already approved by an earlier inspection.
+Acquisition does not cancel deletion already approved by an earlier inspection.
 For example, cleanup can select an old file, a user can restore a version that
-references it, and a job can then lease that source before cleanup deletes the file.
-Applications coordinating restore and cleanup can finish running cleanup first
-and pause new cleanup until lease confirmation; leases do not enforce that ordering.
+references it, and a holder can then lease that version before cleanup deletes
+the file. Applications coordinating restore and cleanup can finish running
+cleanup first and pause new cleanup until lease confirmation; leases do not
+enforce that ordering.
 
 Branch deletion has the same inspection/deletion gap. It can miss a later lease,
 and delayed deletion after recovery and branch-name reuse can damage a replacement
 branch. Leases inherit these existing races and do not change branch-name reuse.
-Jobs should register before reading and preserve ordinary cleanup grace protections.
+Holders should acquire before reading and preserve ordinary cleanup grace protections.

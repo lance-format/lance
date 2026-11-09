@@ -42,8 +42,7 @@ message Transaction {
    * a missing target is a no-op for release, not for the accompanying operation.
    * Valid only on an ordinary attached operation, not a lease operation or Clone.
    * Apply normal publication checks before removal; set sticky writer bit 20.
-   * Persist this transaction inline or in a referenced sidecar before publication,
-   * even when no leases remain. Reject if neither representation can be stored.
+   * The transaction must be recorded with its manifest, even when no leases remain.
    */
   UUID release_lease_id = 5;
 
@@ -435,24 +434,24 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
-  /* Register retention of the version this commit creates. Transaction.uuid
-   * must parse as a UUID and supplies the lease ID. Registration may rebase;
-   * the successful publishing version becomes the fixed source_version.
+  /* Acquire a lease on the version this commit creates. Transaction.uuid
+   * must parse as a UUID and supplies the lease ID. Acquisition may rebase;
+   * the successful publishing version becomes the fixed leased version.
    */
-  message RegisterLease {
+  message AcquireLease {
     /* UTC request creation time, fixed before the first send.
      * Absent is invalid. The lease retains this value through retries/renewals.
      */
     google.protobuf.Timestamp created_at = 2;
     /* Absolute UTC expiry time fixed before the first send.
      * Absent or not later than created_at is invalid.
-     * Fresh registration requires a future deadline at each attempt's validation.
+     * Fresh acquisition requires a future deadline at each attempt's validation.
      */
     google.protobuf.Timestamp expires_at = 3;
     /* Optional immutable context. Absent or empty means no label.
-     * Recovering an active registration returns its existing label.
+     * Recovering a listed lease returns its existing label.
      */
-    optional string job_label = 4;
+    optional string label = 4;
   }
 
   // Extend an existing lease; this operation never creates a missing lease.
@@ -495,7 +494,7 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
-    RegisterLease register_lease = 116;
+    AcquireLease acquire_lease = 116;
     RenewLease renew_lease = 117;
     ReleaseLease release_lease = 118;
   }

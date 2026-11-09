@@ -43,7 +43,7 @@ they should return an "unsupported" error on any read or write operation.
 | `2^17`   | `FLAG_OBJECT_METADATA`         | No              | Yes             | The snapshot contains [clustering definitions, references, or a nonzero allocation high-water mark](clustering.md), nonempty [fragment metadata](index.md#fragment-metadata), or nonempty [index segment metadata](../index/index.md#index-segment-metadata). Readers may ignore this metadata; writers must preserve it. |
 | `2^18`   | `FLAG_ROW_ADDR_INDICES`         | No              | Yes             | A stable-row-ID table contains an index that stores physical row addresses. Older writers could treat its entries as stable row IDs and silently extend coverage without indexing rewritten fragments. |
 | `2^19`   | `FLAG_INLINE_DELETIONS`         | Yes             | Yes             | Some fragment stores its deletion vector in the manifest (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader without this flag would look for a file that does not exist. |
-| `2^20`   | `FLAG_RETENTION_LEASES` | No | Yes | The current manifest owns the active [retention lease list](retention_leases.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until lease maintenance is implemented. |
+| `2^20`   | `FLAG_RETENTION_LEASES` | No | Yes | The current manifest owns the [retention lease list](retention_leases.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until lease maintenance is implemented. |
 
 </div>
 
@@ -76,7 +76,7 @@ use the existing commit/retry path. Each attempt **must derive membership and
 the sticky capability from its predecessor**, recheck expiration after rebase,
 and atomically claim the next version without replacing an occupied slot.
 A historical-slot write cannot change the real head's lease state or end retention.
-Required transaction persistence still applies; subsequent maintenance must
+Required transaction recording still applies; subsequent maintenance must
 resolve the real head. External handlers must provide equivalent guarantees.
 
 An unsupported handler may keep existing maintenance behavior on a table that

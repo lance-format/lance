@@ -138,7 +138,7 @@ or a resolution failure, **must fail deletion**. If the selected head disappears
 resolve again rather than infer absence. Corrupt metadata requires administrator
 repair; force deletion cannot bypass the check.
 
-Inspection is separate from physical deletion. A later registration cannot stop
+Inspection is separate from physical deletion. A later acquisition cannot stop
 a deletion already approved, and delayed deletion after recovery and name reuse
 may affect a replacement branch. See [cleanup and deletion races](retention_leases.md#cleanup-and-deletion-races).
 
