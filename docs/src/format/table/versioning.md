@@ -43,7 +43,7 @@ they should return an "unsupported" error on any read or write operation.
 | `2^17`   | `FLAG_OBJECT_METADATA`         | No              | Yes             | The snapshot contains [clustering definitions, references, or a nonzero allocation high-water mark](clustering.md), nonempty [fragment metadata](index.md#fragment-metadata), or nonempty [index segment metadata](../index/index.md#index-segment-metadata). Readers may ignore this metadata; writers must preserve it. |
 | `2^18`   | `FLAG_ROW_ADDR_INDICES`         | No              | Yes             | A stable-row-ID table contains an index that stores physical row addresses. Older writers could treat its entries as stable row IDs and silently extend coverage without indexing rewritten fragments. |
 | `2^19`   | `FLAG_INLINE_DELETIONS`         | Yes             | Yes             | Some fragment stores its deletion vector in the manifest (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader without this flag would look for a file that does not exist. |
-| `2^20`   | `FLAG_ONGOING_WORK_PINS` | No | Yes | The current manifest owns the active [ongoing-work pin list](ongoing_work_pins.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until pin maintenance is implemented. |
+| `2^20`   | `FLAG_ONGOING_WORK_PINS` | No | Yes | The current manifest owns the active [version pin list](ongoing_work_pins.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until pin maintenance is implemented. |
 
 </div>
 
@@ -53,46 +53,40 @@ Committing schema metadata `lance.blob.managed = "true"` activates the Managed B
 
 ## Current state for pin decisions
 
-Pin acquisition, recovery, renewal, explicit release, restore, overwrite,
-compaction, retention planning, and branch-deletion checks
-must resolve the authoritative current attached manifest. A previously opened
-Dataset, historical transaction read-back, or hint that stops probing at a gap
-is insufficient.
+Pin operations and recovery, transactions carrying `release_pin_id`, restore,
+overwrite, rewrite/trim checks, retention planning, and branch deletion through
+a pin-capable handler **must resolve the authoritative current attached head**.
+This includes maintenance triggered through an old or unflagged Dataset handle.
+A cached version or a hint that stops at a reclaimed gap is insufficient.
 
-Ordinary attached commits that carry pins and prune expired records may use the existing
-commit and retry protocol without an additional complete-history listing solely
-for pins. Derive the pin list and sticky capability from the predecessor
-manifest used for each attempt, including after rebasing. Recheck expiration
-on that list and preserve every field of remaining records. Then
-atomically publish at that predecessor's version plus one without replacing an
-occupied version. Do not copy membership from the transaction's original read
-version after rebasing. Only an authoritative committed removal ends retention;
-a successful write into an old reclaimed slot is insufficient. Required
-transaction persistence still applies.
+- **Direct storage:** enumerate attached manifests in the active naming scheme,
+  excluding detached and staging files, and select the highest version. Consume
+  every unordered listing page. An ordered V2 listing may stop at its first
+  valid manifest when that ordering guarantee applies.
+- **External coordination:** use the coordinator's resolution and finalization
+  protocol. Do not substitute an uncoordinated object-store listing.
 
-A write that advances the head must carry that head's pin state. A successful
-write to a reclaimed older slot does not make it the authoritative head or
-revive its historical pins. This exemption does not apply to explicit pin mutations
-or a transaction carrying `release_pin_id`,
-Restore or Overwrite, rewrite/trim validation, retention planning, or branch
-deletion. Cleanup triggered by an ordinary write must resolve current membership
-even when invoked through an older or unflagged Dataset. Supported external
-handlers must provide the same predecessor and atomic-publication guarantees.
+Read the selected manifest. If it disappears, resolve again; propagate other
+listing/read errors. Optimizations must preserve this result despite reclaimed
+slots and delayed writes. A backend unable to provide its protocol's visibility
+guarantees must refuse acquisition.
 
-For ordinary file/object-store commit handlers, enumerate attached manifests
-using the active naming scheme, exclude detached and staging files, and choose
-the highest version. On an unordered store, consume every listing page. A
-lexically ordered V2 listing may stop at its first valid attached manifest when
-that naming scheme's ordering guarantee applies. Read the selected manifest;
-if it disappeared, restart resolution rather than accepting an older cached
-result. Propagate listing/read errors. An optimization is allowed only if it
-preserves this result in the presence of reclaimed slots and delayed writes.
-A hint that moves forward alone is not a correctness proof.
+Ordinary attached writes that only carry pins and prune expired records may
+use the existing commit/retry path. Each attempt **must derive membership and
+the sticky capability from its predecessor**, recheck expiration after rebase,
+and atomically claim the next version without replacing an occupied slot.
+A historical-slot write cannot change the real head's pin state or end retention.
+Required transaction persistence still applies; subsequent maintenance must
+resolve the real head. External handlers must provide equivalent guarantees.
 
-External commit stores must resolve and finalize their selected authoritative
-head through their own commit protocol; do not replace their coordination with
-an uncoordinated object listing. A backend must provide the visibility guarantees
-required by its commit protocol or refuse pin acquisition. These reads do not
-lock current state. Apply the transaction's publication and retry rules after
-resolution; the [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
-remain even when these reads succeed.
+An unsupported handler may keep existing maintenance behavior on a table that
+has never enabled pins, but **must reject** any pin capability or record it
+encounters. This relies on the same-handler table contract and exclusion of
+incompatible maintenance clients at activation, not an old handle's flags.
+After activation, all maintenance clients must use a pin-capable path even when
+the list is empty. Mixing capable and incapable implementations of the same
+handler type does not satisfy this requirement.
+
+Head resolution establishes current pin state, not output-publication validity.
+It does not lock the table; the [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
+still apply.

@@ -122,37 +122,27 @@ which means `/` would create a logical subdirectory (e.g., `bugfix/issue-123`, `
                     1.manifest
 ```
 
-### Deletion with ongoing work pins
+<a id="deletion-with-ongoing-work-pins"></a>
 
-Deletion must resolve the [authoritative head](versioning.md#current-state-for-pin-decisions)
-and reject if its active-pin list is nonempty, identifying the blocking pins.
-A pin past `expires_at` still blocks deletion until removed by a committed
-release or expiration in an attached commit. On a quiet table, use explicit
-ReleasePin to remove a blocking pin without waiting for another write.
-Deletion does not implicitly revoke pins. Force deletion
-must perform the same check. Existing tag and dependent-branch checks also apply.
+### Deletion with version pins
 
-For force deletion of an orphan with no branch reference, the pin check may be
-skipped only when authoritative resolution definitively establishes that no
-attached manifest exists. A listing or resolution failure, or a manifest that
-exists but cannot be read or validated, must fail deletion. If a selected head
-disappears during inspection, restart resolution as specified in
-[Format Versioning](versioning.md#current-state-for-pin-decisions); do not treat
-that failed read alone as proof of absence.
+Normal and force deletion **must resolve the
+[authoritative head](versioning.md#current-state-for-pin-decisions)**, validate
+its writer capabilities and pin list, and reject any listed pins, identifying
+the blocking IDs. Expired records still block
+deletion until a commit removes them. On an idle table, use explicit ReleasePin;
+deletion does not expire pins itself. Existing tag and dependent-branch checks
+also apply.
 
-A corrupt current manifest therefore requires repair or administrator recovery
-outside the ordinary branch-deletion protocol. `force` does not bypass pin
-protection; this proposal defines no operator override.
+For an orphan with no branch reference, skip the pin check only when authoritative
+resolution proves there is no attached manifest. An unreadable or invalid head,
+or a resolution failure, **must fail deletion**. If the selected head disappears,
+resolve again rather than infer absence. Corrupt metadata requires administrator
+repair; force deletion cannot bypass the check.
 
-This follows existing tag protection: the check is separate from physical
-deletion and is not atomic with concurrent acquisition. Registration after a
-deleter's inspection does not force that deleter to observe the new pin.
-Delayed deletion after recovery and name reuse also remains a known gap. See
-[Cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races).
-
-Resolving those existing coordination gaps is outside the pin proposal. Branch
-names remain reusable; pins add no name-retirement record, deletion marker,
-branch layout, or reference-history format.
+Inspection is separate from physical deletion. A later registration cannot stop
+a deletion already approved, and delayed deletion after recovery and name reuse
+may affect a replacement branch. See [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races).
 
 ## Tagging
 

@@ -605,93 +605,51 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
-## Ongoing Work Pin Transactions
+<a id="ongoing-work-pin-transactions"></a>
 
-The persisted operations are `RegisterPin` (field 116), `RenewPin` (117),
-and `ReleasePin` (118), defined in `protos/transaction.proto`.
-They mutate only the authoritative current pin list and its required capability.
-They cannot be used in detached commits. The record, time, identity, no-op, and
-confirmation rules are specified in [Ongoing Work Pins](ongoing_work_pins.md).
-Their manifest conflict rules do not make physical cleanup or branch deletion
-atomic with acquisition; the existing [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
-still apply.
+## Version Pin Transactions
 
-Expired pins are removed while constructing the next attached commit; there is
-no separate expiration operation. `Transaction.release_pin_id` (field 5) lets
-an ordinary attached operation explicitly release one pin in the same commit.
-It uses the existing `UUID` message with exactly 16 bytes. Absence means no
-explicit release; a missing target does not cancel the accompanying operation.
-It is invalid on pin operations, Clone, and detached commits. See
-[Publication and release](ongoing_work_pins.md#publication-and-release) for
-validation and lost-response recovery. This extends the current transaction
-format without depending on Transaction V2.
+`RegisterPin` (field 116), `RenewPin` (117), and `ReleasePin` (118) update the
+current pin list. `Transaction.release_pin_id` (field 5) removes one pin
+atomically with an ordinary attached operation. None may be used in detached
+commits; the release field is also invalid on pin operations and Clone.
 
-An attached commit whose resulting manifest contains active pins, or which
-sets `release_pin_id`, must persist its own transaction inline or in its
-referenced sidecar before publication. This also applies when publication
-releases the last pin or its target is already absent; reject publication if
-neither representation can be stored.
-This preserves the committed-change evidence required by the
-[version retention window](ongoing_work_pins.md#retention-and-data-operations),
-including when the operation carries existing pins without changing them.
-
-Detached commits instead serialize an empty pin list and preserve the sticky
-capability when inherited. They do not change the branch's current membership.
+The [Version Pins specification](ongoing_work_pins.md) defines registration,
+confirmation, expiration, transaction persistence, and retention. Pin changes
+**must not bypass** existing data conflicts, writer-capability checks, or
+branch identity. Unknown operations retain their fail-closed conflict behavior.
+Config and metadata maps cannot mutate pins.
 
 ### Directional conflict rules
 
-For an incoming RegisterPin, recover an existing active ID first without
-changing its source or times. Otherwise it may rebase over known attached data
-and pin operations in the same table and branch. Set the source to each attempt's
-publishing version; only the successfully committed source becomes fixed.
-Validate the acquired named-branch identity and the request's unexpired deadline
-on fresh attempts. A lost-response retry still needs current membership and
-confirmation of the stored source. The job plans and reads only after confirmation.
-Requests must not be reused across whole-table deletion and recreation.
+Pin operations may re-evaluate over known attached data and pin operations in
+the same table and branch. Fresh registration or a definitively lost attempt
+may rebase; uncertain registration recovery cannot resubmit. The successful
+registration version fixes the source, and work begins only after confirmation.
 
-For all other incoming attached operations, the following rules describe their
-behavior across a committed pin operation. Existing conflicts with other data
-operations still apply; this does not make a conflicting Append/Overwrite pair compatible.
-Unknown transaction operations retain their existing fail-closed conflict rule.
+For an incoming operation rebasing across RegisterPin, RenewPin, or ReleasePin:
 
-| Incoming operation | Across committed RegisterPin, RenewPin, or ReleasePin |
+| Incoming operation | Required behavior |
 | --- | --- |
-| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases | May rebase under their existing data rules. Start from current pins, remove expired records, and apply any explicit `release_pin_id`. Preserve the other records exactly. Config and metadata maps cannot change pins. |
-| CreateIndex | Apply the same pin rules and existing index conflict checks. Validate publication and any required FRI history before applying `release_pin_id`. |
-| Rewrite | Revalidate current pins at the final target, allowing only removals that this same commit publishes. Missing movement records for the remaining pins require replanning, even when work was planned before registration. |
-| Restore, Overwrite | Start from current pins and the sticky capability, apply the same expiration and explicit-release rules, and preserve all remaining fields. Never substitute historical membership. Existing data conflicts remain. |
-| Clone | Does not copy source pins into the new branch/table. Preserve an inherited sticky capability and the source's independent version protections. Source publication/retention rules still apply. |
-| RegisterPin | Recover an active ID or retry against the current head. The successful registration version becomes the source. Never move an already active pin to a new source. |
-| RenewPin | Re-read the target pin and check its deadline. Missing or already expired at validation is an error; an already satisfied request is a no-op; otherwise extend to the fixed later `expires_at`. Another renewal cannot shorten it. |
-| ReleasePin | Explicitly remove the target ID from the current list; absent is a no-op. Concurrent renewal does not prevent explicit release. A real commit also applies ordinary expiration. |
+| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive pins from the attempt's predecessor, remove expired records, apply any explicit release, and preserve the rest. |
+| Rewrite | Recheck current pin requirements before committing. Missing required movements require replanning, even if planning preceded registration. |
+| Restore, Overwrite | Use current pins and the sticky capability, apply expiration and release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
+| Clone | Start the destination with no pins and preserve the inherited capability. Do not transfer pin mutations or ownership to the destination. |
+| RegisterPin | Recover a listed ID without changing it. Otherwise, a fresh or definitively lost attempt uses the new head and an unexpired request. Uncertain recovery stays read-only. |
+| RenewPin | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |
+| ReleasePin | Remove the target ID; absent is a no-op. A concurrent renewal does not prevent explicit release. |
 
-Every successful attached commit also removes expired records from its attempt's
-predecessor list. Recompute expiration after conflicts; a renewal must not be
-overwritten using an earlier removal decision. A no-op pin request does not
-force a version solely to expire other pins. Cleanup waits for committed
-removal and does not create an expiration commit on an idle table.
+Every retry **must recompute expiration** from its new predecessor. A winning
+renewal defeats an older removal decision; a winning removal prevents renewal
+from recreating the ID. No-op pin requests create no version, while real
+mutations use ordinary version counting. Release does not fence registration
+already in flight. Distinct IDs remain independent.
 
-Incoming RenewPin and ReleasePin can re-evaluate over the existing known data
-operations against the resulting current list. They do not bypass ordinary
-writer-capability checks, branch identity, or unknown-operation rules. An
-operation cannot use this compatibility text to migrate an old handle to a
-recreated branch. Clone creates a separate destination and does not transfer
-ownership of a pin mutation there.
-
-A renewal that commits first and extends the deadline into the future defeats
-an older expiration decision. If another commit removes the ID first, RenewPin
-fails rather than recreating it. An absent-ID ReleasePin does not fence a
-registration still in flight. Distinct IDs operate independently. Pin operations
-with no effect do not commit another version; committed mutations otherwise
-count as ordinary versions and cleanup intervals.
-
-All operations that remove FRI transitions must revalidate the union of current
-pin and attached-consumer requirements, using the representation-specific rules
-in [Ongoing Work Pins](ongoing_work_pins.md#retention-and-data-operations).
-Restore and Overwrite apply those rules to the resulting current history and
-may discard translation paths as described there; they must still preserve
-the remaining pins and their complete version retention window.
-Pin changes never loosen other transaction preconditions.
+Operations removing FRI history **must revalidate** the union of current pin
+and existing-consumer requirements using the
+[retention rules](ongoing_work_pins.md#retention-and-data-operations). Restore
+and Overwrite apply them to the resulting current history; discarded paths need
+not be reconstructed, but surviving pins retain their complete version window.
 
 ## Conflict Resolution
 
