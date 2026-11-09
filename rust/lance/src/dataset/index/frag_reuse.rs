@@ -976,11 +976,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub fn reuse_version(
-        dataset_version: u64,
-        old: &[u64],
-        new: &[u64],
-    ) -> FragReuseVersion {
+    pub fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
         FragReuseVersion {
             dataset_version,
             groups: vec![lance_index::frag_reuse::FragReuseGroup {
