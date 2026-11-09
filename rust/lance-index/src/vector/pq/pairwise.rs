@@ -16,7 +16,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_core::utils::cpu::{Candidate, Dispatch};
+use lance_core::utils::cpu::{Candidate, Kernel};
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 
@@ -39,7 +39,7 @@ pub struct PQPairScorer {
     /// partition centroid that residual codes are relative to.
     squared_norms: Vec<f64>,
     /// Resolved once per scorer; it also fixes the table layout.
-    lookup: &'static Candidate<LookupFn>,
+    lookup: Lookup,
 }
 
 /// The codeword distance table in the layout its lookup kernel reads.
@@ -53,10 +53,11 @@ enum CodewordTable {
 }
 
 impl CodewordTable {
-    fn new(rows: Vec<f32>, lookup: &Candidate<LookupFn>) -> Self {
-        match lookup.name() {
+    fn new(rows: Vec<f32>, layout: TableLayout) -> Self {
+        match layout {
+            TableLayout::Rows => Self::Rows(rows),
             #[cfg(target_arch = "x86_64")]
-            name if name == x86::LOOKUP8_AVX512_VBMI.name() => Self::BytePlanes(
+            TableLayout::BytePlanes => Self::BytePlanes(
                 rows.as_chunks::<256>()
                     .0
                     .iter()
@@ -65,7 +66,6 @@ impl CodewordTable {
                     })
                     .collect(),
             ),
-            _ => Self::Rows(rows),
         }
     }
 
@@ -92,19 +92,14 @@ impl PQPairScorer {
         centroid: &ArrayRef,
         metric: DistanceType,
     ) -> Result<Self> {
-        Self::with_lookup(
-            pq,
-            centroid,
-            metric,
-            lookup_dispatch(pq.num_bits).selected(),
-        )
+        Self::with_lookup(pq, centroid, metric, best_lookup(pq.num_bits))
     }
 
     fn with_lookup(
         pq: &ProductQuantizer,
         centroid: &ArrayRef,
         metric: DistanceType,
-        lookup: &'static Candidate<LookupFn>,
+        lookup: Lookup,
     ) -> Result<Self> {
         let num_sub_vectors = pq.num_sub_vectors;
         let code_bytes = match pq.num_bits {
@@ -163,7 +158,7 @@ impl PQPairScorer {
             num_sub_vectors,
             code_bytes,
             metric,
-            table: CodewordTable::new(table, lookup),
+            table: CodewordTable::new(table, lookup.layout),
             squared_norms,
             lookup,
         })
@@ -708,35 +703,100 @@ mod x86 {
 /// distances for any candidate range.
 type LookupFn = unsafe fn(&PQKernel<'_>, usize, Range<usize>, &mut [f32]);
 
-lance_core::dispatch! {
-    static LOOKUP4: Dispatch<LookupFn> = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            &[x86::LOOKUP4_AVX512, x86::LOOKUP4_AVX2, LOOKUP4_SCALAR]
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            &[LOOKUP4_SCALAR]
-        }
-    };
+/// The codeword-table layout a lookup kernel reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableLayout {
+    Rows,
+    #[cfg(target_arch = "x86_64")]
+    BytePlanes,
 }
 
-lance_core::dispatch! {
-    /// The VBMI kernel reads the table as byte planes, see [`CodewordTable`].
-    static LOOKUP8: Dispatch<LookupFn> = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            &[x86::LOOKUP8_AVX512_VBMI, LOOKUP8_SCALAR]
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            &[LOOKUP8_SCALAR]
-        }
-    };
+/// A lookup kernel and the table layout it reads. The layout is fixed when
+/// the scorer builds its table, so it travels with the candidate rather than
+/// being a `Dispatch` of its own.
+struct LookupCandidate {
+    candidate: Candidate<LookupFn>,
+    layout: TableLayout,
 }
 
-fn lookup_dispatch(num_bits: u32) -> &'static Dispatch<LookupFn> {
-    if num_bits == 4 { &LOOKUP4 } else { &LOOKUP8 }
+impl LookupCandidate {
+    const fn rows(candidate: Candidate<LookupFn>) -> Self {
+        Self {
+            candidate,
+            layout: TableLayout::Rows,
+        }
+    }
+
+    /// The lookup, if the host supports its kernel.
+    fn lookup(&self) -> Option<Lookup> {
+        Some(Lookup {
+            #[cfg(test)]
+            name: self.candidate.name(),
+            kernel: self.candidate.kernel()?,
+            layout: self.layout,
+        })
+    }
+}
+
+/// A host-supported lookup kernel and the table layout it reads.
+#[derive(Clone, Copy)]
+struct Lookup {
+    #[cfg(test)]
+    name: &'static str,
+    kernel: Kernel<LookupFn>,
+    layout: TableLayout,
+}
+
+/// 4-bit lookups, best first.
+const LOOKUP4: &[LookupCandidate] = {
+    #[cfg(target_arch = "x86_64")]
+    {
+        &[
+            LookupCandidate::rows(x86::LOOKUP4_AVX512),
+            LookupCandidate::rows(x86::LOOKUP4_AVX2),
+            LookupCandidate::rows(LOOKUP4_SCALAR),
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        &[LookupCandidate::rows(LOOKUP4_SCALAR)]
+    }
+};
+
+/// 8-bit lookups, best first.
+const LOOKUP8: &[LookupCandidate] = {
+    #[cfg(target_arch = "x86_64")]
+    {
+        &[
+            LookupCandidate {
+                candidate: x86::LOOKUP8_AVX512_VBMI,
+                layout: TableLayout::BytePlanes,
+            },
+            LookupCandidate::rows(LOOKUP8_SCALAR),
+        ]
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        &[LookupCandidate::rows(LOOKUP8_SCALAR)]
+    }
+};
+
+// Every host must have a lookup.
+const _: () = {
+    assert!(LOOKUP4[LOOKUP4.len() - 1].candidate.features().is_empty());
+    assert!(LOOKUP8[LOOKUP8.len() - 1].candidate.features().is_empty());
+};
+
+fn lookup_candidates(num_bits: u32) -> &'static [LookupCandidate] {
+    if num_bits == 4 { LOOKUP4 } else { LOOKUP8 }
+}
+
+/// The first lookup for `num_bits` codes that the host supports.
+fn best_lookup(num_bits: u32) -> Lookup {
+    lookup_candidates(num_bits)
+        .iter()
+        .find_map(LookupCandidate::lookup)
+        .expect("the last lookup needs no CPU features")
 }
 
 impl PairKernel for PQKernel<'_> {
@@ -744,16 +804,12 @@ impl PairKernel for PQKernel<'_> {
         let scorer = self.scorer;
         assert_eq!(out.len(), candidates.len());
         let range = candidates.clone();
-        let lookup = scorer
-            .lookup
-            .kernel()
-            .expect("the scorer's lookup kernel was supported when selected");
         // SAFETY: the host supports the kernel's target features, since the
         // pointer came from a `Kernel`. The lookup kernels are safe functions
         // with no other preconditions: they bounds-check `range` against the
         // staged codes and write only `out`. (`call` cannot name the
         // `PQKernel` lifetime, hence the raw pointer.)
-        unsafe { lookup.as_fn()(self, anchor_row, range, out) };
+        unsafe { scorer.lookup.kernel.as_fn()(self, anchor_row, range, out) };
         match scorer.metric {
             DistanceType::Dot => {
                 // Each sub-vector contributed `1 - dot`; keep a single `1 -`.
@@ -779,12 +835,11 @@ mod tests {
     use lance_core::ROW_ID;
     use rstest::rstest;
 
-    /// The lookup kernels this host supports for `num_bits` codes.
-    fn supported_lookups(num_bits: u32) -> impl Iterator<Item = &'static Candidate<LookupFn>> {
-        lookup_dispatch(num_bits)
-            .candidates()
+    /// The lookups this host supports for `num_bits` codes.
+    fn supported_lookups(num_bits: u32) -> impl Iterator<Item = Lookup> {
+        lookup_candidates(num_bits)
             .iter()
-            .filter(|candidate| candidate.kernel().is_some())
+            .filter_map(LookupCandidate::lookup)
     }
 
     /// Dimension 6 with 3 sub-vectors of width 2; codewords are small
@@ -910,10 +965,10 @@ mod tests {
                     assert!(
                         (f64::from(distance) - expected).abs() <= 1e-5 * expected.abs().max(1.0),
                         "{} bits={num_bits} {metric} a={a} b={b} actual={distance} expected={expected}",
-                        lookup.name()
+                        lookup.name
                     );
                     if subs[a] == subs[b] && metric != DistanceType::Dot {
-                        assert_eq!(distance, 0.0, "{} a={a} b={b}", lookup.name());
+                        assert_eq!(distance, 0.0, "{} a={a} b={b}", lookup.name);
                     }
                 }
             }
@@ -996,9 +1051,8 @@ mod tests {
         if (num_bits == 4 && is_x86_feature_detected!("avx2"))
             || (num_bits == 8 && is_x86_feature_detected!("avx512vbmi"))
         {
-            let dispatch = lookup_dispatch(num_bits);
-            let portable = dispatch.candidates().last().unwrap();
-            assert_ne!(dispatch.selected().name(), portable.name());
+            let portable = lookup_candidates(num_bits).last().unwrap().candidate;
+            assert_ne!(best_lookup(num_bits).name, portable.name());
         }
         for lookup in supported_lookups(num_bits) {
             let scorer = PQPairScorer {
@@ -1006,7 +1060,7 @@ mod tests {
                 num_sub_vectors,
                 code_bytes,
                 metric: DistanceType::L2,
-                table: CodewordTable::new(table.clone(), lookup),
+                table: CodewordTable::new(table.clone(), lookup.layout),
                 squared_norms: Vec::new(),
                 lookup,
             };
@@ -1029,7 +1083,7 @@ mod tests {
                         actual.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
                         expected.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
                         "{} bits={num_bits} subs={num_sub_vectors} a={anchor_row} {range:?}",
-                        lookup.name()
+                        lookup.name
                     );
                 }
             }
