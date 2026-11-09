@@ -324,6 +324,15 @@ pub struct VectorIndexDetails {
     #[prost(map = "string, string", tag = "9")]
     pub runtime_hints:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    ///
+    /// Content-derived identity of this segment's final IVF coarse-routing state.
+    /// Readers may reuse routing only for identical, well-formed values. It is
+    /// absent for legacy or unsupported routers. The current encoding is a
+    /// 32-byte BLAKE3 digest. Its canonical input encoding and lifecycle are
+    /// defined in docs/src/format/index/vector/index.md under
+    /// "Coarse-routing fingerprint".
+    #[prost(bytes = "vec", optional, tag = "10")]
+    pub coarse_quantizer_fingerprint: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(oneof = "vector_index_details::Compression", tags = "4, 5, 6, 8")]
     pub compression: ::core::option::Option<vector_index_details::Compression>,
 }

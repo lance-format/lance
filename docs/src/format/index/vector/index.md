@@ -59,6 +59,73 @@ address (`fragment_id << 32 | offset`) of each vector in `_rowaddr` instead of t
 dataset's logical row id in `_rowid`. A segment persisted below version 3 stores
 row ids throughout, and merging never combines segments of differing domain.
 
+## Coarse-routing fingerprint
+
+The manifest's per-segment `VectorIndexDetails` may contain
+`coarse_quantizer_fingerprint` (optional bytes, protobuf field 10). The value is
+the raw 32-byte output of unkeyed BLAKE3, not a hexadecimal string. It identifies
+the effective IVF coarse-routing model, not the entire index or its data.
+It does not establish compatibility of quantization codebooks or permit physical
+segment merging by itself.
+
+### Canonical input encoding
+
+Hash the concatenation of the following bytes, in this order, without padding,
+length prefixes other than the two dimensions below, or a trailing terminator:
+
+1. The ASCII bytes `lance.coarse_quantizer.v1` (no NUL terminator).
+2. One metric byte: L2 = 1, cosine = 2, dot product = 3, Hamming = 4.
+   These tags are specific to this encoding, not protobuf enum numbers. Use the
+   index's metric, so cosine remains distinct from L2 even when routing evaluates
+   L2 distances on normalized query vectors.
+3. The number of centroids as an unsigned 64-bit little-endian integer.
+4. The centroid dimension as an unsigned 64-bit little-endian integer.
+5. One scalar-type byte: float16 = 1, float32 = 2, float64 = 3, uint8 = 4,
+   int8 = 5.
+6. All centroid scalar values, in partition-ID order, with coordinates in their
+   stored order within each centroid. There are exactly centroid-count times
+   dimension values. Floating-point values use their raw IEEE-754 binary16,
+   binary32, or binary64 bit representation, in little-endian order. Unsigned
+   8-bit values use their single byte; signed 8-bit values use their two's
+   complement byte. Do not round, cast, reorder, or normalize values while
+   hashing; signed zeros and NaN payloads retain their distinct bit patterns.
+
+Arrow field names, nullability annotations, allocation layout, partition offsets
+and lengths, training loss, and quantization state are not hash inputs. Missing
+centroids, null centroid rows or scalar values, and unlisted scalar types cannot
+be represented by this encoding; writers omit the field for those models.
+The encoding describes routing determined solely by the centroids and metric.
+Routers with additional effective state, such as a query pre-transform or an
+approximate coarse-search graph, must not emit this encoding for that state.
+
+### Writer lifecycle
+
+A present fingerprint must describe the final model written to the segment,
+after training, conversion, and partition splitting or joining. Creating or
+appending a segment, retraining, or rebalancing requires computing the identity
+from that final model, not from requested build parameters or another segment's
+metadata. A pure remap or file copy may preserve the identity when routing is
+unchanged. A compatible physical merge may preserve a common identity only when
+all inputs carry that identity and the output retains the same routing model;
+otherwise compute it from the final output model or omit it. Writers must clear
+an inherited identity when they cannot establish this invariant.
+
+### Reader behavior and evolution
+
+Readers may group segments with equal, exactly 32-byte fingerprints and evaluate
+centroid routing once per group for a query. Each segment still searches its own
+partitions. A missing field, undecodable vector metadata, or any other byte
+length disables sharing for that segment; unequal identities are never grouped.
+The remaining compatible segments may still share routing. The identity is a
+writer assertion, not a checksum that authenticates the index files.
+
+Older readers ignore the optional field. Existing indices do not require a
+rewrite: segments without the field continue independent routing. The encoding
+above must not be repurposed for different routing semantics. Any future
+identity encoding requires a separately specified domain and must not make
+incompatible routing states compare equal; until then, unsupported writers omit
+the field. There is no separate version byte in the stored digest.
+
 ## PCA Pre-transform
 
 !!! warning "Experimental"
