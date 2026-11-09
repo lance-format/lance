@@ -3839,11 +3839,24 @@ async fn scan_blobs_as_logical_keeps_escaped_external_names() {
     );
 }
 
+fn map_schema(value: Field) -> Arc<Schema> {
+    let key = Field::new("key", DataType::Utf8, false);
+    let entries = Field::new("entries", DataType::Struct(vec![key, value].into()), false);
+    let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
+    Arc::new(Schema::new(vec![attrs]))
+}
+
+fn fixed_size_list_struct_schema(value: Field) -> Arc<Schema> {
+    let item = Field::new("item", DataType::Struct(vec![value].into()), false);
+    let items = Field::new("items", DataType::FixedSizeList(Arc::new(item), 1), true);
+    Arc::new(Schema::new(vec![items]))
+}
+
 /// Blob v2 nests only under Struct, List and LargeList, and from file version
 /// 2.2 every blob is stored as Blob v2: both the writer and the commit refuse a
-/// blob in a Map. A legacy blob in a 2.1 table stays allowed.
+/// blob in a Map or FixedSizeList. A legacy blob in a 2.1 table stays allowed.
 #[tokio::test]
-async fn test_blob_in_map_is_rejected_from_v2_2() {
+async fn test_blob_in_map_or_fixed_size_list_is_rejected_from_v2_2() {
     fn assert_not_supported<T>(result: Result<T>) {
         assert!(
             matches!(result, Err(Error::NotSupported { .. })),
@@ -3851,12 +3864,6 @@ async fn test_blob_in_map_is_rejected_from_v2_2() {
             result.err()
         );
     }
-    let map_of = |blob: Field| {
-        let key = Field::new("key", DataType::Utf8, false);
-        let entries = Field::new("entries", DataType::Struct(vec![key, blob].into()), false);
-        let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
-        Arc::new(Schema::new(vec![attrs]))
-    };
     let empty = |schema| RecordBatchIterator::new(std::iter::empty(), schema);
     let params = |mode, version| WriteParams {
         mode,
@@ -3882,17 +3889,30 @@ async fn test_blob_in_map_is_rejected_from_v2_2() {
 
     // The writer refuses legacy and prepared input alike.
     let prepared_blob = BlobDescriptorArrayBuilder::new("value").field().clone();
-    for blob in [legacy_blob.clone(), prepared_blob] {
+    for blob in [legacy_blob.clone(), prepared_blob.clone()] {
         let result = crate::dataset::fragment::write::FragmentCreateBuilder::new(&test_dir)
             .write_params(&v2_2)
-            .write(empty(map_of(blob)), None)
+            .write(empty(map_schema(blob)), None)
             .await;
         assert_not_supported(result);
     }
+    let result = crate::dataset::fragment::write::FragmentCreateBuilder::new(&test_dir)
+        .write_params(&v2_2)
+        .write(empty(fixed_size_list_struct_schema(prepared_blob)), None)
+        .await;
+    let Err(err) = result else {
+        panic!("Blob v2 in FixedSizeList should be rejected");
+    };
+    assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("nested in FixedSizeList field 'items'"),
+        "{err}"
+    );
     // A schema-only add writes no data file, so only the commit can refuse it.
     let result = dataset
         .add_columns(
-            crate::dataset::NewColumnTransform::AllNulls(map_of(blob_field("value", true))),
+            crate::dataset::NewColumnTransform::AllNulls(map_schema(blob_field("value", true))),
             None,
             None,
         )
@@ -3901,7 +3921,7 @@ async fn test_blob_in_map_is_rejected_from_v2_2() {
     // An empty overwrite restarts the field ids, so the nested blob takes the
     // id of column "d" and must not pass as a field the table already held.
     let result = Dataset::write(
-        empty(map_of(blob_field("value", true))),
+        empty(map_schema(blob_field("value", true))),
         &test_dir,
         Some(params(WriteMode::Overwrite, LanceFileVersion::V2_2)),
     )
@@ -3910,10 +3930,61 @@ async fn test_blob_in_map_is_rejected_from_v2_2() {
 
     let test_dir = TempStrDir::default();
     Dataset::write(
-        empty(map_of(legacy_blob)),
+        empty(map_schema(legacy_blob)),
         &test_dir,
         Some(params(WriteMode::Create, LanceFileVersion::V2_1)),
     )
     .await
     .unwrap();
+}
+
+/// Marking an ordinary binary field nested in a Map as Blob v2 through the
+/// metadata update API is rejected before the new manifest is published.
+#[tokio::test]
+async fn test_blob_v2_metadata_update_rejects_binary_in_map() {
+    let test_dir = TempStrDir::default();
+    let value = Field::new("value", DataType::Binary, true);
+    let schema = map_schema(value);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![].into_iter().map(Ok), schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let value = dataset.schema().field("attrs.entries.value").unwrap();
+    assert_eq!(value.data_type(), DataType::Binary);
+    assert!(!value.is_blob_v2());
+    let published_version = dataset.version_id();
+    let published_manifest = dataset.manifest_location().path.clone();
+
+    let err = dataset
+        .update_field_metadata()
+        .update(
+            "attrs.entries.value",
+            [(ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME)],
+        )
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("nested in Map field 'attrs'"),
+        "{err}"
+    );
+
+    let reopened = Dataset::open(&test_dir).await.unwrap();
+    assert_eq!(reopened.version_id(), published_version);
+    assert_eq!(
+        reopened.latest_version_id().await.unwrap(),
+        published_version
+    );
+    assert_eq!(reopened.manifest_location().path, published_manifest);
+    let value = reopened.schema().field("attrs.entries.value").unwrap();
+    assert!(!value.is_blob_v2());
+    assert!(!value.metadata.contains_key(ARROW_EXT_NAME_KEY));
 }
