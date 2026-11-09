@@ -2,7 +2,7 @@ name: Rust (no lockfile)
 
 # Builds against the newest dependency versions (no Cargo.lock) to catch
 # upstream releases that break us. That doesn't need to run on every PR, so it
-# runs nightly and on PRs that change dependency declarations.
+# runs nightly and on PRs that change workspace dependency declarations.
 on:
   schedule:
     - cron: "0 0 * * *"
@@ -12,7 +12,9 @@ on:
       - main
       - release/**
     paths:
-      - "**/Cargo.toml"
+      # Only the root workspace is built; python/ and java/ are excluded from it.
+      - Cargo.toml
+      - rust/**/Cargo.toml
       - .github/workflows/rust-no-lock.yml
 
 permissions:
