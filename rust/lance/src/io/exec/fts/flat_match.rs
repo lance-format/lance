@@ -625,6 +625,11 @@ impl ExecutionPlan for FlatMatchFilterExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
+
+    // Drops rows that do not match the query, so a limit cannot move below it.
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 /// Calculates the FTS score for each row in the input.
