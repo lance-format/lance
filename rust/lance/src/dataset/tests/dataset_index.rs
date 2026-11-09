@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod composition;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -164,6 +166,19 @@ async fn test_create_index(
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0]["metric_type"].as_str().unwrap(), "l2");
     assert_eq!(deltas[0]["num_partitions"].as_i64().unwrap(), 10);
+
+    let segment_statistics = dataset
+        .index_segment_statistics("embeddings_idx", &[index_meta.uuid])
+        .await
+        .unwrap();
+    let assembled_statistics: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("embeddings_idx", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(assembled_statistics.as_object().unwrap(), actual_statistics);
 
     assert!(dataset.index_statistics("non-existent_idx").await.is_err());
     assert!(dataset.index_statistics("").await.is_err());
@@ -898,6 +913,92 @@ async fn test_search_empty(
             &ArrowField::new(DIST_COL, DataType::Float32, true)
         );
     }
+}
+
+/// Rows deleted after the index was built must never come back from a vector
+/// search, also when deletions are the only prefilter and each segment's
+/// prefilter is its ownership mask alone. The compacted case retires fragment
+/// ids, so the masks have to restrict to the live fragments as well.
+#[rstest]
+#[tokio::test]
+async fn test_vector_search_excludes_rows_deleted_after_indexing(
+    #[values(false, true)] use_stable_row_id: bool,
+    #[values(false, true)] compact: bool,
+) {
+    let write_params = WriteParams {
+        max_rows_per_file: 300,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let rows = |first_id: u64, num_rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(num_rows), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(rows(0, 1200), "memory://", Some(write_params.clone()))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(rows(1200, 600), Some(write_params))
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+    dataset.delete("id % 3 = 0").await.unwrap();
+    if compact {
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("id % 3 = 1 AND id % 2 = 0").await.unwrap();
+    }
+
+    let live_ids = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let query = Float32Array::from_iter_values((0..16).map(|i| i as f32 / 16.0));
+    // Probing every partition with k above the row count returns every row the
+    // prefilter lets through, so the result must be exactly the live rows.
+    let results = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .nearest("vec", &query, 2000)
+        .unwrap()
+        .minimum_nprobes(2)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let found_ids = results["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert_eq!(found_ids.len(), results.num_rows());
+    assert_eq!(found_ids, live_ids);
 }
 
 #[rstest]
@@ -4059,6 +4160,7 @@ async fn test_fts_unindexed_data() {
 
 #[derive(Clone, Copy, Debug)]
 enum RestrictedMatchDomain {
+    Unrestricted,
     Prefilter,
     IndexedFragment,
     Filter(&'static str),
@@ -4149,6 +4251,24 @@ fn raw_match_oracle(corpus: &[(i32, &str)], query: &str) -> (RawMatchCorpus, Vec
     )
 }
 
+/// A phrase scores as the Match of its terms, so the oracle keeps the Match scores
+/// of the rows that hold the terms adjacently and in order.
+fn raw_phrase_oracle(corpus: &[(i32, &str)], phrase: &str) -> (RawMatchCorpus, Vec<(i32, f64)>) {
+    let terms: Vec<_> = phrase.split_whitespace().collect();
+    let (corpus_stats, mut scores) = raw_match_oracle(corpus, phrase);
+    scores.retain(|(id, _)| {
+        corpus.iter().any(|(row, text)| {
+            row == id
+                && text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(terms.len())
+                    .any(|window| window == terms.as_slice())
+        })
+    });
+    (corpus_stats, scores)
+}
+
 #[derive(Debug, serde::Serialize)]
 struct RestrictedMatchObservation {
     stage: &'static str,
@@ -4170,6 +4290,16 @@ async fn restricted_match_observation(
         .with_fuzziness(Some(0))
         .with_operator(Operator::Or)
         .with_document_granularity(DocumentGranularity::Row);
+    restricted_fts_observation(dataset, domain, stage, limit, query.into()).await
+}
+
+async fn restricted_fts_observation(
+    dataset: &Dataset,
+    domain: RestrictedMatchDomain,
+    stage: &'static str,
+    limit: Option<i64>,
+    query: FtsQuery,
+) -> RestrictedMatchObservation {
     let collected_stats = Arc::new(Mutex::new(None::<ExecutionSummaryCounts>));
     let stats_setter = collected_stats.clone();
     let mut scanner = dataset.scan();
@@ -4179,11 +4309,12 @@ async fn restricted_match_observation(
         }))
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .limit(limit, None)
         .unwrap();
     match domain {
+        RestrictedMatchDomain::Unrestricted => {}
         RestrictedMatchDomain::Prefilter => {
             scanner.prefilter(true).filter("id < 2").unwrap();
         }
@@ -4366,7 +4497,24 @@ fn assert_restricted_match_oracle(
     candidate_ids: &[i32],
     observations: &[RestrictedMatchObservation],
 ) {
-    let (corpus_stats, mut expected) = raw_match_oracle(corpus, "alpha beta");
+    assert_restricted_oracle(
+        name,
+        corpus,
+        raw_match_oracle(corpus, "alpha beta"),
+        domain,
+        candidate_ids,
+        observations,
+    );
+}
+
+fn assert_restricted_oracle(
+    name: &str,
+    corpus: &[(i32, &str)],
+    (corpus_stats, mut expected): (RawMatchCorpus, Vec<(i32, f64)>),
+    domain: RestrictedMatchDomain,
+    candidate_ids: &[i32],
+    observations: &[RestrictedMatchObservation],
+) {
     expected.retain(|(id, _)| candidate_ids.contains(id));
     let evidence = serde_json::json!({
         "case": name,
@@ -5220,6 +5368,432 @@ async fn test_fts_9058_match_planner_domains(
     assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
     assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
     assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
+}
+
+/// Over the whole corpus "beta" is the more common term, so for the phrase
+/// "alpha beta" row 0 ("alpha" twice) outranks row 1 ("beta" twice). Over the
+/// first fragment alone the order flips.
+const PHRASE_CORPUS: [(i32, &str); 10] = [
+    (0, "alpha beta alpha"),
+    (1, "alpha beta beta"),
+    (2, "alpha"),
+    (3, "alpha gamma"),
+    (4, "beta"),
+    (5, "alpha beta"),
+    (6, "beta delta"),
+    (7, "beta gamma"),
+    (8, "gamma alpha beta"),
+    (9, "beta"),
+];
+
+/// `PHRASE_CORPUS` in three fragments.
+fn phrase_corpus_fragments() -> Vec<Vec<(i32, Option<&'static str>)>> {
+    [
+        &PHRASE_CORPUS[..4],
+        &PHRASE_CORPUS[4..7],
+        &PHRASE_CORPUS[7..],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect()
+}
+
+/// One fragment per entry of `fragments`. The first `indexed_fragments` are indexed,
+/// one segment each, and the rest form the unindexed tail. With none indexed the
+/// dataset has no FTS index.
+async fn phrase_dataset(
+    fragments: &[Vec<(i32, Option<&str>)>],
+    indexed_fragments: usize,
+    with_position: bool,
+    stable_row_ids: bool,
+) -> Dataset {
+    let mut dataset = restricted_match_dataset(fragments, 0, stable_row_ids).await;
+    if indexed_fragments > 0 {
+        let fragment_groups = dataset.get_fragments()[..indexed_fragments]
+            .iter()
+            .map(|fragment| vec![fragment.id() as u32])
+            .collect();
+        create_fragmented_fts_index_with_groups(
+            &mut dataset,
+            "text",
+            with_position,
+            fragment_groups,
+        )
+        .await;
+    }
+    dataset
+}
+
+fn phrase_corpus_query() -> FtsQuery {
+    PhraseQuery::new("alpha beta".to_owned())
+        .with_column(Some("text".to_owned()))
+        .into()
+}
+
+#[rstest]
+#[case::unrestricted(RestrictedMatchDomain::Unrestricted, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])]
+#[case::prefilter(RestrictedMatchDomain::Prefilter, &[0, 1])]
+#[case::indexed_fragment(RestrictedMatchDomain::IndexedFragment, &[0, 1, 2, 3])]
+#[case::residual_filter(RestrictedMatchDomain::Filter("id >= 5"), &[5, 6, 7, 8, 9])]
+#[case::residual_fragment(RestrictedMatchDomain::Fragments(&[2]), &[7, 8, 9])]
+#[case::mixed_fragments(RestrictedMatchDomain::Fragments(&[0, 2]), &[0, 1, 2, 3, 7, 8, 9])]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus(
+    #[case] domain: RestrictedMatchDomain,
+    #[case] candidate_ids: &[i32],
+    #[values(0, 1, 2)] indexed_fragments: usize,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = phrase_dataset(
+        &phrase_corpus_fragments(),
+        indexed_fragments,
+        true,
+        stable_row_ids,
+    )
+    .await;
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            if indexed_fragments == 0 {
+                let fragment_ids = dataset
+                    .get_fragments()
+                    .iter()
+                    .map(|fragment| fragment.id() as u32)
+                    .collect();
+                create_fragmented_fts_index_with_groups(
+                    &mut dataset,
+                    "text",
+                    true,
+                    vec![fragment_ids],
+                )
+                .await;
+            } else {
+                dataset
+                    .optimize_indices(&OptimizeOptions::append())
+                    .await
+                    .unwrap();
+            }
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, phrase_corpus_query())
+                    .await,
+            );
+        }
+    }
+    assert_restricted_oracle(
+        &format!("9058-phrase-{domain:?}-indexed-{indexed_fragments}.json"),
+        &PHRASE_CORPUS,
+        raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta"),
+        domain,
+        candidate_ids,
+        &observations,
+    );
+    for observation in &observations[..2] {
+        let plan = observation.plan.as_ref().unwrap();
+        if indexed_fragments == 0 {
+            assert_contains!(plan, "FlatMatchQuery:");
+        } else {
+            assert_contains!(plan, "MatchCorpus");
+            assert_contains!(plan, "PhraseQuery:");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_requires_positions() {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, false, false).await;
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    let error = observation.rows.unwrap_err();
+    assert!(
+        error.contains("position is not found but required for phrase queries"),
+        "{error}"
+    );
+    // Only the indexed fragments need positions.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Fragments(&[2]),
+        "without_positions",
+        None,
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership("9058-phrase-without-positions", &[8], &[observation]);
+    // Like Match, a zero limit returns no rows, before positions are checked.
+    let observation = restricted_fts_observation(
+        &dataset,
+        RestrictedMatchDomain::Unrestricted,
+        "without_positions",
+        Some(0),
+        phrase_corpus_query(),
+    )
+    .await;
+    assert_restricted_match_membership(
+        "9058-phrase-without-positions-zero-limit",
+        &[],
+        &[observation],
+    );
+}
+
+#[rstest]
+#[case::all_null("all-null", &[None, None], &[None, None], &[])]
+#[case::all_empty("all-empty", &[Some(""), Some("")], &[Some(""), Some("")], &[])]
+#[case::empty_index("empty-index", &[None, Some("")], &[Some("alpha beta"), None], &[2])]
+#[case::empty_residual("empty-residual", &[Some("alpha beta"), None], &[None, Some("")], &[0])]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_text_corpus(
+    #[case] name: &str,
+    #[case] initial: &[Option<&str>],
+    #[case] residual: &[Option<&str>],
+    #[case] expected_ids: &[i32],
+) {
+    let fragments = vec![
+        initial
+            .iter()
+            .enumerate()
+            .map(|(id, text)| (id as i32, *text))
+            .collect(),
+        residual
+            .iter()
+            .enumerate()
+            .map(|(id, text)| ((initial.len() + id) as i32, *text))
+            .collect(),
+    ];
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations.push(
+            restricted_fts_observation(
+                &dataset,
+                RestrictedMatchDomain::Filter("id >= 0"),
+                stage,
+                None,
+                phrase_corpus_query(),
+            )
+            .await,
+        );
+    }
+    // Membership only, as in `test_fts_9058_empty_text_corpus`.
+    assert_restricted_match_membership(
+        &format!("9058-phrase-text-{name}.json"),
+        expected_ids,
+        &observations,
+    );
+}
+
+#[rstest]
+#[case::zero_limit("zero-limit", "alpha beta", Some(0))]
+#[case::no_matches("no-matches", "gamma beta", Some(1))]
+#[tokio::test]
+async fn test_fts_9058_phrase_empty_results_complete(
+    #[case] name: &str,
+    #[case] phrase: &str,
+    #[case] limit: Option<i64>,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::IndexedFragment
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let mut dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .into();
+    let mut observations = Vec::with_capacity(2);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        observations
+            .push(restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await);
+    }
+    assert_restricted_match_membership(
+        &format!("9058-phrase-empty-{name}-{domain:?}.json"),
+        &[],
+        &observations,
+    );
+}
+
+/// Slop, a removed stop word and a repeated term change how a phrase matches and
+/// counts. Scores while the tail is unindexed must equal those once it is indexed,
+/// also when the filter drops an appended row that holds the phrase terms.
+#[rstest]
+#[case::slop("alpha delta", 1)]
+#[case::stop_word("alpha the beta", 0)]
+#[case::repeated_term("beta beta", 0)]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_matches_complete_index(
+    #[case] phrase: &str,
+    #[case] slop: u32,
+    #[values(
+        RestrictedMatchDomain::Unrestricted,
+        RestrictedMatchDomain::Prefilter,
+        RestrictedMatchDomain::Filter("id != 4")
+    )]
+    domain: RestrictedMatchDomain,
+) {
+    let fragments: Vec<Vec<_>> = [
+        &[
+            (0, "alpha beta delta"),
+            (1, "alpha the beta beta"),
+            (2, "alpha delta gamma"),
+            (3, "beta beta"),
+        ][..],
+        &[
+            (4, "alpha the beta"),
+            (5, "beta beta gamma delta"),
+            (6, "alpha gamma delta"),
+        ],
+        &[
+            (7, "delta alpha beta delta"),
+            (8, "gamma beta beta alpha"),
+            (9, "alpha delta"),
+        ],
+    ]
+    .iter()
+    .map(|rows| rows.iter().map(|(id, text)| (*id, Some(*text))).collect())
+    .collect();
+    let mut dataset = phrase_dataset(&fragments, 1, true, false).await;
+    let query: FtsQuery = PhraseQuery::new(phrase.to_owned())
+        .with_column(Some("text".to_owned()))
+        .with_slop(slop)
+        .into();
+    let mut observations = Vec::with_capacity(4);
+    for stage in ["partial_index", "complete_index"] {
+        if stage == "complete_index" {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        for limit in [Some(1), None] {
+            observations.push(
+                restricted_fts_observation(&dataset, domain, stage, limit, query.clone()).await,
+            );
+        }
+    }
+    let evidence = serde_json::json!({
+        "phrase": phrase,
+        "slop": slop,
+        "domain": format!("{domain:?}"),
+        "observations": observations,
+    });
+    let rows = |observation: &RestrictedMatchObservation| {
+        let mut rows = observation
+            .rows
+            .clone()
+            .unwrap_or_else(|error| panic!("execution failed: {error}; {evidence:#}"));
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    };
+    let (partial, complete) = observations.split_at(2);
+    let expected = rows(&complete[1]);
+    assert!(!expected.is_empty(), "no row matches: {evidence:#}");
+    let top_score = expected
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f32::MIN, f32::max);
+    for observation in observations.iter().filter(|o| o.limit.is_none()) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), expected.len(), "wrong hits: {evidence:#}");
+        for ((actual_id, actual_score), (expected_id, expected_score)) in
+            actual.iter().zip(&expected)
+        {
+            assert_eq!(actual_id, expected_id, "wrong candidate: {evidence:#}");
+            assert!(
+                (actual_score - expected_score).abs() < 1e-5,
+                "score depends on index coverage: {evidence:#}"
+            );
+        }
+    }
+    // Ties may pick either row for the top-1, so compare its score.
+    for observation in observations.iter().filter(|o| o.limit == Some(1)) {
+        let actual = rows(observation);
+        assert_eq!(actual.len(), 1, "wrong top-1: {evidence:#}");
+        assert!(
+            (actual[0].1 - top_score).abs() < 1e-5,
+            "top-1 score depends on index coverage: {evidence:#}"
+        );
+    }
+    assert_contains!(partial[0].plan.as_ref().unwrap(), "MatchCorpus");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_phrase_corpus_reuses_physical_plan(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let dataset = phrase_dataset(&phrase_corpus_fragments(), 1, true, stable_row_ids).await;
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(phrase_corpus_query()))
+        .unwrap()
+        .prefilter(true)
+        .filter("id < 2")
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap();
+    // Each execution of the same physical plan needs its own scorer.
+    let plan = tokio::time::timeout(Duration::from_secs(10), scanner.create_plan())
+        .await
+        .expect("phrase planning timed out")
+        .unwrap();
+    let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
+    let (_, mut expected) = raw_phrase_oracle(&PHRASE_CORPUS, "alpha beta");
+    expected.retain(|(id, _)| *id < 2);
+    let expected = expected[0];
+    let assert_top_result = |batches: Vec<RecordBatch>| {
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        for batch in batches {
+            let ids = batch["id"].as_primitive::<Int32Type>();
+            let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
+            for (id, score) in ids.values().iter().zip(scores.values()) {
+                assert_eq!(*id, expected.0);
+                assert!((f64::from(*score) - expected.1).abs() < 1e-5);
+            }
+        }
+    };
+    for _ in 0..2 {
+        let batches = tokio::time::timeout(
+            Duration::from_secs(10),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        )
+        .await
+        .expect("reused phrase physical plan timed out")
+        .unwrap();
+        assert_top_result(batches);
+    }
+    let (left, right) = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::try_join(
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+            datafusion::physical_plan::collect(plan.clone(), context.clone()),
+        ),
+    )
+    .await
+    .expect("concurrent phrase physical plan executions timed out")
+    .unwrap();
+    assert_top_result(left);
+    assert_top_result(right);
 }
 
 #[tokio::test]
@@ -7844,6 +8418,183 @@ async fn test_optimize_json_btree_index(#[case] append_rebuild: bool) {
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 2);
+
+    // Without stable row ids a row id and a row address coincide, so the
+    // segments keep the pre-migration version older builds can read.
+    for index in dataset.load_indices_by_name("json_idx").await.unwrap() {
+        assert_eq!(
+            index.index_version,
+            lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32
+        );
+    }
+}
+
+fn json_val_batch(values: std::ops::Range<i64>) -> RecordBatch {
+    let docs = values
+        .map(|val| format!(r#"{{"val": {val}}}"#))
+        .collect::<Vec<_>>();
+    json_batch(docs.iter().map(String::as_str).collect())
+}
+
+/// 12 rows over 3 fragments with stable row ids, so row ids and row addresses
+/// differ from the second fragment on.
+async fn stable_row_id_json_dataset(uri: &str) -> Dataset {
+    let batch = json_val_batch(0..12);
+    let schema = batch.schema();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+fn json_index_params(target_index_type: &str) -> ScalarIndexParams {
+    ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
+        "target_index_type": target_index_type,
+        "path": "val",
+    }))
+}
+
+/// Asserts the JSON index answers `json_get_int(json, 'val') = {val}` for each
+/// of `vals` exactly like a scan that ignores it.
+async fn assert_json_index_matches_scan(dataset: &Dataset, vals: &[i64]) {
+    for val in vals {
+        let predicate = format!("json_get_int(json, 'val') = {val}");
+        let indexed = dataset
+            .scan()
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut baseline_scan = dataset.scan();
+        baseline_scan.use_scalar_index(false);
+        let baseline = baseline_scan
+            .filter(&predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, baseline, "{predicate}");
+    }
+}
+
+/// On a stable-row-id dataset a JSON index over a BTree stores row addresses,
+/// and keeps doing so through a delete, an append, and an optimize that updates
+/// the one existing segment in place. That update must filter the old segment's
+/// data by fragment: a row-id filter would treat every address past the first
+/// fragment as a deleted row and drop it.
+#[tokio::test]
+async fn test_json_btree_row_addr_domain_with_stable_row_ids() {
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some("json_idx".to_string()),
+            &json_index_params("btree"),
+            false,
+        )
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(
+        segments[0].index_version,
+        lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION as i32
+    );
+    assert!(segments[0].results_are_row_addrs());
+
+    dataset
+        .delete("json_get_int(json, 'val') = 5")
+        .await
+        .unwrap();
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 5, 6, 9, 14]).await;
+}
+
+/// A JSON segment written before `JSON_ROW_ADDR_DOMAIN_VERSION` is version 0.
+/// Optimizing must rebuild it rather than leave it beside (or merge it with)
+/// version-1 data, even in append mode, which selects no segment to merge.
+///
+/// For a BTree target the legacy segment stores row ids. For a ZoneMap target
+/// it already stores row addresses, but its version 0 wrapper is classified as
+/// row ids, so leaving it beside a fresh version 1 segment would mix domains.
+#[rstest]
+#[case::btree("btree")]
+#[case::zonemap("zonemap")]
+#[tokio::test]
+async fn test_optimize_rebuilds_legacy_json_segment_with_stable_row_ids(
+    #[case] target_index_type: &str,
+) {
+    use lance_table::format::IndexMetadata;
+    use prost::Message;
+
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
+    let segment = dataset
+        .create_index_builder(
+            &["json"],
+            IndexType::Scalar,
+            &json_index_params(target_index_type),
+        )
+        .name("json_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert!(segment.results_are_row_addrs());
+
+    // A legacy segment differs from a fresh one only in its versions: the target
+    // loads in whichever domain its recorded version names.
+    let mut details = lance_index::pb::JsonIndexDetails::decode(
+        segment.index_details.as_ref().unwrap().value.as_slice(),
+    )
+    .unwrap();
+    details.target_index_version = None;
+    let legacy_segment = IndexMetadata {
+        index_version: lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION as i32,
+        index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+        ..segment
+    };
+    assert!(!legacy_segment.results_are_row_addrs());
+    dataset
+        .commit_existing_index_segments("json_idx", "json", vec![legacy_segment])
+        .await
+        .unwrap();
+
+    let appended = json_val_batch(12..16);
+    let schema = appended.schema();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+
+    let segments = dataset.load_indices_by_name("json_idx").await.unwrap();
+    assert_eq!(segments.len(), 1, "{segments:?}");
+    assert!(segments[0].results_are_row_addrs());
+    assert_json_index_matches_scan(&dataset, &[1, 6, 9, 14]).await;
 }
 
 #[tokio::test]
@@ -7885,42 +8636,24 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
 /// row ids past fragment 0, so the wrapper must report its target's domain.
 #[tokio::test]
 async fn test_json_zonemap_index_with_stable_row_ids() {
-    let batch = json_batch(vec![
-        r#"{"val": 1}"#,
-        r#"{"val": 2}"#,
-        r#"{"val": 3}"#,
-        r#"{"val": 4}"#,
-    ]);
-    let schema = batch.schema();
-    let write_params = WriteParams {
-        enable_stable_row_ids: true,
-        max_rows_per_file: 2,
-        ..Default::default()
-    };
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new([Ok(batch)], schema),
-        "memory://",
-        Some(write_params),
-    )
-    .await
-    .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 2);
-    let params = ScalarIndexParams::new("json".to_string()).with_params(&serde_json::json!({
-        "target_index_type": "zonemap",
-        "path": "val",
-    }));
+    let mut dataset = stable_row_id_json_dataset("memory://").await;
     dataset
-        .create_index(&["json"], IndexType::Scalar, None, &params, false)
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            None,
+            &json_index_params("zonemap"),
+            false,
+        )
         .await
         .unwrap();
 
-    let predicate = "json_get_int(json, 'val') >= 2";
     let mut scan = dataset.scan();
-    scan.filter(predicate).unwrap();
+    scan.filter("json_get_int(json, 'val') >= 6").unwrap();
     let plan = scan.explain_plan(false).await.unwrap();
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
     let indexed = scan.try_into_batch().await.unwrap();
-    assert_eq!(indexed.num_rows(), 3);
+    assert_eq!(indexed.num_rows(), 6);
 }
 
 /// `json_extract` evaluates to serialized JSON text (`"click"`, `9`) while a JSON-path
@@ -8729,6 +9462,88 @@ async fn test_sql_contains_tokens() {
     );
 }
 
+/// An ngram FTS index with positions, which 13.0.0 could create and current
+/// versions refuse to, still loads, takes appended rows and answers queries.
+#[rstest]
+#[tokio::test]
+async fn test_existing_ngram_index_with_positions_keeps_working(
+    #[values(false, true)] merge: bool,
+) {
+    let test_dir =
+        copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_with_position.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let schema = Arc::new(dataset.schema().into());
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["yellow"]))]).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let options = if merge {
+        OptimizeOptions::merge(2)
+    } else {
+        OptimizeOptions::append()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("ello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut texts = results["text"]
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    texts.sort_unstable();
+    assert_eq!(texts, ["hello world", "world hello", "yellow"]);
+
+    // Copying the index to another dataset keeps its settings.
+    let target_dir = TempStrDir::default();
+    let rows = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema());
+    let mut target = Dataset::write(reader, &target_dir, None).await.unwrap();
+    target.initialize_indices(&dataset).await.unwrap();
+    let copied = target.load_indices().await.unwrap();
+    assert_eq!(copied.len(), 1);
+    let copied_params = load_scalar_segment_params(&target, &copied[0])
+        .await
+        .unwrap();
+    let copied_params: serde_json::Value =
+        serde_json::from_str(copied_params.params.as_deref().unwrap()).unwrap();
+    assert_eq!(copied_params["base_tokenizer"], "ngram");
+    assert_eq!(copied_params["with_position"], true);
+
+    // Creating such an index anew is rejected.
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".to_string())
+        .with_position(true);
+    let err = dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("with_position is not supported with base_tokenizer='ngram'"),
+        "{err}"
+    );
+}
+
 /// On legacy storage the index result is materialized before the recheck. The
 /// query parser does not see the index's custom stop words: 'cat' reaches the
 /// index, which drops it, and 'a' is dropped by the parser but not the index.
@@ -9181,6 +9996,21 @@ async fn test_manifest_read_recovers_from_stale_size() {
         .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
+
+    // Long enough for a footer, but what ends there is not one: this is not a damaged file.
+    let short_location = ManifestLocation {
+        size: real_location.size.map(|size| size - 1),
+        ..real_location.clone()
+    };
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &short_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
 }
 
 #[rstest]

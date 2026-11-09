@@ -18,8 +18,9 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
-    sample_row_offsets, validate_dataset_root_for_drop, write_manifest_file,
+    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
+    write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -47,6 +48,7 @@ use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_file::{
+    reader::FileReaderOptions,
     version::{ConcreteFileVersion, LanceFileVersion},
     writer::FileWriterOptions,
 };
@@ -74,6 +76,71 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[tokio::test]
+async fn test_file_reader_options_preserve_dataset_defaults() {
+    let dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    let dataset = Dataset::write(
+        reader,
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.file_reader_options().is_none());
+    Dataset::write(
+        gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1)),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let dataset = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            file_reader_options: Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    let mut per_read = dataset.file_reader_options().unwrap().clone();
+    per_read.batch_size_bytes = Some(2048);
+    assert_eq!(per_read.read_chunk_size, 1234);
+    for (snapshot, expected_rows) in [
+        (dataset.clone(), 8),
+        (dataset.checkout_version(1).await.unwrap(), 4),
+    ] {
+        let defaults = snapshot.file_reader_options().unwrap();
+        assert_eq!(defaults.read_chunk_size, 1234);
+        assert_eq!(defaults.batch_size_bytes, Some(4096));
+        let batch = snapshot
+            .scan()
+            .with_file_reader_options(per_read.clone())
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        assert_eq!(
+            snapshot.file_reader_options().unwrap().batch_size_bytes,
+            Some(4096)
+        );
+    }
 }
 
 #[rstest]
@@ -4241,16 +4308,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[rstest]
+#[case::empty(|_: &[u8]| Vec::new(), "only 0 bytes")]
+#[case::cut_to_half(|m: &[u8]| m[..m.len() / 2].to_vec(), "magic number")]
+#[case::cut_off_footer(|m: &[u8]| m[..m.len() - 16].to_vec(), "magic number")]
+#[case::cut_off_last_byte(|m: &[u8]| m[..m.len() - 1].to_vec(), "magic number")]
+#[case::all_zeros(|m: &[u8]| vec![0; m.len()], "magic number")]
+#[case::all_ones(|m: &[u8]| vec![0xff; m.len()], "magic number")]
+#[case::zeros_after_half(
+    |m: &[u8]| [&m[..m.len() / 2], vec![0; m.len() - m.len() / 2].as_slice()].concat(),
+    "magic number"
+)]
+#[case::zeros_before_footer(
+    |m: &[u8]| [vec![0; m.len() - 16].as_slice(), &m[m.len() - 16..]].concat(),
+    "version 0"
+)]
 #[tokio::test]
-async fn test_open_empty_latest_manifest_reports_path() {
+async fn test_open_damaged_latest_manifest_reports_path(
+    #[case] damage: fn(&[u8]) -> Vec<u8>,
+    #[case] expected_message: &str,
+    #[values(1, 8192)] column_name_len: usize,
+) {
     let test_dir = TempStdDir::default();
     let uri = test_dir.to_str().unwrap();
-    let mut dataset = write_tiny_dataset(uri).await;
-    dataset.truncate_table().await.unwrap();
+    let batch =
+        arrow_array::record_batch!(("i".repeat(column_name_len), Int32, [1, 2, 3])).unwrap();
+    let rows = || RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(rows(), uri, Some(params)).await.unwrap();
+    dataset.append(rows(), None).await.unwrap();
     assert_eq!(dataset.version().version, 2);
+    assert_eq!(dataset.get_fragments().len(), 3);
 
     let manifest_path = dataset.manifest_location.path.clone();
-    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+    let local_path = lance_io::local::to_local_path(&manifest_path);
+    let manifest = std::fs::read(&local_path).unwrap();
+    // Past one block the manifest takes another request than the block with the footer.
+    let block_size = dataset.object_store.block_size();
+    assert_eq!(manifest.len() > block_size, column_name_len > block_size);
+    std::fs::write(&local_path, damage(&manifest)).unwrap();
 
     let error = Dataset::open(uri).await.unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
@@ -4258,7 +4357,7 @@ async fn test_open_empty_latest_manifest_reports_path() {
         error.to_string().contains(manifest_path.as_ref()),
         "{error}"
     );
-    assert!(error.to_string().contains("0 bytes"), "{error}");
+    assert!(error.to_string().contains(expected_message), "{error}");
 }
 
 #[tokio::test]
@@ -4634,11 +4733,14 @@ async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
     );
 }
 
-/// The repair path: drop the offending rows, then tighten the column. Both have
-/// to be reachable on a table that already carries the bad key, or the only
-/// remaining fix is a full overwrite.
+/// The repair path: drop the offending rows, compact them out of the data files,
+/// tighten the column, and read the surviving data back through `add_columns`.
+/// All of it has to stay reachable on a table that already carries the bad key,
+/// or the only remaining fix is a full overwrite.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use lance_core::utils::tempfile::TempStrDir;
 
     let test_dir = TempStrDir::default();
@@ -4651,10 +4753,38 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         .expect("removing the offending rows must not be blocked");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
+    // The deleted row still stores its NULL, which readers of physical rows
+    // reject once the column is non-nullable.
+    let not_null = [ColumnAlteration::new("id".into()).set_nullable(false)];
+    let err = dataset.alter_columns(&not_null).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deleted rows still store NULL values"),
+        "{err}"
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("compacting the deleted rows away must not be blocked");
+
     dataset
-        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .alter_columns(&not_null)
         .await
         .expect("tightening the column completes the repair");
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("doubled".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .expect("the repaired column reads back");
 
     let id_field = dataset
         .schema()
@@ -4666,6 +4796,18 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         !id_field.nullable,
         "the key column must end up non-nullable"
     );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"].as_ref(),
+        &Int32Array::from(vec![1]) as &dyn Array
+    );
+    assert_eq!(
+        batch["doubled"].as_ref(),
+        &Int32Array::from(vec![2]) as &dyn Array
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// The MemWAL variant of the repair path. This is the state the original report

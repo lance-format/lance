@@ -5,7 +5,7 @@ description: Get started with Lance using Apache Spark - create a table, query i
 
 # Getting Started with Apache Spark
 
-The [Lance Spark connector](../guide/spark/index.md) lets Apache Spark read and write Lance tables, so you can work with your AI data using Spark SQL and DataFrames. In this guide, you'll run Spark on your machine, create a product catalog, query it, search it by vector similarity and by keyword, and modify it. Finally, you'll open the same table from LanceDB.
+The [Lance Spark connector](../integrations/spark/index.md) lets Apache Spark read and write Lance tables, so you can work with your AI data using Spark SQL and DataFrames. In this guide, you'll run Spark on your machine, create a product catalog, query it, search it by vector similarity and by keyword, and modify it. Finally, you'll open the same table from LanceDB.
 
 Each step shows both Spark SQL and PySpark. Pick whichever you prefer.
 
@@ -19,7 +19,7 @@ The connector needs Java 17 or later. Install PySpark, which includes the `spark
 
 ## Start Spark
 
-Start Spark with the Lance connector and a Lance catalog named `lance`. The `dir` catalog keeps tables in a local directory. For production, the connector also supports catalogs such as Hive, AWS Glue, and REST catalogs; see [Configuration](../guide/spark/config.md).
+Start Spark with the Lance connector and a Lance catalog named `lance`. The `dir` catalog keeps tables in a local directory. For production, the connector also supports catalogs such as Hive, AWS Glue, and REST catalogs; see [Configuration](../integrations/spark/config.md).
 
 === "SQL"
 
@@ -99,7 +99,7 @@ The `VECTOR_SEARCH` table function returns the rows nearest to a query vector, a
     --8<-- "snippets/quickstart/outputs/spark_quickstart.py.vector-search.txt"
     ```
 
-`VECTOR_SEARCH` also takes filters and index tuning options. See [Vector Search](../guide/spark/operations/dql/vector-search.md).
+`VECTOR_SEARCH` also takes filters and index tuning options. See [Vector Search](../integrations/spark/operations/dql/vector-search.md).
 
 ## Search by Keyword
 
@@ -161,6 +161,6 @@ Spark wrote an ordinary Lance table, so other engines can use it directly. For e
 
 ## Next Steps
 
-- Read the [Spark connector documentation](../guide/spark/index.md) for the full set of supported DDL, DML, and query operations.
+- Read the [Spark connector documentation](../integrations/spark/index.md) for the full set of supported DDL, DML, and query operations.
 - See the [LanceDB quickstart](index.md) to build search into an application.
 - See the [PyLance quickstart](pylance.md) to work directly with the Lance format.

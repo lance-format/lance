@@ -1499,7 +1499,9 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+    use lance_index::vector::{
+        bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
@@ -1785,11 +1787,23 @@ mod tests {
         assert_eq!(indexed_rows(&dataset, &segments).await, 1250);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_vector_retrain() {
+    async fn test_vector_retrain(#[values(false, true)] hnsw_rq: bool) {
         let test_dir = TempStrDir::default();
         let mut dataset = write_dataset(&test_dir, 1000, 500).await;
-        create_vector_index(&mut dataset).await;
+        if hnsw_rq {
+            let (ivf, hnsw) = (IvfBuildParams::new(2), HnswBuildParams::default());
+            let rq = RQBuildParams::default();
+            let params = VectorIndexParams::with_ivf_hnsw_rq_params(MetricType::L2, ivf, hnsw, rq);
+            let name = Some(VECTOR_INDEX.to_string());
+            dataset
+                .create_index(&["vector"], IndexType::Vector, name, &params, true)
+                .await
+                .unwrap();
+        } else {
+            create_vector_index(&mut dataset).await;
+        }
         let original = segments(&dataset, VECTOR_INDEX).await[0].uuid;
         append(&mut dataset, 500, 250).await; // fragments 2, 3
 
@@ -1805,6 +1819,10 @@ mod tests {
         let fingerprint = CoarseQuantizerFingerprint::from_metadata(model).unwrap();
         assert_ne!(model.uuid, original);
         assert_eq!(model.fragment_bitmap, Some(RoaringBitmap::new()));
+        // The model segment carries the trained model only: no rows, no graphs.
+        let opened =
+            dataset.open_vector_index_from_metadata("vector", model, &NoOpMetricsCollector);
+        assert_eq!(opened.await.unwrap().num_rows(), 0);
         assert!(
             plan.tasks
                 .iter()

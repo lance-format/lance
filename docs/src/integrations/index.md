@@ -10,7 +10,7 @@ a stable Rust core with Python and Java bindings, it can be consumed from query 
 and catalog systems without copying or converting data.
 
 This page lists the integrations maintained by the Lance community. Some live in this repository as first-party
-Rust/Python APIs; others are maintained as dedicated subprojects under the [lance-format](https://github.com/lance-format)
+Rust, Python, and Java APIs; others are maintained as dedicated subprojects under the [lance-format](https://github.com/lance-format)
 GitHub organization.
 
 ## Query Engines and SQL
@@ -18,7 +18,7 @@ GitHub organization.
 | Integration | Description | Source |
 |---|---|---|
 | [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown. Available in both Rust and Python. | Built-in |
-| [Apache Spark](../guide/spark/index.md) | Read and write Lance datasets from Spark SQL and DataFrames. | [lance-format/lance-spark](https://github.com/lance-format/lance-spark) |
+| [Apache Spark](spark/index.md) | Read and write Lance datasets from Spark SQL and DataFrames. | [lance-format/lance-spark](https://github.com/lance-format/lance-spark) |
 | [Apache Doris](https://doris.apache.org/docs/4.x/lakehouse/catalogs/lance-catalog/) | Query Lance datasets with Doris SQL through filesystem and REST catalogs, with predicate pushdown and vector search. Read-only. | [apache/doris](https://github.com/apache/doris) |
 | [DuckDB](duckdb/index.md) | Query Lance datasets directly from DuckDB. | [lance-format/lance-duckdb](https://github.com/lance-format/lance-duckdb) |
 | [Trino](trino/index.md) | Federate Lance into Trino alongside other connectors. | [lance-format/lance-trino](https://github.com/lance-format/lance-trino) |

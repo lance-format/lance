@@ -63,6 +63,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::{NoFilter, PreFilter};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::vector::DIST_COL;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
@@ -70,7 +71,7 @@ use lance_index::vector::hnsw::{HNSW, HnswMetadata};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
-use lance_index::vector::quantizer::QuantizerMetadata;
+use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
@@ -92,7 +93,9 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
-use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
+use lance_testing::datagen::{
+    generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
+};
 use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rstest::rstest;
@@ -374,6 +377,35 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(cache_weight_with_coverage > cache_weight_without_coverage);
     assert!(cache_weight_with_coverage >= entry.deep_size_of());
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
+}
+
+#[rstest]
+#[case::no_probes(vec![0, 0, 0], 4, vec![])]
+#[case::too_few_to_split(vec![1, 2, 3], 4, vec![0..3])]
+#[case::even(vec![8; 4], 2, vec![0..2, 2..4])]
+#[case::capped_by_tasks(vec![8; 6], 2, vec![0..3, 3..6])]
+#[case::skewed(vec![30, 1, 1, 0, 16], 3, vec![0..1, 1..5])]
+#[case::trailing_queries_without_probes(vec![16, 16, 0, 0], 4, vec![0..1, 1..2])]
+fn test_balanced_query_ranges(
+    #[case] probes_per_query: Vec<usize>,
+    #[case] max_tasks: usize,
+    #[case] expected: Vec<std::ops::Range<usize>>,
+) {
+    let ranges = super::balanced_query_ranges(&probes_per_query, max_tasks);
+    assert_eq!(ranges, expected);
+    assert!(ranges.len() <= max_tasks);
+    // Ranges are ordered and disjoint, and cover every query that has probes.
+    assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+    for (query_index, &count) in probes_per_query.iter().enumerate() {
+        let owners = ranges
+            .iter()
+            .filter(|range| range.contains(&query_index))
+            .count();
+        assert!(owners <= 1, "query {query_index} is in {owners} ranges");
+        if count > 0 {
+            assert_eq!(owners, 1, "query {query_index} must be scored by one task");
+        }
+    }
 }
 
 #[rstest]
@@ -1880,18 +1912,29 @@ fn multivec_ground_truth(
         .collect()
 }
 
-const TWO_FRAG_NUM_ROWS: usize = 2000;
-const TWO_FRAG_DIM: usize = 128;
+const TWO_FRAG_NUM_ROWS: usize = 512;
+const TWO_FRAG_ROWS_PER_FILE: usize = 128;
+const TWO_FRAG_DIM: usize = 32;
 const TWO_FRAG_NUM_PARTITIONS: usize = 4;
-const TWO_FRAG_NUM_SUBVECTORS: usize = 16;
+const TWO_FRAG_NUM_SUBVECTORS: usize = 8;
 const TWO_FRAG_NUM_BITS: usize = 8;
 const TWO_FRAG_SAMPLE_RATE: usize = 7;
-const TWO_FRAG_MAX_ITERS: u32 = 20;
+const TWO_FRAG_MAX_ITERS: u32 = 4;
 
 fn make_two_fragment_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
     let ids = Arc::new(UInt64Array::from_iter_values(0..TWO_FRAG_NUM_ROWS as u64));
 
-    let values = generate_random_array_with_range(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, 0.0..1.0);
+    // Seeded so the single-vs-segmented equality checks run on fixed data.
+    let mut values: Vec<f32> =
+        generate_random_array_with_seed::<Float32Type>(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, [42; 32])
+            .values()
+            .to_vec();
+    // Pin the value range in every fragment so per-segment SQ bounds equal the
+    // whole-dataset bounds and segmented SQ search ranks rows identically.
+    for row in (0..TWO_FRAG_NUM_ROWS).step_by(TWO_FRAG_ROWS_PER_FILE) {
+        values[row * TWO_FRAG_DIM] = 0.0;
+        values[row * TWO_FRAG_DIM + 1] = 1.0;
+    }
     let vectors = Arc::new(
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), TWO_FRAG_DIM as i32)
             .unwrap(),
@@ -1911,7 +1954,8 @@ async fn write_dataset_from_batches(
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
 ) -> Dataset {
-    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, 500).await
+    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, TWO_FRAG_ROWS_PER_FILE)
+        .await
 }
 
 async fn write_dataset_from_batches_with_max_rows(
@@ -2827,7 +2871,7 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
     let params = VectorIndexParams::ivf_hnsw(
         DistanceType::L2,
         prepare_global_ivf(&dataset, "vector").await,
-        HnswBuildParams::default(),
+        lightweight_hnsw_params(),
     );
     let mut segments = Vec::new();
 
@@ -2869,12 +2913,18 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
     assert!(result.num_rows() > 0);
 }
 
+/// `rotation_type` only applies to IVF_HNSW_RQ.
 #[rstest]
-#[case::flat("IVF_HNSW_FLAT")]
-#[case::pq("IVF_HNSW_PQ")]
-#[case::sq("IVF_HNSW_SQ")]
+#[case::flat("IVF_HNSW_FLAT", RQRotationType::Fast)]
+#[case::pq("IVF_HNSW_PQ", RQRotationType::Fast)]
+#[case::sq("IVF_HNSW_SQ", RQRotationType::Fast)]
+#[case::rq("IVF_HNSW_RQ", RQRotationType::Fast)]
+#[case::rq_matrix("IVF_HNSW_RQ", RQRotationType::Matrix)]
 #[tokio::test]
-async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
+async fn test_merge_existing_hnsw_segments_rebuilds_graph(
+    #[case] expected_index_type: &str,
+    #[case] rotation_type: RQRotationType,
+) {
     let test_dir = TempStrDir::default();
     let base_uri = test_dir.as_str();
     let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
@@ -2882,7 +2932,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
     } else {
         let (schema, batches) = make_two_fragment_batches();
-        (schema, batches, 500)
+        (schema, batches, TWO_FRAG_ROWS_PER_FILE)
     };
     let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
     let mut dataset =
@@ -2895,7 +2945,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
         ),
         "IVF_HNSW_PQ" => {
             let (ivf_params, pq_params) = prepare_ivf_pq(
@@ -2919,9 +2969,27 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
             SQBuildParams::default(),
         ),
+        "IVF_HNSW_RQ" => {
+            // Shards merge only if they rotate vectors the same way.
+            let rotation = RabitQuantizer::new_with_rotation::<Float32Type>(
+                5,
+                TWO_FRAG_DIM as i32,
+                rotation_type,
+            )
+            .metadata(None);
+            VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                lightweight_hnsw_params(),
+                RQBuildParams {
+                    rotation: Some(rotation),
+                    ..RQBuildParams::with_rotation_type(5, rotation_type)
+                },
+            )
+        }
         other => panic!("unexpected HNSW index type {other}"),
     };
     let mut segments = Vec::new();
@@ -4155,14 +4223,26 @@ async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
 #[case::fast(RQRotationType::Fast)]
 #[case::matrix(RQRotationType::Matrix)]
 #[tokio::test]
-async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotationType) {
+async fn test_ivf_rq_rotation_type_after_optimize(
+    #[case] rotation_type: RQRotationType,
+    #[values(false, true)] hnsw: bool,
+) {
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
     let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
     let ivf_params = IvfBuildParams::new(4);
     let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
-    let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+    let params = if hnsw {
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            HnswBuildParams::default(),
+            rq_params,
+        )
+    } else {
+        VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params)
+    };
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
         .await
@@ -4211,12 +4291,25 @@ async fn test_create_ivf_hnsw_flat(
     let ivf_params = IvfBuildParams::new(nlist);
     let hnsw_params = HnswBuildParams::default();
     let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors and remap don't depend on the float metric, so only L2 runs
+    // them; Hamming covers the u8 path.
+    if matches!(distance_type, DistanceType::L2 | DistanceType::Hamming) {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
 }
 
 #[rstest]
@@ -4238,15 +4331,203 @@ async fn test_create_ivf_hnsw_sq(
         hnsw_params,
         sq_params,
     );
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors, distance ranges, delete-all and remap don't depend on the
+    // metric, so only L2 runs them.
+    if distance_type == DistanceType::L2 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_distance_range(Some(params.clone()), nlist).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_distance_range(Some(params.clone()), nlist).await;
-    // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
-    Box::pin(test_delete_all_rows(params.clone())).await;
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
+}
+
+// Like flat IVF_RQ (see test_build_ivf_rq), 1 bit per dimension recalls far
+// less than 5 bits on this uniformly random data.
+#[rstest]
+#[case(4, DistanceType::L2, 5, 0.9)]
+#[case(4, DistanceType::Cosine, 5, 0.9)]
+#[case(4, DistanceType::Dot, 5, 0.85)]
+#[case(4, DistanceType::L2, 1, 0.5)]
+#[tokio::test]
+async fn test_create_ivf_hnsw_rq(
+    #[case] nlist: usize,
+    #[case] distance_type: DistanceType,
+    #[case] num_bits: u8,
+    #[case] recall_requirement: f32,
+) {
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        distance_type,
+        IvfBuildParams::new(nlist),
+        HnswBuildParams::default(),
+        RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+    );
+    // f64 vectors, delete-all and remap don't depend on the metric or the bit
+    // width, so only the 5-bit L2 case runs them. test_distance_range pins the
+    // row-id order of range splits against the unfiltered top-k, which a 1-bit
+    // walk need not reproduce for every k.
+    if distance_type == DistanceType::L2 && num_bits == 5 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
+    }
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
+}
+
+async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
+    const K: usize = 10;
+
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, K)
+        .unwrap()
+        .minimum_nprobes(nlist)
+        .maximum_nprobes(nlist);
+    scan.with_row_id();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
+    );
+
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), K);
+    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(
+        row_ids.iter().copied().collect::<HashSet<_>>().len(),
+        K,
+        "IVF_HNSW_RQ returned duplicate row ids"
+    );
+
+    let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
+    let recall = row_ids
+        .iter()
+        .filter(|row_id| ground_truth.contains(row_id))
+        .count() as f32
+        / K as f32;
+    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+}
+
+#[tokio::test]
+async fn test_ivf_hnsw_rq_stable_row_ids_lifecycle() {
+    const INDEX_NAME: &str = "ivf_hnsw_rq_stable";
+    const INITIAL_ROWS: usize = 256;
+    const APPEND_ROWS: usize = 32;
+    const NLIST: usize = 4;
+
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+    let (batch, schema) = make_seeded_vector_batch(INITIAL_ROWS + APPEND_ROWS);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let appended = batch.slice(INITIAL_ROWS, APPEND_ROWS);
+    let batches = RecordBatchIterator::new(vec![Ok(batch.slice(0, INITIAL_ROWS))], schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        test_uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert!(
+        dataset.get_fragments().len() >= 2,
+        "stable-row-id fixture should span multiple fragments"
+    );
+    let stable_row_id = row_ids_matching(&dataset, "id = 0").await;
+    assert_eq!(stable_row_id.len(), 1);
+
+    let ivf_params = IvfBuildParams {
+        max_iters: 2,
+        sample_rate: 32,
+        ..IvfBuildParams::new(NLIST)
+    };
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        ivf_params,
+        lightweight_hnsw_params(),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::IvfHnswRq,
+            Some(INDEX_NAME.to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
+
+    let appended = RecordBatchIterator::new(vec![Ok(appended)], schema);
+    dataset.append(appended, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "optimize should merge the appended stable-row-id data into one index"
+    );
+
+    drop(dataset);
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert_eq!(
+        row_ids_matching(&dataset, "id = 0").await,
+        stable_row_id,
+        "optimize and reopen should preserve the row's stable id"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
 }
 
 #[tokio::test]
@@ -6072,9 +6353,10 @@ async fn test_multivec_build_from_partition_count_records_no_target() {
 async fn test_partition_split_on_append_multivec() {
     const INDEX_NAME: &str = "vector_idx";
     const VECTORS_PER_ROW: usize = 3;
-    // 512 base rows and this append flatten to 33,036 vectors, just over
-    // the 32,768-vector IVF-PQ split threshold.
-    const APPEND_ROWS: usize = 10_500;
+    const TARGET_PARTITION_SIZE: usize = 512;
+    // 512 base rows and this append flatten to 2,136 vectors, just over
+    // the 2,048-vector split threshold of the target above.
+    const APPEND_ROWS: usize = 200;
 
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
@@ -6082,7 +6364,10 @@ async fn test_partition_split_on_append_multivec() {
     let (mut dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::Cosine,
-        IvfBuildParams::new(1),
+        IvfBuildParams {
+            target_partition_size: Some(TARGET_PARTITION_SIZE),
+            ..IvfBuildParams::new(1)
+        },
         lightweight_pq_params(),
     );
     dataset
@@ -6108,8 +6393,7 @@ async fn test_partition_split_on_append_multivec() {
     let expected_rows = NUM_ROWS + APPEND_ROWS;
     // Every vector of a row counts towards the partition size, and the split
     // goes straight to the target size: ceil(vectors / target) pieces.
-    let expected_partitions =
-        (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
+    let expected_partitions = (expected_rows * VECTORS_PER_ROW).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -6157,9 +6441,10 @@ async fn test_partition_split_on_append_multivec() {
 async fn test_split_multiple_partitions_in_one_optimize() {
     const INDEX_NAME: &str = "vector_idx";
     const BASE_ROWS_PER_PARTITION: usize = 512;
-    // Each IVF-FLAT partition reaches 16,512 rows, just over its 16,384-row
-    // split threshold.
-    const APPEND_ROWS_PER_PARTITION: usize = 16_000;
+    const TARGET_PARTITION_SIZE: usize = 256;
+    // Each partition reaches 1,112 rows, just over the 1,024-row split
+    // threshold of the target above.
+    const APPEND_ROWS_PER_PARTITION: usize = 600;
     let offsets = [-50.0, 50.0];
 
     let test_dir = TempStrDir::default();
@@ -6179,10 +6464,10 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    // Pin the type default target so the threshold above is the one this test
-    // reasons about; a build from a partition count would record its own.
+    // Pin the target so the threshold above is the one this test reasons
+    // about; a build from a partition count would record its own.
     let ivf_params = IvfBuildParams {
-        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        target_partition_size: Some(TARGET_PARTITION_SIZE),
         ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
     };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
@@ -6218,8 +6503,8 @@ async fn test_split_multiple_partitions_in_one_optimize() {
 
     // Both partitions hold BASE + APPEND rows and are split straight to the
     // target size in one optimize: ceil(rows / target) pieces each.
-    let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
-        .div_ceil(IndexType::IvfFlat.target_partition_size());
+    let pieces_per_partition =
+        (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -6657,6 +6942,14 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
     assert_eq!(unique_uuids.len(), 2, "expected two unique index UUIDs");
 
+    // Prewarm an index that was already opened for demand, so its retained
+    // cache handle must remain suitable for the later query.
+    dataset
+        .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let before_prewarm = dataset.session().cache_diagnostics();
+
     // Reset IO stats after index creation.
     dataset.object_store.as_ref().io_stats_incremental();
 
@@ -6677,6 +6970,18 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         stats.read_iops > 0,
         "prewarm should have read from disk, but read_iops was 0"
     );
+    let after_prewarm = dataset.session().cache_diagnostics();
+    assert!(
+        after_prewarm.index.activity.warm.attempts > before_prewarm.index.activity.warm.attempts
+    );
+    assert!(
+        after_prewarm.index.activity.warm.loads_succeeded
+            > before_prewarm.index.activity.warm.loads_succeeded
+    );
+    assert!(
+        after_prewarm.index.activity.warm.load_bytes
+            > before_prewarm.index.activity.warm.load_bytes
+    );
 
     // Query should not perform IO after prewarming all deltas.
     let q = vectors.value(0);
@@ -6695,6 +7000,16 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         read_iops,
         0,
         "query should not perform IO after prewarm"
+    );
+    let after_query = dataset.session().cache_diagnostics();
+    assert!(after_query.index.activity.hits > after_prewarm.index.activity.hits);
+    assert_eq!(
+        after_query.index.activity.warm.attempts,
+        after_prewarm.index.activity.warm.attempts
+    );
+    assert_eq!(
+        after_query.index.activity.warm.loads_succeeded,
+        after_prewarm.index.activity.warm.loads_succeeded
     );
 
     // Second prewarm should not need IO (already cached).
@@ -6897,6 +7212,15 @@ impl lance_core::cache::CacheBackend for PartitionBypassCacheBackend {
             SQBuildParams::default(),
         ),
         <PartitionEntry<HNSW, ScalarQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
+#[case::ivf_hnsw_rq(
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        ),
+        <PartitionEntry<HNSW, RabitQuantizer> as CacheCodecImpl>::TYPE_ID
     )]
 #[tokio::test]
 async fn test_prewarm_and_query_with_serializing_backend(

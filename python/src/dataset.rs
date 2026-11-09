@@ -61,7 +61,6 @@ use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::inverted::query::{FtsQuery, MatchQuery, PhraseQuery};
 use lance_index::{
     FtsPrewarmOptions, IndexParams, IndexType, PrewarmOptions,
-    optimize::OptimizeOptions,
     progress::{IndexBuildProgress, NoopIndexBuildProgress},
     scalar::inverted::{DocumentGranularity, InvertedListFormatVersion},
     scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams},
@@ -117,6 +116,8 @@ pub(crate) mod delta;
 pub mod io_stats;
 pub(crate) mod merge_insert;
 pub mod optimize;
+pub mod optimize_indices;
+mod replayable;
 pub(crate) mod sql;
 pub mod stats;
 pub(crate) mod write;
@@ -2254,22 +2255,7 @@ impl Dataset {
     #[pyo3(signature = (**kwargs))]
     fn optimize_indices(&mut self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        let mut options: OptimizeOptions = Default::default();
-        if let Some(kwargs) = kwargs {
-            if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-                options.num_indices_to_merge = num_indices_to_merge.extract()?;
-            }
-            if let Some(retrain) = kwargs.get_item("retrain")? {
-                options.retrain = retrain.extract()?;
-            }
-            if let Some(index_names) = kwargs.get_item("index_names")? {
-                options.index_names = Some(
-                    index_names
-                        .extract::<Vec<String>>()
-                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
-                );
-            }
-        }
+        let options = optimize_indices::optimize_options(kwargs)?;
         rt().block_on(
             None,
             new_self
@@ -2308,7 +2294,7 @@ impl Dataset {
             "INVERTED" | "FTS" => IndexType::Inverted,
             "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
-            | "IVF_HNSW_SQ" => IndexType::Vector,
+            | "IVF_HNSW_SQ" | "IVF_HNSW_RQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -2678,6 +2664,19 @@ impl Dataset {
         rt().block_on(None, self.ds.calculate_data_stats())?
             .infer_error()
             .map(PyLance)
+    }
+
+    /// Per-zone statistics for a ZoneMap index, as one Arrow record batch.
+    #[pyo3(signature = (index_name))]
+    fn zone_statistics<'py>(
+        &self,
+        py: Python<'py>,
+        index_name: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let batch = rt()
+            .block_on(None, self.ds.statistics().zone_statistics(&index_name))?
+            .infer_error()?;
+        batch.to_pyarrow(py)
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
@@ -4564,6 +4563,13 @@ fn prepare_vector_index_params(
             ivf_params,
             hnsw_params,
             sq_params,
+        ))),
+
+        "IVF_HNSW_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_rq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            rq_params,
         ))),
 
         _ => Err(PyValueError::new_err(format!(
