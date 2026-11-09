@@ -1093,10 +1093,10 @@ fn inner_get_zonemap_stats<'local>(
 ) -> Result<JObject<'local>> {
     use arrow_array::Array;
     use datafusion_common::ScalarValue;
+    use lance::dataset::index::LanceIndexStoreExt;
     use lance::index::DatasetIndexExt;
-    use lance::index::scalar::open_scalar_index;
-    use lance_index::metrics::NoOpMetricsCollector;
-    use lance_index::scalar::zonemap::ZoneMapIndex;
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion};
 
     let column_name: String = jcolumn_name.extract(env)?;
 
@@ -1152,25 +1152,21 @@ fn inner_get_zonemap_stats<'local>(
 
                     let mut batches = Vec::with_capacity(indices.len());
                     for index in &indices {
-                        // Load through the index itself: the file version, its
-                        // invariants and the typed bounds are its business, not
-                        // this binding's.
-                        let segment =
-                            open_scalar_index(&dataset, &column_name, index, &NoOpMetricsCollector)
+                        // Decode through the index's own reader (version check,
+                        // invariants, typed bounds) but read only the zones:
+                        // no null bitmap, no cache entry.
+                        let version = ZoneMapIndexVersion::from_metadata(
+                            u32::try_from(index.index_version).unwrap_or(u32::MAX),
+                        )
+                        .map_err(Error::from)?;
+                        let store = LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                            .await
+                            .map_err(Error::from)?;
+                        batches.push(
+                            ZoneMapIndex::load_zone_statistics(&store, version)
                                 .await
-                                .map_err(Error::from)?;
-                        let zonemap =
-                            segment
-                                .as_any()
-                                .downcast_ref::<ZoneMapIndex>()
-                                .ok_or_else(|| {
-                                    Error::runtime_error(format!(
-                                        "Index '{}' segment {} is not a ZoneMap index",
-                                        desc.name(),
-                                        index.uuid
-                                    ))
-                                })?;
-                        batches.push(zonemap.zones_as_batch().map_err(Error::from)?);
+                                .map_err(Error::from)?,
+                        );
                     }
                     Ok::<_, Error>(batches)
                 }
