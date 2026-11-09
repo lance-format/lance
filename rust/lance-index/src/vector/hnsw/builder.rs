@@ -2793,14 +2793,20 @@ mod tests {
         })
     }
 
+    /// Which node ids were scored, when a test needs to know that a search
+    /// reached a particular node and not just how many it reached.
+    type ScoredIds = Arc<std::sync::Mutex<std::collections::HashSet<u32>>>;
+
     /// Counts the distances a search actually computes, so a reported metric
-    /// can be checked against an independent oracle instead of a bound.
-    /// Prefetches are forwarded uncounted: they compute no distance, and the
-    /// default `prefetch_distance` keeps that path live.
+    /// can be checked against an independent oracle instead of a bound, and
+    /// records which ids they were. Prefetches are forwarded uncounted: they
+    /// compute no distance, and the default `prefetch_distance` keeps that
+    /// path live.
     #[derive(Clone)]
     struct CountingStorage {
         inner: FlatFloatStorage,
         calls: Arc<AtomicUsize>,
+        scored: ScoredIds,
     }
 
     impl CountingStorage {
@@ -2808,29 +2814,40 @@ mod tests {
             Self {
                 inner,
                 calls: Arc::new(AtomicUsize::new(0)),
+                scored: Default::default(),
             }
         }
 
         /// Distances computed since the previous call.
         fn take(&self) -> usize {
+            self.scored.lock().unwrap().clear();
             self.calls.swap(0, Ordering::Relaxed)
+        }
+
+        /// Whether `id`'s distance was computed since the previous [Self::take].
+        fn scored(&self, id: u32) -> bool {
+            self.scored.lock().unwrap().contains(&id)
         }
     }
 
     struct CountingDistCalc<'a> {
         inner: FlatFloatDistanceCalc<'a>,
         calls: Arc<AtomicUsize>,
+        scored: ScoredIds,
     }
 
     impl DistCalculator for CountingDistCalc<'_> {
         fn distance(&self, id: u32) -> f32 {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.scored.lock().unwrap().insert(id);
             self.inner.distance(id)
         }
 
         fn distance_all(&self, k_hint: usize) -> Vec<f32> {
             let dists = self.inner.distance_all(k_hint);
             self.calls.fetch_add(dists.len(), Ordering::Relaxed);
+            // `distance_all` scores every row, so its length names the ids.
+            self.scored.lock().unwrap().extend(0..dists.len() as u32);
             dists
         }
 
@@ -2878,6 +2895,7 @@ mod tests {
             Ok(Self {
                 inner: self.inner.append_batch(batch, vector_column)?,
                 calls: self.calls.clone(),
+                scored: self.scored.clone(),
             })
         }
 
@@ -2885,6 +2903,7 @@ mod tests {
             CountingDistCalc {
                 inner: self.inner.dist_calculator(query, dist_q_c),
                 calls: self.calls.clone(),
+                scored: self.scored.clone(),
             }
         }
 
@@ -2892,6 +2911,7 @@ mod tests {
             CountingDistCalc {
                 inner: self.inner.dist_calculator_from_id(id),
                 calls: self.calls.clone(),
+                scored: self.scored.clone(),
             }
         }
     }
@@ -2982,6 +3002,100 @@ mod tests {
         let mut expected = truth;
         expected.sort_unstable();
         assert_eq!(got, expected);
+    }
+
+    /// The dense prefiltered traversal walks THROUGH masked-off nodes: a
+    /// masked node is scored and expanded like any other, only barred from the
+    /// results. This is the mechanism a partition's tombstoned slots rely on,
+    /// since `TombstoneAwarePreFilter` masks exactly those positions off.
+    ///
+    /// Proven by masking off the query's own nearest nodes and recording the
+    /// ids whose distance was computed: a masked nearest node is scored, none
+    /// of them is returned, and the live rows that replace them are still
+    /// found (recall against the masked brute force, which the traversal
+    /// approximates rather than matches exactly).
+    #[tokio::test]
+    async fn test_dense_prefilter_traverses_masked_nodes() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [7; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+
+        let k = 10;
+        let query_key = fsl.value(0);
+        // The query's own nearest nodes, which stand between it and whatever
+        // takes their place once they are masked off.
+        let blocked: Vec<u32> = brute_force_topk_masked(&store, query_key.clone(), k, |_| true);
+        let passes = |id: u32| !blocked.contains(&id);
+
+        // Dense mask: everything but those nodes, so the dispatch takes the
+        // graph traversal rather than the flat scan.
+        let allowed: Vec<u64> = (0..TOTAL as u32)
+            .filter(|id| passes(*id))
+            .map(u64::from)
+            .collect();
+        assert!(
+            allowed.len() > TOTAL / 10,
+            "mask must stay on the dense branch"
+        );
+
+        let counting = CountingStorage::new(store.clone());
+        counting.take();
+        let batch = hnsw
+            .search(
+                query_key.clone(),
+                k,
+                HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                &counting,
+                masked_prefilter(allowed),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let mut got: Vec<u32> = batch[lance_core::ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .iter()
+            .map(|id| *id as u32)
+            .collect();
+        got.sort_unstable();
+
+        // The mechanism: a masked-off node was scored, so the traversal
+        // reached it and expanded through it instead of stopping there.
+        assert!(
+            blocked.iter().any(|id| counting.scored(*id)),
+            "the traversal never reached a masked node: {blocked:?}"
+        );
+        assert_eq!(got.len(), k);
+        assert!(
+            got.iter().all(|id| passes(*id)),
+            "a masked node was returned: {got:?}"
+        );
+        // And the rows behind the masked ones are found: the traversal is
+        // approximate, so this is a recall floor, not an equality.
+        let truth: std::collections::HashSet<u32> =
+            brute_force_topk_masked(&store, query_key, k, passes)
+                .into_iter()
+                .collect();
+        let hits = got.iter().filter(|id| truth.contains(id)).count();
+        assert!(
+            hits * 2 >= k,
+            "recall {hits}/{k} below 0.5 past the masked nearest nodes"
+        );
     }
 
     #[rstest]

@@ -5378,3 +5378,322 @@ async fn hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots() {
         );
     }
 }
+
+/// The delete-then-rewrite history of
+/// `hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete`, with the
+/// deleted rows chosen by the caller: `F0 -> F10/F11`, `F1,F2 -> F20/F21`,
+/// `delete`, then `F10,F11 -> F30/F31`. The delete has to fall inside F10/F11
+/// (`i < 64`) for its rows to become the tombstoned slots the last rewrite
+/// cannot map, which is the state every check below needs present.
+async fn hnsw_tombstoned_history(delete_predicate: &str) -> Dataset {
+    let dataset = hnsw_tagged_fixture().await;
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete(delete_predicate).await.unwrap();
+    commit_tagged_partition(dataset, &[10, 11], 30).await
+}
+
+/// The fragments retired once the whole `hnsw_tombstoned_history` rewrite
+/// chain has been committed: the two rewrites' sources and the outputs the
+/// last one consumed.
+const FULLY_REWRITTEN_RETIRED: [u32; 5] = [0, 1, 2, 10, 11];
+
+/// No result may carry a tombstoned slot, nor an address in any of `retired`:
+/// the slots the deferred remap kept for the graph's positions must stay
+/// inside the index. Which fragments count as retired depends on the version
+/// being read, so the caller names them.
+fn assert_no_tombstones(addrs: &[u64], retired: &[u32], label: &str) {
+    let retired: std::collections::HashSet<u32> = retired.iter().copied().collect();
+    for addr in addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "{label}: a tombstoned slot escaped"
+        );
+        let fragment = RowAddress::from(*addr).fragment_id();
+        assert!(
+            !retired.contains(&fragment),
+            "{label}: row address {addr} points at retired fragment {fragment}"
+        );
+    }
+}
+
+/// The tombstone exclusion has to compose with a user prefilter rather than
+/// replace it: `TombstoneAwarePreFilter` reports a non-empty filter so the
+/// sub-index takes its prefiltered path, and there it must select exactly the
+/// non-tombstone rows the inner filter selects.
+///
+/// The predicate is chosen to straddle the delete (`i < 32` keeps the rows on
+/// both sides of the deleted `16..24`), so the kept set contains neighbours of
+/// the deleted-then-rewritten rows and an off-by-one in the composition would
+/// change the answer.
+#[tokio::test]
+async fn hnsw_deferred_remap_composes_the_tombstone_mask_with_a_prefilter() {
+    let dataset = hnsw_tombstoned_history("i >= 16 AND i < 24").await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+    let query = arrow_array::Float32Array::from(rows[37].1.clone());
+
+    for predicate in ["i < 32", "i < 128", "i >= 8 AND i < 48"] {
+        let kept: Vec<(i32, Vec<f32>)> = rows
+            .iter()
+            .filter(|(i, _)| match predicate {
+                "i < 32" => *i < 32,
+                "i < 128" => *i < 128,
+                _ => (8..48).contains(i),
+            })
+            .cloned()
+            .collect();
+        assert!(
+            kept.iter().any(|(i, _)| *i < 16),
+            "{predicate}: must keep rows below the delete"
+        );
+        let truth = brute_force_top_k(&kept, query.values());
+        let (plan, ids, addrs) = ann_query(&dataset, &query, Some(predicate), true).await;
+        assert!(plan.contains("ANN"), "{predicate}: no ANN node in {plan}");
+        assert_eq!(
+            ids, truth,
+            "{predicate}: the composed filter must answer exactly"
+        );
+        assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, predicate);
+        // The deleted rows are outside the live set, so brute force cannot
+        // name them; this states it of the engine's answer directly.
+        for id in &ids {
+            assert!(
+                !(16..24).contains(id),
+                "{predicate}: deleted row {id} came back"
+            );
+        }
+    }
+}
+
+/// A partition carrying tombstoned slots answers exactly across a wide range
+/// of prefilter selectivity, from a predicate keeping a dozen rows to one
+/// keeping nearly all of them.
+///
+/// `HNSW::search` picks between the exact flat scan and the graph traversal on
+/// the mask's ratio within each partition
+/// (`rust/lance-index/src/vector/hnsw/builder.rs:1757`), which these
+/// end-to-end predicates do not pin down: they constrain only the global
+/// selectivity, and the IVF partition a query probes holds an unknown share of
+/// the kept rows. Which branch runs is therefore not asserted here — it is
+/// `test_subindex_prefilter_dispatch` in that same file that drives both
+/// branches from controlled mask ratios. This test is the end-to-end
+/// exactness control over the real tombstoned history on both sides of that
+/// threshold.
+#[tokio::test]
+async fn hnsw_deferred_remap_is_exact_across_prefilter_selectivity() {
+    let dataset = hnsw_tombstoned_history("i >= 16 AND i < 24").await;
+    let rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(rows[37].1.clone());
+
+    // 12 of the 248 live rows against 240 of them: a global selectivity far
+    // either side of the 10% threshold, without claiming what ratio reaches
+    // the probed partition.
+    let sparse = "i >= 100 AND i < 112";
+    let dense = "i < 240 OR i >= 248";
+    for predicate in [sparse, dense] {
+        let kept: Vec<(i32, Vec<f32>)> = rows
+            .iter()
+            .filter(|(i, _)| {
+                if predicate == sparse {
+                    (100..112).contains(i)
+                } else {
+                    *i < 240 || *i >= 248
+                }
+            })
+            .cloned()
+            .collect();
+        let truth = brute_force_top_k(&kept, query.values());
+        let (plan, ids, addrs) = ann_query(&dataset, &query, Some(predicate), true).await;
+        assert!(plan.contains("ANN"), "{predicate}: no ANN node in {plan}");
+        assert_eq!(ids, truth, "{predicate}: answered inexactly");
+        assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, predicate);
+    }
+}
+
+/// Tombstoning the query's own nearest neighbours must not cost recall: the
+/// live rows that take their place in the answer have to be found anyway.
+///
+/// The deleted rows are the query's global nearest neighbours that the rewrite
+/// re-addresses, so the tombstoned slots are the ones nearest the query rather
+/// than slots anywhere in the graph, and the answer moves. That the traversal
+/// scores and walks through a masked-off node (not merely skips it) is proven
+/// directly, with the ids it scored recorded, by
+/// `test_dense_prefilter_traverses_masked_nodes` in
+/// `rust/lance-index/src/vector/hnsw/builder.rs`; this test cannot observe
+/// which nodes the end-to-end search visited, so it asserts the consequence:
+/// recall against brute force stays 1.
+#[tokio::test]
+async fn hnsw_deferred_remap_keeps_recall_when_the_nearest_rows_are_tombstoned() {
+    let fixture = hnsw_tagged_fixture().await;
+    let all_rows = live_rows(&fixture).await;
+
+    // The tombstones have to land among the query's own nearest neighbours,
+    // not merely somewhere in the graph, or the delete would not move the
+    // answer at all. The vectors are uniform random, so which rows are
+    // nearest is not known up front: take the query's global nearest and
+    // delete exactly the ones the rewrite re-addresses (`i < 64`), which are
+    // the ones whose slots can become tombstones. The query is itself a row of
+    // that range, so at least its own slot always qualifies.
+    let query_id = all_rows
+        .iter()
+        .position(|(i, _)| *i == 0)
+        .expect("row i = 0 is live in the fixture");
+    let query = arrow_array::Float32Array::from(all_rows[query_id].1.clone());
+    let nearest = brute_force_top_k(&all_rows, query.values());
+    let doomed: Vec<i32> = nearest.iter().copied().filter(|i| *i < 64).collect();
+    assert!(
+        !doomed.is_empty(),
+        "the query's own row is in range, so something must be deleted: {nearest:?}"
+    );
+    // An OR-chain of equalities rather than `IN`, matching the predicate
+    // forms the tests around this one already use.
+    let predicate = doomed
+        .iter()
+        .map(|i| format!("i = {i}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let dataset = hnsw_tombstoned_history(&predicate).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), all_rows.len() - doomed.len());
+    for id in &doomed {
+        assert!(
+            !rows.iter().any(|(i, _)| i == id),
+            "row {id} should have been deleted"
+        );
+    }
+
+    // The live top-k now reaches past the retired rows: its tail is made of
+    // neighbours that ranked below them before the delete.
+    let truth = brute_force_top_k(&rows, query.values());
+    assert_ne!(truth, nearest, "the delete must have moved the answer");
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(
+        ids, truth,
+        "recall must stay 1.0 when the nearest nodes are tombstones"
+    );
+    assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, "nearest tombstoned");
+    for id in &doomed {
+        assert!(!ids.contains(id), "tombstoned row {id} was returned");
+    }
+}
+
+/// A tombstoned slot must not leak between versions through the shared index
+/// cache, in either warming order.
+///
+/// Both handles of one order share an index cache, so whichever version
+/// queries first warms the partitions the other reads. Each order gets its own
+/// fresh session, so the second order really warms from cold rather than
+/// finding the first order's entries: sharing one cache across both would let
+/// a passing "warm new, read old" ride on the earlier "read old".
+///
+/// Both versions are after the delete; they differ in the rewrite that strands
+/// the deleted rows' slots. The older one has no tombstones (its index still
+/// addresses the live F10/F11) and must answer from its own live rows; the
+/// newer one carries the tombstoned slots and must not serve them. Neither may
+/// return a deleted row.
+#[tokio::test]
+async fn hnsw_deferred_remap_does_not_leak_tombstones_across_a_warm_cache() {
+    let dataset = hnsw_tagged_fixture().await;
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    // After the delete, before the rewrite that strands the deleted rows'
+    // slots: post-delete / pre-remap.
+    let before_remap = dataset.manifest.version;
+    let dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+
+    let after_rows = live_rows(&dataset).await;
+    let before_rows = {
+        let old = dataset.checkout_version(before_remap).await.unwrap();
+        live_rows(&old).await
+    };
+    assert_eq!(
+        before_rows.len(),
+        after_rows.len(),
+        "the delete precedes both"
+    );
+    let query = arrow_array::Float32Array::from(after_rows[37].1.clone());
+    let before_truth = brute_force_top_k(&before_rows, query.values());
+    let after_truth = brute_force_top_k(&after_rows, query.values());
+
+    // At `before_remap` the last rewrite has not happened, so F10/F11 are
+    // still live and only the first two rewrites' sources are retired.
+    let assert_version = async |dataset: &Dataset, truth: &[i32], retired: &[u32], label: &str| {
+        let (plan, ids, addrs) = ann_query(dataset, &query, None, true).await;
+        assert!(plan.contains("ANN"), "{label}: no ANN node in {plan}");
+        assert_eq!(
+            ids.as_slice(),
+            truth,
+            "{label}: diverged from its version's live rows"
+        );
+        assert_no_tombstones(&addrs, retired, label);
+        // Neither version may serve a row the delete retired before both.
+        for id in &ids {
+            assert!(
+                !(16..24).contains(id),
+                "{label}: deleted row {id} came back"
+            );
+        }
+    };
+
+    let before_retired = [0u32, 1, 2];
+
+    // Cloning the fixture keeps its in-memory object store and commit context,
+    // which re-resolving `memory://` through a builder would not reach. Only
+    // the session is swapped, so this warming order starts on an empty index
+    // cache that just the handles derived from it share.
+    let open = async |version: Option<u64>| {
+        let mut fresh = dataset.clone();
+        fresh.session = Arc::new(crate::session::Session::new(
+            crate::dataset::DEFAULT_INDEX_CACHE_SIZE,
+            crate::dataset::DEFAULT_METADATA_CACHE_SIZE,
+            dataset.session().store_registry(),
+        ));
+        match version {
+            Some(version) => fresh.checkout_version(version).await.unwrap(),
+            None => fresh,
+        }
+    };
+
+    // Warm the old segment, then follow the same handle to the remapped one.
+    let mut handle = open(Some(before_remap)).await;
+    assert_version(
+        &handle,
+        &before_truth,
+        &before_retired,
+        "warm old, read old",
+    )
+    .await;
+    handle.checkout_latest().await.unwrap();
+    assert_version(
+        &handle,
+        &after_truth,
+        &FULLY_REWRITTEN_RETIRED,
+        "warm old, read new",
+    )
+    .await;
+
+    // The reverse order, on a cache no query has touched: warm the remapped
+    // segment, whose partitions hold the tombstoned slots, then read the
+    // version before it through that same warm cache.
+    let reverse = open(None).await;
+    assert_version(
+        &reverse,
+        &after_truth,
+        &FULLY_REWRITTEN_RETIRED,
+        "warm new, read new",
+    )
+    .await;
+    let reverse = reverse.checkout_version(before_remap).await.unwrap();
+    assert_version(
+        &reverse,
+        &before_truth,
+        &before_retired,
+        "warm new, read old",
+    )
+    .await;
+}
