@@ -10,13 +10,10 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
     FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
-use crate::Dataset;
 use crate::dataset::index::frag_reuse::index_postdates_rewrite;
-use crate::index::frag_reuse::{OpenPurpose, fri_cache_id, open_row_id_remapping_with_plan};
 
 /// What [`v0_segment_cache_id`] needs from a v0 history, computed once per
 /// history: a content digest of each version in history order.
@@ -137,25 +134,6 @@ pub(super) fn v0_segment_cache_id(
         identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
         Uuid::from_bytes(identity)
     })
-}
-
-/// The FRI part of a segment's vector cache keys, resolved the way the open
-/// path resolves it (see [`fri_cache_id`]). `None` when it cannot be resolved
-/// here.
-pub(super) async fn segment_cache_id(
-    dataset: &Dataset,
-    uuid: &Uuid,
-    purpose: OpenPurpose,
-) -> Option<Option<Uuid>> {
-    let index = dataset
-        .load_index_with_purpose(uuid, purpose)
-        .await
-        .ok()??;
-    let resolved =
-        open_row_id_remapping_with_plan(dataset, &index, None, purpose, &NoOpMetricsCollector)
-            .await
-            .ok()?;
-    Some(fri_cache_id(&resolved).copied())
 }
 
 #[cfg(test)]

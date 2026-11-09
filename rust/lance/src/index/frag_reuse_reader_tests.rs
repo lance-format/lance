@@ -1104,10 +1104,16 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
         let index = indices.iter().find(|index| index.name == name).unwrap();
         let metrics = lance_index::metrics::LocalMetricsCollector::default();
         if column == "vector" {
-            dataset
-                .open_vector_index(column, &index.uuid, &metrics)
-                .await
-                .unwrap();
+            // Through the generic open, whose vector-cache probe uses the whole
+            // history: a miss there must still be served from the segment's key.
+            crate::index::loading::DatasetIndexInternalExt::open_generic_index(
+                dataset,
+                column,
+                &index.uuid,
+                &metrics,
+            )
+            .await
+            .unwrap();
         } else {
             crate::index::scalar::open_scalar_index(dataset, column, index, &metrics)
                 .await
@@ -1217,6 +1223,11 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
             index_loads(&dataset, column, name).await,
             1,
             "{name} predates the compaction"
+        );
+        assert_eq!(
+            index_loads(&dataset, column, name).await,
+            0,
+            "{name} is warm"
         );
     }
     assert_queries(&dataset).await;
