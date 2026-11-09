@@ -28,9 +28,9 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
-[Version pins](ongoing_work_pins.md) retain in-progress jobs' source versions,
+[Retention leases](retention_leases.md) retain in-progress jobs' source versions,
 intervening transaction history, and required FRI movements. The current
-manifest owns the active pin list.
+manifest owns the active lease list.
 
 `max_allocated_field_id` is optional. If a manifest sets it, the dataset uses non-reusable field IDs from
 that version onward. See [Field IDs](schema.md#field-ids).

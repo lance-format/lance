@@ -85,8 +85,8 @@ impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
     fn try_from(message: pb::Transaction) -> Result<Self> {
-        // Do not interpret publication with an unsupported pin release as a plain write.
-        let operation = if message.release_pin_id.is_some() {
+        // Do not interpret publication with an unsupported lease release as a plain write.
+        let operation = if message.release_lease_id.is_some() {
             None
         } else {
             message.operation
@@ -418,9 +418,9 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             // Reserved format operations remain unsupported until runtime
             // handling is implemented. Unknown operations fail closed.
-            Some(pb::transaction::Operation::RegisterPin(_))
-            | Some(pb::transaction::Operation::RenewPin(_))
-            | Some(pb::transaction::Operation::ReleasePin(_)) => Operation::Unknown {},
+            Some(pb::transaction::Operation::RegisterLease(_))
+            | Some(pb::transaction::Operation::RenewLease(_))
+            | Some(pb::transaction::Operation::ReleaseLease(_)) => Operation::Unknown {},
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
             None => Operation::Unknown {},
@@ -754,7 +754,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-            release_pin_id: None,
+            release_lease_id: None,
         })
     }
 }
@@ -853,15 +853,15 @@ mod tests {
     use prost::Message;
 
     #[rstest::rstest]
-    #[case::register(pb::transaction::Operation::RegisterPin(Default::default()))]
-    #[case::renew(pb::transaction::Operation::RenewPin(Default::default()))]
-    #[case::release(pb::transaction::Operation::ReleasePin(Default::default()))]
-    fn test_ongoing_work_pin_operations_remain_unsupported(
+    #[case::register(pb::transaction::Operation::RegisterLease(Default::default()))]
+    #[case::renew(pb::transaction::Operation::RenewLease(Default::default()))]
+    #[case::release(pb::transaction::Operation::ReleaseLease(Default::default()))]
+    fn test_retention_lease_operations_remain_unsupported(
         #[case] operation: pb::transaction::Operation,
     ) {
         let message = pb::Transaction {
             read_version: 12,
-            uuid: "pin-operation".to_string(),
+            uuid: "lease-operation".to_string(),
             operation: Some(operation),
             ..Default::default()
         };
@@ -869,7 +869,7 @@ mod tests {
         let transaction = Transaction::try_from(decoded).unwrap();
         assert!(matches!(transaction.operation, Operation::Unknown {}));
         assert_eq!(transaction.read_version, 12);
-        assert_eq!(transaction.uuid, "pin-operation");
+        assert_eq!(transaction.uuid, "lease-operation");
         let error = pb::Transaction::try_from(&transaction).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("cannot be re-encoded"));
@@ -879,14 +879,14 @@ mod tests {
     #[case::plain_publication(None, false)]
     #[case::publication_with_release(Some(pb::Uuid { uuid: vec![7; 16] }), true)]
     #[case::malformed_release(Some(pb::Uuid::default()), true)]
-    fn test_publication_pin_release_remains_unsupported(
-        #[case] release_pin_id: Option<pb::Uuid>,
+    fn test_publication_lease_release_remains_unsupported(
+        #[case] release_lease_id: Option<pb::Uuid>,
         #[case] unsupported: bool,
     ) {
         let message = pb::Transaction {
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CreateIndex(Default::default())),
-            release_pin_id,
+            release_lease_id,
             ..Default::default()
         };
         let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
@@ -904,7 +904,7 @@ mod tests {
             assert!(
                 pb::Transaction::try_from(&transaction)
                     .unwrap()
-                    .release_pin_id
+                    .release_lease_id
                     .is_none()
             );
         }

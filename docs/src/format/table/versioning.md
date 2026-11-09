@@ -43,7 +43,7 @@ they should return an "unsupported" error on any read or write operation.
 | `2^17`   | `FLAG_OBJECT_METADATA`         | No              | Yes             | The snapshot contains [clustering definitions, references, or a nonzero allocation high-water mark](clustering.md), nonempty [fragment metadata](index.md#fragment-metadata), or nonempty [index segment metadata](../index/index.md#index-segment-metadata). Readers may ignore this metadata; writers must preserve it. |
 | `2^18`   | `FLAG_ROW_ADDR_INDICES`         | No              | Yes             | A stable-row-ID table contains an index that stores physical row addresses. Older writers could treat its entries as stable row IDs and silently extend coverage without indexing rewritten fragments. |
 | `2^19`   | `FLAG_INLINE_DELETIONS`         | Yes             | Yes             | Some fragment stores its deletion vector in the manifest (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader without this flag would look for a file that does not exist. |
-| `2^20`   | `FLAG_ONGOING_WORK_PINS` | No | Yes | The current manifest owns the active [version pin list](ongoing_work_pins.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until pin maintenance is implemented. |
+| `2^20`   | `FLAG_RETENTION_LEASES` | No | Yes | The current manifest owns the active [retention lease list](retention_leases.md). Sticky after first activation, including restore and an empty list. Reserved and unsupported until lease maintenance is implemented. |
 
 </div>
 
@@ -51,11 +51,11 @@ Bit 20 is reserved but remains unsupported. Bits at positions 21 and above are u
 
 Committing schema metadata `lance.blob.managed = "true"` activates the Managed Blob capability, even without new blob files. Ordinary Blob v2 writes without this opt-in do not activate it. Once activated, removing the opt-in, removing Blob fields, or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).
 
-## Current state for pin decisions
+## Current state for lease decisions
 
-Pin operations and recovery, transactions carrying `release_pin_id`, restore,
+Lease operations and recovery, transactions carrying `release_lease_id`, restore,
 overwrite, rewrite/trim checks, retention planning, and branch deletion through
-a pin-capable handler **must resolve the authoritative current attached head**.
+a lease-capable handler **must resolve the authoritative current attached head**.
 This includes maintenance triggered through an old or unflagged Dataset handle.
 A cached version or a hint that stops at a reclaimed gap is insufficient.
 
@@ -71,22 +71,22 @@ listing/read errors. Optimizations must preserve this result despite reclaimed
 slots and delayed writes. A backend unable to provide its protocol's visibility
 guarantees must refuse acquisition.
 
-Ordinary attached writes that only carry pins and prune expired records may
+Ordinary attached writes that only carry leases and prune expired records may
 use the existing commit/retry path. Each attempt **must derive membership and
 the sticky capability from its predecessor**, recheck expiration after rebase,
 and atomically claim the next version without replacing an occupied slot.
-A historical-slot write cannot change the real head's pin state or end retention.
+A historical-slot write cannot change the real head's lease state or end retention.
 Required transaction persistence still applies; subsequent maintenance must
 resolve the real head. External handlers must provide equivalent guarantees.
 
 An unsupported handler may keep existing maintenance behavior on a table that
-has never enabled pins, but **must reject** any pin capability or record it
+has never enabled leases, but **must reject** any lease capability or record it
 encounters. This relies on the same-handler table contract and exclusion of
 incompatible maintenance clients at activation, not an old handle's flags.
-After activation, all maintenance clients must use a pin-capable path even when
+After activation, all maintenance clients must use a lease-capable path even when
 the list is empty. Mixing capable and incapable implementations of the same
 handler type does not satisfy this requirement.
 
-Head resolution establishes current pin state, not output-publication validity.
-It does not lock the table; the [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
+Head resolution establishes current lease state, not output-publication validity.
+It does not lock the table; the [cleanup and deletion races](retention_leases.md#cleanup-and-deletion-races)
 still apply.

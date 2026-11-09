@@ -34,13 +34,13 @@ message UUID {
   bytes uuid = 1;
 }
 
-/* An active resource pin owned by the branch whose current manifest contains it.
+/* An active resource lease owned by the branch whose current manifest contains it.
  * Historical copies do not impose retention requirements. All fields except
- * job_label are required by the pin contract; protobuf presence permits
+ * job_label are required by the lease contract; protobuf presence permits
  * detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
  * are compared by those bytes.
  */
-message OngoingWorkPin {
+message RetentionLease {
   /* The registering Transaction.uuid parsed into its 16-byte UUID value.
    * Absent or any length other than 16 bytes is invalid.
    * Distinct logical registrations must use distinct IDs, including after reuse
@@ -48,9 +48,9 @@ message OngoingWorkPin {
    */
   UUID id = 1;
   /* The version created by the successful registration commit. Absent or zero is invalid.
-   * Renewal never changes this version. Active pins retain complete attached
+   * Renewal never changes this version. Active leases retain complete attached
    * versions from their oldest source version through the current branch head,
-   * including committed transaction history, as specified in Ongoing Work Pins.
+   * including committed transaction history, as specified in Retention Leases.
    */
   optional uint64 source_version = 2;
   /* Creation time chosen before the first registration attempt, in UTC.
@@ -58,12 +58,12 @@ message OngoingWorkPin {
    */
   google.protobuf.Timestamp created_at = 4;
   /* Absolute UTC expiry time. Absent or not later than created_at is invalid.
-   * Passing it makes the pin eligible for removal by the next attached commit;
+   * Passing it makes the lease eligible for removal by the next attached commit;
    * it does not remove the stored record. Renewals may only increase it.
    */
   google.protobuf.Timestamp expires_at = 5;
   /* Optional human-readable context. Absent or empty means no label.
-   * It has no retention or authorization meaning and is immutable for this pin.
+   * It has no retention or authorization meaning and is immutable for this lease.
    */
   optional string job_label = 6;
 }
@@ -216,8 +216,8 @@ message Manifest {
    * * 1 << 16: paired with the reader bit for version 1 zone-level statistics
    *   seeds. Writers must preserve the seed contract and the required bits
    *   during data writes, index maintenance, cleanup, clone, and restore.
-   * * 1 << 20: ongoing-work pins. Writer-only and sticky; maintenance must honor
-   *   the current active-pin list. Reserved until the pin contract is implemented.
+   * * 1 << 20: retention leases. Writer-only and sticky; maintenance must honor
+   *   the current active-lease list. Reserved until the lease contract is implemented.
    */
   uint64 writer_feature_flags = 10;
 
@@ -352,15 +352,15 @@ message Manifest {
    */
   uint32 max_clustering_id = 26;
 
-  /* The authoritative active pins when this is the current attached manifest.
-   * Absent/empty means no active pins. Order is insignificant; IDs must be
+  /* The authoritative active leases when this is the current attached manifest.
+   * Absent/empty means no active leases. Order is insignificant; IDs must be
    * unique. A nonempty list requires writer bit 20. Once set, that bit remains
-   * set even when this list becomes empty. Attached commits remove expired pins.
-   * Restore/overwrite start from current pins, never a historical list;
+   * set even when this list becomes empty. Attached commits remove expired leases.
+   * Restore/overwrite start from current leases, never a historical list;
    * new clones/branches start with an empty list. Detached manifests cannot own
-   * or mutate active pins. No reader capability is required solely for pins.
+   * or mutate active leases. No reader capability is required solely for leases.
    */
-  repeated OngoingWorkPin ongoing_work_pins = 27;
+  repeated RetentionLease retention_leases = 27;
 
 } // Manifest
 

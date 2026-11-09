@@ -802,13 +802,13 @@ impl ::prost::Name for Uuid {
         "/lance.table.UUID".into()
     }
 }
-/// An active resource pin owned by the branch whose current manifest contains it.
+/// An active resource lease owned by the branch whose current manifest contains it.
 /// Historical copies do not impose retention requirements. All fields except
-/// job_label are required by the pin contract; protobuf presence permits
+/// job_label are required by the lease contract; protobuf presence permits
 /// detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
 /// are compared by those bytes.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct OngoingWorkPin {
+pub struct RetentionLease {
     /// The registering Transaction.uuid parsed into its 16-byte UUID value.
     /// Absent or any length other than 16 bytes is invalid.
     /// Distinct logical registrations must use distinct IDs, including after reuse
@@ -816,9 +816,9 @@ pub struct OngoingWorkPin {
     #[prost(message, optional, tag = "1")]
     pub id: ::core::option::Option<Uuid>,
     /// The version created by the successful registration commit. Absent or zero is invalid.
-    /// Renewal never changes this version. Active pins retain complete attached
+    /// Renewal never changes this version. Active leases retain complete attached
     /// versions from their oldest source version through the current branch head,
-    /// including committed transaction history, as specified in Ongoing Work Pins.
+    /// including committed transaction history, as specified in Retention Leases.
     #[prost(uint64, optional, tag = "2")]
     pub source_version: ::core::option::Option<u64>,
     /// Creation time chosen before the first registration attempt, in UTC.
@@ -826,23 +826,23 @@ pub struct OngoingWorkPin {
     #[prost(message, optional, tag = "4")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
     /// Absolute UTC expiry time. Absent or not later than created_at is invalid.
-    /// Passing it makes the pin eligible for removal by the next attached commit;
+    /// Passing it makes the lease eligible for removal by the next attached commit;
     /// it does not remove the stored record. Renewals may only increase it.
     #[prost(message, optional, tag = "5")]
     pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
     /// Optional human-readable context. Absent or empty means no label.
-    /// It has no retention or authorization meaning and is immutable for this pin.
+    /// It has no retention or authorization meaning and is immutable for this lease.
     #[prost(string, optional, tag = "6")]
     pub job_label: ::core::option::Option<::prost::alloc::string::String>,
 }
-impl ::prost::Name for OngoingWorkPin {
-    const NAME: &'static str = "OngoingWorkPin";
+impl ::prost::Name for RetentionLease {
+    const NAME: &'static str = "RetentionLease";
     const PACKAGE: &'static str = "lance.table";
     fn full_name() -> ::prost::alloc::string::String {
-        "lance.table.OngoingWorkPin".into()
+        "lance.table.RetentionLease".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/lance.table.OngoingWorkPin".into()
+        "/lance.table.RetentionLease".into()
     }
 }
 /// Manifest is a global section shared between all the files.
@@ -952,8 +952,8 @@ pub struct Manifest {
     /// * 1 << 16: paired with the reader bit for version 1 zone-level statistics
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
-    /// * 1 << 20: ongoing-work pins. Writer-only and sticky; maintenance must honor
-    ///    the current active-pin list. Reserved until the pin contract is implemented.
+    /// * 1 << 20: retention leases. Writer-only and sticky; maintenance must honor
+    ///    the current active-lease list. Reserved until the lease contract is implemented.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.
@@ -1057,15 +1057,15 @@ pub struct Manifest {
     /// u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
     #[prost(uint32, tag = "26")]
     pub max_clustering_id: u32,
-    /// The authoritative active pins when this is the current attached manifest.
-    /// Absent/empty means no active pins. Order is insignificant; IDs must be
+    /// The authoritative active leases when this is the current attached manifest.
+    /// Absent/empty means no active leases. Order is insignificant; IDs must be
     /// unique. A nonempty list requires writer bit 20. Once set, that bit remains
-    /// set even when this list becomes empty. Attached commits remove expired pins.
-    /// Restore/overwrite start from current pins, never a historical list;
+    /// set even when this list becomes empty. Attached commits remove expired leases.
+    /// Restore/overwrite start from current leases, never a historical list;
     /// new clones/branches start with an empty list. Detached manifests cannot own
-    /// or mutate active pins. No reader capability is required solely for pins.
+    /// or mutate active leases. No reader capability is required solely for leases.
     #[prost(message, repeated, tag = "27")]
-    pub ongoing_work_pins: ::prost::alloc::vec::Vec<OngoingWorkPin>,
+    pub retention_leases: ::prost::alloc::vec::Vec<RetentionLease>,
 }
 /// Nested message and enum types in `Manifest`.
 pub mod manifest {
@@ -1986,15 +1986,15 @@ pub struct Transaction {
     #[prost(map = "string, string", tag = "4")]
     pub transaction_properties:
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
-    /// Optional pin to release atomically with this transaction's operation.
+    /// Optional lease to release atomically with this transaction's operation.
     /// Absent means no explicit release. Present requires exactly 16 UUID bytes;
     /// a missing target is a no-op for release, not for the accompanying operation.
-    /// Valid only on an ordinary attached operation, not a pin operation or Clone.
+    /// Valid only on an ordinary attached operation, not a lease operation or Clone.
     /// Apply normal publication checks before removal; set sticky writer bit 20.
     /// Persist this transaction inline or in a referenced sidecar before publication,
-    /// even when no pins remain. Reject if neither representation can be stored.
+    /// even when no leases remain. Reject if neither representation can be stored.
     #[prost(message, optional, tag = "5")]
-    pub release_pin_id: ::core::option::Option<Uuid>,
+    pub release_lease_id: ::core::option::Option<Uuid>,
     /// The operation of this transaction.
     ///
     /// Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -2721,12 +2721,12 @@ pub mod transaction {
         }
     }
     /// Register retention of the version this commit creates. Transaction.uuid
-    /// must parse as a UUID and supplies the pin ID. Registration may rebase;
+    /// must parse as a UUID and supplies the lease ID. Registration may rebase;
     /// the successful publishing version becomes the fixed source_version.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct RegisterPin {
+    pub struct RegisterLease {
         /// UTC request creation time, fixed before the first send.
-        /// Absent is invalid. The pin retains this value through retries/renewals.
+        /// Absent is invalid. The lease retains this value through retries/renewals.
         #[prost(message, optional, tag = "2")]
         pub created_at: ::core::option::Option<::prost_types::Timestamp>,
         /// Absolute UTC expiry time fixed before the first send.
@@ -2739,53 +2739,53 @@ pub mod transaction {
         #[prost(string, optional, tag = "4")]
         pub job_label: ::core::option::Option<::prost::alloc::string::String>,
     }
-    impl ::prost::Name for RegisterPin {
-        const NAME: &'static str = "RegisterPin";
+    impl ::prost::Name for RegisterLease {
+        const NAME: &'static str = "RegisterLease";
         const PACKAGE: &'static str = "lance.table";
         fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.RegisterPin".into()
+            "lance.table.Transaction.RegisterLease".into()
         }
         fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.RegisterPin".into()
+            "/lance.table.Transaction.RegisterLease".into()
         }
     }
-    /// Extend an existing pin; this operation never creates a missing pin.
+    /// Extend an existing lease; this operation never creates a missing lease.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct RenewPin {
-        /// Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
+    pub struct RenewLease {
+        /// Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
         #[prost(message, optional, tag = "1")]
-        pub pin_id: ::core::option::Option<super::Uuid>,
+        pub lease_id: ::core::option::Option<super::Uuid>,
         /// Fixed requested absolute UTC expiry time. Absent is invalid.
-        /// The current pin must still be unexpired at each attempt's validation.
+        /// The current lease must still be unexpired at each attempt's validation.
         /// A current expires_at that meets or exceeds this request is a successful no-op.
         #[prost(message, optional, tag = "2")]
         pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
     }
-    impl ::prost::Name for RenewPin {
-        const NAME: &'static str = "RenewPin";
+    impl ::prost::Name for RenewLease {
+        const NAME: &'static str = "RenewLease";
         const PACKAGE: &'static str = "lance.table";
         fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.RenewPin".into()
+            "lance.table.Transaction.RenewLease".into()
         }
         fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.RenewPin".into()
+            "/lance.table.Transaction.RenewLease".into()
         }
     }
-    /// Remove one pin; an absent target is a successful no-op.
+    /// Remove one lease; an absent target is a successful no-op.
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-    pub struct ReleasePin {
-        /// Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
+    pub struct ReleaseLease {
+        /// Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
         #[prost(message, optional, tag = "1")]
-        pub pin_id: ::core::option::Option<super::Uuid>,
+        pub lease_id: ::core::option::Option<super::Uuid>,
     }
-    impl ::prost::Name for ReleasePin {
-        const NAME: &'static str = "ReleasePin";
+    impl ::prost::Name for ReleaseLease {
+        const NAME: &'static str = "ReleaseLease";
         const PACKAGE: &'static str = "lance.table";
         fn full_name() -> ::prost::alloc::string::String {
-            "lance.table.Transaction.ReleasePin".into()
+            "lance.table.Transaction.ReleaseLease".into()
         }
         fn type_url() -> ::prost::alloc::string::String {
-            "/lance.table.Transaction.ReleasePin".into()
+            "/lance.table.Transaction.ReleaseLease".into()
         }
     }
     /// The mode of update operation
@@ -2861,11 +2861,11 @@ pub mod transaction {
         #[prost(message, tag = "115")]
         DataOverlay(DataOverlay),
         #[prost(message, tag = "116")]
-        RegisterPin(RegisterPin),
+        RegisterLease(RegisterLease),
         #[prost(message, tag = "117")]
-        RenewPin(RenewPin),
+        RenewLease(RenewLease),
         #[prost(message, tag = "118")]
-        ReleasePin(ReleasePin),
+        ReleaseLease(ReleaseLease),
     }
 }
 impl ::prost::Name for Transaction {

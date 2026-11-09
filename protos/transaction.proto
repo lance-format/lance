@@ -37,15 +37,15 @@ message Transaction {
    */
   map<string, string> transaction_properties = 4;
 
-  /* Optional pin to release atomically with this transaction's operation.
+  /* Optional lease to release atomically with this transaction's operation.
    * Absent means no explicit release. Present requires exactly 16 UUID bytes;
    * a missing target is a no-op for release, not for the accompanying operation.
-   * Valid only on an ordinary attached operation, not a pin operation or Clone.
+   * Valid only on an ordinary attached operation, not a lease operation or Clone.
    * Apply normal publication checks before removal; set sticky writer bit 20.
    * Persist this transaction inline or in a referenced sidecar before publication,
-   * even when no pins remain. Reject if neither representation can be stored.
+   * even when no leases remain. Reject if neither representation can be stored.
    */
-  UUID release_pin_id = 5;
+  UUID release_lease_id = 5;
 
   // Add new rows to the dataset.
   message Append {
@@ -436,12 +436,12 @@ message Transaction {
   }
 
   /* Register retention of the version this commit creates. Transaction.uuid
-   * must parse as a UUID and supplies the pin ID. Registration may rebase;
+   * must parse as a UUID and supplies the lease ID. Registration may rebase;
    * the successful publishing version becomes the fixed source_version.
    */
-  message RegisterPin {
+  message RegisterLease {
     /* UTC request creation time, fixed before the first send.
-     * Absent is invalid. The pin retains this value through retries/renewals.
+     * Absent is invalid. The lease retains this value through retries/renewals.
      */
     google.protobuf.Timestamp created_at = 2;
     /* Absolute UTC expiry time fixed before the first send.
@@ -455,21 +455,21 @@ message Transaction {
     optional string job_label = 4;
   }
 
-  // Extend an existing pin; this operation never creates a missing pin.
-  message RenewPin {
-    // Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
-    UUID pin_id = 1;
+  // Extend an existing lease; this operation never creates a missing lease.
+  message RenewLease {
+    // Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID lease_id = 1;
     /* Fixed requested absolute UTC expiry time. Absent is invalid.
-     * The current pin must still be unexpired at each attempt's validation.
+     * The current lease must still be unexpired at each attempt's validation.
      * A current expires_at that meets or exceeds this request is a successful no-op.
      */
     google.protobuf.Timestamp expires_at = 2;
   }
 
-  // Remove one pin; an absent target is a successful no-op.
-  message ReleasePin {
-    // Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
-    UUID pin_id = 1;
+  // Remove one lease; an absent target is a successful no-op.
+  message ReleaseLease {
+    // Target lease ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID lease_id = 1;
   }
 
   /* The operation of this transaction.
@@ -495,9 +495,9 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
-    RegisterPin register_pin = 116;
-    RenewPin renew_pin = 117;
-    ReleasePin release_pin = 118;
+    RegisterLease register_lease = 116;
+    RenewLease renew_lease = 117;
+    ReleaseLease release_lease = 118;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

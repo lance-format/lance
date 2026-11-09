@@ -5027,7 +5027,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
-            release_pin_id: None,
+            release_lease_id: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],
@@ -5078,7 +5078,7 @@ mod tests {
             uuid: "test".to_string(),
             tag: String::new(),
             transaction_properties: HashMap::new(),
-            release_pin_id: None,
+            release_lease_id: None,
             operation: Some(pb::transaction::Operation::Update(
                 pb::transaction::Update {
                     removed_fragment_ids: vec![],

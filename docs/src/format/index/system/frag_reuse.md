@@ -194,42 +194,34 @@ Each rewrite that defers index remapping records its mapping: a reuse version
 in FRI index version 0, or transitions in index version 1. A rewrite publishes
 its mapping atomically, replacing the FRI entry in the same commit. A
 transition must reference only fragments committed no later than itself.
-Queries scan fragments that no index covers. An in-progress job may still need
-their movements recorded, as described below.
 
-### Cleanup
+## Trimming
 
-FRI history is needed as long as an index or another consumer uses its row
-translations. For example, an index may return row addresses in fragments A
-and B after compaction has moved those rows into C. The movements from A and B
-to C must remain available until the index no longer needs those translations.
+An FRI history may be trimmed to reduce its size. Trimming must not remove any entry if:
 
-An in-progress job can have the same dependency before its index exists.
-Building an index against A and B may take hours. If compaction moves those
-rows during the build, the job still needs the movements to C when it publishes
-the index. Checking only published indices would miss that requirement.
+* It is referenced by an index
+* It is referenced by a [Retention lease](../../table/retention_leases.md)
+* It describes an intermediate transition that is required by another required
+  entry to translate correctly.
 
-[Version pins](../../table/ongoing_work_pins.md) record the dependencies of
-in-progress work. Cleanup **must retain** the union of existing-consumer and
-current pin requirements. Resolve the complete source fragment metadata for
-each pin; an empty inline list on a fragment-tree table is not empty coverage.
-Unresolvable metadata must stop affected maintenance.
+For example, consider:
 
-Legacy FRI uses an inclusive source-version boundary. Version 1 follows movement
-paths from the source fragments, including whole selected legacy records and
-their downstream dependencies. Use the exact
-[retention rules](../../table/ongoing_work_pins.md#required-fri-history).
+```
+retention lease: 12 (fragments at version 12: {3, 4, 5})
+current indexes: {1, 3}
 
-Compaction **must record** the movements surviving pins need. Every rewrite or
-trim **must recheck** current requirements before committing, including after
-conflicts. Exclude only pins whose removal that same commit publishes. Reject
-results lacking required mappings and replan. Restore and Overwrite apply the
-rules to the resulting current history and may discard translation paths while
-preserving surviving pins and their version windows.
+Transitions:
 
-Mapping files remain protected while any retained version or required history
-references them. Replacing FRI metadata does not release those files, and pin
-registration does not cancel [deletion already approved](../../table/ongoing_work_pins.md#cleanup-and-deletion-races).
+  {1, 2} -> {5}  keep: an index references fragment 1
+  {4}    -> {6}  keep: the retention lease references fragment 4
+  {6}    -> {7}  keep: translating leased fragment 4 to 7 passes through 6
+  {8}    -> {9}  trim: no index or retention lease references fragment 8
+```
+
+Here, `current indexes` lists the fragments covered by existing indices.
+Fragment 3 was never rewritten, so neither its index nor the lease needs a
+transition for it. Fragment 8 was written after version 12 and compacted
+before any index covered it, so its transition can be trimmed.
 
 ## Stable Row IDs
 

@@ -56,9 +56,9 @@ branched from and a fresh UUID. Newly generated UUIDs use 32 lowercase
 hexadecimal digits without hyphens. Main's mapping is empty.
 
 Compare the complete ordered mapping by value. Preserve an existing identifier
-when updating branch metadata. Pin requests retain the identifier read during
+when updating branch metadata. Lease requests retain the identifier read during
 acquisition and reject a different identifier on later inspection. This
-documents the existing branch representation; pins add no identity field.
+documents the existing branch representation; leases add no identity field.
 
 For an older file without `identifier`, derive a stable identifier from its
 branch name, `parentBranch`, `parentVersion`, and `createAt`. Apply the same
@@ -79,7 +79,7 @@ the string `00000000000000000000000000000000`. The existing derivation is:
 
 The fallback is stable across reads, not a unique record of each creation.
 Recreating an older branch with identical inputs produces the same identifier.
-Applications must coordinate such recreation and must not reuse old pin
+Applications must coordinate such recreation and must not reuse old lease
 requests or handles across it. Main's empty mapping likewise does not identify
 a particular creation of the whole table. No branch names are retired and no
 stored metadata needs migration.
@@ -122,19 +122,17 @@ which means `/` would create a logical subdirectory (e.g., `bugfix/issue-123`, `
                     1.manifest
 ```
 
-<a id="deletion-with-ongoing-work-pins"></a>
-
-### Deletion with version pins
+### Deletion with retention leases
 
 Normal and force deletion **must resolve the
-[authoritative head](versioning.md#current-state-for-pin-decisions)**, validate
-its writer capabilities and pin list, and reject any listed pins, identifying
+[authoritative head](versioning.md#current-state-for-lease-decisions)**, validate
+its writer capabilities and lease list, and reject any listed leases, identifying
 the blocking IDs. Expired records still block
-deletion until a commit removes them. On an idle table, use explicit ReleasePin;
-deletion does not expire pins itself. Existing tag and dependent-branch checks
+deletion until a commit removes them. On an idle table, use explicit ReleaseLease;
+deletion does not expire leases itself. Existing tag and dependent-branch checks
 also apply.
 
-For an orphan with no branch reference, skip the pin check only when authoritative
+For an orphan with no branch reference, skip the lease check only when authoritative
 resolution proves there is no attached manifest. An unreadable or invalid head,
 or a resolution failure, **must fail deletion**. If the selected head disappears,
 resolve again rather than infer absence. Corrupt metadata requires administrator
@@ -142,7 +140,7 @@ repair; force deletion cannot bypass the check.
 
 Inspection is separate from physical deletion. A later registration cannot stop
 a deletion already approved, and delayed deletion after recovery and name reuse
-may affect a replacement branch. See [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races).
+may affect a replacement branch. See [cleanup and deletion races](retention_leases.md#cleanup-and-deletion-races).
 
 ## Tagging
 

@@ -605,51 +605,49 @@ An UpdateBases operation only modifies the base paths. As a result, it only conf
 UpdateBases operations and even then only conflicts if the two operations have base paths with the
 same id, name, or path.
 
-<a id="ongoing-work-pin-transactions"></a>
+## Retention Lease Transactions
 
-## Version Pin Transactions
-
-`RegisterPin` (field 116), `RenewPin` (117), and `ReleasePin` (118) update the
-current pin list. `Transaction.release_pin_id` (field 5) removes one pin
+`RegisterLease` (field 116), `RenewLease` (117), and `ReleaseLease` (118) update the
+current lease list. `Transaction.release_lease_id` (field 5) removes one lease
 atomically with an ordinary attached operation. None may be used in detached
-commits; the release field is also invalid on pin operations and Clone.
+commits; the release field is also invalid on lease operations and Clone.
 
-The [Version Pins specification](ongoing_work_pins.md) defines registration,
-confirmation, expiration, transaction persistence, and retention. Pin changes
+The [Retention Leases specification](retention_leases.md) defines registration,
+confirmation, expiration, transaction persistence, and retention. Lease changes
 **must not bypass** existing data conflicts, writer-capability checks, or
 branch identity. Unknown operations retain their fail-closed conflict behavior.
-Config and metadata maps cannot mutate pins.
+Config and metadata maps cannot mutate leases.
 
 ### Directional conflict rules
 
-Pin operations may re-evaluate over known attached data and pin operations in
+Lease operations may re-evaluate over known attached data and lease operations in
 the same table and branch. Fresh registration or a definitively lost attempt
 may rebase; uncertain registration recovery cannot resubmit. The successful
 registration version fixes the source, and work begins only after confirmation.
 
-For an incoming operation rebasing across RegisterPin, RenewPin, or ReleasePin:
+For an incoming operation rebasing across RegisterLease, RenewLease, or ReleaseLease:
 
 | Incoming operation | Required behavior |
 | --- | --- |
-| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive pins from the attempt's predecessor, remove expired records, apply any explicit release, and preserve the rest. |
-| Rewrite | Recheck current pin requirements before committing. Missing required movements require replanning, even if planning preceded registration. |
-| Restore, Overwrite | Use current pins and the sticky capability, apply expiration and release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
-| Clone | Start the destination with no pins and preserve the inherited capability. Do not transfer pin mutations or ownership to the destination. |
-| RegisterPin | Recover a listed ID without changing it. Otherwise, a fresh or definitively lost attempt uses the new head and an unexpired request. Uncertain recovery stays read-only. |
-| RenewPin | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |
-| ReleasePin | Remove the target ID; absent is a no-op. A concurrent renewal does not prevent explicit release. |
+| Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, apply any explicit release, and preserve the rest. |
+| Rewrite | Recheck current lease requirements before committing. Missing required movements require replanning, even if planning preceded registration. |
+| Restore, Overwrite | Use current leases and the sticky capability, apply expiration and release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
+| Clone | Start the destination with no leases and preserve the inherited capability. Do not transfer lease mutations or ownership to the destination. |
+| RegisterLease | Recover a listed ID without changing it. Otherwise, a fresh or definitively lost attempt uses the new head and an unexpired request. Uncertain recovery stays read-only. |
+| RenewLease | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |
+| ReleaseLease | Remove the target ID; absent is a no-op. A concurrent renewal does not prevent explicit release. |
 
 Every retry **must recompute expiration** from its new predecessor. A winning
 renewal defeats an older removal decision; a winning removal prevents renewal
-from recreating the ID. No-op pin requests create no version, while real
+from recreating the ID. No-op lease requests create no version, while real
 mutations use ordinary version counting. Release does not fence registration
 already in flight. Distinct IDs remain independent.
 
-Operations removing FRI history **must revalidate** the union of current pin
+Operations removing FRI history **must revalidate** the union of current lease
 and existing-consumer requirements using the
-[retention rules](ongoing_work_pins.md#retention-and-data-operations). Restore
+[retention rules](retention_leases.md#retention-and-data-operations). Restore
 and Overwrite apply them to the resulting current history; discarded paths need
-not be reconstructed, but surviving pins retain their complete version window.
+not be reconstructed, but surviving leases retain their complete version window.
 
 ## Conflict Resolution
 
