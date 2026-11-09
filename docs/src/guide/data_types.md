@@ -418,7 +418,8 @@ column, but it does not include values left in the residual data. Use the Arrow
 Variant kernels on the full Variant array when reconstruction or path extraction
 needs those values. Keep the same physical shredding schema across batches and
 appends. This interoperability does not automatically select fields to shred,
-rewrite existing data, or add Variant-aware SQL functions. Existing
+or rewrite existing data. The optional query functions below provide logical
+access with residual fallback. Existing
 [JSON columns](json.md) continue to use their separate JSONB representation.
 
 ### Explicit Variant shredding on write (Rust)
@@ -478,9 +479,85 @@ unselected object fields are preserved. Raw typed-child projections therefore
 still require residual fallback for complete query results.
 
 Decimal, temporal, UUID, and fixed-size/list-view targets are not yet exposed by
-this API. Automatic field selection, layout evolution, and Variant SQL functions
-are separate capabilities; this option neither infers a layout nor rewrites
-existing data.
+this API. Automatic field selection and layout evolution are separate
+capabilities; this option neither infers a layout nor rewrites existing data.
+
+### Variant queries (Rust)
+
+With the `variant` Cargo feature, dataset SQL, scanner filters, and computed
+projections support the following functions on `arrow.parquet.variant` columns:
+
+| Function | Result |
+| --- | --- |
+| `variant_get(event, 'user.id')` | An unshredded standard Variant, preserving the value's type |
+| `variant_get_int(event, 'user.id')` | Int64 using Arrow Variant's safe conversion rules |
+| `variant_get_float(event, 'price')` | Float64 using Arrow Variant's safe conversion rules |
+| `variant_get_string(event, 'user.name')` | Utf8 using Arrow Variant's safe conversion rules |
+| `variant_get_bool(event, 'active')` | Boolean using Arrow Variant's safe conversion rules |
+| `variant_to_json(event)` | JSON text reconstructed from typed and residual values |
+
+Paths must be non-null constant strings. They use Arrow Variant path syntax:
+`user.name`, `items[0]`, or `user['first.name']`; the empty string selects the
+whole value. Wildcards and recursive descent are not supported. Paths are
+relative: use `user.name` without a JSONPath `$` prefix.
+
+```rust
+use lance::Dataset;
+
+async fn example(dataset: &Dataset) -> lance::Result<()> {
+    let result = dataset.scan()
+        .filter("variant_get_float(event, 'price') > 10")?
+        .project_with_transform(&[
+            ("name", "variant_get_string(event, 'user.name')"),
+            ("document", "variant_to_json(event)"),
+        ])?
+        .try_into_batch().await?;
+    Ok(())
+}
+```
+
+Missing paths, out-of-bounds array indices, and SQL null inputs return SQL null.
+`variant_get` preserves an explicit Variant null as a valid Variant value;
+`variant_to_json` renders it as the string `"null"`. The typed getters return SQL
+null for Variant null and failed conversions. They perform conversions, unlike the
+lossless write API: for example, `variant_get_int` can truncate a fractional
+number or convert a Boolean to 0/1; a numeric string returns SQL null. Use
+`variant_get` to preserve the original type and value. `variant_to_json` follows Arrow's JSON serialization rules; it is not
+a lossless interchange format for every non-JSON Variant type.
+
+The initial query implementation reconstructs each batch before extracting a
+path, so it includes residual values at any ancestor level. It reads the full
+Variant column and does **not** yet push paths into physical child projections
+or use indices on shredded fields. This establishes equivalent results for
+shredded and unshredded layouts; it does not promise faster queries.
+
+### When shredding helps
+
+Lance already converts JSON columns to binary JSONB, avoiding repeated JSON text
+parsing. Shredding's additional opportunity is to read just the relevant typed
+columns, apply columnar operations, and compress homogeneous values efficiently.
+This is most useful for repeated filters, projections, and aggregations over a
+small subset of a wide document. Complete path queries must also account for
+residual values before they can safely exploit those independent columns.
+
+Writing incurs extra extraction work. Whole-document reads require reconstruction,
+and mixed types can leave many rows in residual storage. Storage savings and
+query speedups depend on field selection, residual frequency, and the workload.
+The current reconstruction-based query path can be slower than JSONB.
+
+A reproducible field-projection benchmark compares JSONB, unshredded Variant,
+and shredded Variant with 0% and 10% whole-row fallback:
+
+```bash
+cargo bench -p lance --bench variant --features variant --profile release-with-debug
+```
+
+It checks that all cases return the same values. A separate direct typed-child
+case is included only for the zero-fallback fixture: it illustrates the potential
+of column projection, not the performance of a complete residual-aware query.
+This measures unindexed in-memory scans, not object-storage latency. Existing
+JSONB path indices can already accelerate selective lookups; this benchmark
+does not compare indexed queries.
 
 ## Data Type Mapping for Integrations
 

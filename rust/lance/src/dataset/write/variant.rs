@@ -331,6 +331,124 @@ mod tests {
     }
 
     #[rstest]
+    #[case::unshredded(false)]
+    #[case::shredded(true)]
+    #[tokio::test]
+    async fn variant_query_residuals(#[case] is_shredded: bool) {
+        let documents = vec![
+            Some(r#"{"id":42,"name":"typed","items":[5,null],"extra":{"x":7}}"#),
+            // This entire object stays in the root residual: id does not fit int64.
+            Some(r#"{"id":1.5,"name":"residual","items":[6],"extra":{"x":8}}"#),
+            Some(r#"{"id":null,"items":[]}"#),
+            Some("{}"),
+            Some("null"),
+            None,
+            Some(r#"{"items":[false,2]}"#),
+            Some(r#"{"id":43,"name":"other","items":[9]}"#),
+        ];
+        let batch = variant_batch(documents.clone());
+        let params = WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        let builder = InsertBuilder::new("memory://").with_params(&params);
+        let builder = if is_shredded {
+            builder.with_variant_shredding("event", object_target())
+        } else {
+            builder
+        };
+        let dataset = builder.execute(vec![batch]).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+        let result = dataset
+            .scan()
+            .project_with_transform(&[
+                ("id", "variant_get_float(event, 'id')"),
+                ("name", "variant_get_string(event, 'name')"),
+                ("extra", "variant_get_int(event, 'extra.x')"),
+                ("second", "variant_to_json(variant_get(event, 'items[1]'))"),
+                ("raw", "variant_to_json(event)"),
+                ("event", "variant_get(event, '')"),
+            ])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            result["id"].as_ref(),
+            &arrow_array::Float64Array::from(vec![
+                Some(42.0),
+                Some(1.5),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(43.0)
+            ])
+        );
+        assert_eq!(
+            result["name"].as_ref(),
+            &StringArray::from(vec![
+                Some("typed"),
+                Some("residual"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("other")
+            ])
+        );
+        assert_eq!(
+            result["extra"].as_ref(),
+            &Int64Array::from(vec![Some(7), Some(8), None, None, None, None, None, None])
+        );
+        assert_eq!(
+            result["second"].as_ref(),
+            &StringArray::from(vec![
+                Some("null"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("2"),
+                None
+            ])
+        );
+        assert_documents(&result, &documents);
+        for (actual, expected) in result["raw"].as_string::<i32>().iter().zip(&documents) {
+            assert_eq!(
+                actual.map(|v| serde_json::from_str::<serde_json::Value>(v).unwrap()),
+                expected.map(|v| serde_json::from_str::<serde_json::Value>(v).unwrap()),
+            );
+        }
+        let filtered = dataset
+            .scan()
+            .filter("variant_get_string(event, 'name') = 'residual'")
+            .unwrap()
+            .project(&["row"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered["row"].as_ref(), &Int64Array::from(vec![1]));
+        let results = dataset
+            .sql("SELECT SUM(variant_get_float(event, 'id')) AS total FROM events")
+            .table_name("events")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0]["total"].as_ref(),
+            &arrow_array::Float64Array::from(vec![86.5])
+        );
+    }
+
+    #[rstest]
     #[case::batches(false, false)]
     #[case::stream(true, false)]
     #[case::uncommitted_batches(false, true)]

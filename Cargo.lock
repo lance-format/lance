@@ -4750,6 +4750,8 @@ dependencies = [
  "lance-datagen",
  "lance-jsonb",
  "log",
+ "parquet-variant",
+ "parquet-variant-compute",
  "pin-project",
  "prost",
  "rstest",

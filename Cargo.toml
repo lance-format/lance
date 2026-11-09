@@ -208,6 +208,7 @@ parquet = { version = "59.2.0", default-features = false, features = [
     "arrow",
     "async",
 ] }
+parquet-variant = "59.3.0"
 parquet-variant-compute = "59.3.0"
 pin-project = "1.0"
 path_abs = "0.5"
