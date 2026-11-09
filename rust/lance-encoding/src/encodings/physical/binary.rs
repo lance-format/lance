@@ -1614,7 +1614,6 @@ mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
         #[values(
-            TestEncoding::Array,
             TestEncoding::StructuralU16,
             TestEncoding::StructuralU32,
             TestEncoding::StructuralSparse
@@ -1631,6 +1630,19 @@ mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(field_metadata);
         check_basic_random_case(field, encoding, page_size, use_slicing).await;
+    }
+
+    /// The 2.0 array encoding ignores the structural encoding metadata, so it
+    /// is not crossed with it.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_binary_array_encoding(
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, TestEncoding::Array, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -1719,7 +1731,6 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(
-            TestEncoding::Array,
             TestEncoding::StructuralU16,
             TestEncoding::StructuralU32,
             TestEncoding::StructuralSparse
@@ -1734,6 +1745,27 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        check_small_strings(field, encoding, page_size, use_slicing).await;
+    }
+
+    /// The 2.0 array encoding ignores the structural encoding metadata, so it
+    /// is not crossed with it.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_small_strings_array_encoding(
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", DataType::Utf8, true);
+        check_small_strings(field, TestEncoding::Array, page_size, use_slicing).await;
+    }
+
+    async fn check_small_strings(
+        field: Field,
+        encoding: TestEncoding,
+        page_size: u64,
+        use_slicing: bool,
+    ) {
         check_round_trip_encoding_generated(
             field,
             Box::new(FnArrayGeneratorProvider::new(move || {
