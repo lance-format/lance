@@ -474,11 +474,10 @@ fn ex_dot_scalar<const EX_BITS: u8>(ex_query: &[f32], codes: &[u8]) -> f32 {
     sum
 }
 
-// The layered and prefix kernels below still select with feature checks and
+// The layered and prefix kernels below select with feature checks and
 // `LazyLock` rather than `Dispatch`. The prefix kernels are generic over their
 // plane widths, and a `static` cannot depend on a generic parameter, so they
-// need one hand-written dispatch per width pair. Converting them is left to a
-// follow-up so this change stays limited to the single-plane kernels.
+// would need one hand-written dispatch per width pair.
 
 /// Dot product of an `f32` query and full codes stored as high/low blocked
 /// planes. The selected kernel fixes their widths and combines the codes
