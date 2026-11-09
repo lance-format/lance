@@ -1,0 +1,46 @@
+name: Docs build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-build.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs-build.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs & run theme tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: "docs/pyproject.toml"
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: docs/pyproject.toml
+      - name: Run theme tests
+        run: uv run python -m unittest discover -s tests
+      - name: Build single-repo docs site strictly
+        run: |
+          ./clean-full-website.sh
+          uv run mkdocs build --strict

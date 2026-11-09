@@ -91,8 +91,8 @@ impl<'a> ExRows<'a> {
 }
 
 /// Stage-1 output of a lazy full-precision scan over every row of the
-/// original sign plane: binary inner products in the partition's own
-/// SIMD/tail layout and the native lower bounds derived from them.
+/// original sign plane. Positions remain physical file offsets; surviving
+/// rows use the eager scan's SIMD/tail precision after FRI deletes are removed.
 #[derive(Debug, Default, Clone)]
 pub struct SignStage {
     pub binary_ips: Vec<f32>,
@@ -237,6 +237,8 @@ impl RabitQuantizationStorage {
             packed_ex_codes: None,
             ex_add_factors: None,
             ex_scale_factors: None,
+            walk_signs: None,
+            pairs: None,
         })
     }
 
@@ -282,8 +284,8 @@ impl RabitQuantizationStorage {
 }
 
 impl<'a> RabitDistCalculator<'a> {
-    /// Calculate the original partition's binary inner products with the
-    /// same SIMD blocks, tail and LUT precision as the full scan.
+    /// Calculate binary inner products at physical offsets with the full
+    /// scan's LUT precision, including its live-row tail after FRI deletions.
     pub fn binary_inner_products(&self) -> Vec<f32> {
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
@@ -302,7 +304,9 @@ impl<'a> RabitDistCalculator<'a> {
         dists
     }
 
-    /// Compute sign inner products and native lower bounds in partition order.
+    /// Compute sign inner products and native lower bounds at physical offsets.
+    /// FRI tombstones retain their slots; surviving rows match the full scan's
+    /// precision after those slots are removed.
     /// Returns the full scan's gating reason without changing `out` when
     /// Fast mode, the estimator or missing error factors prevent pruning.
     pub fn full_sign_stage_with_scratch(
@@ -311,6 +315,51 @@ impl<'a> RabitDistCalculator<'a> {
         quantized_dists: &mut Vec<u16>,
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
+    ) -> std::result::Result<(), &'static str> {
+        self.sign_stage_with_scratch(
+            out,
+            quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
+            false,
+        )
+    }
+
+    /// Prepare bounds using the scalar LUT precision of filtered partition search.
+    ///
+    /// ```
+    /// # use lance_index::vector::bq::storage::{RabitDistCalculator, SignStage};
+    /// fn prepare(calc: &RabitDistCalculator<'_>) -> Result<SignStage, &'static str> {
+    ///     let mut stage = SignStage::default();
+    ///     calc.filtered_partition_sign_stage_with_scratch(
+    ///         &mut stage, &mut Vec::new(), &mut Vec::new(), &mut Vec::new(),
+    ///     )?;
+    ///     Ok(stage)
+    /// }
+    /// ```
+    pub fn filtered_partition_sign_stage_with_scratch(
+        &self,
+        out: &mut SignStage,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
+    ) -> std::result::Result<(), &'static str> {
+        self.sign_stage_with_scratch(
+            out,
+            quantized_dists,
+            quantized_dists_table,
+            hacc_quantized_dists,
+            true,
+        )
+    }
+
+    fn sign_stage_with_scratch(
+        &self,
+        out: &mut SignStage,
+        quantized_dists: &mut Vec<u16>,
+        quantized_dists_table: &mut Vec<u8>,
+        hacc_quantized_dists: &mut Vec<u32>,
+        scalar: bool,
     ) -> std::result::Result<(), &'static str> {
         if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
             return Err(reason);
@@ -325,14 +374,21 @@ impl<'a> RabitDistCalculator<'a> {
             out.binary_ips.clear();
             return Ok(());
         }
-        self.binary_distances_with_scratch(
-            n,
-            code_len,
-            &mut out.binary_ips,
-            quantized_dists,
-            quantized_dists_table,
-            hacc_quantized_dists,
-        );
+        if scalar {
+            out.binary_ips.clear();
+            out.binary_ips.extend((0..n).map(|id| {
+                compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table)
+            }));
+        } else {
+            self.binary_distances_with_scratch(
+                n,
+                code_len,
+                &mut out.binary_ips,
+                quantized_dists,
+                quantized_dists_table,
+                hacc_quantized_dists,
+            );
+        }
         // Same expression as `raw_query_lower_bound`, so the survivors'
         // bounds match the eager scan's (and its prune masks) bit for bit.
         out.lower_bounds
@@ -364,6 +420,82 @@ impl<'a> RabitDistCalculator<'a> {
             query_lower_bound: lower_bound.unwrap_or(f32::MIN),
             query_upper_bound: upper_bound.unwrap_or(f32::MAX),
         }
+    }
+
+    /// Score rows with the replacement and tie order of native partition search.
+    /// Unlike the query-wide scorer, a replacement pops then pushes the heap.
+    /// This preserves the candidate batch that drives partition stop accounting.
+    /// Query-wide approximate bounds are not used: native partition search scores
+    /// every accepted row, including intermediate candidates that change tie order.
+    /// Rows must reference the supplied ex batch and retain original partition order.
+    ///
+    /// ```
+    /// # use std::collections::BinaryHeap;
+    /// # use lance_index::vector::bq::storage::{RabitDistCalculator, StagePruneCounts, SurvivorRow};
+    /// # use lance_index::vector::graph::OrderedNode;
+    /// fn score(calc: &RabitDistCalculator<'_>, rows: &[SurvivorRow]) -> BinaryHeap<OrderedNode<u64>> {
+    ///     let mut heap = BinaryHeap::new();
+    ///     calc.accumulate_partition_survivor_rows(
+    ///         8, None, None, rows, StagePruneCounts::default(), &mut heap, |_| {},
+    ///     );
+    ///     heap
+    /// }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_partition_survivor_rows(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        rows: &[SurvivorRow],
+        stage1: StagePruneCounts,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        mut on_first_full: impl FnMut(f32),
+    ) -> RabitPruneCounters {
+        let mut counters = RabitPruneCounters {
+            candidates: stage1.candidates,
+            pruned_upper_bound: stage1.pruned_upper_bound,
+            pruned_heap: stage1.pruned_heap,
+            ..Default::default()
+        };
+        let n = self.codes.len() / rabit_binary_code_bytes(self.dim);
+        if k == 0 || n == 0 {
+            return counters;
+        }
+        let ctx = self.raw_query_ex_context(n, k, lower_bound, upper_bound);
+        let mut full = res.len() >= k;
+        for row in rows {
+            counters.exact += 1;
+            let distance = self.raw_query_multi_bit_exact_distance(
+                row.ex_index as usize,
+                row.binary_ip,
+                ctx.ex_bits,
+                ctx.ex_codes,
+                ctx.ex_add_factors,
+                ctx.ex_scale_factors,
+            );
+            if (lower_bound.is_some() || upper_bound.is_some())
+                && (distance < ctx.query_lower_bound || distance >= ctx.query_upper_bound)
+            {
+                counters.exact_rejected += 1;
+                continue;
+            }
+            let distance = OrderedFloat(distance);
+            if res.len() < k {
+                res.push(OrderedNode::new(row.row_id, distance));
+            } else if res.peek().is_some_and(|top| top.dist > distance) {
+                res.pop();
+                res.push(OrderedNode::new(row.row_id, distance));
+            }
+            if !full && res.len() >= k {
+                full = true;
+                if let Some(top) = res.peek() {
+                    on_first_full(top.dist.0);
+                }
+            }
+        }
+        record_rabit_prune_stats(&counters);
+        counters
     }
 
     /// Score survivors against the live full-score heap in original row order.

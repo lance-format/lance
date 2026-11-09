@@ -21,7 +21,8 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import ScannerBuilder, VectorIndexReader, VectorSearchQuery
+from lance._dataset.index import VectorIndexReader
+from lance._dataset.scanner import ScannerBuilder, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -211,6 +212,7 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
         ("IVF_HNSW_FLAT", {}, np.float32, None),
         ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
         ("IVF_HNSW_SQ", {}, np.float32, None),
+        ("IVF_HNSW_RQ", {"num_bits": 5}, np.float32, None),
         ("IVF_FLAT", {}, np.float16, None),
         ("IVF_FLAT", {}, np.float64, None),
         ("IVF_FLAT", {}, np.float32, 2),
@@ -500,8 +502,9 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
 
 @pytest.mark.parametrize("metric", ["l2", "cosine"])
 @pytest.mark.parametrize("query_count", [3, 1], ids=["three_queries", "single_query"])
+@pytest.mark.parametrize("refine_factor", [None, 1, 4])
 def test_batch_indexed_query_matches_repeated_single_queries(
-    dataset, metric, query_count
+    dataset, metric, query_count, refine_factor
 ):
     indexed = dataset.create_index(
         "vector",
@@ -520,6 +523,8 @@ def test_batch_indexed_query_matches_repeated_single_queries(
     # nprobes covers every partition so the shared-scan batch path and the
     # repeated single-query path search the same partitions deterministically.
     nearest_kwargs = {"use_index": True, "nprobes": 4}
+    if refine_factor is not None:
+        nearest_kwargs["refine_factor"] = refine_factor
     _assert_batch_matches_single_queries(
         indexed,
         queries,
@@ -1303,6 +1308,10 @@ def test_index_type(tmp_path):
         (
             "IVF_HNSW_FLAT",
             {"max_level": 2, "m": 4, "ef_construction": 16},
+        ),
+        (
+            "IVF_HNSW_RQ",
+            {"num_bits": 5, "max_level": 2, "m": 4, "ef_construction": 16},
         ),
     ]
     rng = np.random.default_rng(42)
@@ -3061,18 +3070,28 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
 @pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
 @pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
 @pytest.mark.parametrize(
-    "effort,probes,bounded_probes",
+    "effort,probes_by_metric,bounded_by_metric",
     [
-        (0, 1, (1, 1)),
-        (0.25, 2, (2, 2)),
-        (0.5, 4, (2, 4)),
-        (0.75, 8, (2, 6)),
-        (1, 16, (2, 8)),
+        (0, (1, 1, 1), ((1, 1), (1, 1), (1, 1))),
+        (0.1, (2, 1, 1), ((1, 2), (1, 1), (1, 1))),
+        (0.25, (3, 2, 2), ((2, 3), (1, 2), (1, 2))),
+        (0.5, (4, 4, 4), ((2, 4), (2, 4), (2, 4))),
+        (0.75, (8, 8, 8), ((2, 6), (2, 6), (2, 6))),
+        (1, (16, 16, 16), ((2, 8), (2, 8), (2, 8))),
     ],
 )
 def test_vector_search_effort(
-    tmp_path, monkeypatch, metric, index_type, effort, probes, bounded_probes
+    tmp_path,
+    monkeypatch,
+    metric,
+    index_type,
+    effort,
+    probes_by_metric,
+    bounded_by_metric,
 ):
+    metric_position = ("l2", "cosine", "dot").index(metric)
+    probes = probes_by_metric[metric_position]
+    bounded_probes = bounded_by_metric[metric_position]
     centroids = np.eye(16, dtype=np.float32)
     vectors = np.repeat(centroids, 16, axis=0)
     vectors += (
@@ -3146,7 +3165,7 @@ def test_vector_search_effort(
         assert sorted(filtered["id"].to_pylist()) == sorted(actual["id"].to_pylist())
         # The shared counter also includes the inverted index's one partition.
         assert captured[0].all_counts["partitions_searched"] == probes + 1
-    if effort == 0:
+    if effort in (0, 0.1):
         captured.clear()
         filtered = ds.scanner(
             columns=["id"],
@@ -3157,7 +3176,7 @@ def test_vector_search_effort(
         ).to_table()
         assert len(filtered) == 8
         assert min(filtered["id"].to_pylist()) >= 240
-        assert captured[0].all_counts["partitions_searched"] > 1
+        assert captured[0].all_counts["partitions_searched"] > probes
     for maximum, expected_probes in zip((2, 8), bounded_probes):
         captured.clear()
         bounded = ds.scanner(

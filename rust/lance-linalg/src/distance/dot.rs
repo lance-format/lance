@@ -10,7 +10,10 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
 #[allow(unused_imports)]
-use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
+use lance_core::{
+    deepsize::DeepSizeOf,
+    utils::cpu::{SIMD_SUPPORT, SimdSupport},
+};
 use num_traits::{AsPrimitive, Num, real::Real};
 
 use crate::Result;
@@ -88,6 +91,96 @@ pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
     1.0 - T::dot(from, to)
+}
+
+/// Accumulate one query dimension into the Dot distances for all targets.
+///
+/// Keeping this in a separate function tells LLVM that `row` and `distances`
+/// do not alias, allowing it to vectorize across targets on every architecture.
+#[inline(never)]
+fn accumulate_dot_dimension(q: f32, row: &[f32], distances: &mut [f32]) {
+    for (distance, &target) in distances.iter_mut().zip(row) {
+        *distance -= q * target;
+    }
+}
+
+/// Pre-transposed target vectors for batched Dot distance computation.
+///
+/// Stores targets in SoA layout `[dimension][num_targets]`, allowing one query
+/// dimension to be multiplied with many contiguous target values. Construction
+/// performs the AoS-to-SoA transpose once, so callers should reuse this across
+/// queries. This is intended for small target sets whose transposed values fit
+/// in cache, such as PQ sub-vector codebooks.
+///
+/// # Example
+///
+/// ```
+/// use lance_linalg::distance::dot::DotPrepared;
+///
+/// let targets = [1.0, 0.0, 0.0, 1.0];
+/// let prepared = DotPrepared::new(&targets, 2);
+/// assert_eq!(prepared.distances(&[1.0, 0.0]), [0.0, 1.0]);
+/// ```
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct DotPrepared {
+    transposed: Vec<f32>,
+    dimension: usize,
+    num_targets: usize,
+}
+
+impl DotPrepared {
+    /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    pub fn new(targets: &[f32], dimension: usize) -> Self {
+        let num_targets = targets.len() / dimension;
+        debug_assert_eq!(targets.len(), num_targets * dimension);
+
+        let mut transposed = vec![0.0; targets.len()];
+        for target in 0..num_targets {
+            for dim in 0..dimension {
+                transposed[dim * num_targets + target] = targets[target * dimension + dim];
+            }
+        }
+
+        Self {
+            transposed,
+            dimension,
+            num_targets,
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target, writing into `out`.
+    pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(query.len(), self.dimension);
+        debug_assert_eq!(out.len(), self.num_targets);
+
+        out.fill(1.0);
+        for (dim, &q) in query.iter().enumerate() {
+            let row = &self.transposed[dim * self.num_targets..][..self.num_targets];
+            accumulate_dot_dimension(q, row, out);
+        }
+    }
+
+    /// Compute Dot distances from `query` to every target.
+    pub fn distances(&self, query: &[f32]) -> Vec<f32> {
+        let mut result = vec![0.0; self.num_targets];
+        self.distances_into(query, &mut result);
+        result
+    }
+
+    /// Number of targets in this set.
+    pub fn num_targets(&self) -> usize {
+        self.num_targets
+    }
+
+    /// Dimension of each target vector.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Size of the transposed values in bytes.
+    pub fn size_bytes(&self) -> usize {
+        self.transposed.len() * std::mem::size_of::<f32>()
+    }
 }
 
 /// Dot product
@@ -795,6 +888,51 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_prepared_matches_per_target_distance() {
+        for (dimension, num_targets) in
+            [(1_usize, 32_usize), (3, 20), (8, 256), (16, 17), (128, 64)]
+        {
+            let query = (0..dimension)
+                .map(|idx| idx as f32 * 0.125 - 1.5)
+                .collect::<Vec<_>>();
+            let targets = (0..dimension * num_targets)
+                .map(|idx| ((idx * 7) % 101) as f32 * 0.02 - 1.0)
+                .collect::<Vec<_>>();
+            let expected = targets
+                .chunks_exact(dimension)
+                .map(|target| dot_distance(&query, target))
+                .collect::<Vec<_>>();
+
+            let prepared = DotPrepared::new(&targets, dimension);
+            let actual = prepared.distances(&query);
+
+            assert_eq!(prepared.dimension(), dimension);
+            assert_eq!(prepared.num_targets(), num_targets);
+            assert_eq!(
+                prepared.size_bytes(),
+                targets.len() * std::mem::size_of::<f32>()
+            );
+            for (target, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    approx::relative_eq!(actual, expected, epsilon = 1e-4, max_relative = 1e-5),
+                    "target {target}, dimension {dimension}: prepared={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dot_prepared_reuses_output() {
+        let prepared = DotPrepared::new(&[1.0, 0.0, 0.0, 1.0], 2);
+        let mut distances = vec![f32::NAN; 2];
+
+        prepared.distances_into(&[1.0, 0.0], &mut distances);
+        assert_eq!(distances, [0.0, 1.0]);
+        prepared.distances_into(&[0.0, 1.0], &mut distances);
+        assert_eq!(distances, [1.0, 0.0]);
+    }
+
+    #[test]
     fn test_dot() {
         let x: Vec<f32> = (0..20).map(|v| v as f32).collect();
         let y: Vec<f32> = (100..120).map(|v| v as f32).collect();
@@ -978,71 +1116,32 @@ mod tests {
             do_dot_test(&x, &y)?;
         }
 
-        /// Cross-backend parity: scalar fallback must match the dispatched
-        /// SIMD path within numerical tolerance. Exercises `dot_f64_scalar`
-        /// directly so the runtime fallback is exercised even on AVX2-capable
-        /// CI hosts.
+        /// Every f64 kernel the host supports, plus the runtime dispatch, must
+        /// match the scalar fallback. Calling `dot_f64_scalar` directly
+        /// exercises the fallback even on AVX2-capable CI hosts.
         #[cfg(target_arch = "x86_64")]
         #[test]
-        fn test_dot_f64_scalar_simd_parity(
+        fn test_dot_f64_kernels_match_scalar(
             (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
         ) {
             let scalar = dot_f64_scalar(&x, &y);
-            let simd = dot_f64_simd(&x, &y);
             let max_error = max_error::<f64>(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, simd, epsilon = max_error));
-        }
-
-        /// AVX-512-direct parity: explicitly compares the scalar fallback
-        /// against the native AVX-512 inner kernel on AVX-512F-capable hosts
-        /// (Skylake-X+, Ice Lake, Sapphire Rapids, Zen 4). Early-returns on
-        /// hosts without AVX-512F.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f64_scalar_vs_avx512_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx512f") {
-                return Ok(());
+            let mut results = vec![("dispatched", dot_f64_simd(&x, &y))];
+            if std::is_x86_feature_detected!("avx512f") {
+                results.push(("avx512", unsafe { x86::dot_f64_avx512(&x, &y) }));
             }
-            let scalar = dot_f64_scalar(&x, &y);
-            let avx512 = unsafe { x86::dot_f64_avx512(&x, &y) };
-            let max_error = max_error::<f64>(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, avx512, epsilon = max_error));
-        }
-
-        /// AVX + FMA-direct parity for the f64 dot kernel. Covers the AMD
-        /// Piledriver / Steamroller / FX-7500 tier. Early-returns on hosts
-        /// without both AVX and FMA.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f64_scalar_vs_avx_fma_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !(std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma")) {
-                return Ok(());
+            if std::is_x86_feature_detected!("avx") && std::is_x86_feature_detected!("fma") {
+                results.push(("avx_fma", unsafe { x86::dot_f64_avx_fma(&x, &y) }));
             }
-            let scalar = dot_f64_scalar(&x, &y);
-            let avx_fma = unsafe { x86::dot_f64_avx_fma(&x, &y) };
-            let max_error = max_error::<f64>(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, avx_fma, epsilon = max_error));
-        }
-
-        /// AVX-only-direct parity for the f64 dot kernel. Covers the Intel
-        /// Sandy Bridge / Ivy Bridge tier (AVX without FMA). Early-returns
-        /// on hosts without AVX.
-        #[cfg(target_arch = "x86_64")]
-        #[test]
-        fn test_dot_f64_scalar_vs_avx_parity(
-            (x, y) in arbitrary_vector_pair(arbitrary_f64, 4..4048)
-        ) {
-            if !std::is_x86_feature_detected!("avx") {
-                return Ok(());
+            if std::is_x86_feature_detected!("avx") {
+                results.push(("avx", unsafe { x86::dot_f64_avx(&x, &y) }));
             }
-            let scalar = dot_f64_scalar(&x, &y);
-            let avx = unsafe { x86::dot_f64_avx(&x, &y) };
-            let max_error = max_error::<f64>(&x, &y);
-            prop_assert!(approx::relative_eq!(scalar, avx, epsilon = max_error));
+            for (kernel, got) in results {
+                prop_assert!(
+                    approx::relative_eq!(scalar, got, epsilon = max_error),
+                    "{kernel}: {got} != scalar {scalar}"
+                );
+            }
         }
     }
 

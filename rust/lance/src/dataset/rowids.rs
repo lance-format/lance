@@ -6,7 +6,8 @@ mod validate;
 
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
+use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
+use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
@@ -242,7 +243,7 @@ pub(crate) async fn get_row_id_index_with(
         e_tag: Some(e_tag),
     };
     let index = dataset
-        .metadata_cache
+        .index_cache
         .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
         .await?;
     Ok(Some(index))
@@ -646,12 +647,20 @@ mod test {
 
         // Building the index adds one cache entry: the index, which holds its
         // sequences itself rather than reading them through their own entries.
-        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let metadata_before = session.metadata_cache_stats().await;
+        let index_before = session.index_cache_stats().await;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert_eq!(
-            session.metadata_cache_stats().await.num_entries,
-            entries_before + 1
+            session.index_cache_stats().await.num_entries,
+            index_before.num_entries + 1
         );
+        assert!(
+            session.index_cache_stats().await.size_bytes - index_before.size_bytes
+                >= lance_core::deepsize::DeepSizeOf::deep_size_of(index.as_ref())
+        );
+        let metadata_after = session.metadata_cache_stats().await;
+        assert_eq!(metadata_after.num_entries, metadata_before.num_entries);
+        assert_eq!(metadata_after.size_bytes, metadata_before.size_bytes);
         let again = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(Arc::ptr_eq(&index, &again));
 
@@ -664,7 +673,117 @@ mod test {
         );
         assert_eq!(
             session.metadata_cache_stats().await.num_entries,
-            entries_before + 2
+            metadata_before.num_entries + 1
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::metadata_disabled(4096, 0, true)]
+    #[case::index_disabled(0, 1 << 20, false)]
+    #[case::index_too_small(1, 1 << 20, false)]
+    #[tokio::test]
+    async fn test_row_id_index_cache_budget(
+        #[case] index_capacity: usize,
+        #[case] metadata_capacity: usize,
+        #[case] is_cached: bool,
+    ) {
+        let session = Arc::new(Session::new(
+            index_capacity,
+            metadata_capacity,
+            Default::default(),
+        ));
+        let batch = sequence_batch(0..30);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let metadata_before = session.metadata_cache_stats().await;
+        let entries_before = session.index_cache_stats().await.num_entries;
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            index.get(21).unwrap(),
+            Some(RowAddress::new_from_parts(2, 1))
+        );
+        let weak = Arc::downgrade(&index);
+        drop(index);
+        assert_eq!(weak.upgrade().is_some(), is_cached);
+        assert_eq!(
+            session.index_cache_stats().await.num_entries,
+            entries_before + usize::from(is_cached)
+        );
+        assert_eq!(
+            session.metadata_cache_stats().await.size_bytes,
+            metadata_before.size_bytes
+        );
+
+        let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.get(21).unwrap(),
+            Some(RowAddress::new_from_parts(2, 1))
+        );
+        assert!(reloaded.get(30).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_row_id_index_eviction_and_reload() {
+        let session = Arc::new(Session::new(4096, 4096, Default::default()));
+        let batch = sequence_batch(0..30);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 10,
+                session: Some(session.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let metadata_before = session.metadata_cache_stats().await;
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        let weak = Arc::downgrade(&index);
+        drop(index);
+        assert!(weak.upgrade().is_some());
+
+        // QuickCache resists scans of small cold entries. Compete with other
+        // loaded indices of the same size, without touching this one's recency.
+        for version in 100..132 {
+            let key = RowIdIndexKey {
+                version,
+                with_deletions: true,
+                e_tag: Some("pressure"),
+            };
+            dataset
+                .index_cache
+                .insert_with_key(
+                    &key,
+                    Arc::new(load_row_id_index(&dataset, true).await.unwrap()),
+                )
+                .await;
+            assert!(dataset.index_cache.get_with_key(&key).await.is_some());
+        }
+        assert!(weak.upgrade().is_none());
+        let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.get(21).unwrap(),
+            Some(RowAddress::new_from_parts(2, 1))
+        );
+        assert!(reloaded.get(30).unwrap().is_none());
+        assert!(session.index_cache_stats().await.size_bytes <= 4096);
+        assert_eq!(
+            session.metadata_cache_stats().await.size_bytes,
+            metadata_before.size_bytes
         );
     }
 
@@ -683,12 +802,12 @@ mod test {
         // at the same URI, so the index must be built privately, never cached.
         dataset.manifest_location.e_tag = None;
         let session = dataset.session();
-        let entries_before = session.metadata_cache_stats().await.num_entries;
+        let entries_before = session.index_cache_stats().await.num_entries;
         let first = get_row_id_index(&dataset).await.unwrap().unwrap();
         let second = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(
-            session.metadata_cache_stats().await.num_entries,
+            session.index_cache_stats().await.num_entries,
             entries_before
         );
         assert_eq!(
@@ -865,9 +984,8 @@ mod test {
             .await
             .unwrap();
         assert_eq!(sequence.len(), 100);
-        // Leave this generation's index in the session cache: `RowIdIndexKey`
-        // is scoped by version alone, so the recreated dataset below reaches
-        // the same key, and no sequence load may be answered from it.
+        // Keep this generation's index warm to check that a recreated dataset
+        // at the same URI and version cannot reuse it.
         get_row_id_index(&dataset).await.unwrap().unwrap();
 
         // Reloading the unchanged fragment must still hit: keying on contents has
@@ -1115,7 +1233,8 @@ mod test {
 
     #[tokio::test]
     async fn test_row_ids_update() {
-        // Updated fragments get fresh row ids.
+        // With stable row ids an update remaps the row's id onto the rewritten
+        // row's address; it does not mint a new id.
         let num_rows = 5u64;
         let batch = sequence_batch(0..num_rows as i32);
 

@@ -9,6 +9,13 @@ import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import io, log
+from ._dataset.cleanup import CleanupPolicy, CleanupRule, KeepOne, RemoveAll
+from ._dataset.index import Index, IndexFile
+from ._dataset.merge_insert import MergeInsertBuilder
+from ._dataset.optimize import AutoCleanupConfig
+from ._dataset.scanner import LanceScanner
+from ._dataset.stats import DataStatistics, FieldStatistics
+from ._dataset.transaction import LanceOperation, Transaction
 from .blob import (
     Blob,
     BlobArray,
@@ -23,20 +30,8 @@ from .blob import (
     blob_field,
 )
 from .dataset import (
-    CleanupPolicy,
-    CleanupRule,
-    DataStatistics,
-    FieldStatistics,
-    Index,
-    IndexFile,
-    KeepOne,
     LanceDataset,
-    LanceOperation,
-    LanceScanner,
-    MergeInsertBuilder,
-    RemoveAll,
     Session,
-    Transaction,
     __version__,
     batch_udf,
     write_dataset,
@@ -51,6 +46,7 @@ from .lance import (
     FFILanceTableProvider,
     FragmentAddColumnsCleanup,
     FtsToken,
+    InsertedRowsFilter,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
@@ -99,6 +95,7 @@ __all__ = [
     "CleanupStats",
     "CleanupPolicy",
     "CleanupRule",
+    "AutoCleanupConfig",
     "KeepOne",
     "RemoveAll",
     "DatasetBasePath",
@@ -109,6 +106,7 @@ __all__ = [
     "FtsToken",
     "Index",
     "IndexFile",
+    "InsertedRowsFilter",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",
@@ -173,8 +171,12 @@ def dataset(
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
     asof : optional, datetime or str
-        If specified, find the latest version created on or earlier than the given
-        argument value. If a version is already specified, this arg is ignored.
+        If specified, find the latest retained version created before the given
+        timestamp. Only versions still listed by :meth:`LanceDataset.versions`
+        are considered. If cleanup removed the version that was current at that
+        time, this can return an older retained version instead. Raises
+        ``ValueError`` if no retained version predates the timestamp.
+        If a version is already specified, this arg is ignored.
         Pandas timestamps are accepted, but ``pandas.NaT`` raises ``ValueError``.
         Strings use pandas parsing when installed; otherwise they must match
         ``YYYY-MM-DD HH:MM:SS``. Use ``version`` for version numbers or tags.

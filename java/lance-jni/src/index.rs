@@ -17,7 +17,10 @@ use std::sync::Arc;
 ///
 /// Not `JLance<Vec<i32>>`'s `IntoJava`: that produces a primitive `int[]`, while
 /// the Java constructors here take `List`.
-fn int_list<'a>(env: &mut JNIEnv<'a>, ids: impl IntoIterator<Item = i32>) -> Result<JObject<'a>> {
+pub(crate) fn int_list<'a>(
+    env: &mut JNIEnv<'a>,
+    ids: impl IntoIterator<Item = i32>,
+) -> Result<JObject<'a>> {
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for id in ids {
         let id_obj = env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(id)])?;
@@ -31,7 +34,7 @@ fn int_list<'a>(env: &mut JNIEnv<'a>, ids: impl IntoIterator<Item = i32>) -> Res
     Ok(array_list)
 }
 
-fn u64_to_jlong(field: &str, value: u64) -> Result<i64> {
+pub(crate) fn u64_to_jlong(field: &str, value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
         Error::runtime_error(format!(
             "Cannot convert Rust index field {field}={value} to Java long"
@@ -39,7 +42,7 @@ fn u64_to_jlong(field: &str, value: u64) -> Result<i64> {
     })
 }
 
-fn u32_to_jint(field: &str, value: u32) -> Result<i32> {
+pub(crate) fn u32_to_jint(field: &str, value: u32) -> Result<i32> {
     i32::try_from(value).map_err(|_| {
         Error::runtime_error(format!(
             "Cannot convert Rust index field {field}={value} to Java int"

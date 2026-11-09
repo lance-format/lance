@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
     decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
     load_raw_frag_reuse_content,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
+use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
@@ -401,6 +401,12 @@ pub(crate) enum TaggedTrimOutcome {
 /// for every fragment another segment covers directly, so removing a
 /// qualifying X cannot change any query result.
 ///
+/// Refused outright when the derived listing could not verify every segment:
+/// an unreadable index file leaves a healthy segment's translated coverage
+/// invisible, which reads as superseded. This decision spans the whole table,
+/// so any unverifiable logical index refuses it, not only the one that cannot
+/// be verified.
+///
 /// Deterministic fixed point for mutual redundancy: segments are confirmed
 /// newest-first (dataset_version, then uuid), and a segment is prunable only
 /// against the direct coverage of segments already confirmed KEPT -- so of
@@ -436,9 +442,22 @@ pub(crate) async fn derive_superseded_segments(
         }
     }
     // The reader's own coverage derivation (translated through the ledger,
-    // direct-coverage-wins applied); not reimplemented here.
-    use crate::index::DatasetIndexExt;
-    let derived = dataset.load_indices().await?;
+    // direct-coverage-wins applied); not reimplemented here. Taken through
+    // the listing that carries its own certainty: a segment the reader
+    // dropped because its format marker could not be read is simply absent
+    // from `load_indices`, so its translated coverage would look empty and
+    // the subset check below would prune a healthy segment. The prune commits
+    // one table-wide decision, so it stays fail-closed on any uncertain group.
+    let listing = dataset.derived_index_listing().await?;
+    if !listing.unverifiable.is_empty() {
+        let names: Vec<&str> = listing.unverifiable.iter().map(String::as_str).collect();
+        return Err(Error::index(format!(
+            "could not verify the coverage of index segments before pruning superseded \
+             segments: an index file of {} could not be read",
+            names.join(", ")
+        )));
+    }
+    let derived = listing.indices;
     let derived_by_uuid: HashMap<uuid::Uuid, &RoaringBitmap> = derived
         .iter()
         .filter_map(|idx| {
@@ -473,7 +492,7 @@ pub(crate) async fn derive_superseded_segments(
             // version) is opaque: its translated coverage is invisible, so it
             // is never pruned, and it must not mask anyone -- the reader will
             // not answer queries from it, so its bitmap covers nothing.
-            if !crate::index::index_is_usable(segment) {
+            if !crate::index::segment::index_is_usable(segment) {
                 kept_any = true;
                 continue;
             }
@@ -755,7 +774,7 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
         match &index.fragment_bitmap {
             Some(bitmap) => {
                 group.provenance |= bitmap;
-                if crate::index::index_is_usable(index) {
+                if crate::index::segment::index_is_usable(index) {
                     group.direct |= bitmap;
                 }
             }
@@ -1577,7 +1596,7 @@ mod tests {
         }
 
         async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
-            crate::index::load_all_indices(dataset)
+            crate::index::loading::load_all_indices(dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -2562,7 +2581,7 @@ mod tests {
             assert_eq!(records.legacy_versions.len(), 1);
             assert!(records.transitions.is_empty());
             let legacy_version = records.legacy_versions[0].dataset_version;
-            let listed = crate::index::load_all_indices(&dataset)
+            let listed = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .iter()

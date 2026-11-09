@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use std::vec;
 
 use super::dataset_common::{create_file, require_send};
@@ -18,8 +20,9 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
-    sample_row_offsets, validate_dataset_root_for_drop, write_manifest_file,
+    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
+    write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
@@ -27,6 +30,7 @@ use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
@@ -41,21 +45,26 @@ use arrow_array::{
 };
 use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
-use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::{
+    reader::FileReaderOptions,
     version::{ConcreteFileVersion, LanceFileVersion},
     writer::FileWriterOptions,
 };
 use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
+use crate::index::vector::VectorIndexParams;
 use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -63,9 +72,14 @@ use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
+use lance_linalg::distance::MetricType;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+};
 use rand::{SeedableRng, rngs::StdRng};
 use rstest::rstest;
 
@@ -73,6 +87,71 @@ fn file_object_store_uri(path: &std::path::Path) -> String {
     let path = path.to_str().unwrap().replace('\\', "/");
     let path_prefix = if path.starts_with('/') { "" } else { "/" };
     format!("file-object-store://{path_prefix}{path}")
+}
+
+#[tokio::test]
+async fn test_file_reader_options_preserve_dataset_defaults() {
+    let dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+    let dataset = Dataset::write(
+        reader,
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.file_reader_options().is_none());
+    Dataset::write(
+        gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1)),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let dataset = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            file_reader_options: Some(FileReaderOptions {
+                read_chunk_size: 1234,
+                batch_size_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    let mut per_read = dataset.file_reader_options().unwrap().clone();
+    per_read.batch_size_bytes = Some(2048);
+    assert_eq!(per_read.read_chunk_size, 1234);
+    for (snapshot, expected_rows) in [
+        (dataset.clone(), 8),
+        (dataset.checkout_version(1).await.unwrap(), 4),
+    ] {
+        let defaults = snapshot.file_reader_options().unwrap();
+        assert_eq!(defaults.read_chunk_size, 1234);
+        assert_eq!(defaults.batch_size_bytes, Some(4096));
+        let batch = snapshot
+            .scan()
+            .with_file_reader_options(per_read.clone())
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        assert_eq!(
+            snapshot.file_reader_options().unwrap().batch_size_bytes,
+            Some(4096)
+        );
+    }
 }
 
 #[rstest]
@@ -677,6 +756,193 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let _ = tracker.incremental_stats();
     cloned.index_statistics("id_idx").await.unwrap();
     assert!(tracker.incremental_stats().read_iops > 0);
+}
+
+/// Counts and delays reads of deletion files. The delay keeps concurrent
+/// cold-cache loads of the same file open long enough that they overlap.
+/// `ThrottledStore` cannot be used instead: it does not support the local file
+/// store's `GetResultPayload::File`.
+#[derive(Debug, Default)]
+struct DelayedDeletionReads {
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReads {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl WrappingObjectStore for DelayedDeletionReads {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(DelayedDeletionReadStore {
+            target: original,
+            reads: self.reads.clone(),
+        })
+    }
+
+    // Deletion-file loads never list, so the pushed-down listing path can stay.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct DelayedDeletionReadStore {
+    target: Arc<dyn object_store::ObjectStore>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl DelayedDeletionReadStore {
+    async fn count_and_delay(&self, location: &Path) {
+        if location.as_ref().contains(DELETIONS_DIR) {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl std::fmt::Display for DelayedDeletionReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DelayedDeletionReadStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for DelayedDeletionReadStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.count_and_delay(location).await;
+        self.target.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.count_and_delay(location).await;
+        self.target.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.target.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+/// A prefiltered vector search builds the deletion mask and runs the filter
+/// scan concurrently, and both load the deletion vector of every fragment. On a
+/// cold metadata cache the two loads of the same file must share one read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = file_object_store_uri(dir.path());
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+        .into_reader_rows(RowCount::from(800), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset.delete("id % 10 = 0").await.unwrap();
+    let deletion_files = dataset
+        .get_fragments()
+        .iter()
+        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .count();
+    assert_eq!(deletion_files, 8);
+
+    // Re-open with a fresh session (cold metadata cache) on a store that counts
+    // and delays deletion-file reads.
+    let deletion_reads = Arc::new(DelayedDeletionReads::default());
+    let dataset = DatasetBuilder::from_uri(&uri)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(deletion_reads.clone()),
+            ..Default::default()
+        })
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(deletion_reads.reads(), 0);
+
+    let query = arrow_array::Float32Array::from(vec![0.5f32; 16]);
+    let results = dataset
+        .scan()
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .filter("id > 5")
+        .unwrap()
+        .prefilter(true)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(results.num_rows(), 10);
+    assert_eq!(deletion_reads.reads(), deletion_files);
 }
 
 #[tokio::test]
@@ -3333,6 +3599,140 @@ async fn scan_dictionary_batches_spanning_pages(
     );
 }
 
+/// Int8 dictionary batches of 100 values starting at 0, 28 and 128: the first two hold
+/// exactly the 128 values Int8 keys address, so the writer starts a new file for the third.
+#[rstest]
+#[tokio::test]
+async fn write_splits_files_before_dictionary_outgrows_key_type(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    #[values(false, true)] is_compaction: bool,
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batches = [0, 28, 128]
+        .into_iter()
+        .map(|start| {
+            let values =
+                StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(1000));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let params = || {
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            enable_stable_row_ids,
+            ..Default::default()
+        })
+    };
+    let reader = |batches: Vec<RecordBatch>| {
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone())
+    };
+
+    let dataset = if is_compaction {
+        let mut dataset = Dataset::write(reader(vec![batches[0].clone()]), "memory://", params())
+            .await
+            .unwrap();
+        for batch in &batches[1..] {
+            dataset
+                .append(reader(vec![batch.clone()]), None)
+                .await
+                .unwrap();
+        }
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (3, 2));
+        dataset
+    } else {
+        Dataset::write(reader(batches.clone()), "memory://", params())
+            .await
+            .unwrap()
+    };
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(2000), Some(1000)]);
+    // The files' dictionaries cannot share one Int8 array, so compare the values as strings.
+    let as_utf8 = |batch: &RecordBatch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(
+        actual
+            .iter()
+            .all(|batch| batch["d"].data_type() == schema.field(0).data_type())
+    );
+    let concat_utf8 = |batches: &[RecordBatch]| {
+        let arrays = batches.iter().map(as_utf8).collect::<Vec<_>>();
+        let arrays = arrays
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>();
+        arrow_select::concat::concat(&arrays).unwrap()
+    };
+    assert_eq!(
+        concat_utf8(&actual).as_ref(),
+        concat_utf8(&batches).as_ref()
+    );
+    dataset.validate().await.unwrap();
+}
+
+/// A file finished early for its dictionary leaves the input's row-limit cuts out of line
+/// with the files. The next file must still stop at `max_rows_per_file` rows.
+#[rstest]
+#[tokio::test]
+async fn write_keeps_max_rows_per_file_after_dictionary_close(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    // 150-row batches over 100 values each; the second and third share theirs, so the
+    // first file closes at 150 rows and the second holds no more than 128 values.
+    let batches = ["a", "b", "b"]
+        .into_iter()
+        .map(|prefix| {
+            let values = StringArray::from_iter_values((0..100).map(|i| format!("{prefix}{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(150));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        max_rows_per_file: 200,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, "memory://", Some(params))
+        .await
+        .unwrap();
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(150), Some(200), Some(100)]);
+    dataset.validate().await.unwrap();
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.
@@ -4106,16 +4506,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[rstest]
+#[case::empty(|_: &[u8]| Vec::new(), "only 0 bytes")]
+#[case::cut_to_half(|m: &[u8]| m[..m.len() / 2].to_vec(), "magic number")]
+#[case::cut_off_footer(|m: &[u8]| m[..m.len() - 16].to_vec(), "magic number")]
+#[case::cut_off_last_byte(|m: &[u8]| m[..m.len() - 1].to_vec(), "magic number")]
+#[case::all_zeros(|m: &[u8]| vec![0; m.len()], "magic number")]
+#[case::all_ones(|m: &[u8]| vec![0xff; m.len()], "magic number")]
+#[case::zeros_after_half(
+    |m: &[u8]| [&m[..m.len() / 2], vec![0; m.len() - m.len() / 2].as_slice()].concat(),
+    "magic number"
+)]
+#[case::zeros_before_footer(
+    |m: &[u8]| [vec![0; m.len() - 16].as_slice(), &m[m.len() - 16..]].concat(),
+    "version 0"
+)]
 #[tokio::test]
-async fn test_open_empty_latest_manifest_reports_path() {
+async fn test_open_damaged_latest_manifest_reports_path(
+    #[case] damage: fn(&[u8]) -> Vec<u8>,
+    #[case] expected_message: &str,
+    #[values(1, 8192)] column_name_len: usize,
+) {
     let test_dir = TempStdDir::default();
     let uri = test_dir.to_str().unwrap();
-    let mut dataset = write_tiny_dataset(uri).await;
-    dataset.truncate_table().await.unwrap();
+    let batch =
+        arrow_array::record_batch!(("i".repeat(column_name_len), Int32, [1, 2, 3])).unwrap();
+    let rows = || RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(rows(), uri, Some(params)).await.unwrap();
+    dataset.append(rows(), None).await.unwrap();
     assert_eq!(dataset.version().version, 2);
+    assert_eq!(dataset.get_fragments().len(), 3);
 
     let manifest_path = dataset.manifest_location.path.clone();
-    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+    let local_path = lance_io::local::to_local_path(&manifest_path);
+    let manifest = std::fs::read(&local_path).unwrap();
+    // Past one block the manifest takes another request than the block with the footer.
+    let block_size = dataset.object_store.block_size();
+    assert_eq!(manifest.len() > block_size, column_name_len > block_size);
+    std::fs::write(&local_path, damage(&manifest)).unwrap();
 
     let error = Dataset::open(uri).await.unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
@@ -4123,7 +4555,7 @@ async fn test_open_empty_latest_manifest_reports_path() {
         error.to_string().contains(manifest_path.as_ref()),
         "{error}"
     );
-    assert!(error.to_string().contains("0 bytes"), "{error}");
+    assert!(error.to_string().contains(expected_message), "{error}");
 }
 
 #[tokio::test]
@@ -4499,11 +4931,14 @@ async fn an_exempt_operation_stays_exempt_when_its_transaction_spills() {
     );
 }
 
-/// The repair path: drop the offending rows, then tighten the column. Both have
-/// to be reachable on a table that already carries the bad key, or the only
-/// remaining fix is a full overwrite.
+/// The repair path: drop the offending rows, compact them out of the data files,
+/// tighten the column, and read the surviving data back through `add_columns`.
+/// All of it has to stay reachable on a table that already carries the bad key,
+/// or the only remaining fix is a full overwrite.
 #[tokio::test]
 async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
+    use crate::dataset::NewColumnTransform;
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
     use lance_core::utils::tempfile::TempStrDir;
 
     let test_dir = TempStrDir::default();
@@ -4516,10 +4951,38 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         .expect("removing the offending rows must not be blocked");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
 
+    // The deleted row still stores its NULL, which readers of physical rows
+    // reject once the column is non-nullable.
+    let not_null = [ColumnAlteration::new("id".into()).set_nullable(false)];
+    let err = dataset.alter_columns(&not_null).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("deleted rows still store NULL values"),
+        "{err}"
+    );
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            materialize_deletions_threshold: 0.0,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .expect("compacting the deleted rows away must not be blocked");
+
     dataset
-        .alter_columns(&[ColumnAlteration::new("id".into()).set_nullable(false)])
+        .alter_columns(&not_null)
         .await
         .expect("tightening the column completes the repair");
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("doubled".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .expect("the repaired column reads back");
 
     let id_field = dataset
         .schema()
@@ -4531,6 +4994,18 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_in_place() {
         !id_field.nullable,
         "the key column must end up non-nullable"
     );
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"].as_ref(),
+        &Int32Array::from(vec![1]) as &dyn Array
+    );
+    assert_eq!(
+        batch["doubled"].as_ref(),
+        &Int32Array::from(vec![2]) as &dyn Array
+    );
+    dataset.validate().await.unwrap();
 }
 
 /// The MemWAL variant of the repair path. This is the state the original report
