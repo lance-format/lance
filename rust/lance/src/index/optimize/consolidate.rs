@@ -184,9 +184,9 @@ pub(super) async fn plan_index(
         });
         return Ok(());
     }
-    // A task reads physical rows and an output holds live ones, so deleted
-    // rows don't shrink outputs. Checked before training so an unsatisfiable
-    // request trains nothing.
+    // An output is sized by the live rows it holds, a task by the physical rows
+    // it reads. Checked before training, so an unsatisfiable request trains
+    // nothing.
     let inputs = coverage
         .iter()
         .map(|id| (id, fragment_rows[&id]))
@@ -425,10 +425,12 @@ pub(super) async fn validate_commit(
             .replaces
             .retain(|uuid| current.iter().any(|source| source.uuid == *uuid));
     }
-    if expected.keys().chain(actual.keys()).any(|name| {
-        expected.get(name).cloned().unwrap_or_default()
-            != actual.get(name).cloned().unwrap_or_default()
-    }) {
+    let none = RoaringBitmap::new();
+    if expected
+        .keys()
+        .chain(actual.keys())
+        .any(|name| expected.get(name).unwrap_or(&none) != actual.get(name).unwrap_or(&none))
+    {
         return Err(incomplete());
     }
     // Fully retired outputs have no work left to publish.
