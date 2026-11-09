@@ -300,10 +300,6 @@ pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize, values: 
 /// length are treated as zero-padded.
 pub type ExDotKernelFn = unsafe fn(&[f32], &[u8]) -> f32;
 
-/// Safe function-pointer form of [`ExDotKernelFn`].
-#[deprecated(note = "use `ExDotKernelFn` with `ex_dot_host_kernel`")]
-pub type ExDotFn = fn(&[f32], &[u8]) -> f32;
-
 // On x86 the AVX-512 baseline kernels of the two- and six-bit widths stay
 // listed behind their four-chain variants, which fall back to them for partial
 // rows, so tests cover them on aligned rows too. NEON is part of the aarch64
@@ -351,72 +347,9 @@ fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotKernelFn> {
 
 /// The dot kernel for `ex_bits` on the running CPU; the caller can keep it
 /// for per-candidate use.
-pub fn ex_dot_host_kernel(ex_bits: u8) -> Kernel<ExDotKernelFn> {
+pub fn ex_dot_kernel(ex_bits: u8) -> Kernel<ExDotKernelFn> {
     debug_assert!((1..=8).contains(&ex_bits));
     ex_dot_dispatch(ex_bits).get()
-}
-
-/// Resolve the dot kernel for `ex_bits` as a safe function pointer.
-#[deprecated(note = "use `ex_dot_host_kernel`, which avoids the extra indirect call")]
-#[allow(deprecated)]
-pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
-    match ex_bits {
-        1 => |query, codes| EX_DOT_U1.get().call(query, codes),
-        2 => |query, codes| EX_DOT_U2.get().call(query, codes),
-        3 => |query, codes| EX_DOT_U3.get().call(query, codes),
-        4 => |query, codes| EX_DOT_U4.get().call(query, codes),
-        5 => |query, codes| EX_DOT_U5.get().call(query, codes),
-        6 => |query, codes| EX_DOT_U6.get().call(query, codes),
-        7 => |query, codes| EX_DOT_U7.get().call(query, codes),
-        8 => |query, codes| EX_DOT_U8.get().call(query, codes),
-        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-    }
-}
-
-/// The host-supported dot kernels for `ex_bits`, named by function, after the
-/// dispatched one.
-#[deprecated(note = "use `ex_dot_host_kernel`; the per-candidate kernels are no longer public")]
-#[allow(deprecated)]
-pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
-    // A safe `fn` pointer cannot capture the candidate, so each one gets a
-    // monomorphized wrapper keyed by its position in the dispatch.
-    fn candidate<const EX_BITS: u8, const INDEX: usize>(query: &[f32], codes: &[u8]) -> f32 {
-        ex_dot_dispatch(EX_BITS).candidates()[INDEX]
-            .kernel()
-            .expect("only host-supported candidates are listed")
-            .call(query, codes)
-    }
-    fn candidates<const EX_BITS: u8>() -> [ExDotFn; 4] {
-        [
-            candidate::<EX_BITS, 0>,
-            candidate::<EX_BITS, 1>,
-            candidate::<EX_BITS, 2>,
-            candidate::<EX_BITS, 3>,
-        ]
-    }
-    let wrappers = match ex_bits {
-        1 => candidates::<1>(),
-        2 => candidates::<2>(),
-        3 => candidates::<3>(),
-        4 => candidates::<4>(),
-        5 => candidates::<5>(),
-        6 => candidates::<6>(),
-        7 => candidates::<7>(),
-        8 => candidates::<8>(),
-        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
-    };
-    let dispatch = ex_dot_dispatch(ex_bits);
-    assert!(dispatch.candidates().len() <= wrappers.len());
-    let mut variants = vec![("dispatched", ex_dot_kernel(ex_bits))];
-    variants.extend(
-        dispatch
-            .candidates()
-            .iter()
-            .zip(wrappers)
-            .filter(|(candidate, _)| candidate.kernel().is_some())
-            .map(|(candidate, wrapper)| (candidate.name(), wrapper)),
-    );
-    variants
 }
 
 macro_rules! scalar_kernels {
@@ -1776,23 +1709,6 @@ mod tests {
                 "ex_bits={ex_bits} dim={dim} kernel={name}: {actual} != {expected}"
             );
         }
-        #[allow(deprecated)]
-        let variants = ex_dot_kernel_variants(ex_bits);
-        assert_eq!(
-            variants.len(),
-            1 + ex_dot_dispatch(ex_bits)
-                .candidates()
-                .iter()
-                .filter(|candidate| candidate.kernel().is_some())
-                .count()
-        );
-        for (name, kernel) in variants {
-            let actual = kernel(&ex_query, &codes) as f64;
-            assert!(
-                (actual - expected).abs() <= tolerance,
-                "ex_bits={ex_bits} dim={dim} deprecated variant={name}: {actual} != {expected}"
-            );
-        }
     }
 
     /// The four-chain kernels must win over the AVX-512 baseline they fall
@@ -1839,7 +1755,7 @@ mod tests {
         pack_blocked_row(&high, layout.high_bits, &mut hi);
         pack_blocked_row(&low, layout.low_bits, &mut lo);
         query.resize(padded_query_len(dim), 0.0);
-        let expected = ex_dot_host_kernel(bits - 1).call(&query, &packed);
+        let expected = ex_dot_kernel(bits - 1).call(&query, &packed);
         for (name, kernel) in ex_dot_prefix_kernel_variants(bits) {
             assert_eq!(
                 kernel(&query, &hi, &lo),
@@ -1854,7 +1770,7 @@ mod tests {
         query.resize(padded_query_len(dim), 0.0);
         assert_eq!(
             ex_dot_prefix_kernel(bits)(&query, &hi, &lo).to_bits(),
-            ex_dot_host_kernel(bits - 1).call(&query, &packed).to_bits(),
+            ex_dot_kernel(bits - 1).call(&query, &packed).to_bits(),
             "dispatched bits={bits}, dim={dim}"
         );
     }
@@ -1877,9 +1793,9 @@ mod tests {
                 }
             })
             .collect();
-        let expected = ex_dot_host_kernel(8).call(&query, &full);
-        let two_pass = 16.0 * ex_dot_host_kernel(4).call(&query, &hi)
-            + ex_dot_host_kernel(4).call(&query, &lo);
+        let expected = ex_dot_kernel(8).call(&query, &full);
+        let two_pass =
+            16.0 * ex_dot_kernel(4).call(&query, &hi) + ex_dot_kernel(4).call(&query, &lo);
         let tolerance = expected.abs().max(1.0) * 1e-4;
         assert!(
             (two_pass - expected).abs() <= tolerance,
