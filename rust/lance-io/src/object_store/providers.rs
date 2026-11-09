@@ -4,7 +4,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, RwLock, Weak,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -107,6 +107,9 @@ pub struct ObjectStoreRegistryStats {
     pub active_stores: usize,
 }
 
+/// Serializes the builds of one cached store key.
+type BuildLock = Arc<tokio::sync::Mutex<()>>;
+
 /// A registry of object store providers.
 ///
 /// Use [`Self::default()`] to create one with the available default providers.
@@ -139,6 +142,9 @@ pub struct ObjectStoreRegistry {
     // it.
     active_stores:
         RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
+    // Held by `get_store` while it builds the store for a key, so concurrent
+    // cold calls for that key wait for one build instead of each making one.
+    building: Mutex<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), BuildLock>>,
     // Floor for `prune_threshold`; 0 disables the sweep.
     min_prune_threshold: AtomicUsize,
     // Cache size at which `get_store` sweeps out dead entries before inserting.
@@ -157,6 +163,7 @@ impl ObjectStoreRegistry {
         Self {
             providers: RwLock::new(HashMap::new()),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
             min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
@@ -318,7 +325,8 @@ impl ObjectStoreRegistry {
     ///
     /// If the object store is already in use, it will return a strong reference
     /// to the object store. If the object store is not in use, it will create a
-    /// new object store and return a strong reference to it.
+    /// new object store and return a strong reference to it. Concurrent calls
+    /// for the same key build it once; the others wait and reuse it.
     ///
     /// A dead entry is only found again if the same key is looked up, which
     /// never happens when every key is distinct (each namespace table gets its
@@ -390,6 +398,36 @@ impl ObjectStoreRegistry {
                     }
                 }
             }
+        }
+
+        // Locks that no call holds any more are swept first, so the map only
+        // grows with the builds in flight.
+        let build_lock = {
+            let mut building = self.building.lock().ok().expect_ok()?;
+            building.retain(|_, lock| Arc::strong_count(lock) > 1);
+            building.entry(cache_key.clone()).or_default().clone()
+        };
+        let _build_guard = match build_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            // Wait for the build in flight without then holding the lock, so if
+            // that build failed, the calls that waited retry together rather
+            // than one after another.
+            Err(_) => {
+                drop(build_lock.lock().await);
+                None
+            }
+        };
+        // Another call may have built the store while this one waited.
+        let maybe_store = self
+            .active_stores
+            .read()
+            .ok()
+            .expect_ok()?
+            .get(&cache_key)
+            .and_then(Weak::upgrade);
+        if let Some(store) = maybe_store {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(store);
         }
 
         self.misses.fetch_add(1, Ordering::Relaxed);
@@ -490,6 +528,7 @@ impl Default for ObjectStoreRegistry {
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
+            building: Mutex::new(HashMap::new()),
             min_prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             prune_threshold: AtomicUsize::new(DEFAULT_MIN_PRUNE_THRESHOLD),
             hits: AtomicU64::new(0),
@@ -513,6 +552,7 @@ impl ObjectStoreRegistry {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::*;
     use crate::object_store::OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION;
@@ -884,6 +924,77 @@ mod tests {
 
         // Same params returns same instance
         assert!(Arc::ptr_eq(&stores[0], &stores[1]));
+    }
+
+    /// A memory store provider whose builds are slow enough to overlap.
+    #[derive(Debug, Default)]
+    struct SlowProvider {
+        builds: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for SlowProvider {
+        async fn new_store(
+            &self,
+            base_path: Url,
+            params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            self.builds.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if self.fail {
+                return Err(Error::io("build failed"));
+            }
+            MemoryStoreProvider.new_store(base_path, params).await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_get_store_builds_once() {
+        let provider = Arc::new(SlowProvider::default());
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("slowmem", provider.clone());
+        let url = Url::parse("slowmem:///").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let stores =
+            futures::future::try_join_all((0..8).map(|_| registry.get_store(url.clone(), &params)))
+                .await
+                .unwrap();
+
+        assert_eq!(provider.builds.load(Ordering::Relaxed), 1);
+        assert!(stores.iter().all(|store| Arc::ptr_eq(store, &stores[0])));
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses), (7, 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_get_store_failures_retry_together() {
+        let provider = Arc::new(SlowProvider {
+            fail: true,
+            ..Default::default()
+        });
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert("slowmem", provider.clone());
+        let url = Url::parse("slowmem:///").unwrap();
+        let params = ObjectStoreParams::default();
+
+        let start = tokio::time::Instant::now();
+        let results =
+            futures::future::join_all((0..8).map(|_| registry.get_store(url.clone(), &params)))
+                .await;
+
+        for result in &results {
+            let Err(error) = result else {
+                panic!("expected the failed build's error");
+            };
+            assert!(matches!(error, Error::IO { .. }), "{error:?}");
+            assert!(error.to_string().contains("build failed"), "{error}");
+        }
+        // The first build fails, then the seven calls that waited retry at once.
+        assert_eq!(provider.builds.load(Ordering::Relaxed), 8);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(300), "took {elapsed:?}");
     }
 
     #[tokio::test]

@@ -294,6 +294,69 @@ async fn test_plan_join_build_side_uses_measured_widths() {
     );
 }
 
+#[tokio::test]
+async fn test_first_seen_native_source_matches_ordered_scanner() {
+    let source_batch = record_batch!(
+        ("key", UInt32, [2, 2, 3, 3, 5]),
+        ("value", UInt32, [100, 200, 400, 500, 600])
+    )
+    .unwrap();
+    let source = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(source_batch.clone())], source_batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let initial =
+        record_batch!(("key", UInt32, [1, 2, 3]), ("value", UInt32, [10, 20, 30])).unwrap();
+    let mut results = Vec::new();
+    for native in [true, false] {
+        let target = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let job = crate::dataset::MergeInsertBuilder::try_new(target, vec!["key".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+            .try_build()
+            .unwrap();
+        let (result, stats) = if native {
+            job.execute_dataset(source.clone()).await.unwrap()
+        } else {
+            job.execute(source.scan().try_into_stream().await.unwrap().into())
+                .await
+                .unwrap()
+        };
+        assert_eq!(stats.num_skipped_duplicates, 2);
+        let batch = result.scan().try_into_batch().await.unwrap();
+        let keys = batch.column(0).as_primitive::<UInt32Type>();
+        let values = batch.column(1).as_primitive::<UInt32Type>();
+        let mut rows = keys
+            .values()
+            .iter()
+            .zip(values.values())
+            .map(|(&k, &v)| (k, v))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        results.push(rows);
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0], vec![(1, 10), (2, 100), (3, 400), (5, 600)]);
+}
+
 /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
 /// was handed would actually run. The batches entry point must therefore not
 /// fall back to the streaming plan: with the row counts used below the join

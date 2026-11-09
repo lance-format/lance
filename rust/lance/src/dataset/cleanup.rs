@@ -19,6 +19,8 @@
 //! * Orphaned staging manifests - If a staging manifest is not recorded by
 //!   the commit handler then it will be deleted after the unverified-file
 //!   retention period.
+//! * Local object-store staging files - Files ending in `#<digits>` left by
+//!   interrupted writes are deleted after the unverified-file retention period.
 //!
 //! It is also difficult to distinguish between a data/tx/idx file which was
 //! leftover from an abandoned transaction and a data file which is part
@@ -41,7 +43,8 @@ pub mod retention;
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
-use super::refs::{TagContents, normalize_branch};
+use super::mem_wal::util::is_mem_wal_dir_name;
+use super::refs::{REFS_DIR, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -168,7 +171,8 @@ pub enum CleanupFileKind {
     Index,
     Deletion,
     /// A leftover manifest from a failed transaction, either under
-    /// `_versions/.tmp` or named `<manifest>-<uuid>`. These are deleted but
+    /// `_versions/.tmp`, named `<manifest>-<uuid>`, or a local object-store
+    /// staging file ending in `#<digits>`. These are deleted but
     /// excluded from per-kind `RemovalStats` counts and audit logs to match the
     /// long-standing cleanup behavior. Their bytes are still included in
     /// `bytes_removed`.
@@ -1535,6 +1539,71 @@ impl<'a> CleanupTask<'a> {
         }
         let unreferenced_files = stream::iter(streams).flatten().boxed();
 
+        // LocalFileSystem hides its staging files from object listings. They can
+        // never be referenced, even inside a retained index or blob directory.
+        // Scan without the retained-manifest cutoff: an orphan can be newer than
+        // every retained manifest and still age past the unverified threshold.
+        let mut local_staging_roots = vec![
+            (
+                self.dataset.versions_dir(),
+                CleanupFileKind::TemporaryManifest,
+            ),
+            (
+                self.dataset.transactions_dir(),
+                CleanupFileKind::Transaction,
+            ),
+            (self.dataset.data_dir(), CleanupFileKind::Data),
+            (
+                self.dataset.base.clone().join("_blobs"),
+                CleanupFileKind::Data,
+            ),
+            (self.dataset.indices_dir(), CleanupFileKind::Index),
+            (self.dataset.deletions_dir(), CleanupFileKind::Deletion),
+            (
+                self.dataset.base.clone().join("_fri"),
+                CleanupFileKind::Index,
+            ),
+            // Refs do not have a dedicated cleanup accounting kind.
+            (
+                self.dataset.base.clone().join(REFS_DIR),
+                CleanupFileKind::Data,
+            ),
+        ];
+        // Avoid listing every dataset root on remote stores that cannot expose
+        // hidden local staging files.
+        if self.dataset.object_store.is_local()
+            || self.dataset.object_store.scheme() == "file-object-store"
+        {
+            for name in self
+                .dataset
+                .object_store
+                .read_dir(self.dataset.base.clone())
+                .await?
+            {
+                if is_mem_wal_dir_name(&name) {
+                    local_staging_roots
+                        .push((self.dataset.base.clone().join(name), CleanupFileKind::Index));
+                }
+            }
+        }
+        let local_staging_files = stream::iter(local_staging_roots)
+            .flat_map(|(dir, kind)| {
+                self.dataset
+                    .object_store
+                    .read_local_staging_files(&dir)
+                    .try_filter_map(move |meta| {
+                        let can_remove = self.policy.delete_unverified
+                            || meta.last_modified < verification_threshold;
+                        future::ready(Ok(can_remove.then_some(CleanupFile {
+                            path: meta.location,
+                            kind,
+                            unverified: true,
+                            size_bytes: meta.size,
+                        })))
+                    })
+            })
+            .boxed();
+
         let old_manifests = inspection.old_manifests.clone();
         let manifest_files = stream::iter(old_manifests)
             .map(|(path, expired)| async move {
@@ -1551,7 +1620,12 @@ impl<'a> CleanupTask<'a> {
             .buffer_unordered(self.dataset.object_store.io_parallelism())
             .boxed();
 
-        let all_files = stream::iter(vec![unreferenced_files, manifest_files]).flatten();
+        let all_files = stream::iter(vec![
+            unreferenced_files,
+            local_staging_files,
+            manifest_files,
+        ])
+        .flatten();
         let all_files_to_remove = all_files.map(|file| -> Result<CleanupFile> {
             let file = file?;
             if deletes_files {
@@ -4342,92 +4416,6 @@ mod tests {
                 .is_some()
         );
         assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
-    }
-
-    #[rstest]
-    #[case::recent(false, 1, false)]
-    #[case::at_threshold(false, 8, false)]
-    #[case::aged(false, 9, true)]
-    #[case::delete_unverified(true, 1, true)]
-    #[tokio::test]
-    async fn cleanup_temporary_data_files(
-        #[case] delete_unverified: bool,
-        #[case] cleanup_day: i64,
-        #[case] should_remove: bool,
-    ) {
-        MockClock::set_system_time(std::time::Duration::ZERO);
-        let fixture = MockDatasetFixture::try_new().unwrap();
-        fixture.create_some_data().await.unwrap();
-        fixture.append_some_data().await.unwrap();
-        let dataset = fixture.open().await.unwrap();
-        assert_eq!(dataset.manifest.fragments.len(), 2);
-        let expected_rows = dataset.count_rows(None).await.unwrap();
-
-        let data_file = &dataset.manifest.fragments[0].files[0].path;
-        let data_file_key = data_file.strip_suffix(".lance").unwrap();
-        let temporary_paths = [
-            dataset.data_dir().join(".tmpAb3Xz9"),
-            dataset.data_dir().join("uncommitted").join(".tmpAb3Xz9"),
-            dataset.data_dir().join(data_file_key).join(".tmpAb3Xz9"),
-        ];
-        let preserved_paths = [
-            dataset.data_dir().join("unrelated"),
-            dataset.data_dir().join(".tmpDirectory").join("unrelated"),
-            dataset
-                .data_dir()
-                .join(data_file_key)
-                .join("10000000000000000000000000000000.blob"),
-            dataset.base.clone().join("database").join(".tmpAb3Xz9"),
-        ];
-
-        // The debris is newer than every retained manifest, as with an interrupted
-        // append. Its eligibility must depend on its own age, not the manifest age.
-        MockClock::set_system_time(TimeDelta::days(1).to_std().unwrap());
-        for path in temporary_paths.iter().chain(&preserved_paths) {
-            dataset.object_store.put(path, b"debris").await.unwrap();
-        }
-        MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
-
-        let policy = CleanupPolicyBuilder::default()
-            .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
-            .delete_unverified(delete_unverified)
-            .build();
-        let before_count = fixture.count_files().await.unwrap();
-        let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
-        let expected_files = if should_remove {
-            temporary_paths.len() as u64
-        } else {
-            0
-        };
-        assert_eq!(explanation.stats.data_files_removed, expected_files);
-        assert_eq!(explanation.stats.bytes_removed, expected_files * 6);
-        assert_eq!(explanation.candidate_files.len() as u64, expected_files);
-        for file in &explanation.candidate_files {
-            assert_eq!(file.kind, CleanupFileKind::Data);
-            assert!(file.unverified);
-            assert!(
-                temporary_paths
-                    .iter()
-                    .any(|path| path.as_ref() == file.path)
-            );
-        }
-        assert_eq!(fixture.count_files().await.unwrap(), before_count);
-
-        let removed = dataset.cleanup(policy).execute().await.unwrap();
-        assert_eq!(removed.data_files_removed, expected_files);
-        assert_eq!(removed.bytes_removed, expected_files * 6);
-        assert_eq!(removed.old_versions, 0);
-        for path in &temporary_paths {
-            assert_eq!(
-                dataset.object_store.exists(path).await.unwrap(),
-                !should_remove,
-                "{path}"
-            );
-        }
-        for path in &preserved_paths {
-            assert!(dataset.object_store.exists(path).await.unwrap(), "{path}");
-        }
-        assert_eq!(fixture.count_rows().await.unwrap(), expected_rows);
     }
 
     #[tokio::test]

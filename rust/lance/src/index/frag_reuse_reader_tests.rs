@@ -4741,3 +4741,91 @@ async fn row_map_reads_follow_index_cache_capacity() {
     assert_eq!(block_requests, 1, "exactly the block read");
     assert!(block_bytes < small_bytes, "{block_bytes} vs {small_bytes}");
 }
+
+/// Which index kinds the engine's single deferred-remap capability predicate
+/// (`segment_supports_batch_remapping`) classifies as deferrable at this pin.
+/// Asserts current behavior, so a later reclassification of HNSW shows up here.
+#[tokio::test]
+async fn capability_predicate_classifies_hnsw_as_deferrable() {
+    use arrow_array::types::Float32Type;
+    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+
+    let reader = lance_datagen::gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(32.into()))
+        .into_reader_rows(RowCount::from(512), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, "memory://hnsw_capability", None)
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
+        lance_linalg::distance::MetricType::L2,
+        IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        },
+        HnswBuildParams {
+            max_level: 4,
+            m: 8,
+            ef_construction: 32,
+            prefetch_distance: None,
+        },
+        SQBuildParams::default(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("hnsw_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    let hnsw = indices.iter().find(|i| i.name == "hnsw_idx").unwrap();
+    let btree = indices.iter().find(|i| i.name == "id_idx").unwrap();
+
+    // A modern-format HNSW segment: the engine says it CAN defer, because
+    // `vector_supports_batch_remapping` tests only the index file version.
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, hnsw)
+            .await
+            .unwrap(),
+        Some(true),
+        "HNSW is deferrable at this pin"
+    );
+    // A BTree segment: deferrable through the scalar plugin capability.
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, btree)
+            .await
+            .unwrap(),
+        Some(true),
+        "BTree keeps its normal deferred behavior"
+    );
+    // Absent details is the fail-closed third state.
+    let mut opaque = hnsw.clone();
+    opaque.index_details = None;
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, &opaque)
+            .await
+            .unwrap(),
+        None,
+        "unreadable metadata is neither deferrable nor silently withdrawn"
+    );
+}

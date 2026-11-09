@@ -28,6 +28,7 @@ class DatasetOptimizer:
         target_rows_per_fragment: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,
         max_bytes_per_file: Optional[int] = None,
+        min_bytes_per_file: Optional[int] = None,
         materialize_deletions: Optional[bool] = None,
         materialize_deletions_threshold: Optional[float] = None,
         defer_index_remap: Optional[bool] = None,
@@ -67,6 +68,7 @@ class DatasetOptimizer:
         Supported config keys: ``lance.compaction.target_rows_per_fragment``,
         ``lance.compaction.max_rows_per_group``,
         ``lance.compaction.max_bytes_per_file``,
+        ``lance.compaction.min_bytes_per_file``,
         ``lance.compaction.materialize_deletions``,
         ``lance.compaction.materialize_deletions_threshold``,
         ``lance.compaction.defer_index_remap``,
@@ -92,12 +94,16 @@ class DatasetOptimizer:
             This setting only affects datasets using the legacy storage format.
             The newer format does not require row groups.
         max_bytes_per_file: Optional[int], default None
-            Max number of bytes in a single file.  This does not affect which
-            fragments need compaction, but does affect how they are re-written if
-            selected.  If this value is too small you may end up with fragments
-            that are smaller than `target_rows_per_fragment`.
-
-            The default will use the default from ``write_dataset``.
+            Maximum bytes per output file. See
+            :attr:`lance.optimize.CompactionOptions.max_bytes_per_file`
+            for defaults.
+        min_bytes_per_file: int, optional
+            Files at or above this size are excluded from small-file compaction.
+            When omitted or None, defaults to the dataset config value, or 95% of
+            :attr:`lance.optimize.CompactionOptions.max_bytes_per_file`.
+            Must be greater than zero and no greater than that limit.
+            Files needing cleanup may still be compacted.
+            For example, ``compact_files(min_bytes_per_file=512 * 1024 * 1024)``.
         materialize_deletions: bool, optional
             Whether to compact fragments with soft deleted rows so they are no
             longer present in the file. If not specified, uses the manifest
@@ -173,6 +179,7 @@ class DatasetOptimizer:
                 target_rows_per_fragment=target_rows_per_fragment,
                 max_rows_per_group=max_rows_per_group,
                 max_bytes_per_file=max_bytes_per_file,
+                min_bytes_per_file=min_bytes_per_file,
                 materialize_deletions=materialize_deletions,
                 materialize_deletions_threshold=materialize_deletions_threshold,
                 defer_index_remap=defer_index_remap,
@@ -260,6 +267,19 @@ class DatasetOptimizer:
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
             This rebuilds the index from the source data and may be expensive.
+        max_rows_per_task: optional, int, default None
+            Upper bound on the rows one build task covers. Setting this or
+            `max_rows_per_segment` splits the build of every index whose
+            segments can be merged into several tasks; a split vector build
+            never rebalances the partitions (set `retrain` to rebuild).
+        max_rows_per_segment: optional, int, default None
+            Upper bound on the rows one committed segment holds.
+
+            The limits are packing targets: an indivisible fragment or segment
+            larger than a target is processed on its own.
+
+        See :py:class:`lance.optimize.OptimizeIndices` to run the same
+        optimization as a plan whose tasks execute on several workers.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

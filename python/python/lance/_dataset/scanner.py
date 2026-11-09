@@ -38,6 +38,7 @@ from ..lance import (
     _serialize_row_addrs,
 )
 from ..query import FullTextQuery, MinHashQuery
+from ..types import _coerce_source, _WriteSource
 from ..util import _normalize_index_segment_ids
 
 if TYPE_CHECKING:
@@ -538,7 +539,11 @@ def _build_vector_search_query(
         Initial IVF search budget, a finite value in [0, 1]. None resolves
         to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
         available partition); one starts at all available partitions, subject
-        to maximum_nprobes. Intermediate values interpolate geometrically.
+        to maximum_nprobes. For L2, cosine and dot with k <= 100000, efforts
+        0.1, 0.25 and 0.5 target 80%, 90% and 95% mean partition-routing recall,
+        respectively. Intermediate budgets interpolate geometrically between
+        these anchors. These empirical targets do not guarantee end-to-end
+        Recall@k. Hamming and larger k retain uncalibrated interpolation.
         Later expansion to find enough candidates is unchanged. This is
         independent of approx_mode, ef and refinement, and is not a recall
         guarantee. When supplied, effort ignores nprobes, including an explicit
@@ -1052,7 +1057,11 @@ class ScannerBuilder:
             Initial IVF search budget, a finite value in [0, 1]. None resolves
             to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
             available partition); one starts at all available partitions, subject
-            to maximum_nprobes. Intermediate values interpolate geometrically.
+            to maximum_nprobes. For L2, cosine and dot with k <= 100000, efforts
+            0.1, 0.25 and 0.5 target 80%, 90% and 95% mean partition-routing recall,
+            respectively. Intermediate budgets interpolate geometrically between
+            these anchors. These empirical targets do not guarantee end-to-end
+            Recall@k. Hamming and larger k retain uncalibrated interpolation.
             Later expansion to find enough candidates is unchanged. This is
             independent of approx_mode, ef and refinement, and is not a recall
             guarantee. When supplied, effort ignores nprobes, including an explicit
@@ -1588,3 +1597,44 @@ class VectorSearchQuery:
 
     def inner(self):
         return self._inner
+
+
+@_coerce_source.register(LanceScanner)
+def _lance_scanner_source(data_obj: LanceScanner, schema=None) -> _WriteSource:
+    if type(data_obj) is not LanceScanner:
+        return _WriteSource.from_reader(data_obj.to_reader())
+    snapshot = data_obj._snapshot
+    replayable = False
+    if snapshot is not None:
+        defaults = vars(ScannerBuilder(data_obj._ds)).copy()
+        defaults.pop("ds")
+        # These settings preserve source values and order. Expressions, searches,
+        # callbacks, and sorting can change results across otherwise valid scans.
+        stable_options = {
+            "_columns",
+            "_limit",
+            "_offset",
+            "_batch_size",
+            "_batch_size_bytes",
+            "_io_buffer_size",
+            "_batch_readahead",
+            "_fragment_readahead",
+            "_fragments",
+            "_with_row_id",
+            "_with_row_address",
+            "_use_stats",
+            "_use_scalar_index",
+            "_include_deleted_rows",
+            "_late_materialization",
+            "_blob_handling",
+            "_strict_batch_size",
+            "_row_addr_allowlist",
+            "_row_addr_blocklist",
+        }
+        replayable = snapshot.keys() == defaults.keys() and all(
+            key in stable_options or value == defaults[key]
+            for key, value in snapshot.items()
+        )
+    if replayable:
+        return _WriteSource(data_obj.projected_schema, data_obj.to_reader)
+    return _WriteSource.from_reader(data_obj.to_reader())

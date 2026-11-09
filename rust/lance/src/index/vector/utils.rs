@@ -1590,13 +1590,12 @@ mod tests {
     fn test_random_ranges(
         #[values(99, 100, 102)] num_rows: usize,
         #[values(10, 100)] sample_size: usize,
+        // A vector wider than the block still gets a one-row range (#3426).
+        #[values((10, 10), (101, 1))] byte_width_and_bin_size: (usize, usize),
     ) {
         // We can just assert that the output when sorted is the same as the input
         let block_size = 100;
-        let byte_width = 10;
-
-        let bin_size = block_size / byte_width;
-        assert_eq!(bin_size, 10);
+        let (byte_width, bin_size) = byte_width_and_bin_size;
 
         let mut ranges =
             random_ranges(num_rows, sample_size, block_size, byte_width).collect::<Vec<_>>();
