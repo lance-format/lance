@@ -625,10 +625,6 @@ impl ExecutionPlan for FlatMatchFilterExec {
     fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
-
-    fn supports_limit_pushdown(&self) -> bool {
-        true
-    }
 }
 
 /// Calculates the FTS score for each row in the input.
