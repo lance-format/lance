@@ -1655,7 +1655,14 @@ async fn prepare_attempt(
         &dataset.manifest.fragments,
     )
     .is_empty();
-    let ledger = if rewrites_in_place {
+    // A deferred rewrite withdrawing an undeferrable segment's coverage walks
+    // the history too, to find the retired sources that reach the rewritten
+    // fragments.
+    let withdraws_undeferrable = matches!(
+        &frag_reuse,
+        FragReuseUpdate::Rewrite(assembly) if !assembly.undeferrable_segments.is_empty()
+    );
+    let ledger = if rewrites_in_place || withdraws_undeferrable {
         match indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -1870,7 +1877,9 @@ pub(crate) async fn commit_transaction(
             // started at exact same time better.
 
             let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
+                    .await?
+                    .with_read_version_fragments(read_version_dataset.fragments().clone());
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()

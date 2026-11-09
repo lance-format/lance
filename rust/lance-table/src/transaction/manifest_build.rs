@@ -625,19 +625,44 @@ impl Transaction {
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
-                        frag_reuse_ledger,
+                        frag_reuse_ledger.clone(),
                     )?;
-                let live: RoaringBitmap = manifest
-                    .fragments
-                    .iter()
-                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
-                    .collect();
+                let live = Self::live_fragment_bitmap(manifest);
                 Self::withdraw_in_place_rewrites(
                     &mut prepared,
                     rewrites,
                     &manifest.schema,
                     &live,
                     lineage.as_ref(),
+                );
+            }
+            // A deferred compaction leaves every covering segment's retired
+            // provenance in place for the reader to translate through the
+            // history. A segment whose type cannot do that would be left
+            // addressing provenance it can never translate, so its coverage
+            // of this compaction's sources is withdrawn in this same commit;
+            // the commit layer, which can read the index details, decided
+            // which segments those are.
+            if let FragReuseUpdate::Rewrite(assembly) = &frag_reuse
+                && !assembly.undeferrable_segments.is_empty()
+            {
+                let lineage =
+                    crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
+                        &current_indices,
+                        frag_reuse_ledger,
+                    )?;
+                let live = Self::live_fragment_bitmap(manifest);
+                let rewritten: RoaringBitmap = self
+                    .operation
+                    .rewritten_source_fragments()
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .collect();
+                Self::withdraw_undeferrable_rewrite_coverage(
+                    &mut prepared,
+                    lineage.as_ref(),
+                    &live,
+                    &assembly.undeferrable_segments,
+                    &rewritten,
                 );
             }
         }
@@ -647,6 +672,15 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// The fragment ids `manifest` lists, as a bitmap.
+    fn live_fragment_bitmap(manifest: &Manifest) -> RoaringBitmap {
+        manifest
+            .fragments
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .collect()
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -1613,9 +1647,10 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path / size / base to the fragment
+                            // assign the new file path / size / metadata size / base to the fragment
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
+                            file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
                             file.base_id = new_file.base_id;
                             replaced_in_place = true;
                         }
@@ -2496,6 +2531,7 @@ mod tests {
     use rstest::rstest;
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::num::NonZero;
     use std::sync::Arc;
     use uuid::Uuid;
 
@@ -3441,6 +3477,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: Some(7),
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -3638,6 +3675,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -5915,6 +5953,51 @@ mod tests {
         // overlay is dropped.
         assert_eq!(frag.overlays.len(), 1);
         assert_eq!(frag.overlays[0].data_file.fields.as_ref(), &[3, -2]);
+    }
+
+    #[rstest]
+    #[case::new_file_has_a_hint(NonZero::new(512))]
+    #[case::new_file_has_no_hint(None)]
+    fn test_data_replacement_takes_metadata_size_hint_from_new_file(
+        #[case] new_hint: Option<NonZero<u64>>,
+    ) {
+        let data_file = |path: &str, hint: Option<NonZero<u64>>| {
+            let mut file = DataFile::new(
+                path,
+                vec![0],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            );
+            file.file_metadata_size_bytes = hint;
+            file
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.files = vec![data_file("v.lance", NonZero::new(1024))];
+        let schema = ArrowSchema::new(vec![ArrowField::new("v", DataType::Int32, true)]);
+        let manifest = Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(vec![fragment]),
+            crate::format::DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let txn = Transaction::new(
+            manifest.version,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(0, data_file("v-new.lance", new_hint))],
+            },
+            None,
+        );
+
+        let (result, _) = txn
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+
+        let files = &result.fragments[0].files;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "v-new.lance");
+        assert_eq!(files[0].file_metadata_size_bytes, new_hint);
     }
 
     /// Replace `fields` in `fragment` at `read_version`, against a manifest
