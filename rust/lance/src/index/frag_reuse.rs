@@ -45,8 +45,7 @@ pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
     V0 {
         remapper: Arc<dyn RowIdRemapper>,
-        /// The segment's cache identity under this history (see
-        /// [`v0_segment_cache_id`]).
+        /// See [`v0_segment_cache_id`].
         cache_id: Option<Uuid>,
     },
     /// A tagged history under which this segment's rows are unchanged.
@@ -108,11 +107,10 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history identify
-/// cached content, and only through the versions on the segment's path (see
-/// [`v0_segment_cache_id`]). Under a tagged history the FRI is deliberately
-/// left out: every rewrite and trim mints a new UUID, even for transitions a
-/// segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history, by
+/// [`v0_segment_cache_id`], identify cached content. Under a tagged history the
+/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
+/// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
@@ -128,10 +126,9 @@ pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Opti
 /// by what they depend on rather than by snapshot:
 ///
 /// * Content decoded without translation (an identity segment under a
-///   tagged history, no history) depends only on the index file, so it
-///   lives in the plain per-index namespace and an append or an unrelated
-///   rewrite never cold-starts it. Content decoded through a v0 remapper
-///   also lives here, under the per-index id from [`fri_cache_id`].
+///   tagged history, a v0 history, no history) depends only on the index
+///   file, so it lives in the plain per-index namespace and an append or an
+///   unrelated rewrite never cold-starts it.
 /// * Content that embeds translated addresses (pages, postings, partitions
 ///   loaded through a `V1Translate` remapper) depends on the segment's
 ///   translation state, so it lives under a namespace named by the segment's
