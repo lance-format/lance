@@ -445,7 +445,7 @@ fn row_id_domain_version(index_type: &str) -> Option<u32> {
     let is = |builtin: BuiltinIndexType| index_type.eq_ignore_ascii_case(builtin.as_str());
     #[cfg(feature = "geo")]
     if is(BuiltinIndexType::RTree) {
-        return Some(lance_index::scalar::rtree::RTREE_ROW_ID_DOMAIN_VERSION);
+        return Some(lance_geo::rtree::RTREE_ROW_ID_DOMAIN_VERSION);
     }
     if is(BuiltinIndexType::BTree) {
         Some(btree::BTREE_ROW_ID_DOMAIN_VERSION)
