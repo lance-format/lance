@@ -991,6 +991,15 @@ mod tests {
         let candidates: Vec<u8> = (0..code_bytes * candidate_stride)
             .map(|_| rng.random())
             .collect();
+        // Hosts with the SIMD kernels' features must select one of them.
+        #[cfg(target_arch = "x86_64")]
+        if (num_bits == 4 && is_x86_feature_detected!("avx2"))
+            || (num_bits == 8 && is_x86_feature_detected!("avx512vbmi"))
+        {
+            let dispatch = lookup_dispatch(num_bits);
+            let portable = dispatch.candidates().last().unwrap();
+            assert_ne!(dispatch.selected().name(), portable.name());
+        }
         for lookup in supported_lookups(num_bits) {
             let scorer = PQPairScorer {
                 num_bits,
