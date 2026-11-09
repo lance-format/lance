@@ -482,6 +482,15 @@ pub extern "system" fn Java_org_lance_otel_LanceMetrics_snapshotLanceMetricsNati
     .into_raw()
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_otel_LanceMetrics_setMemoryObservationNative(
+    _env: JNIEnv,
+    _class: JClass,
+    enabled: jboolean,
+) {
+    lance_core::memory::set_observation(enabled != 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,8 +43,8 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
     # export even when a plain write doesn't happen to emit them.
     assert catalog["lance_object_store_retryable_responses_total"].kind == "counter"
     assert catalog["lance_object_store_in_flight_requests"].kind == "gauge"
-    # Memory metrics are described whether or not LANCE_MEMORY_OBSERVE is set;
-    # they only carry values while it is.
+    # Memory metrics are described whether or not memory observation is on;
+    # they stay empty until it is first switched on.
     for name in (
         "lance_memory_rss_bytes",
         "lance_memory_rss_peak_bytes",
@@ -156,6 +156,7 @@ import sys
 import lance
 import pyarrow as pa
 from lance.lance import register_lance_metrics_recorder, snapshot_lance_metrics
+from lance.otel import set_memory_observation
 
 assert register_lance_metrics_recorder()
 dataset = lance.write_dataset(pa.table({"id": pa.array(range(256))}), sys.argv[1])
@@ -196,6 +197,48 @@ for stage in stages:
     assert "stage" in stage.attributes, stage.attributes
     assert stage.count > 0, stage.count
     assert dict(stage.buckets)["+Inf"] == stage.count, stage.buckets
+
+
+def snapshot(name):
+    return [point for point in snapshot_lance_metrics() if point.name == name]
+
+
+def observed(name):
+    # How many builds, or stages of builds, have reported a peak.
+    points = snapshot(name)
+    return sum(p.count for p in points if build.items() <= p.attributes.items())
+
+
+def resident_bytes():
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    raise AssertionError("no VmRSS in /proc/self/status")
+
+
+build_count = observed("lance_memory_operation_peak_bytes")
+stage_count = observed("lance_memory_stage_peak_bytes")
+# A call takes over from LANCE_MEMORY_OBSERVE=1.
+set_memory_observation(False)
+dataset.create_scalar_index("id", "BTREE")
+assert observed("lance_memory_operation_peak_bytes") == build_count
+assert observed("lance_memory_stage_peak_bytes") == stage_count
+# While observation is off, a snapshot leaves the gauges as they were, even
+# once the process has grown by 64 MiB.
+(frozen,) = snapshot("lance_memory_rss_bytes")
+before = resident_bytes()
+ballast = b"x" * (64 << 20)
+assert resident_bytes() - before >= 48 << 20, "the ballast is not resident"
+(current,) = snapshot("lance_memory_rss_bytes")
+assert current.value == frozen.value, (current.value, frozen.value)
+# Switched back on, the gauges follow the process again.
+set_memory_observation(True)
+(current,) = snapshot("lance_memory_rss_bytes")
+assert current.value >= before + (48 << 20), (current.value, before)
+dataset.create_scalar_index("id", "BTREE")
+assert observed("lance_memory_operation_peak_bytes") == build_count + 1
+assert observed("lance_memory_stage_peak_bytes") > stage_count
 """
 
 
@@ -204,7 +247,8 @@ for stage in stages:
 )
 def test_native_snapshot_reports_memory_while_observed(tmp_path):
     # This exercises the recorder and snapshot directly, without the optional
-    # OpenTelemetry SDK used by the export test above.
+    # OpenTelemetry SDK used by the export test above, and then switches
+    # observation from code.
     result = subprocess.run(
         [
             sys.executable,
@@ -225,7 +269,10 @@ import sys
 import lance
 import pyarrow as pa
 from lance.lance import register_lance_metrics_recorder, snapshot_lance_metrics
+from lance.otel import set_memory_observation
 
+if sys.argv[2] == "call":
+    set_memory_observation(True)
 assert register_lance_metrics_recorder()
 dataset = lance.write_dataset(pa.table({"id": pa.array(range(256))}), sys.argv[1])
 assert dataset.to_table().num_rows == 256
@@ -241,14 +288,18 @@ assert all(value >= 0 for value in components.values()), components
 """
 
 
-def test_native_snapshot_reports_components_while_observed(tmp_path):
+@pytest.mark.parametrize("switch", ["variable", "call"])
+def test_native_snapshot_reports_components_while_observed(tmp_path, switch):
     # The component gauges come from Lance's own accounting rather than /proc,
     # so unlike the process gauges they are checked on every platform.
+    env = {k: v for k, v in os.environ.items() if k != "LANCE_MEMORY_OBSERVE"}
+    if switch == "variable":
+        env["LANCE_MEMORY_OBSERVE"] = "1"
     result = subprocess.run(
-        [sys.executable, "-c", _OBSERVED_SCAN, str(tmp_path / "ds.lance")],
+        [sys.executable, "-c", _OBSERVED_SCAN, str(tmp_path / "ds.lance"), switch],
         capture_output=True,
         text=True,
-        env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},
+        env=env,
     )
     assert result.returncode == 0, result.stderr
 
@@ -258,6 +309,7 @@ import sys
 
 import lance
 import pyarrow as pa
+from lance.otel import set_memory_observation
 
 dataset = lance.write_dataset(pa.table({"id": pa.array(range(16))}), sys.argv[1])
 try:
@@ -266,13 +318,18 @@ except ValueError as error:
     assert 'LANCE_MEMORY_OBSERVE="maybe" is invalid' in str(error), error
 else:
     raise AssertionError("the build ignored an invalid LANCE_MEMORY_OBSERVE")
+
+# A call takes over from the invalid variable, whichever way it switches.
+for enabled in (True, False):
+    set_memory_observation(enabled)
+    dataset.create_scalar_index("id", "BTREE")
 """
 
 
 def test_invalid_memory_switch_fails_index_builds(tmp_path):
     # LANCE_MEMORY_OBSERVE is read once per process, so the failure is
     # exercised in a child. Invalid values are rejected before the
-    # Linux-only observation support is checked.
+    # Linux-only observation support is checked, until a call takes over.
     result = subprocess.run(
         [sys.executable, "-c", _INVALID_SWITCH_BUILD, str(tmp_path / "ds.lance")],
         capture_output=True,

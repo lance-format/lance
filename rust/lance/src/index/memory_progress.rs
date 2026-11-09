@@ -33,7 +33,7 @@ impl ObservedOperation {
     }
 }
 
-/// An index build whose memory is observed while `LANCE_MEMORY_OBSERVE` is on.
+/// An index build whose memory is observed while memory observation is on.
 ///
 /// The build reports progress through [`Self::progress`], which reports the
 /// start and the peak memory of every stage; [`Self::finish`] reports the peak
@@ -52,8 +52,8 @@ impl ObservedBuild {
         }
     }
 
-    /// Observes the build with the process-wide observer when
-    /// `LANCE_MEMORY_OBSERVE` is on; `index_type` is only evaluated then.
+    /// Observes the build with the process-wide observer when memory
+    /// observation is on; `index_type` is only evaluated then.
     pub fn start(
         progress: Arc<dyn IndexBuildProgress>,
         operation: ObservedOperation,
