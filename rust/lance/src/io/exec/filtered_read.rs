@@ -938,10 +938,9 @@ impl FilteredReadStream {
         // Used only when index guarantees enough rows to satisfy scan_range_after_filter
         let mut scan_push_down_fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
         // True once a queued fragment has no mirror in scan_push_down_fragments_to_read.
-        // Swapping in the pushdown map would then silently drop that fragment's
-        // rows.  This cannot happen in default manifest order (index coverage is
-        // an id-prefix there) but caller-supplied fragment order can place an
-        // uncovered fragment before the covered ones.
+        // Swapping in the pushdown map would then drop that fragment's rows. The
+        // index can leave out a fragment that comes before covered ones, e.g. after
+        // a column rewrite in place or when the caller reorders the fragments.
         let mut has_fragment_without_pushdown_mirror = false;
 
         // The current offset, includes filtered rows, but not deleted rows
