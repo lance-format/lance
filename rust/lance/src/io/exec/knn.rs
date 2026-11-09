@@ -3275,18 +3275,13 @@ impl ExecutionPlan for MultivectorScoringExec {
             .map(|input| input.execute(partition, context.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        // Collect the top k results from each stream,
+        // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
         //
-        // Each query stream is pre-reduced on its own: all of a stream's batches
-        // are folded into a single (row id -> best similarity) map plus that
-        // stream's own worst similarity, and only then do the streams merge.
-        // The sort feeding this node chunks its top-fetch output at the session
-        // batch size, and multivector indexes repeat a parent row id once per
-        // sub-vector, so the same row id can appear in several batches of one
-        // stream; the merge below adds one similarity per (row id, query), so
-        // each stream must present each row id exactly once.
+        // Reduce each stream as a whole: its sort splits the output into
+        // batches of the session batch size, and the index stores one entry per
+        // sub-vector, so a row id can show up in more than one batch.
         let reduced_futures = inputs
             .into_iter()
             .map(|mut stream| async move {
@@ -3297,26 +3292,20 @@ impl ExecutionPlan for MultivectorScoringExec {
                     let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                     debug_assert_eq!(dists.null_count(), 0);
 
-                    // The batches are sorted by distance, so the last row of
-                    // each batch carries that batch's worst similarity.
+                    // the results are sorted by distance, so the last row is the worst
                     if let Some(&worst_dist) = dists.values().last() {
                         let batch_min_sim = 1.0 - worst_dist;
-                        stream_min_sim = Some(match stream_min_sim {
-                            Some(current) => current.min(batch_min_sim),
-                            None => batch_min_sim,
-                        });
+                        stream_min_sim = Some(
+                            stream_min_sim.map_or(batch_min_sim, |sim| sim.min(batch_min_sim)),
+                        );
                     }
                     for (&row_id, &dist) in row_ids.values().iter().zip(dists.values().iter()) {
                         // it's cosine distance, so we need to convert it to similarity
                         let sim = 1.0 - dist;
-                        match best_sim_by_row_id.get_mut(&row_id) {
-                            // max-reduce: keep the best similarity when the same
-                            // row id appears in another batch of this stream
-                            Some(best) => *best = best.max(sim),
-                            None => {
-                                best_sim_by_row_id.insert(row_id, sim);
-                            }
-                        }
+                        best_sim_by_row_id
+                            .entry(row_id)
+                            .and_modify(|best| *best = best.max(sim))
+                            .or_insert(sim);
                     }
                 }
                 let (row_ids, sims): (Vec<_>, Vec<_>) = best_sim_by_row_id.into_iter().unzip();
@@ -5400,11 +5389,8 @@ mod tests {
             }
         }
 
-        // A query stream can span multiple batches: the sort feeding this node
-        // chunks its top-fetch output at the session batch size, and multivector
-        // indexes legitimately repeat a parent row id per sub-vector, so the
-        // same row id can straddle a batch boundary. Each row id must still
-        // contribute once per query stream, keeping its best similarity.
+        // A row id repeated across batches of one stream counts once, with its
+        // best similarity, and the stream contributes one min_sim.
         let batch_42_best = RecordBatch::try_new(
             KNN_INDEX_SCHEMA.clone(),
             vec![
