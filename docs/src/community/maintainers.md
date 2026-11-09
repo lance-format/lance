@@ -42,7 +42,6 @@ Maintainers with GitHub write access are additionally encouraged to:
 
 | Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                    |
 |------------------------|----------------------|-------------------|---------------------|----------------------------------------------------|
-| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                    |
 | Matt Basta             | mattbasta            | Runway AI         |                     |                                                    |
 | Giuseppe Battista      | giusedroid           | AWS               |                     |                                                    |
 | Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                    |
@@ -58,7 +57,6 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                    |
 | Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member              |
 | ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                    |
-| Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                                 |
 | Dan Rammer             | hamersaw             | LanceDB           | ✓                   |                                                    |
 | Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer    |
 | Nat Roth               | nrothGIT             | Meta AI           |                     |                                                    |
