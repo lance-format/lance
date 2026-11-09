@@ -1093,10 +1093,10 @@ fn inner_get_zonemap_stats<'local>(
 ) -> Result<JObject<'local>> {
     use arrow_array::Array;
     use datafusion_common::ScalarValue;
-    use lance::dataset::index::LanceIndexStoreExt;
     use lance::index::DatasetIndexExt;
-    use lance_index::scalar::IndexStore;
-    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance::index::scalar::open_scalar_index;
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::zonemap::ZoneMapIndex;
 
     let column_name: String = jcolumn_name.extract(env)?;
 
@@ -1152,24 +1152,25 @@ fn inner_get_zonemap_stats<'local>(
 
                     let mut batches = Vec::with_capacity(indices.len());
                     for index in &indices {
-                        let index_store = Arc::new(
-                            LanceIndexStore::from_dataset_for_existing(&dataset, index)
+                        // Load through the index itself: the file version, its
+                        // invariants and the typed bounds are its business, not
+                        // this binding's.
+                        let segment =
+                            open_scalar_index(&dataset, &column_name, index, &NoOpMetricsCollector)
                                 .await
-                                .map_err(Error::from)?,
-                        );
-                        let index_file = index_store
-                            .open_index_file("zonemap.lance")
-                            .await
-                            .map_err(Error::from)?;
-                        if index_file.num_rows() == 0 {
-                            continue;
-                        }
-                        batches.push(
-                            index_file
-                                .read_range(0..index_file.num_rows(), None)
-                                .await
-                                .map_err(Error::from)?,
-                        );
+                                .map_err(Error::from)?;
+                        let zonemap =
+                            segment
+                                .as_any()
+                                .downcast_ref::<ZoneMapIndex>()
+                                .ok_or_else(|| {
+                                    Error::runtime_error(format!(
+                                        "Index '{}' segment {} is not a ZoneMap index",
+                                        desc.name(),
+                                        index.uuid
+                                    ))
+                                })?;
+                        batches.push(zonemap.zones_as_batch().map_err(Error::from)?);
                     }
                     Ok::<_, Error>(batches)
                 }
@@ -1200,6 +1201,16 @@ fn inner_get_zonemap_stats<'local>(
             .downcast_ref::<arrow_array::UInt32Array>()
             .ok_or_else(|| {
                 Error::input_error("ZoneMap 'null_count' column is not UInt32".to_string())
+            })?;
+        let nan_count_col = record_batch
+            .column_by_name("nan_count")
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap index file missing 'nan_count' column".to_string())
+            })?
+            .as_any()
+            .downcast_ref::<arrow_array::UInt32Array>()
+            .ok_or_else(|| {
+                Error::input_error("ZoneMap 'nan_count' column is not UInt32".to_string())
             })?;
         let fragment_id_col = record_batch
             .column_by_name("fragment_id")
@@ -1237,6 +1248,7 @@ fn inner_get_zonemap_stats<'local>(
             let zone_start = zone_start_col.value(i) as i64;
             let zone_length = zone_length_col.value(i) as i64;
             let null_count = null_count_col.value(i) as i64;
+            let nan_count = nan_count_col.value(i) as i64;
 
             let min_scalar = ScalarValue::try_from_array(min_col, i).map_err(|e| {
                 Error::input_error(format!("Failed to read min value at row {}: {}", i, e))
@@ -1250,7 +1262,7 @@ fn inner_get_zonemap_stats<'local>(
 
             let zone_stats = env.new_object(
                 "org/lance/index/scalar/ZoneStats",
-                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;J)V",
+                "(IJJLjava/lang/Comparable;Ljava/lang/Comparable;JJ)V",
                 &[
                     JValue::Int(fragment_id),
                     JValue::Long(zone_start),
@@ -1258,6 +1270,7 @@ fn inner_get_zonemap_stats<'local>(
                     JValue::Object(&j_min),
                     JValue::Object(&j_max),
                     JValue::Long(null_count),
+                    JValue::Long(nan_count),
                 ],
             )?;
 
