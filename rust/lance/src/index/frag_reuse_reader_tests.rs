@@ -5290,8 +5290,12 @@ async fn hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete() {
     );
 }
 
-/// An eager remap of an IVF_HNSW_SQ segment whose partitions are loaded
+/// An explicit remap of an IVF_HNSW_SQ segment whose partitions are loaded
 /// preserving layout must not carry a tombstoned slot into the new segment.
+///
+/// This is the eager path a tagged table has: compaction refuses
+/// `defer_index_remap: false` on a tagged history, because only the deferred
+/// commit path appends the transitions the tagged reader depends on.
 ///
 /// `IVFIndex::load_partition_storage` keeps the slot of a row the deferred
 /// remap cannot map so the graph's positions still address the right rows.
@@ -5301,7 +5305,7 @@ async fn hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete() {
 /// through unchanged and `remap_hnsw_partition` would have persisted it as a
 /// graph node over no live row.
 #[tokio::test]
-async fn hnsw_eager_remap_after_deferred_remap_drops_tombstoned_slots() {
+async fn hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots() {
     use lance_index::vector::storage::VectorStore as _;
 
     let dataset = hnsw_tagged_fixture().await;
@@ -5318,17 +5322,15 @@ async fn hnsw_eager_remap_after_deferred_remap_drops_tombstoned_slots() {
     let rows = live_rows(&dataset).await;
     assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
 
-    // `defer_index_remap: false` rewrites the index through
-    // `remap_hnsw_partition`, which reads the partitions of a segment the FRI
-    // still translates.
-    crate::dataset::optimize::compact_files(
+    // A tagged history is only ever extended by the deferred-remap commit
+    // path, so compaction refuses `defer_index_remap: false` here; the
+    // explicit remap is the eager path for a tagged table. It rewrites the
+    // index through `remap_hnsw_partition`, which reads the partitions of a
+    // segment the FRI still translates.
+    crate::dataset::optimize::remapping::remap_column_index(
         &mut dataset,
-        crate::dataset::optimize::CompactionOptions {
-            target_rows_per_fragment: 1024,
-            defer_index_remap: false,
-            ..Default::default()
-        },
-        None,
+        &["vector"],
+        Some("vector_idx".into()),
     )
     .await
     .unwrap();
