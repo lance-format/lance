@@ -1016,12 +1016,10 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // actually holds those rows. (For types that stream raw pages, e.g.
         // BTree, the rows the reader cedes are dropped by the translator's
         // claim filter below, so file and bitmap agree.)
-        use crate::index::DatasetIndexExt;
-        if let Some(listed) = dataset
-            .load_indices()
-            .await?
-            .iter()
-            .find(|idx| idx.uuid == *index_id)
+        // The narrowing reads the same listing the guard above verified, so a
+        // read outage between the two steps cannot change the published
+        // ownership.
+        if let Some(listed) = listing.indices.iter().find(|idx| idx.uuid == *index_id)
             && let Some(servable) = &listed.fragment_bitmap
         {
             coverage &= servable;

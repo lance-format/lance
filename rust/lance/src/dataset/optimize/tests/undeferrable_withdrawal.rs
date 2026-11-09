@@ -3670,3 +3670,446 @@ async fn an_unreadable_index_does_not_block_maintenance_of_another_index() {
         .await
         .expect("the prune must succeed once the marker is readable");
 }
+
+/// An attempt window over reads of one suffix: the first `start` matching
+/// reads succeed, the next [`PHASED_FAULT_READS`] fail, and the rest succeed.
+/// Unlike [`BudgetedFailingReadWrapper`], whose budget always starts at the
+/// first matching read, this places the fault at a later probe of the same
+/// marker so an earlier probe answers and a later one does not.
+#[derive(Debug)]
+struct PhasedFailingReadWrapper {
+    suffix: String,
+    /// Counts every matching read, so a test can report how far the window got.
+    attempts: Arc<AtomicUsize>,
+    start: usize,
+}
+
+impl lance_io::object_store::WrappingObjectStore for PhasedFailingReadWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(PhasedFailingReadStore {
+            inner: original,
+            suffix: self.suffix.clone(),
+            attempts: self.attempts.clone(),
+            start: self.start,
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct PhasedFailingReadStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    suffix: String,
+    attempts: Arc<AtomicUsize>,
+    start: usize,
+}
+
+impl PhasedFailingReadStore {
+    /// Counts one attempt when `location` matches, and fails it when that
+    /// attempt falls inside the window.
+    fn fails(&self, location: &object_store::path::Path) -> bool {
+        if !location.as_ref().ends_with(&self.suffix) {
+            return false;
+        }
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        (self.start..self.start + PHASED_FAULT_READS).contains(&attempt)
+    }
+}
+
+impl std::fmt::Display for PhasedFailingReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PhasedFailingReadStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for PhasedFailingReadStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if self.fails(location) {
+            return Err(FailingReadStore::injected_error());
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &object_store::path::Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<bytes::Bytes>> {
+        if self.fails(location) {
+            return Err(FailingReadStore::injected_error());
+        }
+        self.inner.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+        offset: &object_store::path::Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.inner.rename_opts(from, to, opts).await
+    }
+}
+
+/// How many consecutive marker reads [`PhasedFailingReadWrapper`] fails: one
+/// outage long enough to span the narrowing step's own derivation.
+const PHASED_FAULT_READS: usize = 4;
+
+/// The attempt the fault starts at: the guard's verification of the listing
+/// answers, and the narrowing that follows meets the outage.
+const PHASED_FAULT_START: usize = 2;
+
+/// A `start` past every marker read the operation makes, so the wrapper is
+/// installed but never fires: the healthy control of the same fixture.
+const PHASED_FAULT_NEVER: usize = 1000;
+
+/// Builds the partial-coverage fixture at `path` and returns the delta's uuid
+/// and the word/brute-force pair to assert against.
+///
+/// The compaction leaves TWO destinations and the finalized delta covers only
+/// ONE of them. That asymmetry is what the narrowing under test needs: the
+/// older segment still translates provenance into the other destination, so
+/// it keeps nonempty derived coverage and stays eligible for the remap
+/// instead of being skipped as fully superseded.
+async fn partially_covered_fts_delta(path: &str) -> (Uuid, String, usize) {
+    let seed = tagged_with_fts_index(path).await;
+    let (word, brute_force) = frequent_word_and_brute_force_count(&seed, "doc").await;
+    assert!(brute_force > 0, "the word {word} must match rows");
+    drop(seed);
+
+    let mut writer = DatasetBuilder::from_uri(path).load().await.unwrap();
+    let options = deferred_options(2 * INDEX_ROWS_PER_FRAGMENT as usize);
+    run_deferred_compaction(&mut writer, &options, None).await;
+    let destinations: Vec<u32> = writer
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    assert_eq!(
+        destinations.len(),
+        2,
+        "the fixture needs two destinations so the delta can cover one: {destinations:?}"
+    );
+
+    // Built over one destination only, and finalized (root metadata written)
+    // before registration, so the reader recognizes it as a directly covering
+    // sibling rather than an unpublished staging layout.
+    let params = InvertedIndexParams::default();
+    let staged = CreateIndexBuilder::new(&mut writer, &["doc"], IndexType::Inverted, &params)
+        .name("doc_idx_partial_delta".to_string())
+        .fragments(vec![destinations[0]])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let mut delta = writer
+        .merge_existing_index_segments(vec![staged])
+        .await
+        .unwrap();
+    assert!(
+        delta
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|file| file.path == lance_index::scalar::inverted::METADATA_FILE),
+        "the fixture delta must be finalized before registration"
+    );
+    delta.name = FTS_INDEX.to_string();
+    let delta_uuid = delta.uuid;
+    writer
+        .apply_commit(
+            Transaction::new(
+                writer.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![delta],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    drop(writer);
+
+    // A plain handle, no fault and no cache surgery: the premise the faulted
+    // run depends on must hold before the fault is installed.
+    let plain = DatasetBuilder::from_uri(path).load().await.unwrap();
+    let fragments: RoaringBitmap = plain
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let segments = stored_segments(&plain).await;
+    let fts: Vec<(Uuid, RoaringBitmap)> = segments
+        .iter()
+        .filter(|(name, _, _)| name == FTS_INDEX)
+        .map(|(_, uuid, bitmap)| (*uuid, bitmap.clone()))
+        .collect();
+    assert_eq!(fts.len(), 2, "the fixture must hold two FTS segments");
+    let delta_coverage = fts
+        .iter()
+        .find(|(uuid, _)| *uuid == delta_uuid)
+        .map(|(_, bitmap)| bitmap.clone())
+        .expect("the registered delta must be in the manifest");
+    assert!(
+        !delta_coverage.is_empty() && delta_coverage.is_subset(&fragments),
+        "the delta must cover a nonempty subset of the destinations: \
+         {delta_coverage:?} vs {fragments:?}"
+    );
+    assert_ne!(
+        delta_coverage, fragments,
+        "a delta covering everything would supersede the older segment \
+         outright, skipping the narrowing under test"
+    );
+    // The older segment translates its retired provenance into the
+    // destination the delta does not hold, so it is only PARTIALLY
+    // superseded and the remap still visits it.
+    let older_derived = plain
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == FTS_INDEX && index.uuid != delta_uuid)
+        .fold(RoaringBitmap::new(), |coverage, index| {
+            coverage | index.fragment_bitmap.clone().unwrap_or_default()
+        });
+    assert!(
+        !older_derived.is_empty(),
+        "the older segment must still derive coverage, or it would be \
+         skipped as fully superseded before the narrowing"
+    );
+    assert_eq!(
+        derived_coverage(&plain, FTS_INDEX).await,
+        fragments,
+        "together the two segments must derive every destination"
+    );
+    let (count, plan) = fts_count_on_column(&plain, &word, "doc").await;
+    assert_eq!(
+        count, brute_force,
+        "the fixture must answer exactly before any fault: {plan}"
+    );
+
+    (delta_uuid, word, brute_force)
+}
+
+/// The explicit remap verifies a derived listing before publishing anything,
+/// then narrows the segment's coverage to what the reader attributes to it.
+/// Both steps must read the SAME listing. The fixture keeps the older
+/// segment only PARTIALLY superseded -- a finalized delta covers one of two
+/// destinations -- so the older segment stays eligible and the narrowing is
+/// reached. When the narrowing derives its own listing, a marker outage
+/// between the two steps drops the directly covering sibling from it, nothing
+/// cedes that sibling's destination, and the published replacement overlaps
+/// it: every match is answered twice, on the same handle, on a fresh one,
+/// after a successful retry, and in a materialized scan.
+#[tokio::test]
+async fn an_explicit_remap_narrows_coverage_from_the_listing_it_verified() {
+    // Both caches off, so the narrowing step would really re-derive instead
+    // of reusing a cached listing: the fault only shows through a fresh read.
+    Box::pin(assert_partial_coverage_remap_is_exact(
+        PHASED_FAULT_START,
+        true,
+    ))
+    .await;
+}
+
+/// The same fixture and wrapper with the window placed past every marker
+/// read: reads never fail, so an exact answer here shows the faulted case
+/// above fails on overlapping publication rather than on the fixture, the
+/// fault budget or the disabled caches.
+#[tokio::test]
+async fn a_partially_covered_remap_is_exact_with_healthy_uncached_reads() {
+    Box::pin(assert_partial_coverage_remap_is_exact(
+        PHASED_FAULT_NEVER,
+        true,
+    ))
+    .await;
+}
+
+/// The same healthy run with the default caches, the ordinary configuration.
+#[tokio::test]
+async fn a_partially_covered_remap_is_exact_with_healthy_cached_reads() {
+    Box::pin(assert_partial_coverage_remap_is_exact(
+        PHASED_FAULT_NEVER,
+        false,
+    ))
+    .await;
+}
+
+/// Remaps the partial-coverage fixture through the phased wrapper at `start`
+/// and asserts nothing overlaps and every indexed answer is exact.
+async fn assert_partial_coverage_remap_is_exact(start: usize, no_cache: bool) {
+    let dir = TempStrDir::default();
+    let path = format!("{}/fts_remap_listing_check_to_use", dir.as_str());
+    let (delta_uuid, word, brute_force) = Box::pin(partially_covered_fts_delta(&path)).await;
+
+    let suffix = format!(
+        "{delta_uuid}/{}",
+        lance_index::scalar::inverted::METADATA_FILE
+    );
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut builder = DatasetBuilder::from_uri(&path).with_store_params(ObjectStoreParams {
+        object_store_wrapper: Some(Arc::new(PhasedFailingReadWrapper {
+            suffix,
+            attempts: attempts.clone(),
+            start,
+        })),
+        ..Default::default()
+    });
+    if no_cache {
+        builder = builder
+            .with_index_cache_size_bytes(0)
+            .with_metadata_cache_size_bytes(0);
+    }
+    let mut dataset = builder.load().await.unwrap();
+
+    // Whatever the outcome -- a refusal or a remap narrowed from the verified
+    // listing -- what is published must never overlap.
+    let remap_result = crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await;
+    // The first remap need not consume the whole window, so the counter is
+    // driven past it before the retry: otherwise the retry would meet
+    // leftover injected errors and prove nothing about recovered reads.
+    let met = attempts.swap(usize::MAX / 2, Ordering::SeqCst);
+    let exhausted = met >= start + PHASED_FAULT_READS;
+    let context = format!(
+        "start={start}, no_cache={no_cache}, attempts={met}, \
+         exhausted={exhausted}, remap={remap_result:?}"
+    );
+
+    let segments = stored_segments(&dataset).await;
+    let fts: Vec<(Uuid, RoaringBitmap)> = segments
+        .iter()
+        .filter(|(name, _, _)| name == FTS_INDEX)
+        .map(|(_, uuid, bitmap)| (*uuid, bitmap.clone()))
+        .collect();
+    for i in 0..fts.len() {
+        for j in i + 1..fts.len() {
+            assert!(
+                fts[i].1.is_disjoint(&fts[j].1),
+                "segments {} and {} must not claim the same destinations: \
+                 {:?} ({context})",
+                fts[i].0,
+                fts[j].0,
+                (&fts[i].1 & &fts[j].1).iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    let (same_count, same_plan) = fts_count_on_column(&dataset, &word, "doc").await;
+    let fresh = DatasetBuilder::from_uri(&path).load().await.unwrap();
+    let (fresh_count, fresh_plan) = fts_count_on_column(&fresh, &word, "doc").await;
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["doc"],
+        Some(FTS_INDEX.into()),
+    )
+    .await
+    .unwrap_or_else(|error| {
+        panic!("the retry must succeed once reads recover: {error} ({context})")
+    });
+    let (retried_count, retried_plan) = fts_count_on_column(&dataset, &word, "doc").await;
+
+    let mut scan = fresh.scan();
+    scan.full_text_search(
+        FullTextSearchQuery::new(word.to_string())
+            .with_column("doc".to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    scan.project(&["i"]).unwrap();
+    let materialized = scan.try_into_batch().await.unwrap().num_rows();
+
+    assert_eq!(
+        (same_count, fresh_count, retried_count, materialized),
+        (brute_force, brute_force, brute_force, brute_force),
+        "an overlapping replacement answers every match twice ({context})\
+         \n{same_plan}\n{fresh_plan}"
+    );
+    for plan in [&same_plan, &fresh_plan, &retried_plan] {
+        assert!(
+            plan_has_node(plan, "MatchQuery:") && !plan_has_node(plan, "FlatMatchQuery:"),
+            "every destination must stay served from the index ({context}): {plan}"
+        );
+    }
+}
