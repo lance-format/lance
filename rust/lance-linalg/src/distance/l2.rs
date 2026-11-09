@@ -351,8 +351,20 @@ mod half_c {
                     /// dimension-8 distance. Other tiers share it for uniformity.
                     #[inline(never)]
                     fn $name(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
-                        for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                            *distance = $pair(x, y);
+                        // A pointer walk rather than `zip` with `chunks_exact`:
+                        // the zip kept a row index, its successor and the row
+                        // count live across the C call, more values than x86
+                        // has callee-saved registers, so two of them were
+                        // reloaded from the stack on every row.
+                        let batch = &batch[..output.len() * dimension];
+                        let mut y = batch.as_ptr();
+                        for distance in output.iter_mut() {
+                            // SAFETY: `batch` holds `output.len()` vectors of
+                            // `dimension` elements.
+                            unsafe {
+                                *distance = $pair(x, std::slice::from_raw_parts(y, dimension));
+                                y = y.add(dimension);
+                            }
                         }
                     }
                 }
