@@ -1201,7 +1201,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         IndexType::IvfRq => {
