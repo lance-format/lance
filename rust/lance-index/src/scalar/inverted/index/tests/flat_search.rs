@@ -4,6 +4,159 @@
 use super::*;
 
 #[rstest::rstest]
+#[case::or(Operator::Or, None, vec![0, 1, 2])]
+#[case::and(Operator::And, None, vec![0, 2])]
+#[case::phrase(Operator::And, Some(0), vec![0])]
+#[tokio::test]
+async fn flat_bm25_batches_preserve_full_corpus_scores(
+    #[case] operator: Operator,
+    #[case] phrase_slop: Option<u32>,
+    #[case] expected_rows: Vec<u64>,
+    #[values(false, true)] split_input: bool,
+    #[values(DocumentGranularity::Row, DocumentGranularity::ListElement)]
+    document_granularity: DocumentGranularity,
+) {
+    // Whitespace forces more than one tokenization chunk without changing the
+    // hand-counted corpus. Nonmatching rows must still affect normalization.
+    let padding = " ".repeat(140_000);
+    let docs = [
+        "alpha alpha beta",
+        "alpha gamma",
+        "beta alpha",
+        "filler filler filler",
+    ]
+    .map(|text| Some(format!("{text}{padding}")))
+    .into_iter()
+    .chain([None, Some(String::new())])
+    .collect::<Vec<_>>();
+    let mut batch = arrow_array::record_batch!(
+        ("text", Utf8, docs),
+        ("_rowid", UInt64, vec![0_u64, 1, 2, 3, 4, 5])
+    )
+    .unwrap();
+    if document_granularity.is_list_element() {
+        batch = batch
+            .try_with_column(
+                Field::new(doc_index_storage_column(0), DataType::UInt32, false),
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])),
+            )
+            .unwrap();
+    }
+    let input_batches = if split_input {
+        (0..batch.num_rows()).map(|i| batch.slice(i, 1)).collect()
+    } else {
+        vec![batch.clone()]
+    };
+    let input = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter(input_batches.into_iter().map(Ok)),
+    ));
+    let base = MemBM25Scorer::new(
+        12,
+        4,
+        HashMap::from([("alpha".into(), 2), ("beta".into(), 1)]),
+    );
+    let (output, scorer) = flat_bm25_search_stream_with_options_and_scorer(
+        input,
+        "text".into(),
+        "alpha beta".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        Some(base),
+        FlatBm25SearchOptions {
+            target_batch_size: 1,
+            elapsed_compute: None,
+            document_granularity,
+            operator,
+            boost: 2.0,
+            phrase_slop,
+        },
+    )
+    .await
+    .unwrap();
+    let num_docs = if document_granularity.is_list_element() {
+        10
+    } else {
+        8
+    };
+    assert_eq!(scorer.num_docs(), num_docs);
+    assert_eq!(scorer.total_tokens, 22);
+    assert_eq!(scorer.num_docs_containing_token("alpha"), 5);
+    assert_eq!(scorer.num_docs_containing_token("beta"), 3);
+    let batches = output.try_collect::<Vec<_>>().await.unwrap();
+    let mut actual_rows = Vec::new();
+    for batch in batches {
+        assert_eq!(batch.num_rows(), 1);
+        let row = batch[ROW_ID].as_primitive::<UInt64Type>().value(0);
+        actual_rows.push(row);
+        if document_granularity.is_list_element() {
+            let coordinates = batch.column(1).as_list::<i32>().value(0);
+            assert_eq!(
+                coordinates.as_primitive::<UInt32Type>().values(),
+                &[row as u32]
+            );
+        }
+        let (length, frequencies) = match row {
+            0 => (3.0_f32, [2.0_f32, 1.0]),
+            1 => (2.0, [1.0, 0.0]),
+            2 => (2.0, [1.0, 1.0]),
+            _ => panic!("unexpected result row {row}"),
+        };
+        let norm = 1.2 * (0.25 + 0.75 * length / (22.0 / num_docs as f32));
+        let expected = frequencies
+            .into_iter()
+            .zip([5.0_f32, 3.0])
+            .map(|(frequency, df)| {
+                ((num_docs as f32 - df + 0.5) / (df + 0.5) + 1.0).ln()
+                    * (frequency * 2.2 / (frequency + norm))
+            })
+            .sum::<f32>()
+            * 2.0;
+        assert!((batch["_score"].as_primitive::<Float32Type>().value(0) - expected).abs() < 1e-6);
+    }
+    assert_eq!(actual_rows, expected_rows);
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn flat_bm25_empty_input_preserves_base_statistics(#[values(false, true)] empty_batch: bool) {
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, Vec::<String>::new()),
+        ("_rowid", UInt64, Vec::<u64>::new())
+    )
+    .unwrap();
+    let input = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter(empty_batch.then_some(Ok(batch))),
+    ));
+    let (output, scorer) = flat_bm25_search_stream_with_options_and_scorer(
+        input,
+        "text".into(),
+        "alpha beta".into(),
+        InvertedIndexParams::default().stem(false).build().unwrap(),
+        Some(MemBM25Scorer::new(
+            12,
+            4,
+            HashMap::from([("alpha".into(), 2)]),
+        )),
+        FlatBm25SearchOptions {
+            target_batch_size: 1,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::Or,
+            boost: 1.0,
+            phrase_slop: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(scorer.num_docs(), 4);
+    assert_eq!(scorer.total_tokens, 12);
+    assert_eq!(scorer.num_docs_containing_token("alpha"), 2);
+    assert_eq!(scorer.num_docs_containing_token("beta"), 0);
+    assert!(output.try_collect::<Vec<_>>().await.unwrap().is_empty());
+}
+
+#[rstest::rstest]
 #[case::bigrams(2, 2, 0)]
 #[case::mixed_lengths(1, 3, 0)]
 #[case::fuzzy_bigrams(2, 2, 1)]
@@ -236,7 +389,9 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
             0,
             None,
         )
+        .try_next()
         .await
+        .unwrap()
         .unwrap();
         let scorer = initialize_scorer(None, &tokens, &counted);
         let result = flat_bm25_score(
@@ -319,7 +474,9 @@ async fn test_document_lengths_indexed_and_flat(
         0,
         None,
     )
+    .try_next()
     .await
+    .unwrap()
     .unwrap();
     assert_eq!(
         counted[FLAT_ALL_TOKENS_COL]
@@ -565,7 +722,9 @@ async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
         0,
         None,
     )
+    .try_next()
     .await
+    .unwrap()
     .unwrap();
 
     assert_eq!(counted_input.num_rows(), 1);
@@ -624,7 +783,9 @@ async fn flat_bm25_preserves_zero_token_list_element_documents() {
         1,
         None,
     )
+    .try_next()
     .await
+    .unwrap()
     .unwrap();
 
     assert_eq!(counted_input.num_rows(), 6);

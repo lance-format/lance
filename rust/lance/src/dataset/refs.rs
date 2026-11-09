@@ -1535,7 +1535,7 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
-const REFS_DIR: &str = "_refs";
+pub(crate) const REFS_DIR: &str = "_refs";
 
 // Nested branches cannot use these names because they overlap
 // directories owned by their ancestors.

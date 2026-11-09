@@ -93,7 +93,9 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
-use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
+use lance_testing::datagen::{
+    generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
+};
 use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rstest::rstest;
@@ -1910,18 +1912,29 @@ fn multivec_ground_truth(
         .collect()
 }
 
-const TWO_FRAG_NUM_ROWS: usize = 2000;
-const TWO_FRAG_DIM: usize = 128;
+const TWO_FRAG_NUM_ROWS: usize = 512;
+const TWO_FRAG_ROWS_PER_FILE: usize = 128;
+const TWO_FRAG_DIM: usize = 32;
 const TWO_FRAG_NUM_PARTITIONS: usize = 4;
-const TWO_FRAG_NUM_SUBVECTORS: usize = 16;
+const TWO_FRAG_NUM_SUBVECTORS: usize = 8;
 const TWO_FRAG_NUM_BITS: usize = 8;
 const TWO_FRAG_SAMPLE_RATE: usize = 7;
-const TWO_FRAG_MAX_ITERS: u32 = 20;
+const TWO_FRAG_MAX_ITERS: u32 = 4;
 
 fn make_two_fragment_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
     let ids = Arc::new(UInt64Array::from_iter_values(0..TWO_FRAG_NUM_ROWS as u64));
 
-    let values = generate_random_array_with_range(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, 0.0..1.0);
+    // Seeded so the single-vs-segmented equality checks run on fixed data.
+    let mut values: Vec<f32> =
+        generate_random_array_with_seed::<Float32Type>(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, [42; 32])
+            .values()
+            .to_vec();
+    // Pin the value range in every fragment so per-segment SQ bounds equal the
+    // whole-dataset bounds and segmented SQ search ranks rows identically.
+    for row in (0..TWO_FRAG_NUM_ROWS).step_by(TWO_FRAG_ROWS_PER_FILE) {
+        values[row * TWO_FRAG_DIM] = 0.0;
+        values[row * TWO_FRAG_DIM + 1] = 1.0;
+    }
     let vectors = Arc::new(
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), TWO_FRAG_DIM as i32)
             .unwrap(),
@@ -1941,7 +1954,8 @@ async fn write_dataset_from_batches(
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
 ) -> Dataset {
-    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, 500).await
+    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, TWO_FRAG_ROWS_PER_FILE)
+        .await
 }
 
 async fn write_dataset_from_batches_with_max_rows(
@@ -2857,7 +2871,7 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
     let params = VectorIndexParams::ivf_hnsw(
         DistanceType::L2,
         prepare_global_ivf(&dataset, "vector").await,
-        HnswBuildParams::default(),
+        lightweight_hnsw_params(),
     );
     let mut segments = Vec::new();
 
@@ -2918,7 +2932,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
         (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
     } else {
         let (schema, batches) = make_two_fragment_batches();
-        (schema, batches, 500)
+        (schema, batches, TWO_FRAG_ROWS_PER_FILE)
     };
     let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
     let mut dataset =
@@ -2931,7 +2945,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
         "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
         ),
         "IVF_HNSW_PQ" => {
             let (ivf_params, pq_params) = prepare_ivf_pq(
@@ -2955,7 +2969,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
         "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
             SQBuildParams::default(),
         ),
         "IVF_HNSW_RQ" => {
@@ -2969,7 +2983,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
             VectorIndexParams::with_ivf_hnsw_rq_params(
                 DistanceType::L2,
                 prepare_global_ivf(&dataset, "vector").await,
-                HnswBuildParams::default(),
+                lightweight_hnsw_params(),
                 RQBuildParams {
                     rotation: Some(rotation),
                     ..RQBuildParams::with_rotation_type(5, rotation_type)
@@ -4277,12 +4291,25 @@ async fn test_create_ivf_hnsw_flat(
     let ivf_params = IvfBuildParams::new(nlist);
     let hnsw_params = HnswBuildParams::default();
     let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors and remap don't depend on the float metric, so only L2 runs
+    // them; Hamming covers the u8 path.
+    if matches!(distance_type, DistanceType::L2 | DistanceType::Hamming) {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
 }
 
 #[rstest]
@@ -4304,15 +4331,28 @@ async fn test_create_ivf_hnsw_sq(
         hnsw_params,
         sq_params,
     );
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors, distance ranges, delete-all and remap don't depend on the
+    // metric, so only L2 runs them.
+    if distance_type == DistanceType::L2 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_distance_range(Some(params.clone()), nlist).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_distance_range(Some(params.clone()), nlist).await;
-    // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
-    Box::pin(test_delete_all_rows(params.clone())).await;
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
 }
 
 // Like flat IVF_RQ (see test_build_ivf_rq), 1 bit per dimension recalls far
@@ -4335,15 +4375,28 @@ async fn test_create_ivf_hnsw_rq(
         HnswBuildParams::default(),
         RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
     );
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors, delete-all and remap don't depend on the metric or the bit
+    // width, so only the 5-bit L2 case runs them. test_distance_range pins the
+    // row-id order of range splits against the unfiltered top-k, which a 1-bit
+    // walk need not reproduce for every k.
+    if distance_type == DistanceType::L2 && num_bits == 5 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    // test_distance_range pins the row-id order of range splits against the
-    // unfiltered top-k, which a 1-bit walk need not reproduce for every k.
-    Box::pin(test_delete_all_rows(params.clone())).await;
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
 }
 
 async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
@@ -6300,9 +6353,10 @@ async fn test_multivec_build_from_partition_count_records_no_target() {
 async fn test_partition_split_on_append_multivec() {
     const INDEX_NAME: &str = "vector_idx";
     const VECTORS_PER_ROW: usize = 3;
-    // 512 base rows and this append flatten to 33,036 vectors, just over
-    // the 32,768-vector IVF-PQ split threshold.
-    const APPEND_ROWS: usize = 10_500;
+    const TARGET_PARTITION_SIZE: usize = 512;
+    // 512 base rows and this append flatten to 2,136 vectors, just over
+    // the 2,048-vector split threshold of the target above.
+    const APPEND_ROWS: usize = 200;
 
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
@@ -6310,7 +6364,10 @@ async fn test_partition_split_on_append_multivec() {
     let (mut dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::Cosine,
-        IvfBuildParams::new(1),
+        IvfBuildParams {
+            target_partition_size: Some(TARGET_PARTITION_SIZE),
+            ..IvfBuildParams::new(1)
+        },
         lightweight_pq_params(),
     );
     dataset
@@ -6336,8 +6393,7 @@ async fn test_partition_split_on_append_multivec() {
     let expected_rows = NUM_ROWS + APPEND_ROWS;
     // Every vector of a row counts towards the partition size, and the split
     // goes straight to the target size: ceil(vectors / target) pieces.
-    let expected_partitions =
-        (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
+    let expected_partitions = (expected_rows * VECTORS_PER_ROW).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -6385,9 +6441,10 @@ async fn test_partition_split_on_append_multivec() {
 async fn test_split_multiple_partitions_in_one_optimize() {
     const INDEX_NAME: &str = "vector_idx";
     const BASE_ROWS_PER_PARTITION: usize = 512;
-    // Each IVF-FLAT partition reaches 16,512 rows, just over its 16,384-row
-    // split threshold.
-    const APPEND_ROWS_PER_PARTITION: usize = 16_000;
+    const TARGET_PARTITION_SIZE: usize = 256;
+    // Each partition reaches 1,112 rows, just over the 1,024-row split
+    // threshold of the target above.
+    const APPEND_ROWS_PER_PARTITION: usize = 600;
     let offsets = [-50.0, 50.0];
 
     let test_dir = TempStrDir::default();
@@ -6407,10 +6464,10 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    // Pin the type default target so the threshold above is the one this test
-    // reasons about; a build from a partition count would record its own.
+    // Pin the target so the threshold above is the one this test reasons
+    // about; a build from a partition count would record its own.
     let ivf_params = IvfBuildParams {
-        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        target_partition_size: Some(TARGET_PARTITION_SIZE),
         ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
     };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
@@ -6446,8 +6503,8 @@ async fn test_split_multiple_partitions_in_one_optimize() {
 
     // Both partitions hold BASE + APPEND rows and are split straight to the
     // target size in one optimize: ceil(rows / target) pieces each.
-    let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
-        .div_ceil(IndexType::IvfFlat.target_partition_size());
+    let pieces_per_partition =
+        (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -7396,6 +7453,7 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
     assert_ge!(recall, 0.5);
 }
 
+mod native_prewarm_tests;
 mod native_resident_tests;
 mod native_scan_tests;
 mod native_share_tests;

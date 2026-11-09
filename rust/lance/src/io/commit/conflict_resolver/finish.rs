@@ -399,6 +399,83 @@ impl<'a> TransactionRebase<'a> {
                 );
             }
 
+            // A rewrite committed since this build started retired its source
+            // fragments; a segment landing with coverage of them relies on
+            // translating through the history at query time (the deferred
+            // rule `check_create_index` admits). A segment whose type cannot
+            // do that would land addressing provenance it can never
+            // translate, so the retired part of its coverage is withdrawn
+            // here, in the same commit, exactly as the rewrite's own commit
+            // withdraws it in the other order.
+            //
+            // Only a REWRITE's sources are withdrawn: a fragment the history
+            // records as consumed. A fragment that merely left the manifest
+            // (a whole-fragment delete) carries no rows anywhere, so no
+            // segment can serve them and the coverage the reader already
+            // filters to the live set needs no narrowing. Without a walkable
+            // history the whole retired set stays conservative.
+            if dataset.manifest.version != self.transaction.read_version
+                && let (Some(lineage), Some(live)) =
+                    (self.current_lineage.as_ref(), self.current_live.as_ref())
+            {
+                let retired = new_indices
+                    .iter()
+                    .filter_map(|index| index.fragment_bitmap.as_ref())
+                    .fold(RoaringBitmap::new(), |retired, bitmap| {
+                        retired | (bitmap - live)
+                    });
+                let retired: RoaringBitmap = retired
+                    .iter()
+                    .filter(|fragment| {
+                        lineage
+                            .destinations_of(*fragment)
+                            .is_none_or(|destinations| !destinations.is_empty())
+                    })
+                    .collect();
+                // The helper's `rewritten` must still be live in the liveness
+                // the withdrawal is measured against: that is what makes the
+                // remainder rule fire only for provenance the segment was
+                // ALREADY addressing across a rewrite when it was built. Here
+                // the rewrite is already committed, so restore the liveness of
+                // the transaction's read snapshot for exactly the sources this
+                // rewrite retired. Older provenance, retired before the build
+                // read the table, stays outside and keeps the conservative
+                // ancestor and remainder rules.
+                // The snapshot the transaction read, not the handle it was
+                // submitted through: a handle already past the rewrite does
+                // not list its sources, which would leave their pre-rewrite
+                // liveness unrestored and clear the untouched remainder.
+                let read_version_fragments = self
+                    .read_version_fragments
+                    .as_ref()
+                    .or(self.read_fragments.as_ref());
+                let pre_rewrite_live = match read_version_fragments {
+                    Some(read_fragments) => {
+                        let read_live: RoaringBitmap = read_fragments
+                            .iter()
+                            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                            .collect();
+                        live | (&retired & read_live)
+                    }
+                    None => live.clone(),
+                };
+                let undeferrable = crate::index::frag_reuse::undeferrable_segments_covering(
+                    dataset,
+                    new_indices.iter(),
+                    &retired,
+                    Some(lineage),
+                    &pre_rewrite_live,
+                )
+                .await?;
+                Transaction::withdraw_undeferrable_rewrite_coverage(
+                    new_indices,
+                    Some(lineage),
+                    &pre_rewrite_live,
+                    &undeferrable,
+                    &retired,
+                );
+            }
+
             // Handle MEM_WAL_INDEX rebasing
             let has_mem_wal = new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
 
@@ -559,7 +636,24 @@ impl<'a> TransactionRebase<'a> {
                 // proven disjoint, and disjoint transitions merge.
                 let (entry, base_entry_version) =
                     build_frag_reuse_rewrite_entry(dataset, transitions, groups).await?;
-                let assembly = TaggedRewriteAssembly::new(entry, base_entry_version, transitions)?;
+                // Established here, against the manifest THIS attempt builds
+                // on, for the same reason the entry is: a concurrent
+                // CreateIndex may have added a segment that cannot translate
+                // through the history, and the withdrawal has to cover it.
+                let rewritten: RoaringBitmap = groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter())
+                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                    .collect();
+                let undeferrable_segments =
+                    crate::index::frag_reuse::undeferrable_rewrite_segments(dataset, &rewritten)
+                        .await?;
+                let assembly = TaggedRewriteAssembly::new(
+                    entry,
+                    base_entry_version,
+                    transitions,
+                    undeferrable_segments,
+                )?;
                 return Ok((self.transaction, Some(Arc::new(assembly))));
             }
 
