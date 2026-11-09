@@ -425,11 +425,40 @@ impl Schema {
 
     /// The blob fields nested in a Map or FixedSizeList: Blob v2 supports
     /// nesting only under Struct, List and LargeList.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let blob = Field::new("blob", DataType::Binary, true).with_metadata(HashMap::from([(
+    ///     ARROW_EXT_NAME_KEY.to_string(),
+    ///     BLOB_V2_EXT_NAME.to_string(),
+    /// )]));
+    /// let key = Field::new("key", DataType::Utf8, false);
+    /// let entries = Field::new("entries", DataType::Struct(vec![key, blob].into()), false);
+    /// let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
+    /// let schema = Schema::try_from(&ArrowSchema::new(vec![attrs]))?;
+    ///
+    /// let nested = schema
+    ///     .nested_blob_fields()
+    ///     .map(|field| field.name.as_str())
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nested, ["blob"]);
+    /// let error = schema.check_blob_nesting(|field| field.is_blob_v2()).unwrap_err();
+    /// assert!(error.to_string().contains("nested in Map field 'attrs'"));
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
     pub fn nested_blob_fields(&self) -> impl Iterator<Item = &Field> {
         self.nested_blobs().into_iter().map(|(field, _, _)| field)
     }
 
     /// Reject the blob fields `rejects` selects among [`Self::nested_blob_fields`].
+    /// See [`Self::nested_blob_fields`] for an example that combines both checks.
     pub fn check_blob_nesting(&self, rejects: impl Fn(&Field) -> bool) -> Result<()> {
         for (field, kind, container_path) in self.nested_blobs() {
             if rejects(field) {
