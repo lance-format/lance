@@ -428,7 +428,7 @@ impl AddRowOffsetExec {
         dataset: Arc<Dataset>,
     ) -> LanceResult<Arc<HashMap<u32, FragInfo>>> {
         // On a metadata-cache miss, a deletion vector stored in a file costs an
-        // object-store read, so load all fragments concurrently. `buffered`
+        // object-store read, so load them concurrently. `buffered`
         // keeps fragment order, which the row-offset accumulation below needs.
         let frag_infos = futures::stream::iter(dataset.get_fragments())
             .map(|frag| async move {
