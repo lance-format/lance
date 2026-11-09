@@ -304,43 +304,35 @@ pub type ExDotKernelFn = unsafe fn(&[f32], &[u8]) -> f32;
 #[deprecated(note = "use `ExDotKernelFn` with `ex_dot_host_kernel`")]
 pub type ExDotFn = fn(&[f32], &[u8]) -> f32;
 
-/// Declares one dispatch per `ex_bits`. On x86 the AVX-512 baseline kernels
-/// of the two- and six-bit widths stay listed behind their four-chain
-/// variants, which fall back to them for partial rows, so tests cover them on
-/// aligned rows too.
-macro_rules! ex_dot_dispatch {
-    ($($name:ident = x86[$($x86:ident),*], neon $neon:ident, $scalar:ident;)*) => {$(
-        lance_core::dispatch! {
-            static $name: Dispatch<ExDotKernelFn> = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    &[$(x86::$x86,)* $scalar]
-                }
-                // NEON is part of the aarch64 baseline.
-                #[cfg(target_arch = "aarch64")]
-                {
-                    &[neon::$neon, $scalar]
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                {
-                    &[$scalar]
-                }
-            };
-        }
-    )*};
-}
-
-ex_dot_dispatch! {
-    EX_DOT_U1 = x86[EX_DOT_U1_AVX512, EX_DOT_U1_AVX2], neon EX_DOT_U1_NEON, EX_DOT_U1_SCALAR;
-    EX_DOT_U2 = x86[EX_DOT_U2_FOUR_CHAIN, EX_DOT_U2_AVX512, EX_DOT_U2_AVX2],
-        neon EX_DOT_U2_NEON, EX_DOT_U2_SCALAR;
-    EX_DOT_U3 = x86[EX_DOT_U3_AVX512, EX_DOT_U3_AVX2], neon EX_DOT_U3_NEON, EX_DOT_U3_SCALAR;
-    EX_DOT_U4 = x86[EX_DOT_U4_AVX512, EX_DOT_U4_AVX2], neon EX_DOT_U4_NEON, EX_DOT_U4_SCALAR;
-    EX_DOT_U5 = x86[EX_DOT_U5_AVX512, EX_DOT_U5_AVX2], neon EX_DOT_U5_NEON, EX_DOT_U5_SCALAR;
-    EX_DOT_U6 = x86[EX_DOT_U6_FOUR_CHAIN, EX_DOT_U6_AVX512, EX_DOT_U6_AVX2],
-        neon EX_DOT_U6_NEON, EX_DOT_U6_SCALAR;
-    EX_DOT_U7 = x86[EX_DOT_U7_AVX512, EX_DOT_U7_AVX2], neon EX_DOT_U7_NEON, EX_DOT_U7_SCALAR;
-    EX_DOT_U8 = x86[EX_DOT_U8_AVX512, EX_DOT_U8_AVX2], neon EX_DOT_U8_NEON, EX_DOT_U8_SCALAR;
+// On x86 the AVX-512 baseline kernels of the two- and six-bit widths stay
+// listed behind their four-chain variants, which fall back to them for partial
+// rows, so tests cover them on aligned rows too. NEON is part of the aarch64
+// baseline.
+crate::arch_dispatch! {
+    static EX_DOT_U1: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U1_AVX512, x86::EX_DOT_U1_AVX2],
+        aarch64[neon::EX_DOT_U1_NEON], portable EX_DOT_U1_SCALAR;
+    static EX_DOT_U2: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U2_FOUR_CHAIN, x86::EX_DOT_U2_AVX512, x86::EX_DOT_U2_AVX2],
+        aarch64[neon::EX_DOT_U2_NEON], portable EX_DOT_U2_SCALAR;
+    static EX_DOT_U3: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U3_AVX512, x86::EX_DOT_U3_AVX2],
+        aarch64[neon::EX_DOT_U3_NEON], portable EX_DOT_U3_SCALAR;
+    static EX_DOT_U4: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U4_AVX512, x86::EX_DOT_U4_AVX2],
+        aarch64[neon::EX_DOT_U4_NEON], portable EX_DOT_U4_SCALAR;
+    static EX_DOT_U5: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U5_AVX512, x86::EX_DOT_U5_AVX2],
+        aarch64[neon::EX_DOT_U5_NEON], portable EX_DOT_U5_SCALAR;
+    static EX_DOT_U6: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U6_FOUR_CHAIN, x86::EX_DOT_U6_AVX512, x86::EX_DOT_U6_AVX2],
+        aarch64[neon::EX_DOT_U6_NEON], portable EX_DOT_U6_SCALAR;
+    static EX_DOT_U7: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U7_AVX512, x86::EX_DOT_U7_AVX2],
+        aarch64[neon::EX_DOT_U7_NEON], portable EX_DOT_U7_SCALAR;
+    static EX_DOT_U8: Dispatch<ExDotKernelFn> =
+        x86_64[x86::EX_DOT_U8_AVX512, x86::EX_DOT_U8_AVX2],
+        aarch64[neon::EX_DOT_U8_NEON], portable EX_DOT_U8_SCALAR;
 }
 
 fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotKernelFn> {
@@ -383,7 +375,7 @@ pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
 
 /// The host-supported dot kernels for `ex_bits`, named by function, after the
 /// dispatched one.
-#[deprecated(note = "iterate the candidates of the `ex_bits` dispatch instead")]
+#[deprecated(note = "use `ex_dot_host_kernel`; the per-candidate kernels are no longer public")]
 #[allow(deprecated)]
 pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
     // A safe `fn` pointer cannot capture the candidate, so each one gets a

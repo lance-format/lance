@@ -4545,30 +4545,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // One dispatch per kernel, so each picks its AVX2 variant whenever
         // the host has AVX2.
-        macro_rules! merge_dispatch {
-            ($($dispatch:ident: $kernel_type:ty = $avx2:ident, $portable:ident;)*) => {$(
-                lance_core::dispatch! {
-                    static $dispatch: Dispatch<$kernel_type> = {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            &[$avx2, $portable]
-                        }
-                        #[cfg(not(target_arch = "x86_64"))]
-                        {
-                            &[$portable]
-                        }
-                    };
-                }
-            )*};
-        }
-        merge_dispatch! {
-            MERGE_WINDOW_2: MergeWindowFn = MERGE_WINDOW_2_AVX2, MERGE_WINDOW_2_PORTABLE;
-            MERGE_WINDOW_3: MergeWindowFn = MERGE_WINDOW_3_AVX2, MERGE_WINDOW_3_PORTABLE;
-            MERGE_WINDOW_N: MergeWindowNFn = MERGE_WINDOW_N_AVX2, MERGE_WINDOW_N_PORTABLE;
-            MERGE_WINDOW_DOCS_2: MergeWindowDocsFn =
-                MERGE_WINDOW_DOCS_2_AVX2, MERGE_WINDOW_DOCS_2_PORTABLE;
-            MERGE_WINDOW_DOCS_3: MergeWindowDocsFn =
-                MERGE_WINDOW_DOCS_3_AVX2, MERGE_WINDOW_DOCS_3_PORTABLE;
+        crate::arch_dispatch! {
+            static MERGE_WINDOW_2: Dispatch<MergeWindowFn> =
+                x86_64[MERGE_WINDOW_2_AVX2], portable MERGE_WINDOW_2_PORTABLE;
+            static MERGE_WINDOW_3: Dispatch<MergeWindowFn> =
+                x86_64[MERGE_WINDOW_3_AVX2], portable MERGE_WINDOW_3_PORTABLE;
+            static MERGE_WINDOW_N: Dispatch<MergeWindowNFn> =
+                x86_64[MERGE_WINDOW_N_AVX2], portable MERGE_WINDOW_N_PORTABLE;
+            static MERGE_WINDOW_DOCS_2: Dispatch<MergeWindowDocsFn> =
+                x86_64[MERGE_WINDOW_DOCS_2_AVX2], portable MERGE_WINDOW_DOCS_2_PORTABLE;
+            static MERGE_WINDOW_DOCS_3: Dispatch<MergeWindowDocsFn> =
+                x86_64[MERGE_WINDOW_DOCS_3_AVX2], portable MERGE_WINDOW_DOCS_3_PORTABLE;
         }
 
         #[inline]

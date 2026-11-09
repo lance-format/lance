@@ -145,33 +145,14 @@ fn dequant_overflows(table_len: usize, qmin: f32, qmax: f32) -> bool {
         || !(num_tables * (qmax - qmin)).is_finite()
 }
 
-/// Declares a dispatch over one operation's AVX-512, AVX2 and portable kernels.
-/// Off x86_64 it still declares the dispatch, holding only the portable
-/// kernel, so callers need no `cfg` of their own.
-macro_rules! x86_dispatch {
-    ($name:ident: $kernel_type:ty = $avx512:ident, $avx2:ident, $portable:ident) => {
-        lance_core::dispatch! {
-            static $name: Dispatch<$kernel_type> = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    &[x86::$avx512, x86::$avx2, $portable]
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    &[$portable]
-                }
-            };
-        }
-    };
+crate::arch_dispatch! {
+    static MIN_MAX: Dispatch<MinMaxFn> =
+        x86_64[x86::MIN_MAX_AVX512, x86::MIN_MAX_AVX2], portable MIN_MAX_FOLD;
+    static QUANTIZE_U8: Dispatch<QuantizeU8Fn> =
+        x86_64[x86::QUANTIZE_U8_AVX512, x86::QUANTIZE_U8_AVX2], portable QUANTIZE_U8_SCALAR;
+    static QUANTIZE_U16: Dispatch<QuantizeU16Fn> =
+        x86_64[x86::QUANTIZE_U16_AVX512, x86::QUANTIZE_U16_AVX2], portable QUANTIZE_U16_SCALAR;
 }
-
-x86_dispatch!(MIN_MAX: MinMaxFn = MIN_MAX_AVX512, MIN_MAX_AVX2, MIN_MAX_FOLD);
-x86_dispatch!(QUANTIZE_U8: QuantizeU8Fn = QUANTIZE_U8_AVX512, QUANTIZE_U8_AVX2, QUANTIZE_U8_SCALAR);
-x86_dispatch!(
-    QUANTIZE_U16: QuantizeU16Fn = QUANTIZE_U16_AVX512,
-    QUANTIZE_U16_AVX2,
-    QUANTIZE_U16_SCALAR
-);
 
 fn min_max(values: &[f32]) -> (f32, f32) {
     MIN_MAX.get().call(values)
