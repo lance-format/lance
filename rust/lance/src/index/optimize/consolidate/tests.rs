@@ -10,7 +10,10 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
+use lance_index::vector::quantizer::Quantization;
 use lance_index::{IndexType, vector::ivf::IvfBuildParams};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::generate_random_array;
@@ -63,6 +66,20 @@ async fn append(dataset: &mut Dataset, start: usize, rows: usize) {
 }
 
 async fn fixture(uri: &str, stable: bool) -> Dataset {
+    let params = VectorIndexParams::with_ivf_pq_params(
+        MetricType::Cosine,
+        IvfBuildParams::new(2),
+        PQBuildParams {
+            num_bits: 4,
+            num_sub_vectors: 2,
+            ..Default::default()
+        },
+    );
+    fixture_with(uri, stable, &params).await
+}
+
+/// Three segments, one per fragment, each trained on its own fragment.
+async fn fixture_with(uri: &str, stable: bool, params: &VectorIndexParams) -> Dataset {
     let first = batch(0, BASE);
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
@@ -76,19 +93,10 @@ async fn fixture(uri: &str, stable: bool) -> Dataset {
     .unwrap();
     append(&mut dataset, BASE, SMALL).await;
     append(&mut dataset, BASE + SMALL, SMALL).await;
-    let params = VectorIndexParams::with_ivf_pq_params(
-        MetricType::Cosine,
-        IvfBuildParams::new(2),
-        PQBuildParams {
-            num_bits: 4,
-            num_sub_vectors: 2,
-            ..Default::default()
-        },
-    );
     let mut segments = Vec::new();
     for fragment in 0..3 {
         segments.push(
-            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, params)
                 .name(NAME.to_string())
                 .fragments(vec![fragment])
                 .execute_uncommitted()
@@ -642,6 +650,58 @@ async fn selected_segments_with_different_models_are_retrained(#[case] stable: b
         .unwrap();
     assert_eq!(index.ivf_model().num_partitions(), 1);
     assert_query(&dataset, live as usize + SMALL).await;
+}
+
+#[tokio::test]
+async fn a_retrained_rq_selection_keeps_the_shared_rotation() {
+    let dir = TempStrDir::default();
+    let shared = RabitQuantizer::new_with_rotation::<arrow_array::types::Float32Type>(
+        RQBuildParams::default().num_bits,
+        DIM as i32,
+        RQRotationType::default(),
+    )
+    .metadata(None);
+    let params = VectorIndexParams::with_ivf_rq_params(
+        MetricType::Cosine,
+        IvfBuildParams::new(2),
+        RQBuildParams {
+            rotation: Some(shared.clone()),
+            ..Default::default()
+        },
+    );
+    let mut dataset = fixture_with(&dir, false, &params).await;
+    let rotation = async |dataset: &Dataset, segment: &IndexMetadata| {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let quantizer: RabitQuantizer = index.quantizer().try_into().unwrap();
+        let metadata = quantizer.metadata_ref();
+        (
+            metadata.fast_rotation_signs.clone(),
+            metadata.rotate_mat.as_ref().map(|matrix| matrix.to_data()),
+            index.ivf_model().centroids_array().unwrap().to_data(),
+        )
+    };
+    let expected = (
+        shared.fast_rotation_signs.clone(),
+        shared.rotate_mat.as_ref().map(|matrix| matrix.to_data()),
+    );
+    let old = segments(&dataset).await;
+    let source = rotation(&dataset, &old[1]).await;
+    assert_eq!((source.0.clone(), source.1.clone()), expected);
+
+    dataset
+        .optimize_indices(&select(&[&old[1], &old[2]]))
+        .await
+        .unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    let output = rotation(&dataset, &new[1]).await;
+    // Retrained centroids, under the rotation every segment shares.
+    assert_ne!(output.2, source.2);
+    assert_eq!((output.0, output.1), expected);
+    assert_query(&dataset, BASE + 2 * SMALL).await;
 }
 
 #[tokio::test]
