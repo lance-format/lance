@@ -662,7 +662,13 @@ mod tests {
             dot: SQ_DOT.fallback(),
             ..*kernel
         });
-        for (l2, dot) in SQ_L2.candidates().iter().zip(SQ_DOT.candidates()) {
+        // Unbatched scorers stage no statistics for the batched kernels.
+        let l2_candidates = if kernel.scorer.batched {
+            SQ_L2.candidates()
+        } else {
+            &[]
+        };
+        for (l2, dot) in l2_candidates.iter().zip(SQ_DOT.candidates()) {
             let (Some(l2_kernel), Some(dot_kernel)) = (l2.kernel(), dot.kernel()) else {
                 continue;
             };
@@ -775,5 +781,53 @@ mod tests {
             }
         }
         assert!(!batched_kernels_available(MAX_BATCHED_DIM + 1));
+    }
+
+    /// Past `MAX_BATCHED_DIM` the scorer stages no batched statistics and
+    /// scores with the portable kernels, in u64 where i32 would overflow.
+    #[rstest]
+    fn test_sq_unbatched_dim(
+        #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)] metric: DistanceType,
+    ) {
+        let dim = MAX_BATCHED_DIM + 1;
+        let rows = 3;
+        let sq = ScalarQuantizer::with_bounds(8, dim, -1.0..1.5);
+        let scorer = SQPairScorer::new(&sq, metric).unwrap();
+        assert!(!scorer.batched);
+        let codes: Vec<u8> = (0..rows)
+            .flat_map(|r| (0..dim).map(move |i| [0, 255, (i * 131 + 7) as u8][r]))
+            .collect();
+        let staged = stage(&scorer, &codes, 0..rows);
+        let expected_columns = match metric {
+            DistanceType::L2 => vec![SQ_CODE_COLUMN],
+            DistanceType::Dot => vec![SQ_CODE_COLUMN, CODE_SUM_COLUMN],
+            _ => vec![SQ_CODE_COLUMN, NORM_COLUMN],
+        };
+        let schema = staged.schema();
+        let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(columns, expected_columns);
+        let kernel = scorer.kernel(&staged, &staged).unwrap();
+        for a in 0..rows {
+            let out = distances(&kernel, a, 0..rows);
+            if metric != DistanceType::Dot {
+                assert_eq!(out[a], 0.0, "{metric} a={a}");
+            }
+        }
+        if metric == DistanceType::L2 {
+            let expected = (dim as u64 * 255 * 255) as f32 * scorer.distance_scale;
+            assert_eq!(distances(&kernel, 0, 1..2), [expected]);
+        }
+    }
+
+    /// One `batched` flag stages statistics for both dispatches, so they
+    /// must pair candidates with the same features.
+    #[test]
+    fn test_sq_dispatches_list_the_same_features() {
+        use lance_core::utils::cpu::{Candidate, CpuFeatures};
+
+        fn features<F: Copy>(candidates: &[Candidate<F>]) -> Vec<CpuFeatures> {
+            candidates.iter().map(|c| c.features()).collect()
+        }
+        assert_eq!(features(SQ_L2.candidates()), features(SQ_DOT.candidates()));
     }
 }
