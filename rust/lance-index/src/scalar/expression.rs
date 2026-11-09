@@ -2401,9 +2401,8 @@ fn visit_or(
 /// `(left AND right) OR (NOT left AND NOT right)` or
 /// `(left AND NOT right) OR (NOT left AND right)`.
 ///
-/// Both expansions are NULL exactly where either side is, as the comparison is,
-/// provided each side reports its NULL rows; negating a side turns the rows it
-/// reports as FALSE into TRUE.
+/// The result is NULL if either `left` or `right` are null, provided that
+/// each side reports its NULL rows.
 ///
 /// Each side appears twice, so nested comparisons double the plan per level;
 /// past [`MAX_PREDICATE_EQUALITY_SEARCHES`] the comparison is left to the scan.
@@ -2439,11 +2438,12 @@ fn visit_predicate_equality(
     })
 }
 
-/// The plain column that `predicate` is NULL exactly where, when it only
-/// combines comparisons of that column against non-null literals.
+/// Returns the plain column whose NULL values make `predicate` evaluate to NULL.
 ///
-/// A function of a column, such as a JSON accessor, can be NULL where the
-/// column is not, so only a plain column qualifies.
+/// Supports a Boolean column, comparisons, `BETWEEN`, or `IN` against non-NULL
+/// literals, and `NOT`/`AND`/`OR` combinations that all refer to the same column.
+/// Computed expressions, such as JSON accessors, are excluded because they can
+/// be NULL even when the underlying column is not.
 fn null_where_column_is<'a>(
     predicate: &'a Expr,
     index_info: &dyn IndexInformationProvider,
