@@ -54,7 +54,7 @@ from ci_benchmarks.datagen.merge_insert import (
 from ci_benchmarks.datasets import get_dataset_uri
 
 if TYPE_CHECKING:
-    from lance.dataset import ExecuteResult
+    from lance._dataset.transaction import ExecuteResult
 
 PLANS = ["v1_indexed", "v2_hash"]
 

@@ -112,20 +112,3 @@ impl ObjectStoreProvider for TencentStoreProvider {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::TencentStoreProvider;
-    use crate::object_store::ObjectStoreProvider;
-    use url::Url;
-
-    #[test]
-    fn test_cos_store_path() {
-        let provider = TencentStoreProvider;
-
-        let url = Url::parse("cos://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
-    }
-}

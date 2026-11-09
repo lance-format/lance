@@ -567,6 +567,164 @@ fn bench_shot_table(c: &mut Criterion) {
     group.finish();
 }
 
+/// Construction and warm batch lookup with independent physical addresses.
+/// Set BENCH_NUM_ROWS, BENCH_BATCH_FRAGMENTS, BENCH_BATCH_STRIDE and
+/// BENCH_BATCH_LAYOUT (shuffled, disjoint or sorted) to exercise dense, packed
+/// and full-width keys with overlapping arrays or sparse probe trees.
+fn bench_batch_lookup(c: &mut Criterion) {
+    let sparse = std::env::var_os("BENCH_SPARSE_LOOKUP").is_some();
+    let rows = num_rows() as usize;
+    let fragment_count = std::env::var("BENCH_BATCH_FRAGMENTS")
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(10);
+    let layout = std::env::var("BENCH_BATCH_LAYOUT").unwrap_or_else(|_| "shuffled".into());
+    let stride = std::env::var("BENCH_BATCH_STRIDE")
+        .map(|s| s.parse::<u64>().unwrap())
+        .unwrap_or(2);
+    assert!(matches!(
+        layout.as_str(),
+        "shuffled" | "disjoint" | "sorted"
+    ));
+    assert!(fragment_count > 0 && fragment_count <= rows);
+    assert!(stride > 0);
+    let mut ids: Vec<u64> = (0..rows as u64)
+        .map(|id| id.checked_mul(stride).unwrap())
+        .collect();
+    if layout == "shuffled" {
+        ids.shuffle(&mut SmallRng::seed_from_u64(42));
+    }
+    let per_fragment = rows.div_ceil(fragment_count);
+    let fragments: Vec<_> = ids
+        .chunks(per_fragment)
+        .enumerate()
+        .map(|(fragment_id, chunk)| {
+            let segment = if layout == "sorted" {
+                U64Segment::SortedArray(chunk.to_vec().into())
+            } else {
+                // Reverse disjoint chunks to keep the Array lookup while
+                // leaving fragment ranges disjoint.
+                U64Segment::Array(if layout == "disjoint" {
+                    chunk.iter().copied().rev().collect::<Vec<_>>().into()
+                } else {
+                    chunk.to_vec().into()
+                })
+            };
+            FragmentRowIdIndex {
+                fragment_id: fragment_id as u32,
+                row_id_sequence: Arc::new(
+                    read_row_ids(
+                        &pb::RowIdSequence {
+                            segments: vec![segment.into()],
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap(),
+                ),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            }
+        })
+        .collect();
+    let index = RowIdIndex::new(&fragments).unwrap();
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut group = c.benchmark_group(format!(
+        "row_id_index_batch/{layout}/f{fragment_count}/stride{stride}"
+    ));
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.bench_function("build", |b| {
+        b.iter(|| std::hint::black_box(RowIdIndex::new(&fragments).unwrap()));
+    });
+    let counts: &[usize] = if sparse {
+        &[1, 4, 16, 32]
+    } else {
+        &[1, 31, 32, 33, 1000]
+    };
+    for &count in counts {
+        let batches: Vec<_> = (0..16)
+            .map(|_| {
+                let mut keys = Vec::with_capacity(count);
+                let mut expected = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let physical = rng.random_range(0..rows);
+                    keys.push(ids[physical]);
+                    let fragment = physical / per_fragment;
+                    let offset = if layout == "disjoint" {
+                        (rows - fragment * per_fragment).min(per_fragment)
+                            - 1
+                            - physical % per_fragment
+                    } else {
+                        physical % per_fragment
+                    };
+                    expected.push(Some(RowAddress::new_from_parts(
+                        fragment as u32,
+                        offset as u32,
+                    )));
+                }
+                assert_eq!(index.get_many(&keys).unwrap(), expected);
+                if sparse {
+                    assert_eq!(resolve_direct(&fragments, &keys), expected);
+                }
+                keys
+            })
+            .collect();
+        group.throughput(criterion::Throughput::Elements(count as u64));
+        if sparse {
+            group.bench_with_input(BenchmarkId::new("direct", count), &batches, |b, batches| {
+                let mut next = 0;
+                b.iter(|| {
+                    let result = resolve_direct(&fragments, &batches[next]);
+                    next = (next + 1) % batches.len();
+                    std::hint::black_box(result)
+                });
+            });
+            group.bench_with_input(
+                BenchmarkId::new("build_and_get", count),
+                &batches,
+                |b, batches| {
+                    let mut next = 0;
+                    b.iter(|| {
+                        let result = RowIdIndex::new(&fragments)
+                            .unwrap()
+                            .get_many(&batches[next])
+                            .unwrap();
+                        next = (next + 1) % batches.len();
+                        std::hint::black_box(result)
+                    });
+                },
+            );
+        }
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &batches,
+            |b, batches| {
+                let mut next = 0;
+                b.iter(|| {
+                    let result = index
+                        .get_many(std::hint::black_box(&batches[next]))
+                        .unwrap();
+                    next = (next + 1) % batches.len();
+                    std::hint::black_box(result)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn resolve_direct(fragments: &[FragmentRowIdIndex], ids: &[u64]) -> Vec<Option<RowAddress>> {
+    let mut output = vec![None; ids.len()];
+    for fragment in fragments {
+        for (slot, address) in output.iter_mut().zip(fragment.get_many(ids).unwrap()) {
+            if address.is_some() {
+                assert!(slot.is_none(), "duplicate live row ID");
+                *slot = address;
+            }
+        }
+    }
+    output
+}
+
 fn bench_bitmap_mask_density(c: &mut Criterion) {
     let span = 1_000_000_u64;
     let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
@@ -647,7 +805,7 @@ fn bench_broad_dataset_wide_mask(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
+    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_batch_lookup, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
@@ -655,6 +813,7 @@ criterion_group!(
     bench_get_single,
     bench_apply_row_id,
     bench_shot_table,
+    bench_batch_lookup,
     bench_bitmap_mask_density,
     bench_broad_dataset_wide_mask
 );

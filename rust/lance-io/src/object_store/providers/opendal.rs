@@ -3,13 +3,48 @@
 
 use std::time::Duration;
 
-use opendal::Operator;
+use http::header::{ACCEPT_ENCODING, HeaderValue};
+use http::{Request, Response};
 use opendal::layers::RetryLayer;
+use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, Operator};
+
+/// Sends `Accept-Encoding: identity` unless the request already sets an encoding.
+///
+/// OpenDAL takes an object's size from the GET response. reqwest asks for gzip as
+/// soon as any crate in the build enables its `gzip` feature, and some stores then
+/// compress the body and drop `Content-Length`: Alibaba Cloud OSS does this for
+/// `text/plain` objects on a full GET, and the read fails with "HTTP response does
+/// not contain file content length".
+#[derive(Debug)]
+struct IdentityEncodingTransport {
+    inner: HttpTransporter,
+}
+
+impl HttpTransport for IdentityEncodingTransport {
+    async fn fetch(&self, mut req: Request<Buffer>) -> opendal::Result<Response<HttpBody>> {
+        req.headers_mut()
+            .entry(ACCEPT_ENCODING)
+            .or_insert(HeaderValue::from_static("identity"));
+        self.inner.fetch(req).await
+    }
+}
 
 pub(in crate::object_store) fn finish_opendal_operator(
     operator: Operator,
     max_retries: usize,
 ) -> Operator {
+    // OpenDAL's auto-registration process constructor can emit an ARM64 branch
+    // outside the +/-128 MiB range in large dynamic libraries. Initialize the
+    // registry and default transport explicitly at the operator boundary.
+    opendal::install_default();
+
+    let base_context = operator.base_context();
+    let context =
+        base_context.with_http_transport(HttpTransporter::new(IdentityEncodingTransport {
+            inner: base_context.http_transport().clone(),
+        }));
+    let operator = operator.with_context(context);
+
     if max_retries == 0 {
         return operator;
     }
@@ -37,12 +72,29 @@ mod tests {
         OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
         RpPresign, RpRename, RpStat, Service, ServiceInfo,
     };
+    #[cfg(feature = "aws")]
+    use opendal::services::S3;
     use opendal::{
         Buffer, Capability, Error, ErrorKind, Metadata, MetadataBuilder, OperationContext, Result,
     };
     use rstest::rstest;
+    #[cfg(feature = "aws")]
+    use wiremock::matchers::{header, method, path};
+    #[cfg(feature = "aws")]
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn test_finish_opendal_operator_installs_defaults() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .expect("memory operator should be created");
+        let _ = finish_opendal_operator(operator, 0);
+
+        let operator =
+            Operator::via_iter("memory", []).expect("memory service should be registered");
+        assert_eq!(operator.info().scheme(), "memory");
+    }
 
     #[derive(Debug, Clone)]
     struct RetryTestService {
@@ -321,5 +373,36 @@ mod tests {
             .await
             .expect("write should succeed");
         assert_eq!(service.close_attempts(), 2);
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_reads_request_identity_encoding() {
+        let server = MockServer::start().await;
+        // A store that compresses the body would leave out Content-Length, so the
+        // GET is only answered when it asks for the body unencoded.
+        Mock::given(method("GET"))
+            .and(path("/bucket/data.manifest"))
+            .and(header("accept-encoding", "identity"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"manifest".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let builder = S3::default()
+            .endpoint(&server.uri())
+            .bucket("bucket")
+            .region("us-east-1")
+            .access_key_id("test")
+            .secret_access_key("test")
+            .disable_config_load()
+            .disable_ec2_metadata();
+        let operator = finish_opendal_operator(Operator::new(builder).unwrap(), 0);
+
+        let data = operator
+            .read("data.manifest")
+            .await
+            .expect("read should succeed");
+        assert_eq!(data.to_bytes(), Bytes::from_static(b"manifest"));
     }
 }
