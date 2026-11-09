@@ -2768,35 +2768,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hierarchical_kmeans() {
-        const DIM: usize = 64;
-        const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
-        const NUM_VALUES: usize = 1024 * K;
-
-        let values = generate_random_array(NUM_VALUES * DIM);
-        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
-
-        let params = KMeansParams {
-            max_iters: 10,
-            hierarchical_k: 16,
-            ..Default::default()
-        };
-
-        let kmeans = KMeans::new_with_params(&fsl, K, &params).unwrap();
-
-        // Verify that we have the correct number of clusters
-        assert_eq!(kmeans.centroids.len(), K * DIM);
-        assert_eq!(kmeans.dimension, DIM);
-        assert_eq!(kmeans.centroids.data_type(), &DataType::Float32);
-
-        // Verify that all centroids are valid (not NaN)
-        let centroids = kmeans.centroids.as_primitive::<Float32Type>().values();
-        for val in centroids {
-            assert!(!val.is_nan(), "Centroid should not contain NaN values");
-        }
-    }
-
-    #[tokio::test]
     async fn test_hierarchical_kmeans_too_few_distinct_vectors_errors() {
         // Regression test for https://github.com/lance-format/lance/issues/7867
         //
@@ -3478,6 +3449,16 @@ mod tests {
 
         let kmeans = KMeans::new_with_params(&data, K, &params).unwrap();
         assert_eq!(kmeans.centroids.len(), K * DIM);
+        assert_eq!(kmeans.dimension, DIM);
+        assert!(
+            kmeans
+                .centroids
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|value| !value.is_nan()),
+            "centroids must not contain NaN"
+        );
         let again = KMeans::new_with_params(&data, K, &params).unwrap();
         assert_eq!(
             kmeans.centroids.as_primitive::<Float32Type>().values(),

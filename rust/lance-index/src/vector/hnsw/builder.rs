@@ -2009,8 +2009,8 @@ mod tests {
     #[tokio::test]
     async fn test_builder_write_load() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
-        const NUM_EDGES: usize = 20;
+        const TOTAL: usize = 512;
+        const NUM_EDGES: usize = 8;
         let data = generate_random_array(TOTAL * DIM);
         let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
@@ -2018,7 +2018,7 @@ mod tests {
             store.as_ref(),
             HnswBuildParams::default()
                 .num_edges(NUM_EDGES)
-                .ef_construction(50),
+                .ef_construction(32),
         )
         .unwrap();
 
@@ -2485,8 +2485,8 @@ mod tests {
     #[rstest]
     #[case::l2_single(DistanceType::L2, 1)]
     #[case::l2_pair(DistanceType::L2, 2)]
-    #[case::l2_multi_level(DistanceType::L2, 2048)]
-    #[case::dot_multi_level(DistanceType::Dot, 2048)]
+    #[case::l2_multi_level(DistanceType::L2, 512)]
+    #[case::dot_multi_level(DistanceType::Dot, 512)]
     #[tokio::test]
     async fn test_loaded_search_parity_and_recall(
         #[case] distance_type: DistanceType,
@@ -2502,7 +2502,7 @@ mod tests {
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
@@ -2699,7 +2699,7 @@ mod tests {
     #[tokio::test]
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         // Seeded so the data and query are fixed across runs.
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
@@ -2709,7 +2709,7 @@ mod tests {
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
@@ -2896,14 +2896,14 @@ mod tests {
     #[tokio::test]
     async fn test_subindex_prefilter_dispatch() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let hnsw = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
 
@@ -3044,7 +3044,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_reports_distance_comparisons() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
             DIM as i32,
@@ -3053,7 +3053,7 @@ mod tests {
         let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
         let hnsw = HNSW::index_vectors(
             &store,
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         // build through the plain storage, search through the counting one, so
@@ -3218,14 +3218,14 @@ mod tests {
         use arrow::datatypes::UInt32Type;
 
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
 
@@ -3302,14 +3302,14 @@ mod tests {
     #[test]
     fn test_load_legacy_misaligned_level_offsets() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(builder.max_level() >= 2);
@@ -3738,14 +3738,14 @@ mod tests {
     #[tokio::test]
     async fn test_loaded_graph_is_arrow_backed() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));

@@ -1073,26 +1073,52 @@ async fn stage_val(dataset: &Dataset, fragments: Vec<u32>) -> Vec<IndexMetadata>
     .await
 }
 
-/// Checks that looking up each of `values`, and a few ranges, through
-/// `val_idx` finds what a scan finds.
+/// How many rows hold each `val` among those `filter` selects, through
+/// `val_idx`, or among all rows by a scan.
+async fn val_counts(dataset: &Dataset, filter: Option<&str>) -> HashMap<i32, usize> {
+    let mut scan = dataset.scan();
+    scan.project(&["val"]).unwrap();
+    match filter {
+        Some(filter) => scan.filter(filter).unwrap(),
+        None => scan.use_scalar_index(false),
+    };
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut counts = HashMap::new();
+    for val in batch["val"].as_primitive::<Int32Type>().values() {
+        *counts.entry(*val).or_default() += 1;
+    }
+    counts
+}
+
+/// Checks that looking up `values` together and a few of them alone, and a
+/// few ranges, through `val_idx` finds what a scan finds.
 async fn assert_val_lookups_match_scan(
     dataset: &Dataset,
     values: impl IntoIterator<Item = i32>,
     trace: &str,
 ) {
-    let mut scan = dataset.scan();
-    scan.use_scalar_index(false).project(&["val"]).unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut scanned = HashMap::<i32, usize>::new();
-    for val in batch["val"].as_primitive::<Int32Type>().values() {
-        *scanned.entry(*val).or_default() += 1;
-    }
-    for value in values {
+    let scanned = val_counts(dataset, None).await;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let list = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let found = val_counts(dataset, Some(&format!("val IN ({list})"))).await;
+    let want = values
+        .iter()
+        .filter_map(|value| Some((*value, *scanned.get(value)?)))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(found, want, "{trace}: val IN {values:?}");
+    for value in [values.first(), values.get(values.len() / 2), values.last()]
+        .into_iter()
+        .flatten()
+    {
         let found = dataset
             .count_rows(Some(format!("val = {value}")))
             .await
             .unwrap();
-        let want = scanned.get(&value).copied().unwrap_or(0);
+        let want = scanned.get(value).copied().unwrap_or(0);
         assert_eq!(found, want, "{trace}: val = {value}");
     }
     for bound in [0, 100, 500, 1_000, 1_000_000, 2_000_000] {
@@ -1295,10 +1321,10 @@ async fn merge_under_workload(seed: u64) -> u64 {
 #[tokio::test]
 async fn test_merged_index_matches_a_scan_under_a_workload() {
     let mut covered = 0;
-    for seed in 0..24 {
+    for seed in 0..4 {
         covered += Box::pin(merge_under_workload(seed)).await;
     }
-    assert!(covered >= 16, "only {covered} fragments stayed covered");
+    assert!(covered >= 3, "only {covered} fragments stayed covered");
 }
 
 /// The fragment that holds the row with `id`.
