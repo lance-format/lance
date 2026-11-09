@@ -194,9 +194,6 @@ fn fr_options_to_proto(
             .as_ref()
             .map(|frags| frags.iter().map(|f| f.id).collect())
             .unwrap_or_default(),
-        // A repeated field alone cannot distinguish `Some(vec![])` from
-        // `None`; this presence bit keeps an explicit empty selection from
-        // widening into a scan of every fragment on the executor.
         has_fragment_ids: Some(options.fragments.is_some()),
         projection: Some(projection_to_proto(&options.projection)),
         refine_filter_substrait,
@@ -1161,18 +1158,22 @@ mod tests {
         let options =
             FilteredReadOptions::basic_full_read(&dataset).with_fragments(Arc::new(first_frag));
 
-        let proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
         assert_eq!(proto.fragment_ids.len(), 1);
-
-        let back = fr_options_from_proto(proto, &dataset, &state)
-            .await
-            .unwrap();
-        assert!(back.fragments.is_some());
-        assert_eq!(back.fragments.as_ref().unwrap().len(), 1);
-        assert_eq!(
-            back.fragments.as_ref().unwrap()[0].id,
-            options.fragments.as_ref().unwrap()[0].id
-        );
+        // Planners released before `has_fragment_ids` leave it absent; a
+        // non-empty list is still a selection.
+        for has_fragment_ids in [Some(true), None] {
+            proto.has_fragment_ids = has_fragment_ids;
+            let back = fr_options_from_proto(proto.clone(), &dataset, &state)
+                .await
+                .unwrap();
+            assert!(back.fragments.is_some());
+            assert_eq!(back.fragments.as_ref().unwrap().len(), 1);
+            assert_eq!(
+                back.fragments.as_ref().unwrap()[0].id,
+                options.fragments.as_ref().unwrap()[0].id
+            );
+        }
     }
 
     // Physical row counts distinguish fragments with the same ID.
