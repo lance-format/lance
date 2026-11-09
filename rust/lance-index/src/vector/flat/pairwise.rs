@@ -285,6 +285,9 @@ mod f32_rows {
     pub(super) const LANES: usize = 16;
 
     /// Like [`super::RowsFn`], for the host-checked kernels below.
+    /// `target_kernel!` needs an `unsafe fn` candidate type, while `RowsFn`
+    /// stays a safe pointer because it also holds the f16 and f64 batch
+    /// kernels; `select` bridges the two with safe wrappers.
     type RowsKernel = unsafe fn(anchor: &[f32], rows: &[f32], out: &mut [f32]);
 
     lance_core::dispatch! {
@@ -352,6 +355,9 @@ mod f32_rows {
     /// One row at a time, in lance-linalg's own loop shape. Autovectorized
     /// NEON already runs the 16 lanes as four independent chains, so blocking
     /// rows gains nothing there.
+    // Inlined into each portable candidate so it compiles to the loop itself,
+    // as it did when `portable::<L2>` was the selected pointer, rather than
+    // to a call into a shared copy.
     #[inline(always)]
     fn portable<const L2: bool>(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
         assert_eq!(rows.len(), anchor.len() * out.len());
