@@ -12,6 +12,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, ListArray,
     RecordBatch, RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
@@ -3261,4 +3262,73 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
     assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
     assert_eq!(quantized.num_rows(), 1);
     assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
+}
+
+/// A multivector query must score each row the same whatever the execution
+/// batch size. Each query vector's top-k sort emits its output in batches of
+/// that size, and one row id can appear in several of them because the index
+/// stores one entry per sub-vector.
+#[tokio::test]
+async fn test_multivector_scores_do_not_depend_on_batch_size() {
+    const DIM: i32 = 8;
+    const SUB_VECTORS: usize = 8;
+    const ROWS: usize = 200;
+    let values = (0..ROWS * SUB_VECTORS * DIM as usize)
+        .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+        .collect::<Vec<_>>();
+    let sub_vectors =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM).unwrap();
+    let item = ArrowField::new("item", sub_vectors.data_type().clone(), true);
+    let offsets = OffsetBuffer::from_lengths(vec![SUB_VECTORS; ROWS]);
+    let vectors = ListArray::new(Arc::new(item), offsets, Arc::new(sub_vectors), None);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        vectors.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors.clone())]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::Cosine),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let search = |batch_size: Option<usize>| {
+        let dataset = &dataset;
+        let query = &query;
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", query.as_ref(), 10)
+                .unwrap()
+                .minimum_nprobes(2)
+                .with_row_id()
+                .project::<&str>(&[])
+                .unwrap();
+            if let Some(batch_size) = batch_size {
+                scan.batch_size(batch_size);
+            }
+            let batch = scan.try_into_batch().await.unwrap();
+            batch_row_ids(&batch)
+                .into_iter()
+                .zip(
+                    batch[DIST_COL]
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec(),
+                )
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let expected = search(None).await;
+    assert_eq!(expected.len(), 10);
+    assert_eq!(search(Some(8)).await, expected);
 }
