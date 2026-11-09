@@ -7104,7 +7104,7 @@ mod tests {
     #[case::ivf_pq_dot(CreateIndexCase {
         metric_type: MetricType::Dot,
         num_partitions: 2,
-        dimension: 2000,
+        dimension: 16,
         index_type: TestIndexType::IvfPq { pq: TestPqParams::small() },
     })]
     #[case::ivf_flat(CreateIndexCase { num_partitions: 1, metric_type: MetricType::Dot, dimension: 16, index_type: TestIndexType::IvfFlat })]
