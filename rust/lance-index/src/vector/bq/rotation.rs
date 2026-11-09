@@ -51,11 +51,11 @@ type FlipSignsFn = unsafe fn(&mut [f32], &[u8]);
 
 lance_core::dispatch! {
     static FLIP_SIGNS: Dispatch<FlipSignsFn> = {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             &[x86::FLIP_SIGNS_AVX2, FLIP_SIGNS_SCALAR]
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         {
             &[FLIP_SIGNS_SCALAR]
         }
@@ -81,10 +81,11 @@ lance_core::target_kernel! {
     }
 }
 
-// `CpuFeatures` detects host features only on x86_64, so a 32-bit x86 build
-// would never select an AVX2 candidate; it uses the scalar kernel instead.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
     use super::{FlipSignsFn, flip_signs_scalar};
@@ -92,7 +93,7 @@ mod x86 {
     lance_core::target_kernel! {
         #[target_features("avx2")]
         #[candidate(pub(super) FLIP_SIGNS_AVX2: FlipSignsFn)]
-        fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+        pub(super) fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
             // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
             // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
             let full_chunks = values.len() / 8;
@@ -122,6 +123,14 @@ mod x86 {
 #[inline]
 fn flip_signs(values: &mut [f32], signs: &[u8]) {
     debug_assert!(signs.len() * 8 >= values.len());
+    // `CpuFeatures` has no runtime detection on 32-bit x86, so `FLIP_SIGNS`
+    // would only pick AVX2 there when the build enables it; check directly.
+    #[cfg(target_arch = "x86")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the host supports AVX2.
+        unsafe { x86::flip_signs_avx2(values, signs) };
+        return;
+    }
     FLIP_SIGNS.get().call(values, signs);
 }
 
