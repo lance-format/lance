@@ -207,6 +207,9 @@ def maybe_sample(
     Generator[pa.RecordBatch]
         A generator that yields [RecordBatch] of data.
     """
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+
     if isinstance(dataset, (str, Path)):
         dataset = lance.dataset(dataset)
 
@@ -225,7 +228,15 @@ def maybe_sample(
     elif n > max_takes:
         yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
     else:
-        choices = np.random.choice(len(dataset), n, replace=False)
+        # Floyd's algorithm samples without allocating a population-sized permutation.
+        selected = set()
+        choices = []
+        for upper in range(len(dataset) - n, len(dataset)):
+            candidate = int(np.random.randint(0, upper + 1, dtype=np.int64))
+            index = upper if candidate in selected else candidate
+            selected.add(index)
+            choices.append(index)
+        np.random.shuffle(choices)
         idx = 0
         while idx < len(choices):
             end = min(idx + batch_size, len(choices))

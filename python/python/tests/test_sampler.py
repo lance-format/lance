@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import random
+from collections import Counter
+from itertools import permutations, product
 from pathlib import Path
 
 import lance
@@ -645,15 +647,85 @@ def test_maybe_sample_keeps_small_sample_path_when_max_takes_exceeds_rows(
         )
     )
     np.random.seed(seed)
-    expected = np.random.choice(rows, n, replace=False).tolist()
+    expected = list(maybe_sample(dataset, n, ["id"], batch_size=n, max_takes=max_takes))
     expected_state = _copy_numpy_state()
     np.random.seed(seed)
 
     actual = list(maybe_sample(dataset, n, ["id"], batch_size=n, max_takes=max_takes))
 
-    assert [batch["id"].to_pylist() for batch in actual] == [expected]
-    assert dataset.take_sizes == [n]
+    assert actual == expected
+    ids = actual[0]["id"].to_pylist()
+    assert len(ids) == len(set(ids)) == n
+    assert all(0 <= row < rows for row in ids)
+    assert dataset.take_sizes == [n, n]
     _assert_numpy_state(np.random.get_state(), expected_state)
+
+
+class _VirtualDataset:
+    def __init__(self, rows):
+        self.rows = rows
+        self.take_sizes = []
+
+    def __len__(self):
+        return self.rows
+
+    def take(self, indices, columns=None):
+        assert columns == ["id"]
+        self.take_sizes.append(len(indices))
+        return pa.table({"id": pa.array(indices, type=pa.int64())})
+
+
+@pytest.mark.parametrize("rows", [100, 10_000_000, 2**31 - 1, 2**31, 2**31 + 1])
+@pytest.mark.parametrize("n", [0, 1, 32])
+def test_maybe_sample_small_virtual_dataset(rows, n, preserve_numpy_state, monkeypatch):
+    original_randint = np.random.randint
+
+    # Emulate Windows' default integer width on every platform.
+    def randint(low, high, dtype=np.int32):
+        return original_randint(low, high, dtype=dtype)
+
+    monkeypatch.setattr(np.random, "randint", randint)
+    dataset = _VirtualDataset(rows)
+    np.random.seed(1618)
+    batches = list(maybe_sample(dataset, n, "id", batch_size=7, max_takes=32))
+    state = _copy_numpy_state()
+    np.random.seed(1618)
+    assert list(maybe_sample(dataset, n, "id", batch_size=7, max_takes=32)) == batches
+    _assert_numpy_state(np.random.get_state(), state)
+
+    ids = [row for batch in batches for row in batch["id"].to_pylist()]
+    assert len(ids) == len(set(ids)) == n
+    assert all(0 <= row < rows for row in ids)
+    expected_sizes = [min(7, n - start) for start in range(0, n, 7)]
+    assert [batch.num_rows for batch in batches] == expected_sizes
+    assert dataset.take_sizes == expected_sizes * 2
+
+
+def test_maybe_sample_small_uniform_samples(monkeypatch):
+    dataset = _VirtualDataset(4)
+    counts = Counter()
+    # Enumerate every draw, collision, and output order for a two-row sample.
+    for first, second, reverse in product(range(3), range(4), (False, True)):
+        steps = iter(zip((first, second), (3, 4)))
+
+        def randint(low, high, dtype):
+            draw, expected_high = next(steps)
+            assert (low, high) == (0, expected_high)
+            assert dtype == np.int64
+            return draw
+
+        monkeypatch.setattr(np.random, "randint", randint)
+        monkeypatch.setattr(
+            np.random, "shuffle", lambda values: values.reverse() if reverse else None
+        )
+        batch = list(maybe_sample(dataset, 2, "id", batch_size=2))[0]
+        counts[tuple(batch["id"].to_pylist())] += 1
+    assert counts == Counter({sample: 2 for sample in permutations(range(4), 2)})
+
+
+def test_maybe_sample_rejects_negative_sample_size():
+    with pytest.raises(ValueError, match="n must be non-negative, got -1"):
+        list(maybe_sample(_VirtualDataset(10), -1, "id"))
 
 
 @pytest.mark.parametrize("n", [100, 3000, 4095])
