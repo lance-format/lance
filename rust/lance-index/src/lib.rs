@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
         assert_eq!(IndexType::max_vector_version(), VECTOR_PCA_INDEX_VERSION);
-        assert!(VECTOR_PCA_INDEX_VERSION > IVF_RQ_INDEX_VERSION);
+        assert!(IndexType::max_vector_version() > IndexType::IvfRq.version() as u32);
     }
 
     #[test]
