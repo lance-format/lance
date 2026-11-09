@@ -206,7 +206,15 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     mapping: Arc<RowAddrRemap>,
     owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<(Q::Storage, S)> {
-    let old_storage = index.load_partition_storage(partition_id, None).await?;
+    // A remap writes a new index, so it reads the live rows only: a
+    // tombstoned slot of a layout-preserved partition would otherwise be
+    // remapped to itself (`RowAddress::TOMBSTONE_ROW` is in no mapping) and
+    // persisted as a graph node over no row. Dropping the slots can leave the
+    // graph longer than the storage, which the repair below reports and the
+    // rebuild then fixes, exactly as it did before layout was preserved.
+    let old_storage = index
+        .load_live_partition_storage(partition_id, None)
+        .await?;
     let filtered_mapping;
     let mapping = if let Some(owned_fragments) = owned_fragments
         && has_unowned_fragment_rows(old_storage.row_ids().copied(), owned_fragments)
@@ -685,9 +693,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .await?;
 
                 // One partition's addresses are the unit of translation; the
-                // partition itself is the working set it always was.
-                let row_ids: Vec<u64> = part.storage.row_ids().copied().collect();
-                let mapping = resolve_shared_remap(&mapping, row_ids).await?;
+                // partition itself is the working set it always was. A
+                // tombstoned slot of a layout-preserved partition is no
+                // address, so the translator is not asked about it.
+                let mapping = resolve_shared_remap(&mapping, part.live_row_ids()).await?;
                 let (storage, index) = if S::name() == HNSW::name() {
                     remap_hnsw_partition(
                         ivf_index,
@@ -1613,7 +1622,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             // decoded partition per in-flight task while the rest wait on it.
             let old_data_filter = source.old_data_filter().await?;
 
-            let part_storage = existing_index.load_partition_storage(part_id, None).await?;
+            // The merged segment is built from these rows, so it must carry
+            // only the live ones: a tombstoned slot of a layout-preserved
+            // partition addresses no row and would be written into the output.
+            let part_storage = existing_index
+                .load_live_partition_storage(part_id, None)
+                .await?;
             let mut part_batches = part_storage.to_batches()?.collect::<Vec<_>>();
             // for PQ, the PQ codes are transposed, so we need to transpose them back
             match Q::quantization_type() {

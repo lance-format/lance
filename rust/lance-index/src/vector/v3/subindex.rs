@@ -36,6 +36,19 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
+    /// Whether the sub-index addresses its vector storage by row position.
+    ///
+    /// `true` means a node id is a row number into the partition's storage, so
+    /// the storage must keep every row's slot across row-id translation: a
+    /// deferred remap that drops the rows it cannot map would shift the
+    /// positions the sub-index holds. Partitions of such a sub-index are
+    /// loaded preserving layout, with an unmapped row keeping its slot under
+    /// [`RowAddress::TOMBSTONE_ROW`](lance_core::utils::address::RowAddress::TOMBSTONE_ROW),
+    /// and those slots are excluded from results through the prefilter.
+    fn binds_storage_positions() -> bool {
+        false
+    }
+
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
     where

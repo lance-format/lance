@@ -1362,6 +1362,52 @@ struct AttachSchemas {
     partition: OnceLock<SchemaRef>,
 }
 
+/// What a deferred remap does with a partition row it cannot map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLayout {
+    /// Drop the row and compact the rest: the storage holds only live rows,
+    /// at positions that may differ from the file's.
+    Compact,
+    /// Keep the row's slot, carrying [`RowAddress::TOMBSTONE_ROW`] as its row
+    /// id, so every storage position still matches the file's.
+    Preserved,
+}
+
+/// Translate `batch`'s row-id column in place with `remapper`, an unmapped row
+/// keeping its slot under [`RowAddress::TOMBSTONE_ROW`]. Column memory other
+/// than the row ids is untouched.
+async fn translate_row_ids_in_place(
+    batch: RecordBatch,
+    remapper: Arc<dyn RowIdRemapper>,
+) -> Result<RecordBatch> {
+    let row_id_idx = batch.schema().index_of(ROW_ID)?;
+    let row_ids = batch
+        .column(row_id_idx)
+        .as_primitive_opt::<UInt64Type>()
+        .filter(|ids| ids.null_count() == 0)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "layout-preserving translation requires non-null uint64 column {ROW_ID}"
+            ))
+        })?
+        .clone();
+    let translated = spawn_cpu(move || {
+        Ok::<_, Error>(UInt64Array::from(
+            row_ids
+                .values()
+                .iter()
+                .map(|&id| {
+                    remapper
+                        .remap_row_id(id)
+                        .unwrap_or(RowAddress::TOMBSTONE_ROW)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    })
+    .await?;
+    Ok(batch.replace_column_by_name(ROW_ID, Arc::new(translated))?)
+}
+
 /// Loader to load partitioned PQ storage from disk.
 #[derive(Debug)]
 pub struct IvfQuantizationStorage<Q: Quantization> {
@@ -1748,9 +1794,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     /// Translate assembled rows without changing cached encoded columns.
+    ///
+    /// Under [`RowLayout::Compact`] the returned remapper still has to run, so
+    /// the storage drops the rows it cannot map and compacts the rest. Under
+    /// [`RowLayout::Preserved`] every row keeps its slot, an unmapped row
+    /// carrying [`RowAddress::TOMBSTONE_ROW`], and no remapper is returned.
     async fn remap_partition_batch(
         &self,
         batch: RecordBatch,
+        layout: RowLayout,
     ) -> Result<(RecordBatch, Option<Arc<dyn RowIdRemapper>>)> {
         if let Some(remapping) = &self.batch_remapper {
             lance_index_core::remapping::check_batch_remapping_entry()?;
@@ -1758,7 +1810,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let (batch, remapper) =
                 remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
                     .await?;
-            Ok((batch, Some(remapper)))
+            match layout {
+                RowLayout::Compact => Ok((batch, Some(remapper))),
+                RowLayout::Preserved => Ok((batch, None)),
+            }
+        } else if let (RowLayout::Preserved, Some(remapper)) =
+            (layout, self.frag_reuse_index.clone())
+        {
+            let batch = translate_row_ids_in_place(batch, remapper).await?;
+            Ok((batch, None))
         } else {
             Ok((batch, self.frag_reuse_index.clone()))
         }
@@ -1779,10 +1839,27 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         part_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<Q::Storage> {
+        self.load_partition_with_layout(part_id, io_stats, RowLayout::Compact)
+            .await
+    }
+
+    /// [`Self::load_partition`] with the row layout spelled out.
+    ///
+    /// A sub-index that addresses its storage by row position
+    /// ([`IvfSubIndex::binds_storage_positions`](crate::vector::v3::subindex::IvfSubIndex::binds_storage_positions))
+    /// asks for [`RowLayout::Preserved`] so a row the deferred remap cannot
+    /// map keeps its slot under [`RowAddress::TOMBSTONE_ROW`]; the search must
+    /// exclude those slots from its results.
+    pub async fn load_partition_with_layout(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+        layout: RowLayout,
+    ) -> Result<Q::Storage> {
         let batch = self
             .read_partition_batch(part_id, io_stats.as_ref())
             .await?;
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self.remap_partition_batch(batch, layout).await?;
         match &self.quantizer {
             Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
                 batch,
@@ -1942,7 +2019,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             None => RecordBatch::new_empty(schema),
             Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
         };
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self
+            .remap_partition_batch(batch, RowLayout::Compact)
+            .await?;
         let storage = match &self.quantizer {
             Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
                 batch,
@@ -2127,7 +2206,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             )),
             columns,
         )?;
-        let (batch, remapper) = self.remap_partition_batch(batch).await?;
+        let (batch, remapper) = self
+            .remap_partition_batch(batch, RowLayout::Compact)
+            .await?;
         Q::Storage::try_from_batch_with_remapper(
             batch,
             self.metadata(),
@@ -2978,7 +3059,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let source = self
                 .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
                 .await?;
-            let (source, remapper) = self.remap_partition_batch(source).await?;
+            let (source, remapper) = self
+                .remap_partition_batch(source, RowLayout::Compact)
+                .await?;
             EncodedPartition::Memory(
                 stage_pairwise_batches(scorer.clone(), source, batch_size, remapper)
                     .try_collect()
@@ -2994,7 +3077,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 let source = self
                     .read_pairwise_codes(partition_id, start..end, &quantizer)
                     .await?;
-                let (source, remapper) = self.remap_partition_batch(source).await?;
+                let (source, remapper) = self
+                    .remap_partition_batch(source, RowLayout::Compact)
+                    .await?;
                 let mut batches =
                     stage_pairwise_batches(scorer.clone(), source, batch_size, remapper);
                 while let Some(batch) = batches.try_next().await? {

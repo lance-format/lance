@@ -4741,3 +4741,1240 @@ async fn row_map_reads_follow_index_cache_capacity() {
     assert_eq!(block_requests, 1, "exactly the block read");
     assert!(block_bytes < small_bytes, "{block_bytes} vs {small_bytes}");
 }
+
+// ---------------------------------------------------------------------------
+// Is deferred remap actually CORRECT for IVF_HNSW_SQ under a tagged
+// stable-partition history? `segment_supports_batch_remapping` says HNSW is
+// deferrable (it only checks the index file version), while lance#3993 refuses
+// eager `remap()` for HNSW. These tests exercise the query-time batch
+// remapping path end to end on the real `Operation::Rewrite` commit path.
+// ---------------------------------------------------------------------------
+
+/// Rows, dims and index shape shared by the HNSW deferred-remap tests: small
+/// enough to train an HNSW graph over two IVF partitions quickly, large enough
+/// that the graph has more than one level.
+const HNSW_DIM: u32 = 16;
+const HNSW_FRAGMENTS: u32 = 4;
+const HNSW_ROWS_PER_FRAGMENT: u32 = 64;
+const HNSW_TOP_K: usize = 10;
+
+fn ivf_hnsw_sq_params() -> crate::index::vector::VectorIndexParams {
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+    crate::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
+        lance_linalg::distance::MetricType::L2,
+        IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        },
+        HnswBuildParams {
+            max_level: 4,
+            m: 8,
+            ef_construction: 32,
+            prefetch_distance: None,
+        },
+        SQBuildParams::default(),
+    )
+}
+
+/// A table with no stable row ids, `HNSW_FRAGMENTS` fragments, an
+/// IVF_HNSW_SQ index over every fragment and a BTree on the scalar `i`.
+async fn hnsw_tagged_fixture() -> Dataset {
+    use arrow_array::types::Float32Type;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(HNSW_DIM.into()),
+        )
+        .into_ram_dataset(
+            FragmentCount::from(HNSW_FRAGMENTS),
+            FragmentRowCount::from(HNSW_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !dataset.manifest.uses_stable_row_ids(),
+        "the deferred-remap path under test is the address-style one"
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &ivf_hnsw_sq_params(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// `(i, vector)` of every live row, as the ground truth a brute-force top-k
+/// is computed from.
+async fn live_rows(dataset: &Dataset) -> Vec<(i32, Vec<f32>)> {
+    use arrow_array::types::Float32Type;
+    let batch = dataset
+        .scan()
+        .project(&["i", "vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["i"].as_primitive::<Int32Type>();
+    let vectors = batch["vector"].as_fixed_size_list();
+    (0..batch.num_rows())
+        .map(|row| {
+            let vector = vectors.value(row);
+            (
+                ids.value(row),
+                vector.as_primitive::<Float32Type>().values().to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// Brute-force L2 top-`HNSW_TOP_K` `i` values over `rows`, ties broken by `i`
+/// so the expected set is deterministic.
+fn brute_force_top_k(rows: &[(i32, Vec<f32>)], query: &[f32]) -> Vec<i32> {
+    let mut scored: Vec<(f32, i32)> = rows
+        .iter()
+        .map(|(id, vector)| {
+            let distance = vector
+                .iter()
+                .zip(query)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>();
+            (distance, *id)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut ids: Vec<i32> = scored
+        .into_iter()
+        .take(HNSW_TOP_K)
+        .map(|(_, id)| id)
+        .collect();
+    // Compared against query results sorted the same way: top-k membership is
+    // the contract under test, the engine's intra-k ordering is not.
+    ids.sort_unstable();
+    ids
+}
+
+/// One ANN query: `(plan, sorted i values, sorted row addresses)`.
+async fn ann_query(
+    dataset: &Dataset,
+    query: &arrow_array::Float32Array,
+    filter: Option<&str>,
+    use_index: bool,
+) -> (String, Vec<i32>, Vec<u64>) {
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, HNSW_TOP_K).unwrap();
+    scan.use_index(use_index);
+    scan.with_row_address();
+    if let Some(filter) = filter {
+        // Prefilter, not ANN's default postfilter: the filter's row ids must
+        // be translated into the rewritten address space before the search,
+        // which is the path a deferred remap has to get right.
+        scan.filter(filter).unwrap();
+        scan.prefilter(true);
+    }
+    let plan = scan.explain_plan(false).await.unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids: Vec<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    let mut addrs: Vec<u64> = batch[lance_core::ROW_ADDR]
+        .as_primitive::<arrow_array::types::UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    addrs.sort_unstable();
+    (plan, ids, addrs)
+}
+
+/// Commit a tagged stable-partition rewrite of `source_ids` through the real
+/// `Operation::Rewrite` path (the shape a clustering redistribution commits),
+/// with no eager index remap: the index entries keep their retired source
+/// provenance and the FRI carries the translation.
+async fn commit_tagged_partition(
+    dataset: Dataset,
+    source_ids: &[u64],
+    dest_base_id: u64,
+) -> Dataset {
+    let old_fragments: Vec<lance_table::format::Fragment> = source_ids
+        .iter()
+        .map(|id| {
+            dataset
+                .fragments()
+                .iter()
+                .find(|f| f.id == *id)
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    let (transition, new_fragments) =
+        super::tests::prepare_partition(&dataset, source_ids, dest_base_id).await;
+    let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    crate::dataset::CommitBuilder::new(Arc::new(dataset))
+        .execute(lance_table::transaction::Transaction::new(
+            read_version,
+            lance_table::transaction::Operation::Rewrite {
+                groups: vec![lance_table::transaction::RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap()
+}
+
+/// The deferred-remap contract for an IVF_HNSW_SQ segment on a tagged
+/// stable-partition history, covering the whole brief: (a) the segment is
+/// reported supported and its translated coverage includes the rewrite's
+/// outputs; (b) indexed top-k equals brute force, with and without a filter
+/// that hits a rewritten fragment; (c) the plan keeps the ANN node; (d) the
+/// BTree stays correct and translated; (e) a second rewrite on an output
+/// fragment (multi-hop) keeps (b); (f) deleting rows in a rewritten output
+/// keeps (b); (g) an old-version handle and the new version both answer
+/// exactly from the same lineage.
+#[tokio::test]
+async fn hnsw_deferred_remap_is_exact_under_a_tagged_partition_history() {
+    let dataset = hnsw_tagged_fixture().await;
+    let before_rows = live_rows(&dataset).await;
+    // Several queries drawn from live vectors plus one synthetic point.
+    let mut queries: Vec<arrow_array::Float32Array> = [0usize, 37, 101, 200]
+        .iter()
+        .map(|row| arrow_array::Float32Array::from(before_rows[*row].1.clone()))
+        .collect();
+    queries.push(arrow_array::Float32Array::from(
+        (0..HNSW_DIM).map(|d| d as f32 * 0.01).collect::<Vec<f32>>(),
+    ));
+
+    // The pre-rewrite baseline: the index already answers exactly, so any
+    // later divergence belongs to the deferred translation, not to recall.
+    for query in &queries {
+        let truth = brute_force_top_k(&before_rows, query.values());
+        let (plan, ids, _) = ann_query(&dataset, query, None, true).await;
+        assert!(plan.contains("ANN"), "{plan}");
+        assert_eq!(ids, truth, "pre-rewrite baseline for {query:?}");
+    }
+    let old_version = dataset.clone();
+
+    // One source split into two outputs (F0 -> F10,F11) and two sources
+    // redistributed into two more (F1,F2 -> F20,F21); F3 is untouched. No
+    // eager remap runs: `rewritten_indices` is empty.
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    let live: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(live, vec![3, 10, 11, 20, 21], "{live:?}");
+
+    // (a) the HNSW segment is advertised as supported and its translated
+    // coverage includes the rewrite outputs.
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "vector_idx")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, &stored)
+            .await
+            .unwrap(),
+        Some(true),
+        "(a) the HNSW segment must be classified deferrable"
+    );
+    let translated: RoaringBitmap = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+    assert_eq!(
+        translated,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "(a) translated coverage must span every live fragment, outputs included"
+    );
+
+    // (b)+(c) indexed top-k equals brute force on the new version, exact row
+    // addresses, no duplicates, nothing from a retired fragment.
+    let after_rows = live_rows(&dataset).await;
+    let retired: std::collections::HashSet<u32> = [0u32, 1, 2].into_iter().collect();
+    let assert_exact = async |dataset: &Dataset, rows: &[(i32, Vec<f32>)], label: &str| {
+        for query in &queries {
+            let truth = brute_force_top_k(rows, query.values());
+            let (plan, ids, addrs) = ann_query(dataset, query, None, true).await;
+            assert!(plan.contains("ANN"), "{label}: no ANN node in {plan}");
+            assert_eq!(ids, truth, "{label}: indexed top-k diverged");
+            let mut unique = addrs.clone();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                addrs.len(),
+                "{label}: duplicate row addresses"
+            );
+            for addr in &addrs {
+                let fragment = RowAddress::from(*addr).fragment_id();
+                assert!(
+                    !retired.contains(&fragment),
+                    "{label}: row address {addr} points at retired fragment {fragment}"
+                );
+            }
+        }
+    };
+    assert_exact(&dataset, &after_rows, "(b) after rewrite").await;
+
+    // (b) with a filter that selects rows of a rewritten output: the prefilter
+    // has to be expressed in the rewritten address space.
+    let rewritten_slice = "i < 128";
+    for query in &queries {
+        let filtered: Vec<(i32, Vec<f32>)> = after_rows
+            .iter()
+            .filter(|(id, _)| *id < 128)
+            .cloned()
+            .collect();
+        let truth = brute_force_top_k(&filtered, query.values());
+        let (plan, ids, _) = ann_query(&dataset, query, Some(rewritten_slice), true).await;
+        assert!(plan.contains("ANN"), "{plan}");
+        assert_eq!(ids, truth, "(b) filtered top-k diverged");
+    }
+
+    // (d) the BTree segment is translated too and still answers exactly.
+    let btree = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "i_idx")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, &btree)
+            .await
+            .unwrap(),
+        Some(true),
+        "(d) the BTree segment stays deferrable"
+    );
+    let btree_coverage: RoaringBitmap = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "i_idx")
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+    assert_eq!(btree_coverage, dataset.fragment_bitmap.as_ref().clone());
+    let scalar_plan = dataset
+        .scan()
+        .filter("i = 5")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(scalar_plan.contains("ScalarIndexQuery"), "{scalar_plan}");
+    assert_eq!(
+        dataset.count_rows(Some("i = 5".into())).await.unwrap(),
+        1,
+        "(d) the translated BTree must find the moved row"
+    );
+
+    // (g) the old-version handle still answers exactly from the same lineage,
+    // after the new version has warmed the shared caches.
+    for query in &queries {
+        let truth = brute_force_top_k(&before_rows, query.values());
+        let (plan, ids, _) = ann_query(&old_version, query, None, true).await;
+        assert!(plan.contains("ANN"), "{plan}");
+        assert_eq!(ids, truth, "(g) old version diverged after warming");
+    }
+    assert_exact(&dataset, &after_rows, "(g) new version after warm old").await;
+
+    // (e) a second rewrite whose sources are outputs of the first: the
+    // multi-hop chains F0 -> F10 -> F30/F31 and F0 -> F11 -> F30/F31 must
+    // still translate. Both outputs of a hop go in together, because the
+    // fixture's `i % 2` split needs each destination to be non-empty and
+    // F10/F11 are each of uniform parity on their own.
+    let multi_hop = commit_tagged_partition(dataset.clone(), &[10, 11], 30).await;
+    let hop_live: Vec<u64> = multi_hop.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(hop_live, vec![3, 20, 21, 30, 31], "{hop_live:?}");
+    let hop_rows = live_rows(&multi_hop).await;
+    assert_exact(&multi_hop, &hop_rows, "(e) multi-hop").await;
+
+    // (f) delete rows inside a rewritten output; the surviving top-k stays
+    // exact and the deleted rows never come back. (A delete followed by a
+    // further rewrite of the same output is the case that diverges; see
+    // `hnsw_deferred_remap_breaks_when_a_rewrite_follows_a_delete`.)
+    let mut deleted_dataset = dataset.clone();
+    deleted_dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let deleted_rows = live_rows(&deleted_dataset).await;
+    assert_eq!(deleted_rows.len(), after_rows.len() - 8);
+    assert_exact(&deleted_dataset, &deleted_rows, "(f) after delete").await;
+
+    let hop_coverage: RoaringBitmap = multi_hop
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .filter_map(|index| index.fragment_bitmap.clone())
+        .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+    assert_eq!(
+        hop_coverage,
+        multi_hop.fragment_bitmap.as_ref().clone(),
+        "(e) coverage must survive the second hop"
+    );
+}
+
+/// The genuinely undeferrable counterpart of the test above: a pre-(0,3)
+/// vector file. `vector_supports_batch_remapping` is false, so the segment is
+/// withdrawn from the query listing and the query scans flat instead of
+/// serving untranslated addresses -- a correct but index-less answer.
+#[tokio::test]
+async fn legacy_vector_format_is_undeferrable_and_scans_exactly() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(HNSW_DIM.into()),
+        )
+        .into_ram_dataset(
+            FragmentCount::from(HNSW_FRAGMENTS),
+            FragmentRowCount::from(HNSW_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    // The legacy on-disk vector format exists for IVF_PQ only; HNSW has no
+    // pre-(0,3) writer, so this is the undeferrable case the predicate means.
+    let mut params = crate::index::vector::VectorIndexParams::ivf_pq(
+        1,
+        4,
+        2,
+        lance_linalg::distance::DistanceType::L2,
+        10,
+    );
+    params.version(crate::index::vector::IndexFileVersion::Legacy);
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(rows[37].1.clone());
+
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == "vector_idx")
+        .unwrap()
+        .clone();
+    assert!(
+        !vector_supports_batch_remapping(&dataset, &stored)
+            .await
+            .unwrap(),
+        "a pre-(0,3) vector file is not batch-remappable"
+    );
+
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+
+    // Withdrawn from the query listing rather than refused outright.
+    assert!(
+        !dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .any(|index| index.name == "vector_idx"),
+        "an undeferrable vector segment must not claim coverage"
+    );
+    let after_rows = live_rows(&dataset).await;
+    let truth = brute_force_top_k(&after_rows, query.values());
+    let (plan, ids, _) = ann_query(&dataset, &query, None, true).await;
+    assert!(
+        !plan.contains("ANN"),
+        "the undeferrable segment must fall back to a flat scan: {plan}"
+    );
+    assert_eq!(ids, truth, "the flat-scan fallback still answers exactly");
+}
+
+/// Deferred remap of an IVF_HNSW_SQ segment is exact when a rewrite follows a
+/// delete on the same output -- the history that used to fail the query with
+/// "HNSW graph has 128 nodes but its vector storage has 123 rows".
+///
+/// The graph's node ids are row numbers into its storage
+/// (`HNSW::ensure_storage_covers_graph`), so a translation that dropped the
+/// deleted rows shifted every position after them and left the graph longer
+/// than the storage. The partition of a sub-index that binds storage
+/// positions is now loaded preserving layout: an unmapped row keeps its slot
+/// under `RowAddress::TOMBSTONE_ROW`, and those slots are excluded through the
+/// prefilter, so rows equal nodes and no result carries a retired address.
+#[tokio::test]
+async fn hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete() {
+    let dataset = hnsw_tagged_fixture().await;
+    let before_rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(before_rows[37].1.clone());
+
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    // 8 rows deleted out of F10/F11's 64 physical rows.
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+
+    // The flat scan and the scalar index both answer correctly on this
+    // history, so they bound what the HNSW segment has to match.
+    let truth = brute_force_top_k(&rows, query.values());
+    let (_, flat_ids, _) = ann_query(&dataset, &query, None, false).await;
+    assert_eq!(flat_ids, truth, "the flat scan is exact on this history");
+    assert_eq!(dataset.count_rows(Some("i = 5".into())).await.unwrap(), 1);
+
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(ids, truth, "the HNSW segment must answer exactly");
+    // Neither a tombstoned slot nor a retired fragment may reach the result.
+    let retired: std::collections::HashSet<u32> = [0u32, 1, 2, 10, 11].into_iter().collect();
+    for addr in &addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot escaped"
+        );
+        let fragment = RowAddress::from(*addr).fragment_id();
+        assert!(
+            !retired.contains(&fragment),
+            "row address {addr} points at retired fragment {fragment}"
+        );
+    }
+
+    // Prefiltered: the filter's own translation and the tombstone exclusion
+    // have to compose, with `i < 128` spanning the twice-rewritten output.
+    let filtered: Vec<(i32, Vec<f32>)> = rows.iter().filter(|(i, _)| *i < 128).cloned().collect();
+    let filtered_truth = brute_force_top_k(&filtered, query.values());
+    let (filtered_plan, filtered_ids, _) = ann_query(&dataset, &query, Some("i < 128"), true).await;
+    assert!(filtered_plan.contains("ANN"), "{filtered_plan}");
+    assert_eq!(
+        filtered_ids, filtered_truth,
+        "the prefiltered HNSW search must answer exactly"
+    );
+}
+
+/// An explicit remap of an IVF_HNSW_SQ segment whose partitions are loaded
+/// preserving layout must not carry a tombstoned slot into the new segment.
+///
+/// This is the eager path a tagged table has: compaction refuses
+/// `defer_index_remap: false` on a tagged history, because only the deferred
+/// commit path appends the transitions the tagged reader depends on.
+///
+/// `IVFIndex::load_partition_storage` keeps the slot of a row the deferred
+/// remap cannot map so the graph's positions still address the right rows.
+/// Only the search addresses the storage by position, so a remap reads the
+/// live rows alone (`load_live_partition_storage`): `RowAddress::TOMBSTONE_ROW`
+/// is in no mapping, so `QuantizerStorage::remap` would have carried the slot
+/// through unchanged and `remap_hnsw_partition` would have persisted it as a
+/// graph node over no live row.
+#[tokio::test]
+async fn hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots() {
+    use lance_index::vector::storage::VectorStore as _;
+
+    let dataset = hnsw_tagged_fixture().await;
+    let before_rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(before_rows[37].1.clone());
+
+    // The same delete-then-rewrite history as
+    // `hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete`: the one
+    // that leaves unmappable rows in the segment's partitions.
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let mut dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+
+    // A tagged history is only ever extended by the deferred-remap commit
+    // path, so compaction refuses `defer_index_remap: false` here; the
+    // explicit remap is the eager path for a tagged table. It rewrites the
+    // index through `remap_hnsw_partition`, which reads the partitions of a
+    // segment the FRI still translates.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["vector"],
+        Some("vector_idx".into()),
+    )
+    .await
+    .unwrap();
+
+    let remapped = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let mut stored: Vec<u64> = Vec::new();
+    for segment in &remapped {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswSqIndex>()
+            .expect("the remapped segment is an IVF_HNSW_SQ index");
+        for partition in 0..index.ivf_model().num_partitions() {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            stored.extend(storage.row_ids().copied());
+        }
+    }
+    for row_id in &stored {
+        assert_ne!(
+            *row_id,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot was remapped into the new segment"
+        );
+    }
+    assert_eq!(
+        stored.len(),
+        rows.len(),
+        "the remapped segment must hold exactly the live rows"
+    );
+
+    // The remapped segment answers from its own addresses, with no
+    // translation left to apply, so it must still be exact.
+    let truth = brute_force_top_k(&rows, query.values());
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(ids, truth, "the remapped HNSW segment must answer exactly");
+    for addr in &addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "a tombstoned slot escaped"
+        );
+    }
+}
+
+fn ivf_hnsw_pq_params() -> crate::index::vector::VectorIndexParams {
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::builder::PQBuildParams;
+    crate::index::vector::VectorIndexParams::with_ivf_hnsw_pq_params(
+        lance_linalg::distance::MetricType::L2,
+        IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        },
+        HnswBuildParams {
+            max_level: 4,
+            m: 8,
+            ef_construction: 32,
+            prefetch_distance: None,
+        },
+        PQBuildParams {
+            // More than one sub-vector, so a row's code is several bytes wide
+            // and strided across the transposed column: a byte taken from the
+            // wrong row is visible as a mismatch.
+            num_sub_vectors: PQ_SUB_VECTORS,
+            num_bits: 8,
+            ..Default::default()
+        },
+    )
+}
+
+/// Sub-vectors of the PQ code in `ivf_hnsw_pq_params`; `HNSW_DIM` must divide
+/// by it, and at 8 bits each sub-vector is one byte of the code.
+const PQ_SUB_VECTORS: usize = 4;
+
+/// [`hnsw_tagged_fixture`] with an IVF_HNSW_PQ index instead of IVF_HNSW_SQ.
+async fn hnsw_pq_tagged_fixture() -> Dataset {
+    use arrow_array::types::Float32Type;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<Float32Type>(HNSW_DIM.into()),
+        )
+        .into_ram_dataset(
+            FragmentCount::from(HNSW_FRAGMENTS),
+            FragmentRowCount::from(HNSW_ROWS_PER_FRAGMENT),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !dataset.manifest.uses_stable_row_ids(),
+        "the deferred-remap path under test is the address-style one"
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &ivf_hnsw_pq_params(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("i_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+/// One row's PQ code, read from the transposed `PQ_CODE_COLUMN` layout.
+///
+/// `ProductQuantizationStorage` stores the codes transposed: byte `s` of the
+/// row at position `row` lives at `s * num_rows + row`, not at
+/// `row * num_bytes + s`. Slicing the FSL row at `row` therefore yields bytes
+/// belonging to `num_bytes` different rows, which is exactly the corruption
+/// this test is here to catch, so the extraction below must stride.
+fn transposed_pq_code(batch: &RecordBatch, row: usize, num_bytes: usize) -> Vec<u8> {
+    let codes = batch[lance_index::vector::PQ_CODE_COLUMN]
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<arrow_array::types::UInt8Type>()
+        .values();
+    let num_rows = codes.len() / num_bytes;
+    assert_eq!(
+        codes.len() % num_bytes,
+        0,
+        "a transposed PQ column holds whole codes"
+    );
+    (0..num_bytes)
+        .map(|sub_vector| codes[sub_vector * num_rows + row])
+        .collect()
+}
+
+/// A live read of an IVF_HNSW_PQ partition loaded preserving layout must keep
+/// every surviving row's PQ code bytes, not just its row id.
+///
+/// `PartitionEntry::live_batches` has to drop the slots a deferred remap could
+/// not map. Row-filtering the exported batches cannot do that for PQ: the
+/// codes are stored transposed, so the `PQ_CODE_COLUMN` "row" at position `i`
+/// is not row `i`'s code but one byte from each of `num_sub_vectors` rows.
+/// Dropping FSL rows by a row-id predicate would leave every surviving row
+/// holding a blend of its neighbours' codes — row ids intact, vectors
+/// silently wrong. Dropping the slots through the storage's own
+/// `QuantizerStorage::remap`, which re-extracts and re-transposes each
+/// retained code, is what keeps a code with its row; this test pins that by
+/// comparing against the codes read out of the tombstone-bearing storage
+/// before any live read happens.
+#[tokio::test]
+async fn hnsw_pq_live_read_keeps_each_rows_codes_after_deferred_remap() {
+    use lance_index::vector::quantizer::QuantizerStorage as _;
+    use lance_index::vector::storage::VectorStore as _;
+
+    let dataset = hnsw_pq_tagged_fixture().await;
+
+    // The delete-then-rewrite history that leaves tombstoned slots, same as
+    // `hnsw_explicit_remap_after_deferred_remap_drops_tombstoned_slots`.
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    let mut dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+
+    // The ground truth, taken before any live read: the layout-preserving
+    // loader keeps the tombstoned slots, so each live row's code is read at
+    // its own position in the untouched transposed column.
+    let segments = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let num_partitions = {
+        let index = dataset
+            .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        index.ivf_model().num_partitions()
+    };
+    let mut expected_codes: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut tombstoned_slots = 0usize;
+    let mut num_bytes_in_code = 0usize;
+    for segment in &segments {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswPqIndex>()
+            .expect("the segment is an IVF_HNSW_PQ index");
+        for partition in 0..num_partitions {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            let metadata = storage.metadata();
+            assert_eq!(
+                metadata.nbits, 8,
+                "an 8-bit code is one byte per sub-vector"
+            );
+            num_bytes_in_code = metadata.num_sub_vectors;
+            let batch = storage.batch().clone();
+            let row_ids: Vec<u64> = storage.row_ids().copied().collect();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                if *row_id == RowAddress::TOMBSTONE_ROW {
+                    tombstoned_slots += 1;
+                    continue;
+                }
+                let code = transposed_pq_code(&batch, position, num_bytes_in_code);
+                assert!(
+                    expected_codes.insert(*row_id, code).is_none(),
+                    "row {row_id} appears twice in the index"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        num_bytes_in_code, PQ_SUB_VECTORS,
+        "the code must stay multi-byte for a mis-strided read to be visible"
+    );
+    assert!(
+        tombstoned_slots > 0,
+        "the history must leave tombstoned slots, or the test passes vacuously"
+    );
+    assert!(!expected_codes.is_empty(), "the index must hold live rows");
+
+    // The public live-read path, which must return the live rows alone with
+    // each code still attached to its own row.
+    let logical_index = dataset
+        .open_logical_vector_index("vector", "vector_idx")
+        .await
+        .unwrap();
+    let ivf_view = logical_index.as_ivf().unwrap();
+    let mut remaining = expected_codes.clone();
+    for partition in 0..num_partitions {
+        let batches: Vec<RecordBatch> = ivf_view
+            .read_partition(partition, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        for batch in &batches {
+            let row_ids = batch[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                assert_ne!(
+                    *row_id,
+                    RowAddress::TOMBSTONE_ROW,
+                    "a tombstoned slot escaped the live read"
+                );
+                let expected = remaining.remove(row_id).unwrap_or_else(|| {
+                    panic!("row {row_id} is not a live indexed row, or was returned twice")
+                });
+                assert_eq!(
+                    &transposed_pq_code(batch, position, num_bytes_in_code),
+                    &expected,
+                    "row {row_id} came back holding another row's PQ code bytes"
+                );
+            }
+        }
+    }
+    assert!(
+        remaining.is_empty(),
+        "the live read omitted live indexed rows: {:?}",
+        remaining.keys().collect::<Vec<_>>()
+    );
+
+    // The eager path: an explicit remap must store exactly the live rows, each
+    // with its own code, as the SQ twin asserts.
+    crate::dataset::optimize::remapping::remap_column_index(
+        &mut dataset,
+        &["vector"],
+        Some("vector_idx".into()),
+    )
+    .await
+    .unwrap();
+    let remapped = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let mut remaining = expected_codes.clone();
+    let mut stored = 0usize;
+    for segment in &remapped {
+        let index = dataset
+            .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::index::vector::ivf::v2::IvfHnswPqIndex>()
+            .expect("the remapped segment is an IVF_HNSW_PQ index");
+        for partition in 0..index.ivf_model().num_partitions() {
+            let storage = hnsw.load_partition_storage(partition, None).await.unwrap();
+            let batch = storage.batch().clone();
+            let row_ids: Vec<u64> = storage.row_ids().copied().collect();
+            for (position, row_id) in row_ids.iter().enumerate() {
+                assert_ne!(
+                    *row_id,
+                    RowAddress::TOMBSTONE_ROW,
+                    "a tombstoned slot was remapped into the new segment"
+                );
+                let expected = remaining.remove(row_id).unwrap_or_else(|| {
+                    panic!("remapped row {row_id} is not a live indexed row, or appears twice")
+                });
+                assert_eq!(
+                    &transposed_pq_code(&batch, position, num_bytes_in_code),
+                    &expected,
+                    "row {row_id} was remapped holding another row's PQ code bytes"
+                );
+                stored += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stored,
+        rows.len(),
+        "the remapped segment must hold exactly the live rows"
+    );
+    assert!(
+        remaining.is_empty(),
+        "the explicit remap dropped live indexed rows: {:?}",
+        remaining.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The delete-then-rewrite history of
+/// `hnsw_deferred_remap_is_exact_when_a_rewrite_follows_a_delete`, with the
+/// deleted rows chosen by the caller: `F0 -> F10/F11`, `F1,F2 -> F20/F21`,
+/// `delete`, then `F10,F11 -> F30/F31`. The delete has to fall inside F10/F11
+/// (`i < 64`) for its rows to become the tombstoned slots the last rewrite
+/// cannot map, which is the state every check below needs present.
+async fn hnsw_tombstoned_history(delete_predicate: &str) -> Dataset {
+    let dataset = hnsw_tagged_fixture().await;
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete(delete_predicate).await.unwrap();
+    commit_tagged_partition(dataset, &[10, 11], 30).await
+}
+
+/// The fragments retired once the whole `hnsw_tombstoned_history` rewrite
+/// chain has been committed: the two rewrites' sources and the outputs the
+/// last one consumed.
+const FULLY_REWRITTEN_RETIRED: [u32; 5] = [0, 1, 2, 10, 11];
+
+/// No result may carry a tombstoned slot, nor an address in any of `retired`:
+/// the slots the deferred remap kept for the graph's positions must stay
+/// inside the index. Which fragments count as retired depends on the version
+/// being read, so the caller names them.
+fn assert_no_tombstones(addrs: &[u64], retired: &[u32], label: &str) {
+    let retired: std::collections::HashSet<u32> = retired.iter().copied().collect();
+    for addr in addrs {
+        assert_ne!(
+            *addr,
+            RowAddress::TOMBSTONE_ROW,
+            "{label}: a tombstoned slot escaped"
+        );
+        let fragment = RowAddress::from(*addr).fragment_id();
+        assert!(
+            !retired.contains(&fragment),
+            "{label}: row address {addr} points at retired fragment {fragment}"
+        );
+    }
+}
+
+/// The tombstone exclusion has to compose with a user prefilter rather than
+/// replace it: `TombstoneAwarePreFilter` reports a non-empty filter so the
+/// sub-index takes its prefiltered path, and there it must select exactly the
+/// non-tombstone rows the inner filter selects.
+///
+/// The predicate is chosen to straddle the delete (`i < 32` keeps the rows on
+/// both sides of the deleted `16..24`), so the kept set contains neighbours of
+/// the deleted-then-rewritten rows and an off-by-one in the composition would
+/// change the answer.
+#[tokio::test]
+async fn hnsw_deferred_remap_composes_the_tombstone_mask_with_a_prefilter() {
+    let dataset = hnsw_tombstoned_history("i >= 16 AND i < 24").await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), 248, "8 of the 256 rows are deleted");
+    let query = arrow_array::Float32Array::from(rows[37].1.clone());
+
+    for predicate in ["i < 32", "i < 128", "i >= 8 AND i < 48"] {
+        let kept: Vec<(i32, Vec<f32>)> = rows
+            .iter()
+            .filter(|(i, _)| match predicate {
+                "i < 32" => *i < 32,
+                "i < 128" => *i < 128,
+                _ => (8..48).contains(i),
+            })
+            .cloned()
+            .collect();
+        assert!(
+            kept.iter().any(|(i, _)| *i < 16),
+            "{predicate}: must keep rows below the delete"
+        );
+        let truth = brute_force_top_k(&kept, query.values());
+        let (plan, ids, addrs) = ann_query(&dataset, &query, Some(predicate), true).await;
+        assert!(plan.contains("ANN"), "{predicate}: no ANN node in {plan}");
+        assert_eq!(
+            ids, truth,
+            "{predicate}: the composed filter must answer exactly"
+        );
+        assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, predicate);
+        // The deleted rows are outside the live set, so brute force cannot
+        // name them; this states it of the engine's answer directly.
+        for id in &ids {
+            assert!(
+                !(16..24).contains(id),
+                "{predicate}: deleted row {id} came back"
+            );
+        }
+    }
+}
+
+/// A partition carrying tombstoned slots answers exactly across a wide range
+/// of prefilter selectivity, from a predicate keeping a dozen rows to one
+/// keeping nearly all of them.
+///
+/// `HNSW::search` picks between the exact flat scan and the graph traversal on
+/// the mask's ratio within each partition
+/// (`rust/lance-index/src/vector/hnsw/builder.rs:1757`), which these
+/// end-to-end predicates do not pin down: they constrain only the global
+/// selectivity, and the IVF partition a query probes holds an unknown share of
+/// the kept rows. Which branch runs is therefore not asserted here — it is
+/// `test_subindex_prefilter_dispatch` in that same file that drives both
+/// branches from controlled mask ratios. This test is the end-to-end
+/// exactness control over the real tombstoned history on both sides of that
+/// threshold.
+#[tokio::test]
+async fn hnsw_deferred_remap_is_exact_across_prefilter_selectivity() {
+    let dataset = hnsw_tombstoned_history("i >= 16 AND i < 24").await;
+    let rows = live_rows(&dataset).await;
+    let query = arrow_array::Float32Array::from(rows[37].1.clone());
+
+    // 12 of the 248 live rows against 240 of them: a global selectivity far
+    // either side of the 10% threshold, without claiming what ratio reaches
+    // the probed partition.
+    let sparse = "i >= 100 AND i < 112";
+    let dense = "i < 240 OR i >= 248";
+    for predicate in [sparse, dense] {
+        let kept: Vec<(i32, Vec<f32>)> = rows
+            .iter()
+            .filter(|(i, _)| {
+                if predicate == sparse {
+                    (100..112).contains(i)
+                } else {
+                    *i < 240 || *i >= 248
+                }
+            })
+            .cloned()
+            .collect();
+        let truth = brute_force_top_k(&kept, query.values());
+        let (plan, ids, addrs) = ann_query(&dataset, &query, Some(predicate), true).await;
+        assert!(plan.contains("ANN"), "{predicate}: no ANN node in {plan}");
+        assert_eq!(ids, truth, "{predicate}: answered inexactly");
+        assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, predicate);
+    }
+}
+
+/// Tombstoning the query's own nearest neighbours must not cost recall: the
+/// live rows that take their place in the answer have to be found anyway.
+///
+/// The deleted rows are the query's global nearest neighbours that the rewrite
+/// re-addresses, so the tombstoned slots are the ones nearest the query rather
+/// than slots anywhere in the graph, and the answer moves. That the traversal
+/// scores and walks through a masked-off node (not merely skips it) is proven
+/// directly, with the ids it scored recorded, by
+/// `test_dense_prefilter_traverses_masked_nodes` in
+/// `rust/lance-index/src/vector/hnsw/builder.rs`; this test cannot observe
+/// which nodes the end-to-end search visited, so it asserts the consequence:
+/// recall against brute force stays 1.
+#[tokio::test]
+async fn hnsw_deferred_remap_keeps_recall_when_the_nearest_rows_are_tombstoned() {
+    let fixture = hnsw_tagged_fixture().await;
+    let all_rows = live_rows(&fixture).await;
+
+    // The tombstones have to land among the query's own nearest neighbours,
+    // not merely somewhere in the graph, or the delete would not move the
+    // answer at all. The vectors are uniform random, so which rows are
+    // nearest is not known up front: take the query's global nearest and
+    // delete exactly the ones the rewrite re-addresses (`i < 64`), which are
+    // the ones whose slots can become tombstones. The query is itself a row of
+    // that range, so at least its own slot always qualifies.
+    let query_id = all_rows
+        .iter()
+        .position(|(i, _)| *i == 0)
+        .expect("row i = 0 is live in the fixture");
+    let query = arrow_array::Float32Array::from(all_rows[query_id].1.clone());
+    let nearest = brute_force_top_k(&all_rows, query.values());
+    let doomed: Vec<i32> = nearest.iter().copied().filter(|i| *i < 64).collect();
+    assert!(
+        !doomed.is_empty(),
+        "the query's own row is in range, so something must be deleted: {nearest:?}"
+    );
+    // An OR-chain of equalities rather than `IN`, matching the predicate
+    // forms the tests around this one already use.
+    let predicate = doomed
+        .iter()
+        .map(|i| format!("i = {i}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let dataset = hnsw_tombstoned_history(&predicate).await;
+    let rows = live_rows(&dataset).await;
+    assert_eq!(rows.len(), all_rows.len() - doomed.len());
+    for id in &doomed {
+        assert!(
+            !rows.iter().any(|(i, _)| i == id),
+            "row {id} should have been deleted"
+        );
+    }
+
+    // The live top-k now reaches past the retired rows: its tail is made of
+    // neighbours that ranked below them before the delete.
+    let truth = brute_force_top_k(&rows, query.values());
+    assert_ne!(truth, nearest, "the delete must have moved the answer");
+    let (plan, ids, addrs) = ann_query(&dataset, &query, None, true).await;
+    assert!(plan.contains("ANN"), "{plan}");
+    assert_eq!(
+        ids, truth,
+        "recall must stay 1.0 when the nearest nodes are tombstones"
+    );
+    assert_no_tombstones(&addrs, &FULLY_REWRITTEN_RETIRED, "nearest tombstoned");
+    for id in &doomed {
+        assert!(!ids.contains(id), "tombstoned row {id} was returned");
+    }
+}
+
+/// A tombstoned slot must not leak between versions through the shared index
+/// cache, in either warming order.
+///
+/// Both handles of one order share an index cache, so whichever version
+/// queries first warms the partitions the other reads. Each order gets its own
+/// fresh session, so the second order really warms from cold rather than
+/// finding the first order's entries: sharing one cache across both would let
+/// a passing "warm new, read old" ride on the earlier "read old".
+///
+/// Both versions are after the delete; they differ in the rewrite that strands
+/// the deleted rows' slots. The older one has no tombstones (its index still
+/// addresses the live F10/F11) and must answer from its own live rows; the
+/// newer one carries the tombstoned slots and must not serve them. Neither may
+/// return a deleted row.
+#[tokio::test]
+async fn hnsw_deferred_remap_does_not_leak_tombstones_across_a_warm_cache() {
+    let dataset = hnsw_tagged_fixture().await;
+    let dataset = commit_tagged_partition(dataset, &[0], 10).await;
+    let mut dataset = commit_tagged_partition(dataset, &[1, 2], 20).await;
+    dataset.delete("i >= 16 AND i < 24").await.unwrap();
+    // After the delete, before the rewrite that strands the deleted rows'
+    // slots: post-delete / pre-remap.
+    let before_remap = dataset.manifest.version;
+    let dataset = commit_tagged_partition(dataset, &[10, 11], 30).await;
+
+    let after_rows = live_rows(&dataset).await;
+    let before_rows = {
+        let old = dataset.checkout_version(before_remap).await.unwrap();
+        live_rows(&old).await
+    };
+    assert_eq!(
+        before_rows.len(),
+        after_rows.len(),
+        "the delete precedes both"
+    );
+    let query = arrow_array::Float32Array::from(after_rows[37].1.clone());
+    let before_truth = brute_force_top_k(&before_rows, query.values());
+    let after_truth = brute_force_top_k(&after_rows, query.values());
+
+    // At `before_remap` the last rewrite has not happened, so F10/F11 are
+    // still live and only the first two rewrites' sources are retired.
+    let assert_version = async |dataset: &Dataset, truth: &[i32], retired: &[u32], label: &str| {
+        let (plan, ids, addrs) = ann_query(dataset, &query, None, true).await;
+        assert!(plan.contains("ANN"), "{label}: no ANN node in {plan}");
+        assert_eq!(
+            ids.as_slice(),
+            truth,
+            "{label}: diverged from its version's live rows"
+        );
+        assert_no_tombstones(&addrs, retired, label);
+        // Neither version may serve a row the delete retired before both.
+        for id in &ids {
+            assert!(
+                !(16..24).contains(id),
+                "{label}: deleted row {id} came back"
+            );
+        }
+    };
+
+    let before_retired = [0u32, 1, 2];
+
+    // Cloning the fixture keeps its in-memory object store and commit context,
+    // which re-resolving `memory://` through a builder would not reach. Only
+    // the session is swapped, so this warming order starts on an empty index
+    // cache that just the handles derived from it share.
+    let open = async |version: Option<u64>| {
+        let mut fresh = dataset.clone();
+        fresh.session = Arc::new(crate::session::Session::new(
+            crate::dataset::DEFAULT_INDEX_CACHE_SIZE,
+            crate::dataset::DEFAULT_METADATA_CACHE_SIZE,
+            dataset.session().store_registry(),
+        ));
+        match version {
+            Some(version) => fresh.checkout_version(version).await.unwrap(),
+            None => fresh,
+        }
+    };
+
+    // Warm the old segment, then follow the same handle to the remapped one.
+    let mut handle = open(Some(before_remap)).await;
+    assert_version(
+        &handle,
+        &before_truth,
+        &before_retired,
+        "warm old, read old",
+    )
+    .await;
+    handle.checkout_latest().await.unwrap();
+    assert_version(
+        &handle,
+        &after_truth,
+        &FULLY_REWRITTEN_RETIRED,
+        "warm old, read new",
+    )
+    .await;
+
+    // The reverse order, on a cache no query has touched: warm the remapped
+    // segment, whose partitions hold the tombstoned slots, then read the
+    // version before it through that same warm cache.
+    let reverse = open(None).await;
+    assert_version(
+        &reverse,
+        &after_truth,
+        &FULLY_REWRITTEN_RETIRED,
+        "warm new, read new",
+    )
+    .await;
+    let reverse = reverse.checkout_version(before_remap).await.unwrap();
+    assert_version(
+        &reverse,
+        &before_truth,
+        &before_retired,
+        "warm new, read old",
+    )
+    .await;
+}
