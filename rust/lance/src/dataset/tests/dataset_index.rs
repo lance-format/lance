@@ -9612,8 +9612,8 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
 }
 
 /// A negated filter answered by the index on a legacy-storage dataset with
-/// stable row ids, scanned one fragment at a time: the index's block list
-/// spans every fragment, so it is longer than the scanned fragment.
+/// stable row ids, restricted to one fragment: the index's block list spans
+/// every fragment, so it is longer than the scanned fragment.
 #[tokio::test]
 async fn test_not_equal_filter_on_fragment_subset_legacy_stable_row_ids() {
     let reader = gen_batch()
@@ -9648,7 +9648,7 @@ async fn test_not_equal_filter_on_fragment_subset_legacy_stable_row_ids() {
         .unwrap();
     let plan = scan.explain_plan(false).await.unwrap();
     assert_contains!(&plan, "MaterializeIndex");
-    assert_eq!(scan.count_rows().await.unwrap(), 5);
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 5);
 }
 
 #[tokio::test]
