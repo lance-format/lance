@@ -441,15 +441,7 @@ impl<'a> TransactionRebase<'a> {
                 // rewrite retired. Older provenance, retired before the build
                 // read the table, stays outside and keeps the conservative
                 // ancestor and remainder rules.
-                // The snapshot the transaction read, not the handle it was
-                // submitted through: a handle already past the rewrite does
-                // not list its sources, which would leave their pre-rewrite
-                // liveness unrestored and clear the untouched remainder.
-                let read_version_fragments = self
-                    .read_version_fragments
-                    .as_ref()
-                    .or(self.read_fragments.as_ref());
-                let pre_rewrite_live = match read_version_fragments {
+                let pre_rewrite_live = match self.read_fragments.as_ref() {
                     Some(read_fragments) => {
                         let read_live: RoaringBitmap = read_fragments
                             .iter()

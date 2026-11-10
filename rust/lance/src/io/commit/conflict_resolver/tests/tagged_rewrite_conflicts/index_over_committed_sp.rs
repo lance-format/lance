@@ -101,6 +101,16 @@ fn stored_bitmap(indices: &[IndexMetadata]) -> RoaringBitmap {
         .unwrap()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IndexCommitPath {
+    Immediate,
+    /// Committed through the handle that built the segment.
+    StagedOnBuildHandle,
+    /// Committed through `CommitBuilder::new(uri)`, which loads the latest
+    /// version rather than the read version.
+    StagedOnLatest,
+}
+
 #[rstest::rstest]
 #[case::indexed_payload("text", true)]
 #[case::preserved_join_key("i", false)]
@@ -110,7 +120,12 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
     #[case] indexed_column: &str,
     #[case] is_withdrawn: bool,
     #[values(false, true)] is_tagged: bool,
-    #[values(false, true)] is_staged: bool,
+    #[values(
+        IndexCommitPath::Immediate,
+        IndexCommitPath::StagedOnBuildHandle,
+        IndexCommitPath::StagedOnLatest
+    )]
+    commit_path: IndexCommitPath,
 ) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
@@ -121,7 +136,7 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
     };
     let read_version = stale.version().version;
     let fragments = stale.fragments().iter().map(|f| f.id as u32).collect();
-    let segment = if is_staged {
+    let segment = if commit_path != IndexCommitPath::Immediate {
         Some(
             stage(&stale, indexed_column, IndexType::BTree, fragments)
                 .await
@@ -154,20 +169,39 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
         ))
         .await
         .unwrap();
+    // Committing through the latest handle checks out the read version, so it
+    // must survive cleanup; only the rewrite's version is removed.
+    let first_cleaned = if commit_path == IndexCommitPath::StagedOnLatest {
+        read_version + 1
+    } else {
+        1
+    };
     let stats = latest
         .cleanup(
             CleanupPolicyBuilder::default()
-                .versions((1..=rewrite_version).collect())
+                .versions((first_cleaned..=rewrite_version).collect())
                 .unwrap()
                 .build(),
         )
         .execute()
         .await
         .unwrap();
-    assert_eq!(stats.old_versions, rewrite_version);
+    assert_eq!(stats.old_versions, rewrite_version - first_cleaned + 1);
     assert_eq!(stale.version().version, read_version);
 
-    if let Some(segment) = segment {
+    if commit_path == IndexCommitPath::StagedOnLatest {
+        crate::dataset::CommitBuilder::new(dir.as_str())
+            .execute(Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![segment.unwrap()],
+                    removed_indices: vec![],
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+    } else if let Some(segment) = segment {
         stale
             .commit_existing_index_segments("idx", indexed_column, vec![segment])
             .await
