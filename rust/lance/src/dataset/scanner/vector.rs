@@ -10,7 +10,7 @@
 //! `dataset/tests/dataset_scanner_knn.rs` and
 //! `dataset/tests/dataset_scanner_segments.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef};
@@ -49,6 +49,7 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
     knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
@@ -397,7 +398,7 @@ impl Scanner {
             // fragment, so sparse overlays incur near-zero overhead.
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let overlay_block = stale_rows.block_mask().await?;
 
             let ann_query = if self.quantized_refine_factor.is_some() {
                 let exact_factor = q.refine_factor.unwrap_or(1) as usize;
@@ -873,7 +874,7 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_rows: &HashMap<u32, RoaringBitmap>,
+        stale_rows: &IndexVisibility,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -976,7 +977,8 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
+            let mut stale_node =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
@@ -1092,7 +1094,7 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, HashMap<u32, RoaringBitmap>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, IndexVisibility)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let stale_rows = self
             .overlay_stale_index_rows(index_expr, &fragments)
