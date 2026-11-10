@@ -68,6 +68,7 @@ fn cleanup_policy_preserves_large_duration_precision() {
 // Rule semantics are covered by `expiry::tests`; these cases cover config
 // parsing, tag and filter wiring, and the delete_unverified sweep.
 #[rstest]
+// (auto_config, protected, delete_unverified)
 #[case::configured_and_protected(true, true, true)]
 #[case::builder(false, false, false)]
 #[tokio::test]
@@ -237,6 +238,7 @@ fn cleanup_retention_policy_validation(#[case] value: &str, #[case] message: &st
 }
 
 #[rstest]
+// (period_hours, expected_versions, delete_unverified, auto_config)
 #[case::daily(24, vec![4, 7, 8, 9, 10], false, false)]
 #[case::twice_daily_configured(12, vec![2, 4, 7, 8, 9, 10], true, true)]
 #[tokio::test]
@@ -328,6 +330,7 @@ async fn cleanup_keeps_one_per_period(
 }
 
 #[rstest]
+// (hinted_version, expected_versions, auto_config, filtered)
 #[case::current_hint_filtered(None, vec![5, 7, 9, 10, 11, 12, 13, 14], false, true)]
 #[case::stale_hint_configured(Some(9), vec![5, 7, 8, 9, 10, 11, 12, 13, 14], true, false)]
 #[tokio::test]
@@ -546,6 +549,7 @@ async fn cleanup_thinning_preserves_branch_dependencies(
 }
 
 #[rstest]
+// (age, expected_removed, auto_config, pinned_snapshot)
 #[case::default_pinned(None, 1, false, true)]
 #[case::three_days_configured(Some(Duration::from_secs(3 * 86_400)), 0, true, false)]
 #[tokio::test]

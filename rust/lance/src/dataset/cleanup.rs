@@ -940,12 +940,12 @@ impl<'a> CleanupTask<'a> {
 
     async fn run(self) -> Result<CleanupRunResult> {
         let now = utc_now();
-        let keeps_samples = self.retention_policy.as_ref().is_some_and(|rules| {
+        let has_keep_one = self.retention_policy.as_ref().is_some_and(|rules| {
             rules
                 .iter()
                 .any(|rule| matches!(rule, CleanupRule::KeepOne { .. }))
         });
-        let anchor = if keeps_samples {
+        let anchor = if has_keep_one {
             Some(self.resolve_thinning_anchor().await?)
         } else {
             None
@@ -1352,7 +1352,6 @@ impl<'a> CleanupTask<'a> {
             }
             Err(error) => return Err(error),
         };
-        // Detached versions do not move the retained-manifest cutoff below.
         let is_detached = is_detached_version(manifest.version);
         let verdict = expiry.classify(manifest.version, manifest.timestamp());
         let in_working_set = retain_bucket_survivor || verdict.is_retained();
@@ -2793,18 +2792,15 @@ impl CleanupPolicy {
     pub fn should_clean(&self, manifest: &Manifest) -> bool {
         self.before_timestamp
             .is_none_or(|timestamp| manifest.timestamp() < timestamp)
-            && self.matches_version_filters(manifest)
+            && self.matches_version_filters(manifest.version)
     }
 
-    fn matches_version_filters(&self, manifest: &Manifest) -> bool {
-        let mut should_clean = true;
-        if let Some(before_version) = self.before_version {
-            should_clean &= manifest.version < before_version;
-        }
-        if let Some(versions) = self.versions.as_ref() {
-            should_clean &= versions.contains(&manifest.version);
-        }
-        should_clean
+    fn matches_version_filters(&self, version: u64) -> bool {
+        self.before_version.is_none_or(|before| version < before)
+            && self
+                .versions
+                .as_ref()
+                .is_none_or(|versions| versions.contains(&version))
     }
 }
 

@@ -3,6 +3,34 @@
 
 //! Decides which versions cleanup expires, from version numbers and commit
 //! times alone. Listing and reading manifests stays in the cleanup task.
+//!
+//! A version can be removed in two ways:
+//!
+//! * **Expiration.** It is older than a cutoff: the legacy `before_timestamp`,
+//!   or `now - older_than` of a `RemoveAll` rule. With neither, a legacy policy
+//!   expires every version its version filters match.
+//! * **Thinning.** A `KeepOne { per_interval, older_than }` rule keeps only one
+//!   version per `per_interval` of history older than `older_than`. With
+//!   `per_interval = 1h` and `older_than = 2 days`, history older than two days
+//!   is cut down to one version per hour.
+//!
+//! Thinning splits history into windows of `per_interval`, aligned to the Unix
+//! epoch. One window of one rule is a [`Bucket`]. The newest version in a bucket
+//! is its *survivor* and is kept; every other version in the bucket is removed.
+//!
+//! ```text
+//! KeepOne { per_interval: 1h, older_than: 2 days }
+//!
+//!          thinned: older than (anchor - 2 days)       | kept: newer
+//!   10:00       11:00       12:00       13:00          |
+//!     | v3 v4 v5 | v6       |          | v7 v8 |  ...  | v11 v12 v13
+//!             ^     ^                        ^         |
+//!   survivors v5,   v6,                      v8        |
+//! ```
+//!
+//! A survivor is only known once every version in its bucket has been seen, so
+//! thinning takes two steps: [`VersionExpiry::classify`] puts a version in its
+//! bucket, and [`ThinningSurvivors`] picks the newest version of each bucket.
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::time::Duration;
@@ -30,20 +58,37 @@ enum Expiration {
     Before(DateTime<Utc>),
 }
 
+/// A `KeepOne` rule resolved against the anchor.
 #[derive(Clone, Copy, Debug)]
 struct ThinningRule {
     per_interval: Duration,
+    /// Versions committed before this are thinned by this rule, unless a later
+    /// (older) rule applies.
     cutoff: DateTime<Utc>,
 }
 
-/// Whether a version is retained, given its commit time. See [`VersionExpiry::classify`].
+/// One `per_interval` window of one `KeepOne` rule.
+///
+/// Each rule thins on its own, so two rules' windows never share a bucket,
+/// even when their window numbers are equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Bucket {
+    /// Position of the rule among the policy's `KeepOne` rules.
+    rule: usize,
+    /// Window number since the Unix epoch: `commit time / per_interval`. Signed
+    /// so that a commit time before 1970, from a skewed clock, still gets a window.
+    window: i128,
+}
+
+/// Whether a version is kept, given its commit time. See [`VersionExpiry::classify`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Verdict {
     Retained,
     /// Old enough to expire, but kept for its tag.
     TaggedOld,
     Expired,
-    /// Expires unless it is the newest version in its bucket; see [`ThinningSurvivors`].
+    /// In a thinning bucket: removed unless it is the bucket's survivor, which
+    /// [`ThinningSurvivors`] decides once every version has been seen.
     Thinned(ThinningCandidate),
 }
 
@@ -53,24 +98,26 @@ impl Verdict {
     }
 }
 
+/// A version in a thinning bucket, waiting to learn whether it is the survivor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ThinningCandidate {
-    /// (rule index, epoch-aligned interval index)
-    bucket: (usize, i128),
+    bucket: Bucket,
     timestamp: DateTime<Utc>,
     version: u64,
 }
 
-/// The newest thinning candidate in each bucket, which survives thinning.
+/// The survivor of each thinning bucket: its newest version, with the higher
+/// version breaking commit-time ties.
 ///
-/// Candidates can be offered in any order. `T` carries whatever the caller needs
-/// to find the survivor again.
+/// Candidates can be offered in any order. `Handle` is whatever the caller needs
+/// to act on a survivor afterwards. Cleanup passes the manifest location, so it
+/// can re-read each survivor's manifest and keep its files.
 #[derive(Debug)]
-pub(super) struct ThinningSurvivors<T> {
-    newest: HashMap<(usize, i128), (DateTime<Utc>, u64, T)>,
+pub(super) struct ThinningSurvivors<Handle> {
+    newest: HashMap<Bucket, (ThinningCandidate, Handle)>,
 }
 
-impl<T> Default for ThinningSurvivors<T> {
+impl<Handle> Default for ThinningSurvivors<Handle> {
     fn default() -> Self {
         Self {
             newest: HashMap::new(),
@@ -78,25 +125,23 @@ impl<T> Default for ThinningSurvivors<T> {
     }
 }
 
-impl<T> ThinningSurvivors<T> {
-    pub(super) fn offer(&mut self, candidate: ThinningCandidate, value: T) {
-        let entry = (candidate.timestamp, candidate.version, value);
+impl<Handle> ThinningSurvivors<Handle> {
+    pub(super) fn offer(&mut self, candidate: ThinningCandidate, handle: Handle) {
         match self.newest.entry(candidate.bucket) {
             Entry::Occupied(mut occupied) => {
-                let (timestamp, version, _) = occupied.get();
-                // The higher version breaks timestamp ties.
-                if (candidate.timestamp, candidate.version) > (*timestamp, *version) {
-                    occupied.insert(entry);
+                let (newest, _) = occupied.get();
+                if (candidate.timestamp, candidate.version) > (newest.timestamp, newest.version) {
+                    occupied.insert((candidate, handle));
                 }
             }
             Entry::Vacant(vacant) => {
-                vacant.insert(entry);
+                vacant.insert((candidate, handle));
             }
         }
     }
 
-    pub(super) fn into_survivors(self) -> impl Iterator<Item = T> {
-        self.newest.into_values().map(|(_, _, value)| value)
+    pub(super) fn into_survivors(self) -> impl Iterator<Item = Handle> {
+        self.newest.into_values().map(|(_, handle)| handle)
     }
 }
 
@@ -105,13 +150,20 @@ impl<T> ThinningSurvivors<T> {
 /// Combines the legacy [`CleanupPolicy`] filters, the retention rules resolved
 /// against the current time and thinning anchor, and the versions protected by
 /// tags, branches, and the read version.
+///
+/// Tags and branch-held versions are added after construction with
+/// [`Self::with_tagged`] and [`Self::with_branch_held`], because cleanup only
+/// learns them after it must already know which versions are old: [`Self::is_old`]
+/// ignores them so it can pick the branches to clean first.
 #[derive(Clone, Debug)]
 pub(super) struct VersionExpiry {
-    before_version: Option<u64>,
-    versions: Option<HashSet<u64>>,
+    legacy_policy: CleanupPolicy,
     expiration: Expiration,
+    /// Ordered by increasing age, like the `KeepOne` rules they come from.
     thinning: Vec<ThinningRule>,
-    thinning_floor: u64,
+    /// Versions at or above this are never thinned: the lower of the anchor and
+    /// read versions.
+    first_unthinned_version: u64,
     read_version: u64,
     tagged: HashSet<u64>,
     branch_held: HashSet<u64>,
@@ -172,11 +224,11 @@ impl VersionExpiry {
             (None, Some(_)) => Expiration::Never,
         };
         Ok(Self {
-            before_version: policy.before_version,
-            versions: policy.versions.clone(),
+            legacy_policy: policy.clone(),
             expiration,
             thinning,
-            thinning_floor: anchor.map_or(read_version, |anchor| anchor.version.min(read_version)),
+            first_unthinned_version: anchor
+                .map_or(read_version, |anchor| anchor.version.min(read_version)),
             read_version,
             tagged: HashSet::new(),
             branch_held: HashSet::new(),
@@ -194,14 +246,6 @@ impl VersionExpiry {
         self
     }
 
-    fn matches_version_filters(&self, version: u64) -> bool {
-        self.before_version.is_none_or(|before| version < before)
-            && self
-                .versions
-                .as_ref()
-                .is_none_or(|versions| versions.contains(&version))
-    }
-
     fn is_hard_expired(&self, timestamp: DateTime<Utc>) -> bool {
         match self.expiration {
             Expiration::Never => false,
@@ -210,9 +254,9 @@ impl VersionExpiry {
         }
     }
 
-    /// The oldest thinning rule whose age the version has reached.
-    fn thinning_tier(&self, version: u64, timestamp: DateTime<Utc>) -> Option<usize> {
-        if version >= self.thinning_floor {
+    /// The index of the oldest thinning rule whose age the version has reached.
+    fn thinning_rule(&self, version: u64, timestamp: DateTime<Utc>) -> Option<usize> {
+        if version >= self.first_unthinned_version {
             return None;
         }
         self.thinning
@@ -223,29 +267,34 @@ impl VersionExpiry {
     /// True when the policy would expire or thin this version, ignoring every
     /// protection (tags, branches, the read version).
     pub(super) fn is_old(&self, version: u64, timestamp: DateTime<Utc>) -> bool {
-        self.matches_version_filters(version)
-            && (self.is_hard_expired(timestamp) || self.thinning_tier(version, timestamp).is_some())
+        self.legacy_policy.matches_version_filters(version)
+            && (self.is_hard_expired(timestamp) || self.thinning_rule(version, timestamp).is_some())
     }
 
     pub(super) fn classify(&self, version: u64, timestamp: DateTime<Utc>) -> Verdict {
         // Versions at or above the read version are current, in progress, or
         // committed since this cleanup started. Detached versions set the high
         // bit, so they are above any attached read version and never expire.
-        if version >= self.read_version || !self.matches_version_filters(version) {
+        if version >= self.read_version || !self.legacy_policy.matches_version_filters(version) {
             return Verdict::Retained;
         }
         let hard_expired = self.is_hard_expired(timestamp);
-        let tier = self.thinning_tier(version, timestamp);
-        if !hard_expired && tier.is_none() {
+        let rule = self.thinning_rule(version, timestamp);
+        if !hard_expired && rule.is_none() {
             Verdict::Retained
         } else if self.tagged.contains(&version) {
             Verdict::TaggedOld
         } else if self.branch_held.contains(&version) {
             Verdict::Retained
-        } else if let Some(tier) = tier.filter(|_| !hard_expired) {
-            let interval = self.thinning[tier].per_interval.as_nanos() as i128;
+        } else if let Some(rule) = rule.filter(|_| !hard_expired) {
+            let per_interval = self.thinning[rule].per_interval.as_nanos() as i128;
             Verdict::Thinned(ThinningCandidate {
-                bucket: (tier, timestamp_nanos(timestamp).div_euclid(interval)),
+                bucket: Bucket {
+                    rule,
+                    // Rounds toward negative infinity, so windows before the
+                    // epoch are as wide as windows after it.
+                    window: timestamp_nanos(timestamp).div_euclid(per_interval),
+                },
                 timestamp,
                 version,
             })
@@ -261,11 +310,12 @@ impl VersionExpiry {
     /// timestamp precision do not make object write time an upper bound.
     pub(super) fn is_expired_by_version(&self, version: u64) -> bool {
         matches!(self.expiration, Expiration::All)
-            && (self.before_version.is_some() || self.versions.is_some())
+            && (self.legacy_policy.before_version.is_some()
+                || self.legacy_policy.versions.is_some())
             && version < self.read_version
             && !self.tagged.contains(&version)
             && !self.branch_held.contains(&version)
-            && self.matches_version_filters(version)
+            && self.legacy_policy.matches_version_filters(version)
     }
 }
 
@@ -316,12 +366,25 @@ mod tests {
         ThinningAnchor { timestamp, version }
     }
 
-    /// The versions a cleanup run keeps, offering candidates in reverse to show
-    /// that survivors do not depend on listing order.
+    /// The versions a cleanup run keeps. Manifests are listed in no particular
+    /// order, so this checks that oldest-first and newest-first agree.
     fn kept(expiry: &VersionExpiry, history: &[(u64, DateTime<Utc>)]) -> Vec<u64> {
+        let oldest_first = kept_in_order(expiry, history.iter());
+        let newest_first = kept_in_order(expiry, history.iter().rev());
+        assert_eq!(
+            oldest_first, newest_first,
+            "survivors depend on listing order"
+        );
+        oldest_first
+    }
+
+    fn kept_in_order<'a>(
+        expiry: &VersionExpiry,
+        listing: impl Iterator<Item = &'a (u64, DateTime<Utc>)>,
+    ) -> Vec<u64> {
         let mut kept = Vec::new();
         let mut survivors = ThinningSurvivors::default();
-        for (version, timestamp) in history.iter().rev() {
+        for (version, timestamp) in listing {
             match expiry.classify(*version, *timestamp) {
                 Verdict::Retained | Verdict::TaggedOld => kept.push(*version),
                 Verdict::Thinned(candidate) => survivors.offer(candidate, *version),
@@ -531,6 +594,48 @@ mod tests {
     }
 
     #[test]
+    fn survivor_ties_go_to_the_higher_version() {
+        // Versions 1 and 2 commit at the same instant, in the same bucket.
+        let history = history(&[0, 0, 72]);
+        let expiry = VersionExpiry::new(
+            &CleanupPolicy::default(),
+            Some(&[keep_one(DAY, 2 * DAY)]),
+            at_hour(72),
+            Some(latest(&history)),
+            3,
+        )
+        .unwrap();
+        assert_eq!(kept(&expiry, &history), vec![2, 3]);
+    }
+
+    #[test]
+    fn tag_protection_reports_tagged_old_even_when_a_branch_holds_the_version() {
+        let policy = CleanupPolicy {
+            before_timestamp: Some(at_hour(50)),
+            ..Default::default()
+        };
+        let expiry = VersionExpiry::new(&policy, None, at_hour(72), None, 3)
+            .unwrap()
+            .with_tagged(HashSet::from([1]))
+            .with_branch_held(HashSet::from([1]));
+        assert_eq!(expiry.classify(1, at_hour(0)), Verdict::TaggedOld);
+    }
+
+    #[test]
+    fn tagged_version_outside_the_filters_is_not_tagged_old() {
+        let policy = CleanupPolicy {
+            before_timestamp: Some(at_hour(50)),
+            versions: Some(HashSet::from([2])),
+            ..Default::default()
+        };
+        let expiry = VersionExpiry::new(&policy, None, at_hour(72), None, 3)
+            .unwrap()
+            .with_tagged(HashSet::from([1, 2]));
+        assert_eq!(expiry.classify(1, at_hour(0)), Verdict::Retained);
+        assert_eq!(expiry.classify(2, at_hour(0)), Verdict::TaggedOld);
+    }
+
+    #[test]
     fn branch_held_versions_are_retained_without_a_tag_error() {
         let history = history(&[0, 1, 72]);
         let policy = CleanupPolicy {
@@ -689,7 +794,8 @@ mod tests {
     #[rstest]
     #[case::remove_all(remove_all(u64::MAX / 2), "remove_all.older_than")]
     #[case::keep_one(keep_one(DAY, u64::MAX / 2), "keep_one.older_than")]
-    #[case::underflow(remove_all(10_000_000_000_000), "underflows current time")]
+    #[case::remove_all_underflow(remove_all(10_000_000_000_000), "underflows current time")]
+    #[case::keep_one_underflow(keep_one(DAY, 10_000_000_000_000), "underflows anchor timestamp")]
     fn out_of_range_ages_are_rejected(#[case] rule: CleanupRule, #[case] message: &str) {
         let error = VersionExpiry::new(
             &CleanupPolicy::default(),
