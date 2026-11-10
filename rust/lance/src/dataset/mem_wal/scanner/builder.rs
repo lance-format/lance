@@ -597,9 +597,8 @@ impl LsmScanner {
 
     /// Whether the projection requests any system column (e.g. `_rowaddr`,
     /// `_memtable_gen`), which only the union scan path can produce.
-    fn projection_has_system_columns(&self) -> bool {
-        self.projection
-            .as_ref()
+    fn projection_has_system_columns(projection: Option<&[String]>) -> bool {
+        projection
             .map(|p| p.iter().any(|c| is_system_column(c)))
             .unwrap_or(false)
     }
@@ -622,7 +621,7 @@ impl LsmScanner {
         if self.full_text_query.is_some() {
             return self.plan_fts().await;
         }
-        self.plan_scan().await
+        self.plan_scan(self.projection.as_deref()).await
     }
 
     /// Apply the builder's `limit`/`offset` on top of a search plan. The plain
@@ -748,10 +747,14 @@ impl LsmScanner {
     }
 
     /// Plain (filter / projection / limit) scan over base ∪ SSTables ∪ in-memory.
-    async fn plan_scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+    ///
+    /// `projection` is the effective output projection to push into every
+    /// source scan; `count_rows` passes an empty list so sources scan only
+    /// the PK columns dedup already requires.
+    async fn plan_scan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
+        validate_projection_names(projection, &base_schema, &[])?;
 
         // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter on the
         // single pk column — with no offset and no scan-only system columns —
@@ -763,7 +766,7 @@ impl LsmScanner {
             && self.offset.is_none()
             && !self.with_memtable_gen
             && !self.with_row_address
-            && !self.projection_has_system_columns()
+            && !Self::projection_has_system_columns(projection)
             && let Some(filter) = &self.filter
             && let Ok(pk_field) = base_schema.field_with_name(&self.pk_columns[0])
             && let Some(keys) =
@@ -784,9 +787,7 @@ impl LsmScanner {
             if let Some(warmer) = &self.warmer {
                 planner = planner.with_warmer(warmer.clone());
             }
-            let plan = planner
-                .plan_point_lookup(&keys, self.projection.as_deref())
-                .await?;
+            let plan = planner.plan_point_lookup(&keys, projection).await?;
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
                 None => plan,
@@ -815,7 +816,7 @@ impl LsmScanner {
 
         planner
             .plan_scan(
-                self.projection.as_deref(),
+                projection,
                 self.filter.as_ref(),
                 self.limit,
                 self.offset,
@@ -850,6 +851,11 @@ impl LsmScanner {
     /// Execute the scan without converting Lance JSON columns to Arrow JSON.
     async fn execute_plan(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
+        Self::execute_created_plan(plan)
+    }
+
+    /// Run an already-built plan as a record batch stream.
+    fn execute_created_plan(plan: Arc<dyn ExecutionPlan>) -> Result<SendableRecordBatchStream> {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         plan.execute(0, task_ctx)
@@ -876,14 +882,28 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        // Counting needs no JSON conversion, so skip decoding the values.
-        let stream = self.execute_plan().await?;
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
+        // Counting needs no JSON conversion, so skip decoding the values. It
+        // needs no projected columns either: plan the plain scan with an empty
+        // projection so sources scan only the PK/_rowaddr columns dedup
+        // already requires, instead of decoding the caller's (possibly wide)
+        // projection just to sum `num_rows`. The caller's names are validated
+        // first so a bad projection still errors exactly as `plan_scan` would.
+        // The search arms keep their normal plan: their planners validate and
+        // honor the projection themselves, and their fetch is bounded by k.
+        let plan = if self.nearest.is_some() || self.full_text_query.is_some() {
+            self.create_plan().await?
+        } else {
+            validate_projection_names(self.projection.as_deref(), &self.schema(), &[])?;
+            self.plan_scan(Some(&[])).await?
+        };
+        // Fold per batch instead of collecting: a count never needs more than
+        // one batch of rows in memory at a time.
+        Self::execute_created_plan(plan)?
+            .try_fold(0u64, |count, batch| async move {
+                Ok(count + batch.num_rows() as u64)
+            })
             .await
-            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))?;
-
-        Ok(batches.iter().map(|b| b.num_rows() as u64).sum())
+            .map_err(|e| Error::io(format!("Failed to count rows: {}", e)))
     }
 
     /// Test which `pks` have been (re)written in the WAL fresh tier — the active
@@ -1223,6 +1243,142 @@ mod tests {
             err.to_string().contains("missing"),
             "unexpected missing-column point lookup error: {err}"
         );
+    }
+
+    /// `count_rows` needs only PK rows, never payload: counting a projection
+    /// that names a wide `vector` column must not decode that column's pages.
+    /// Asserted via the base store's IO stats — the bytes read while counting
+    /// must be a small fraction of the vector payload.
+    #[tokio::test]
+    async fn count_rows_skips_projected_payload_reads() {
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+        use arrow_array::{Int32Array, RecordBatchIterator};
+        use arrow_schema::{DataType, Field};
+
+        const ROWS: i32 = 512;
+        const DIM: i32 = 1024;
+        let vector_payload_bytes = ROWS as u64 * DIM as u64 * 4;
+
+        let schema = pk_schema_with(Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), DIM),
+            false,
+        ));
+        let ids: Vec<i32> = (0..ROWS).collect();
+        let mut vb = FixedSizeListBuilder::with_capacity(
+            Float32Builder::with_capacity((ROWS * DIM) as usize),
+            DIM,
+            ROWS as usize,
+        );
+        for id in &ids {
+            for d in 0..DIM {
+                // Noisy values so page compression cannot shrink the payload
+                // enough to blur the read-bytes signal.
+                vb.values()
+                    .append_value((id * 7919 + d * 104729).rem_euclid(65521) as f32 / 65521.0);
+            }
+            vb.append(true);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(vb.finish())],
+        )
+        .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let base = Arc::new(
+            Dataset::write(reader, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .project(&["vector"])
+            .unwrap();
+        let _ = base.object_store.io_stats_incremental(); // reset
+        let count = scanner.count_rows().await.unwrap();
+        let stats = base.object_store.io_stats_incremental();
+
+        assert_eq!(count, ROWS as u64, "count must match the base row count");
+        assert!(
+            stats.read_bytes * 8 < vector_payload_bytes,
+            "count_rows read {} bytes for a {} byte vector payload; \
+             counting must not decode the projected column",
+            stats.read_bytes,
+            vector_payload_bytes,
+        );
+    }
+
+    /// The count plans with an empty projection, so it validates the user's
+    /// names up front; an unknown column must still fail exactly as the scan
+    /// path does.
+    #[tokio::test]
+    async fn count_rows_rejects_unknown_projection_column() {
+        let scanner = LsmScanner::without_base_table(
+            pk_schema(),
+            "memory://t",
+            vec![],
+            vec!["id".to_string()],
+        )
+        .project(&["missing"])
+        .unwrap();
+
+        let Err(err) = scanner.count_rows().await else {
+            panic!("unknown projection column should fail counting");
+        };
+        assert!(
+            err.to_string().contains("missing"),
+            "unexpected missing-column count error: {err}"
+        );
+    }
+
+    /// The count must stay correct when the filter names a column outside the
+    /// count's (empty) projection: each source scan resolves filter columns
+    /// itself, so only the count, not the predicate, must survive the
+    /// projection override. `limit` continues to cap the counted rows.
+    #[tokio::test]
+    async fn count_rows_honors_filter_and_limit() {
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::{Int32Array, Int64Array, RecordBatchIterator};
+        use arrow_schema::{DataType, Field};
+
+        let schema = pk_schema_with(Field::new("value", DataType::Int64, true));
+        let ids: Vec<i32> = (0..10).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int64Array::from(vec![9i64, 8, 7, 6, 5, 4, 3, 2, 1, 0])),
+            ],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let base = Arc::new(
+            Dataset::write(reader, &uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let filtered = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .project(&["id"])
+            .unwrap()
+            .filter("value >= 3")
+            .unwrap();
+        assert_eq!(filtered.count_rows().await.unwrap(), 7);
+
+        let limited = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .project(&["id"])
+            .unwrap()
+            .filter("value >= 3")
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap();
+        assert_eq!(limited.count_rows().await.unwrap(), 5);
     }
 
     #[tokio::test]
