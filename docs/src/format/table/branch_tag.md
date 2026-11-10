@@ -178,7 +178,11 @@ values `(F', R')`. It writes `F = max(F_own, F')`, and lists as retained exactly
 Tag creation, tag update, and branch creation that target version `v` of branch `b` must write the
 reference first and then read the latest manifest of `b`. If `v` is expired there, the writer
 must remove the reference it wrote and fail. Implementations may offer an explicit option that skips
-this check. Restore follows the conflict rules in [Restore Compatibility](transaction.md#restore-compatibility).
+this check.
+
+Restore of version `v` must fail if `v` is expired in the manifest the restore commits on top of.
+This covers rules committed before the restore read the table; rules committed after it are caught
+by the conflict rules in [Restore Compatibility](transaction.md#restore-compatibility).
 
 ### Writer Rules
 
