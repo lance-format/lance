@@ -210,17 +210,19 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
 }
 
 #[rstest]
-#[case::cleanup_revives_all(true, false, true)]
-#[case::cleanup_revives_some(true, true, true)]
-#[case::cleanup_more_deletions(true, true, false)]
-#[case::distributed_revives_all(false, false, true)]
-#[case::distributed_revives_some(false, true, true)]
-#[case::distributed_more_deletions(false, true, false)]
+#[case::cleanup_revives_all(true, false, true, false)]
+#[case::cleanup_revives_some(true, true, true, false)]
+#[case::cleanup_more_deletions(true, true, false, false)]
+#[case::cleanup_from_updated_handle(true, false, true, true)]
+#[case::distributed_revives_all(false, false, true, false)]
+#[case::distributed_revives_some(false, true, true, false)]
+#[case::distributed_more_deletions(false, true, false, false)]
 #[tokio::test]
 async fn test_create_index_revived_rows(
     #[case] is_after_cleanup: bool,
     #[case] has_prior_deletion: bool,
     #[case] has_revived_rows: bool,
+    #[case] submit_from_updated_handle: bool,
 ) {
     let mut build = create_base_dataset_with(false).await;
     if has_prior_deletion {
@@ -268,7 +270,12 @@ async fn test_create_index_revived_rows(
             .naming_scheme
             .manifest_path(&current.base, intervening_version);
         current.object_store.delete(&path).await.unwrap();
-        build
+        let mut submission = if submit_from_updated_handle {
+            current.clone()
+        } else {
+            build.clone()
+        };
+        submission
             .apply_commit(
                 Transaction::new(
                     build.manifest.version,
@@ -283,7 +290,7 @@ async fn test_create_index_revived_rows(
             )
             .await
             .unwrap();
-        build
+        submission
     } else {
         // Untagged tables do not replay the staged segment's transactions.
         current
