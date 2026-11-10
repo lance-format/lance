@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::{
     ops::{Range, RangeInclusive},
     sync::Arc,
+    time::Instant,
 };
 
 use arrow_array::cast::AsArray;
@@ -53,6 +54,9 @@ use lance_datafusion::utils::{
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
+use lance_io::object_store::{
+    METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
+};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
@@ -357,15 +361,56 @@ pub struct FilteredReadPartitionMetrics {
     /// sum can exceed the elapsed time.
     decode_time: Time,
     baseline_metrics: BaselineMetrics,
+    /// The two timers again, as cumulative process-wide `metrics` counters a
+    /// scrape can read while the scan runs; the plan metrics exist only once
+    /// it has ended.
+    task_wait_counter: StoreCounter,
+    decode_counter: StoreCounter,
 }
 
 impl FilteredReadPartitionMetrics {
-    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, store: &ObjectStore) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
             decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            task_wait_counter: store.counter(METRIC_SCAN_TASK_WAIT_TIME),
+            decode_counter: store.counter(METRIC_SCAN_DECODE_TIME),
         }
+    }
+
+    fn task_wait_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.task_wait_time, &self.task_wait_counter)
+    }
+
+    fn decode_timer(&self) -> ScanTimer<'_> {
+        ScanTimer::new(&self.decode_time, &self.decode_counter)
+    }
+}
+
+/// Records the same elapsed duration to a plan timer and its facade counter when
+/// dropped, including when the future is cancelled or the stream ends early.
+struct ScanTimer<'a> {
+    time: &'a Time,
+    counter: &'a StoreCounter,
+    start: Instant,
+}
+
+impl<'a> ScanTimer<'a> {
+    fn new(time: &'a Time, counter: &'a StoreCounter) -> Self {
+        Self {
+            time,
+            counter,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ScanTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.start.elapsed();
+        self.time.add_duration(elapsed);
+        self.counter.increment(elapsed.as_nanos().max(1) as u64);
     }
 }
 
@@ -474,6 +519,8 @@ struct FilteredReadStream {
     /// execute time, so the detection lives there too)
     touched_fragments: usize,
     planned_rows: u64,
+    /// The dataset's primary store, whose labels the scan's `metrics` counters carry
+    object_store: Arc<ObjectStore>,
 }
 
 /// Below this many fragments there are too few handoffs to be worth
@@ -614,6 +661,7 @@ impl FilteredReadStream {
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
+        let object_store = dataset.object_store.clone();
         let fragment_readahead = options
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
@@ -709,6 +757,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
+            object_store,
         })
     }
 
@@ -888,6 +937,11 @@ impl FilteredReadStream {
         // fall back to read the full fragment in fragments_to_read
         // Used only when index guarantees enough rows to satisfy scan_range_after_filter
         let mut scan_push_down_fragments_to_read: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        // True once a queued fragment has no mirror in scan_push_down_fragments_to_read.
+        // Swapping in the pushdown map would then drop that fragment's rows. The
+        // index can leave out a fragment that comes before covered ones, e.g. after
+        // a column rewrite in place or when the caller reorders the fragments.
+        let mut has_fragment_without_pushdown_mirror = false;
 
         // The current offset, includes filtered rows, but not deleted rows
         let mut range_offset = 0;
@@ -952,7 +1006,17 @@ impl FilteredReadStream {
                 options.only_indexed_fragments,
             )?;
 
-            if can_push_down_scan_range_after_filter && to_take == 0 {
+            let fragment_id = fragment.id() as u32;
+            if fragments_to_read.contains_key(&fragment_id)
+                && !scan_push_down_fragments_to_read.contains_key(&fragment_id)
+            {
+                has_fragment_without_pushdown_mirror = true;
+            }
+
+            if can_push_down_scan_range_after_filter
+                && to_take == 0
+                && !has_fragment_without_pushdown_mirror
+            {
                 scan_planned_with_limit_pushed_down = true;
                 fragments_to_read = scan_push_down_fragments_to_read;
                 break;
@@ -1399,7 +1463,11 @@ impl FilteredReadStream {
         let global_metrics = self.metrics.clone();
         let scan_scheduler = self.scan_scheduler.clone();
 
-        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(metrics, partition));
+        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+            metrics,
+            partition,
+            &self.object_store,
+        ));
 
         match self.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
@@ -1416,13 +1484,13 @@ impl FilteredReadStream {
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
                             let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                                task_stream.lock().await.next().await.transpose()?
+                                let _timer = partition_metrics.task_wait_timer();
+                                task_stream.lock().await.next().await
                             };
-                            Result::Ok(maybe_task.map(|task| {
+                            Result::Ok(maybe_task.transpose()?.map(|task| {
                                 let partition_metrics = partition_metrics.clone();
                                 let task = async move {
-                                    let _decode_timer = partition_metrics.decode_time.timer();
+                                    let _timer = partition_metrics.decode_timer();
                                     task.await
                                 };
                                 (task, task_stream)
@@ -1493,15 +1561,16 @@ impl FilteredReadStream {
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
                             let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
+                                let _timer = partition_metrics.task_wait_timer();
                                 task_stream.lock().await.next().await
                             };
                             if let Some(task) = maybe_task {
                                 let task = task?;
                                 let batches = {
-                                    let _decode_timer = partition_metrics.decode_time.timer();
-                                    task.await?
+                                    let _timer = partition_metrics.decode_timer();
+                                    task.await
                                 };
+                                let batches = batches?;
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
@@ -4772,6 +4841,66 @@ mod tests {
             UInt32Array::from((30..40).collect::<Vec<_>>())
         };
         assert_eq!(batch["value"].as_ref(), &expected);
+    }
+
+    /// Limit pushdown must not discard an uncovered fragment that the caller
+    /// lists before the covered fragment satisfying the limit.  The pushdown
+    /// plan only mirrors covered fragments, so swapping it in would drop the
+    /// uncovered fragment's rows, which belong first in the caller's order.
+    #[rstest]
+    #[case::limit(0..2, vec![10, 11])]
+    #[case::offset_and_limit(1..3, vec![11, 12])]
+    #[tokio::test]
+    async fn test_limit_pushdown_keeps_preceding_uncovered_fragments(
+        #[case] scan_range: Range<u64>,
+        #[case] expected_values: Vec<u32>,
+        #[values(false, true)] uses_stable_row_ids: bool,
+    ) {
+        let (_tmp_path, dataset) = metadata_pruning_dataset(uses_stable_row_ids).await;
+        let all_fragments = dataset.fragments().as_ref().clone();
+        let fragment = |id: u64| {
+            all_fragments
+                .iter()
+                .find(|fragment| fragment.id == id)
+                .unwrap()
+                .clone()
+        };
+        // Uncovered fragment 1 precedes covered fragment 0 in the caller's
+        // order; fragment 1 holds values 10..20, fragment 0 holds values 0..10.
+        let fragments = Arc::new(vec![fragment(1), fragment(0)]);
+
+        // Exact result covering only fragment 0, where every row matches.
+        // (Fragment 0's row addresses and initial stable row ids are both 0..10.)
+        let covered = RoaringBitmap::from_iter([0u32]);
+        let index_input = index_result_input_with_coverage(
+            IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from(0u64..10))),
+            &covered,
+        );
+
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let filter = planner.parse_filter("value < 1000").unwrap();
+        let filter = planner.optimize_expr(filter).unwrap();
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_fragments(fragments)
+            .with_filter(None, Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(scan_range)
+            .unwrap();
+
+        let plan = FilteredReadExec::try_new(dataset, options, Some(index_input)).unwrap();
+        let stream = plan.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let schema = stream.schema();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+        let batch = concat_batches(&schema, &batches).unwrap();
+
+        assert_eq!(
+            batch["value"]
+                .as_primitive::<UInt32Type>()
+                .values()
+                .as_ref(),
+            expected_values.as_slice(),
+            "limit pushdown dropped the uncovered fragment preceding the covered one"
+        );
     }
 
     /// Take-shaped masked reads consolidate their tiny per-fragment batches;
@@ -8225,5 +8354,102 @@ mod tests {
             projected_column_names(&narrow),
             vec!["id", "cells.item.idx"]
         );
+    }
+
+    /// The scan timers also reach the `metrics` facade, as cumulative counters
+    /// a scrape can read while a scan runs.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_scan_timers_reach_the_metrics_facade() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // A thread-local recorder: the counters are registered when the scan
+        // starts, on this thread, so a current-thread runtime keeps every
+        // increment on them visible to it.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dataset = gen_batch()
+                        .col("x", array::step::<UInt32Type>())
+                        .into_dataset(
+                            "memory://scan_timers",
+                            FragmentCount::from(4),
+                            FragmentRowCount::from(16),
+                        )
+                        .await
+                        .unwrap();
+                    let batch = dataset.scan().try_into_batch().await.unwrap();
+                    assert_eq!(batch.num_rows(), 64);
+
+                    let counters = |name: &str| {
+                        snapshotter
+                            .snapshot()
+                            .into_vec()
+                            .into_iter()
+                            .filter_map(|(key, _, _, value)| {
+                                let DebugValue::Counter(value) = value else {
+                                    return None;
+                                };
+                                if key.key().name() != name {
+                                    return None;
+                                }
+                                let labels = key
+                                    .key()
+                                    .labels()
+                                    .map(|label| {
+                                        (label.key().to_string(), label.value().to_string())
+                                    })
+                                    .collect::<HashMap<_, _>>();
+                                Some((labels, value))
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let total_counter = |name: &str| {
+                        counters(name)
+                            .into_iter()
+                            .map(|(_, value)| value)
+                            .sum::<u64>()
+                    };
+                    let wait_before = total_counter(METRIC_SCAN_TASK_WAIT_TIME);
+                    let decode_before = total_counter(METRIC_SCAN_DECODE_TIME);
+
+                    let timer_metrics = ExecutionPlanMetricsSet::new();
+                    let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+                        &timer_metrics,
+                        0,
+                        &dataset.object_store,
+                    ));
+                    let mut cancelled = Box::pin({
+                        let partition_metrics = partition_metrics.clone();
+                        async move {
+                            let _wait_timer = partition_metrics.task_wait_timer();
+                            let _decode_timer = partition_metrics.decode_timer();
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+                    drop(cancelled);
+
+                    assert!(partition_metrics.task_wait_time.value() > 0);
+                    assert!(partition_metrics.decode_time.value() > 0);
+                    assert!(total_counter(METRIC_SCAN_TASK_WAIT_TIME) > wait_before);
+                    assert!(total_counter(METRIC_SCAN_DECODE_TIME) > decode_before);
+
+                    for name in [METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME] {
+                        let recorded = counters(name);
+                        assert_eq!(recorded.len(), 1, "{name}: {recorded:?}");
+                        let (labels, value) = &recorded[0];
+                        assert_eq!(labels.get("base").map(String::as_str), Some("memory"));
+                        assert!(!labels.contains_key("dataset"), "{labels:?}");
+                        assert!(*value > 0, "{name}: {recorded:?}");
+                    }
+                });
+        });
     }
 }

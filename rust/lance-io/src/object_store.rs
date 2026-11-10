@@ -49,6 +49,7 @@ pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+mod local_staging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(any(
@@ -176,6 +177,7 @@ pub trait ObjectStoreExt {
 
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    fn directory_to_filesystem(&self, path: &Path) -> Result<PathBuf>;
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
 }
@@ -935,6 +937,36 @@ impl ObjectStore {
         &self.io_tracker
     }
 
+    /// A cumulative counter named `name` on the `metrics` facade, labelled
+    /// like this store's object store metrics (`base`, and `dataset` in
+    /// dataset mode) so work on the store's data is attributed the way its IO
+    /// is. Unlabelled for a store that is not metered (see `meter_store`); a
+    /// no-op without the `metrics` feature.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # fn example(store: &ObjectStore) {
+    /// let counter = store.counter("lance_example_items_total");
+    /// counter.increment(1);
+    /// # }
+    /// ```
+    #[cfg(feature = "metrics")]
+    pub fn counter(&self, name: &'static str) -> StoreCounter {
+        let labels = self
+            .io_tracker
+            .metrics_base()
+            .map(metrics::store_labels)
+            .unwrap_or_default();
+        StoreCounter(::metrics::counter!(name, labels))
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub fn counter(&self, _name: &'static str) -> StoreCounter {
+        StoreCounter()
+    }
+
     /// Get a snapshot of current IO statistics without resetting counters
     ///
     /// Returns the current IO statistics without modifying the internal state.
@@ -1246,7 +1278,27 @@ impl ObjectStore {
         }
     }
 
+    /// Delete an object, including a local staging file hidden from normal listings.
+    ///
+    /// See [`Self::read_local_staging_files`] for an example of finding and removing
+    /// old staging files after an interrupted write.
     pub async fn delete(&self, path: &Path) -> Result<()> {
+        if let Some(local_path) = self.local_staging_path(path)? {
+            // LocalFileSystem rejects its reserved staging names, even for deletion.
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = tokio::fs::remove_file(&local_path).await.map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    Error::not_found(path.to_string())
+                } else {
+                    Error::io(format!(
+                        "Failed to remove local staging file {}: {error}",
+                        local_path.display()
+                    ))
+                }
+            });
+            metrics.record(&result, 0);
+            return result;
+        }
         self.inner.delete(path).await?;
         Ok(())
     }
@@ -2325,6 +2377,32 @@ impl ObjectStore {
             // Type-erased on the way in, so there is no telling if it can paginate.
             paginated_lister: None,
         }
+    }
+}
+
+/// Wall time of a scan's decode tasks in nanoseconds, summed over tasks and
+/// labelled like the store's object store metrics (`base`, and `dataset` in
+/// dataset mode). Tasks run concurrently, so the counter's rate is the number
+/// of batches decoding at once. Mirrors the scan node's `decode_time` plan
+/// metric, as a cumulative counter a scrape can read while the scan runs.
+pub const METRIC_SCAN_DECODE_TIME: &str = "lance_scan_decode_time_nanoseconds_total";
+/// Time scan partitions spent waiting for their next batch's I/O to be
+/// scheduled, in nanoseconds, labelled like [`METRIC_SCAN_DECODE_TIME`].
+/// Mirrors the scan node's `task_wait_time` plan metric.
+pub const METRIC_SCAN_TASK_WAIT_TIME: &str = "lance_scan_task_wait_time_nanoseconds_total";
+
+/// A cumulative counter on the `metrics` facade carrying a store's labels; see
+/// [`ObjectStore::counter`]. A no-op without the `metrics` feature.
+pub struct StoreCounter(#[cfg(feature = "metrics")] ::metrics::Counter);
+
+impl StoreCounter {
+    /// Add `value` to the counter. This is a no-op without the `metrics`
+    /// feature.
+    pub fn increment(&self, value: u64) {
+        #[cfg(feature = "metrics")]
+        self.0.increment(value);
+        #[cfg(not(feature = "metrics"))]
+        let _ = value;
     }
 }
 

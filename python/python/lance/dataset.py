@@ -956,6 +956,46 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.has_stable_row_ids
 
+    def get_row_addresses(
+        self, row_ids: Union[List[int], pa.Array, pa.ChunkedArray]
+    ) -> pa.UInt64Array:
+        """
+        Resolve row IDs to their current row addresses, in input order.
+
+        A row address is ``(fragment_id << 32) | offset``. With stable row IDs,
+        null, unknown and deleted IDs come back as null. Without stable row IDs,
+        row IDs are row addresses, so each non-null ID is returned unchanged.
+
+        Parameters
+        ----------
+        row_ids : list of int, pyarrow.Array or pyarrow.ChunkedArray
+            Row IDs from ``_rowid``. Integer arrays are cast to uint64, so
+            negative values raise an error.
+
+        Returns
+        -------
+        pyarrow.UInt64Array
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"x": [1, 2, 3]})
+        >>> ds = lance.write_dataset(
+        ...     table, "memory://get_row_addresses", enable_stable_row_ids=True
+        ... )
+        >>> _ = ds.delete("x = 2")
+        >>> ds.get_row_addresses([0, 1, 2, 100]).to_pylist()
+        [0, None, 2, None]
+        """
+        if isinstance(row_ids, pa.ChunkedArray):
+            row_ids = row_ids.combine_chunks()
+        if isinstance(row_ids, pa.Array):
+            row_ids = row_ids.cast(pa.uint64())
+        else:
+            row_ids = pa.array(row_ids, type=pa.uint64())
+        return pa.array(self._ds.row_ids_to_row_addrs(row_ids))
+
     @property
     def max_field_id(self) -> int:
         """
@@ -3436,6 +3476,8 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+            This option is not supported with the ``ngram`` tokenizer when creating
+            a new index.
         block_size: int, default 128
             This is for the ``INVERTED`` index. Number of documents per compressed
             posting block. Must be one of ``128`` or ``256``.
@@ -3704,6 +3746,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
+            "IVF_HNSW_RQ",
             "IVF_RQ",
         ]
         if index_type not in valid_index_types:
@@ -4171,7 +4214,7 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
@@ -4351,7 +4394,7 @@ class LanceDataset(pa.dataset.Dataset):
           interprets partition ids within that segment. Keep independently
           trained segments as separate physical segments unless the merge
           workflow can preserve or reconcile the model state.
-        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+        - ``rabitq_model`` (``IVF_RQ`` and ``IVF_HNSW_RQ``): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
           rotation so every segment rotates vectors the same way. If omitted, each

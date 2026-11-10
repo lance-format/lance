@@ -49,6 +49,14 @@ message FilteredReadThreadingModeProto {
 
 // Serializable form of FilteredReadOptions.
 message FilteredReadOptionsProto {
+  enum ListReadMode {
+    LIST_READ_MODE_UNSPECIFIED = 0;
+    // Preserve exact outer list lengths and validity without element payloads.
+    LIST_READ_MODE_LENGTH = 1;
+    // Preserve outer validity and emptiness; nonempty lengths may become one.
+    LIST_READ_MODE_NON_EMPTY = 2;
+  }
+
   optional U64Range scan_range_before_filter = 1;
   optional U64Range scan_range_after_filter = 2;
   bool with_deleted_rows = 3;
@@ -84,6 +92,21 @@ message FilteredReadOptionsProto {
    * refer to the exact dataset snapshot used to plan the scan.
    */
   optional bytes physical_row_addr_allowlist = 15;
+  /* List field IDs whose consumers need only the specified structural property.
+   * Element values are placeholders and must not be consumed or returned.
+   * An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+   * Older executors may ignore this field and read full values, preserving results
+   * but losing the optimization. These modes apply only to this read, not the dataset.
+   */
+  map<int32, ListReadMode> list_structure = 16;
+  /* If true, fragment_ids is an explicit fragment selection and may be empty
+   * ("read no fragments"). If false or absent (older planners), an empty
+   * fragment_ids list means no fragment selection; a repeated field alone
+   * cannot distinguish the two. A non-empty list is a selection regardless of
+   * this field. Older executors ignore this field and treat an empty list as
+   * no selection.
+   */
+  optional bool has_fragment_ids = 17;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).

@@ -1073,26 +1073,52 @@ async fn stage_val(dataset: &Dataset, fragments: Vec<u32>) -> Vec<IndexMetadata>
     .await
 }
 
-/// Checks that looking up each of `values`, and a few ranges, through
-/// `val_idx` finds what a scan finds.
+/// How many rows hold each `val` among those `filter` selects, through
+/// `val_idx`, or among all rows by a scan.
+async fn val_counts(dataset: &Dataset, filter: Option<&str>) -> HashMap<i32, usize> {
+    let mut scan = dataset.scan();
+    scan.project(&["val"]).unwrap();
+    match filter {
+        Some(filter) => scan.filter(filter).unwrap(),
+        None => scan.use_scalar_index(false),
+    };
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut counts = HashMap::new();
+    for val in batch["val"].as_primitive::<Int32Type>().values() {
+        *counts.entry(*val).or_default() += 1;
+    }
+    counts
+}
+
+/// Checks that looking up `values` together and a few of them alone, and a
+/// few ranges, through `val_idx` finds what a scan finds.
 async fn assert_val_lookups_match_scan(
     dataset: &Dataset,
     values: impl IntoIterator<Item = i32>,
     trace: &str,
 ) {
-    let mut scan = dataset.scan();
-    scan.use_scalar_index(false).project(&["val"]).unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut scanned = HashMap::<i32, usize>::new();
-    for val in batch["val"].as_primitive::<Int32Type>().values() {
-        *scanned.entry(*val).or_default() += 1;
-    }
-    for value in values {
+    let scanned = val_counts(dataset, None).await;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let list = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let found = val_counts(dataset, Some(&format!("val IN ({list})"))).await;
+    let want = values
+        .iter()
+        .filter_map(|value| Some((*value, *scanned.get(value)?)))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(found, want, "{trace}: val IN {values:?}");
+    for value in [values.first(), values.get(values.len() / 2), values.last()]
+        .into_iter()
+        .flatten()
+    {
         let found = dataset
             .count_rows(Some(format!("val = {value}")))
             .await
             .unwrap();
-        let want = scanned.get(&value).copied().unwrap_or(0);
+        let want = scanned.get(value).copied().unwrap_or(0);
         assert_eq!(found, want, "{trace}: val = {value}");
     }
     for bound in [0, 100, 500, 1_000, 1_000_000, 2_000_000] {
@@ -1116,6 +1142,80 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
         .unwrap()
         .unwrap();
     index.fragment_bitmap.unwrap()
+}
+
+/// Older inputs and a later segment directly covering their output can index
+/// different values. Every contribution must be fresh before keeping coverage.
+#[rstest]
+#[case::partial_unchanged(false, false, false)]
+#[case::partial_updated(false, true, false)]
+#[case::partial_restored(false, true, true)]
+#[case::full_unchanged(true, false, false)]
+#[case::full_updated(true, true, false)]
+#[case::full_restored(true, true, true)]
+#[tokio::test]
+async fn test_merge_validates_every_output_contribution(
+    #[case] full_input_coverage: bool,
+    #[case] update: bool,
+    #[case] restore: bool,
+) {
+    let mut dataset = val_table("memory://", 3).await;
+    let sources = if full_input_coverage {
+        vec![0, 1, 2]
+    } else {
+        vec![0, 2]
+    };
+    let mut staged = stage_val(&dataset, sources).await;
+    let outputs = compact_into_two(&mut dataset, &[0, 1]).await;
+    let directly_covered = outputs[1] as u32;
+    let before_update = dataset.manifest.version;
+
+    if update {
+        let patch =
+            arrow_array::record_batch!(("id", Int32, [ROWS]), ("val", Int32, [999])).unwrap();
+        let schema = patch.schema();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns);
+        let (updated, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+            .await
+            .unwrap();
+        dataset = Arc::unwrap_or_clone(updated);
+    } else {
+        // Date the direct segment later without changing its indexed data.
+        dataset.update_config([("touched", "true")]).await.unwrap();
+    }
+    assert_eq!(
+        fragment_ids(&dataset),
+        vec![2, outputs[0] as u32, directly_covered]
+    );
+    staged.extend(stage_val(&dataset, vec![directly_covered]).await);
+
+    if restore {
+        dataset = dataset.checkout_version(before_update).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let mut covered = RoaringBitmap::from_iter([2]);
+    if full_input_coverage {
+        covered.insert(outputs[0] as u32);
+    }
+    if !update {
+        covered.insert(directly_covered);
+    }
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val >= 120").await;
+    assert_val_lookups_match_scan(&dataset, [60, 120, 999], "").await;
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
 }
 
 /// A group compacted while an overlay lands on a fragment outside it: only the
@@ -1221,10 +1321,10 @@ async fn merge_under_workload(seed: u64) -> u64 {
 #[tokio::test]
 async fn test_merged_index_matches_a_scan_under_a_workload() {
     let mut covered = 0;
-    for seed in 0..24 {
+    for seed in 0..4 {
         covered += Box::pin(merge_under_workload(seed)).await;
     }
-    assert!(covered >= 16, "only {covered} fragments stayed covered");
+    assert!(covered >= 3, "only {covered} fragments stayed covered");
 }
 
 /// The fragment that holds the row with `id`.

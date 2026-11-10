@@ -26,6 +26,7 @@ lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
+lance-geo = { workspace = true, optional = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
@@ -175,7 +176,7 @@ tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 # Publish object store and memory metrics via the `metrics` crate.
 metrics = ["lance-core/metrics", "lance-io/metrics"]
-geo = ["lance-datafusion/geo", "lance-index/geo"]
+geo = ["dep:lance-geo", "lance-datafusion/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 # Expose internal update-join controls to the dedicated benchmark target.
@@ -231,6 +232,10 @@ harness = false
 
 [[bench]]
 name = "count_pushdown"
+harness = false
+
+[[bench]]
+name = "list_structure"
 harness = false
 
 [[bench]]
@@ -368,6 +373,10 @@ harness = false
 
 [[bench]]
 name = "hamming_ivf_training"
+harness = false
+
+[[bench]]
+name = "cleanup"
 harness = false
 
 [lints]
