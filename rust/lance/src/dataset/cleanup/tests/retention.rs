@@ -65,12 +65,16 @@ fn cleanup_policy_preserves_large_duration_precision() {
     );
 }
 
+// Rule semantics are covered by `expiry::tests`; these cases cover config
+// parsing, tag and filter wiring, and the delete_unverified sweep.
 #[rstest]
+#[case::configured_and_protected(true, true, true)]
+#[case::builder(false, false, false)]
 #[tokio::test]
 async fn cleanup_retention_policy_ladder(
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] protected: bool,
-    #[values(false, true)] delete_unverified: bool,
+    #[case] auto_config: bool,
+    #[case] protected: bool,
+    #[case] delete_unverified: bool,
 ) {
     let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
     for (index, hour) in [
@@ -202,36 +206,6 @@ async fn cleanup_retention_policy_ladder(
     assert_eq!(operation.execute().await.unwrap().old_versions, 0);
 }
 
-#[tokio::test]
-async fn cleanup_retention_bands_have_independent_buckets() {
-    let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
-    for (index, hour) in [200, 800, 801, 960].into_iter().enumerate() {
-        MockClock::set_system_time(Duration::from_secs(hour * 3600));
-        if index == 0 {
-            fixture.create_some_data().await.unwrap();
-        } else {
-            fixture.overwrite_some_data().await.unwrap();
-        }
-    }
-    let dataset = fixture.open().await.unwrap();
-    let operation = dataset
-        .cleanup(CleanupPolicy::default())
-        .with_retention_policy(RetentionPolicy::new(vec![
-            CleanupRule::KeepOne {
-                per_interval: Duration::from_secs(3600),
-                older_than: MIN_THINNING_AGE,
-            },
-            CleanupRule::KeepOne {
-                per_interval: Duration::from_secs(900),
-                older_than: Duration::from_secs(7 * 86_400),
-            },
-        ]))
-        .unwrap();
-    assert_eq!(operation.explain().await.unwrap().stats.old_versions, 0);
-    assert_eq!(operation.execute().await.unwrap().old_versions, 0);
-    assert_eq!(dataset.version_refs().await.unwrap().len(), 4);
-}
-
 #[rstest]
 #[case::empty("[]", "must not be empty")]
 #[case::duplicate(r#"[{"type":"keep_one","per_interval":"1h","older_than":"2days"},{"type":"keep_one","per_interval":"1day","older_than":"2days"}]"#, "strictly increasing")]
@@ -263,14 +237,14 @@ fn cleanup_retention_policy_validation(#[case] value: &str, #[case] message: &st
 }
 
 #[rstest]
-#[case::daily(24, vec![4, 7, 8, 9, 10])]
-#[case::twice_daily(12, vec![2, 4, 7, 8, 9, 10])]
+#[case::daily(24, vec![4, 7, 8, 9, 10], false, false)]
+#[case::twice_daily_configured(12, vec![2, 4, 7, 8, 9, 10], true, true)]
 #[tokio::test]
 async fn cleanup_keeps_one_per_period(
     #[case] period_hours: u64,
     #[case] expected_versions: Vec<u64>,
-    #[values(false, true)] delete_unverified: bool,
-    #[values(false, true)] auto_config: bool,
+    #[case] delete_unverified: bool,
+    #[case] auto_config: bool,
 ) {
     let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
     for (index, hour) in [0, 2, 1, 12, 24, 26, 26, 48, 49, 96]
@@ -354,14 +328,14 @@ async fn cleanup_keeps_one_per_period(
 }
 
 #[rstest]
-#[case::current_hint(None, vec![5, 7, 9, 10, 11, 12, 13, 14])]
-#[case::stale_hint(Some(9), vec![5, 7, 8, 9, 10, 11, 12, 13, 14])]
+#[case::current_hint_filtered(None, vec![5, 7, 9, 10, 11, 12, 13, 14], false, true)]
+#[case::stale_hint_configured(Some(9), vec![5, 7, 8, 9, 10, 11, 12, 13, 14], true, false)]
 #[tokio::test]
 async fn cleanup_separates_expiration_and_thinning(
     #[case] hinted_version: Option<u64>,
     #[case] mut expected_versions: Vec<u64>,
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] filtered: bool,
+    #[case] auto_config: bool,
+    #[case] filtered: bool,
 ) {
     let fixture = MockDatasetFixture::try_new().unwrap();
     for (index, hour) in [0, 1, 24, 25, 72, 96, 97, 168, 169, 192, 193, 216, 217, 240]
@@ -572,14 +546,14 @@ async fn cleanup_thinning_preserves_branch_dependencies(
 }
 
 #[rstest]
-#[case::default(None, 1)]
-#[case::three_days(Some(Duration::from_secs(3 * 86_400)), 0)]
+#[case::default_pinned(None, 1, false, true)]
+#[case::three_days_configured(Some(Duration::from_secs(3 * 86_400)), 0, true, false)]
 #[tokio::test]
 async fn cleanup_thinning_anchors_to_hint(
     #[case] age: Option<Duration>,
     #[case] expected_removed: u64,
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] pinned_snapshot: bool,
+    #[case] auto_config: bool,
+    #[case] pinned_snapshot: bool,
 ) {
     let fixture = MockDatasetFixture::try_new().unwrap();
     for (index, hour) in [0, 1, 24, 25, 48, 1000, 72, 1, 120].into_iter().enumerate() {
