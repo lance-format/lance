@@ -5035,11 +5035,16 @@ async fn minhash_ids(dataset: &Dataset, text: &str, fast_search: bool) -> crate:
 }
 
 #[rstest]
+#[case::single_task(2, 1)]
+#[case::multiple_tasks(1, 2)]
 #[tokio::test]
 async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     #[values(false, true)] stable_row_ids: bool,
+    #[case] task_limit: u64,
+    #[case] task_count: usize,
 ) {
     let mut dataset = create_text_dataset(stable_row_ids).await;
+    let index_name = "text_idx";
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::MinHashLsh)
         .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 1}));
     dataset
@@ -5051,6 +5056,7 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         1
     );
 
+    let source_version = dataset.load_indices_by_name(index_name).await.unwrap()[0].dataset_version;
     let dataset = commit_overlay(
         dataset,
         "minhash_row_level",
@@ -5112,4 +5118,59 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         ids_from_batches(&[scan.try_into_batch().await.unwrap()]),
         vec![8]
     );
+
+    // The single task refreshes old signatures as it absorbs the source.
+    // Multiple tasks pass the source to a physical merge that preserves its version.
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let added = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![12, 13])),
+            Arc::new(StringArray::from(vec!["olive brine", "papaya lime"])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(added)], schema),
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let options = OptimizeOptions::merge(1).max_rows_per_task(Some(task_limit));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), task_count);
+    let single_task = task_count == 1;
+    dataset.object_store.io_stats_incremental();
+    dataset.optimize_indices(&options).await.unwrap();
+    let merged = dataset.load_indices_by_name(index_name).await.unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged[0].dataset_version,
+        if single_task {
+            plan.read_version
+        } else {
+            source_version
+        }
+    );
+    if !single_task {
+        let requests = dataset.object_store.io_stats_incremental().requests;
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.as_ref().ends_with("minhash_row_level.lance"))
+        );
+    }
+
+    let ids = minhash_ids(&dataset, "apple banana", false).await.unwrap();
+    assert!(!ids.contains(&1), "{ids:?}");
+    let hits = minhash_ids(&dataset, "cherry mango", single_task)
+        .await
+        .unwrap();
+    assert_eq!(hits.first(), Some(&1), "{hits:?}");
 }
