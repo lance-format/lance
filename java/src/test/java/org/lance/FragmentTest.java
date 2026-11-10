@@ -81,6 +81,18 @@ public class FragmentTest {
     assertArrayEquals(inlineBytes, inline.getInline());
     assertNull(inline.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+
+    String explicitPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin";
+    DeletionFile explicit =
+        new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, null, explicitPath);
+    assertEquals(explicitPath, explicit.getRelativePath(5));
+    assertEquals(Optional.of(explicitPath), explicit.getPath());
+    assertEquals(Optional.empty(), bitmap.getPath());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new DeletionFile(
+                7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes, explicitPath));
   }
 
   @Test

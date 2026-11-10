@@ -37,6 +37,8 @@ class DeletionFile:
         file_type: Literal["array", "bitmap"],
         num_deleted_rows: int,
         base_id: Optional[int] = None,
+        inline: Optional[bytes] = None,
+        path: Optional[str] = None,
     ): ...
     def asdict(self) -> dict:
         """Get a dictionary representation of the deletion file."""
@@ -48,7 +50,8 @@ class DeletionFile:
         Parameters
         ----------
         fragment_id : int
-            The fragment id.
+            The id of the fragment that owns the file. Ignored when the file
+            has an explicit path.
         base_uri : str, optional
             The base URI to use for the path. If not provided, a relative path
             is returned.

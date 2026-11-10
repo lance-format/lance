@@ -34,7 +34,8 @@ use lance_core::is_system_column;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
 use lance_table::format::{
-    DataFile, DeletionFile, DeletionFileType, Fragment, RowDatasetVersionMeta, RowIdMeta,
+    DataFile, DeletionFile, DeletionFilePath, DeletionFileType, Fragment, RowDatasetVersionMeta,
+    RowIdMeta,
 };
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
@@ -862,7 +863,7 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
-    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None, path=None))]
     fn new(
         read_version: u64,
         id: u64,
@@ -870,6 +871,7 @@ impl PyDeletionFile {
         num_deleted_rows: usize,
         base_id: Option<u32>,
         inline: Option<Vec<u8>>,
+        path: Option<String>,
     ) -> PyResult<Self> {
         let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
@@ -882,12 +884,22 @@ impl PyDeletionFile {
                 )));
             }
         };
+        if path.is_some() && inline.is_some() {
+            return Err(PyValueError::new_err(
+                "a deletion file cannot set both path and inline",
+            ));
+        }
+        let path = path
+            .map(|path| DeletionFilePath::try_new(&path, &file_type))
+            .transpose()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Ok(Self(DeletionFile {
             read_version,
             id,
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            path,
             inline,
         }))
     }
@@ -911,6 +923,12 @@ impl PyDeletionFile {
             None => slf.py().None(),
         };
         dict.set_item(intern!(slf.py(), "inline"), inline)?;
+        if let Some(path) = &slf.0.path {
+            dict.set_item(
+                intern!(slf.py(), "path"),
+                path.relative_path(&slf.0.file_type),
+            )?;
+        }
 
         Ok(dict)
     }

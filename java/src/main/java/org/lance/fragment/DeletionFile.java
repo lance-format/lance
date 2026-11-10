@@ -29,10 +29,11 @@ public class DeletionFile implements Serializable {
   private final DeletionFileType fileType;
   private final Integer baseId;
   private final byte[] inline;
+  private final String path;
 
   public DeletionFile(
       long id, long readVersion, Long numDeletedRows, DeletionFileType fileType, Integer baseId) {
-    this(id, readVersion, numDeletedRows, fileType, baseId, null);
+    this(id, readVersion, numDeletedRows, fileType, baseId, null, null);
   }
 
   /**
@@ -48,12 +49,32 @@ public class DeletionFile implements Serializable {
       DeletionFileType fileType,
       Integer baseId,
       byte[] inline) {
+    this(id, readVersion, numDeletedRows, fileType, baseId, inline, null);
+  }
+
+  /**
+   * @param path explicit path relative to the dataset root, {@code _deletions/{uuid}.arrow} or
+   *     {@code _deletions/{uuid}.bin}, or null to derive the location from the fragment id
+   */
+  public DeletionFile(
+      long id,
+      long readVersion,
+      Long numDeletedRows,
+      DeletionFileType fileType,
+      Integer baseId,
+      byte[] inline,
+      String path) {
+    if (inline != null && path != null) {
+      throw new IllegalArgumentException(
+          "a deletion file cannot set both path and inline");
+    }
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
     this.fileType = fileType;
     this.baseId = baseId;
     this.inline = inline == null ? null : inline.clone();
+    this.path = path;
   }
 
   public long getId() {
@@ -84,6 +105,10 @@ public class DeletionFile implements Serializable {
     return inline == null ? null : inline.clone();
   }
 
+  public Optional<String> getPath() {
+    return Optional.ofNullable(path);
+  }
+
   /**
    * Returns the deletion file path relative to its dataset-root base.
    *
@@ -93,6 +118,9 @@ public class DeletionFile implements Serializable {
   public String getRelativePath(long fragmentId) {
     if (fragmentId < 0) {
       throw new IllegalArgumentException("fragmentId must be non-negative");
+    }
+    if (path != null) {
+      return path;
     }
     if (inline != null) {
       return null;
@@ -128,12 +156,14 @@ public class DeletionFile implements Serializable {
         && fileType == that.fileType
         && Objects.equals(numDeletedRows, that.numDeletedRows)
         && Objects.equals(baseId, that.baseId)
-        && Arrays.equals(inline, that.inline);
+        && Arrays.equals(inline, that.inline)
+        && Objects.equals(path, that.path);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(id, readVersion, numDeletedRows, fileType, baseId, Arrays.hashCode(inline));
+    return Objects.hash(
+        id, readVersion, numDeletedRows, fileType, baseId, Arrays.hashCode(inline), path);
   }
 
   @Override
@@ -145,6 +175,7 @@ public class DeletionFile implements Serializable {
         .add("fileType", fileType)
         .add("baseId", baseId)
         .add("inlineBytes", inline == null ? null : inline.length)
+        .add("path", path)
         .toString();
   }
 }
