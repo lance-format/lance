@@ -440,6 +440,23 @@ impl ExprFilter {
         full_schema: &Schema,
         full_arrow_schema: SchemaRef,
     ) -> Result<Expr> {
+        let parsed =
+            self.parse_with_arrow(dataset_schema, full_schema, full_arrow_schema.clone())?;
+        self.optimize_parsed(parsed, dataset_schema, full_arrow_schema)
+    }
+
+    /// The first half of [`Self::to_datafusion_with_arrow`]: parsed and
+    /// type-checked, not yet simplified.
+    ///
+    /// Simplification evaluates stable functions such as `now()`, so only this
+    /// half may be reused across plans.
+    #[cfg_attr(not(feature = "substrait"), allow(unused_variables))]
+    pub(crate) fn parse_with_arrow(
+        &self,
+        dataset_schema: &Schema,
+        full_schema: &Schema,
+        full_arrow_schema: SchemaRef,
+    ) -> Result<Expr> {
         match self {
             Self::Sql(sql) => {
                 let schema = full_arrow_schema;
@@ -454,28 +471,17 @@ impl ExprFilter {
                         format!("The filter {} does not return a boolean", filter).into(),
                     ));
                 }
-
-                let optimized = planner.optimize_expr(filter).map_err(|e| {
-                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
-                })?;
-                Ok(optimized)
+                Ok(filter)
             }
             #[cfg(feature = "substrait")]
             Self::Substrait(expr) => {
                 use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
 
                 let ctx = get_session_context(&LanceExecutionOptions::default());
-                let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
+                parse_substrait(expr, schema, &ctx.state())
                     .now_or_never()
-                    .expect("could not parse the Substrait filter in a synchronous fashion")?;
-                let planner = Planner::new(schema);
-                planner.optimize_expr(expr.clone()).map_err(|e| {
-                    Error::invalid_input(format!(
-                        "Error optimizing substrait filter: {expr:?} ({e})"
-                    ))
-                })
+                    .expect("could not parse the Substrait filter in a synchronous fashion")
             }
             #[cfg(not(feature = "substrait"))]
             Self::Substrait(_) => Err(Error::not_supported_source(
@@ -484,9 +490,35 @@ impl ExprFilter {
             Self::Datafusion(expr) => Ok(expr.clone()),
         }
     }
+
+    /// The second half of [`Self::to_datafusion_with_arrow`], applied to the
+    /// output of [`Self::parse_with_arrow`].
+    pub(crate) fn optimize_parsed(
+        &self,
+        parsed: Expr,
+        dataset_schema: &Schema,
+        full_arrow_schema: SchemaRef,
+    ) -> Result<Expr> {
+        match self {
+            Self::Sql(sql) => Planner::new(full_arrow_schema)
+                .optimize_expr(parsed)
+                .map_err(|e| {
+                    Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
+                }),
+            Self::Substrait(_) => {
+                let planner = Planner::new(Arc::new(ArrowSchema::from(dataset_schema)));
+                planner.optimize_expr(parsed.clone()).map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Error optimizing substrait filter: {parsed:?} ({e})"
+                    ))
+                })
+            }
+            Self::Datafusion(_) => Ok(parsed),
+        }
+    }
 }
 
-/// The last expression filter a scanner or its clones converted, with its inputs.
+/// The last expression filter a scanner or its clones parsed, with its inputs.
 ///
 /// Planning a scan converts the filter several times. Filterable schemas are
 /// cached per manifest and extra columns, so the identity of the one held here
