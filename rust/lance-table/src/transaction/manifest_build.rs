@@ -940,6 +940,15 @@ impl Transaction {
                     self.uuid
                 )));
             }
+            Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => {
+                return Err(Error::not_supported(format!(
+                    "{} cannot be committed: retention lease operations are not wired into \
+                     the commit path yet",
+                    self.operation.name()
+                )));
+            }
             Operation::Append { fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -2495,7 +2504,10 @@ impl Transaction {
             | Operation::ReserveFragments { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
-            | Operation::UpdateMemWalState { .. } => Some(vec![]),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => Some(vec![]),
             Operation::Overwrite { .. }
             | Operation::Merge { .. }
             | Operation::Project { .. }

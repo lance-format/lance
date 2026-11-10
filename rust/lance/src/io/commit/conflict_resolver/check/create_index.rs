@@ -502,7 +502,10 @@ impl<'a> TransactionRebase<'a> {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
                 // An unrecognized operation may touch anything: assume it conflicts.
-                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                Operation::AcquireLease { .. }
+                | Operation::RenewLease { .. }
+                | Operation::ReleaseLease { .. }
+                | Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))

@@ -24,6 +24,7 @@
 //! index_maintenance  how that narrows or drops index metadata
 //! row_version        how it assigns row ids and per-row version metadata
 //! conflicts          whether two operations collide, for the commit retry path
+//! retention_leases   deriving the lease list a commit writes
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
 
@@ -34,6 +35,7 @@ mod manifest_build;
 mod operation;
 mod prepare;
 mod proto;
+mod retention_leases;
 mod row_version;
 mod update_map;
 mod validate;
@@ -48,6 +50,7 @@ pub use operation::{
     TaggedRewriteAssembly, UpdateMode, UpdatedFragmentOffsets, reordered_sources,
 };
 pub use prepare::{FragReuseUpdate, PreparedIndices};
+pub use retention_leases::{LeaseChange, derive_retention_leases};
 pub use row_version::has_writer_placed_lineage;
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,

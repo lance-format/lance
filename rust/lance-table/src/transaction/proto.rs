@@ -12,6 +12,7 @@ use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
 use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
+use crate::format::{timestamp_from_pb, timestamp_to_pb, uuid_from_pb};
 use crate::system_index::mem_wal::CompactedSsTable;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
@@ -411,11 +412,29 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            // Reserved format operations remain unsupported until runtime
-            // handling is implemented. Unknown operations fail closed.
-            Some(pb::transaction::Operation::AcquireLease(_))
-            | Some(pb::transaction::Operation::RenewLease(_))
-            | Some(pb::transaction::Operation::ReleaseLease(_)) => Operation::Unknown {},
+            Some(pb::transaction::Operation::AcquireLease(pb::transaction::AcquireLease {
+                lease_id,
+                created_at,
+                expires_at,
+                label,
+            })) => Operation::AcquireLease {
+                lease_id: uuid_from_pb(lease_id.as_ref(), "AcquireLease lease_id")?,
+                created_at: timestamp_from_pb(created_at.as_ref(), "AcquireLease created_at")?,
+                expires_at: timestamp_from_pb(expires_at.as_ref(), "AcquireLease expires_at")?,
+                label: label.filter(|label| !label.is_empty()),
+            },
+            Some(pb::transaction::Operation::RenewLease(pb::transaction::RenewLease {
+                lease_id,
+                expires_at,
+            })) => Operation::RenewLease {
+                lease_id: uuid_from_pb(lease_id.as_ref(), "RenewLease lease_id")?,
+                expires_at: timestamp_from_pb(expires_at.as_ref(), "RenewLease expires_at")?,
+            },
+            Some(pb::transaction::Operation::ReleaseLease(pb::transaction::ReleaseLease {
+                lease_id,
+            })) => Operation::ReleaseLease {
+                lease_id: uuid_from_pb(lease_id.as_ref(), "ReleaseLease lease_id")?,
+            },
             Some(pb::transaction::Operation::CompositeOperation(_)) => {
                 // This version of Lance recognizes action-based transactions
                 // (Transaction V2) but has no support for them yet: reject on
@@ -740,6 +759,29 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::AcquireLease {
+                lease_id,
+                created_at,
+                expires_at,
+                label,
+            } => pb::transaction::Operation::AcquireLease(pb::transaction::AcquireLease {
+                lease_id: Some(lease_id.into()),
+                created_at: Some(timestamp_to_pb(created_at)),
+                expires_at: Some(timestamp_to_pb(expires_at)),
+                label: label.clone(),
+            }),
+            Operation::RenewLease {
+                lease_id,
+                expires_at,
+            } => pb::transaction::Operation::RenewLease(pb::transaction::RenewLease {
+                lease_id: Some(lease_id.into()),
+                expires_at: Some(timestamp_to_pb(expires_at)),
+            }),
+            Operation::ReleaseLease { lease_id } => {
+                pb::transaction::Operation::ReleaseLease(pb::transaction::ReleaseLease {
+                    lease_id: Some(lease_id.into()),
+                })
+            }
             Operation::Unknown { .. } => {
                 return Err(Error::not_supported(format!(
                     "Transaction {} has an operation written by a newer version of Lance \
@@ -858,26 +900,73 @@ mod tests {
     use prost::Message;
 
     #[rstest::rstest]
-    #[case::acquire(pb::transaction::Operation::AcquireLease(Default::default()))]
-    #[case::renew(pb::transaction::Operation::RenewLease(Default::default()))]
-    #[case::release(pb::transaction::Operation::ReleaseLease(Default::default()))]
-    fn test_retention_lease_operations_remain_unsupported(
+    #[case::acquire(Operation::AcquireLease {
+        lease_id: Uuid::from_u128(1),
+        created_at: chrono::DateTime::from_timestamp(10, 5).unwrap(),
+        expires_at: chrono::DateTime::from_timestamp(20, 0).unwrap(),
+        label: Some("index build".to_string()),
+    })]
+    #[case::acquire_unlabeled(Operation::AcquireLease {
+        lease_id: Uuid::from_u128(1),
+        created_at: chrono::DateTime::from_timestamp(10, 0).unwrap(),
+        expires_at: chrono::DateTime::from_timestamp(20, 0).unwrap(),
+        label: None,
+    })]
+    #[case::renew(Operation::RenewLease {
+        lease_id: Uuid::from_u128(2),
+        expires_at: chrono::DateTime::from_timestamp(30, 0).unwrap(),
+    })]
+    #[case::release(Operation::ReleaseLease {
+        lease_id: Uuid::from_u128(3),
+    })]
+    fn test_retention_lease_operations_roundtrip(#[case] operation: Operation) {
+        let transaction = Transaction::new_from_version(12, operation);
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
+        let roundtrip = Transaction::try_from(decoded).unwrap();
+        assert_eq!(roundtrip, transaction);
+    }
+
+    #[rstest::rstest]
+    #[case::acquire_missing_id(
+        pb::transaction::Operation::AcquireLease(pb::transaction::AcquireLease {
+            created_at: Some(prost_types::Timestamp::default()),
+            expires_at: Some(prost_types::Timestamp::default()),
+            ..Default::default()
+        }),
+        "AcquireLease lease_id is missing"
+    )]
+    #[case::acquire_missing_expiry(
+        pb::transaction::Operation::AcquireLease(pb::transaction::AcquireLease {
+            lease_id: Some(pb::Uuid { uuid: vec![1; 16] }),
+            created_at: Some(prost_types::Timestamp::default()),
+            ..Default::default()
+        }),
+        "AcquireLease expires_at is missing"
+    )]
+    #[case::renew_short_id(
+        pb::transaction::Operation::RenewLease(pb::transaction::RenewLease {
+            lease_id: Some(pb::Uuid { uuid: vec![1; 4] }),
+            expires_at: Some(prost_types::Timestamp::default()),
+        }),
+        "RenewLease lease_id must be 16 bytes, got 4 bytes"
+    )]
+    #[case::release_missing_id(
+        pb::transaction::Operation::ReleaseLease(Default::default()),
+        "ReleaseLease lease_id is missing"
+    )]
+    fn test_retention_lease_operations_reject_incomplete_records(
         #[case] operation: pb::transaction::Operation,
+        #[case] message: &str,
     ) {
-        let message = pb::Transaction {
+        let transaction = pb::Transaction {
             read_version: 12,
-            uuid: "lease-operation".to_string(),
+            uuid: Uuid::new_v4().to_string(),
             operation: Some(operation),
             ..Default::default()
         };
-        let decoded = pb::Transaction::decode(message.encode_to_vec().as_slice()).unwrap();
-        let transaction = Transaction::try_from(decoded).unwrap();
-        assert!(matches!(transaction.operation, Operation::Unknown {}));
-        assert_eq!(transaction.read_version, 12);
-        assert_eq!(transaction.uuid, "lease-operation");
-        let error = pb::Transaction::try_from(&transaction).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("cannot be re-encoded"));
+        let error = Transaction::try_from(transaction).unwrap_err();
+        assert!(error.to_string().contains(message), "got: {error}");
     }
 
     #[test]

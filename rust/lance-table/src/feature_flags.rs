@@ -137,7 +137,8 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 /// Writer-only retention requirements for retention leases in the current manifest.
-/// Reserved and unsupported until lease-aware writes and maintenance are implemented.
+/// Set exactly when `Manifest::retention_leases` is nonempty. Unsupported until
+/// lease-aware writes and maintenance are implemented.
 /// Ordinary reads do not require support for the lease metadata.
 pub const FLAG_RETENTION_LEASES: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
@@ -335,6 +336,10 @@ pub fn apply_feature_flags(
 
     if disable_transaction_file {
         manifest.writer_feature_flags |= FLAG_DISABLE_TRANSACTION_FILE;
+    }
+
+    if !manifest.retention_leases.is_empty() {
+        manifest.writer_feature_flags |= FLAG_RETENTION_LEASES;
     }
 
     if non_reusable_field_ids {
@@ -582,7 +587,7 @@ pub fn ensure_can_write_manifest(manifest: &Manifest) -> Result<()> {
             .into(),
         ));
     }
-    Ok(())
+    validate_retention_leases(manifest)
 }
 
 pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
@@ -643,6 +648,32 @@ pub fn validate_non_reusable_field_id_flags(manifest: &Manifest) -> Result<()> {
         return Err(Error::corrupt_file_named(
             "manifest",
             "Manifest has a non-reusable-field-ID reader feature flag, but non-reusable field IDs only require writer support",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a lease list that writers must not carry forward: an invalid or
+/// duplicate record, or a list whose writer flag disagrees with it. Readers
+/// ignore the list, so this is checked only before writes.
+fn validate_retention_leases(manifest: &Manifest) -> Result<()> {
+    if let Some(error) = manifest.retention_lease_error() {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            format!("Manifest retention lease list has an invalid record: {error}"),
+        ));
+    }
+    crate::format::validate_retention_lease_ids(&manifest.retention_leases)?;
+    let listed = !manifest.retention_leases.is_empty();
+    let flagged = manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0;
+    if listed != flagged {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            format!(
+                "Manifest lists {} retention leases but the retention lease writer feature flag is {}",
+                manifest.retention_leases.len(),
+                if flagged { "set" } else { "unset" }
+            ),
         ));
     }
     Ok(())
@@ -833,6 +864,19 @@ mod tests {
             implemented_flags,
             "reserving the lease bit must not disable implemented features"
         );
+    }
+
+    #[test]
+    fn test_retention_lease_flag_follows_lease_list() {
+        let mut manifest = empty_manifest();
+        manifest.retention_leases = vec![crate::format::retention_lease::tests::lease(1, 1, 10)];
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_RETENTION_LEASES, 0);
+
+        manifest.retention_leases.clear();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & FLAG_RETENTION_LEASES, 0);
     }
 
     #[test]

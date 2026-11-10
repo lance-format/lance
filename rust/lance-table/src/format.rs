@@ -11,6 +11,7 @@ mod index;
 pub mod key_existence;
 mod manifest;
 pub mod overlay;
+pub(crate) mod retention_lease;
 mod row_ids;
 mod transaction;
 
@@ -32,6 +33,10 @@ pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
     SelfDescribingFileReader, WriterVersion, is_detached_version,
     populate_manifest_schema_dictionaries,
+};
+pub use retention_lease::RetentionLease;
+pub(crate) use retention_lease::{
+    timestamp_from_pb, timestamp_to_pb, uuid_from_pb, validate_retention_lease_ids,
 };
 pub use row_ids::{
     ExternalFile, InlineRowIds, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,

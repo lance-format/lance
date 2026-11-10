@@ -20,7 +20,7 @@ use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -1240,6 +1240,12 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        Operation::AcquireLease { .. }
+        | Operation::RenewLease { .. }
+        | Operation::ReleaseLease { .. } => Err(Error::input_error(format!(
+            "{} is not supported by the Java bindings yet",
+            operation.name()
+        ))),
         Operation::Unknown { .. } => Err(Error::input_error(
             "Cannot convert an operation written by a newer version of Lance".to_string(),
         )),
@@ -1530,11 +1536,13 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    Ok(TransactionBuilder::new(read_ver, op)
-        .uuid(uuid)
-        .tag(tag)
-        .transaction_properties(transaction_properties.map(Arc::new))
-        .build())
+    Ok(Transaction {
+        read_version: read_ver,
+        uuid,
+        operation: op,
+        tag,
+        transaction_properties: transaction_properties.map(Arc::new),
+    })
 }
 
 struct ConvertedSchema {
