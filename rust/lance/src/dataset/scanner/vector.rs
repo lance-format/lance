@@ -37,6 +37,7 @@ use lance_core::error::LanceOptionExt;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DOC_INDEX_COL;
+use lance_index::vector::warp::DEFAULT_WARP_NPROBE;
 use lance_index::vector::{DIST_COL, Query};
 use lance_linalg::distance::MetricType;
 use lance_select::RowAddrMask;
@@ -49,6 +50,7 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::io::exec::knn::warp::{WarpParams, warp_select};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
     knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
@@ -60,7 +62,9 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 
-use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
+use super::{
+    DEFAULT_XTR_OVERFETCH, FilterPlan, MultivectorAlgorithm, PlannedFilteredScan, Scanner,
+};
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
 /// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
@@ -427,8 +431,26 @@ impl Scanner {
                             "quantized refinement is not supported for multivector columns",
                         ));
                     }
-                    self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
-                        .await?
+                    match self.multivector_algorithm {
+                        MultivectorAlgorithm::Xtr => {
+                            self.multivec_ann(
+                                &q,
+                                &index_segments,
+                                filter_plan,
+                                overlay_block.clone(),
+                            )
+                            .await?
+                        }
+                        MultivectorAlgorithm::Warp => {
+                            self.multivec_warp_ann(
+                                &q,
+                                &index_segments,
+                                filter_plan,
+                                overlay_block.clone(),
+                            )
+                            .await?
+                        }
+                    }
                 }
                 _ => unreachable!(),
             };
@@ -1320,6 +1342,47 @@ impl Scanner {
         Ok(Arc::new(
             SortExec::new([sort_expr, sort_expr_row_id].into(), inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+        ))
+    }
+
+    /// Create an execution plan for WARP multivector search.
+    ///
+    /// Planned stages, unlike XTR's independent per-token ANN searches:
+    /// 1. WARPselect ([`warp_select`]): score every query token against the IVF
+    ///    centroids once, choose each token's partitions, and derive per-token
+    ///    missing-similarity estimates from the centroid scores.
+    /// 2. Candidate generation: score the compressed residuals in the selected
+    ///    partitions without decompressing them.
+    /// 3. Reduction: max-reduce scores per (token, document), then sum across
+    ///    tokens, filling gaps with the step 1 estimates, and keep the top k.
+    async fn multivec_warp_ann(
+        &self,
+        q: &Query,
+        index: &[IndexMetadata],
+        _filter_plan: &ExprFilterPlan,
+        _overlay_block: Option<RowAddrMask>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
+        let params = WarpParams {
+            nprobe: self.probe_params.nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
+            imputation_rank: self
+                .warp_imputation_rank
+                .unwrap_or(q.k * *DEFAULT_XTR_OVERFETCH as usize),
+        };
+        // TODO: move into the WARP execution node once candidate generation
+        // exists, so planning does not open index segments.
+        let _selection = warp_select(
+            &self.dataset,
+            &q.column,
+            index,
+            q.key.as_ref(),
+            dim,
+            params,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+        Err(Error::not_supported(
+            "WARP candidate generation is not implemented yet; use MultivectorAlgorithm::Xtr",
         ))
     }
 

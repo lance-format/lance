@@ -140,6 +140,26 @@ pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
     .unwrap_or(DEFAULT_XTR_OVERFETCH_VALUE)
 });
 
+/// The algorithm used to answer an indexed multivector (late-interaction) query.
+///
+/// Only affects multivector columns searched through a vector index; exact
+/// (flat) multivector search is unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MultivectorAlgorithm {
+    /// Search each query token independently, then sum per-document maxima,
+    /// imputing a token's missing score with its lowest retrieved score.
+    ///
+    /// See XTR: <https://arxiv.org/abs/2304.01982>.
+    Xtr,
+    /// Select IVF partitions per query token from centroid scores, estimate
+    /// missing scores from those centroids, and score compressed residuals
+    /// without decompressing them.
+    ///
+    /// See WARP: <https://arxiv.org/abs/2501.17788>. Not implemented yet.
+    #[default]
+    Warp,
+}
+
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
@@ -569,6 +589,9 @@ pub struct Scanner {
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
+    multivector_algorithm: MultivectorAlgorithm,
+    /// WARP's `t'`; `None` uses the token count XTR retrieves per query token.
+    warp_imputation_rank: Option<usize>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).

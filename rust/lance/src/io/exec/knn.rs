@@ -85,6 +85,7 @@ use super::utils::{
 
 mod adaptive_probe;
 mod refine;
+pub mod warp;
 
 pub use refine::BatchRefineExec;
 

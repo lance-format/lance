@@ -3801,6 +3801,45 @@ async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
 }
 
 #[tokio::test]
+async fn test_multivector_algorithm_dispatch() {
+    use crate::dataset::scanner::MultivectorAlgorithm;
+
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::ivf_flat(2, DistanceType::Cosine);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let search = |algorithm| {
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .multivector_algorithm(algorithm);
+        scanner
+    };
+
+    let xtr = search(MultivectorAlgorithm::Xtr)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(xtr.num_rows(), 10);
+
+    let err = search(MultivectorAlgorithm::Warp)
+        .try_into_batch()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::NotSupported { .. }),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_ivf_pq_delete_all_rows_lifecycle() {
     let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
     // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.

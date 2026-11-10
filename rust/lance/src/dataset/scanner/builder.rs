@@ -48,7 +48,7 @@ use crate::{Error, Result};
 use super::aggregate::AggregateExpr;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
-    QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
+    MultivectorAlgorithm, QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
 };
 
 impl Scanner {
@@ -78,6 +78,8 @@ impl Scanner {
             nearest: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
+            multivector_algorithm: MultivectorAlgorithm::default(),
+            warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -1144,6 +1146,56 @@ impl Scanner {
     /// ```
     pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
         self.quantized_refine_factor = Some(factor);
+        self
+    }
+
+    /// Choose the algorithm for indexed multivector search (default: WARP).
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::dataset::scanner::MultivectorAlgorithm;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// // Two query tokens of dimension 128, flattened.
+    /// let query = Float32Array::from(vec![0.0_f32; 256]);
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("multivector", &query, 10)?;
+    /// scanner.multivector_algorithm(MultivectorAlgorithm::Xtr);
+    /// let results = scanner.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn multivector_algorithm(&mut self, algorithm: MultivectorAlgorithm) -> &mut Self {
+        self.multivector_algorithm = algorithm;
+        self
+    }
+
+    /// Set WARP's imputation rank `t'` (must be at least 1).
+    ///
+    /// A query token imputes, for documents it never observes, an estimate of
+    /// the similarity of its `t'`-th most similar indexed token. Defaults to the
+    /// number of tokens XTR retrieves per query token, `k * LANCE_XTR_OVERFETCH`.
+    /// WARP probes [`Self::nprobes`] partitions per query token and segment,
+    /// defaulting to [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`].
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::dataset::scanner::MultivectorAlgorithm;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0_f32; 256]);
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("multivector", &query, 10)?;
+    /// scanner
+    ///     .multivector_algorithm(MultivectorAlgorithm::Warp)
+    ///     .nprobes(32)
+    ///     .warp_imputation_rank(1000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn warp_imputation_rank(&mut self, imputation_rank: usize) -> &mut Self {
+        self.warp_imputation_rank = Some(imputation_rank);
         self
     }
 
