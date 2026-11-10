@@ -20,7 +20,7 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.datafusion.rs"));
+    include!("pb/lance.datafusion.rs");
 }
 mod numeric_coercion;
 #[doc(hidden)]

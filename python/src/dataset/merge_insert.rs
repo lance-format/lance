@@ -3,6 +3,8 @@
 
 //! Python merge-insert builder.
 
+use std::sync::Arc;
+
 use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
@@ -20,6 +22,7 @@ use crate::error::PythonErrorExt;
 use crate::rt;
 use crate::utils::PyLance;
 
+use super::replayable::replayable_provider;
 use super::{Dataset, convert_reader};
 
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
@@ -228,6 +231,39 @@ impl MergeInsertBuilder {
         Ok((PyLance(transaction), stats))
     }
 
+    pub fn execute_replayable(
+        &mut self,
+        schema: PyArrowType<ArrowSchema>,
+        factory: &Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = factory.py();
+        let provider = replayable_provider(Arc::new(schema.0), factory)?;
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (new_dataset, stats) = rt()
+            .spawn(Some(py), job.execute_provider(provider))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.dataset.bind(py).borrow_mut().ds = new_dataset;
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    pub fn execute_dataset(&mut self, source: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let (dataset, stats) = rt()
+            .spawn(Some(py), job.execute_dataset(source))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.dataset.bind(py).borrow_mut().ds = dataset;
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
     /// Execute the merge insert from fully-materialized data.
     ///
     /// The data is read into memory and wrapped in an in-memory table, so retries
@@ -253,6 +289,26 @@ impl MergeInsertBuilder {
         dataset.borrow_mut().ds = new_dataset;
 
         Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    /// [`Self::execute_batches`] without committing; returns the transaction.
+    pub fn execute_uncommitted_dataset<'a>(
+        &mut self,
+        source: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        let UncommittedMergeInsert {
+            transaction, stats, ..
+        } = rt()
+            .spawn(Some(py), job.execute_uncommitted_dataset(source))?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        let stats = Self::build_stats(&stats, py)?;
+        Ok((PyLance(transaction), stats))
     }
 
     /// [`Self::execute_batches`] without committing; returns the transaction.
@@ -311,6 +367,39 @@ impl MergeInsertBuilder {
 
         rt().block_on(None, job.analyze_plan(new_data_stream))?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    pub fn analyze_plan_replayable(
+        &mut self,
+        schema: PyArrowType<ArrowSchema>,
+        factory: &Bound<'_, PyAny>,
+    ) -> PyResult<String> {
+        let provider = replayable_provider(Arc::new(schema.0), factory)?;
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        rt().spawn(Some(factory.py()), async move {
+            job.analyze_plan_provider(provider).await
+        })?
+        .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    pub fn analyze_plan_dataset(&mut self, source: &Bound<'_, PyAny>) -> PyResult<String> {
+        let py = source.py();
+        let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
+        let job = self
+            .builder
+            .clone()
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        rt().spawn(
+            Some(py),
+            async move { job.analyze_plan_dataset(source).await },
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
     /// [`Self::analyze_plan`] for fully-materialized data.

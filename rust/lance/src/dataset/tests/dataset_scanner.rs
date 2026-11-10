@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::index::vector::VectorIndexParams;
+use crate::io::exec::fts::FlatMatchFilterExec;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::ExecutionPlan;
 use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
 use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
@@ -22,6 +25,7 @@ use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
+use lance_datafusion::exec::execute_plan;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
@@ -475,6 +479,66 @@ async fn test_vector_filter_fts_search() {
         &[300, 255],
     )
     .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector query bounds them.
+    let phrase_query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+    ));
+    // Case 7: Case 3 with limit 2
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[299, 300],
+    )
+    .await;
+
+    // Case 8: Case 5 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(false)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 3 with limit 0
+    let batch = dataset
+        .scan()
+        .full_text_search(phrase_query)
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[tokio::test]
@@ -618,6 +682,83 @@ async fn test_fts_filter_vector_search() {
         .try_into_stream()
         .await;
     assert!(stream.is_err());
+
+    // Case 7: postfilter FTS filter with .limit(): the limit applies to the
+    // rows the FTS filter keeps. The five nearest rows to [298; 4] are ids
+    // 296..=300; 296..=298 hold "noop" text and are dropped by the filter. A
+    // limit pushed below the filter would only let 298 and one of the tied
+    // 297/299 reach it.
+    let postfilter_query_vector = Float32Array::from(vec![298f32, 298f32, 298f32, 298f32]);
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &postfilter_query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(false)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[299, 300],
+    )
+    .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector search picks its neighbours from them.
+    // Case 8: Case 1 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 1 with limit 0
+    let batch = dataset
+        .scan()
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[rstest]
@@ -665,7 +806,35 @@ async fn test_fts_list_postfilter_vector_search(#[case] is_large_list: bool) {
             post_filter_position < vector_search_position,
             "expected FTS to wrap the vector search as a post-filter, got:\n{plan}"
         );
-        let result = scanner.try_into_batch().await.unwrap();
+        let original = scanner.create_plan().await.unwrap();
+        let original_schema = original.schema();
+        let mut rebuilt_filters = 0;
+        let rebuilt = original
+            .transform_up(|plan| {
+                if let Some(filter) = plan.downcast_ref::<FlatMatchFilterExec>() {
+                    rebuilt_filters += 1;
+                    let filter = FlatMatchFilterExec::try_new(
+                        filter.children()[0].clone(),
+                        filter.dataset().clone(),
+                        filter.query().clone(),
+                        filter.params().clone(),
+                        filter.document_binding(),
+                        filter.preset_segments().map(|segments| segments.to_vec()),
+                    )?;
+                    return Ok(Transformed::yes(Arc::new(filter) as Arc<dyn ExecutionPlan>));
+                }
+                Ok(Transformed::no(plan))
+            })
+            .unwrap()
+            .data;
+        assert_eq!(rebuilt_filters, 1);
+        assert_eq!(rebuilt.schema(), original_schema);
+        let batches: Vec<RecordBatch> = execute_plan(rebuilt, Default::default())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let result = concat_batches(&original_schema, &batches).unwrap();
         let mut ids = result["id"]
             .as_any()
             .downcast_ref::<Int32Array>()

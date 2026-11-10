@@ -6,3 +6,5 @@ nav:
     - Versioning: versioning.md
     - Vector Search: vector-search.md
     - Full-Text Search: full-text-search.md
+  - Rust: rust.md
+  - Java: java.md

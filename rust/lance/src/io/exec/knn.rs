@@ -71,16 +71,16 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
-use crate::index::prefilter::{DatasetPreFilter, FilterLoader, mask_selects_nothing};
+use crate::index::prefilter::{DatasetPreFilter, mask_selects_nothing};
+use crate::index::vector::ivf::VectorQueryContract;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
-    PreFilterSource, SelectionVectorToPrefilter,
+    IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks, PreFilterSource,
+    build_prefilter,
 };
 
 mod adaptive_probe;
@@ -193,6 +193,28 @@ async fn find_partitions_batch_on_cpu(
     })
     .await
     .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {e}")))
+}
+
+/// Holds the segments of one search to the contract of the first one opened:
+/// merging distances ranked by different metrics or index types would rank
+/// part of the data by the wrong one, whichever path left them under one name.
+fn check_segment_contract(
+    first: &mut Option<(Uuid, VectorQueryContract)>,
+    uuid: Uuid,
+    contract: VectorQueryContract,
+) -> Result<()> {
+    match first {
+        None => {
+            *first = Some((uuid, contract));
+            Ok(())
+        }
+        Some((first_uuid, expected)) if *expected != contract => Err(Error::index(format!(
+            "vector index segments {first_uuid} ({expected}) and {uuid} ({contract}) cannot \
+             answer one search: a search ranks every segment of an index by one metric and \
+             index type; replace all segments of the index in one commit"
+        ))),
+        Some(_) => Ok(()),
+    }
 }
 
 fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusionResult<Query> {
@@ -1249,50 +1271,6 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
-/// Build the shared [`DatasetPreFilter`] for an ANN search node, executing the
-/// prefilter source (if any) for this partition. Used by both the single-query
-/// [`ANNIvfSubIndexExec`] and the batch [`ANNIvfBatchExec`] so the prefilter is
-/// wired identically (and, for a batch, built once and shared across queries).
-///
-/// `masks.overlay_block`, when `Some`, excludes rows whose index entries may be stale
-/// due to a newer data overlay (see [`DatasetPreFilter::with_overlay_block`]).
-fn build_dataset_prefilter(
-    dataset: Arc<Dataset>,
-    indices: &[IndexMetadata],
-    prefilter_source: &PreFilterSource,
-    partition: usize,
-    context: Arc<datafusion::execution::context::TaskContext>,
-    masks: PreFilterMasks,
-    metrics: &ExecutionPlanMetricsSet,
-) -> DataFusionResult<Arc<DatasetPreFilter>> {
-    let prefilter_loader = match prefilter_source {
-        PreFilterSource::FilteredRowIds(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(
-                Box::new(FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition))
-                    as Box<dyn FilterLoader>,
-            )
-        }
-        PreFilterSource::ScalarIndexQuery(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
-        }
-        PreFilterSource::None => None,
-    };
-    // AND the external row-address mask into whatever the filter produced.
-    let prefilter_loader = match masks.external_mask {
-        Some(mask) => {
-            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
-        }
-        None => prefilter_loader,
-    };
-    let mut pre_filter = DatasetPreFilter::new(dataset, indices, prefilter_loader);
-    if let Some(overlay_block) = masks.overlay_block {
-        pre_filter = pre_filter.with_overlay_block(overlay_block);
-    }
-    Ok(Arc::new(pre_filter))
-}
-
 /// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
 /// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
 /// `external_mask`, when `Some`, additionally restricts the scan to a caller-supplied
@@ -1499,6 +1477,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         ds.open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                             .await?
                     };
+                    let contract = VectorQueryContract::of_index(index.as_ref());
                     // Normalize cosine queries once before partition ranking.
                     let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
@@ -1529,10 +1508,20 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         ],
                     )?;
                     metrics.baseline_metrics.record_output(batch.num_rows());
-                    Ok::<_, DataFusionError>(batch)
+                    Ok::<_, DataFusionError>((batch, uuid, contract))
                 }
             })
             .buffered(self.index_uuids.len().min(target_partitions).max(1))
+            .map({
+                // `buffered` keeps the order, so the first segment listed sets
+                // the contract.
+                let mut first = None;
+                move |opened| {
+                    let (batch, uuid, contract) = opened?;
+                    check_segment_contract(&mut first, uuid, contract)?;
+                    Ok(batch)
+                }
+            })
             .finally(move || {
                 // Partition ranking reads centroids from memory, so this is
                 // typically zero; flushed for symmetry with ANNSubIndex.
@@ -1821,6 +1810,13 @@ impl PreFilter for SegmentPreFilter {
         self.base.wait_for_ready().await?;
         let mut final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_insert_with(|| {
+            // The ownership mask is an allow list of the live rows of this segment's
+            // fragments at the dataset's current version, all of which a deletions-only
+            // base also selects, so the intersection is the ownership mask itself.
+            // Reusing it avoids copying the dataset-wide mask for every segment.
+            if self.base.only_deletions() {
+                return self.ownership_mask.clone();
+            }
             Arc::new(self.base.mask().as_ref().clone() & self.ownership_mask.as_ref().clone())
         });
         Ok(())
@@ -2615,12 +2611,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 async move { DataFusionResult::Ok(stream::iter(plan)) }
             })
             .try_flatten();
-        let pre_filter = build_dataset_prefilter(
+        let pre_filter = build_prefilter(
+            context,
+            partition,
+            &prefilter_source,
             ds.clone(),
             &indices,
-            &prefilter_source,
-            partition,
-            context,
             PreFilterMasks {
                 overlay_block: self.overlay_block.clone(),
                 external_mask: self.external_mask.clone(),
@@ -2797,7 +2793,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
+/// primitives (partition load, prefilter wiring via `build_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
@@ -2989,12 +2985,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
 
-        let pre_filter = build_dataset_prefilter(
+        let pre_filter = build_prefilter(
+            context,
+            partition,
+            &self.prefilter_source,
             ds.clone(),
             &indices,
-            &self.prefilter_source,
-            partition,
-            context,
             // Batch queries have no overlay or external row-address mask.
             PreFilterMasks {
                 overlay_block: None,
@@ -3014,6 +3010,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut candidates = (0..query_count)
                 .map(|_| TopHits::new(query.k))
                 .collect::<Vec<_>>();
+            let mut first_contract = None;
 
             for index_meta in &indices {
                 // A segment's index file may still hold rows for fragments pruned from
@@ -3034,6 +3031,11 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     ds.open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
                         .await?
                 };
+                check_segment_contract(
+                    &mut first_contract,
+                    index_meta.uuid,
+                    VectorQueryContract::of_index(index.as_ref()),
+                )?;
                 // The scanner's `batch_index_search_supported` gate decides which
                 // indices reach this node; this check only guards against that
                 // gate and the index implementation disagreeing (an internal
@@ -3271,44 +3273,36 @@ impl ExecutionPlan for MultivectorScoringExec {
         // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
-        let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
-            stream.map(|batch| {
-                let batch = batch?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let dists = batch[DIST_COL].as_primitive::<Float32Type>();
-                debug_assert_eq!(dists.null_count(), 0);
+        //
+        // Reduce each stream as a whole: its sort splits the output into
+        // batches of the session batch size, and the index stores one entry per
+        // sub-vector, so a row id can show up in more than one batch.
+        let reduced_futures = inputs
+            .into_iter()
+            .map(|mut stream| async move {
+                let mut query_results: HashMap<u64, f32> = HashMap::new();
+                let mut min_sim = 0.0;
+                while let Some(batch) = stream.try_next().await? {
+                    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let dists = batch[DIST_COL].as_primitive::<Float32Type>();
+                    debug_assert_eq!(dists.null_count(), 0);
 
-                // max-reduce for the same row id
-                let min_sim = dists
-                    .values()
-                    .last()
-                    .map(|dist| 1.0 - *dist)
-                    .unwrap_or_default();
-                let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_sims = Vec::with_capacity(row_ids.len());
-                let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
-
-                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
-                    // the results are sorted by distance, so we can skip if we have seen this row id before
-                    if visited_row_ids.contains(row_id) {
-                        continue;
+                    // the results are sorted by distance, so the last row is the worst
+                    if let Some(&worst_dist) = dists.values().last() {
+                        min_sim = 1.0 - worst_dist;
                     }
-                    visited_row_ids.insert(row_id);
-                    new_row_ids.push(*row_id);
-                    // it's cosine distance, so we need to convert it to similarity
-                    new_sims.push(1.0 - *dist);
+                    for (&row_id, &dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                        // it's cosine distance, so we need to convert it to similarity
+                        let sim = 1.0 - dist;
+                        query_results
+                            .entry(row_id)
+                            .and_modify(|best| *best = best.max(sim))
+                            .or_insert(sim);
+                    }
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
-                let new_dists = Float32Array::from(new_sims);
-
-                let batch = RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
-                )?;
-
-                Ok::<_, DataFusionError>((min_sim, batch))
+                Ok::<_, DataFusionError>((min_sim, query_results))
             })
-        }));
+            .collect::<Vec<_>>();
 
         let k = self.query.k;
         let refactor = self.query.refine_factor.unwrap_or(1) as usize;
@@ -3317,17 +3311,8 @@ impl ExecutionPlan for MultivectorScoringExec {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
             let mut missed_sim_sum = 0.0;
-            while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let sims = batch[DIST_COL].as_primitive::<Float32Type>();
-
-                let query_results = row_ids
-                    .values()
-                    .iter()
-                    .copied()
-                    .zip(sims.values().iter().copied())
-                    .collect::<HashMap<_, _>>();
-
+            let reduced_inputs = futures::future::try_join_all(reduced_futures).await?;
+            for (min_sim, query_results) in reduced_inputs {
                 // for a row `r`:
                 // if `r` is in only `results``, then `results[r] += min_sim`
                 // if `r` is in only `query_results`, then `results[r] = query_results[r] + missed_similarities`,
@@ -3416,6 +3401,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::prefilter::FilterLoader;
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
@@ -4091,6 +4077,9 @@ mod tests {
             &first_mask,
             cached_mask.as_ref().as_ref().unwrap()
         ));
+        // The base only removes deleted rows (none here), so the segment reuses its
+        // ownership mask instead of intersecting a copy of the dataset-wide mask.
+        assert!(Arc::ptr_eq(&segment_prefilter.mask(), &first_mask));
 
         assert!(
             !segment_prefilter.is_empty(),
@@ -5373,6 +5362,68 @@ mod tests {
                 res = Some(new_res);
             }
         }
+
+        // A row id repeated across batches of one stream counts once, with its
+        // best similarity, and the stream contributes one min_sim.
+        let batch_42_best = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.1])),
+                Arc::new(UInt64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let batch_42_worse = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.2])),
+                Arc::new(UInt64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let batch_99 = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.5])),
+                Arc::new(UInt64Array::from(vec![99])),
+            ],
+        )
+        .unwrap();
+
+        // One stream split over two batches: row 42 keeps its best similarity
+        // (1.0 - 0.1) instead of accumulating (1.0 - 0.1) + (1.0 - 0.2).
+        let one_stream: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![
+            batch_42_best.clone(),
+            batch_42_worse.clone(),
+        ]));
+        let res = multivector_scoring(vec![one_stream], query.clone())
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[&42], 1.0f32 - (1.0f32 - 0.1f32));
+
+        // Two streams, the second split over two batches. Row 7 is missing
+        // from the second stream, so it is charged that stream's min_sim, which
+        // comes from its last batch.
+        let batch_42_and_7 = RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![0.1, 0.3])),
+                Arc::new(UInt64Array::from(vec![42, 7])),
+            ],
+        )
+        .unwrap();
+        let two_streams = vec![
+            Arc::new(TestingExec::new(vec![batch_42_and_7])) as Arc<dyn ExecutionPlan>,
+            Arc::new(TestingExec::new(vec![batch_42_worse, batch_99])) as Arc<dyn ExecutionPlan>,
+        ];
+        let res = multivector_scoring(two_streams, query.clone())
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[&42], 2.0f32 - ((1.0f32 - 0.1f32) + (1.0f32 - 0.2f32)));
+        assert_eq!(res[&7], 2.0f32 - ((1.0f32 - 0.3f32) + (1.0f32 - 0.5f32)));
+        assert_eq!(res[&99], 2.0f32 - ((1.0f32 - 0.5f32) + (1.0f32 - 0.3f32)));
     }
 
     /// A test dataset for testing the nprobes parameter.

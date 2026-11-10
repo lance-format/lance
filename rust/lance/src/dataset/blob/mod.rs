@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod clone;
+mod compaction;
 mod external;
 mod file;
 mod locate;
@@ -11,9 +12,12 @@ mod prepared;
 mod read;
 mod rewrite;
 #[cfg(test)]
+mod rewrite_tests;
+#[cfg(test)]
 pub mod test_util;
 mod write;
 
+pub(super) use compaction::SidecarRewrite;
 pub(super) use external::{
     ExternalBaseCandidate, ExternalBaseResolver, validate_external_blob_references,
 };

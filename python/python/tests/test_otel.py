@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
+import subprocess
+import sys
+
 import lance
 import pyarrow as pa
 import pytest
@@ -39,6 +43,17 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
     # export even when a plain write doesn't happen to emit them.
     assert catalog["lance_object_store_retryable_responses_total"].kind == "counter"
     assert catalog["lance_object_store_in_flight_requests"].kind == "gauge"
+    # Memory metrics are described whether or not LANCE_MEMORY_OBSERVE is set;
+    # they only carry values while it is.
+    for name in (
+        "lance_memory_rss_bytes",
+        "lance_memory_rss_peak_bytes",
+        "lance_memory_cgroup_bytes",
+        "lance_memory_cgroup_limit_bytes",
+    ):
+        assert catalog[name].kind == "gauge"
+    assert catalog["lance_memory_stage_peak_bytes"].kind == "histogram"
+    assert catalog["lance_memory_operation_peak_bytes"].kind == "histogram"
 
     # Generate object store activity on the local filesystem (scheme "file").
     table = pa.table({"id": pa.array(range(256))})
@@ -68,6 +83,168 @@ def test_instrument_lance_metrics_exports_object_store_metrics(tmp_path):
     # The `_sum` instrument must also be wired and report positive latency.
     duration_sum = metrics["lance_object_store_request_duration_seconds_sum"]
     assert sum(p.value for p in duration_sum.data.data_points) > 0
+
+    # The scan timers (`decode_time` / `task_wait_time` on the plan) are
+    # mirrored as cumulative counters; `to_table()` above ran a scan.
+    for name in (
+        "lance_scan_decode_time_nanoseconds_total",
+        "lance_scan_task_wait_time_nanoseconds_total",
+    ):
+        assert catalog[name].kind == "counter"
+        points = list(metrics[name].data.data_points)
+        assert sum(p.value for p in points) > 0
+        assert all(dict(p.attributes) == {"base": "file"} for p in points)
+
+
+_OBSERVED_BUILD = """
+import sys
+
+import lance
+import pyarrow as pa
+from lance.otel import instrument_lance_metrics
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+reader = InMemoryMetricReader()
+assert instrument_lance_metrics(MeterProvider(metric_readers=[reader]))
+dataset = lance.write_dataset(pa.table({"id": pa.array(range(256))}), sys.argv[1])
+dataset.create_scalar_index("id", "BTREE")
+
+points = {}
+for resource_metrics in reader.get_metrics_data().resource_metrics:
+    for scope_metrics in resource_metrics.scope_metrics:
+        for metric in scope_metrics.metrics:
+            points[metric.name] = list(metric.data.data_points)
+
+assert points["lance_memory_rss_bytes"][0].value > 0
+build = {"operation": "create_index", "index_type": "btree"}
+builds = [
+    point.value
+    for point in points["lance_memory_operation_peak_bytes_count"]
+    if dict(point.attributes) == build
+]
+assert builds == [1], builds
+# Peaks fall into byte buckets, the smallest of which is 16 MiB.
+bounds = {
+    point.attributes["le"]
+    for point in points["lance_memory_operation_peak_bytes_bucket"]
+}
+assert "16777216" in bounds, bounds
+"""
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="process memory is only read on Linux"
+)
+def test_instrument_lance_metrics_exports_memory_while_observed(tmp_path):
+    pytest.importorskip("opentelemetry.sdk.metrics")
+    # LANCE_MEMORY_OBSERVE is read once per process, so the observed build
+    # runs in a process of its own.
+    result = subprocess.run(
+        [sys.executable, "-c", _OBSERVED_BUILD, str(tmp_path / "ds.lance")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+_NATIVE_MEMORY_SNAPSHOT_BUILD = """
+import sys
+
+import lance
+import pyarrow as pa
+from lance.lance import register_lance_metrics_recorder, snapshot_lance_metrics
+
+assert register_lance_metrics_recorder()
+dataset = lance.write_dataset(pa.table({"id": pa.array(range(256))}), sys.argv[1])
+dataset.create_scalar_index("id", "BTREE")
+
+points = snapshot_lance_metrics()
+by_name = {}
+for point in points:
+    by_name.setdefault(point.name, []).append(point)
+
+rss = by_name["lance_memory_rss_bytes"]
+assert len(rss) == 1 and rss[0].value > 0, rss
+peak = by_name["lance_memory_rss_peak_bytes"]
+assert len(peak) == 1 and peak[0].value >= rss[0].value, peak
+
+build = {"operation": "create_index", "index_type": "btree"}
+builds = [
+    point
+    for point in by_name["lance_memory_operation_peak_bytes"]
+    if point.attributes == build
+]
+assert len(builds) == 1, builds
+build_peak = builds[0]
+assert build_peak.count == 1, build_peak.count
+assert build_peak.sum > 0, build_peak.sum
+buckets = dict(build_peak.buckets)
+assert "16777216" in buckets, buckets
+assert buckets["+Inf"] == 1, buckets
+
+stages = [
+    point
+    for point in by_name["lance_memory_stage_peak_bytes"]
+    if point.attributes.get("operation") == "create_index"
+    and point.attributes.get("index_type") == "btree"
+]
+assert stages, "expected at least one completed stage peak"
+for stage in stages:
+    assert "stage" in stage.attributes, stage.attributes
+    assert stage.count > 0, stage.count
+    assert dict(stage.buckets)["+Inf"] == stage.count, stage.buckets
+"""
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="process memory is only read on Linux"
+)
+def test_native_snapshot_reports_memory_while_observed(tmp_path):
+    # This exercises the recorder and snapshot directly, without the optional
+    # OpenTelemetry SDK used by the export test above.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _NATIVE_MEMORY_SNAPSHOT_BUILD,
+            str(tmp_path / "ds.lance"),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LANCE_MEMORY_OBSERVE": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+
+
+_INVALID_SWITCH_BUILD = """
+import sys
+
+import lance
+import pyarrow as pa
+
+dataset = lance.write_dataset(pa.table({"id": pa.array(range(16))}), sys.argv[1])
+try:
+    dataset.create_scalar_index("id", "BTREE")
+except ValueError as error:
+    assert 'LANCE_MEMORY_OBSERVE="maybe" is invalid' in str(error), error
+else:
+    raise AssertionError("the build ignored an invalid LANCE_MEMORY_OBSERVE")
+"""
+
+
+def test_invalid_memory_switch_fails_index_builds(tmp_path):
+    # LANCE_MEMORY_OBSERVE is read once per process, so the failure is
+    # exercised in a child. Invalid values are rejected before the
+    # Linux-only observation support is checked.
+    result = subprocess.run(
+        [sys.executable, "-c", _INVALID_SWITCH_BUILD, str(tmp_path / "ds.lance")],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LANCE_MEMORY_OBSERVE": "maybe"},
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_snapshot_empty_before_install_is_safe():
