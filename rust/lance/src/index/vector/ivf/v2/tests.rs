@@ -3800,6 +3800,9 @@ async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
     test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
 }
 
+/// With every partition of an IVF_FLAT index probed, WARP scores every token
+/// exactly and every document is observed by every query token, so it returns
+/// the exact multivector top k; a prefilter restricts it like ANN search.
 #[tokio::test]
 async fn test_multivector_algorithm_dispatch() {
     use crate::dataset::scanner::MultivectorAlgorithm;
@@ -3807,36 +3810,97 @@ async fn test_multivector_algorithm_dispatch() {
     let test_dir = TempStrDir::default();
     let (mut dataset, vectors) =
         generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
-    let params = VectorIndexParams::ivf_flat(2, DistanceType::Cosine);
+    let num_partitions = 2;
+    let params = VectorIndexParams::ivf_flat(num_partitions, DistanceType::Cosine);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let k = 10;
+    let query = vectors.value(0);
+    let search = |algorithm, filter: Option<&str>| {
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &query, k)
+            .unwrap()
+            .nprobes(num_partitions)
+            .multivector_algorithm(algorithm);
+        if let Some(filter) = filter {
+            scanner.prefilter(true).filter(filter).unwrap();
+        }
+        scanner
+    };
+
+    let xtr = search(MultivectorAlgorithm::Xtr, None)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(xtr.num_rows(), k);
+
+    let warp = search(MultivectorAlgorithm::Warp, None)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ground_truth = multivec_ground_truth(&vectors, query.as_ref(), k, DistanceType::Cosine);
+    let ids = warp["id"].as_primitive::<UInt64Type>().values();
+    let distances = warp[DIST_COL].as_primitive::<Float32Type>().values();
+    assert_eq!(
+        ids.to_vec(),
+        ground_truth.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+    );
+    for (distance, (expected, id)) in distances.iter().zip(&ground_truth) {
+        assert!(
+            (distance - expected).abs() < 1e-4,
+            "row {id}: {distance} vs {expected}"
+        );
+    }
+
+    let filtered = search(MultivectorAlgorithm::Warp, Some("id >= 100"))
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(filtered.num_rows(), k);
+    assert!(
+        filtered["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .all(|&id| id >= 100)
+    );
+}
+
+/// Unset, the multivector algorithm falls back to XTR for an index WARP does
+/// not support; choosing WARP for it explicitly fails.
+#[tokio::test]
+async fn test_multivector_algorithm_falls_back_to_xtr() {
+    use crate::dataset::scanner::MultivectorAlgorithm;
+
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::ivf_hnsw(
+        DistanceType::Cosine,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+    );
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
         .await
         .unwrap();
 
     let query = vectors.value(0);
-    let search = |algorithm| {
-        let mut scanner = dataset.scan();
-        scanner
-            .nearest("vector", &query, 10)
-            .unwrap()
-            .multivector_algorithm(algorithm);
-        scanner
-    };
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query, 10).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 10);
 
-    let xtr = search(MultivectorAlgorithm::Xtr)
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert_eq!(xtr.num_rows(), 10);
-
-    let err = search(MultivectorAlgorithm::Warp)
-        .try_into_batch()
-        .await
-        .unwrap_err();
+    scanner.multivector_algorithm(MultivectorAlgorithm::Warp);
+    let err = scanner.try_into_batch().await.unwrap_err();
     assert!(
         matches!(err, lance_core::Error::NotSupported { .. }),
         "unexpected error: {err}"
     );
+    assert!(err.to_string().contains("HNSW sub-index"), "{err}");
 }
 
 #[tokio::test]

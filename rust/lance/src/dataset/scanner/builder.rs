@@ -78,7 +78,7 @@ impl Scanner {
             nearest: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
-            multivector_algorithm: MultivectorAlgorithm::default(),
+            multivector_algorithm: None,
             warp_imputation_rank: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
@@ -1149,7 +1149,11 @@ impl Scanner {
         self
     }
 
-    /// Choose the algorithm for indexed multivector search (default: WARP).
+    /// Choose the algorithm for indexed multivector search.
+    ///
+    /// Unset, WARP is used when every index segment supports it and XTR
+    /// otherwise. Choosing WARP for an index it does not support fails the
+    /// query; see [`MultivectorAlgorithm::Warp`].
     ///
     /// ```
     /// # use arrow_array::Float32Array;
@@ -1167,7 +1171,7 @@ impl Scanner {
     /// # }
     /// ```
     pub fn multivector_algorithm(&mut self, algorithm: MultivectorAlgorithm) -> &mut Self {
-        self.multivector_algorithm = algorithm;
+        self.multivector_algorithm = Some(algorithm);
         self
     }
 

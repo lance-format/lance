@@ -5,34 +5,52 @@
 //!
 //! [`warp_select`] chooses each query token's partitions and missing similarity
 //! from the IVF centroids alone; [`warp_score`] then scores the tokens of those
-//! partitions.
+//! partitions, and [`top_k_documents`] reduces them to document scores.
+//! [`WarpExec`] runs the three phases as one execution node.
 
 use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{
-    Array, ArrayRef, Float32Array,
+    Array, ArrayRef, Float32Array, RecordBatch, UInt64Array,
     cast::AsArray,
     types::{Float32Type, UInt64Type},
 };
-use arrow_schema::DataType;
-use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use arrow_schema::{DataType, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
+};
+use datafusion_physical_expr::{Distribution, EquivalenceProperties};
+use futures::{StreamExt, TryFutureExt, TryStreamExt, future::try_join_all, stream};
 use lance_core::ROW_ID;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::warp::{centroid_similarities, missing_similarity, probe_partitions};
+use lance_index::vector::warp::{
+    Stride, centroid_similarities, missing_similarity, probe_partitions, top_k_documents,
+};
 use lance_index::vector::{DIST_COL, Query, VectorIndex};
 use lance_linalg::distance::{DistanceType, dot_f32};
+use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
+use uuid::Uuid;
 
-use super::prefilter_for_segment;
+use super::{AnnIndexMetrics, KNN_INDEX_SCHEMA, build_dataset_prefilter, prefilter_for_segment};
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::ivf::IVFIndex;
+use crate::io::exec::utils::{PreFilterMasks, PreFilterSource};
 use crate::{Error, Result};
 
 /// WARPselect output for one index segment.
@@ -57,8 +75,6 @@ pub struct WarpSelection {
     pub segments: Vec<SegmentSelection>,
     /// `m_i`: the similarity imputed for documents query token `i` never
     /// observes, estimated over the partitions of every segment.
-    // TODO: remove once the WARP merge imputes it.
-    #[allow(dead_code)]
     pub missing_similarities: Vec<f32>,
 }
 
@@ -70,15 +86,6 @@ pub struct WarpParams {
     /// The rank `t'` whose estimated similarity is imputed for unobserved
     /// documents.
     pub imputation_rank: usize,
-}
-
-/// The tokens of one probed partition scored against one query token.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Stride {
-    /// Rows with at least one surviving token in the partition, ascending.
-    pub row_ids: Vec<u64>,
-    /// Per row, the highest `<t̂, q_i>` over its tokens in the partition.
-    pub similarities: Vec<f32>,
 }
 
 /// Run WARPselect for a flattened multivector query against index segments.
@@ -219,7 +226,12 @@ pub async fn warp_select(
 /// stores it.
 ///
 /// Returns, per query token `i`, one [`Stride`] per probed (segment, partition)
-/// pair, in segment order and then `P_i` order.
+/// pair, in no particular order.
+///
+/// Partitions are searched partition by partition, all query tokens probing
+/// one partition back to back: concurrent loads of a partition are coalesced
+/// and later ones hit the index cache, so each probed partition is read from
+/// storage once per query rather than once per query token.
 ///
 /// Scoring runs through each segment's own partition search, which already
 /// knows its quantizer: FLAT compares raw vectors, while PQ, SQ and RQ score
@@ -242,10 +254,10 @@ pub async fn warp_score(
     let conversions = selection
         .segments
         .iter()
-        .map(cosine_similarity_conversion)
+        .map(|segment| cosine_similarity_conversion(segment.index.as_ref(), segment.metadata.uuid))
         .collect::<Result<Vec<_>>>()?;
 
-    let probes = selection
+    let mut probes = selection
         .segments
         .iter()
         .enumerate()
@@ -261,6 +273,7 @@ pub async fn warp_score(
                 })
         })
         .collect::<Vec<_>>();
+    probes.sort_unstable_by_key(|&(token, segment_id, partition)| (segment_id, partition, token));
 
     let scored = stream::iter(probes)
         .map(|(token, segment_id, partition)| {
@@ -281,7 +294,7 @@ pub async fn warp_score(
                 Result::Ok((token, stride))
             }
         })
-        .buffered(get_num_compute_intensive_cpus())
+        .buffer_unordered(get_num_compute_intensive_cpus())
         .try_collect::<Vec<_>>()
         .await?;
 
@@ -303,9 +316,7 @@ pub async fn warp_score(
 /// `1 - <t, q>`. PQ, SQ and RQ store normalized vectors and report squared L2
 /// distance `|q - t̂|^2 = 1 + |t̂|^2 - 2<t̂, q>`, which is `2 - 2<t̂, q>` when the
 /// reconstruction keeps unit norm.
-fn cosine_similarity_conversion(segment: &SegmentSelection) -> Result<fn(f32) -> f32> {
-    let uuid = segment.metadata.uuid;
-    let index = segment.index.as_ref();
+fn cosine_similarity_conversion(index: &dyn VectorIndex, uuid: Uuid) -> Result<fn(f32) -> f32> {
     if index.as_any().is::<IVFIndex>() {
         return Err(Error::not_supported(format!(
             "WARP search does not support the legacy IVF_PQ index format of segment {uuid}; \
@@ -334,6 +345,26 @@ fn cosine_similarity_conversion(segment: &SegmentSelection) -> Result<fn(f32) ->
             "WARP search does not support the binary FLAT quantization of segment {uuid}"
         ))),
     }
+}
+
+/// Whether WARP can search every one of `segments`, i.e. whether
+/// [`warp_score`] would not reject any of them as unsupported.
+pub async fn warp_supports_segments(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+) -> Result<bool> {
+    for segment in segments {
+        let index = dataset
+            .open_vector_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await?;
+        match cosine_similarity_conversion(index.as_ref(), segment.uuid) {
+            Ok(_) => {}
+            Err(Error::NotSupported { .. }) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(true)
 }
 
 async fn score_stride(
@@ -406,6 +437,230 @@ async fn score_stride(
         row_ids,
         similarities,
     })
+}
+
+/// Executes WARP multivector search: WARPselect ([`warp_select`]), scoring of
+/// the probed partitions ([`warp_score`]) and the reduction to the top `k`
+/// ([`top_k_documents`]).
+///
+/// Emits one batch of [`KNN_INDEX_SCHEMA`], `k * refine_factor` rows sorted by
+/// ascending distance, where a document's distance is the number of query
+/// tokens minus its WARP score, as XTR reports it.
+#[derive(Debug)]
+pub struct WarpExec {
+    dataset: Arc<Dataset>,
+    indices: Vec<IndexMetadata>,
+    /// The multivector query; `key` holds the query tokens concatenated.
+    query: Query,
+    dim: usize,
+    params: WarpParams,
+    prefilter_source: PreFilterSource,
+    /// Rows whose index entries are stale due to a newer data overlay.
+    overlay_block: Option<RowAddrMask>,
+    /// External row-address mask ANDed into the prefilter.
+    external_mask: Option<Arc<RowAddrMask>>,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+impl WarpExec {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        dataset: Arc<Dataset>,
+        indices: Vec<IndexMetadata>,
+        query: Query,
+        dim: usize,
+        params: WarpParams,
+        prefilter_source: PreFilterSource,
+        overlay_block: Option<RowAddrMask>,
+        external_mask: Option<Arc<RowAddrMask>>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ));
+        Self {
+            dataset,
+            indices,
+            query,
+            dim,
+            params,
+            prefilter_source,
+            overlay_block,
+            external_mask,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
+}
+
+impl DisplayAs for WarpExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let WarpParams {
+            nprobe,
+            imputation_rank,
+        } = self.params;
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                f,
+                "Warp: k={}, nprobes={nprobe}, imputation_rank={imputation_rank}, deltas={}",
+                self.query.k,
+                self.indices.len()
+            ),
+            DisplayFormatType::TreeRender => write!(
+                f,
+                "Warp\nk={}\nnprobes={nprobe}\nimputation_rank={imputation_rank}\ndeltas={}",
+                self.query.k,
+                self.indices.len()
+            ),
+        }
+    }
+}
+
+impl ExecutionPlan for WarpExec {
+    fn name(&self) -> &str {
+        "WarpExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        KNN_INDEX_SCHEMA.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        match &self.prefilter_source {
+            PreFilterSource::None => vec![],
+            PreFilterSource::FilteredRowIds(src) | PreFilterSource::ScalarIndexQuery(src) => {
+                vec![src]
+            }
+        }
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        self.children()
+            .iter()
+            .map(|_| Distribution::SinglePartition)
+            .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != self.children().len() {
+            return Err(DataFusionError::Internal(format!(
+                "WarpExec has {} children but got {} replacements",
+                self.children().len(),
+                children.len()
+            )));
+        }
+        let prefilter_source = match (&self.prefilter_source, children.pop()) {
+            (PreFilterSource::FilteredRowIds(_), Some(src)) => PreFilterSource::FilteredRowIds(src),
+            (PreFilterSource::ScalarIndexQuery(_), Some(src)) => {
+                PreFilterSource::ScalarIndexQuery(src)
+            }
+            (source, _) => source.clone(),
+        };
+        Ok(Arc::new(Self::new(
+            self.dataset.clone(),
+            self.indices.clone(),
+            self.query.clone(),
+            self.dim,
+            self.params,
+            prefilter_source,
+            self.overlay_block.clone(),
+            self.external_mask.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let pre_filter = build_dataset_prefilter(
+            self.dataset.clone(),
+            &self.indices,
+            &self.prefilter_source,
+            partition,
+            context,
+            PreFilterMasks {
+                overlay_block: self.overlay_block.clone(),
+                external_mask: self.external_mask.clone(),
+            },
+            &self.metrics,
+        )?;
+        let dataset = self.dataset.clone();
+        let indices = self.indices.clone();
+        let query = self.query.clone();
+        let dim = self.dim;
+        let params = self.params;
+        let metrics = AnnIndexMetrics::new(&self.metrics, partition);
+
+        let search = async move {
+            let _timer = metrics.baseline_metrics.elapsed_compute().timer();
+            let selection = warp_select(
+                &dataset,
+                &query.column,
+                &indices,
+                query.key.as_ref(),
+                dim,
+                params,
+                &metrics.index_metrics,
+            )
+            .await?;
+            let strides =
+                warp_score(&dataset, &selection, pre_filter, &metrics.index_metrics).await?;
+            metrics
+                .partitions_searched
+                .add(strides.iter().map(Vec::len).sum());
+            metrics.index_metrics.flush_io();
+
+            let num_query_tokens = selection.missing_similarities.len() as f32;
+            let missing_similarities = selection.missing_similarities;
+            let k = query.k * query.refine_factor.unwrap_or(1) as usize;
+            let top =
+                spawn_cpu(move || top_k_documents(&strides, &missing_similarities, k)).await?;
+            let (row_ids, distances): (Vec<_>, Vec<_>) = top
+                .into_iter()
+                .map(|(row_id, score)| (row_id, num_query_tokens - score))
+                .unzip();
+            let batch = RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(distances)),
+                    Arc::new(UInt64Array::from(row_ids)),
+                ],
+            )?;
+            metrics.baseline_metrics.record_output(batch.num_rows());
+            metrics.baseline_metrics.done();
+            Result::Ok(batch)
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream::once(search.map_err(DataFusionError::from)),
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

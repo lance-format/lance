@@ -144,7 +144,7 @@ pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
 ///
 /// Only affects multivector columns searched through a vector index; exact
 /// (flat) multivector search is unchanged.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultivectorAlgorithm {
     /// Search each query token independently, then sum per-document maxima,
     /// imputing a token's missing score with its lowest retrieved score.
@@ -152,11 +152,13 @@ pub enum MultivectorAlgorithm {
     /// See XTR: <https://arxiv.org/abs/2304.01982>.
     Xtr,
     /// Select IVF partitions per query token from centroid scores, estimate
-    /// missing scores from those centroids, and score compressed residuals
-    /// without decompressing them.
+    /// missing scores from those centroids, score every token of the selected
+    /// partitions, and merge the scores per document.
     ///
-    /// See WARP: <https://arxiv.org/abs/2501.17788>. Not implemented yet.
-    #[default]
+    /// Supports IVF indices with a FLAT sub-index (IVF_FLAT, IVF_PQ, IVF_SQ,
+    /// IVF_RQ), but neither HNSW sub-indices nor the legacy IVF_PQ format.
+    ///
+    /// See WARP: <https://arxiv.org/abs/2501.17788>.
     Warp,
 }
 
@@ -589,7 +591,8 @@ pub struct Scanner {
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
-    multivector_algorithm: MultivectorAlgorithm,
+    /// `None` uses WARP when every index segment supports it, and XTR otherwise.
+    multivector_algorithm: Option<MultivectorAlgorithm>,
     /// WARP's `t'`; `None` uses the token count XTR retrieves per query token.
     warp_imputation_rank: Option<usize>,
     nearest_query_count: usize,

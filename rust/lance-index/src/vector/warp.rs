@@ -7,9 +7,11 @@
 //! index. For query tokens `q_1..q_n` and centroids `c_1..c_K` it computes
 //! `Γ[k][i] = <c_k, q_i>` once, then reads off both the partitions each token
 //! probes and the similarity `m_i` imputed for documents that token never
-//! observes ("WARPselect").
+//! observes ("WARPselect"). After the probed partitions are scored into
+//! [`Stride`]s, [`top_k_documents`] reduces them to document scores.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 
 use arrow::compute::cast;
 use arrow_array::{Array, FixedSizeListArray, cast::AsArray, types::Float32Type};
@@ -159,6 +161,154 @@ pub fn missing_similarity(
     Ok(similarities[*order.last().expect("non-empty") as usize])
 }
 
+/// The tokens of one probed partition scored against one query token `q_i`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Stride {
+    /// Rows with at least one scored token in the partition, strictly ascending.
+    pub row_ids: Vec<u64>,
+    /// Per row, the highest `<t̂, q_i>` over its tokens in the partition.
+    pub similarities: Vec<f32>,
+}
+
+/// A scored document; greater means ranked higher.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    score: f32,
+    row_id: u64,
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Ties go to the lower row id so the top k is deterministic.
+        self.score
+            .total_cmp(&other.score)
+            .then(other.row_id.cmp(&self.row_id))
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Candidate {}
+
+/// Reduce scored strides to the `k` best documents, best first, as
+/// `(row_id, score)`.
+///
+/// `strides[i]` holds query token `i`'s strides and `missing_similarities[i]`
+/// is its `m_i`. A document `D` observed by some stride scores
+/// `Σ_i f_i(D)`, where `f_i(D)` is the max of `D`'s similarities over token
+/// `i`'s strides, or `m_i` if none contains `D`. Following Section 5.3, this is
+/// `Σ_i m_i + Σ_{i observes D} (f_i(D) - m_i)`: the max-merge within a token and
+/// the sum across tokens are fused into one merge of all strides by row id, so
+/// no candidate × token score matrix is built. Documents no stride observes
+/// are never candidates.
+///
+/// ```
+/// # use lance_index::vector::warp::{Stride, top_k_documents};
+/// let stride = |row_ids: Vec<u64>, similarities: Vec<f32>| Stride { row_ids, similarities };
+/// let strides = vec![
+///     // Token 0 observes rows 1 and 2; row 2 in two partitions.
+///     vec![stride(vec![1, 2], vec![0.5, 0.75]), stride(vec![2], vec![0.25])],
+///     // Token 1 observes only row 2.
+///     vec![stride(vec![2], vec![0.5])],
+/// ];
+/// // Row 1 misses token 1, which imputes m_1 = 0.125.
+/// let top = top_k_documents(&strides, &[0.0, 0.125], 2).unwrap();
+/// assert_eq!(top, vec![(2, 1.25), (1, 0.625)]);
+/// ```
+pub fn top_k_documents(
+    strides: &[Vec<Stride>],
+    missing_similarities: &[f32],
+    k: usize,
+) -> Result<Vec<(u64, f32)>> {
+    if strides.len() != missing_similarities.len() {
+        return Err(Error::invalid_input(format!(
+            "WARP got strides for {} query tokens but {} missing similarities",
+            strides.len(),
+            missing_similarities.len()
+        )));
+    }
+    let mut flattened = Vec::new();
+    for (token, token_strides) in strides.iter().enumerate() {
+        for stride in token_strides {
+            if stride.row_ids.len() != stride.similarities.len() {
+                return Err(Error::invalid_input(format!(
+                    "WARP stride of query token {token} has {} row ids but {} similarities",
+                    stride.row_ids.len(),
+                    stride.similarities.len()
+                )));
+            }
+            if !stride.row_ids.is_empty() {
+                flattened.push((token, stride));
+            }
+        }
+    }
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+
+    let missing_total = missing_similarities.iter().sum::<f32>();
+    let mut cursors = vec![0_usize; flattened.len()];
+    // Min-heap of each stride's next row id.
+    let mut frontier = flattened
+        .iter()
+        .enumerate()
+        .map(|(position, (_, stride))| Reverse((stride.row_ids[0], position)))
+        .collect::<BinaryHeap<_>>();
+    let mut best = vec![None::<f32>; missing_similarities.len()];
+    let mut observed = Vec::with_capacity(missing_similarities.len());
+    // Min-heap holding the best k candidates seen so far.
+    let mut top = BinaryHeap::with_capacity(k + 1);
+
+    while let Some(&Reverse((row_id, _))) = frontier.peek() {
+        while let Some(&Reverse((next_row_id, position))) = frontier.peek() {
+            if next_row_id != row_id {
+                break;
+            }
+            frontier.pop();
+            let (token, stride) = flattened[position];
+            let similarity = stride.similarities[cursors[position]];
+            match &mut best[token] {
+                Some(current) => *current = current.max(similarity),
+                slot @ None => {
+                    *slot = Some(similarity);
+                    observed.push(token);
+                }
+            }
+            cursors[position] += 1;
+            if let Some(&next) = stride.row_ids.get(cursors[position]) {
+                frontier.push(Reverse((next, position)));
+            }
+        }
+
+        let mut score = missing_total;
+        for token in observed.drain(..) {
+            if let Some(similarity) = best[token].take() {
+                score += similarity - missing_similarities[token];
+            }
+        }
+        top.push(Reverse(Candidate { score, row_id }));
+        if top.len() > k {
+            top.pop();
+        }
+    }
+
+    Ok(top
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(candidate)| (candidate.row_id, candidate.score))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +418,112 @@ mod tests {
         let centroids =
             FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
         let err = centroid_similarities(&[1.0], &centroids).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    fn stride(row_ids: Vec<u64>, similarities: Vec<f32>) -> Stride {
+        Stride {
+            row_ids,
+            similarities,
+        }
+    }
+
+    /// Scores every observed document by the definition and sorts them all.
+    fn brute_force_top_k(
+        strides: &[Vec<Stride>],
+        missing_similarities: &[f32],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let mut rows = strides
+            .iter()
+            .flatten()
+            .flat_map(|s| s.row_ids.iter().copied())
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        let mut scored = rows
+            .into_iter()
+            .map(|row_id| {
+                let score = strides
+                    .iter()
+                    .zip(missing_similarities)
+                    .map(|(token_strides, &missing)| {
+                        token_strides
+                            .iter()
+                            .filter_map(|s| {
+                                s.row_ids
+                                    .binary_search(&row_id)
+                                    .ok()
+                                    .map(|position| s.similarities[position])
+                            })
+                            .reduce(f32::max)
+                            .unwrap_or(missing)
+                    })
+                    .sum::<f32>();
+                (row_id, score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
+    #[rstest]
+    #[case::fewer_than_k(10)]
+    #[case::exactly_k(30)]
+    #[case::truncated(5)]
+    #[case::one(1)]
+    fn test_top_k_documents_matches_brute_force(#[case] k: usize) {
+        // Integer-valued similarities keep both summation orders exact.
+        let num_tokens = 4;
+        let strides = (0..num_tokens)
+            .map(|token| {
+                (0..3)
+                    .map(|partition| {
+                        let row_ids = (0..40_u64)
+                            .filter(|row| (row * 7 + token * 3 + partition) % 5 == 0)
+                            .collect::<Vec<_>>();
+                        let similarities = row_ids
+                            .iter()
+                            .map(|row| ((row * 13 + token * 5 + partition) % 11) as f32)
+                            .collect();
+                        stride(row_ids, similarities)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let missing = [1.0, 2.0, 0.0, 3.0];
+        let top = top_k_documents(&strides, &missing, k).unwrap();
+        assert_eq!(top, brute_force_top_k(&strides, &missing, k));
+    }
+
+    #[rstest]
+    #[case::zero_k(vec![vec![stride(vec![1], vec![0.5])]], vec![0.0], 0)]
+    #[case::no_strides(vec![vec![], vec![]], vec![0.1, 0.2], 3)]
+    #[case::empty_strides(vec![vec![stride(vec![], vec![])]], vec![0.1], 3)]
+    fn test_top_k_documents_empty(
+        #[case] strides: Vec<Vec<Stride>>,
+        #[case] missing: Vec<f32>,
+        #[case] k: usize,
+    ) {
+        assert!(top_k_documents(&strides, &missing, k).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_top_k_documents_ties_prefer_lower_row_id() {
+        let strides = vec![vec![stride(vec![3, 5, 9], vec![1.0, 1.0, 1.0])]];
+        let top = top_k_documents(&strides, &[0.0], 2).unwrap();
+        assert_eq!(top, vec![(3, 1.0), (5, 1.0)]);
+    }
+
+    #[rstest]
+    #[case::token_count_mismatch(vec![vec![]], vec![0.1, 0.2])]
+    #[case::ragged_stride(vec![vec![stride(vec![1, 2], vec![0.5])]], vec![0.1])]
+    fn test_top_k_documents_rejects_invalid_input(
+        #[case] strides: Vec<Vec<Stride>>,
+        #[case] missing: Vec<f32>,
+    ) {
+        let err = top_k_documents(&strides, &missing, 3).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 }
