@@ -62,6 +62,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_key_routed_dir: None,
         };
         let result = rebase.check_txn(&merge, 1);
         assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -92,6 +93,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
     let result = rebase.check_txn(&install, 1);
     assert!(
@@ -147,6 +149,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let same_name = Transaction::new(
@@ -213,6 +216,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
     let different_name_result = rebase.check_txn(&different_name, 1);
     assert!(
@@ -282,6 +286,7 @@ fn test_create_index_conflicts_with_concurrent_drop(
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
     let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -333,6 +338,7 @@ fn test_concurrent_index_drops_are_compatible() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -386,6 +392,7 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -468,6 +475,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            mem_wal_key_routed_dir: None,
         };
         let result = rebase.check_txn(&rewrite, 2);
         if expect_conflict {
@@ -557,6 +565,7 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
             reuse: Default::default(),
 
             staged_replay: false,
+            mem_wal_key_routed_dir: None,
         };
         // Disjoint from the rewritten fragment, so this only exercises the
         // stable-row-ids check and not the group-straddling check below it.
@@ -957,6 +966,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1006,6 +1016,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1056,6 +1067,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1106,6 +1118,7 @@ fn test_compacted_sstables_different_shards_ok() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1166,6 +1179,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result = rebase.check_txn(&committed_txn, 1);
@@ -1201,6 +1215,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -1257,6 +1272,7 @@ fn test_create_index_vs_update_mem_wal_state_rebase() {
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,
+        mem_wal_key_routed_dir: None,
     };
 
     // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState
