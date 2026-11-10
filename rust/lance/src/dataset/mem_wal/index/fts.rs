@@ -2760,12 +2760,11 @@ impl FtsMemIndex {
             }
         }
         // A partition's dictionary is an FST, so a Levenshtein automaton
-        // visits only the terms within `max_distance`, as the committed index
+        // yields only the terms within `max_distance`, as the committed index
         // does. `fst`'s automaton can miss matches for a non-ASCII query
         // (lance-index keeps its own Unicode automaton for those), so such a
         // query, or one too large to compile, scans the dictionary instead.
-        let automaton = term
-            .is_ascii()
+        let automaton = (term.is_ascii() && !st.partitions.is_empty())
             .then(|| Levenshtein::new(term, max_distance).ok())
             .flatten();
         for p in st.partitions.iter() {
@@ -6902,16 +6901,19 @@ mod tests {
     /// term FST; the result must equal a scan of every dictionary term,
     /// including non-ASCII terms, prefix lengths, and a `max_expansions` cap.
     #[rstest]
-    #[case::one_edit("cafe", 1, 0, 50)]
-    #[case::two_edits("bravo", 2, 0, 50)]
-    #[case::prefix("bravo", 2, 1, 50)]
-    #[case::capped("cafe", 2, 0, 3)]
-    #[case::non_ascii_query("café", 1, 0, 50)]
+    #[case::one_edit("cafe", 1, 0, 50, true)]
+    #[case::two_edits("bravo", 2, 0, 50, true)]
+    #[case::prefix("bravo", 2, 1, 50, true)]
+    #[case::capped("cafe", 2, 0, 3, true)]
+    #[case::non_ascii_query("café", 1, 0, 50, false)]
+    // Too many states for `fst` to build the automaton.
+    #[case::automaton_too_large("bravobravobravob", 3, 0, 50, false)]
     fn test_expand_fuzzy_matches_dictionary_scan(
         #[case] term: &str,
         #[case] max_distance: u32,
         #[case] prefix_length: u32,
         #[case] max_expansions: usize,
+        #[case] uses_automaton: bool,
     ) {
         let schema = create_test_schema();
         let params = InvertedIndexParams::default()
@@ -6922,8 +6924,8 @@ mod tests {
             .with_freeze_threshold_rows(1);
         let rows = [
             "cafe café cave care face cafes bravo brave bravos grave crave",
-            "cafe cake safe caff brava bravi bravo drove über uber naïve naive",
-            "zebra cafeteria calf cage bravado bravery",
+            "cafe cake safe caff brava bravi bravo drove über uber naïve naive banana",
+            "zebra cafeteria calf cage bravado bravery bravobravobravo",
         ];
         let batch = |text: &str| {
             RecordBatch::try_new(
@@ -6966,8 +6968,8 @@ mod tests {
             index.expand_fuzzy_term(&st, term, max_distance, prefix_length, max_expansions, true);
         assert_eq!(expanded, expected);
 
-        // An ASCII term reaches only the matching partition terms; a
-        // non-ASCII one scans every partition term.
+        // The automaton reaches only the matching partition terms; the
+        // fallback scans every partition term.
         let partition_matches: usize = st
             .partitions
             .iter()
@@ -6988,7 +6990,11 @@ mod tests {
             .map(|partition| partition.term_fst.len())
             .sum();
         let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
-        if term.is_ascii() {
+        assert_eq!(
+            Levenshtein::new(term, max_distance).is_ok() && term.is_ascii(),
+            uses_automaton
+        );
+        if uses_automaton {
             assert_eq!(computed, partition_matches);
         } else {
             assert_eq!(computed, partition_terms);
