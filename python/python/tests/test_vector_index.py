@@ -1848,7 +1848,8 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
             == doubled_results["_distance"][i].as_py()
         )
 
-    # Multivector routing uses Auto's configuration, including with refinement.
+    # XTR's per-token routing uses Auto's configuration, including with
+    # refinement. WARP probes a fixed number of partitions instead.
     with monkeypatch.context() as overrides:
         overrides.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
         for refine_factor in (None, 2):
@@ -1859,6 +1860,7 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
                         "q": query,
                         "k": 100,
                         "refine_factor": refine_factor,
+                        "multivector_algorithm": "xtr",
                     }
                 )
 
