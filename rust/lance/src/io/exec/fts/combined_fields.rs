@@ -32,8 +32,8 @@ use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsSearchParams, Tokens, try_collect_query_tokens,
 };
 use lance_index::scalar::inverted::{
-    CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsBM25Scorer, DocumentGranularity,
-    FTS_SCHEMA, build_combined_bm25_scorer, combined_fields_search, validate_combined_tokenizers,
+    CombinedCorpusStats, CombinedFieldColumn, CombinedFieldsBM25Scorer, CombinedFieldsSearch,
+    DocumentGranularity, FTS_SCHEMA, InvertedIndexParams, combined_fields_search,
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use tracing::instrument;
@@ -75,6 +75,9 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 /// if let Some(scorer) = exec.base_scorer() {
 ///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
 /// }
+/// if let Some(domain) = exec.statistics_fragments() {
+///     rebuilt = rebuilt.with_statistics_fragments(domain.clone())?;
+/// }
 /// # Ok(rebuilt)
 /// # }
 /// ```
@@ -83,9 +86,10 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 pub struct CombinedFieldsQueryExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
+    statistics_fragments: Option<roaring::RoaringBitmap>,
     /// Tokens `execute()` actually produced, for `analyze_plan`. One snapshot
-    /// covers every target column because `validate_combined_tokenizers`
-    /// requires them to share a tokenizer, so the scan tokenizes once.
+    /// covers every target column because their index metadata
+    /// must declare the same tokenizer, so the scan tokenizes once.
     tokenized_query: Arc<OnceLock<TokenizedQuery>>,
     params: FtsSearchParams,
     prefilter_source: PreFilterSource,
@@ -108,6 +112,62 @@ pub struct CombinedFieldsQueryExec {
 }
 
 impl CombinedFieldsQueryExec {
+    /// Use a fixed physical-fragment statistics domain instead of the complete
+    /// corpus. Set [`Self::with_covered_fragments`] first: candidates must stay
+    /// within the domain. Retained committed-index rows still count after
+    /// deletion, while candidate filtering never changes these statistics.
+    ///
+    /// This requires physical row IDs and modern indices without overlays or a
+    /// preset scorer. An empty domain requires empty candidate coverage. A mixed
+    /// plan's flat sibling must use exactly the same statistics domain.
+    ///
+    /// ```
+    /// # use lance::io::exec::fts::CombinedFieldsQueryExec;
+    /// # use datafusion::error::Result;
+    /// # fn configure(exec: CombinedFieldsQueryExec) -> Result<CombinedFieldsQueryExec> {
+    /// let domain = roaring::RoaringBitmap::from_iter([0, 1]);
+    /// exec.with_covered_fragments(domain.clone()).with_statistics_fragments(domain)
+    /// # }
+    /// ```
+    pub fn with_statistics_fragments(
+        mut self,
+        fragments: roaring::RoaringBitmap,
+    ) -> DataFusionResult<Self> {
+        self.statistics_fragments = Some(fragments);
+        self.validate_statistics_scope()?;
+        Ok(self)
+    }
+
+    fn validate_statistics_scope(&self) -> DataFusionResult<()> {
+        let Some(scope) = &self.statistics_fragments else {
+            return Ok(());
+        };
+        if self.dataset.manifest().uses_stable_row_ids()
+            || self.overlay_block.is_some()
+            || self.base_scorer.is_some()
+        {
+            return Err(DataFusionError::Plan(
+                "BM25F fragment statistics require physical row IDs without overlay or preset scorer".into()));
+        }
+        if self
+            .covered_fragments
+            .as_ref()
+            .is_none_or(|candidates| !candidates.is_subset(scope))
+        {
+            return Err(DataFusionError::Plan(
+                "BM25F candidate fragments must be explicitly contained in the statistics domain"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fixed fragment statistics domain. `None` uses the complete corpus;
+    /// `Some(empty)` contributes no indexed rows.
+    pub fn statistics_fragments(&self) -> Option<&roaring::RoaringBitmap> {
+        self.statistics_fragments.as_ref()
+    }
+
     pub fn new(
         dataset: Arc<Dataset>,
         query: CombinedFieldsQuery,
@@ -123,6 +183,7 @@ impl CombinedFieldsQueryExec {
         Self {
             dataset,
             query,
+            statistics_fragments: None,
             tokenized_query: Arc::new(OnceLock::new()),
             params,
             prefilter_source,
@@ -255,6 +316,7 @@ impl CombinedFieldsQueryExec {
         Self {
             dataset: self.dataset.clone(),
             query: self.query.clone(),
+            statistics_fragments: self.statistics_fragments.clone(),
             tokenized_query: self.tokenized_query.clone(),
             params: self.params.clone(),
             prefilter_source,
@@ -321,6 +383,7 @@ pub(super) enum CombinedFieldsIndexRequirement {
 /// What [`open_combined_fields_scan`] hands back to either `combined_fields` exec.
 pub(super) struct CombinedFieldsScan {
     pub(super) columns: Vec<CombinedFieldColumn>,
+    pub(super) statistics_rows: Option<Arc<RowAddrTreeMap>>,
     /// Every segment opened across all target columns, for the indexed side's
     /// prefilter.
     segments: Vec<IndexMetadata>,
@@ -336,22 +399,40 @@ pub(super) struct CombinedFieldsScan {
 /// list-element index. The query stores each column together with its weight, so
 /// no column can be dropped here for want of one.
 ///
-/// Both sides count the opened segments toward parts searched: the flat side needs
-/// them for the tokenizer and the blended corpus statistics, the indexed side for
-/// scoring.
+/// Both sides count opened segments toward parts searched. The flat side needs
+/// covered segments for blended corpus statistics; a completely uncovered shard
+/// uses tokenizer metadata without opening unrelated segments.
 ///
 /// `stale_rows` is empty, or one entry per target column in query column order.
 /// See [`CombinedFieldColumn::stale_rows`].
 pub(super) async fn open_combined_fields_scan(
     dataset: &Dataset,
     query: &CombinedFieldsQuery,
+    statistics_fragments: Option<&roaring::RoaringBitmap>,
     index_requirement: CombinedFieldsIndexRequirement,
     stale_rows: &[Arc<RowAddrTreeMap>],
     tokenized_query: &OnceLock<TokenizedQuery>,
     metrics: &FtsIndexMetrics,
 ) -> DataFusionResult<CombinedFieldsScan> {
+    let statistics_rows = if let Some(fragments) = statistics_fragments {
+        if dataset.manifest().uses_stable_row_ids() {
+            return Err(DataFusionError::Plan(
+                "BM25F fragment statistics require physical row IDs".into(),
+            ));
+        }
+        let mut rows = RowAddrTreeMap::new();
+        // Candidate membership still uses live fragments. Statistics retain
+        // committed indexed rows, including fragments removed by deletion.
+        for fragment in fragments {
+            rows.insert_fragment(fragment);
+        }
+        Some(Arc::new(rows))
+    } else {
+        None
+    };
     let mut columns = Vec::with_capacity(query.column_names().len());
     let mut all_segments = Vec::new();
+    let mut tokenizer_params: Option<(&str, InvertedIndexParams)> = None;
     for (slot, (column, weight)) in query.weighted_columns().enumerate() {
         let segments = match index_requirement {
             CombinedFieldsIndexRequirement::EveryColumn => Some(
@@ -370,9 +451,40 @@ pub(super) async fn open_combined_fields_scan(
                     .map(Arc::from)
             }
         };
+        // Tokenizer metadata belongs to the field, including when this shard
+        // has no indexed rows. Validate before pruning so a flat-only shard need
+        // not open an unrelated segment just to borrow its tokenizer.
+        if let Some(segments) = &segments {
+            let details = load_segment_details(dataset, column, segments).await?;
+            let params = InvertedIndexParams::try_from(&details)?;
+            if let Some((reference, expected)) = &tokenizer_params {
+                if !expected.same_tokenization(&params) {
+                    return Err(DataFusionError::Execution(format!(
+                        "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
+                    )));
+                }
+            } else {
+                tokenizer_params = Some((column, params));
+            }
+        }
+        let segments = segments.map(|segments| {
+            let Some(scope) = statistics_fragments else {
+                return segments;
+            };
+            let selected: Vec<_> = segments
+                .iter()
+                .filter(|segment| {
+                    segment
+                        .fragment_bitmap
+                        .as_ref()
+                        .is_none_or(|coverage| !coverage.is_disjoint(scope))
+                })
+                .cloned()
+                .collect();
+            Arc::from(selected)
+        });
         let indices = match segments {
             Some(segments) => {
-                let _details = load_segment_details(dataset, column, &segments).await?;
                 let indices =
                     open_fts_segments(dataset, column, &segments, &metrics.index_metrics).await?;
                 all_segments.extend(segments.iter().cloned());
@@ -380,6 +492,11 @@ pub(super) async fn open_combined_fields_scan(
             }
             None => Vec::new(),
         };
+        if statistics_fragments.is_some() && indices.iter().any(|index| index.is_legacy()) {
+            return Err(DataFusionError::Plan(
+                "BM25F fragment statistics require modern DocId-keyed indices".into(),
+            ));
+        }
         columns.push(CombinedFieldColumn {
             column: column.to_string(),
             weight,
@@ -390,7 +507,6 @@ pub(super) async fn open_combined_fields_scan(
                 .cloned(),
         });
     }
-    validate_combined_tokenizers(&columns)?;
     metrics.record_parts_searched(
         columns
             .iter()
@@ -400,29 +516,25 @@ pub(super) async fn open_combined_fields_scan(
     );
 
     // Fields share a tokenizer (validated above), so tokenize once.
-    let first_index = columns
-        .iter()
-        .find_map(|column| column.indices.first())
-        .ok_or_else(|| match index_requirement {
-            // Not a user error: `EveryColumn` resolution already failed for any
-            // column without an index, and `CombinedFieldsQuery::try_new` rejects
-            // an empty column list, so reaching this means one of those two
-            // guarantees broke.
-            CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
-                "combined_fields query reached execution with no target columns".to_string(),
-            ),
-            CombinedFieldsIndexRequirement::AtLeastOneColumn => {
-                DataFusionError::Execution(format!(
-                    "combined_fields requires an inverted index on at least one of {:?}",
-                    query.column_names().collect::<Vec<_>>()
-                ))
-            }
-        })?;
-    let mut tokenizer = first_index.tokenizer();
+    let (_, params) = tokenizer_params.ok_or_else(|| match index_requirement {
+        // Not a user error: `EveryColumn` resolution already failed for any
+        // column without an index, and `CombinedFieldsQuery::try_new` rejects
+        // an empty column list, so reaching this means one of those two
+        // guarantees broke.
+        CombinedFieldsIndexRequirement::EveryColumn => DataFusionError::Internal(
+            "combined_fields query reached execution with no target columns".to_string(),
+        ),
+        CombinedFieldsIndexRequirement::AtLeastOneColumn => DataFusionError::Execution(format!(
+            "combined_fields requires an inverted index on at least one of {:?}",
+            query.column_names().collect::<Vec<_>>()
+        )),
+    })?;
+    let mut tokenizer = params.build()?;
     let tokens = try_collect_query_tokens(query.terms(), &mut tokenizer)?;
     record_tokenized_query(tokenized_query, &tokens);
 
     Ok(CombinedFieldsScan {
+        statistics_rows,
         columns,
         segments: all_segments,
         tokens,
@@ -477,7 +589,9 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
         partition: usize,
         context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
+        self.validate_statistics_scope()?;
         let query = self.query.clone();
+        let statistics_fragments = self.statistics_fragments.clone();
         let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
         let ds = self.dataset.clone();
@@ -497,6 +611,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             let ds_for_scope = ds.clone();
 
             let CombinedFieldsScan {
+                statistics_rows,
                 columns,
                 segments: all_segments,
                 tokens,
@@ -504,6 +619,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             } = open_combined_fields_scan(
                 &ds,
                 &query,
+                statistics_fragments.as_ref(),
                 CombinedFieldsIndexRequirement::EveryColumn,
                 // Nothing to subtract: this side either scores against index
                 // statistics alone or against the scorer the flat sibling built,
@@ -559,16 +675,20 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 (None, Some(shared_scorer)) => shared_scorer.wait().await?,
                 (None, None) => {
                     let scorer_start = std::time::Instant::now();
-                    let scorer = Arc::new(
-                        build_combined_bm25_scorer(
-                            &columns,
-                            &tokens,
-                            CombinedCorpusStats::IndexOnly,
-                            Some(metrics.as_ref()),
-                        )
-                        .boxed()
-                        .await?,
-                    );
+                    let scorer = Arc::new({
+                        let mut search = CombinedFieldsSearch::new(&columns);
+                        if let Some(rows) = &statistics_rows {
+                            search = search.with_statistics_rows(rows);
+                        }
+                        search
+                            .build_scorer(
+                                &tokens,
+                                CombinedCorpusStats::IndexOnly,
+                                Some(metrics.as_ref()),
+                            )
+                            .boxed()
+                            .await?
+                    });
                     metrics.record_scorer_build(scorer_start.elapsed());
                     scorer
                 }
@@ -622,5 +742,376 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
 
     fn supports_limit_pushdown(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::WriteParams;
+    use crate::index::DatasetIndexExt;
+    use crate::io::exec::fts::tests::{candidate_input, execute_results, memory_input};
+    use crate::io::exec::fts::{
+        FlatCombinedFieldsExec, FlatStatsCoverage, FlatStatsScope, FtsCorpusBinding,
+        SharedFtsScorerExec,
+    };
+    use arrow_array::RecordBatchIterator;
+    use datafusion::physical_plan::{
+        coalesce_partitions::CoalescePartitionsExec, union::UnionExec,
+    };
+    use lance_core::ROW_ID;
+    use lance_core::utils::address::RowAddress;
+    use lance_index::IndexType;
+    use lance_index::scalar::inverted::query::Operator;
+
+    #[rstest::rstest]
+    #[case::same_analyzer(false)]
+    #[case::incompatible_analyzer(true)]
+    #[tokio::test]
+    async fn flat_shard_uses_metadata_without_opening_unrelated_indices(
+        #[case] incompatible: bool,
+    ) {
+        let batch =
+            arrow_array::record_batch!(("title", Utf8, ["Alpha"]), ("body", Utf8, ["beta"]))
+                .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for column in ["title", "body"] {
+            let params =
+                InvertedIndexParams::default().lower_case(!(incompatible && column == "body"));
+            dataset
+                .create_index(&[column], IndexType::Inverted, None, &params, true)
+                .await
+                .unwrap();
+        }
+        let query =
+            CombinedFieldsQuery::try_new("ALPHA beta".into(), vec!["title".into(), "body".into()])
+                .unwrap();
+        let scope = roaring::RoaringBitmap::from_iter([1]);
+        let metrics = FtsIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let scan = open_combined_fields_scan(
+            &dataset,
+            &query,
+            Some(&scope),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn,
+            &[],
+            &OnceLock::new(),
+            &metrics,
+        )
+        .await;
+        if incompatible {
+            assert!(
+                scan.err()
+                    .unwrap()
+                    .to_string()
+                    .contains("share the same tokenizer")
+            );
+        } else {
+            let scan = scan.unwrap();
+            assert!(scan.segments.is_empty());
+            assert!(scan.columns.iter().all(|column| column.indices.is_empty()));
+            assert_eq!(scan.tokens.len(), 2);
+            assert_eq!(scan.tokens.get_token(0), "alpha");
+            assert_eq!(scan.tokens.get_token(1), "beta");
+        }
+    }
+
+    // Raw text is the oracle: no index statistics, scorer, or plan helper is
+    // used to calculate expected scores. The third fragment is outside the domain.
+    const TEXT: [[&str; 2]; 6] = [
+        ["alpha alpha", "beta"],
+        ["beta", "alpha beta"],
+        ["alpha", ""],
+        ["", "beta beta"],
+        ["alpha alpha alpha alpha", "alpha"],
+        ["beta beta beta", "beta"],
+    ];
+
+    async fn domain_dataset(stable: bool, mixed: bool) -> Arc<Dataset> {
+        let batch = arrow_array::record_batch!(
+            (
+                "title",
+                Utf8,
+                TEXT.iter().map(|row| row[0]).collect::<Vec<_>>()
+            ),
+            (
+                "body",
+                Utf8,
+                TEXT.iter().map(|row| row[1]).collect::<Vec<_>>()
+            ),
+            ("id", Int32, [0, 1, 2, 3, 4, 5])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(batch.slice(0, if mixed { 2 } else { 6 }))],
+                batch.schema(),
+            ),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: stable,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for column in ["title", "body"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default()
+                        .stem(false)
+                        .remove_stop_words(false),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        if mixed {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.slice(2, 4))], batch.schema()),
+                    Some(WriteParams {
+                        max_rows_per_file: 2,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        Arc::new(dataset)
+    }
+
+    fn domain_query(operator: Operator) -> CombinedFieldsQuery {
+        CombinedFieldsQuery::try_new("alpha beta".into(), vec!["title".into(), "body".into()])
+            .unwrap()
+            .try_with_boosts(vec![3.0, 1.0])
+            .unwrap()
+            .with_operator(operator)
+    }
+
+    fn domain_oracle(rows: usize, candidates: &[usize], operator: Operator) -> Vec<(u64, f32)> {
+        let count = (0..2)
+            .map(|field| TEXT[..rows].iter().filter(|r| !r[field].is_empty()).count())
+            .max()
+            .unwrap() as f64;
+        let weights = [3.0, 1.0];
+        let lengths: Vec<f64> = TEXT[..rows]
+            .iter()
+            .map(|row| {
+                (0..2)
+                    .map(|f| weights[f] * row[f].split_whitespace().count() as f64)
+                    .sum()
+            })
+            .collect();
+        let average = lengths.iter().sum::<f64>() / count;
+        candidates
+            .iter()
+            .filter_map(|&row| {
+                let mut score = 0.0;
+                for term in ["alpha", "beta"] {
+                    let frequency = (0..2)
+                        .map(|f| {
+                            weights[f]
+                                * TEXT[row][f]
+                                    .split_whitespace()
+                                    .filter(|t| *t == term)
+                                    .count() as f64
+                        })
+                        .sum::<f64>();
+                    if operator == Operator::And && frequency == 0.0 {
+                        return None;
+                    }
+                    let df = (0..2)
+                        .map(|f| {
+                            TEXT[..rows]
+                                .iter()
+                                .filter(|r| r[f].split_whitespace().any(|t| t == term))
+                                .count()
+                        })
+                        .max()
+                        .unwrap() as f64;
+                    let idf = (1.0 + (count - df + 0.5) / (df + 0.5)).ln();
+                    score += idf * 2.2 * frequency
+                        / (frequency + 1.2 * (0.25 + 0.75 * lengths[row] / average));
+                }
+                Some((
+                    u64::from(RowAddress::new_from_parts(
+                        (row / 2) as u32,
+                        (row % 2) as u32,
+                    )),
+                    score as f32,
+                ))
+            })
+            .collect()
+    }
+
+    #[rstest::rstest]
+    #[case::indexed_or(false, false, Operator::Or)]
+    #[case::indexed_and(false, false, Operator::And)]
+    #[case::deleted_fragment(false, true, Operator::Or)]
+    #[case::mixed_or(true, false, Operator::Or)]
+    #[case::mixed_and(true, false, Operator::And)]
+    #[tokio::test]
+    async fn statistics_domain_matches_raw_text_with_candidate_filter(
+        #[case] mixed: bool,
+        #[case] delete_fragment: bool,
+        #[case] operator: Operator,
+    ) {
+        let mut dataset = domain_dataset(false, mixed).await;
+        if delete_fragment {
+            Arc::make_mut(&mut dataset)
+                .delete("id >= 2 AND id < 4")
+                .await
+                .unwrap();
+        }
+        let scope = roaring::RoaringBitmap::from_iter([0, 1]);
+        let candidates = if delete_fragment {
+            vec![0]
+        } else {
+            vec![0, 2, 3]
+        };
+        let candidate_rows = candidates
+            .iter()
+            .map(|row| {
+                u64::from(RowAddress::new_from_parts(
+                    (row / 2) as u32,
+                    (row % 2) as u32,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let indexed = CombinedFieldsQueryExec::new(
+            dataset.clone(),
+            domain_query(operator),
+            FtsSearchParams::default(),
+            candidate_input(candidate_rows.clone(), false),
+        )
+        .with_covered_fragments(if mixed || delete_fragment {
+            roaring::RoaringBitmap::from_iter([0])
+        } else {
+            scope.clone()
+        })
+        .with_statistics_fragments(scope.clone())
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = if mixed {
+            let tail = arrow_array::record_batch!(
+                ("title", Utf8, [TEXT[2][0], TEXT[3][0]]),
+                ("body", Utf8, [TEXT[2][1], TEXT[3][1]]),
+                (
+                    ROW_ID,
+                    UInt64,
+                    [
+                        u64::from(RowAddress::new_from_parts(1, 0)),
+                        u64::from(RowAddress::new_from_parts(1, 1))
+                    ]
+                )
+            )
+            .unwrap();
+            let tail_fragments = roaring::RoaringBitmap::from_iter([1]);
+            let flat = FlatCombinedFieldsExec::try_new(
+                dataset,
+                domain_query(operator),
+                FtsSearchParams::default(),
+                memory_input(tail),
+                tail_fragments.clone(),
+                FlatStatsScope::PerColumn(vec![
+                    FlatStatsCoverage {
+                        fragments: tail_fragments,
+                        stale_rows: Arc::new(RowAddrTreeMap::new())
+                    };
+                    2
+                ]),
+                candidate_input(candidate_rows, false),
+            )
+            .unwrap()
+            .with_statistics_fragments(scope)
+            .unwrap();
+            let union = UnionExec::try_new(vec![Arc::new(indexed), Arc::new(flat)]).unwrap();
+            Arc::new(
+                SharedFtsScorerExec::try_new(
+                    Arc::new(CoalescePartitionsExec::new(union)),
+                    FtsCorpusBinding {
+                        producer_path: vec![0, 1],
+                        consumer_path: vec![0, 0],
+                    },
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(indexed)
+        };
+        let expected = domain_oracle(4, &candidates, operator);
+        for _ in 0..2 {
+            let actual = execute_results(plan.as_ref()).await.unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for ((row, score), (expected_row, expected_score)) in actual.iter().zip(&expected) {
+                assert_eq!(row, expected_row);
+                assert!(
+                    (score - expected_score).abs() < 1e-5,
+                    "{row}: {score} != {expected_score}"
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::stable(true, false)]
+    #[case::unscoped(false, false)]
+    #[case::outside(false, true)]
+    #[tokio::test]
+    async fn statistics_domain_rejects_incompatible_candidate_scope(
+        #[case] stable: bool,
+        #[case] explicit_outside: bool,
+    ) {
+        let dataset = domain_dataset(stable, false).await;
+        let mut exec = CombinedFieldsQueryExec::new(
+            dataset,
+            domain_query(Operator::Or),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        );
+        if explicit_outside {
+            exec = exec.with_covered_fragments(roaring::RoaringBitmap::from_iter([1]));
+        }
+        let error = exec
+            .with_statistics_fragments(roaring::RoaringBitmap::from_iter([0]))
+            .unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains(if stable {
+            "physical row IDs"
+        } else {
+            "candidate fragments"
+        }));
+    }
+
+    #[tokio::test]
+    async fn statistics_domain_revalidates_late_candidate_change() {
+        let dataset = domain_dataset(false, false).await;
+        let scope = roaring::RoaringBitmap::from_iter([0]);
+        let exec = CombinedFieldsQueryExec::new(
+            dataset,
+            domain_query(Operator::Or),
+            FtsSearchParams::default(),
+            PreFilterSource::None,
+        )
+        .with_covered_fragments(scope.clone())
+        .with_statistics_fragments(scope)
+        .unwrap()
+        .with_covered_fragments(roaring::RoaringBitmap::from_iter([1]));
+        let error = execute_results(&exec).await.unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(_)));
+        assert!(error.to_string().contains("candidate fragments"));
     }
 }

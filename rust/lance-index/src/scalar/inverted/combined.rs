@@ -61,6 +61,43 @@ pub struct CombinedFieldColumn {
     pub stale_rows: Option<Arc<RowAddrTreeMap>>,
 }
 
+/// A cross-field search and its optional physical-row statistics domain.
+///
+/// Candidate filters and column weights do not define this domain. Without a
+/// selection, the existing complete-index statistics are used. A selected domain
+/// requires modern DocId-keyed indices without overlay-stale rows.
+///
+/// ```
+/// # use lance_index::scalar::inverted::{CombinedFieldsSearch, CombinedFieldColumn};
+/// # use lance_select::RowAddrTreeMap;
+/// # fn configure<'a>(columns: &'a [CombinedFieldColumn], rows: &'a RowAddrTreeMap) {
+/// let search = CombinedFieldsSearch::new(columns).with_statistics_rows(rows);
+/// # }
+/// ```
+pub struct CombinedFieldsSearch<'a> {
+    columns: &'a [CombinedFieldColumn],
+    statistics_rows: Option<&'a RowAddrTreeMap>,
+}
+
+impl<'a> CombinedFieldsSearch<'a> {
+    /// Use complete index statistics for the supplied weighted columns.
+    pub fn new(columns: &'a [CombinedFieldColumn]) -> Self {
+        Self {
+            columns,
+            statistics_rows: None,
+        }
+    }
+
+    /// Count only these physical rows in index statistics. An empty selection
+    /// contributes no indexed rows. Committed indexed rows remain counted after
+    /// dataset deletion until the index is rewritten. This does not filter hits;
+    /// the caller must keep its candidates and flat contribution in this domain.
+    pub fn with_statistics_rows(mut self, rows: &'a RowAddrTreeMap) -> Self {
+        self.statistics_rows = Some(rows);
+        self
+    }
+}
+
 /// Deduplicate the query tokens into the unique terms of the virtual field,
 /// preserving first-seen order. Duplicate terms collapse to one (mirrors the
 /// per-column `load_posting_lists` dedup), so each term is scored once.

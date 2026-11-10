@@ -741,7 +741,13 @@ impl InvertedIndexParams {
     /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
     /// two columns can differ there yet still be safe to combine in a
     /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
-    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    /// let params = InvertedIndexParams::default();
+    /// assert!(params.same_tokenization(&params.clone().with_position(false)));
+    /// ```
+    pub fn same_tokenization(&self, other: &Self) -> bool {
         // Destructure exhaustively so that adding a new field forces an explicit
         // decision here about whether it affects tokenization.
         let Self {

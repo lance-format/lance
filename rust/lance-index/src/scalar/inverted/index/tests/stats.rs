@@ -1664,3 +1664,234 @@ fn test_legacy_per_doc_positions_deep_size_counts_only_referenced_slice() {
         "Positions deep_size_of {wrapped}B must not count the {full_backing}B shared buffer"
     );
 }
+
+#[tokio::test]
+async fn selected_row_statistics_cache_preserves_scope_terms_and_eviction() {
+    let cache = LanceCache::with_capacity(1024 * 1024);
+    let (index, counter, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    let rows = RowAddrTreeMap::from_iter([0, 2, 4]);
+    let terms = vec!["t0".to_owned(), "t1".to_owned(), "t4".to_owned()];
+    let expected = (3, 3, vec![1, 0, 1]);
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &rows, None)
+            .await
+            .unwrap(),
+        expected
+    );
+    let mut serialized = Vec::new();
+    rows.serialize_into(&mut serialized).unwrap();
+    let domain_key = SelectedRowDomainKey {
+        selection: serialized,
+    };
+    let domain_cache = &index.partitions[0].inverted_list.index_cache;
+    let first_domain = domain_cache.get_with_key(&domain_key).await.unwrap();
+    // Novel vectors must reuse the same row domain, including absent terms and
+    // repeated terms, while returning frequencies in the requested order.
+    for query in [vec!["t2", "t7", "missing"], vec!["t4", "t2", "t4"]] {
+        let query = query.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let expected = query
+            .iter()
+            .map(|term| usize::from(matches!(term.as_str(), "t0" | "t2" | "t4")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            index
+                .selected_row_stats_for_terms(&query, &rows, None)
+                .await
+                .unwrap(),
+            (3, 3, expected)
+        );
+        let reused = domain_cache.get_with_key(&domain_key).await.unwrap();
+        assert!(Arc::ptr_eq(&first_domain, &reused));
+    }
+    assert!(first_domain.deep_size_of() >= 3 * (4 + 8));
+    let reads = counter.read_range_calls();
+    let (a, b) = futures::join!(
+        index.selected_row_stats_for_terms(&terms, &rows, None),
+        index.selected_row_stats_for_terms(&terms, &rows, None),
+    );
+    assert_eq!(a.unwrap(), expected);
+    assert_eq!(b.unwrap(), expected);
+    assert_eq!(counter.read_range_calls(), reads);
+    let reversed = terms.iter().cloned().rev().collect::<Vec<_>>();
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&reversed, &RowAddrTreeMap::from_iter([1, 4]), None)
+            .await
+            .unwrap(),
+        (2, 2, vec![1, 1, 0])
+    );
+    let mut whole = RowAddrTreeMap::new();
+    whole.insert_fragment(0);
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &whole, None)
+            .await
+            .unwrap(),
+        (8, 8, vec![1, 1, 1])
+    );
+    cache.clear().await;
+    assert!(domain_cache.get_with_key(&domain_key).await.is_none());
+    let reads = counter.read_range_calls();
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &rows, None)
+            .await
+            .unwrap(),
+        expected
+    );
+    assert!(
+        counter.read_range_calls() > reads,
+        "evicted values must reload from the immutable index"
+    );
+    let reloaded = domain_cache.get_with_key(&domain_key).await.unwrap();
+    assert!(!Arc::ptr_eq(&first_domain, &reloaded));
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &RowAddrTreeMap::from_iter([99]), None)
+            .await
+            .unwrap(),
+        (0, 0, vec![0, 0, 0])
+    );
+    // The replacement index must not reuse the first index's corpus counts.
+    let namespace = cache.with_key_prefix("replacement-index");
+    let (replacement, _, _replacement_tmpdir) = load_counted_v2_index(2, namespace.clone()).await;
+    assert_eq!(
+        replacement
+            .selected_row_stats_for_terms(&terms, &whole, None)
+            .await
+            .unwrap(),
+        (2, 2, vec![1, 1, 0])
+    );
+}
+
+#[derive(Debug)]
+struct SelectedDomainRemapper;
+
+#[async_trait]
+impl BatchRowIdRemapper for SelectedDomainRemapper {
+    async fn remap_row_ids(&self, rows: &[u64]) -> Result<Vec<Option<u64>>> {
+        Ok(rows
+            .iter()
+            .map(|row| (*row != 2).then_some(u64::from(RowAddress::new_from_parts(1, *row as u32))))
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn selected_row_domain_preserves_remapped_identity_and_tombstones() {
+    let cache = LanceCache::with_capacity(1 << 20);
+    let (index, _, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    let terms = vec!["t0".to_owned(), "t2".to_owned(), "t4".to_owned()];
+    let mut original = RowAddrTreeMap::new();
+    original.insert_fragment(0);
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &original, None)
+            .await
+            .unwrap(),
+        (8, 8, vec![1, 1, 1])
+    );
+    let translated = InvertedIndex::load_with_remapping(
+        index.store.clone(),
+        Some(Arc::new(SelectedDomainRemapper)),
+        &cache.with_key_prefix("translated-index"),
+    )
+    .await
+    .unwrap();
+    let mut moved = RowAddrTreeMap::new();
+    moved.insert_fragment(1);
+    assert_eq!(
+        translated
+            .selected_row_stats_for_terms(&terms, &moved, None)
+            .await
+            .unwrap(),
+        (7, 7, vec![1, 0, 1])
+    );
+    assert_eq!(
+        translated
+            .selected_row_stats_for_terms(&terms, &original, None)
+            .await
+            .unwrap(),
+        (0, 0, vec![0, 0, 0])
+    );
+    let novel = vec!["t2".to_owned(), "t5".to_owned()];
+    assert_eq!(
+        translated
+            .selected_row_stats_for_terms(&novel, &moved, None)
+            .await
+            .unwrap(),
+        (7, 7, vec![0, 1])
+    );
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&novel, &original, None)
+            .await
+            .unwrap(),
+        (8, 8, vec![1, 1])
+    );
+}
+
+#[tokio::test]
+async fn selected_row_domain_recomputes_when_over_cache_budget() {
+    let cache = LanceCache::with_capacity(1);
+    let (index, _, _tmpdir) = load_counted_v2_index(8, cache.clone()).await;
+    let rows = RowAddrTreeMap::from_iter([0, 2, 4]);
+    let mut selection = Vec::new();
+    rows.serialize_into(&mut selection).unwrap();
+    for term in ["t0", "t1", "t4"] {
+        assert_eq!(
+            index
+                .selected_row_stats_for_terms(&[term.to_owned()], &rows, None)
+                .await
+                .unwrap(),
+            (3, 3, vec![usize::from(term != "t1")])
+        );
+        // Moka applies its weighted capacity during maintenance. Refresh the
+        // accounting before asserting eviction, while keeping the cache alive.
+        assert!(cache.size_bytes().await <= 1);
+        assert!(
+            index.partitions[0]
+                .inverted_list
+                .index_cache
+                .get_with_key(&SelectedRowDomainKey {
+                    selection: selection.clone()
+                })
+                .await
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn selected_row_domain_keeps_1024_documents_within_16kib() {
+    let cache = LanceCache::with_capacity(64 << 20);
+    let (index, _, _tmpdir) = load_counted_v2_index(1024, cache.clone()).await;
+    let mut selection = RowAddrTreeMap::new();
+    selection.insert_fragment(0);
+    let terms = vec!["t0".to_owned(), "t1023".to_owned()];
+    assert_eq!(
+        index
+            .selected_row_stats_for_terms(&terms, &selection, None)
+            .await
+            .unwrap(),
+        (1024, 1024, vec![1, 1])
+    );
+    let mut serialized = Vec::new();
+    selection.serialize_into(&mut serialized).unwrap();
+    let state = index.partitions[0]
+        .inverted_list
+        .index_cache
+        .get_with_key(&SelectedRowDomainKey {
+            selection: serialized,
+        })
+        .await
+        .unwrap();
+    // The domain shares a bounded cache with postings. A dense 1024-document
+    // selection must fit this budget without retaining another membership copy.
+    assert!(
+        state.deep_size_of() <= 16 * 1024,
+        "Selected domain retained {} bytes, exceeding the 16 KiB budget",
+        state.deep_size_of()
+    );
+}

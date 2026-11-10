@@ -272,6 +272,11 @@ impl SharedFtsCorpus {
                     "FTS corpus branches must use the same combined_fields query".to_string(),
                 ));
             }
+            if producer.statistics_fragments() != consumer.statistics_fragments() {
+                return Err(DataFusionError::Plan(
+                    "FTS corpus branches must use the same BM25F statistics domain".into(),
+                ));
+            }
             return Ok(Self::Combined(Arc::new(SharedFtsScorer::new())));
         }
         Err(DataFusionError::Plan(format!(
@@ -536,7 +541,12 @@ impl SharedFtsScorerExec {
         let fresh = match &self.scorer {
             SharedFtsCorpus::Match(_) => SharedFtsCorpus::Match(Arc::new(SharedFtsScorer::new())),
             SharedFtsCorpus::Combined(_) => {
-                SharedFtsCorpus::Combined(Arc::new(SharedFtsScorer::new()))
+                // Child rewrites can retain scorer identity while changing its
+                // domain. Validate the current pair before allocating fresh state.
+                let binding = self.binding()?;
+                let producer = at_path(&self.input, &binding.producer_path)?;
+                let consumer = at_path(&self.input, &binding.consumer_path)?;
+                SharedFtsCorpus::for_pair(producer.as_ref(), consumer.as_ref())?
             }
         };
         let mut consumers = 0;

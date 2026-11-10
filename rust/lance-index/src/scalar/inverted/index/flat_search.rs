@@ -712,6 +712,12 @@ fn count_column_into(
     counts: &mut [u64],
 ) -> DataFusionResult<()> {
     let discount_overlaps = tokenizer.discount_overlaps();
+    // Flat BM25F visits every token, even those absent from a short query.
+    // Compare one or two query terms directly instead of hashing each token;
+    // retain bounded lookup work for longer queries.
+    let mut terms = query_token_indices.iter();
+    let short_terms = [terms.next(), terms.next()];
+    let use_direct_lookup = query_token_indices.len() <= short_terms.len();
     let mut record = |row: usize, doc: &str| {
         let slot = row * num_columns + column_slot;
         let base = slot * num_terms;
@@ -722,7 +728,15 @@ fn count_column_into(
                 all_tokens[slot] += 1;
             }
             last_position = Some(token.position);
-            if let Some(token_indices) = query_token_indices.get(&token.text) {
+            let token_indices = if use_direct_lookup {
+                short_terms
+                    .iter()
+                    .flatten()
+                    .find_map(|(term, indices)| (*term == &token.text).then_some(*indices))
+            } else {
+                query_token_indices.get(&token.text)
+            };
+            if let Some(token_indices) = token_indices {
                 for token_index in token_indices {
                     counts[base + *token_index] += 1;
                 }
