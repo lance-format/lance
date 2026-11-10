@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-log_dir=${1:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
-source_commit=${2:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
-main_commit=${3:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
+log_dir=${1:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only|lint-only]}
+source_commit=${2:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only|lint-only]}
+main_commit=${3:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only|lint-only]}
 mode=${4:-all}
 
 mkdir -p "$log_dir"
@@ -67,6 +67,11 @@ run_substrait_tests() {
         cargo test --profile ci -p lance --features substrait --lib test_exec_roundtrip_keeps_empty_fragment_selection
 }
 
+run_substrait_clippy() {
+    run_step substrait_clippy \
+        cargo clippy --profile ci -p lance --features substrait --lib --tests -- -D warnings
+}
+
 cd "$(git rev-parse --show-toplevel)"
 
 {
@@ -98,11 +103,15 @@ case "$mode" in
         run_step root_fmt \
             cargo fmt --all -- --check
         run_substrait_tests
+        run_substrait_clippy
         run_step root_clippy \
             cargo clippy --profile ci --all --tests --benches -- -D warnings
         ;;
     tests-only)
         run_substrait_tests
+        ;;
+    lint-only)
+        run_substrait_clippy
         ;;
     *)
         printf 'invalid mode: %s\n' "$mode" >&2
