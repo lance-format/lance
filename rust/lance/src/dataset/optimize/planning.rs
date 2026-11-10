@@ -1134,6 +1134,35 @@ impl DefaultCompactionPlanner {
             );
         }
 
+        // Hard mode has always applied the fragment budget before the shared
+        // limiter, which may inspect file sizes. Preserve that prefilter so a
+        // task it excludes because of its fragment count cannot fail later
+        // planning due to a missing byte size. Soft mode must reach the limiter
+        // so its first task can still make progress.
+        let all_tasks = if self.options.source_budget_mode == SourceBudgetMode::Hard
+            && let Some(max_frags) = self.options.max_source_fragments
+        {
+            let num_candidate_tasks = all_tasks.len();
+            let mut total = 0_usize;
+            let mut kept = Vec::with_capacity(all_tasks.len());
+            for (task, live_rows) in all_tasks {
+                total += task.fragments.len();
+                if total > max_frags {
+                    break;
+                }
+                kept.push((task, live_rows));
+            }
+            if kept.is_empty() && num_candidate_tasks > 0 {
+                warn!(
+                    "Grouped compaction plan is empty: the first of {num_candidate_tasks} tasks \
+                     already exceeds max_source_fragments={max_frags}"
+                );
+            }
+            kept
+        } else {
+            all_tasks
+        };
+
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
         // The hold-back above kept every covered fragment out of every bin, so
@@ -1556,7 +1585,7 @@ pub(super) fn pins_dead_user_columns_for_lineage(
 /// tasks use the same cumulative checks as hard mode.
 ///
 /// Each task is paired with the number of live rows in its source fragments.
-fn limit_tasks_to_source_budget(
+pub(super) fn limit_tasks_to_source_budget(
     options: &CompactionOptions,
     schema: &lance_core::datatypes::Schema,
     all_tasks: Vec<(TaskData, usize)>,

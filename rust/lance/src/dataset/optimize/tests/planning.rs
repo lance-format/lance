@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use crate::dataset::optimize::planning::{
     CandidateBin, CompactionCandidacy, FragmentMetrics, HELD_BACK_SAMPLE_LIMIT, describe_held,
-    fragment_file_bytes,
+    fragment_file_bytes, limit_tasks_to_source_budget,
 };
 
 /// The hold-back log names at most [`HELD_BACK_SAMPLE_LIMIT`] fragment ids,
@@ -596,20 +596,34 @@ async fn grouped_compaction_replaces_only_the_selected_fragments() {
 
     // The non-adjacent remainder under a fragment budget: over budget is
     // not planned and nothing is written; within budget it compacts.
+    let mut missing_size = dataset.clone();
+    let manifest = Arc::make_mut(&mut missing_size.manifest);
+    Arc::make_mut(&mut manifest.fragments)[0].files[0].file_size_bytes = CachedFileSize::unknown();
+    let groups = vec![group(&[&after[0], &after[1]], &[("group", "b")])];
+
     let soft_plan = DefaultCompactionPlanner::new(CompactionOptions {
         max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
         source_budget_mode: SourceBudgetMode::Soft,
         ..options.clone()
     })
     .unwrap()
-    .plan_groups(
-        &dataset,
-        vec![group(&[&after[0], &after[1]], &[("group", "b")])],
-    )
+    .plan_groups(&missing_size, groups.clone())
     .await
     .unwrap();
     assert_eq!(soft_plan.tasks.len(), 1);
     assert_eq!(soft_plan.tasks[0].fragments.len(), 2);
+
+    let hard_plan = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        ..options.clone()
+    })
+    .unwrap()
+    .plan_groups(&missing_size, groups)
+    .await
+    .unwrap();
+    assert!(hard_plan.tasks.is_empty(), "{:?}", hard_plan.tasks);
 
     let metrics = compact_files_with_planner(
         &mut dataset,
