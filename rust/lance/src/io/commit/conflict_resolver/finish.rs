@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::index::provenance::revives_rows;
 
 impl<'a> TransactionRebase<'a> {
     /// Writes
@@ -382,9 +383,9 @@ impl<'a> TransactionRebase<'a> {
                 }
             }
 
-            // Cleanup can hide in-place rewrites from the transaction checks.
-            // Compare the surviving fragments' field paths with the build
-            // snapshot; deletion files and added columns do not stale an index.
+            // Cleanup can hide in-place rewrites and restores from transaction
+            // checks. Added columns and further deletions keep coverage, but a
+            // revived row was never indexed by this build.
             if dataset.manifest.version != self.transaction.read_version
                 && let Some(read_fragments) = &self.read_fragments
             {
@@ -397,6 +398,38 @@ impl<'a> TransactionRebase<'a> {
                     dataset.fragment_bitmap.as_ref(),
                     self.current_lineage.as_ref(),
                 );
+
+                let covered_fragments = new_indices
+                    .iter()
+                    .filter(|index| !is_system_index(index))
+                    .filter_map(|index| index.fragment_bitmap.as_ref())
+                    .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+                let previously_deleted_fragments = self
+                    .read_version_fragments
+                    .as_ref()
+                    .unwrap_or(read_fragments)
+                    .iter()
+                    .filter(|fragment| fragment.deletion_file.is_some())
+                    .map(|fragment| (fragment.id, fragment))
+                    .collect::<HashMap<_, _>>();
+                let mut revived_fragments = RoaringBitmap::new();
+                // Both deletion files are addressable through the current dataset.
+                for current in dataset.fragments().iter() {
+                    if covered_fragments.contains(current.id as u32)
+                        && let Some(previous) = previously_deleted_fragments.get(&current.id)
+                        && revives_rows(dataset, dataset, previous, current).await?
+                    {
+                        revived_fragments.insert(current.id as u32);
+                    }
+                }
+                for index in new_indices
+                    .iter_mut()
+                    .filter(|index| !is_system_index(index))
+                {
+                    if let Some(coverage) = index.fragment_bitmap.as_mut() {
+                        *coverage -= &revived_fragments;
+                    }
+                }
             }
 
             // A rewrite committed since this build started retired its source
