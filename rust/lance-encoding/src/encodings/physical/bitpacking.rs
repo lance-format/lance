@@ -32,6 +32,7 @@ use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
+use crate::encodings::physical::try_vec_with_capacity;
 use crate::format::metadata::CompressiveEncoding;
 use crate::format::{EncodingUtils, metadata};
 use crate::statistics::{GetStat, Stat};
@@ -590,11 +591,14 @@ pub(crate) fn bitpack_out_of_line_vec<T: ArrowNativeType + BitPackingUninit>(
 /// The compressed bit width is provided while the uncompressed width comes from `T`.
 /// Depending on the encoding decision the final chunk may be fully packed (with padding)
 /// or stored as raw tail values. We infer the layout from the buffer length.
+///
+/// A zero-width payload is empty, so only the allocation bounds `num_values`; a count too
+/// large to allocate returns an error.
 pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     num_values: usize,
     compressed_bits_per_value: usize,
-) -> FixedWidthDataBlock {
+) -> Result<FixedWidthDataBlock> {
     let words_per_chunk = (ELEMS_PER_CHUNK as usize * compressed_bits_per_value)
         .div_ceil(data.bits_per_value as usize);
     let compressed_words = data.data.borrow_to_typed_slice::<T>();
@@ -605,9 +609,10 @@ pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     let expected_new_len = expected_full_words + tail_values;
     let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
-    let extra_tail_capacity = ELEMS_PER_CHUNK as usize;
+    // A padded tail decodes a whole block before truncating.
+    let capacity = (num_values as u64).saturating_add(ELEMS_PER_CHUNK);
     let mut decompressed: Vec<T> =
-        Vec::with_capacity(num_values.saturating_add(extra_tail_capacity));
+        try_vec_with_capacity(capacity, "Out-of-line bitpacking output")?;
 
     for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
@@ -648,12 +653,12 @@ pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
 
     debug_assert_eq!(decompressed.len(), num_values);
 
-    FixedWidthDataBlock {
+    Ok(FixedWidthDataBlock {
         data: LanceBuffer::reinterpret_vec(decompressed),
         bits_per_value: data.bits_per_value,
         num_values: num_values as u64,
         block_info: BlockInfo::new(),
-    }
+    })
 }
 
 /// A transparent compressor that bit packs data
@@ -848,10 +853,10 @@ impl BlockDecompressor for OutOfLineBitpacking {
             Error::invalid_input("Out-of-line bitpacking cardinality does not fit usize")
         })?;
         let unpacked = match self.uncompressed_bit_width {
-            8 => unpack_out_of_line::<u8>(block, num_values, self.compressed_bit_width as usize),
-            16 => unpack_out_of_line::<u16>(block, num_values, self.compressed_bit_width as usize),
-            32 => unpack_out_of_line::<u32>(block, num_values, self.compressed_bit_width as usize),
-            64 => unpack_out_of_line::<u64>(block, num_values, self.compressed_bit_width as usize),
+            8 => unpack_out_of_line::<u8>(block, num_values, self.compressed_bit_width as usize)?,
+            16 => unpack_out_of_line::<u16>(block, num_values, self.compressed_bit_width as usize)?,
+            32 => unpack_out_of_line::<u32>(block, num_values, self.compressed_bit_width as usize)?,
+            64 => unpack_out_of_line::<u64>(block, num_values, self.compressed_bit_width as usize)?,
             _ => unreachable!(),
         };
         Ok(DataBlock::FixedWidth(unpacked))
@@ -1364,7 +1369,7 @@ mod test {
             block_info: BlockInfo::new(),
         };
 
-        let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width);
+        let decoded = unpack_out_of_line::<u32>(compressed_block, values.len(), bit_width).unwrap();
         let decoded_values = decoded.data.borrow_to_typed_slice::<u32>();
         assert_eq!(decoded_values.as_ref(), values.as_slice());
     }
@@ -1388,6 +1393,39 @@ mod test {
             panic!("expected fixed-width data");
         };
         assert_eq!(decoded.data.borrow_to_typed_slice::<u16>().as_ref(), values);
+    }
+
+    /// A zero-width payload is empty, so it does not bound the declared count. A count too
+    /// large to allocate is an error rather than a panic or an abort.
+    #[rstest]
+    #[case::u8(8)]
+    #[case::u16(16)]
+    #[case::u32(32)]
+    #[case::u64(64)]
+    fn test_out_of_line_bitpack_zero_width_rejects_unallocatable_count(
+        #[case] uncompressed_bit_width: u64,
+    ) {
+        let decompressor = OutOfLineBitpacking::new(0, uncompressed_bit_width);
+        let word_bytes = uncompressed_bit_width / 8;
+        // Overflows usize bytes, exceeds isize::MAX bytes, and fits isize but not any address
+        // space (1 EiB), where `Vec::with_capacity` would abort the process.
+        for num_values in [
+            u64::MAX - 2048,
+            isize::MAX as u64 / word_bytes + 1,
+            (1_u64 << 60) / word_bytes,
+        ] {
+            let error = decompressor
+                .decompress(Some(LanceBuffer::empty()), num_values)
+                .unwrap_err();
+            assert!(
+                matches!(error, lance_core::Error::InvalidInput { .. }),
+                "{error:?}"
+            );
+            assert!(
+                error.to_string().contains("Out-of-line bitpacking output"),
+                "{error}"
+            );
+        }
     }
 
     #[rstest]

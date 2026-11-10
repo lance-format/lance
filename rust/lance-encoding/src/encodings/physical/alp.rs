@@ -1467,7 +1467,7 @@ impl AlpMiniBlockDecompressor {
                 block,
                 offset_count,
                 header.bit_width as usize,
-            ))
+            )?)
         };
         let offsets_buf = offsets_block
             .as_ref()
@@ -1519,7 +1519,7 @@ impl AlpMiniBlockDecompressor {
                 block,
                 offset_count,
                 header.bit_width as usize,
-            ))
+            )?)
         };
         let offsets_buf = offsets_block
             .as_ref()
@@ -1575,7 +1575,7 @@ impl AlpMiniBlockDecompressor {
                 num_values: count as u64,
                 block_info: BlockInfo::new(),
             };
-            Ok(unpack_out_of_line::<u64>(block, count, width)
+            Ok(unpack_out_of_line::<u64>(block, count, width)?
                 .data
                 .borrow_to_typed_slice::<u64>()
                 .as_ref()
