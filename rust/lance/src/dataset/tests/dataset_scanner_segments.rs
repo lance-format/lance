@@ -19,6 +19,7 @@ use lance_index::scalar::inverted::query::PhraseQuery;
 use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -1676,4 +1677,114 @@ impl FragmentVectorFixture {
         }
         actual["id"].as_primitive::<Int32Type>().values().to_vec()
     }
+}
+
+/// One supplied centroid: no IVF training, so no k-means randomness or minimum
+/// sample size.
+fn one_centroid() -> IvfBuildParams {
+    let centroids = Arc::new(
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 4]), 4).unwrap(),
+    );
+    IvfBuildParams::try_with_centroids(1, centroids).unwrap()
+}
+
+/// Segments of index `idx` on `vec` over fragments 0 and 1, the first an L2
+/// IVF_FLAT and the second built with `second`, published without the commit
+/// check, as an earlier release could have left them.
+async fn mixed_vector_segments(second: VectorIndexParams) -> (Dataset, Uuid, Uuid) {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .into_ram_dataset_with_params(
+            FragmentCount::from(2),
+            FragmentRowCount::from(16),
+            Some(WriteParams {
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let first = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, one_centroid());
+    let mut segments = Vec::with_capacity(2);
+    for (params, fragment) in [(first, 0), (second, 1)] {
+        let segment = dataset
+            .create_index_builder(&["vec"], IndexType::Vector, &params)
+            .name("idx".to_owned())
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        segments.push(segment);
+    }
+    let uuids = (segments[0].uuid, segments[1].uuid);
+    crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, segments).await;
+    (dataset, uuids.0, uuids.1)
+}
+
+/// Segments of one index that rank by different metrics or index types cannot
+/// answer one search: merging their distances would rank part of the data by
+/// the wrong one.
+#[rstest]
+#[case::metric(
+    VectorIndexParams::with_ivf_flat_params(DistanceType::Dot, one_centroid()),
+    "Dot"
+)]
+#[case::index_type(
+    VectorIndexParams::with_ivf_sq_params(
+        DistanceType::L2,
+        one_centroid(),
+        SQBuildParams::default()
+    ),
+    "IVF_SQ"
+)]
+#[tokio::test]
+async fn test_vector_search_refuses_segments_with_different_contracts(
+    #[case] second_params: VectorIndexParams,
+    #[case] mismatch: &str,
+    #[values(false, true)] batch: bool,
+) {
+    let (dataset, first, second) = mixed_vector_segments(second_params).await;
+    let query = Float32Array::from(vec![0.5; 4]);
+    let queries =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.5; 8]), 4).unwrap();
+
+    let mut scanner = dataset.scan();
+    if batch {
+        scanner
+            .nearest("vec", &queries, 5)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1);
+    } else {
+        scanner.nearest("vec", &query, 5).unwrap();
+    }
+    let plan = scanner.explain_plan(false).await.unwrap();
+    let node = if batch {
+        "ANNIvfBatch"
+    } else {
+        "ANNIvfPartition"
+    };
+    assert!(plan.contains(node), "{plan}");
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(
+        matches!(err, Error::Index { .. }),
+        "expected an index error, got {err:?}"
+    );
+    let message = err.to_string();
+    for expected in [first.to_string(), second.to_string(), mismatch.to_string()] {
+        assert!(
+            message.contains(&expected),
+            "the error should name {expected}: {message}"
+        );
+    }
+
+    // One segment alone ranks under one contract.
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &query, 5)
+        .unwrap()
+        .with_index_segments(vec![first])
+        .unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 5);
 }

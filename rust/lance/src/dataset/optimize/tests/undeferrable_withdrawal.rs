@@ -1229,19 +1229,28 @@ async fn an_emptied_create_index_segment_is_kept_beside_its_sibling() {
         .find(|id| !recorded.contains(*id))
         .expect("a fragment off the lineage must exist");
 
-    // A legacy segment's metadata to clone the sibling from, built here and
-    // discarded: `create_index` refuses a duplicate name, so the sibling is
-    // installed directly into the manifest instead.
-    let template = {
+    // Two legacy segments of the index name under test, built here and not
+    // committed: `create_index` refuses a duplicate name, so the sibling is
+    // installed directly into the manifest instead. Each has its own index
+    // files, since a commit to the name reads every segment it keeps.
+    let (template, sibling) = {
         let mut scratch = dataset.clone();
         let mut params =
             VectorIndexParams::ivf_pq(1, 4, 2, lance_linalg::distance::DistanceType::L2, 10);
         params.version(IndexFileVersion::Legacy);
-        CreateIndexBuilder::new(&mut scratch, &["vector"], IndexType::Vector, &params)
-            .name(VECTOR_INDEX.to_string())
-            .execute_uncommitted()
-            .await
-            .unwrap()
+        let template =
+            CreateIndexBuilder::new(&mut scratch, &["vector"], IndexType::Vector, &params)
+                .name(VECTOR_INDEX.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        let sibling =
+            CreateIndexBuilder::new(&mut scratch, &["vector"], IndexType::Vector, &params)
+                .name(VECTOR_INDEX.to_string())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+        (template, sibling)
     };
 
     // The sibling: a segment of the index name under test, already in the
@@ -1249,10 +1258,9 @@ async fn an_emptied_create_index_segment_is_kept_beside_its_sibling() {
     // installed BEFORE the staged build reads the table, so the rebase walks
     // ordinary transaction files afterwards.
     let sibling_coverage = RoaringBitmap::from_iter([untouched]);
-    let sibling_uuid = Uuid::new_v4();
+    let sibling_uuid = sibling.uuid;
     {
-        let mut sibling = template.clone();
-        sibling.uuid = sibling_uuid;
+        let mut sibling = sibling;
         sibling.fragment_bitmap = Some(sibling_coverage.clone());
         let mut indices = load_all_indices(&dataset).await.unwrap().to_vec();
         indices.push(sibling);
@@ -1263,8 +1271,6 @@ async fn an_emptied_create_index_segment_is_kept_beside_its_sibling() {
     // covers the recorded destinations the rewrite then retires: every bit of
     // its coverage is withdrawn, so it lands emptied.
     let stale = dataset.clone();
-    // Keeps the template's uuid, so its index files are the ones the
-    // capability probe actually opens; the SIBLING is the synthetic copy.
     let mut segment = template;
     segment.fragment_bitmap = Some(recorded.clone());
     segment.dataset_version = dataset.manifest.version;
