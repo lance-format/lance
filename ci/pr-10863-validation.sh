@@ -2,9 +2,10 @@
 
 set -euo pipefail
 
-log_dir=${1:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit>}
-source_commit=${2:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit>}
-main_commit=${3:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit>}
+log_dir=${1:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
+source_commit=${2:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
+main_commit=${3:?usage: ci/pr-10863-validation.sh <log-dir> <source-commit> <main-commit> [all|tests-only]}
+mode=${4:-all}
 
 mkdir -p "$log_dir"
 exec > >(tee "$log_dir/runner.log") 2>&1
@@ -55,6 +56,17 @@ run_test_step() {
     fi
 }
 
+run_substrait_tests() {
+    run_test_step options_none test_options_roundtrip_basic \
+        cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_basic
+    run_test_step options_nonempty_legacy test_options_roundtrip_with_fragments \
+        cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_with_fragments
+    run_test_step exec_codec_none test_exec_to_proto_roundtrip \
+        cargo test --profile ci -p lance --features substrait --lib test_exec_to_proto_roundtrip
+    run_test_step exec_empty_selection test_exec_roundtrip_keeps_empty_fragment_selection \
+        cargo test --profile ci -p lance --features substrait --lib test_exec_roundtrip_keeps_empty_fragment_selection
+}
+
 cd "$(git rev-parse --show-toplevel)"
 
 {
@@ -72,27 +84,31 @@ test "$(git diff --name-only "$source_commit"..HEAD)" = "ci/pr-10863-validation.
 git merge-base --is-ancestor "$main_commit" HEAD
 test -z "$(git status --porcelain=v1)"
 
-run_step codegen_fmt \
-    cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
-run_step codegen_clippy \
-    cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
-run_step codegen_check \
-    env PROTOC=/protoc-must-not-be-used \
-    cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
-run_step proto_comments \
-    python3 ci/check_proto_comments.py protos/filtered_read.proto
-run_step root_fmt \
-    cargo fmt --all -- --check
-run_test_step options_none test_options_roundtrip_basic \
-    cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_basic
-run_test_step options_nonempty_legacy test_options_roundtrip_with_fragments \
-    cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_with_fragments
-run_test_step exec_codec_none test_exec_to_proto_roundtrip \
-    cargo test --profile ci -p lance --features substrait --lib test_exec_to_proto_roundtrip
-run_test_step exec_empty_selection test_exec_roundtrip_keeps_empty_fragment_selection \
-    cargo test --profile ci -p lance --features substrait --lib test_exec_roundtrip_keeps_empty_fragment_selection
-run_step root_clippy \
-    cargo clippy --profile ci --all --tests --benches -- -D warnings
+case "$mode" in
+    all)
+        run_step codegen_fmt \
+            cargo fmt --manifest-path protos/codegen/Cargo.toml -- --check
+        run_step codegen_clippy \
+            cargo clippy --locked --manifest-path protos/codegen/Cargo.toml -- -D warnings
+        run_step codegen_check \
+            env PROTOC=/protoc-must-not-be-used \
+            cargo run --locked --manifest-path protos/codegen/Cargo.toml -- --check
+        run_step proto_comments \
+            python3 ci/check_proto_comments.py protos/filtered_read.proto
+        run_step root_fmt \
+            cargo fmt --all -- --check
+        run_substrait_tests
+        run_step root_clippy \
+            cargo clippy --profile ci --all --tests --benches -- -D warnings
+        ;;
+    tests-only)
+        run_substrait_tests
+        ;;
+    *)
+        printf 'invalid mode: %s\n' "$mode" >&2
+        exit 2
+        ;;
+esac
 
 {
     printf 'runner_commit=%s\n' "$(git rev-parse HEAD)"
