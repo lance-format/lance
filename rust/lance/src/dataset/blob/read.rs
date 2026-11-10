@@ -1379,6 +1379,7 @@ mod tests {
             &source_dir,
             Some(WriteParams {
                 data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: 1,
                 ..Default::default()
             }),
         )
@@ -1386,6 +1387,7 @@ mod tests {
         .unwrap();
 
         let mut source = Dataset::open(source_dir.as_ref()).await.unwrap();
+        assert_eq!(source.get_fragments().len(), 3);
         let source_blobs = Arc::new(source.clone())
             .take_blobs_by_indices(&[2, 1, 0], "blob")
             .await
@@ -1416,6 +1418,7 @@ mod tests {
             .await
             .unwrap();
         let cloned = Arc::new(Dataset::open(clone_dir.as_ref()).await.unwrap());
+        assert_eq!(cloned.get_fragments().len(), 3);
         let data_file = cloned.get_fragments()[0].metadata.files[0].clone();
         assert!(
             data_file.base_id.is_some(),
