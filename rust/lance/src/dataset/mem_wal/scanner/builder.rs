@@ -749,10 +749,9 @@ impl LsmScanner {
 
     /// Plain (filter / projection / limit) scan over base ∪ SSTables ∪ in-memory.
     ///
-    /// `projection` is what the sources read and the plan returns: the
-    /// caller's projection, or an empty one for `count_rows`, which still
-    /// reads the key columns dedup needs. Validation and routing follow the
-    /// caller's projection either way.
+    /// `projection` is what the plan returns: the caller's projection, or an
+    /// empty one for `count_rows`. Validation and routing follow the caller's
+    /// projection either way.
     async fn plan_scan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
@@ -886,8 +885,8 @@ impl LsmScanner {
     pub async fn count_rows(&self) -> Result<u64> {
         // Counting needs no JSON conversion, so skip decoding the values. A
         // plain scan needs none of the projected columns either, so it reads
-        // only what dedup needs instead of decoding a possibly wide projection.
-        // A search keeps its plan: its fetch is bounded by k.
+        // only the key and filter columns instead of a possibly wide
+        // projection. Searches keep their own plan.
         let plan = if self.nearest.is_some() || self.full_text_query.is_some() {
             self.create_plan().await?
         } else {
@@ -1307,9 +1306,8 @@ mod tests {
         );
     }
 
-    /// The count plans with an empty projection, so it validates the user's
-    /// names up front; an unknown column must still fail exactly as the scan
-    /// path does.
+    /// The count plans with an empty projection but still validates the
+    /// caller's; an unknown column must fail as the scan path does.
     #[tokio::test]
     async fn count_rows_rejects_unknown_projection_column() {
         let scanner = LsmScanner::without_base_table(
@@ -1360,14 +1358,14 @@ mod tests {
         );
 
         let filtered = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
-            .project(&["id"])
+            .project(&["value"])
             .unwrap()
             .filter("value >= 3")
             .unwrap();
         assert_eq!(filtered.count_rows().await.unwrap(), 7);
 
         let limited = LsmScanner::new(base, vec![], vec!["id".to_string()])
-            .project(&["id"])
+            .project(&["value"])
             .unwrap()
             .filter("value >= 3")
             .unwrap()

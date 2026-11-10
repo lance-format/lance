@@ -2809,7 +2809,7 @@ mod integration_tests {
             ],
         );
         let (bs, ix) = pk_indexed(&[active_batch]);
-        let scanner = |filter: &str| {
+        let scanner = |filter: &str, offset: Option<i64>| {
             LsmScanner::new(
                 base.clone(),
                 vec![shard_snapshot.clone()],
@@ -2827,30 +2827,38 @@ mod integration_tests {
                     frozen: vec![],
                 },
             )
-            .project(&["id"])
+            .project(&["name"])
             .unwrap()
             .filter(filter)
             .unwrap()
+            .limit(None, offset)
+            .unwrap()
         };
 
-        // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active).
-        for (filter, expected) in [
-            ("id > 0", vec![1, 2, 3, 6]),
-            ("name != 'base_2'", vec![1, 3, 6]),
-            ("name LIKE 'base%'", vec![2]),
+        // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active). The
+        // projection leaves out the key; `id = 3` and `id IN (..)` take the
+        // point-lookup route.
+        for (filter, offset, expected) in [
+            ("id > 0", None, 4),
+            ("name != 'base_2'", None, 3),
+            ("name LIKE 'base%'", None, 1),
+            ("id = 3", None, 1),
+            ("id IN (1, 4, 5, 6)", None, 2),
+            ("id > 0", Some(1), 3),
         ] {
-            let batches: Vec<RecordBatch> = scanner(filter)
+            let batches: Vec<RecordBatch> = scanner(filter, offset)
                 .try_into_stream()
                 .await
                 .unwrap()
                 .try_collect()
                 .await
                 .unwrap();
-            assert_eq!(collect_sorted_ids(&batches), expected, "scan, {filter}");
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, expected, "scan, {filter}, offset {offset:?}");
             assert_eq!(
-                scanner(filter).count_rows().await.unwrap(),
-                expected.len() as u64,
-                "count_rows, {filter}"
+                scanner(filter, offset).count_rows().await.unwrap(),
+                expected as u64,
+                "count_rows, {filter}, offset {offset:?}"
             );
         }
     }
