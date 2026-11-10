@@ -1349,6 +1349,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blob_v1_files_read_source_base_after_shallow_clone() {
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let expected = b"known independent legacy clone payload\x00\xff";
+        let blob_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(blob_metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2])),
+                Arc::new(LargeBinaryArray::from_iter([
+                    Some(b"".as_slice()),
+                    None,
+                    Some(expected.as_slice()),
+                ])),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &source_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut source = Dataset::open(source_dir.as_ref()).await.unwrap();
+        let source_blobs = source
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            source_blobs[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert!(source_blobs[1].is_none());
+        assert!(
+            source_blobs[2]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        source
+            .shallow_clone(clone_dir.as_ref(), source.version_id(), None)
+            .await
+            .unwrap();
+        let cloned = Dataset::open(clone_dir.as_ref()).await.unwrap();
+        let data_file = cloned.get_fragments()[0].metadata.files[0].clone();
+        assert!(
+            data_file.base_id.is_some(),
+            "shallow clone data file must reference the source base"
+        );
+        assert!(
+            !std::path::Path::new(clone_dir.as_ref())
+                .join("data")
+                .join(&data_file.path)
+                .exists(),
+            "shallow clone publication must not copy the legacy blob data file"
+        );
+
+        let cloned_blobs = cloned
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            cloned_blobs[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert!(cloned_blobs[1].is_none());
+        assert!(
+            cloned_blobs[2]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_blob_ranges_handles_overlaps_across_scheduler_splits() {
         let max_iop_size = *lance_io::object_store::DEFAULT_MAX_IOP_SIZE;
         let value_size = max_iop_size + 12;
