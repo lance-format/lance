@@ -3,12 +3,13 @@
 
 //! One charged current view, with immutable fragment state reused on replacement.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, Weak};
 
 use futures::{StreamExt, TryStreamExt};
-use lance_core::cache::{CacheKey, CacheNamespace, InternalCacheKey, KeyBuilder};
+use lance_core::cache::{CacheKey, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::deletion::DeletionVector;
 use lance_table::format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta};
@@ -90,12 +91,65 @@ impl CachedRowIdIndex {
     }
 }
 
-pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<RowIdIndex>> {
+/// One measured complete-view size per deletion mode, replaced on version
+/// changes. It owns no lookup graph or request history. Keeping this in the
+/// metadata cache prevents an oversized view from triggering repeated rebuilds
+/// while its smaller fragment working set remains resident.
+#[derive(Debug, DeepSizeOf)]
+pub(super) struct RowIdIndexSize {
+    version: u64,
+    e_tag: String,
+    bytes: usize,
+}
+
+impl RowIdIndexSize {
+    pub(super) fn new(cached: &CachedRowIdIndex) -> Self {
+        Self {
+            version: cached.version,
+            e_tag: cached.e_tag.clone(),
+            // LanceCache charges the value and its Arc control block.
+            bytes: cached.deep_size_of()
+                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>(),
+        }
+    }
+
+    pub(super) fn exceeds(&self, dataset: &Dataset, limit: u64) -> bool {
+        self.version == dataset.manifest.version
+            && Some(self.e_tag.as_str()) == dataset.manifest_location.e_tag.as_deref()
+            && self.bytes as u64 > limit
+    }
+}
+
+pub(super) struct RowIdIndexSizeKey {
+    pub with_deletions: bool,
+}
+
+impl CacheKey for RowIdIndexSizeKey {
+    type ValueType = RowIdIndexSize;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_index_size")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdIndexSize"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-size", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.with_deletions as u64);
+    }
+}
+
+pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<CachedRowIdIndex>> {
     let key = RowIdIndexKey { with_deletions };
     if let Some(cached) = dataset.index_cache.get_with_key(&key).await
         && cached.matches(dataset)
     {
-        return Ok(cached.index.clone());
+        return Ok(cached);
     }
 
     let lock = dataset
@@ -108,7 +162,7 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<R
     if let Some(cached) = &previous
         && cached.matches(dataset)
     {
-        return Ok(cached.index.clone());
+        return Ok(cached.clone());
     }
     if previous.is_none() {
         // Effective deletion fingerprints decide which prepared units are valid
@@ -155,7 +209,6 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<R
         )
     };
     let cached = Arc::new(cached);
-    let index = cached.index.clone();
     dataset
         .index_cache
         .insert_with_key(&key, cached.clone())
@@ -175,7 +228,7 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<R
             }
         }
     }
-    Ok(index)
+    Ok(cached)
 }
 
 pub(super) async fn build(

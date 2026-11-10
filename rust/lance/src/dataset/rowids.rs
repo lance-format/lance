@@ -240,7 +240,9 @@ pub(crate) async fn get_row_id_index_with(
             load_row_id_index(dataset, with_deletions).await?,
         )));
     }
-    cache::get(dataset, with_deletions).await.map(Some)
+    cache::get(dataset, with_deletions)
+        .await
+        .map(|cached| Some(cached.index.clone()))
 }
 
 /// Map a set of physical row addresses to their stable row ids
