@@ -1373,7 +1373,9 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
         let params = WarpParams {
-            nprobe: self.probe_params.nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
+            // WARP probes a fixed count rather than expanding until k results
+            // are found, so it takes the probing ceiling.
+            nprobe: q.maximum_nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
             imputation_rank: self
                 .warp_imputation_rank
                 .unwrap_or(q.k * *DEFAULT_XTR_OVERFETCH as usize),

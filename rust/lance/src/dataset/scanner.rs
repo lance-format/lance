@@ -162,6 +162,27 @@ pub enum MultivectorAlgorithm {
     Warp,
 }
 
+impl std::str::FromStr for MultivectorAlgorithm {
+    type Err = Error;
+
+    /// Parse `"xtr"` or `"warp"`, ignoring case.
+    ///
+    /// ```
+    /// # use lance::dataset::scanner::MultivectorAlgorithm;
+    /// assert_eq!("WARP".parse::<MultivectorAlgorithm>().unwrap(), MultivectorAlgorithm::Warp);
+    /// assert!("plaid".parse::<MultivectorAlgorithm>().is_err());
+    /// ```
+    fn from_str(algorithm: &str) -> Result<Self> {
+        match algorithm.to_lowercase().as_str() {
+            "xtr" => Ok(Self::Xtr),
+            "warp" => Ok(Self::Warp),
+            _ => Err(Error::invalid_input(format!(
+                "unknown multivector algorithm {algorithm:?}; expected \"xtr\" or \"warp\""
+            ))),
+        }
+    }
+}
+
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads

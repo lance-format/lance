@@ -487,6 +487,8 @@ def _build_vector_search_query(
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     search_effort: Optional[float] = None,
+    multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
+    warp_imputation_rank: Optional[int] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -560,6 +562,18 @@ def _build_vector_search_query(
         Both bounds are optional. The lower bound is inclusive and the upper
         bound is exclusive, so (0.0, 1.0) keeps distances d where
         0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+    multivector_algorithm: {"xtr", "warp"}, optional
+        Algorithm for indexed multivector search. ``"xtr"`` searches each query
+        token independently; ``"warp"`` (`WARP <https://arxiv.org/abs/2501.17788>`_)
+        probes ``nprobes`` IVF partitions per query token (default 32), scores
+        every token in them, and imputes missing token scores from the
+        centroids. When unset, WARP is used if the index supports it (IVF
+        indices without an HNSW sub-index) and XTR otherwise.
+    warp_imputation_rank: int, optional
+        WARP's imputation rank ``t'``: a query token scores documents it does
+        not observe by the estimated similarity of its ``t'``-th most similar
+        indexed token. Defaults to the number of tokens XTR retrieves per query
+        token.
 
     Returns
     -------
@@ -652,6 +666,8 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
+        "multivector_algorithm": multivector_algorithm,
+        "warp_imputation_rank": warp_imputation_rank,
     }
 
 
@@ -1022,6 +1038,8 @@ class ScannerBuilder:
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
         quantized_refine_factor: Optional[int] = None,
+        multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
+        warp_imputation_rank: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1083,6 +1101,18 @@ class ScannerBuilder:
             vectors for its candidates. With ``distance_range``, selected partitions
             use Accurate RQ search directly so the range applies before top-k
             truncation.
+        multivector_algorithm: {"xtr", "warp"}, optional
+            Algorithm for indexed multivector search. ``"xtr"`` searches each query
+            token independently; ``"warp"`` (`WARP <https://arxiv.org/abs/2501.17788>`_)
+            probes ``nprobes`` IVF partitions per query token (default 32), scores
+            every token in them, and imputes missing token scores from the
+            centroids. When unset, WARP is used if the index supports it (IVF
+            indices without an HNSW sub-index) and XTR otherwise.
+        warp_imputation_rank: int, optional
+            WARP's imputation rank ``t'``: a query token scores documents it does
+            not observe by the estimated similarity of its ``t'``-th most similar
+            indexed token. Defaults to the number of tokens XTR retrieves per query
+            token.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -1101,6 +1131,8 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
+            multivector_algorithm=multivector_algorithm,
+            warp_imputation_rank=warp_imputation_rank,
         )
         return self
 

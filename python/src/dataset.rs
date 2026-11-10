@@ -39,7 +39,7 @@ use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder, parse_clean
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
-    MaterializationStyle, RowAddrMask,
+    MaterializationStyle, MultivectorAlgorithm, RowAddrMask,
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
@@ -1179,6 +1179,21 @@ impl Dataset {
                     None
                 };
 
+            let multivector_algorithm = match nearest.get_item("multivector_algorithm")? {
+                Some(algorithm) if !algorithm.is_none() => Some(
+                    algorithm
+                        .extract::<String>()?
+                        .parse::<MultivectorAlgorithm>()
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                ),
+                _ => None,
+            };
+            let warp_imputation_rank: Option<usize> =
+                match nearest.get_item("warp_imputation_rank")? {
+                    Some(rank) if !rank.is_none() => Some(rank.extract()?),
+                    _ => None,
+                };
+
             scanner
                 .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
@@ -1200,6 +1215,12 @@ impl Dataset {
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
                     s = s.search_effort(search_effort)?;
+                    if let Some(algorithm) = multivector_algorithm {
+                        s = s.multivector_algorithm(algorithm);
+                    }
+                    if let Some(rank) = warp_imputation_rank {
+                        s = s.warp_imputation_rank(rank);
+                    }
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
                         s.distance_range(lower, upper);

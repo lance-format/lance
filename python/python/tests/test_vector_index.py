@@ -1877,6 +1877,50 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
         )
 
 
+@pytest.mark.parametrize("multivector_algorithm", ["xtr", "warp"])
+def test_multivec_algorithm(
+    indexed_multivec_dataset: lance.LanceDataset, multivector_algorithm: str
+):
+    rng = np.random.default_rng(42)
+    query = rng.random((5, 128))
+    nearest = {
+        "column": "vector",
+        "q": query,
+        "k": 100,
+        "nprobes": 1,
+        "multivector_algorithm": multivector_algorithm,
+        "warp_imputation_rank": 500,
+    }
+    plan = indexed_multivec_dataset.scanner(nearest=nearest).explain_plan()
+    if multivector_algorithm == "warp":
+        assert "Warp: k=100, nprobes=1, imputation_rank=500" in plan
+    else:
+        assert "Warp:" not in plan
+
+    results = indexed_multivec_dataset.to_table(columns=["id"], nearest=nearest)
+    assert results.num_rows == 100
+    ground_truth = indexed_multivec_dataset.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 100, "use_index": False},
+    )
+    actual_ids = set(results["id"].to_pylist())
+    expected_ids = set(ground_truth["id"].to_pylist())
+    assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
+
+
+def test_multivec_algorithm_rejects_unknown(
+    indexed_multivec_dataset: lance.LanceDataset,
+):
+    nearest = {
+        "column": "vector",
+        "q": np.random.default_rng(42).random((5, 128)),
+        "k": 10,
+        "multivector_algorithm": "plaid",
+    }
+    with pytest.raises(ValueError, match="unknown multivector algorithm"):
+        indexed_multivec_dataset.to_table(nearest=nearest)
+
+
 def test_multivec_search_paths(tmp_path: Path):
     vector_type = pa.list_(pa.list_(pa.float32(), 2))
     query = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)

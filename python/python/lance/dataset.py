@@ -631,6 +631,9 @@ class LanceDataset(pa.dataset.Dataset):
             used for batch nearest-neighbor search. When ``use_index`` is true and a
             vector index is available, each query vector is searched through the index
             path; otherwise the flat batch path is used.
+            For multivector columns, ``"multivector_algorithm"`` (``"xtr"`` or
+            ``"warp"``) and ``"warp_imputation_rank"`` choose and tune the search
+            algorithm; see :meth:`ScannerBuilder.nearest`.
 
         batch_size: int, default None
             The maximum number of rows per batch.  In some cases batches can be

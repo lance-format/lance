@@ -1180,7 +1180,8 @@ impl Scanner {
     /// A query token imputes, for documents it never observes, an estimate of
     /// the similarity of its `t'`-th most similar indexed token. Defaults to the
     /// number of tokens XTR retrieves per query token, `k * LANCE_XTR_OVERFETCH`.
-    /// WARP probes [`Self::nprobes`] partitions per query token and segment,
+    /// WARP probes a fixed number of partitions per query token and segment:
+    /// the maximum set by [`Self::nprobes`] or [`Self::maximum_nprobes`],
     /// defaulting to [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`].
     ///
     /// ```

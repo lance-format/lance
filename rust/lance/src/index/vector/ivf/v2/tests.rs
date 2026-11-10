@@ -3838,6 +3838,20 @@ async fn test_multivector_algorithm_dispatch() {
         .unwrap();
     assert_eq!(xtr.num_rows(), k);
 
+    // Python's `nprobes` reaches the scanner as minimum and maximum nprobes.
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query, k)
+        .unwrap()
+        .minimum_nprobes(1)
+        .maximum_nprobes(num_partitions)
+        .multivector_algorithm(MultivectorAlgorithm::Warp);
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(&format!("Warp: k={k}, nprobes={num_partitions}")),
+        "{plan}"
+    );
+
     let warp = search(MultivectorAlgorithm::Warp, None)
         .try_into_batch()
         .await
