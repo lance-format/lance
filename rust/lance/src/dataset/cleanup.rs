@@ -499,9 +499,6 @@ struct CleanupInspection {
     earliest_retained_manifest_time: Option<DateTime<Utc>>,
     /// The latest timestamp of all manifests that will be removed.
     latest_deleted_manifest_time: Option<DateTime<Utc>>,
-    /// Set when an expired manifest was classified from the listing instead of read, so
-    /// its commit time is unknown and the listing cutoff cannot be trusted.
-    skipped_expired_manifest_read: bool,
 }
 
 impl CleanupInspection {
@@ -518,11 +515,6 @@ impl CleanupInspection {
     /// the cutoff and scan the whole subtree — the same approach already used
     /// for `_indices/`.
     fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
-        if self.skipped_expired_manifest_read {
-            // At least one deleted manifest's commit time was never read, so the
-            // comparison below cannot be made safely. Scan everything.
-            return None;
-        }
         match (
             self.earliest_retained_manifest_time,
             self.latest_deleted_manifest_time,
@@ -1373,10 +1365,8 @@ impl<'a> CleanupTask<'a> {
                     .retired_records
                     .insert(location.version, identity);
             }
-            // Without the commit time there is nothing to compare against the retained
-            // side, so give up the listing cutoff and scan the whole subtree. Missing a
-            // file would orphan it permanently; an extra listing only costs time.
-            inspection.skipped_expired_manifest_read = true;
+            // The commit time stays unknown, which is safe because `delete_unverified`
+            // lists without a cutoff.
             return Ok(());
         }
 
