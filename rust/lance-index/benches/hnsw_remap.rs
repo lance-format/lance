@@ -228,6 +228,7 @@ fn search(
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn: false,
+                rq_graph_scoring: Default::default(),
             };
             let batch = hnsw
                 .search(

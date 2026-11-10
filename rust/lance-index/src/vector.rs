@@ -107,6 +107,22 @@ pub enum ApproxMode {
     Accurate,
 }
 
+/// How an HNSW search over RQ codes (`IVF_HNSW_RQ`) scores the nodes it visits.
+///
+/// Other index types ignore this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RqGraphScoring {
+    /// Score every visited node with the full multi-bit RQ estimator.
+    #[default]
+    MultiBit,
+
+    /// Walk the graph with the 1-bit sign codes embedded in every RQ code and a
+    /// 4-bit query, then rescore only the `ef` finalists with the full
+    /// multi-bit codes. Faster per query, but the walk's coarser scores can
+    /// steer it away from some true neighbors, lowering recall at a given `ef`.
+    OneBitRerank,
+}
+
 /// Caller-supplied IVF probe parameters before defaults and precedence are resolved.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProbeParams {
@@ -229,6 +245,10 @@ pub struct Query {
     /// This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
     /// Other index types ignore this setting.
     pub approx_mode: ApproxMode,
+
+    /// How an `IVF_HNSW_RQ` graph search scores visited nodes. Other index
+    /// types ignore this setting.
+    pub rq_graph_scoring: RqGraphScoring,
 }
 
 impl Query {

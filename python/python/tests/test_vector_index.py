@@ -3637,6 +3637,51 @@ def test_vector_index_invalid_approx_mode(indexed_dataset):
         )
 
 
+@pytest.mark.parametrize("rq_graph_scoring", ["multi_bit", "one_bit_rerank"])
+def test_ivf_hnsw_rq_graph_scoring(tmp_path, rq_graph_scoring):
+    rng = np.random.default_rng(7)
+    vectors = rng.standard_normal((256, 32), dtype=np.float32)
+    ds = lance.write_dataset(vec_to_table(data=vectors), tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=2,
+        num_bits=5,
+        max_iters=2,
+        sample_rate=2,
+    )
+    k = 10
+    recalls = []
+    for q in vectors[:8]:
+        expected = np.argsort(np.linalg.norm(vectors - q, axis=1))[:k]
+        result = ds.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": k,
+                "nprobes": 2,
+                "rq_graph_scoring": rq_graph_scoring,
+            },
+            with_row_id=True,
+        )
+        assert len(result) == k
+        found = set(result["_rowid"].to_pylist())
+        recalls.append(len(found & set(expected.tolist())) / k)
+    assert np.mean(recalls) >= 0.5
+
+
+def test_vector_index_invalid_rq_graph_scoring(indexed_dataset):
+    with pytest.raises(ValueError, match="rq_graph_scoring"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "rq_graph_scoring": "two_bit",
+            }
+        )
+
+
 def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
     with pytest.raises(ValueError, match="Quantized refine factor"):
         indexed_dataset.scanner(

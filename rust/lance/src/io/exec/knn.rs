@@ -3467,6 +3467,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -5350,6 +5351,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         async fn multivector_scoring(

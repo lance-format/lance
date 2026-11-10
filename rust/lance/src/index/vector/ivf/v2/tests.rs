@@ -77,7 +77,7 @@ use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
-    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query,
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query, RqGraphScoring,
     pq::storage::ProductQuantizationMetadata,
     sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
     storage::STORAGE_METADATA_KEY,
@@ -436,6 +436,7 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
@@ -5231,6 +5232,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: f32::NAN,
         approx_mode: ApproxMode::Fast,
+        rq_graph_scoring: Default::default(),
     };
     let (partition_ids, centroid_distances) = index.find_partitions(&query).unwrap();
     let partition_position = (0..partition_ids.len())
@@ -5440,6 +5442,7 @@ async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(#[cas
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Accurate,
+        rq_graph_scoring: Default::default(),
     };
     let scored = index
         .score_partition_candidates(0, &query, &[0, 1, 2, 3], &NoOpMetricsCollector)
@@ -5724,37 +5727,46 @@ async fn test_create_ivf_hnsw_rq(
     }
 }
 
+/// Searches with both [`RqGraphScoring`] modes, which must each use the index
+/// and recall the true neighbors.
 async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
     const K: usize = 10;
 
-    let mut scan = dataset.scan();
-    scan.nearest("vector", query, K)
-        .unwrap()
-        .minimum_nprobes(nlist)
-        .maximum_nprobes(nlist);
-    scan.with_row_id();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(
-        plan.contains("ANNSubIndex"),
-        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
-    );
-
-    let result = scan.try_into_batch().await.unwrap();
-    assert_eq!(result.num_rows(), K);
-    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
-    assert_eq!(
-        row_ids.iter().copied().collect::<HashSet<_>>().len(),
-        K,
-        "IVF_HNSW_RQ returned duplicate row ids"
-    );
-
     let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
-    let recall = row_ids
-        .iter()
-        .filter(|row_id| ground_truth.contains(row_id))
-        .count() as f32
-        / K as f32;
-    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+    for scoring in [RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank] {
+        let mut scan = dataset.scan();
+        scan.nearest("vector", query, K)
+            .unwrap()
+            .minimum_nprobes(nlist)
+            .maximum_nprobes(nlist)
+            .rq_graph_scoring(scoring);
+        scan.with_row_id();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "IVF_HNSW_RQ scan with {scoring:?} should use the vector index, got:\n{plan}"
+        );
+
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(
+            row_ids.iter().copied().collect::<HashSet<_>>().len(),
+            K,
+            "IVF_HNSW_RQ with {scoring:?} returned duplicate row ids"
+        );
+
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(
+            recall,
+            0.8,
+            "{scoring:?} recall: {recall}, row_ids: {row_ids:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6715,6 +6727,7 @@ async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
     assert_eq!(partitions.len(), num_partitions);

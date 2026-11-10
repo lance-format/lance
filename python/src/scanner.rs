@@ -34,7 +34,7 @@ use lance_index::scalar::inverted::query::{
     PhraseQuery,
 };
 use lance_index::vector::{
-    ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query as VectorQuery,
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query as VectorQuery, RqGraphScoring,
 };
 use lance_linalg::distance::MetricType;
 use pyo3::exceptions::{PyKeyError, PyValueError};
@@ -395,6 +395,7 @@ pub(crate) type VectorQueryParams = (
     i32,
     ApproxMode,
     f64,
+    RqGraphScoring,
 );
 
 fn extract_query_parallelism(value: &Bound<'_, PyAny>) -> PyResult<i32> {
@@ -430,6 +431,22 @@ fn vector_query_approx_mode_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Appr
         }
     } else {
         Ok(ApproxMode::Normal)
+    }
+}
+
+fn vector_query_rq_graph_scoring_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<RqGraphScoring> {
+    if let Some(scoring) = dict.get_item("rq_graph_scoring")?
+        && !scoring.is_none()
+    {
+        match scoring.to_string().to_lowercase().as_str() {
+            "multi_bit" => Ok(RqGraphScoring::MultiBit),
+            "one_bit_rerank" => Ok(RqGraphScoring::OneBitRerank),
+            value => Err(PyValueError::new_err(format!(
+                "rq_graph_scoring must be one of 'multi_bit' or 'one_bit_rerank', got '{value}'"
+            ))),
+        }
+    } else {
+        Ok(RqGraphScoring::MultiBit)
     }
 }
 
@@ -564,6 +581,7 @@ pub(crate) fn vector_query_params_from_dict(
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
     let approx_mode = vector_query_approx_mode_from_dict(dict)?;
+    let rq_graph_scoring = vector_query_rq_graph_scoring_from_dict(dict)?;
 
     Ok((
         column,
@@ -579,6 +597,7 @@ pub(crate) fn vector_query_params_from_dict(
         query_parallelism,
         approx_mode,
         search_effort,
+        rq_graph_scoring,
     ))
 }
 
@@ -618,6 +637,7 @@ impl PySearchFilter {
             query_parallelism,
             approx_mode,
             search_effort,
+            rq_graph_scoring,
         ) = vector_query_params_from_dict(query, default_k)?;
 
         if quantized_refine_factor.is_some() {
@@ -645,6 +665,7 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            rq_graph_scoring,
             search_effort,
         };
         vector_query

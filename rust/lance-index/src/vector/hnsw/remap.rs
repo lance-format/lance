@@ -467,6 +467,7 @@ fn reselect_damaged<S: VectorStore + Sync>(
         upper_bound: None,
         dist_q_c: 0.0,
         use_acorn: false,
+        rq_graph_scoring: Default::default(),
     };
     for level_idx in (0..levels.len()).rev() {
         if levels[level_idx].damaged.is_empty() {
@@ -798,6 +799,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -1073,6 +1075,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let hits = HNSW::load(repaired)
             .unwrap()

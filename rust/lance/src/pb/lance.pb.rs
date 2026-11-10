@@ -78,6 +78,10 @@ pub struct VectorQueryProto {
     /// subject to caller bounds. Later candidate-count expansion is unchanged.
     #[prost(double, optional, tag = "16")]
     pub search_effort: ::core::option::Option<f64>,
+    /// How an IVF_HNSW_RQ graph search scores visited nodes. Other index types
+    /// ignore this setting.
+    #[prost(enumeration = "VectorRqGraphScoring", tag = "17")]
+    pub rq_graph_scoring: i32,
 }
 impl ::prost::Name for VectorQueryProto {
     const NAME: &'static str = "VectorQueryProto";
@@ -201,6 +205,37 @@ impl VectorApproxMode {
             "Normal" => Some(Self::Normal),
             "Fast" => Some(Self::Fast),
             "Accurate" => Some(Self::Accurate),
+            _ => None,
+        }
+    }
+}
+/// How an HNSW search over RQ codes (IVF_HNSW_RQ) scores the nodes it visits.
+/// Other index types ignore this setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum VectorRqGraphScoring {
+    /// Score every visited node with the full multi-bit RQ estimator.
+    MultiBit = 0,
+    /// Walk the graph with the 1-bit sign codes, then rescore the ef finalists
+    /// with the full multi-bit codes.
+    OneBitRerank = 1,
+}
+impl VectorRqGraphScoring {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::MultiBit => "MultiBit",
+            Self::OneBitRerank => "OneBitRerank",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MultiBit" => Some(Self::MultiBit),
+            "OneBitRerank" => Some(Self::OneBitRerank),
             _ => None,
         }
     }
