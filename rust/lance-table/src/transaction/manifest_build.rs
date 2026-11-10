@@ -164,19 +164,38 @@ fn apply_range_segments(
 }
 
 impl Transaction {
+    /// Give each newly written fragment (id 0) the next id from `fragment_id`.
+    ///
+    /// An explicit deletion path is unchanged. A derived path includes the
+    /// fragment id and is rejected when the assigned id differs. An inline
+    /// vector has no file and can be renumbered.
     pub(super) fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
-    ) -> impl Iterator<Item = Fragment> + 'a
+    ) -> impl Iterator<Item = Result<Fragment>> + 'a
     where
         T: IntoIterator<Item = Fragment> + 'a,
     {
         new_fragments.into_iter().map(move |mut f| {
             if f.id == 0 {
+                if let Some(deletion_file) = &f.deletion_file
+                    && deletion_file.path.is_none()
+                    && deletion_file.inline.is_none()
+                    && *fragment_id != f.id
+                {
+                    return Err(Error::invalid_input(format!(
+                        "A new fragment carries deletion file {}, whose location is derived \
+                         from fragment id {}, but this commit assigns it fragment id {}. \
+                         Record the file's own path (DeletionFile.path) so the id can change.",
+                        crate::io::deletion::relative_deletion_file_path(f.id, deletion_file),
+                        f.id,
+                        *fragment_id
+                    )));
+                }
                 f.id = *fragment_id;
                 *fragment_id += 1;
             }
-            f
+            Ok(f)
         })
     }
 
@@ -944,7 +963,7 @@ impl Transaction {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
                     Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                 if let Some(next_row_id) = &mut next_row_id {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                     // Add version metadata for all new fragments
@@ -1123,7 +1142,7 @@ impl Transaction {
 
                 let mut new_fragments =
                     Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                 // New fragments were staged against the same pre-Project schema.
                 for fragment in &mut new_fragments {
                     let spilled = fragment.spilled_row_lineage_field_ids();
@@ -3989,6 +4008,72 @@ mod tests {
             DataStorageFormat::new(ConcreteFileVersion::V2_0),
             HashMap::new(),
         )
+    }
+
+    #[test]
+    fn test_assign_fragment_id_deletion_path() {
+        use crate::feature_flags::{
+            FLAG_UNSTABLE_DELETION_FILE_PATHS, deletion_file_paths_enabled,
+        };
+        use crate::format::DeletionFilePath;
+
+        let explicit = DeletionFile {
+            read_version: 1,
+            id: 10,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some(DeletionFilePath::new_random()),
+            inline: None,
+        };
+        let build = |deletion_file: &DeletionFile, existing: std::ops::Range<u64>| {
+            let mut fragment = Fragment::new(0).with_physical_rows(10);
+            fragment.deletion_file = Some(deletion_file.clone());
+            Transaction::new(
+                1,
+                Operation::Append {
+                    fragments: vec![fragment],
+                },
+                None,
+            )
+            .build_manifest(
+                Some(&sample_manifest_with_fragments(existing)),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+        };
+
+        if deletion_file_paths_enabled() {
+            let mut assigned_ids = Vec::new();
+            for existing in [0..42, 0..43] {
+                let (new_manifest, _) = build(&explicit, existing).unwrap();
+                let fragment = new_manifest.fragments.last().unwrap();
+                assigned_ids.push(fragment.id);
+                assert_eq!(fragment.deletion_file.as_ref(), Some(&explicit));
+                assert_ne!(
+                    new_manifest.reader_feature_flags & FLAG_UNSTABLE_DELETION_FILE_PATHS,
+                    0
+                );
+            }
+            assert_eq!(assigned_ids, vec![42, 43]);
+        } else {
+            let err = build(&explicit, 0..42).unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+        }
+
+        let derived = DeletionFile {
+            path: None,
+            ..explicit
+        };
+        let err = build(&derived, 0..42).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("fragment id 42"), "{err}");
+
+        let (new_manifest, _) = build(&derived, 0..0).unwrap();
+        let fragment = new_manifest.fragments.last().unwrap();
+        assert_eq!(fragment.id, 0);
+        assert_eq!(fragment.deletion_file.as_ref(), Some(&derived));
     }
 
     /// The real commit path must do clustering work proportional to what the

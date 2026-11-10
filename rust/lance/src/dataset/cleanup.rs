@@ -3342,6 +3342,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use lance_core::utils::deletion::DeletionVector;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
@@ -3351,7 +3352,10 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::feature_flags::deletion_file_paths_enabled;
+    use lance_table::format::DeletionFile;
     use lance_table::io::commit::{RenameCommitHandler, uses_version_hint, write_version_hint};
+    use lance_table::io::deletion::{DeletionFileNaming, write_deletion_file_with_naming};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector, some_batch};
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
@@ -5957,6 +5961,117 @@ mod tests {
         // Ensure we can still read the dataset
         let row_count_after = fixture.count_rows().await.unwrap();
         assert_eq!(row_count_after, 8);
+    }
+
+    /// Cleanup keeps an explicit-path deletion file a retained version references.
+    #[tokio::test]
+    async fn clean_old_explicit_path_delete_files() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let mut data_gen = BatchGenerator::new().col(Box::new(
+            IncrementingInt32::new().named("filter_me".to_owned()),
+        ));
+        fixture.create_with_data(data_gen.batch(16)).await.unwrap();
+        let dataset = *fixture.open().await.unwrap();
+        if !deletion_file_paths_enabled() {
+            let err = write_deletion_file_with_naming(
+                &dataset.base,
+                DeletionFileNaming::Uuid,
+                dataset.manifest.version,
+                &DeletionVector::from_iter([1_u32]),
+                dataset.object_store.as_ref(),
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+            return;
+        }
+        let write = |dataset: &Dataset, offsets: Vec<u32>| {
+            let base = dataset.base.clone();
+            let version = dataset.manifest.version;
+            let store = dataset.object_store.clone();
+            async move {
+                write_deletion_file_with_naming(
+                    &base,
+                    DeletionFileNaming::Uuid,
+                    version,
+                    &DeletionVector::from_iter(offsets),
+                    store.as_ref(),
+                    0,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            }
+        };
+        let commit = |dataset: Dataset, deletion_file: DeletionFile| async move {
+            let mut fragment = dataset.get_fragment(0).unwrap().metadata().clone();
+            fragment.deletion_file = Some(deletion_file);
+            let read_version = dataset.manifest.version;
+            CommitBuilder::new(Arc::new(dataset))
+                .execute(Transaction::new(
+                    read_version,
+                    Operation::Delete {
+                        updated_fragments: vec![fragment],
+                        deleted_fragment_ids: vec![],
+                        predicate: "filter_me in (1, 2, 3)".to_string(),
+                    },
+                    None,
+                ))
+                .await
+                .unwrap()
+        };
+        // Superseded by `latest` below, so only an expiring version uses it.
+        let superseded = write(&dataset, vec![1, 2]).await;
+        let dataset = commit(dataset, superseded.clone()).await;
+        let latest = write(&dataset, vec![1, 2, 3]).await;
+        // As left behind by a commit that never landed.
+        let orphan = write(&dataset, vec![7]).await;
+
+        MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
+        let dataset = commit(dataset, latest.clone()).await;
+        let path_of =
+            |deletion_file: &DeletionFile| deletion_file_path(&dataset.base, 0, deletion_file);
+        let before_count = fixture.count_files().await.unwrap();
+        assert_eq!(before_count.num_delete_files, 3);
+
+        let before = utc_now() - TimeDelta::try_days(8).unwrap();
+        let removed = fixture
+            .run_cleanup_with_override(before, Some(true), None)
+            .await
+            .unwrap();
+
+        assert_eq!(removed.old_versions, 2);
+        assert_eq!(removed.deletion_files_removed, 2);
+        let after_count = fixture.count_files().await.unwrap();
+        assert_eq!(after_count.num_delete_files, 1);
+        for (deletion_file, exists) in [(&latest, true), (&superseded, false), (&orphan, false)] {
+            assert_eq!(
+                dataset
+                    .object_store
+                    .exists(&path_of(deletion_file))
+                    .await
+                    .unwrap(),
+                exists,
+                "{deletion_file:?}"
+            );
+        }
+        // A scan reads the kept file, unlike a row count.
+        let scanned = fixture
+            .open()
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let values = scanned["filter_me"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(values, [0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     }
 
     #[tokio::test]

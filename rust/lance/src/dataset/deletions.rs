@@ -120,6 +120,7 @@ impl Dataset {
         deletion_file.file_type = DeletionFileType::Bitmap;
         deletion_file.num_deleted_rows = Some(bitmap.len() as usize);
         deletion_file.base_id = None;
+        deletion_file.path = None;
         deletion_file.inline = Some(encoded.into());
         Ok(Some(fragment))
     }
@@ -131,9 +132,11 @@ mod tests {
 
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, cast::AsArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_core::utils::deletion::DeletionVector;
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
-    use lance_table::feature_flags::FLAG_INLINE_DELETIONS;
+    use lance_table::feature_flags::{FLAG_INLINE_DELETIONS, deletion_file_paths_enabled};
+    use lance_table::io::deletion::{DeletionFileNaming, write_deletion_file_with_naming};
 
     use crate::dataset::WriteParams;
     use crate::index::DatasetIndexExt;
@@ -337,5 +340,80 @@ mod tests {
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));
         assert_eq!(deletion_file_requests(&reopened), 0);
+    }
+
+    #[tokio::test]
+    async fn test_inline_deletions_drops_an_explicit_path() {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let mut dataset = Dataset::write(reader, &uri, None).await.unwrap();
+
+        let written = write_deletion_file_with_naming(
+            &dataset.base,
+            DeletionFileNaming::Uuid,
+            dataset.manifest.version,
+            &DeletionVector::from_iter([3_u32]),
+            dataset.object_store.as_ref(),
+            0,
+        )
+        .await;
+        if !deletion_file_paths_enabled() {
+            let err = written.unwrap_err();
+            assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+            return;
+        }
+        let deletion_file = written.unwrap().unwrap();
+        assert!(deletion_file.path.is_some());
+
+        let mut fragment = dataset.get_fragment(0).unwrap().metadata().clone();
+        fragment.deletion_file = Some(deletion_file);
+        let read_version = dataset.manifest.version;
+        dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Delete {
+                    updated_fragments: vec![fragment],
+                    deleted_fragment_ids: vec![],
+                    predicate: "i = 3".to_string(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        dataset
+            .update_config([(
+                INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY.to_string(),
+                "4096".to_string(),
+            )])
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.inline_deletions().await.unwrap(), 1);
+        let file = dataset.manifest.fragments[0]
+            .deletion_file
+            .as_ref()
+            .unwrap();
+        assert!(file.path.is_none());
+        assert!(file.is_inline());
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_INLINE_DELETIONS,
+            0
+        );
+
+        let reopened = Dataset::open(&dataset.uri).await.unwrap();
+        let values = live_values(&reopened).await;
+        assert_eq!(values.len(), 9);
+        assert!(!values.contains(&3));
     }
 }
