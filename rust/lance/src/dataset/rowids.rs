@@ -370,9 +370,11 @@ pub(crate) async fn live_row_addrs_to_row_ids(
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Exclude).await
 }
 
-/// A synchronous version of [`live_row_addrs_to_row_ids`] for the rows of
-/// `fragment_ids`, for a caller that must translate addresses one at a time
-/// (e.g. inside a scoring loop) rather than in a batch.
+/// Builds a synchronous lookup, for the rows of `fragment_ids`, that a caller
+/// can use like [`live_row_addrs_to_row_ids`] one address at a time (e.g.
+/// inside a scoring loop) instead of as a batch. This function itself is
+/// still async: it awaits loading every fragment's row id sequence and
+/// deletion vector up front, so the returned closure never has to.
 ///
 /// The returned lookup yields `None` for an address in a fragment outside
 /// `fragment_ids` or no longer in the dataset, past the end of its fragment,
