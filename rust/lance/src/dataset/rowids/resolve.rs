@@ -27,9 +27,6 @@ const INLINE_PREPARE_BYTES: usize = 16 * 1024;
 /// Bound decoded source rows while allowing small fragments to retain remote
 /// I/O concurrency. This schedules work; it is not an RSS limit.
 const PREPARE_ROW_BUDGET: usize = 192 * 1024 * 1024;
-/// Larger routing directories use the CPU pool when combining prepared units.
-const INLINE_COMBINE_FRAGMENTS: usize = 64;
-
 /// A cached empty span proves the immutable source has no IDs. The metadata
 /// entry holds no sequence, deletion vector or prepared lookup allocation.
 #[derive(Debug)]
@@ -363,7 +360,7 @@ fn record_matches(
     Ok(())
 }
 
-/// Compose cached probe fragments and missing raw sources into one charged
+/// Compose cached prepared fragments and missing raw sources into one charged
 /// view. Unsupported representations release cached units before reconstruction;
 /// the complete view never retains fragment wrapper parents.
 pub(super) struct FragmentPromotion {
@@ -458,12 +455,12 @@ pub(super) async fn promote_fragments(
             .iter()
             .filter_map(|(_, unit)| unit.index.clone())
             .collect();
-        // Reject inseparable merged inputs before loading any misses. Prepare
-        // new raw sources against a combined probe parent so a small native
-        // append does not force rereading all previously prepared fragments.
+        // Compose prepared inputs before loading misses so a native append
+        // does not force rereading previously prepared fragments. Even two
+        // merged inputs can require substantial CPU work on their sorted rows.
         let combined = if inputs.is_empty() {
             None
-        } else if inputs.len() > INLINE_COMBINE_FRAGMENTS {
+        } else if inputs.len() > 1 {
             spawn_cpu(move || {
                 let refs: Vec<_> = inputs.iter().map(Arc::as_ref).collect();
                 RowIdIndex::try_combine(&refs)

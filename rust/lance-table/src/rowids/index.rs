@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 mod batch;
+mod combine;
 mod positions;
 mod sparse;
 
@@ -328,11 +329,12 @@ impl RowIdIndex {
     /// invalid-input error. Original source sequences need not remain alive.
     ///
     /// Shares prepared probe allocations directly and rebuilds only routing
-    /// metadata, without retaining the input indices. Returns `None` for merged
-    /// inputs or when the combined overlap requires the merged representation;
-    /// the caller can load the original sequences and use [`Self::new`]. Empty
-    /// input produces an empty index. Duplicate live row IDs remain errors at
-    /// lookup time, as with an index built by [`Self::new`].
+    /// metadata. All-merged inputs share disjoint chunks and merge overlapping
+    /// sorted chunks with bounded scratch space, without original sequences or
+    /// input-index parents. Returns `None` for mixed representations or when
+    /// combined probes require a merged representation; the caller can load
+    /// original sequences and use [`Self::new`]. Empty input produces an empty
+    /// index. Duplicate live IDs error during merged composition or probe lookup.
     ///
     /// ```
     /// # use lance_table::rowids::RowIdIndex;
@@ -361,6 +363,9 @@ impl RowIdIndex {
             }
         }
         if indices.iter().any(|index| index.merged.is_some()) {
+            if indices.iter().all(|index| index.merged.is_some()) {
+                return combine::merged(indices, sources).map(Some);
+            }
             return Ok(None);
         }
         let fragments: Vec<_> = indices
@@ -1688,6 +1693,127 @@ mod tests {
     }
 
     #[test]
+    fn combine_disjoint_merged_chunks_shares_allocations_and_reuses_groups() {
+        let first =
+            RowIdIndex::new(&[fragment(7, RowIdSequence::try_from_iter([20, 10]).unwrap())])
+                .unwrap();
+        let second = RowIdIndex::new(&[fragment(
+            9,
+            RowIdSequence::try_from_iter([200, 100]).unwrap(),
+        )])
+        .unwrap();
+        let combined = RowIdIndex::try_combine(&[&second, &first])
+            .unwrap()
+            .unwrap();
+        for (id, input) in [(10, &first), (100, &second)] {
+            assert!(Arc::ptr_eq(
+                combined.merged.as_ref().unwrap().get(&id).unwrap(),
+                input.merged.as_ref().unwrap().get(&id).unwrap()
+            ));
+        }
+        let retained = combined.try_reuse_fragments(&[7], &[]).unwrap().unwrap();
+        assert_eq!(
+            retained.get_many(&[10, 20, 100]).unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(7, 1)),
+                Some(RowAddress::new_from_parts(7, 0)),
+                None
+            ]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::sorted(false)]
+    #[case::shuffled(true)]
+    fn combine_merged_preserves_physical_oracle_and_releases_parents(#[case] shuffled: bool) {
+        const ROWS: u64 = 31;
+        let sources: Vec<_> = (0..3)
+            .map(|number| {
+                let ids = (0..ROWS)
+                    .map(|offset| {
+                        let logical = if shuffled { offset * 7 % ROWS } else { offset };
+                        logical * 4 + number
+                    })
+                    .collect::<Vec<_>>();
+                let mut source = fragment(
+                    number as u32 * 13 + 7,
+                    RowIdSequence::try_from_iter(ids).unwrap(),
+                );
+                source.deletion_vector =
+                    Arc::new(DeletionVector::Bitmap([5, 17].into_iter().collect()));
+                source
+            })
+            .collect();
+        let originals: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::downgrade(&source.row_id_sequence))
+            .collect();
+        let indices: Vec<_> = sources
+            .iter()
+            .map(|source| Arc::new(RowIdIndex::new(std::slice::from_ref(source)).unwrap()))
+            .collect();
+        assert!(indices.iter().all(|index| index.merged.is_some()));
+        drop(sources);
+        assert!(originals.iter().all(|source| source.upgrade().is_none()));
+        let combined = RowIdIndex::try_combine(&[&indices[2], &indices[0], &indices[1]])
+            .unwrap()
+            .unwrap();
+        let parents: Vec<_> = indices.iter().map(Arc::downgrade).collect();
+        drop(indices);
+        assert!(parents.iter().all(|parent| parent.upgrade().is_none()));
+        let mut ids: Vec<_> = (0..=ROWS * 4).rev().collect();
+        ids.extend([0, 0, u64::MAX]);
+        let expected: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                if id >= ROWS * 4 || id % 4 == 3 {
+                    return None;
+                }
+                // 9 is the inverse of 7 modulo31; this oracle uses only the
+                // fixture's arithmetic,not an index or another lookup path.
+                let offset = if shuffled { id / 4 * 9 % ROWS } else { id / 4 };
+                (![5, 17].contains(&offset))
+                    .then(|| RowAddress::new_from_parts((id % 4) as u32 * 13 + 7, offset as u32))
+            })
+            .collect();
+        assert_eq!(combined.get_many(&ids).unwrap(), expected);
+        for (&id, &address) in ids.iter().zip(&expected) {
+            assert_eq!(combined.get(id).unwrap(), address);
+        }
+        let appended = combined
+            .try_reuse_fragments(
+                &[7, 20, 33],
+                &[fragment(99, RowIdSequence::from(1000..1007))],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(appended.get_many(&ids).unwrap(), expected);
+        assert_eq!(
+            appended.get_many(&[1000, 1006, 1007]).unwrap(),
+            vec![
+                Some(RowAddress::new_from_parts(99, 0)),
+                Some(RowAddress::new_from_parts(99, 6)),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn combine_merged_rejects_live_duplicates_without_original_sequences() {
+        let first =
+            RowIdIndex::new(&[fragment(1, RowIdSequence::try_from_iter([9, 3]).unwrap())]).unwrap();
+        let second =
+            RowIdIndex::new(&[fragment(2, RowIdSequence::try_from_iter([7, 3]).unwrap())]).unwrap();
+        let error = RowIdIndex::try_combine(&[&first, &second]).unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("stable row id 3 is live in multiple fragments")
+        );
+    }
+
+    #[test]
     fn combine_preserves_overlap_gate_and_live_duplicate_errors() {
         // A deletion makes each large range costly to merge, but preparing its
         // probe remains constant-time. No large test array is needed here.
@@ -1722,7 +1848,11 @@ mod tests {
 
         let small = RowIdIndex::new(&[fragment(99, sparse_sequence(3))]).unwrap();
         assert!(small.merged.is_some());
-        assert!(RowIdIndex::try_combine(&[&small]).unwrap().is_none());
+        let copied = RowIdIndex::try_combine(&[&small]).unwrap().unwrap();
+        assert_eq!(
+            copied.get_many(&[0, 2, 4, 6]).unwrap(),
+            small.get_many(&[0, 2, 4, 6]).unwrap()
+        );
         assert!(
             RowIdIndex::try_combine(&[&indices[0], &small])
                 .unwrap()
