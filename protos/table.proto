@@ -42,13 +42,13 @@ message UUID {
  */
 message RetentionLease {
   /* The UUID of the transaction the holder intends to publish, as 16 bytes.
-   * Committing an ordinary attached transaction with this UUID releases the
+   * Committing an ordinary transaction with this UUID releases the
    * lease. Absent or any length other than 16 bytes is invalid.
    */
   UUID id = 1;
   /* The leased version: the version created by the successful acquisition commit.
    * Absent or zero is invalid. Renewal never changes it. Listed leases retain
-   * complete attached versions from the oldest leased version through the
+   * complete versions from the oldest leased version through the
    * current branch head, including their transactions, as specified in
    * Retention Leases.
    */
@@ -56,16 +56,16 @@ message RetentionLease {
   /* Creation time chosen before the first acquisition attempt, in UTC.
    * Absent is invalid. Retries preserve it; it need not equal commit time.
    */
-  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp created_at = 3;
   /* Absolute UTC expiry time. Absent or not later than created_at is invalid.
-   * Passing it makes the lease eligible for removal by the next attached commit;
+   * Passing it makes the lease eligible for removal by the next commit;
    * it does not remove the stored record. Renewals may only increase it.
    */
-  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp expires_at = 4;
   /* Optional human-readable context. Absent or empty means no label.
    * It has no retention or authorization meaning and is immutable for this lease.
    */
-  optional string label = 6;
+  optional string label = 5;
 }
 
 // Manifest is a global section shared between all the files.
@@ -352,13 +352,13 @@ message Manifest {
    */
   uint32 max_clustering_id = 26;
 
-  /* The authoritative lease list when this is the current attached manifest.
+  /* The authoritative lease list when this is the current manifest.
    * Absent/empty means no listed leases. Order is insignificant; IDs must be
-   * unique. Writer bit 20 is set exactly when this list is nonempty. Attached
-   * commits remove expired leases.
+   * unique. Writer bit 20 is set exactly when this list is nonempty. Commits
+   * remove expired leases.
    * Restore and overwrite remove all leases; new clones and branches start
-   * with an empty list. Detached manifests cannot own
-   * or mutate listed leases. No reader capability is required solely for leases.
+   * with an empty list. Detached manifests neither carry nor change
+   * leases. No reader capability is required solely for leases.
    */
   repeated RetentionLease retention_leases = 27;
 

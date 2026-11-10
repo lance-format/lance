@@ -6,7 +6,7 @@ While a lease is listed in the current manifest:
 
 1. Cleanup **must retain** every version from the leased version through the
    current head, including the files and transactions those versions need.
-2. Fragment Reuse Index (FRI) trimming **must retain** the transitions that
+2. [Fragment Reuse Index](../index/system/frag_reuse.md) (FRI) trimming **must retain** the transitions that
    connect the leased version's fragments to the current layout.
 
 This lets compaction and cleanup proceed while a holder spends hours or days
@@ -64,7 +64,8 @@ manifest's list is authoritative; missing or empty means no leases. A lease is
 </details>
 
 - `id` is the UUID of the transaction the holder intends to publish. It must
-  differ from the acquisition transaction's own UUID.
+  differ from the acquisition transaction's own UUID, or the acquisition commit
+  would release its own lease.
 - `version` is the version created by the acquisition commit. The holder does
   not choose it: an older version's files or FRI transitions could already be
   removed or approved for deletion, but the newly created head cannot be.
@@ -79,58 +80,62 @@ table only while leases exist. Readers may ignore the list.
 
 ## Lifecycle
 
-Every attached commit **must derive the lease list from its predecessor**,
+Every commit **must derive the lease list from its predecessor**,
 including on retry: remove records whose `expires_at` has passed, apply the
 commit's own lease changes, and preserve the rest. A cached or historical list
 is never used.
 
 - **AcquireLease** adds a lease with `version` set to the version the commit
-  creates. It is idempotent by ID: if the ID is already listed, it returns the
-  stored record unchanged. The holder **must not read** the leased version until
-  acquisition is confirmed.
+  creates. Its `expires_at` must be in the future. It is idempotent by ID: if
+  the ID is already listed, it returns the stored record unchanged. The holder **must not read** the leased version until
+  the acquisition commit succeeds, since a rebase can change which version it
+  creates.
 - **RenewLease** extends `expires_at` of a listed, unexpired lease. An absent or
-  expired target is an error; an earlier requested time is a no-op.
+  expired target is an error; a requested time not later than the current
+  `expires_at` is a no-op.
 - **ReleaseLease** removes a lease, for example when work is abandoned. An
   absent target is a no-op.
-- **Publication**: an ordinary attached commit whose `Transaction.uuid`, parsed
+- **Publication**: an ordinary commit whose `Transaction.uuid`, parsed
   as a UUID, equals a listed lease ID removes that lease atomically with its
   operation. If no listed lease matches, the commit proceeds unchanged. Lease
-  operations, Clone, and detached commits never release a lease this way.
+  operations and Clone never release a lease this way, since they do not
+  publish the holder's result.
 
-An expired lease remains listed, and still retains resources, until the next
-attached commit removes it.
+No-op lease requests create no version. An expired lease remains listed, and
+still retains resources, until the next commit removes it. Cleanup does not commit, so it never judges
+expiration by its own clock.
 
 ## Retention
 
 ### Retained versions
 
 Let F be the oldest leased version among listed leases and H the current head.
-Cleanup **must retain every attached version from F through H**, together with
-all files they reference. Detached versions are outside this window.
+Cleanup **must retain every version from F through H**, together with all
+files they reference.
 
-The holder's publication must rebase over every commit after F, so each attached
+The holder's publication must rebase over every commit after F, so each
 commit while leases are listed **must record its [transaction](transaction.md)**,
 and cleanup must retain the transactions of versions after F. If cleanup cannot
 confirm that a required version or transaction is present, it **must not
 delete** files that version might need.
 
-Acquisition does not cancel deletions that cleanup approved before it. Holders
-should acquire before reading.
+Acquisition does not cancel deletions that cleanup approved before it.
 
 ### Required transitions
 
 The required transitions are found from the fragment IDs of each leased
-version:
+version, using the [FRI history](../index/system/frag_reuse.md#fri-index-versions):
 
 - **FRI version 1:** select each transition whose sources intersect the set, add
   its destination IDs, and repeat until no more transitions are selected. A
   selected legacy reuse version contributes every group's destinations.
 - **Legacy-only FRI (`index_version = 0`):** retain reuse versions stamped at or
   after the oldest leased version. New reuse versions are stamped with their
-  publishing version minus one.
+  publishing version minus one, the version the rewrite was based on, which
+  index catch-up already compares against an index's `dataset_version`.
 
 FRI trimming **must retain** the union of the transitions required by listed
-leases and by existing FRI consumers. Compaction **must record** the
+leases and by existing indices. Compaction **must record** the
 transitions listed leases require, even when no index needs them. Every rewrite
 or trim **must recheck** these requirements against its predecessor before
 committing, including after conflicts.
@@ -139,6 +144,8 @@ committing, including after conflicts.
 
 - **Restore and overwrite** remove all leases. A holder's publication would
   conflict with them anyway.
-- **New branches, clones, and detached versions** start with an empty lease list
-  and therefore no flag 20. Detached commits cannot change leases.
+- **New branches and clones** start with an empty lease list and therefore no
+  flag 20.
+- **Detached commits** neither carry nor change leases, and are outside the
+  retention window.
 - **Branch deletion** does not check leases; deleting a branch ends its leases.

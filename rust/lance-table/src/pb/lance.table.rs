@@ -810,29 +810,29 @@ impl ::prost::Name for Uuid {
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RetentionLease {
     /// The UUID of the transaction the holder intends to publish, as 16 bytes.
-    /// Committing an ordinary attached transaction with this UUID releases the
+    /// Committing an ordinary transaction with this UUID releases the
     /// lease. Absent or any length other than 16 bytes is invalid.
     #[prost(message, optional, tag = "1")]
     pub id: ::core::option::Option<Uuid>,
     /// The leased version: the version created by the successful acquisition commit.
     /// Absent or zero is invalid. Renewal never changes it. Listed leases retain
-    /// complete attached versions from the oldest leased version through the
+    /// complete versions from the oldest leased version through the
     /// current branch head, including their transactions, as specified in
     /// Retention Leases.
     #[prost(uint64, optional, tag = "2")]
     pub version: ::core::option::Option<u64>,
     /// Creation time chosen before the first acquisition attempt, in UTC.
     /// Absent is invalid. Retries preserve it; it need not equal commit time.
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "3")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
     /// Absolute UTC expiry time. Absent or not later than created_at is invalid.
-    /// Passing it makes the lease eligible for removal by the next attached commit;
+    /// Passing it makes the lease eligible for removal by the next commit;
     /// it does not remove the stored record. Renewals may only increase it.
-    #[prost(message, optional, tag = "5")]
+    #[prost(message, optional, tag = "4")]
     pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
     /// Optional human-readable context. Absent or empty means no label.
     /// It has no retention or authorization meaning and is immutable for this lease.
-    #[prost(string, optional, tag = "6")]
+    #[prost(string, optional, tag = "5")]
     pub label: ::core::option::Option<::prost::alloc::string::String>,
 }
 impl ::prost::Name for RetentionLease {
@@ -1057,13 +1057,13 @@ pub struct Manifest {
     /// u32::MAX exhausts the ID space. A nonzero value requires FLAG_OBJECT_METADATA.
     #[prost(uint32, tag = "26")]
     pub max_clustering_id: u32,
-    /// The authoritative lease list when this is the current attached manifest.
+    /// The authoritative lease list when this is the current manifest.
     /// Absent/empty means no listed leases. Order is insignificant; IDs must be
-    /// unique. Writer bit 20 is set exactly when this list is nonempty. Attached
-    /// commits remove expired leases.
+    /// unique. Writer bit 20 is set exactly when this list is nonempty. Commits
+    /// remove expired leases.
     /// Restore and overwrite remove all leases; new clones and branches start
-    /// with an empty list. Detached manifests cannot own
-    /// or mutate listed leases. No reader capability is required solely for leases.
+    /// with an empty list. Detached manifests neither carry nor change
+    /// leases. No reader capability is required solely for leases.
     #[prost(message, repeated, tag = "27")]
     pub retention_leases: ::prost::alloc::vec::Vec<RetentionLease>,
 }
@@ -2716,7 +2716,7 @@ pub mod transaction {
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct AcquireLease {
         /// The UUID of the transaction the holder intends to publish. Committing an
-        /// ordinary attached transaction with this UUID releases the lease.
+        /// ordinary transaction with this UUID releases the lease.
         /// Absent, any length other than 16 bytes, or equal to this transaction's
         /// own UUID is invalid. Retries preserve it.
         #[prost(message, optional, tag = "1")]
@@ -2731,7 +2731,7 @@ pub mod transaction {
         #[prost(message, optional, tag = "3")]
         pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
         /// Optional immutable context. Absent or empty means no label.
-        /// Recovering a listed lease returns its existing label.
+        /// Re-acquiring a listed ID returns the stored label.
         #[prost(string, optional, tag = "4")]
         pub label: ::core::option::Option<::prost::alloc::string::String>,
     }

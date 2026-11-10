@@ -430,7 +430,7 @@ message Transaction {
    */
   message AcquireLease {
     /* The UUID of the transaction the holder intends to publish. Committing an
-     * ordinary attached transaction with this UUID releases the lease.
+     * ordinary transaction with this UUID releases the lease.
      * Absent, any length other than 16 bytes, or equal to this transaction's
      * own UUID is invalid. Retries preserve it.
      */
@@ -445,7 +445,7 @@ message Transaction {
      */
     google.protobuf.Timestamp expires_at = 3;
     /* Optional immutable context. Absent or empty means no label.
-     * Recovering a listed lease returns its existing label.
+     * Re-acquiring a listed ID returns the stored label.
      */
     optional string label = 4;
   }

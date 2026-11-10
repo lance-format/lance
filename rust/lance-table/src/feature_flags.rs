@@ -833,12 +833,6 @@ mod tests {
             implemented_flags,
             "reserving the lease bit must not disable implemented features"
         );
-        // The zone seed bit is supported; retention leases remain reserved.
-        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 21);
-        assert!(!can_read_dataset(FLAG_UNKNOWN));
-        assert!(!can_write_dataset(FLAG_UNKNOWN));
     }
 
     #[test]

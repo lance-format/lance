@@ -608,19 +608,15 @@ same id, name, or path.
 ## Retention Lease Transactions
 
 `AcquireLease` (field 116), `RenewLease` (117), and `ReleaseLease` (118) update the
-current lease list. An ordinary attached operation whose `Transaction.uuid`, parsed as a UUID,
-equals a listed lease ID removes that lease atomically. Lease operations cannot
-be used in detached commits, and lease operations, Clone, and detached commits
-never release a lease by UUID.
-
-The [Retention Leases specification](retention_leases.md) defines acquisition,
-confirmation, expiration, transaction recording, and retention.
+current lease list. An ordinary commit whose `Transaction.uuid`, parsed as a UUID,
+equals a listed lease ID removes that lease atomically. Detached commits cannot
+use lease operations. The [Retention Leases specification](retention_leases.md)
+defines their behavior.
 
 ### Directional conflict rules
 
-Lease operations may re-evaluate over known attached data and lease operations in
-the same table and branch. Acquisition may rebase and is idempotent by lease ID. The successful
-acquisition version fixes the leased version, and work begins only after confirmation.
+Lease operations do not conflict with concurrent data or lease commits; a retry
+re-applies them against the new head.
 
 For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLease:
 
@@ -629,19 +625,15 @@ For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLe
 | Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, release the lease matching the transaction UUID if listed, and preserve the rest. |
 | Rewrite | If the rewrite replaces fragments a listed lease requires, it must record FRI transitions for them; otherwise it conflicts and must be replanned. |
 | Restore, Overwrite | Remove all leases. Existing data conflicts remain. |
-| Clone | Start the destination with no leases and no lease flag. Do not transfer lease mutations or ownership to the destination. |
+| Clone | Start the destination with no leases and no lease flag. |
 | AcquireLease | Return a listed ID without changing it. Otherwise, add the lease against the new head with an unexpired request. |
-| RenewLease | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |
-| ReleaseLease | Remove the target ID; absent is a no-op. A concurrent renewal does not prevent explicit release. |
+| RenewLease | Recheck membership and expiration. Missing or expired is an error; a requested time not later than the current one is a no-op; otherwise extend only `expires_at`. |
+| ReleaseLease | Remove the target ID; absent is a no-op. |
 
-Every retry **must recompute expiration** from its new predecessor. A winning
-renewal defeats an older removal decision; a winning removal prevents renewal
-from recreating the ID. No-op lease requests create no version, while real
-mutations use ordinary version counting.
-
-FRI trimming **must revalidate** the union of the transitions listed leases and
-existing FRI consumers require, using the
-[retention rules](retention_leases.md#required-transitions).
+Every retry **must recompute expiration** from its new predecessor, so a
+renewal that commits first wins over a concurrent commit's expiry check. FRI
+trimming **must revalidate** the transitions listed leases and existing indices
+require, using the [retention rules](retention_leases.md#required-transitions).
 
 ## Conflict Resolution
 

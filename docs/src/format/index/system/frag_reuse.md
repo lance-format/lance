@@ -200,7 +200,7 @@ transition must reference only fragments committed no later than itself.
 An FRI history may be trimmed to reduce its size. Trimming must not remove any entry if:
 
 * It is referenced by an index
-* It is referenced by a [Retention lease](../../table/retention_leases.md)
+* It is referenced by a [retention lease](../../table/retention_leases.md)
 * It describes an intermediate transition that is required by another required
   entry to translate correctly.
 
@@ -208,7 +208,7 @@ For example, consider:
 
 ```
 leased version: 12 (fragments: {3, 4, 5})
-current indexes: {1, 3}
+indexed fragments: {1, 3}
 
 Transitions:
 
@@ -218,10 +218,12 @@ Transitions:
   {8}    -> {9}  trim: no index or retention lease references fragment 8
 ```
 
-Here, `current indexes` lists the fragments covered by existing indices.
 Fragment 3 was never rewritten, so neither its index nor the lease needs a
 transition for it. Fragment 8 was written after version 12 and compacted
 before any index covered it, so its transition can be trimmed.
+
+External mapping files can be deleted only when no retained dataset version
+references them.
 
 ## Stable Row IDs
 
@@ -252,7 +254,7 @@ The first commit publishing FRI index version 1 sets
 `FLAG_FRAGMENT_REUSE_INDEX` (1024) in both manifest flag fields. Subsequent
 manifests retain both bits. FRI index version 0 does not require this flag.
 
-Tables using stable row IDs do not support FRI version 1; writers must not
+Tables using stable row IDs do not support tagged histories; writers must not
 publish `index_version >= 1` on them.
 
 The reader flag prevents older clients from partially interpreting the new

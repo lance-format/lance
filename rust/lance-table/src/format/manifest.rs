@@ -21,7 +21,9 @@ use std::sync::Arc;
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_RETENTION_LEASES, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -1168,6 +1170,13 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
+        // This build does not carry the lease list forward, so listed leases
+        // must block writes even if the manifest omits their flag.
+        let mut writer_feature_flags = p.writer_feature_flags;
+        if !p.retention_leases.is_empty() {
+            writer_feature_flags |= FLAG_RETENTION_LEASES;
+        }
+
         Ok(Self {
             schema,
             version: p.version,
@@ -1178,7 +1187,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             timestamp_nanos: timestamp_nanos.unwrap_or(0),
             tag: if p.tag.is_empty() { None } else { Some(p.tag) },
             reader_feature_flags: p.reader_feature_flags,
-            writer_feature_flags: p.writer_feature_flags,
+            writer_feature_flags,
             max_fragment_id: p.max_fragment_id,
             max_allocated_field_id: p.max_allocated_field_id,
             fragments,
@@ -1355,7 +1364,9 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{
+        FLAG_NON_REUSABLE_FIELD_IDS, FLAG_RETENTION_LEASES, FLAG_USE_V2_FORMAT_DEPRECATED,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
@@ -1669,6 +1680,31 @@ mod tests {
                 .to_string()
                 .contains("All data files must have the same version")
         );
+    }
+
+    #[rstest::rstest]
+    #[case::flag_set(FLAG_RETENTION_LEASES)]
+    #[case::flag_missing(0)]
+    fn test_listed_retention_leases_block_writes_but_not_reads(#[case] writer_flags: u64) {
+        let manifest = Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.writer_feature_flags = writer_flags;
+        encoded.retention_leases = vec![pb::RetentionLease {
+            id: Some(pb::Uuid { uuid: vec![7; 16] }),
+            version: Some(1),
+            ..Default::default()
+        }];
+
+        let decoded = Manifest::try_from(encoded).unwrap();
+
+        crate::feature_flags::ensure_can_read_manifest(&decoded).unwrap();
+        let error = crate::feature_flags::ensure_can_write_manifest(&decoded).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
     }
 
     #[test]
