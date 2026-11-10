@@ -652,13 +652,23 @@ impl BinaryMiniBlockDecompressor {
     }
 }
 
-fn decode_generic_binary_miniblock(
+fn decode_generic_binary_miniblock_range(
     bits_per_offset: u8,
     offsets: &dyn BlockDecompressor,
     offsets_have_payload: bool,
     data: Vec<LanceBuffer>,
     num_values: u64,
+    range: std::ops::Range<u64>,
 ) -> Result<DataBlock> {
+    if range.start > range.end || range.end > num_values {
+        return Err(Error::corrupt_file_named(
+            "binary mini-block",
+            format!(
+                "selection {:?} exceeds {} values in binary mini-block chunk",
+                range, num_values
+            ),
+        ));
+    }
     let expected_buffers = 1 + usize::from(offsets_have_payload);
     if data.len() != expected_buffers {
         return Err(Error::corrupt_file_named(
@@ -718,6 +728,25 @@ fn decode_generic_binary_miniblock(
                     ),
                 ));
             }
+            if range != (0..num_values) {
+                let start = range.start as usize;
+                let end = range.end as usize;
+                let sub_first = typed[start];
+                let sub_last = typed[end];
+                let rebased: Vec<u32> = typed[start..=end]
+                    .iter()
+                    .map(|&off| off - sub_first)
+                    .collect();
+                drop(typed);
+                return Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                    data: values
+                        .slice_with_length(sub_first as usize, (sub_last - sub_first) as usize),
+                    offsets: LanceBuffer::reinterpret_vec(rebased),
+                    bits_per_offset,
+                    num_values: range.end - range.start,
+                    block_info: BlockInfo::new(),
+                }));
+            }
         }
         64 => {
             let typed = checked_fixed_values::<u64>(&offsets, "Binary mini-block offsets")?;
@@ -745,6 +774,25 @@ fn decode_generic_binary_miniblock(
                         values.len()
                     ),
                 ));
+            }
+            if range != (0..num_values) {
+                let start = range.start as usize;
+                let end = range.end as usize;
+                let sub_first = typed[start];
+                let sub_last = typed[end];
+                let rebased: Vec<u64> = typed[start..=end]
+                    .iter()
+                    .map(|&off| off - sub_first)
+                    .collect();
+                drop(typed);
+                return Ok(DataBlock::VariableWidth(VariableWidthBlock {
+                    data: values
+                        .slice_with_length(sub_first as usize, (sub_last - sub_first) as usize),
+                    offsets: LanceBuffer::reinterpret_vec(rebased),
+                    bits_per_offset,
+                    num_values: range.end - range.start,
+                    block_info: BlockInfo::new(),
+                }));
             }
         }
         _ => unreachable!("generic offset width was validated during decoder construction"),
@@ -851,6 +899,24 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // read.  The monotonicity check rides along the existing rebase loop (the
     // `&=` accumulation keeps it branchless) so validation adds no extra pass.
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        self.decompress_range(data, num_values, 0..num_values)
+    }
+
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "binary mini-block",
+                format!(
+                    "selection {:?} exceeds {} values in binary mini-block chunk",
+                    range, num_values
+                ),
+            ));
+        }
         let bits_per_offset = match &self.layout {
             BinaryMiniBlockLayout::Legacy { bits_per_offset } => *bits_per_offset,
             BinaryMiniBlockLayout::Generic {
@@ -858,12 +924,13 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 offsets,
                 offsets_have_payload,
             } => {
-                return decode_generic_binary_miniblock(
+                return decode_generic_binary_miniblock_range(
                     *bits_per_offset,
                     offsets.as_ref(),
                     *offsets_have_payload,
                     data,
                     num_values,
+                    range,
                 );
             }
         };
@@ -920,6 +987,10 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             )
         };
 
+        let sel_start = range.start as usize;
+        let sel_end = range.end as usize;
+        let selected_values = range.end - range.start;
+
         if bits_per_offset == 64 {
             let offsets_buffer = data.borrow_to_typed_slice::<u64>();
             let offsets = &offsets_buffer.as_ref()[..num_offsets];
@@ -930,24 +1001,37 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
             let mut previous = first;
             let mut is_monotonic = true;
-            let result_offsets = offsets
-                .iter()
-                .map(|&offset| {
-                    is_monotonic &= previous <= offset;
-                    previous = offset;
-                    offset.wrapping_sub(first)
-                })
-                .collect::<Vec<u64>>();
+            for &offset in &offsets[1..] {
+                is_monotonic &= previous <= offset;
+                previous = offset;
+            }
             let last = offsets[num_offsets - 1];
             if !is_monotonic || last as usize > data.len() {
                 return Err(chunk_offset_violation_error(offsets, data.len()));
             }
 
+            let sub_first = offsets[sel_start];
+            let sub_last = offsets[sel_end];
+            if sub_last - sub_first > i64::MAX as u64 {
+                return Err(Error::corrupt_file_named(
+                    "binary mini-block",
+                    format!(
+                        "selected value range {}..{} exceeds i64::MAX bytes",
+                        sub_first, sub_last
+                    ),
+                ));
+            }
+            let result_offsets: Vec<u64> = offsets[sel_start..=sel_end]
+                .iter()
+                .map(|&offset| offset - sub_first)
+                .collect();
+            drop(offsets_buffer);
+
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: data.slice_with_length(first as usize, last as usize - first as usize),
+                data: data.slice_with_length(sub_first as usize, (sub_last - sub_first) as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
-                num_values,
+                num_values: selected_values,
                 block_info: BlockInfo::new(),
             }))
         } else {
@@ -960,24 +1044,37 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
             let mut previous = first;
             let mut is_monotonic = true;
-            let result_offsets = offsets
-                .iter()
-                .map(|&offset| {
-                    is_monotonic &= previous <= offset;
-                    previous = offset;
-                    offset.wrapping_sub(first)
-                })
-                .collect::<Vec<u32>>();
+            for &offset in &offsets[1..] {
+                is_monotonic &= previous <= offset;
+                previous = offset;
+            }
             let last = offsets[num_offsets - 1];
             if !is_monotonic || last as usize > data.len() {
                 return Err(chunk_offset_violation_error(offsets, data.len()));
             }
 
+            let sub_first = offsets[sel_start];
+            let sub_last = offsets[sel_end];
+            if sub_last - sub_first > i32::MAX as u32 {
+                return Err(Error::corrupt_file_named(
+                    "binary mini-block",
+                    format!(
+                        "selected value range {}..{} exceeds i32::MAX bytes",
+                        sub_first, sub_last
+                    ),
+                ));
+            }
+            let result_offsets: Vec<u32> = offsets[sel_start..=sel_end]
+                .iter()
+                .map(|&offset| offset - sub_first)
+                .collect();
+            drop(offsets_buffer);
+
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: data.slice_with_length(first as usize, last as usize - first as usize),
+                data: data.slice_with_length(sub_first as usize, (sub_last - sub_first) as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
-                num_values,
+                num_values: selected_values,
                 block_info: BlockInfo::new(),
             }))
         }

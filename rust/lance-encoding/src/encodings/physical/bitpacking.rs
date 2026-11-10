@@ -321,13 +321,88 @@ impl InlineBitpacking {
         }))
     }
 
+    /// Maximum number of values to extract via `O(1)` FastLanes single-element unpacking
+    /// before falling back to a full 1024-element SIMD unpack.
+    pub(crate) const SPARSE_UNPACK_THRESHOLD: u64 = 32;
+
+    fn unchunk_range<T: ArrowNativeType + BitPackingUninit + Pod>(
+        data: LanceBuffer,
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "selection {:?} exceeds {} decoded values",
+                    range, num_values
+                ),
+            ));
+        }
+        let (width, chunk_words) = Self::parse_chunk::<T>(&data, num_values)?;
+        let selected_len = (range.end - range.start) as usize;
+        if selected_len == 0 {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(Vec::<T>::new()),
+                bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }));
+        }
+        if (range.end - range.start) <= Self::SPARSE_UNPACK_THRESHOLD {
+            let mut decompressed = Vec::with_capacity(selected_len);
+            let packed = &chunk_words[1..];
+            for idx in range.start as usize..range.end as usize {
+                // SAFETY: parse_chunk checked width and exact packed word count,
+                // and range.end <= num_values <= ELEMS_PER_CHUNK (1024).
+                decompressed.push(unsafe { T::unchecked_unpack_single(width, packed, idx) });
+            }
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(decompressed),
+                bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+                num_values: selected_len as u64,
+                block_info: BlockInfo::new(),
+            }));
+        }
+
+        let mut decompressed = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
+        unsafe {
+            // SAFETY: parse_chunk validated width and packed slice length; the kernel
+            // initializes all 1024 slots before set_len exposes them.
+            BitPackingUninit::unchecked_unpack_uninit(
+                width,
+                &chunk_words[1..],
+                &mut decompressed.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
+            );
+            decompressed.set_len(ELEMS_PER_CHUNK as usize);
+        }
+        if range == (0..ELEMS_PER_CHUNK) {
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(decompressed),
+                bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+                num_values: selected_len as u64,
+                block_info: BlockInfo::new(),
+            }))
+        } else {
+            let sliced = decompressed[range.start as usize..range.end as usize].to_vec();
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(sliced),
+                bits_per_value: (std::mem::size_of::<T>() * 8) as u64,
+                num_values: selected_len as u64,
+                block_info: BlockInfo::new(),
+            }))
+        }
+    }
+
     /// Append a selected range from one inline bitpacked mini-block. The caller
     /// owns `output` and keeps `scratch` across chunks in the same decode task.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_selected<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
         data: &LanceBuffer,
         num_values: u64,
         selection: Range<u64>,
         chunk_idx: usize,
+        use_full_unpack: bool,
         output: &mut Vec<T>,
         scratch: &mut Vec<T>,
         cached_chunk_idx: &mut Option<usize>,
@@ -349,7 +424,7 @@ impl InlineBitpacking {
             return Ok(());
         }
 
-        if num_values == ELEMS_PER_CHUNK && selection == (0..ELEMS_PER_CHUNK) {
+        if num_values == ELEMS_PER_CHUNK && selection == (0..ELEMS_PER_CHUNK) && !use_full_unpack {
             let previous_len = output.len();
             let next_len = previous_len
                 .checked_add(ELEMS_PER_CHUNK as usize)
@@ -374,15 +449,33 @@ impl InlineBitpacking {
             return Ok(());
         }
 
+        if *cached_chunk_idx != Some(chunk_idx)
+            && !use_full_unpack
+            && (selection.end - selection.start) <= Self::SPARSE_UNPACK_THRESHOLD
+        {
+            let packed = &words[1..];
+            for idx in selection.start as usize..selection.end as usize {
+                // SAFETY: parse_chunk validated width and packed word length, and
+                // selection.end <= num_values <= ELEMS_PER_CHUNK (1024).
+                output.push(unsafe { T::unchecked_unpack_single(width, packed, idx) });
+            }
+            return Ok(());
+        }
+
         if *cached_chunk_idx != Some(chunk_idx) {
-            if scratch.is_empty() {
-                scratch.resize(ELEMS_PER_CHUNK as usize, T::default());
+            scratch.clear();
+            if scratch.capacity() < ELEMS_PER_CHUNK as usize {
+                scratch.reserve(ELEMS_PER_CHUNK as usize);
             }
             unsafe {
-                // SAFETY: parse_chunk checked width and packed length; scratch
-                // remains initialized and has room for the complete 1024-value
-                // decode even when the logical chunk is a shorter tail.
-                T::unchecked_unpack(width, &words[1..], scratch);
+                // SAFETY: parse_chunk checked width and packed length; scratch has
+                // capacity >= 1024 and unchecked_unpack_uninit writes all 1024 slots.
+                T::unchecked_unpack_uninit(
+                    width,
+                    &words[1..],
+                    &mut scratch.spare_capacity_mut()[..ELEMS_PER_CHUNK as usize],
+                );
+                scratch.set_len(ELEMS_PER_CHUNK as usize);
             }
             *cached_chunk_idx = Some(chunk_idx);
         }
@@ -393,8 +486,15 @@ impl InlineBitpacking {
     /// An empty fixed-width block, used for the `num_values == 0` short-circuit in
     /// both decompressor entry points so empty blocks skip chunk validation entirely.
     fn empty_block(&self) -> DataBlock {
+        let data = match self.uncompressed_bit_width {
+            8 => LanceBuffer::reinterpret_vec(Vec::<u8>::new()),
+            16 => LanceBuffer::reinterpret_vec(Vec::<u16>::new()),
+            32 => LanceBuffer::reinterpret_vec(Vec::<u32>::new()),
+            64 => LanceBuffer::reinterpret_vec(Vec::<u64>::new()),
+            _ => LanceBuffer::empty(),
+        };
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::empty(),
+            data,
             bits_per_value: self.uncompressed_bit_width,
             num_values: 0,
             block_info: BlockInfo::new(),
@@ -447,6 +547,10 @@ impl BlockCompressor for InlineBitpacking {
 }
 
 impl MiniBlockDecompressor for InlineBitpacking {
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn inline_bitpacking_width(&self) -> Option<u64> {
         Some(self.uncompressed_bit_width)
     }
@@ -467,6 +571,39 @@ impl MiniBlockDecompressor for InlineBitpacking {
             16 => Self::unchunk::<u16>(data, num_values),
             32 => Self::unchunk::<u32>(data, num_values),
             64 => Self::unchunk::<u64>(data, num_values),
+            _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
+        }
+    }
+
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<DataBlock> {
+        let [data] = <[LanceBuffer; 1]>::try_from(data).map_err(|data| {
+            Error::invalid_input(format!(
+                "Inline bitpacking expects one buffer, got {}",
+                data.len()
+            ))
+        })?;
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "selection {:?} exceeds {} decoded values",
+                    range, num_values
+                ),
+            ));
+        }
+        if num_values == 0 {
+            return Ok(self.empty_block());
+        }
+        match self.uncompressed_bit_width {
+            8 => Self::unchunk_range::<u8>(data, num_values, range),
+            16 => Self::unchunk_range::<u16>(data, num_values, range),
+            32 => Self::unchunk_range::<u32>(data, num_values, range),
+            64 => Self::unchunk_range::<u64>(data, num_values, range),
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
     }
@@ -986,7 +1123,7 @@ mod test {
         } else {
             LanceBuffer::reinterpret_vec(chunk)
         };
-        let mut output = Vec::<T>::with_capacity(num_values + 40);
+        let mut output = Vec::<T>::with_capacity(num_values + 50);
         let mut scratch = Vec::<T>::new();
         let mut cached_chunk_idx = None;
         InlineBitpacking::append_selected(
@@ -994,6 +1131,7 @@ mod test {
             num_values as u64,
             0..num_values as u64,
             7,
+            false,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
@@ -1005,11 +1143,32 @@ mod test {
         } else {
             assert_eq!(scratch.len(), ELEMS_PER_CHUNK as usize);
         }
+
+        // Sparse O(1) extraction avoids allocating or populating scratch.
+        let mut sparse_out = Vec::<T>::with_capacity(10);
+        let mut sparse_scratch = Vec::<T>::new();
+        let mut sparse_cached = None;
         InlineBitpacking::append_selected(
             &data,
             num_values as u64,
             10..20,
             7,
+            false,
+            &mut sparse_out,
+            &mut sparse_scratch,
+            &mut sparse_cached,
+        )
+        .unwrap();
+        assert_eq!(sparse_out, values[10..20]);
+        assert!(sparse_scratch.is_empty());
+        assert_eq!(sparse_cached, None);
+
+        InlineBitpacking::append_selected(
+            &data,
+            num_values as u64,
+            10..20,
+            7,
+            true,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
@@ -1020,6 +1179,7 @@ mod test {
             num_values as u64,
             15..25,
             7,
+            true,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
@@ -1068,6 +1228,7 @@ mod test {
             1,
             0..2,
             0,
+            false,
             &mut output,
             &mut scratch,
             &mut cached,
@@ -1080,6 +1241,7 @@ mod test {
             1,
             0..1,
             0,
+            false,
             &mut output,
             &mut scratch,
             &mut cached,

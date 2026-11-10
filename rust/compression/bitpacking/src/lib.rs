@@ -198,6 +198,15 @@ pub trait BitPacking: FastLanes {
     /// is the packed width. The output slice must be of exactly length 1024.
     /// These lengths are checked only with `debug_assert` (i.e., not checked on release builds).
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]);
+
+    /// Unpacks a single element at `index` (`0..1024`) from `W`-bit FastLanes-packed `input`
+    /// in `O(1)` time without unpacking the rest of the 1024-element block.
+    ///
+    /// # Safety
+    /// - `width <= Self::T`
+    /// - `index < 1024`
+    /// - `input.len() >= 1024 * width / Self::T`
+    unsafe fn unchecked_unpack_single(width: usize, input: &[Self], index: usize) -> Self;
 }
 
 /// Bitpacking kernels that can initialize previously uninitialized output storage.
@@ -244,6 +253,48 @@ macro_rules! impl_bitpacking_compat {
                 unsafe {
                     <Self as BitPackingUninit>::unchecked_unpack_uninit(width, input, output)
                 };
+            }
+
+            #[inline]
+            unsafe fn unchecked_unpack_single(width: usize, input: &[Self], index: usize) -> Self {
+                const BITS: usize = <$ty as FastLanes>::T;
+                const LANES: usize = <$ty as FastLanes>::LANES;
+
+                debug_assert!(index < 1024, "Index must be less than 1024");
+                debug_assert!(width <= BITS, "Width must be <= {BITS}");
+                debug_assert!(
+                    input.len() >= 1024 * width / BITS,
+                    "Input buffer too small for width {width}"
+                );
+
+                if width == 0 {
+                    return 0;
+                }
+
+                // Inverse of FastLanes index(row, lane) = FL_ORDER[row / 8] * 16 + (row % 8) * 128 + lane.
+                // Because FL_ORDER = [0, 4, 2, 6, 1, 5, 3, 7] is an involution (FL_ORDER[FL_ORDER[x]] == x)
+                // and LANES = 1024 / BITS is a power of two in 16..=128, lane, FL_ORDER[o] * 16, and s * 128
+                // occupy disjoint bit ranges of `index`.
+                let lane = index & (LANES - 1);
+                let fl_o = (index & 127 & !(LANES - 1)) >> 4;
+                let o = unsafe { *FL_ORDER.get_unchecked(fl_o) };
+                let row = (o << 3) | (index >> 7);
+
+                if width == BITS {
+                    return unsafe { *input.get_unchecked(LANES * row + lane) };
+                }
+
+                let mask: Self = (1 << width) - 1;
+                let bit_pos = row * width;
+                let curr_word = bit_pos / BITS;
+                let shift = bit_pos % BITS;
+                let src0 = unsafe { *input.get_unchecked(LANES * curr_word + lane) };
+                if shift + width <= BITS {
+                    (src0 >> shift) & mask
+                } else {
+                    let src1 = unsafe { *input.get_unchecked(LANES * (curr_word + 1) + lane) };
+                    ((src0 >> shift) | (src1 << (BITS - shift))) & mask
+                }
             }
         }
     };
@@ -2378,5 +2429,90 @@ mod test {
         unchecked_pack_unpack_u64(62);
         unchecked_pack_unpack_u64(63);
         unchecked_pack_unpack_u64(64);
+    }
+
+    #[test]
+    fn test_unchecked_unpack_single_exhaustive() {
+        let mut rng = XorShift::new(0x9E37_79B9);
+
+        for width in 0..=8 {
+            let mut values = [0u8; 1024];
+            if width > 0 {
+                let mask = if width == 8 {
+                    u8::MAX
+                } else {
+                    (1u8 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u8) & mask;
+                }
+            }
+            let mut packed = vec![0u8; 1024 * width / u8::T];
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u8 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=16 {
+            let mut values = [0u16; 1024];
+            if width > 0 {
+                let mask = if width == 16 {
+                    u16::MAX
+                } else {
+                    (1u16 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u16) & mask;
+                }
+            }
+            let mut packed = vec![0u16; 1024 * width / u16::T];
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u16 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=32 {
+            let mut values = [0u32; 1024];
+            if width > 0 {
+                let mask = if width == 32 {
+                    u32::MAX
+                } else {
+                    (1u32 << width) - 1
+                };
+                for v in &mut values {
+                    *v = (rng.next() as u32) & mask;
+                }
+            }
+            let mut packed = vec![0u32; 1024 * width / u32::T];
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u32 mismatch at width={width}, idx={idx}");
+            }
+        }
+
+        for width in 0..=64 {
+            let mut values = [0u64; 1024];
+            if width > 0 {
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                for v in &mut values {
+                    *v = rng.next() & mask;
+                }
+            }
+            let mut packed = vec![0u64; 1024 * width / u64::T];
+            unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
+            for (idx, &expected) in values.iter().enumerate() {
+                let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
+                assert_eq!(actual, expected, "u64 mismatch at width={width}, idx={idx}");
+            }
+        }
     }
 }
