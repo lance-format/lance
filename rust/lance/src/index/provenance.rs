@@ -587,29 +587,28 @@ fn sources_at_build(
     Some(sources)
 }
 
-/// The version each covered fragment's index entries describe: its segment's
-/// version, or for a fragment compactions produced after the build, the
+/// The versions each covered fragment's index entries describe: its segments'
+/// versions, or for a fragment compactions produced after the build, the
 /// fragments of the segment's version that they rewrote into it, through every
-/// recorded rewrite in between ([`sources_at_build`]). `None` for a fragment
-/// whose segment's version has been cleaned up, or whose chain of rewrites is
-/// not fully recorded.
+/// recorded rewrite in between ([`sources_at_build`]). Every contributing build
+/// must be checked, since they may have indexed different data. `None` records
+/// a contribution whose build version has been cleaned up, or whose chain of
+/// rewrites is not fully recorded.
 async fn build_provenance<T: TableVersion>(
     history: &mut History<'_, T>,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
-) -> Result<HashMap<u32, Option<u64>>> {
-    let mut by_version = segments.iter().collect::<Vec<_>>();
-    // Oldest first: a fragment reached through two segments is checked
-    // against the older one.
-    by_version.sort_by_key(|segment| segment.dataset_version);
-
+) -> Result<HashMap<u32, Vec<Option<u64>>>> {
     let mut provenance = HashMap::new();
-    for segment in by_version {
+    for segment in segments {
         let version = segment.dataset_version;
         let built_at = history.at(version).await?;
         for fragment in segment.fragment_bitmap.iter().flatten() {
             let Some(built_at) = &built_at else {
-                provenance.entry(fragment).or_insert(None);
+                provenance
+                    .entry(fragment)
+                    .or_insert_with(|| Vec::with_capacity(1))
+                    .push(None);
                 continue;
             };
             let sources = sources_at_build(
@@ -621,14 +620,24 @@ async fn build_provenance<T: TableVersion>(
             match sources {
                 Some(sources) => {
                     for source in sources {
-                        provenance.entry(source).or_insert(Some(version));
+                        provenance
+                            .entry(source)
+                            .or_insert_with(|| Vec::with_capacity(1))
+                            .push(Some(version));
                     }
                 }
                 None => {
-                    provenance.entry(fragment).or_insert(None);
+                    provenance
+                        .entry(fragment)
+                        .or_insert_with(|| Vec::with_capacity(1))
+                        .push(None);
                 }
             }
         }
+    }
+    for versions in provenance.values_mut() {
+        versions.sort_unstable();
+        versions.dedup();
     }
     Ok(provenance)
 }
@@ -653,7 +662,8 @@ pub(crate) async fn fresh_fragments<T: TableVersion>(
         )?);
     }
     let mut history = History::new(dataset).await?;
-    // Each followed fragment's version, or `None` once it cannot be shown fresh.
+    // Every followed fragment's contributing versions; a `None` contribution
+    // prevents it from being shown fresh.
     let mut following = build_provenance(&mut history, frag_reuse_index, segments).await?;
 
     let mut versions = frag_reuse_index.details.versions.iter().collect::<Vec<_>>();
@@ -690,29 +700,34 @@ pub(crate) async fn fresh_fragments<T: TableVersion>(
             let mut stale = committed.is_none();
             for old in &group.old_frags {
                 let old = old.id as u32;
-                let (Some(recorded), Some(before_commit)) =
+                let (Some(recorded_versions), Some(before_commit)) =
                     (following.remove(&old), &before_commit)
                 else {
                     continue;
                 };
-                stale |= match recorded {
-                    None => true,
-                    Some(recorded) => match history.at(recorded).await? {
+                for recorded in recorded_versions {
+                    stale |= match recorded {
                         None => true,
-                        Some(against) => {
-                            indexed_data_differs(&against, before_commit, old, &indexed).await?
-                        }
-                    },
-                };
+                        Some(recorded) => match history.at(recorded).await? {
+                            None => true,
+                            Some(against) => {
+                                indexed_data_differs(&against, before_commit, old, &indexed).await?
+                            }
+                        },
+                    };
+                }
             }
             for new in &group.new_frags {
                 let new = new.id as u32;
-                // A covered fragment whose entries could not be dated stays
-                // out, though another covered fragment's sources lead to the
-                // group that produced it: those vouch for none of the group's
-                // other inputs.
-                if following.get(&new) != Some(&None) {
-                    following.insert(new, committed.filter(|_| !stale));
+                // The merge can retain both directly indexed entries and entries
+                // remapped from older inputs. Neither contribution can vouch for
+                // the other's freshness, including when either is undated.
+                let recorded = committed.filter(|_| !stale);
+                let recorded_versions = following
+                    .entry(new)
+                    .or_insert_with(|| Vec::with_capacity(1));
+                if !recorded_versions.contains(&recorded) {
+                    recorded_versions.push(recorded);
                 }
             }
         }
@@ -720,20 +735,23 @@ pub(crate) async fn fresh_fragments<T: TableVersion>(
 
     let current = history.current();
     let mut fresh = RoaringBitmap::new();
-    for (fragment, recorded) in following {
+    for (fragment, recorded_versions) in following {
         // A fragment no longer in the manifest is dropped from coverage anyway.
         if current.fragment(fragment).is_none() {
             continue;
         }
-        let differs = match recorded {
-            None => true,
-            Some(recorded) => match history.at(recorded).await? {
+        let mut differs = false;
+        for recorded in recorded_versions {
+            differs |= match recorded {
                 None => true,
-                Some(against) => {
-                    indexed_data_differs(&against, &current, fragment, &indexed).await?
-                }
-            },
-        };
+                Some(recorded) => match history.at(recorded).await? {
+                    None => true,
+                    Some(against) => {
+                        indexed_data_differs(&against, &current, fragment, &indexed).await?
+                    }
+                },
+            };
+        }
         if !differs {
             fresh.insert(fragment);
         }
