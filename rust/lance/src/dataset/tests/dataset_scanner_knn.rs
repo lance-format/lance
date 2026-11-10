@@ -12,6 +12,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, ListArray,
     RecordBatch, RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
 };
+use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
@@ -101,6 +102,248 @@ async fn test_knn_nodes(
         .copied()
         .collect();
     assert_eq!(expected_i, actual_i);
+}
+
+#[rstest]
+#[case::flat(None)]
+#[case::ivf_flat(Some(VectorIndexParams::with_ivf_flat_params(
+    MetricType::L2,
+    IvfBuildParams::new(2)
+)))]
+#[case::ivf_pq(Some(VectorIndexParams::ivf_pq(2, 4, 2, MetricType::L2, 2)))]
+#[tokio::test]
+async fn test_cross_column_refinement_candidates(
+    #[case] index_params: Option<VectorIndexParams>,
+    #[values(MetricType::L2, MetricType::Cosine, MetricType::Dot)] metric: MetricType,
+) {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(32))
+        .await
+        .unwrap();
+    if let Some(params) = &index_params {
+        dataset
+            .create_index(&["coarse"], IndexType::Vector, None, params, false)
+            .await
+            .unwrap();
+    }
+    let coarse_query = Float32Array::from(vec![0.1, 0.2, 0.3, 0.4]);
+    let full_query = Float32Array::from(vec![0.4, 0.3, 0.2, 0.1, 0.5, 0.6, 0.7, 0.8]);
+    let candidates = dataset
+        .scan()
+        .nearest("coarse", &coarse_query, 12)
+        .unwrap()
+        .distance_metric(MetricType::L2)
+        .nprobes(2)
+        .project(&["id", "full"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(candidates.num_rows(), 12);
+
+    let vectors = candidates["full"].as_fixed_size_list();
+    let ids = candidates["id"].as_primitive::<Int32Type>();
+    let mut expected = (0..candidates.num_rows())
+        .map(|i| {
+            let vector = vectors.value(i);
+            let vector = vector.as_primitive::<Float32Type>();
+            let pairs = vector.values().iter().zip(full_query.values().iter());
+            let dot = pairs
+                .clone()
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum::<f64>();
+            let distance = match metric {
+                MetricType::L2 => pairs
+                    .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+                    .sum(),
+                MetricType::Cosine => {
+                    let norm = vector
+                        .values()
+                        .iter()
+                        .map(|&value| f64::from(value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    let query_norm = full_query
+                        .values()
+                        .iter()
+                        .map(|&value| f64::from(value).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    1.0 - dot / (norm * query_norm)
+                }
+                MetricType::Dot => 1.0 - dot,
+                _ => unreachable!(),
+            };
+            (ids.value(i), distance as f32)
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+    expected.truncate(6);
+
+    let mut scan = dataset.scan();
+    scan.nearest("coarse", &coarse_query, 6)
+        .unwrap()
+        .distance_metric(MetricType::L2)
+        .nprobes(2)
+        .refine(2)
+        .with_refine_column("full", &full_query, metric)
+        .unwrap()
+        .project(&["id", DIST_COL])
+        .unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    if index_params.is_some() {
+        assert!(plan.contains("ANNSubIndex"), "{plan}");
+        // Quantized candidates go directly to final-space scoring.
+        assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+    }
+
+    let result = scan.try_into_batch().await.unwrap();
+    let actual_ids = result["id"].as_primitive::<Int32Type>();
+    let actual_distances = result[DIST_COL].as_primitive::<Float32Type>();
+    assert_eq!(result.num_rows(), expected.len());
+    for (i, (id, distance)) in expected.iter().enumerate() {
+        assert_eq!(actual_ids.value(i), *id);
+        assert!((actual_distances.value(i) - distance).abs() < 1e-5);
+    }
+    assert!(result.schema().column_with_name("full").is_none());
+    assert!(result.schema().column_with_name("coarse").is_none());
+}
+
+#[tokio::test]
+async fn test_cross_column_refinement_validation_and_reset() {
+    let dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    let coarse = Float32Array::from(vec![0.1; 4]);
+    let full = Float32Array::from(vec![0.1; 8]);
+
+    let mut scan = dataset.scan();
+    let error = scan
+        .with_refine_column("full", &full, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("nearest must be set"));
+
+    scan.nearest("coarse", &coarse, 2).unwrap();
+    let error = scan
+        .with_refine_column("id", &full, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("vector"));
+
+    let wrong_type = arrow_array::Float64Array::from(vec![0.1; 8]);
+    let error = scan
+        .with_refine_column("full", &wrong_type, MetricType::Cosine)
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("Float32"));
+
+    scan.with_refine_column("full", &full, MetricType::Cosine)
+        .unwrap();
+    let error = scan.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("positive refine_factor"));
+
+    scan.refine(0);
+    let error = scan.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("positive refine_factor"));
+
+    let mut overflow = dataset.scan();
+    overflow
+        .nearest("coarse", &coarse, usize::MAX)
+        .unwrap()
+        .refine(2)
+        .with_refine_column("full", &full, MetricType::Cosine)
+        .unwrap();
+    let error = overflow.explain_plan(false).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("overflows"));
+
+    scan.nearest("coarse", &coarse, 2).unwrap();
+    scan.explain_plan(false).await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cross_column_refinement_sliced_batch_query(#[values(false, true)] build_index: bool) {
+    let mut dataset = gen_batch()
+        .col("coarse", array::rand_vec::<Float32Type>(Dimension::from(4)))
+        .col("full", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    if build_index {
+        dataset
+            .create_index(
+                &["coarse"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(2, MetricType::L2),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let coarse_values =
+        Float32Array::from((1..9).map(|value| value as f32 / 10.0).collect::<Vec<_>>());
+    let coarse = FixedSizeListArray::try_new_from_values(coarse_values, 4).unwrap();
+    let full_values = Float32Array::from((0..32).map(|value| value as f32).collect::<Vec<_>>());
+    let full = FixedSizeListArray::try_new_from_values(full_values, 8)
+        .unwrap()
+        .slice(1, 2);
+
+    let mut scan = dataset.scan();
+    scan.nearest("coarse", &coarse, 2)
+        .unwrap()
+        .nprobes(2)
+        .refine(2)
+        .with_refine_column("full", &full, MetricType::L2)
+        .unwrap()
+        .project(&[DIST_COL])
+        .unwrap()
+        .with_row_id();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(
+        batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
+        &[0, 0, 1, 1]
+    );
+
+    for query_index in 0..coarse.len() {
+        let mut single = dataset.scan();
+        single
+            .nearest("coarse", coarse.value(query_index).as_ref(), 2)
+            .unwrap()
+            .nprobes(2)
+            .refine(2)
+            .with_refine_column("full", full.value(query_index).as_ref(), MetricType::L2)
+            .unwrap()
+            .project(&[DIST_COL])
+            .unwrap()
+            .with_row_id();
+        let single = single.try_into_batch().await.unwrap();
+        let query_batch = batch.slice(query_index * 2, 2);
+        assert_eq!(
+            query_batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+            single[ROW_ID].as_primitive::<UInt64Type>().values()
+        );
+        assert_eq!(
+            query_batch[DIST_COL].as_primitive::<Float32Type>().values(),
+            single[DIST_COL].as_primitive::<Float32Type>().values()
+        );
+    }
 }
 
 async fn nested_vector_test_dataset(dim: u32) -> (TempStrDir, Dataset) {
@@ -3261,4 +3504,73 @@ async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
     assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
     assert_eq!(quantized.num_rows(), 1);
     assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
+}
+
+/// A multivector query must score each row the same whatever the execution
+/// batch size. Each query vector's top-k sort emits its output in batches of
+/// that size, and one row id can appear in several of them because the index
+/// stores one entry per sub-vector.
+#[tokio::test]
+async fn test_multivector_scores_do_not_depend_on_batch_size() {
+    const DIM: i32 = 8;
+    const SUB_VECTORS: usize = 8;
+    const ROWS: usize = 200;
+    let values = (0..ROWS * SUB_VECTORS * DIM as usize)
+        .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+        .collect::<Vec<_>>();
+    let sub_vectors =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM).unwrap();
+    let item = ArrowField::new("item", sub_vectors.data_type().clone(), true);
+    let offsets = OffsetBuffer::from_lengths(vec![SUB_VECTORS; ROWS]);
+    let vectors = ListArray::new(Arc::new(item), offsets, Arc::new(sub_vectors), None);
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        vectors.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors.clone())]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(2, MetricType::Cosine),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let search = |batch_size: Option<usize>| {
+        let dataset = &dataset;
+        let query = &query;
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", query.as_ref(), 10)
+                .unwrap()
+                .minimum_nprobes(2)
+                .with_row_id()
+                .project::<&str>(&[])
+                .unwrap();
+            if let Some(batch_size) = batch_size {
+                scan.batch_size(batch_size);
+            }
+            let batch = scan.try_into_batch().await.unwrap();
+            batch_row_ids(&batch)
+                .into_iter()
+                .zip(
+                    batch[DIST_COL]
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .to_vec(),
+                )
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let expected = search(None).await;
+    assert_eq!(expected.len(), 10);
+    assert_eq!(search(Some(8)).await, expected);
 }
