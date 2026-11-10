@@ -21,8 +21,7 @@
 //! paths cannot drift apart.
 //!
 //! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! With a bound set, an index whose kind can merge segments (vector, BTree,
-//! Bitmap, BloomFilter, NGram, RTree, Inverted, LabelList) is split: tasks
+//! Bitmap, BloomFilter, NGram, MinHash LSH, RTree, Inverted, LabelList) is split: tasks
 //! build one uncommitted segment each over a group of fragments, encoded
 //! against the model of a reference segment; merges combine the task results
 //! that carry their `group` with the committed segments they list into one
@@ -124,8 +123,8 @@ use super::scalar;
 use super::segment::{
     index_is_usable, index_type_is_known, retain_committed_inverted_files,
     segment_has_bloomfilter_details, segment_has_inverted_details, segment_has_label_list_details,
-    segment_has_merge_primitive, segment_has_vector_details, unsupported_index_version,
-    validate_segment_metadata,
+    segment_has_merge_primitive, segment_has_minhashlsh_details, segment_has_vector_details,
+    unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -317,12 +316,15 @@ fn is_vector_field(data_type: DataType) -> bool {
 /// Whether this segment stores row ids because it predates its index type's
 /// move to the row-address domain.
 ///
-/// Only the scalar kinds that made that move carry a `row_id_domain_version`.
-/// Vector segments also report row ids, but they keep their own identifiers
-/// across a merge and stay split-capable.
+/// MinHash LSH reads legacy row-id segments and writes only the row-address
+/// layout, so it has no `row_id_domain_version` for new writes. Vector
+/// segments keep their own identifiers across a merge and stay split-capable.
 fn stores_legacy_row_ids(segment: &IndexMetadata) -> bool {
     if segment.results_are_row_addrs() {
         return false;
+    }
+    if segment_has_minhashlsh_details(segment) {
+        return true;
     }
     let Some(details) = segment.index_details.as_ref() else {
         return false;
