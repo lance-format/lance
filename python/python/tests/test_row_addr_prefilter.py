@@ -22,7 +22,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.dataset import ScannerBuilder, serialize_row_addrs
+from lance._dataset.scanner import ScannerBuilder, serialize_row_addrs
 from lance.file import LanceFileWriter
 
 if TYPE_CHECKING:
@@ -46,8 +46,8 @@ def _write(tmp_path: Path, with_index: bool = False) -> lance.LanceDataset:
     )
     ds = lance.write_dataset(tbl, str(tmp_path / "t.lance"), mode="overwrite")
     if with_index:
-        # IVF_FLAT with nprobes == num_partitions is exact, so the masked result
-        # can be compared against brute force without recall slack.
+        # IVF_FLAT with both probe bounds set to num_partitions is exact, so the
+        # masked result can be compared against brute force without recall slack.
         ds.create_index("vector", index_type="IVF_FLAT", num_partitions=4, metric="l2")
     return ds
 
@@ -136,7 +136,13 @@ def test_knn_topk_is_computed_over_masked_rows(
     query = np.zeros(DIM, dtype=np.float32)
 
     got = ds.scanner(
-        nearest={"column": "vector", "q": query, "k": 5, "nprobes": 4},
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 5,
+            "minimum_nprobes": 4,
+            "maximum_nprobes": 4,
+        },
         with_row_id=True,
         row_addr_allowlist=serialize_row_addrs(allowed),
     ).to_table()
@@ -226,7 +232,9 @@ def _overlay(
     return lance.LanceDataset.commit(ds, op, read_version=ds.version)
 
 
-def test_overlay_stale_replay_scan_respects_mask(tmp_path: Path) -> None:
+def test_overlay_stale_replay_scan_respects_mask(
+    tmp_path: Path, enable_unstable_data_overlay_files
+) -> None:
     base_dir = tmp_path / "ov_scan"
     ds = lance.write_dataset(
         pa.table(
@@ -266,7 +274,9 @@ def test_overlay_stale_replay_scan_respects_mask(tmp_path: Path) -> None:
     assert got["_rowid"].to_pylist() == [stale_addr]
 
 
-def test_overlay_stale_replay_ann_respects_mask(tmp_path: Path) -> None:
+def test_overlay_stale_replay_ann_respects_mask(
+    tmp_path: Path, enable_unstable_data_overlay_files
+) -> None:
     base_dir = tmp_path / "ov_ann"
     rng = np.random.default_rng(7)
     vectors = rng.standard_normal((N, DIM)).astype(np.float32)

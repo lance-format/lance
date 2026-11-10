@@ -26,7 +26,7 @@ from .lance import (
 )
 
 if TYPE_CHECKING:
-    from .blob import DedicatedBlobWriter, PackedBlobWriter
+    from .blob import DedicatedBlobWriter, ManagedBlobWriter, PackedBlobWriter
     from .namespace import LanceNamespace
 
 
@@ -333,6 +333,35 @@ class LanceFileSession:
             None,  # pyright: ignore[reportArgumentType]
             _inner_writer=inner,
         )
+
+    def open_managed_blob_writer(
+        self, *, base_id: Optional[int] = None
+    ) -> "ManagedBlobWriter":
+        """Upload immutable payloads and return references reusable across fragments.
+
+        Open this session at the table root, or at a registered base's root and
+        supply its ``base_id``. The dataset write must use the same base registry
+        and schema metadata ``lance.blob.managed=true``. With ``base_id=None``,
+        write the referencing data files in primary storage. Supply a registered
+        payload base ID when writing data files to other bases. This method does not
+        register bases or commit a dataset version. Finish the upload before
+        committing references; uncommitted objects follow the normal unverified
+        cleanup policy.
+
+        Examples
+        --------
+        >>> import tempfile
+        >>> import lance
+        >>> with tempfile.TemporaryDirectory() as uri:
+        ...     writer = LanceFileSession(uri).open_managed_blob_writer()
+        ...     writer.write_blob(b"shared")
+        ...     (reference,) = writer.finish()
+        ...     builder = lance.BlobDescriptorArrayBuilder("blob")
+        ...     builder.extend([reference, reference])
+        ...     len(builder.finish())
+        2
+        """
+        return self._session.open_managed_blob_writer(base_id=base_id)
 
     def open_packed_blob_writer(self, path: str, blob_id: int) -> "PackedBlobWriter":
         """

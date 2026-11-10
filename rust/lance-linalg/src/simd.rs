@@ -26,7 +26,13 @@ pub(crate) mod x86;
 use num_traits::{Float, Num};
 use u8::u8x16;
 
-/// Lance SIMD lib
+/// Lance SIMD lib.
+///
+/// `Mul` operates independently on each lane. Integer implementations keep the
+/// low bits of each product, wrapping on overflow, while floating-point
+/// implementations follow the scalar type's multiplication semantics.
+/// `Add` and `Sub` retain implementation-specific overflow behavior; notably,
+/// [`u8x16`] addition saturates while its subtraction wraps.
 ///
 pub trait SIMD<T: Num + Copy, const N: usize>:
     std::fmt::Debug
@@ -58,6 +64,15 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     /// Load unaligned data from memory.
     ///
     /// # Safety
+    ///
+    /// `ptr` must be valid for reads of `N` elements of `T`.
+    ///
+    /// On loongarch64, `f32x8`, `f32x16`, `f64x4`, `f64x8`, and `i32x8`
+    /// additionally require LASX. These implementations do not check for it at
+    /// runtime, and calling one without LASX is undefined behavior.
+    ///
+    /// `u8x16` has no target-feature requirements beyond the architecture
+    /// baseline.
     unsafe fn load_unaligned(ptr: *const T) -> Self;
 
     /// Store the values to aligned memory.

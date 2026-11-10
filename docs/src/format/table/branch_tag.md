@@ -17,7 +17,9 @@ Branch names must follow these validation rules:
 4. Cannot contain `..` or `\`
 5. Segments must contain only alphanumeric characters, `.`, `-`, `_`
 6. Cannot end with `.lock`
-7. Cannot be named `main` (reserved for main branch)
+7. Cannot be named `main` (reserved for the default branch)
+
+Branch names are case-sensitive, matching Git/GitHub ref semantics. The exact name `main` is a virtual name for the default branch. It may appear in API reference contexts as an alias for the default branch, but no branch metadata file named `main.json` is created.
 
 ### Branch Metadata Path
 
@@ -38,7 +40,7 @@ Each branch metadata file is a JSON file with the following fields:
 
 | JSON Key         | Type   | Optional | Description                                                                    |
 |------------------|--------|----------|--------------------------------------------------------------------------------|
-| `parentBranch`   | string | Yes      | Name of the branch this was created from. `null` indicates branched from main. |
+| `parentBranch`   | string | Yes      | Name of the branch this was created from. `null` indicates branched from the default branch. |
 | `parentVersion`  | number |          | Version number of the parent branch at the time this branch was created.       |
 | `createAt`       | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
 | `manifestSize`   | number |          | Size of the initial manifest file in bytes.                                    |
@@ -117,7 +119,7 @@ Each tag file is a JSON file with the following fields:
 
 | JSON Key        | Type   | Optional | Description                                                              |
 |-----------------|--------|----------|--------------------------------------------------------------------------|
-| `branch`        | string | Yes      | Branch name being tagged. `null` or absent indicates main branch.        |
+| `branch`        | string | Yes      | Branch name being tagged. `null` or absent indicates the default branch. |
 | `version`       | number |          | Version number being tagged within that branch.                          |
 | `createdAt`     | string | Yes      | RFC 3339 timestamp for when the tag was first created.                  |
 | `updatedAt`     | string | Yes      | RFC 3339 timestamp for the latest tag reference update.                 |

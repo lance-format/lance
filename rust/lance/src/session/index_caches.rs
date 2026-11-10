@@ -14,8 +14,9 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
-use lance_index::frag_reuse::CompactFragReuseIndex;
-use lance_table::format::IndexMetadata;
+use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
+use lance_select::RowAddrMask;
+use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
 use uuid::Uuid;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
@@ -91,6 +92,55 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
+/// Whole-dataset row-id lookup for one manifest and deletion mode.
+#[derive(Debug)]
+pub(crate) struct RowIdIndexKey<'a> {
+    pub version: u64,
+    /// Whether the index knows the deleted rows (it then maps them to `None`).
+    /// An index built without deletion vectors reads no deletion file.
+    pub with_deletions: bool,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`super::caches::ManifestKey::e_tag`] does. Callers without one must not
+    /// share the cached index at all (see `get_row_id_index`).
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for RowIdIndexKey<'_> {
+    type ValueType = RowIdIndex;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_index/{}/{}/{}",
+            self.version,
+            self.with_deletions,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_u64(self.with_deletions as u64);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+}
+
+/// Decoded fragment reuse history with `index_version = 0`, keyed by
+/// `index::frag_reuse::v0_cache_identity`.
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
@@ -113,6 +163,94 @@ impl CacheKey for FragReuseIndexKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
+/// Decoded fragment reuse details of an external `details.binpb`, keyed by where the
+/// file lives: a shallow clone's entry resolves to the source dataset's file. Each file
+/// is written once, under a fresh entry UUID. A hit does not check the file still exists.
+#[derive(Debug)]
+pub struct FragReuseDetailsKey<'a> {
+    pub store_identity: &'a str,
+    pub path: &'a object_store::path::Path,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl CacheKey for FragReuseDetailsKey<'_> {
+    type ValueType = FragReuseIndexDetails;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "frag_reuse_details/{}:{}/{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.path,
+            self.offset,
+            self.size
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndexDetails"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-details-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_str(self.path.as_ref());
+        builder.write_u64(self.offset);
+        builder.write_u64(self.size);
+    }
+}
+
+/// Restricted deletion mask of a vector index segment at one dataset version
+/// (`None`: the segment needs no restriction). Building it walks every
+/// fragment of the dataset, hence the cache entry.
+#[derive(Debug)]
+pub struct SegmentOwnershipMaskKey<'a> {
+    pub uuid: &'a Uuid,
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for SegmentOwnershipMaskKey<'_> {
+    type ValueType = Option<Arc<RowAddrMask>>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "segment_mask/{}/{}:{}/{}/{}",
+            self.uuid,
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "SegmentOwnershipMask"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.segment-ownership-mask-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
     }
 }
 
@@ -141,11 +279,15 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        // v2 holds every index the manifest names; v1 held only the ones the
-        // writing build could read. The fields are identical, so on a persistent
-        // backend shared with another release nothing but this version stops each
-        // build from reading the other's entry as its own meaning.
-        CacheKeySchema::new("lance.index.metadata-key", 2)
+        // v3 entries carry each segment's clustering reference and metadata;
+        // a v2 entry, written by a build that did not know those fields, holds
+        // every segment unlabelled, and a writer trusting it would republish
+        // the index section without the labels. v2 in turn holds every index
+        // the manifest names where v1 held only the readable ones. On a
+        // persistent backend shared with another release nothing but this
+        // version stops each build from reading the other's entry as its own
+        // meaning.
+        CacheKeySchema::new("lance.index.metadata-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -163,6 +305,69 @@ impl CacheKey for IndexMetadataKey<'_> {
     fn codec() -> Option<lance_core::cache::CacheCodec> {
         Some(lance_table::format::index_metadata_codec())
     }
+}
+
+/// Cache key for the query-time index listing DERIVED from a v1 (tagged) FRI:
+/// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
+///
+/// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
+/// listing. This one caches the per-snapshot result of the coverage backtrack so
+/// `load_indices` does not recompute `segment_coverage` and the per-index bitmap
+/// rewrites on every query-planning / merge_insert call. Keyed by the same
+/// snapshot identity: a different table (`store_identity`), a different snapshot
+/// (`version`), or any index add/replace (which commits a new manifest and bumps
+/// `version`/`e_tag`) yields a different key, so a stale derived listing is never
+/// reused.
+///
+/// This cache is MEMORY-ONLY (no `codec`): the derived listing depends on the
+/// READER's translation capability, not only on the snapshot. Different builds
+/// admit different segments for the same snapshot (a build that cannot translate
+/// a segment excludes it; one that can includes it), so a persisted entry
+/// reused across builds could serve a listing the current reader must not use.
+/// Snapshot identity does not capture reader capability, so we never persist
+/// this value; it is cheap to recompute per process.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedIndexListingKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for DerivedIndexListingKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}:{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.derived-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+
+    // No `codec`: memory-only. See the type doc: the derived listing is
+    // reader-capability dependent and must not be persisted across builds.
 }
 
 pub struct ProstAny(pub Arc<prost_types::Any>);
@@ -208,6 +413,47 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 mod tests {
     use super::*;
 
+    #[rstest::rstest]
+    #[case::generation(5, true, "second-etag")]
+    #[case::version(6, true, "first-etag")]
+    #[case::deletions(5, false, "first-etag")]
+    #[tokio::test]
+    async fn row_id_index_key_separates_snapshots(
+        #[case] version: u64,
+        #[case] with_deletions: bool,
+        #[case] e_tag: &str,
+    ) {
+        let global = GlobalIndexCache(LanceCache::with_capacity(4096));
+        let cache = global.for_dataset("first");
+        let key = RowIdIndexKey {
+            version: 5,
+            with_deletions: true,
+            e_tag: Some("first-etag"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&RowIdIndexKey {
+                    version,
+                    with_deletions,
+                    e_tag: Some(e_tag),
+                })
+                .await
+                .is_none()
+        );
+        assert!(
+            global
+                .for_dataset("second")
+                .get_with_key(&key)
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn index_metadata_key_isolates_object_store_identity() {
         let first = IndexMetadataKey {
@@ -238,5 +484,41 @@ mod tests {
         };
 
         assert_ne!(first.key(), second.key());
+    }
+
+    #[test]
+    fn derived_listing_key_isolates_table_snapshot_and_generation() {
+        let base = DerivedIndexListingKey {
+            version: 7,
+            store_identity: "s3$options",
+            e_tag: Some("etag"),
+        };
+        // Different table (object store identity).
+        let other_table = DerivedIndexListingKey {
+            store_identity: "s3$other-options",
+            ..base
+        };
+        // Different snapshot version (an index add/replace commits a new version).
+        let other_version = DerivedIndexListingKey { version: 8, ..base };
+        // Different manifest generation (e_tag).
+        let other_generation = DerivedIndexListingKey {
+            e_tag: Some("other-etag"),
+            ..base
+        };
+
+        assert_ne!(base.key(), other_table.key());
+        assert_ne!(base.key(), other_version.key());
+        assert_ne!(base.key(), other_generation.key());
+    }
+
+    #[test]
+    fn derived_listing_key_does_not_collide_with_raw_metadata_key() {
+        // The derived (coverage-rewritten) listing and the raw manifest listing
+        // share the same snapshot identity but must live in separate cache
+        // namespaces, so the derived listing is never served as the raw one.
+        assert_ne!(
+            DerivedIndexListingKey::schema().id(),
+            IndexMetadataKey::schema().id()
+        );
     }
 }

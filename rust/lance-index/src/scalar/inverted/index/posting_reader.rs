@@ -82,6 +82,10 @@ impl PostingReader {
 
 pub struct PostingListReader {
     pub(super) reader: PostingReader,
+    /// Row count of the posting file. Kept here because every query term
+    /// needs it to find its cache group, and asking `reader` costs a dynamic
+    /// call into file metadata that is usually cold.
+    num_rows: usize,
 
     /// Layout-specific metadata. V2 keeps its per-token max-score and
     /// length columns lazy so opening a partition doesn't drag O(num_tokens)
@@ -94,15 +98,17 @@ pub struct PostingListReader {
     pub(super) block_size: usize,
     pub(super) positions_layout: PositionsLayout,
 
-    /// Runtime posting-list cache grouping. Non-empty v2 indexes use synthetic
-    /// fixed groups so prewarm can improve cache density without rebuilding the
-    /// index or relying on persisted grouping metadata.
+    /// Runtime cache groups. Byte boundaries are cached separately from the
+    /// immutable source index and shared by request-local reader handles.
     pub(super) grouping: PostingGrouping,
 
     /// Modern postings contain dense DocIds into the partition document table.
     /// Cache successful boundary validation per immutable token so repeated
     /// queries do not decode the final posting block again.
-    pub(super) modern_doc_id_validations: Option<Arc<[OnceCell<()>]>>,
+    /// One byte per token: a synchronizing cell here costs 56 bytes per token,
+    /// which dominates memory when every partition is opened at once (segment
+    /// merge). Validation is a pure check, so a racing duplicate is harmless.
+    pub(super) modern_doc_id_validations: Option<Arc<[AtomicBool]>>,
     /// Skips per-token readiness checks once the whole immutable table is validated.
     pub(super) modern_postings_validated: Arc<AtomicBool>,
     pub(super) modern_num_docs: Option<usize>,
@@ -194,7 +200,7 @@ impl DeepSizeOf for PostingListReader {
             .map(|validations| {
                 validations
                     .len()
-                    .saturating_mul(std::mem::size_of::<OnceCell<()>>())
+                    .saturating_mul(std::mem::size_of::<AtomicBool>())
             })
             .unwrap_or(0);
         metadata_size + self.grouping.deep_size_of_children(context) + validation_size
@@ -230,15 +236,22 @@ impl PostingListReader {
         };
 
         let is_legacy_layout = matches!(&metadata, PostingMetadata::LegacyV1 { .. });
-        let grouping = PostingGrouping::for_reader(is_legacy_layout, reader.num_rows());
+        let grouping = PostingGrouping::for_reader(
+            is_legacy_layout,
+            positions_layout,
+            reader.num_rows(),
+            index_cache,
+        )
+        .await?;
         let modern_doc_id_validations = (!is_legacy_layout).then(|| {
             (0..reader.num_rows())
-                .map(|_| OnceCell::new())
+                .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
                 .into()
         });
 
         Ok(Self {
+            num_rows: reader.num_rows(),
             reader: PostingReader::Opened {
                 reader,
                 metadata: OnceLock::new(),
@@ -268,6 +281,7 @@ impl PostingListReader {
         };
         Ok(Self {
             reader: self.reader.with_store(store, path),
+            num_rows: self.num_rows,
             metadata: PostingMetadata::V2 {
                 metadata: metadata.clone(),
             },
@@ -307,7 +321,7 @@ impl PostingListReader {
     pub fn len(&self) -> usize {
         match &self.metadata {
             PostingMetadata::LegacyV1 { offsets, .. } => offsets.len(),
-            PostingMetadata::V2 { .. } => self.reader.num_rows(),
+            PostingMetadata::V2 { .. } => self.num_rows,
         }
     }
 
@@ -591,17 +605,12 @@ impl PostingListReader {
                 })?;
                 if read_policy == PostingReadPolicy::CacheAwareExact
                     && (start != token_id || end != exact_end)
-                    && let Some(group) = self
-                        .index_cache
-                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
-                        .await
-                {
-                    // This cache-only probe never invokes the posting loader.
-                    // Report the group hit because it is the path that serves
-                    // the posting; a probe miss is not a query-cache miss.
-                    metrics.record_index_cache_hit();
-                    self.posting_from_group(token_id, start, end, group.as_ref(), metrics)
+                    && let Some(posting) = self
+                        .cached_exact_posting(token_id, exact_end, start, end, metrics)
                         .await?
+                {
+                    metrics.record_index_cache_hit();
+                    posting
                 } else {
                     let (selected_start, selected_end) = match read_policy {
                         PostingReadPolicy::ReadAhead => (start, end),
@@ -653,6 +662,63 @@ impl PostingListReader {
         }
 
         Ok(posting)
+    }
+
+    async fn cached_exact_posting(
+        &self,
+        token_id: u32,
+        exact_end: u32,
+        start: u32,
+        end: u32,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<PostingList>> {
+        let group_key = posting_list_group_cache_key(start, end, self.has_impacts);
+        if let Some(group) = self.index_cache.get_resident_with_key(&group_key).await {
+            return self
+                .posting_from_group(token_id, start, end, group.as_ref(), metrics)
+                .await
+                .map(Some);
+        }
+
+        let exact_key = posting_list_group_cache_key(token_id, exact_end, self.has_impacts);
+        if let Some(group) = self.index_cache.get_with_key(&exact_key).await {
+            return self
+                .posting_from_group(token_id, token_id, exact_end, group.as_ref(), metrics)
+                .await
+                .map(Some);
+        }
+
+        let Some(group) = self.index_cache.get_with_key(&group_key).await else {
+            return Ok(None);
+        };
+        // A persistent group can avoid a remote source read. Retain a compact
+        // singleton after paying for that read, so later exact requests do not
+        // repeatedly decode the larger group once it leaves RAM. Taking the
+        // row copies its buffers; a slice would pin unrelated posting bytes.
+        if let PostingListGroupStorage::Packed(packed) = &group.storage {
+            let batch = arrow_select::take::take_record_batch(
+                &packed.batch,
+                &UInt32Array::from(vec![token_id - start]),
+            )?;
+            let singleton = Arc::new(PostingListGroup::new_packed_with_block_size(
+                batch,
+                packed.posting_tail_codec,
+                packed.block_size,
+            )?);
+            // Persistent-cache insertion can wait for spill backpressure. Do
+            // not pin the superseded group while waiting to publish its copy.
+            drop(group);
+            self.index_cache
+                .insert_with_key(&exact_key, singleton.clone())
+                .await;
+            self.posting_from_group(token_id, token_id, exact_end, singleton.as_ref(), metrics)
+                .await
+                .map(Some)
+        } else {
+            self.posting_from_group(token_id, start, end, group.as_ref(), metrics)
+                .await
+                .map(Some)
+        }
     }
 
     async fn load_cached_posting_group(
@@ -720,12 +786,12 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async {
-                Self::validate_modern_posting(token_id, posting, num_docs)
-            })
-            .await
-            .map(|_| ())
+        if validation.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Self::validate_modern_posting(token_id, posting, num_docs)?;
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[inline]
@@ -743,7 +809,7 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        Ok(validation.get().is_some())
+        Ok(validation.load(Ordering::Acquire))
     }
 
     pub(super) fn validate_modern_posting(
@@ -764,10 +830,8 @@ impl PostingListReader {
                 validations.len()
             ))
         })?;
-        validation
-            .get_or_try_init(|| async { Result::Ok(()) })
-            .await
-            .map(|_| ())
+        validation.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn modern_posting_validation_ready(&self) -> bool {
@@ -777,7 +841,11 @@ impl PostingListReader {
         let ready = self
             .modern_doc_id_validations
             .as_ref()
-            .is_none_or(|validations| validations.iter().all(|state| state.get().is_some()));
+            .is_none_or(|validations| {
+                validations
+                    .iter()
+                    .all(|state| state.load(Ordering::Acquire))
+            });
         if ready {
             self.modern_postings_validated
                 .store(true, Ordering::Release);
