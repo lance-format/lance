@@ -5,16 +5,15 @@
 //!
 //! [`warp_select`] chooses each query token's partitions and missing similarity
 //! from the IVF centroids alone; [`warp_score`] then scores the tokens of those
-//! partitions, and [`top_k_documents`] reduces them to document scores.
+//! partitions, and [`warp_top_k`] reduces them to document scores.
 //! [`WarpExec`] runs the three phases as one execution node.
 
 use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{
-    Array, ArrayRef, Float32Array, RecordBatch, UInt64Array,
-    cast::AsArray,
-    types::{Float32Type, UInt64Type},
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array, cast::AsArray,
+    types::Float32Type,
 };
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -29,17 +28,18 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
-use futures::{StreamExt, TryFutureExt, TryStreamExt, future::try_join_all, stream};
-use lance_core::ROW_ID;
+use futures::stream::FuturesUnordered;
+use futures::{Stream, StreamExt, TryFutureExt, future::try_join_all, stream};
+use lance_arrow::FixedSizeListArrayExt;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::prefilter::PreFilter;
+use lance_index::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::warp::{
-    Stride, centroid_similarities, missing_similarity, probe_partitions, top_k_documents,
+    Stride, centroid_similarities, merge_strides, merge_top_k, missing_similarity,
+    probe_partitions, split_row_ids, top_k_documents,
 };
-use lance_index::vector::{DIST_COL, Query, VectorIndex};
+use lance_index::vector::{PreparedPartitionRows, Query, VectorIndex};
 use lance_linalg::distance::{DistanceType, dot_f32};
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
@@ -50,6 +50,7 @@ use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::ivf::IVFIndex;
+use crate::index::vector::ivf::v2::GLOBAL_TOPK_CHUNK_BYTES;
 use crate::io::exec::utils::{PreFilterMasks, PreFilterSource};
 use crate::{Error, Result};
 
@@ -60,6 +61,8 @@ pub struct SegmentSelection {
     pub index: Arc<dyn VectorIndex>,
     /// `Γ[i][k] = <c_k, q_i>` for query token `i` and partition `k`.
     pub centroid_similarities: Vec<Vec<f32>>,
+    /// `|c_k|^2` for partition `k`.
+    pub centroid_norms: Arc<[f32]>,
     /// `P_i`: partitions query token `i` probes in this segment, best first.
     pub probed_partitions: Vec<Vec<u32>>,
 }
@@ -70,8 +73,9 @@ pub struct WarpSelection {
     pub column: String,
     /// The unit query tokens `q_i`.
     pub query_tokens: Vec<Vec<f32>>,
-    /// The vector column's float type, which partition search expects queries in.
-    pub value_type: DataType,
+    /// The unit query tokens as partition search expects them, in the vector
+    /// column's float type.
+    pub query_keys: Vec<ArrayRef>,
     pub segments: Vec<SegmentSelection>,
     /// `m_i`: the similarity imputed for documents query token `i` never
     /// observes, estimated over the partitions of every segment.
@@ -151,6 +155,13 @@ pub async fn warp_select(
             }
         })
         .collect::<Vec<Vec<f32>>>();
+    let query_keys = query_tokens
+        .iter()
+        .map(|token| {
+            let key: ArrayRef = Arc::new(Float32Array::from(token.clone()));
+            Ok(cast(&key, &value_type)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let indices = try_join_all(
         segments
@@ -158,67 +169,98 @@ pub async fn warp_select(
             .map(|segment| dataset.open_vector_index(column, &segment.uuid, metrics)),
     )
     .await?;
-    let column = column.to_string();
-    let segments = segments.to_vec();
-
-    spawn_cpu(move || {
-        let segments = indices
-            .into_iter()
-            .zip(segments)
-            .map(|(index, metadata)| {
-                let ivf = index.ivf_model();
-                let centroids = ivf.centroids_array().ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "WARP search on column {column} needs IVF centroids, but index segment \
-                         {} has none",
-                        metadata.uuid
-                    ))
-                })?;
-                let centroid_similarities = query_tokens
-                    .iter()
-                    .map(|token| centroid_similarities(token, centroids))
-                    .collect::<Result<Vec<_>>>()?;
-                let probed_partitions = centroid_similarities
-                    .iter()
-                    .map(|similarities| probe_partitions(similarities, nprobe))
-                    .collect();
-                Ok(SegmentSelection {
-                    metadata,
-                    index,
-                    centroid_similarities,
-                    probed_partitions,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // The centroid model's `lengths` are not populated for current index
-        // files; the partition storage holds the real sizes.
-        let partition_sizes = segments
-            .iter()
-            .flat_map(|segment| {
-                (0..segment.index.total_partitions())
-                    .map(|partition| segment.index.partition_size(partition) as u32)
-            })
-            .collect::<Vec<_>>();
-        let missing_similarities = (0..query_tokens.len())
-            .map(|token| {
-                let similarities = segments
-                    .iter()
-                    .flat_map(|segment| segment.centroid_similarities[token].iter().copied())
-                    .collect::<Vec<_>>();
-                missing_similarity(&similarities, &partition_sizes, imputation_rank)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(WarpSelection {
-            column,
-            query_tokens,
-            value_type,
-            segments,
-            missing_similarities,
+    // Each segment's centroids, cast to f32 once, and their squared norms.
+    let centroids = try_join_all(indices.iter().zip(segments).map(|(index, metadata)| {
+        let centroids = index.ivf_model().centroids_array().cloned();
+        let uuid = metadata.uuid;
+        let column = column.to_string();
+        spawn_cpu(move || {
+            let centroids = centroids.ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "WARP search on column {column} needs IVF centroids, but index segment \
+                     {uuid} has none"
+                ))
+            })?;
+            let dim = centroids.value_length();
+            let values = cast(centroids.values().as_ref(), &DataType::Float32)?;
+            let values = values.as_primitive::<Float32Type>();
+            let start = centroids.offset() * dim as usize;
+            let values = values.slice(start, centroids.len() * dim as usize);
+            let norms = values
+                .values()
+                .chunks_exact(dim as usize)
+                .map(|centroid| dot_f32(centroid, centroid))
+                .collect::<Arc<[f32]>>();
+            let centroids = FixedSizeListArray::try_new_from_values(values, dim)?;
+            Result::Ok((centroids, norms))
         })
+    }))
+    .await?;
+    // The centroid model's `lengths` are not populated for current index
+    // files; the partition storage holds the real sizes.
+    let partition_sizes = indices
+        .iter()
+        .flat_map(|index| {
+            (0..index.total_partitions()).map(|partition| index.partition_size(partition) as u32)
+        })
+        .collect::<Arc<[u32]>>();
+
+    // Each query token is selected independently, so tokens run in parallel.
+    let shared_centroids = Arc::new(
+        centroids
+            .iter()
+            .map(|(centroids, _)| centroids.clone())
+            .collect::<Vec<_>>(),
+    );
+    let per_token = try_join_all(query_tokens.iter().cloned().map(|token| {
+        let centroids = shared_centroids.clone();
+        let partition_sizes = partition_sizes.clone();
+        spawn_cpu(move || {
+            let similarities = centroids
+                .iter()
+                .map(|centroids| centroid_similarities(&token, centroids))
+                .collect::<Result<Vec<_>>>()?;
+            let probed = similarities
+                .iter()
+                .map(|similarities| probe_partitions(similarities, nprobe))
+                .collect::<Vec<_>>();
+            let missing =
+                missing_similarity(&similarities.concat(), &partition_sizes, imputation_rank)?;
+            Result::Ok((similarities, probed, missing))
+        })
+    }))
+    .await?;
+
+    let mut segments = indices
+        .into_iter()
+        .zip(segments.iter().cloned())
+        .zip(centroids)
+        .map(
+            |((index, metadata), (_, centroid_norms))| SegmentSelection {
+                metadata,
+                index,
+                centroid_similarities: Vec::with_capacity(query_tokens.len()),
+                centroid_norms,
+                probed_partitions: Vec::with_capacity(query_tokens.len()),
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut missing_similarities = Vec::with_capacity(query_tokens.len());
+    for (similarities, probed, missing) in per_token {
+        for ((segment, similarities), probed) in segments.iter_mut().zip(similarities).zip(probed) {
+            segment.centroid_similarities.push(similarities);
+            segment.probed_partitions.push(probed);
+        }
+        missing_similarities.push(missing);
+    }
+
+    Ok(WarpSelection {
+        column: column.to_string(),
+        query_tokens,
+        query_keys,
+        segments,
+        missing_similarities,
     })
-    .await
 }
 
 /// Score every token in each query token's probed partitions: `<t̂, q_i>` for
@@ -228,16 +270,11 @@ pub async fn warp_select(
 /// Returns, per query token `i`, one [`Stride`] per probed (segment, partition)
 /// pair, in no particular order.
 ///
-/// Partitions are searched partition by partition, all query tokens probing
-/// one partition back to back: concurrent loads of a partition are coalesced
-/// and later ones hit the index cache, so each probed partition is read from
-/// storage once per query rather than once per query token.
-///
-/// Scoring runs through each segment's own partition search, which already
-/// knows its quantizer: FLAT compares raw vectors, while PQ, SQ and RQ score
-/// their codes (against `q_i - c_k` for the residual quantizers PQ and RQ). So
-/// WARP needs no per-quantizer kernel. Partition search returns at most `k`
-/// rows, so `k` is set to the partition size to keep every token.
+/// Each probed partition is loaded and scanned once, for every query token
+/// that probes it, through [`VectorIndex::score_prepared_partition_rows`], which scores
+/// the partition with its own quantizer: FLAT compares raw vectors, while PQ,
+/// SQ and RQ score their codes (against `q_i - c_k` for the residual
+/// quantizers PQ and RQ). So WARP needs no per-quantizer kernel.
 ///
 /// `pre_filter` removes deleted and filtered rows; rows a segment no longer
 /// owns are dropped per segment, as in ANN search.
@@ -269,40 +306,271 @@ pub async fn warp_score(
                 .flat_map(move |(token, partitions)| {
                     partitions
                         .iter()
-                        .map(move |&partition| (token, segment_id, partition as usize))
+                        .map(move |&partition| (segment_id, partition as usize, token))
                 })
         })
         .collect::<Vec<_>>();
-    probes.sort_unstable_by_key(|&(token, segment_id, partition)| (segment_id, partition, token));
+    probes.sort_unstable();
+    let mut partitions = Vec::<(usize, usize, Vec<usize>)>::new();
+    for (segment_id, partition, token) in probes {
+        match partitions.last_mut() {
+            Some((last_segment, last_partition, tokens))
+                if (*last_segment, *last_partition) == (segment_id, partition) =>
+            {
+                tokens.push(token);
+            }
+            _ => partitions.push((segment_id, partition, vec![token])),
+        }
+    }
 
-    let scored = stream::iter(probes)
-        .map(|(token, segment_id, partition)| {
+    // Partitions are prepared (loaded, pre-filter awaited) concurrently, then
+    // scored in batches, one CPU task per batch: one task per partition would
+    // contend on the CPU pool's queue. A prepared partition pins its storage
+    // until scored, so batches are capped in partitions and bytes, and the
+    // in-flight batches share the byte budget of one global top-k chunk:
+    // what a query pins does not grow with the partitions it probes.
+    let num_cpus = get_num_compute_intensive_cpus();
+    let partitions_per_task = partitions
+        .len()
+        .div_ceil(2 * num_cpus)
+        .clamp(1, MAX_PARTITIONS_PER_TASK);
+    let bytes_per_task = (*GLOBAL_TOPK_CHUNK_BYTES / num_cpus).max(1);
+    let prepared = stream::iter(partitions)
+        .map(|(segment_id, partition, tokens)| {
             let segment = &selection.segments[segment_id];
             let pre_filter = segment_filters[segment_id].clone();
             let to_similarity = conversions[segment_id];
             async move {
-                let stride = score_stride(
-                    selection,
-                    segment,
-                    token,
-                    partition,
-                    pre_filter,
+                let prepared = if segment.index.partition_size(partition) == 0 {
+                    None
+                } else {
+                    let queries = tokens
+                        .iter()
+                        .map(|&token| partition_query(selection, segment, token, partition))
+                        .collect::<Vec<_>>();
+                    Some(
+                        segment
+                            .index
+                            .prepare_partition_rows(partition, &queries, pre_filter, metrics)
+                            .await?,
+                    )
+                };
+                Result::Ok(PreparedPartition {
+                    index: segment.index.clone(),
                     to_similarity,
-                    metrics,
-                )
-                .await?;
-                Result::Ok((token, stride))
+                    tokens,
+                    prepared,
+                })
             }
         })
-        .buffer_unordered(get_num_compute_intensive_cpus())
-        .try_collect::<Vec<_>>()
-        .await?;
+        .buffer_unordered(num_cpus)
+        // Boxing erases the closure types, which otherwise make the compiler
+        // demand the stream be generic over the borrowed selection's lifetimes.
+        .boxed();
+    let scored = score_in_batches(
+        prepared,
+        BatchLimits {
+            max_tasks: num_cpus,
+            max_items: partitions_per_task,
+            max_bytes: bytes_per_task,
+        },
+        PreparedPartition::size_bytes,
+        score_batch,
+    )
+    .await?;
 
     let mut strides = vec![Vec::new(); selection.query_tokens.len()];
-    for (token, stride) in scored {
-        strides[token].push(stride);
+    for (task_strides, task_metrics) in scored {
+        task_metrics.dump_into(metrics);
+        for (token, stride) in task_strides {
+            strides[token].push(stride);
+        }
     }
     Ok(strides)
+}
+
+/// Most probed partitions one CPU task scores: enough to amortize dispatching
+/// the task, few enough to keep the partitions in-flight tasks pin bounded.
+const MAX_PARTITIONS_PER_TASK: usize = 16;
+
+/// A probed partition ready to score on the CPU pool.
+struct PreparedPartition {
+    index: Arc<dyn VectorIndex>,
+    to_similarity: fn(f32) -> f32,
+    /// The query tokens probing the partition.
+    tokens: Vec<usize>,
+    /// The prepared scan; `None` for an empty partition.
+    prepared: Option<PreparedPartitionRows>,
+}
+
+impl PreparedPartition {
+    fn size_bytes(&self) -> usize {
+        self.prepared
+            .as_ref()
+            .map_or(0, |prepared| prepared.size_bytes)
+    }
+}
+
+/// How [`score_in_batches`] groups items into tasks.
+#[derive(Debug, Clone, Copy)]
+struct BatchLimits {
+    /// Most batches being scored at once.
+    max_tasks: usize,
+    /// Most items in one batch.
+    max_items: usize,
+    /// A batch stops growing once its items reach this many bytes.
+    max_bytes: usize,
+}
+
+/// Group the items of `prepared` into batches and `score` each, keeping at
+/// most `limits.max_tasks` batches in flight. The items alive at once are
+/// bounded by the batches in flight, the batch being assembled and the items
+/// `prepared` itself buffers, however many items there are.
+async fn score_in_batches<T, R, Fut>(
+    mut prepared: impl Stream<Item = Result<T>> + Unpin,
+    limits: BatchLimits,
+    size_bytes: fn(&T) -> usize,
+    score: fn(Vec<T>) -> Fut,
+) -> Result<Vec<R>>
+where
+    Fut: Future<Output = Result<R>>,
+{
+    let mut tasks = FuturesUnordered::new();
+    let mut scored = Vec::new();
+    let mut is_prepared_exhausted = false;
+    loop {
+        while !is_prepared_exhausted && tasks.len() < limits.max_tasks.max(1) {
+            match next_batch(&mut prepared, limits, size_bytes).await {
+                Some(batch) => tasks.push(score(batch?)),
+                None => is_prepared_exhausted = true,
+            }
+        }
+        match tasks.next().await {
+            Some(result) => scored.push(result?),
+            None => return Ok(scored),
+        }
+    }
+}
+
+/// Take items until the batch reaches `limits.max_items` items or
+/// `limits.max_bytes` bytes; `None` once `prepared` is exhausted.
+async fn next_batch<T>(
+    prepared: &mut (impl Stream<Item = Result<T>> + Unpin),
+    limits: BatchLimits,
+    size_bytes: fn(&T) -> usize,
+) -> Option<Result<Vec<T>>> {
+    let mut batch = Vec::new();
+    let mut bytes = 0;
+    while batch.len() < limits.max_items.max(1) && bytes < limits.max_bytes {
+        match prepared.next().await {
+            Some(Ok(item)) => {
+                bytes += size_bytes(&item);
+                batch.push(item);
+            }
+            Some(Err(err)) => return Some(Err(err)),
+            None => break,
+        }
+    }
+    (!batch.is_empty()).then_some(Ok(batch))
+}
+
+/// Score a batch of prepared partitions in one CPU task, as
+/// `(query token, stride)` pairs.
+fn score_batch(
+    partitions: Vec<PreparedPartition>,
+) -> impl Future<Output = Result<(Vec<(usize, Stride)>, LocalMetricsCollector)>> {
+    spawn_cpu(move || {
+        let task_metrics = LocalMetricsCollector::default();
+        let mut strides = Vec::new();
+        for PreparedPartition {
+            index,
+            to_similarity,
+            tokens,
+            prepared,
+        } in partitions
+        {
+            let Some(prepared) = prepared else {
+                strides.extend(tokens.into_iter().map(|token| (token, Stride::default())));
+                continue;
+            };
+            let scores = index.score_prepared_partition_rows(prepared, &task_metrics)?;
+            for (token, mut similarities) in tokens.into_iter().zip(scores.distances) {
+                similarities
+                    .iter_mut()
+                    .for_each(|distance| *distance = to_similarity(*distance));
+                let stride = Stride {
+                    row_ids: scores.row_ids.clone(),
+                    similarities,
+                };
+                strides.push((token, stride));
+            }
+        }
+        Ok((strides, task_metrics))
+    })
+}
+
+/// The query that scores query token `token` against `partition`.
+fn partition_query(
+    selection: &WarpSelection,
+    segment: &SegmentSelection,
+    token: usize,
+    partition: usize,
+) -> Query {
+    // RQ needs `|q_i - c_k|^2`, the distance IVF probing would have reported.
+    let dist_q_c = 1.0 + segment.centroid_norms[partition]
+        - 2.0 * segment.centroid_similarities[token][partition];
+    Query {
+        column: selection.column.clone(),
+        key: selection.query_keys[token].clone(),
+        k: 0,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 1,
+        maximum_nprobes: None,
+        search_effort: 0.5,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(DistanceType::Cosine),
+        use_index: true,
+        query_parallelism: 0,
+        dist_q_c,
+        approx_mode: Default::default(),
+    }
+}
+
+/// The `k` best documents of a WARP query from its strides, best first, as
+/// `(row_id, WARP score)`.
+///
+/// Each query token's strides are merged on the CPU pool in parallel; the sum
+/// across tokens is then split by row id range, also in parallel.
+pub async fn warp_top_k(
+    strides: Vec<Vec<Stride>>,
+    missing_similarities: Vec<f32>,
+    k: usize,
+) -> Result<Vec<(u64, f32)>> {
+    // Below this many scored rows per range, splitting costs more than it saves.
+    const MIN_ROWS_PER_RANGE: usize = 8192;
+    let token_scores = try_join_all(
+        strides
+            .into_iter()
+            .map(|token_strides| spawn_cpu(move || merge_strides(&token_strides))),
+    )
+    .await?;
+    let num_rows = token_scores
+        .iter()
+        .map(|scores| scores.row_ids.len())
+        .sum::<usize>();
+    let max_ranges = (num_rows / MIN_ROWS_PER_RANGE).clamp(1, get_num_compute_intensive_cpus());
+    let ranges = split_row_ids(&token_scores, max_ranges);
+    let token_scores = Arc::new(token_scores);
+    let missing_similarities = Arc::new(missing_similarities);
+    let tops = try_join_all(ranges.into_iter().map(|rows| {
+        let token_scores = token_scores.clone();
+        let missing_similarities = missing_similarities.clone();
+        spawn_cpu(move || top_k_documents(&token_scores, &missing_similarities, rows, k))
+    }))
+    .await?;
+    Ok(merge_top_k(tops, k))
 }
 
 /// Map a segment's partition search distance to cosine similarity, or reject
@@ -367,81 +635,9 @@ pub async fn warp_supports_segments(
     Ok(true)
 }
 
-async fn score_stride(
-    selection: &WarpSelection,
-    segment: &SegmentSelection,
-    token: usize,
-    partition: usize,
-    pre_filter: Arc<dyn PreFilter>,
-    to_similarity: fn(f32) -> f32,
-    metrics: &dyn MetricsCollector,
-) -> Result<Stride> {
-    let index = segment.index.as_ref();
-    let partition_size = index.partition_size(partition);
-    if partition_size == 0 {
-        return Ok(Stride::default());
-    }
-    let query_token = &selection.query_tokens[token];
-    let centroid = index.ivf_model().centroid(partition).ok_or_else(|| {
-        Error::index(format!(
-            "partition {partition} of segment {} has no centroid",
-            segment.metadata.uuid
-        ))
-    })?;
-    let centroid = cast(&centroid, &DataType::Float32)?;
-    let centroid = centroid.as_primitive::<Float32Type>().values();
-    // RQ needs `|q_i - c_k|^2`, the distance IVF probing would have reported.
-    let dist_q_c =
-        1.0 + dot_f32(centroid, centroid) - 2.0 * segment.centroid_similarities[token][partition];
-    let key: ArrayRef = Arc::new(Float32Array::from(query_token.clone()));
-    let query = Query {
-        column: selection.column.clone(),
-        key: cast(&key, &selection.value_type)?,
-        k: partition_size,
-        lower_bound: None,
-        upper_bound: None,
-        minimum_nprobes: 1,
-        maximum_nprobes: None,
-        search_effort: 0.5,
-        ef: None,
-        refine_factor: None,
-        metric_type: Some(DistanceType::Cosine),
-        use_index: true,
-        query_parallelism: 0,
-        dist_q_c,
-        approx_mode: Default::default(),
-    };
-    let batch = index
-        .search_in_partition(partition, &query, pre_filter, metrics)
-        .await?;
-
-    let column = |name: &str| {
-        batch.column_by_name(name).ok_or_else(|| {
-            Error::internal(format!(
-                "partition search of segment {} returned no {name} column",
-                segment.metadata.uuid
-            ))
-        })
-    };
-    let row_ids = column(ROW_ID)?.as_primitive::<UInt64Type>().values();
-    let distances = column(DIST_COL)?.as_primitive::<Float32Type>().values();
-    let mut scored = row_ids
-        .iter()
-        .zip(distances.iter())
-        .map(|(&row_id, &distance)| (row_id, to_similarity(distance)))
-        .collect::<Vec<_>>();
-    scored.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
-    scored.dedup_by_key(|(row_id, _)| *row_id);
-    let (row_ids, similarities) = scored.into_iter().unzip();
-    Ok(Stride {
-        row_ids,
-        similarities,
-    })
-}
-
 /// Executes WARP multivector search: WARPselect ([`warp_select`]), scoring of
 /// the probed partitions ([`warp_score`]) and the reduction to the top `k`
-/// ([`top_k_documents`]).
+/// ([`warp_top_k`]).
 ///
 /// Emits one batch of [`KNN_INDEX_SCHEMA`], `k * refine_factor` rows sorted by
 /// ascending distance, where a document's distance is the number of query
@@ -457,7 +653,7 @@ pub struct WarpExec {
     prefilter_source: PreFilterSource,
     /// Rows whose index entries are stale due to a newer data overlay.
     overlay_block: Option<RowAddrMask>,
-    /// External row-address mask ANDed into the prefilter.
+    /// External row-address mask, combined with the prefilter by logical AND.
     external_mask: Option<Arc<RowAddrMask>>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
@@ -627,8 +823,7 @@ impl ExecutionPlan for WarpExec {
             let num_query_tokens = selection.missing_similarities.len() as f32;
             let missing_similarities = selection.missing_similarities;
             let k = query.k * query.refine_factor.unwrap_or(1) as usize;
-            let top =
-                spawn_cpu(move || top_k_documents(&strides, &missing_similarities, k)).await?;
+            let top = warp_top_k(strides, missing_similarities, k).await?;
             let (row_ids, distances): (Vec<_>, Vec<_>) = top
                 .into_iter()
                 .map(|(row_id, score)| (row_id, num_query_tokens - score))
@@ -667,6 +862,10 @@ impl ExecutionPlan for WarpExec {
 mod tests {
     use super::*;
 
+    use arrow_array::types::UInt64Type;
+    use lance_core::ROW_ID;
+    use lance_index::vector::DIST_COL;
+
     use std::collections::{HashMap, HashSet};
 
     use arrow_array::{
@@ -674,7 +873,6 @@ mod tests {
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{Field, Schema};
-    use lance_arrow::FixedSizeListArrayExt;
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::OptimizeOptions;
@@ -1049,5 +1247,266 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
         assert!(err.to_string().contains(message), "{err}");
+    }
+
+    /// Scoring as WARP did before partitions were scanned directly: a top-k
+    /// partition search over every row of the partition per (token, partition)
+    /// probe, sorted by row id and reduced to each row's best token.
+    async fn reference_strides(
+        dataset: &Arc<Dataset>,
+        selection: &WarpSelection,
+        pre_filter: Arc<DatasetPreFilter>,
+    ) -> Vec<Vec<Stride>> {
+        let mut strides = vec![Vec::new(); selection.query_tokens.len()];
+        for segment in &selection.segments {
+            let pre_filter =
+                prefilter_for_segment(dataset.clone(), &segment.metadata, pre_filter.clone())
+                    .await
+                    .unwrap();
+            let to_similarity =
+                cosine_similarity_conversion(segment.index.as_ref(), segment.metadata.uuid)
+                    .unwrap();
+            for (token, partitions) in segment.probed_partitions.iter().enumerate() {
+                for &partition in partitions {
+                    let partition = partition as usize;
+                    let partition_size = segment.index.partition_size(partition);
+                    if partition_size == 0 {
+                        strides[token].push(Stride::default());
+                        continue;
+                    }
+                    let mut query = partition_query(selection, segment, token, partition);
+                    query.k = partition_size;
+                    let batch = segment
+                        .index
+                        .search_in_partition(
+                            partition,
+                            &query,
+                            pre_filter.clone(),
+                            &NoOpMetricsCollector,
+                        )
+                        .await
+                        .unwrap();
+                    let mut scored = batch[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .zip(batch[DIST_COL].as_primitive::<Float32Type>().values())
+                        .map(|(&row_id, &distance)| (row_id, to_similarity(distance)))
+                        .collect::<Vec<_>>();
+                    scored.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+                    scored.dedup_by_key(|(row_id, _)| *row_id);
+                    let (row_ids, similarities): (Vec<_>, Vec<_>) = scored.into_iter().unzip();
+                    strides[token].push(Stride {
+                        row_ids: row_ids.into(),
+                        similarities,
+                    });
+                }
+            }
+        }
+        strides
+    }
+
+    /// Scores every observed document by the definition, adding query tokens
+    /// in ascending order, and sorts them all.
+    fn reference_top_k(strides: &[Vec<Stride>], missing: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let mut best = HashMap::<u64, Vec<Option<f32>>>::new();
+        for (token, token_strides) in strides.iter().enumerate() {
+            for stride in token_strides {
+                for (&row_id, &similarity) in stride.row_ids.iter().zip(&stride.similarities) {
+                    let slot = &mut best
+                        .entry(row_id)
+                        .or_insert_with(|| vec![None; strides.len()])[token];
+                    *slot = Some(slot.map_or(similarity, |current| current.max(similarity)));
+                }
+            }
+        }
+        let missing_total = missing.iter().sum::<f32>();
+        let mut scored = best
+            .into_iter()
+            .map(|(row_id, per_token)| {
+                let score = per_token
+                    .iter()
+                    .zip(missing)
+                    .filter_map(|(best, &missing)| best.map(|best| best - missing))
+                    .fold(missing_total, |score, gain| score + gain);
+                (row_id, score)
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
+    /// Scanning each probed partition once for all its query tokens, and the
+    /// parallel reduction, return the same top k as scoring every probe with a
+    /// partition search and reducing by the definition.
+    #[rstest]
+    #[case::ivf_flat(VectorIndexParams::ivf_flat(4, DistanceType::Cosine))]
+    #[case::ivf_pq(VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::Cosine, 50))]
+    #[case::ivf_sq(VectorIndexParams::with_ivf_sq_params(
+        DistanceType::Cosine,
+        ivf(4),
+        SQBuildParams::default()
+    ))]
+    #[case::ivf_rq(VectorIndexParams::ivf_rq(4, 4, DistanceType::Cosine))]
+    #[tokio::test]
+    async fn test_warp_matches_partition_search_reference(#[case] params: VectorIndexParams) {
+        let mut rng = StdRng::seed_from_u64(7);
+        let (mut dataset, segments) = two_segment_dataset(&params, &mut rng).await;
+        dataset.delete("id % 10 = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+        let query =
+            Float32Array::from_iter_values((0..3 * DIM).map(|_| rng.random_range(-1.0..1.0)));
+        // Probing two of four partitions leaves rows unobserved by some tokens.
+        let selection = warp_select(
+            &dataset,
+            "vector",
+            &segments,
+            &query,
+            DIM,
+            WarpParams {
+                nprobe: 2,
+                imputation_rank: 100,
+            },
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let pre_filter = Arc::new(DatasetPreFilter::new(dataset.clone(), &segments, None));
+        let k = 50;
+
+        let strides = warp_score(
+            &dataset,
+            &selection,
+            pre_filter.clone(),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let reference = reference_strides(&dataset, &selection, pre_filter).await;
+        for (token, (actual, expected)) in strides.iter().zip(&reference).enumerate() {
+            assert_eq!(
+                merge_strides(actual).unwrap(),
+                merge_strides(expected).unwrap(),
+                "token {token}"
+            );
+        }
+
+        let expected = reference_top_k(&reference, &selection.missing_similarities, k);
+        assert_eq!(expected.len(), k);
+        let top = warp_top_k(strides, selection.missing_similarities.clone(), k)
+            .await
+            .unwrap();
+        assert_eq!(top, expected);
+    }
+
+    /// Counts the items alive, like the storage prepared partitions pin.
+    struct Pinned {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Pinned {
+        fn new(
+            live: &Arc<std::sync::atomic::AtomicUsize>,
+            peak: &Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Self {
+            let now = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            Self { live: live.clone() }
+        }
+    }
+
+    impl Drop for Pinned {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn score_pinned(batch: Vec<Pinned>) -> Result<usize> {
+        tokio::task::yield_now().await;
+        Ok(batch.len())
+    }
+
+    /// However many partitions a query probes, scoring pins at most the
+    /// prepared items buffered upstream, the batch being assembled and every
+    /// in-flight batch; and every item is scored exactly once.
+    #[rstest]
+    #[case::by_items(BatchLimits { max_tasks: 3, max_items: 4, max_bytes: usize::MAX }, 1, 4)]
+    #[case::by_bytes(BatchLimits { max_tasks: 2, max_items: 100, max_bytes: 10 }, 4, 3)]
+    #[case::one_task(BatchLimits { max_tasks: 1, max_items: 5, max_bytes: usize::MAX }, 1, 5)]
+    #[tokio::test]
+    async fn test_score_in_batches_bounds_pinned_items(
+        #[case] limits: BatchLimits,
+        #[case] item_bytes: usize,
+        #[case] max_batch: usize,
+    ) {
+        const NUM_ITEMS: usize = 1000;
+        const PREPARE_WINDOW: usize = 2;
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let prepared = stream::iter(0..NUM_ITEMS)
+            .map(|_| {
+                let (live, peak) = (live.clone(), peak.clone());
+                async move { Result::Ok(Pinned::new(&live, &peak)) }
+            })
+            .buffer_unordered(PREPARE_WINDOW)
+            .boxed();
+        let size_bytes: fn(&Pinned) -> usize = match item_bytes {
+            1 => |_| 1,
+            _ => |_| 4,
+        };
+        let scored = score_in_batches(prepared, limits, size_bytes, score_pinned)
+            .await
+            .unwrap();
+
+        assert_eq!(scored.iter().sum::<usize>(), NUM_ITEMS);
+        assert!(scored.iter().all(|&len| (1..=max_batch).contains(&len)));
+        let bound = PREPARE_WINDOW + (limits.max_tasks + 1) * max_batch;
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak <= bound, "peak {peak}, bound {bound}");
+        assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Partition scans count toward the index's prepared-partition tracker
+    /// and are all released once scored.
+    #[tokio::test]
+    async fn test_warp_score_releases_prepared_partitions() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::Cosine,
+            ivf(4),
+            lance_index::vector::pq::PQBuildParams::new(4, 8),
+        );
+        let (dataset, segments) = two_segment_dataset(&params, &mut rng).await;
+        let dataset = Arc::new(dataset);
+        let query = Float32Array::from_iter_values((0..DIM).map(|_| rng.random_range(-1.0..1.0)));
+        let selection = warp_select(
+            &dataset,
+            "vector",
+            &segments,
+            &query,
+            DIM,
+            WarpParams {
+                nprobe: 4,
+                imputation_rank: 1,
+            },
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let pre_filter = Arc::new(DatasetPreFilter::new(dataset.clone(), &segments, None));
+        warp_score(&dataset, &selection, pre_filter, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        for segment in &selection.segments {
+            let tracker = segment
+                .index
+                .as_any()
+                .downcast_ref::<crate::index::vector::ivf::v2::IvfPq>()
+                .expect("IVF_PQ index")
+                .prepared_partitions();
+            assert!(tracker.peak() >= 1);
+            assert_eq!(tracker.in_flight(), 0);
+        }
     }
 }
