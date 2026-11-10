@@ -204,6 +204,8 @@ Example: `data/101100101101010011010110a1b2c3d4e5f6g7h8i9j0.lance`
 
 Pattern: `_deletions/{fragment_id}-{read_version}-{id}.{extension}`
 
+Explicit deletion files use `_deletions/{uuid}.{extension}`. See [Deletion Files](index.md#deletion-files).
+
 Deletion files use two extensions: `.arrow` for Arrow IPC format (sparse deletions) and `.bin` for Roaring bitmap format (dense deletions).
 
 Example: `_deletions/42-10-a1b2c3d4.arrow`
