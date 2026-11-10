@@ -1751,8 +1751,29 @@ mod tests {
         assert!(clone.retention_leases.is_empty());
     }
 
+    #[test]
+    fn test_valid_retention_leases_writable_where_supported() {
+        let mut encoded = pb::Manifest::from(&Manifest::new(
+            Schema::default(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        ));
+        encoded.writer_feature_flags = FLAG_RETENTION_LEASES;
+        encoded.retention_leases = vec![lease_record(1)];
+        let decoded = Manifest::try_from(encoded).unwrap();
+
+        crate::feature_flags::ensure_can_read_manifest(&decoded).unwrap();
+        let result = crate::feature_flags::ensure_can_write_manifest(&decoded);
+        if crate::feature_flags::retention_leases_enabled() {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }), "got: {error}");
+        }
+    }
+
     #[rstest::rstest]
-    #[case::flag_set(FLAG_RETENTION_LEASES, vec![lease_record(1)], "cannot be written")]
     #[case::flag_missing(0, vec![lease_record(1)], "writer feature flag is unset")]
     #[case::incomplete_record(
         0,
