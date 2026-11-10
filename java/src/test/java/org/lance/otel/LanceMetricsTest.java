@@ -47,6 +47,14 @@ public class LanceMetricsTest {
   private static final String DURATION = "lance_object_store_request_duration_seconds";
   private static final String RETRYABLE = "lance_object_store_retryable_responses_total";
   private static final String IN_FLIGHT = "lance_object_store_in_flight_requests";
+  private static final List<String> MEMORY_GAUGES =
+      List.of(
+          "lance_memory_rss_bytes",
+          "lance_memory_rss_peak_bytes",
+          "lance_memory_cgroup_bytes",
+          "lance_memory_cgroup_limit_bytes");
+  private static final String MEMORY_STAGE_PEAK = "lance_memory_stage_peak_bytes";
+  private static final String MEMORY_OPERATION_PEAK = "lance_memory_operation_peak_bytes";
 
   @AfterEach
   void closeLanceMetrics() {
@@ -68,6 +76,13 @@ public class LanceMetricsTest {
       assertEquals("histogram", catalog.get(DURATION).getKind());
       assertEquals("counter", catalog.get(RETRYABLE).getKind());
       assertEquals("gauge", catalog.get(IN_FLIGHT).getKind());
+      // Memory metrics are described whether or not LANCE_MEMORY_OBSERVE is set;
+      // they only carry values while it is.
+      for (String gauge : MEMORY_GAUGES) {
+        assertEquals("gauge", catalog.get(gauge).getKind(), gauge);
+      }
+      assertEquals("histogram", catalog.get(MEMORY_STAGE_PEAK).getKind());
+      assertEquals("histogram", catalog.get(MEMORY_OPERATION_PEAK).getKind());
 
       generateObjectStoreMetrics(tempDir.resolve("otel_metrics.lance"));
 

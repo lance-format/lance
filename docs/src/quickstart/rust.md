@@ -5,7 +5,7 @@ description: Get started with the Lance Rust SDK — write Arrow batches, filter
 
 # Getting Started with Rust
 
-The `lance` crate is the native Rust core and SDK for the Lance format. Use it when building Rust services, storage engines, or data pipelines that read and write Lance datasets directly with Apache Arrow. If you want a higher-level retrieval database API in Rust, see [LanceDB](lancedb.md) instead.
+The `lance` crate is the native Rust SDK for the Lance format itself, giving direct, low-level control over Lance datasets, files, and indices. If you are building an application or analytics pipeline, start with an engine such as [LanceDB](index.md) (which also provides a Rust client) or [Apache Spark](spark.md) instead.
 
 ## Add Dependencies
 

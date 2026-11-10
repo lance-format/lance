@@ -9,6 +9,8 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypedDict
 
+import pyarrow as pa
+
 if TYPE_CHECKING:
     from ..lance import _Dataset
 
@@ -87,6 +89,58 @@ class LanceStats:
         Statistics about the data in the dataset.
         """
         return self._ds.data_stats()
+
+    def zone_statistics(self, index_name: str) -> pa.Table:
+        """
+        Per-zone statistics for a ZoneMap index.
+
+        The table contains the persisted index entries and does not scan data
+        files. It is not a snapshot of the current dataset: ``fragment_id`` and
+        ``zone_start`` use the original index address domain, ``zone_length``
+        is the recorded offset span rather than a post-deletion row count, and
+        fragment reuse, data overlays, and later appends are not remapped or
+        represented.
+
+        Parameters
+        ----------
+        index_name : str
+            Name of the ZoneMap index.
+
+        Returns
+        -------
+        pyarrow.Table
+            One row per zone. Columns are ``min``, ``max``, ``null_count``,
+            ``nan_count``, ``negative_nan_count``, ``fragment_id``,
+            ``zone_start``, and ``zone_length``. ``zone_length`` is an offset
+            span. ``negative_nan_count`` is null for a legacy zone with NaNs
+            whose sign split was not persisted; it must not be read as zero.
+
+            The ``rows_per_zone`` schema metadata is present only when every
+            returned segment uses the same value. It is omitted when segments
+            of one index use different values.
+
+        Raises
+        ------
+        ValueError
+            If ``index_name`` does not exist or is not a ZoneMap index.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            zones = dataset.stats.zone_statistics("x_zonemap")
+            print(
+                zones.select(
+                    [
+                        "fragment_id",
+                        "zone_start",
+                        "zone_length",
+                        "negative_nan_count",
+                    ]
+                )
+            )
+        """
+        return pa.Table.from_batches([self._ds.zone_statistics(index_name)])
 
     def column_layout_stats(self) -> List[FragmentColumnLayoutStats]:
         """

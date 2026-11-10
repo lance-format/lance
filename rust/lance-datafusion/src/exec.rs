@@ -33,7 +33,7 @@ use tracing::Span;
 
 pub use lance_datafusion_exec::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
-    OneShotExec, StrictBatchSizeExec, collect_execution_metrics,
+    OneShotExec, RecordBatchExec, StrictBatchSizeExec, collect_execution_metrics,
 };
 use lance_datafusion_exec::exec::{execute_plan_with_context, new_runtime_env, new_session_config};
 

@@ -3,11 +3,17 @@
 
 from typing import Literal, Optional, TypedDict
 
-# Re-exported from native module. See src/dataset/optimize.rs for implementation.
+# Re-exported from native module. See src/dataset/optimize.rs and
+# src/dataset/optimize_indices.rs for implementation.
 from .lance import Compaction as Compaction
 from .lance import CompactionMetrics as CompactionMetrics
 from .lance import CompactionPlan as CompactionPlan
 from .lance import CompactionTask as CompactionTask
+from .lance import IndexSegmentResult as IndexSegmentResult
+from .lance import OptimizeIndexMerge as OptimizeIndexMerge
+from .lance import OptimizeIndexTask as OptimizeIndexTask
+from .lance import OptimizeIndices as OptimizeIndices
+from .lance import OptimizeIndicesPlan as OptimizeIndicesPlan
 from .lance import RewriteResult as RewriteResult
 
 # from .lance import CompactionPlan as CompactionPlan
@@ -29,12 +35,17 @@ class CompactionOptions(TypedDict, total=False):
     """
     max_bytes_per_file: Optional[int]
     """
-    Max number of bytes in a single file.  This does not affect which
-    fragments need compaction, but does affect how they are re-written if
-    selected.  If this value is too small you may end up with fragments
-    that are smaller than `target_rows_per_fragment`.
-
-    The default will use the default from ``write_dataset``.
+    Maximum bytes per output file. Defaults to the dataset config value, or the
+    `writer's default <https://docs.rs/lance/latest/lance/dataset/write/struct.WriteParams.html#structfield.max_bytes_per_file>`_.
+    """
+    min_bytes_per_file: Optional[int]
+    """
+    Files at or above this size are excluded from small-file compaction.
+    When omitted or None, defaults to the dataset config value, or 95% of
+    :attr:`max_bytes_per_file`.
+    Must be greater than zero and no greater than that limit.
+    Files needing cleanup may still be compacted.
+    Example: ``Compaction.plan(ds, {"min_bytes_per_file": 512 * 1024 * 1024})``.
     """
     materialize_deletions: Optional[bool]
     """
@@ -113,6 +124,17 @@ class CompactionOptions(TypedDict, total=False):
     this is not a cap on total compaction I/O for datasets with blob
     columns.
     (default: None, no limit)
+    """
+    source_budget_mode: Optional[Literal["hard", "soft"]]
+    """
+    Controls how all configured max-source budgets are applied to cumulative
+    totals across the tasks selected for one plan. ``"hard"`` rejects a task
+    when adding it would exceed any cumulative budget and is the default.
+    ``"soft"`` always admits the first task. If that task exceeds a budget,
+    the plan stops there; otherwise later tasks use the same cumulative checks
+    as ``"hard"``. If a byte budget is set but the first task has a source
+    file without a recorded size, ``"soft"`` admits that task and stops;
+    ``"hard"`` reports an error.
     """
     excluded_fragment_ids: Optional[list[int]]
     """
