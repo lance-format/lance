@@ -100,6 +100,7 @@ use super::segment::{
     segment_has_merge_primitive, segment_has_vector_details, unsupported_index_version,
     validate_segment_metadata,
 };
+use super::vector::coarse_quantizer::with_fingerprint;
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
     IVFIndex as LegacyIvfIndex, VectorSegmentCompatibility, optimize_vector_indices,
@@ -939,6 +940,7 @@ async fn plan_split_rebuild(
         index_details: Some(Arc::new(vector_index_details(
             &params,
             built.target_partition_size,
+            built.coarse_quantizer_fingerprint,
         ))),
         index_version: params.index_type().version(),
         created_at: Some(Utc::now()),
@@ -1293,7 +1295,7 @@ async fn merge_vector_segments(
         pairs.push((metadata.clone(), index));
     }
     let logical_index = LogicalVectorIndex::try_new(last.name.clone(), field_path.clone(), pairs)?;
-    let (uuid, merged_count, files) = optimize_vector_indices(
+    let (uuid, summary) = optimize_vector_indices(
         dataset.clone(),
         Option::<
             lance_io::stream::RecordBatchStreamAdapter<
@@ -1306,9 +1308,10 @@ async fn merge_vector_segments(
     )
     .boxed()
     .await?;
-    if merged_count != inputs.len() {
+    if summary.indices_merged != inputs.len() {
         return Err(Error::internal(format!(
-            "optimize merge combined {merged_count} segments, expected {}",
+            "optimize merge combined {} segments, expected {}",
+            summary.indices_merged,
             inputs.len()
         )));
     }
@@ -1328,15 +1331,17 @@ async fn merge_vector_segments(
                 .filter_map(|metadata| metadata.fragment_bitmap.clone())
                 .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap),
         ),
-        index_details: last.index_details.clone().or_else(|| {
-            Some(Arc::new(
-                super::vector::details::vector_index_details_default(),
-            ))
-        }),
+        index_details: Some(Arc::new(with_fingerprint(
+            last.index_details
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(super::vector::details::vector_index_details_default),
+            summary.coarse_quantizer_fingerprint,
+        )?)),
         index_version: last.index_version,
         created_at: Some(Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(summary.files),
         clustering_id: None,
         metadata: Default::default(),
     })
@@ -1501,6 +1506,7 @@ mod tests {
     use lance_testing::datagen::generate_random_array;
 
     use crate::dataset::WriteParams;
+    use crate::index::vector::coarse_quantizer::{CoarseQuantizerFingerprint, common_fingerprint};
 
     const DIM: usize = 64;
     const VECTOR_INDEX: &str = "vector_idx";
@@ -1721,6 +1727,7 @@ mod tests {
         assert_eq!(dataset.manifest.version, before_commit + 1);
         let segments = segments(&dataset, VECTOR_INDEX).await;
         assert_eq!(segments.len(), 3);
+        assert!(common_fingerprint(&segments).is_some());
         assert_eq!(coverage(&segments), RoaringBitmap::from_iter(0u32..=5));
         assert_eq!(indexed_rows(&dataset, &segments).await, 2000);
 
@@ -1809,6 +1816,7 @@ mod tests {
             vec![(0, vec![0]), (1, vec![1]), (2, vec![2, 3])]
         );
         let model = &plan.tasks[0].reference;
+        let fingerprint = CoarseQuantizerFingerprint::from_metadata(model).unwrap();
         assert_ne!(model.uuid, original);
         assert_eq!(model.fragment_bitmap, Some(RoaringBitmap::new()));
         // The model segment carries the trained model only: no rows, no graphs.
@@ -1830,6 +1838,7 @@ mod tests {
             .unwrap();
         let rebuilt = segments(&dataset, VECTOR_INDEX).await;
         assert_eq!(rebuilt.len(), 1);
+        assert_eq!(common_fingerprint(&rebuilt), Some(fingerprint));
         assert_ne!(rebuilt[0].uuid, original);
         assert_eq!(coverage(&rebuilt), RoaringBitmap::from_iter([0u32]));
 

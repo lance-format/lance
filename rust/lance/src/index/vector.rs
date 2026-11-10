@@ -12,6 +12,7 @@ use std::{any::Any, collections::HashMap};
 
 mod bounded_partition_stream;
 pub mod builder;
+pub(crate) mod coarse_quantizer;
 pub mod dedup;
 pub(crate) mod details;
 pub mod hamming;
@@ -22,7 +23,7 @@ pub mod utils;
 #[cfg(test)]
 mod fixture_test;
 
-use self::{ivf::*, pq::PQIndex};
+use self::{coarse_quantizer::with_fingerprint, ivf::*, pq::PQIndex};
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_schema::{DataType, Schema};
@@ -858,7 +859,7 @@ pub(crate) async fn build_distributed_vector_index(
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
-) -> Result<(Uuid, Vec<IndexFile>)> {
+) -> Result<(Uuid, VectorIndexBuildSummary)> {
     let (element_type, index_type, ivf_params, shuffler) = prepare_vector_segment_build(
         dataset,
         column,
@@ -952,7 +953,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                return Ok((segment_uuid, summary.files));
+                return Ok((segment_uuid, summary));
             }
             DataType::UInt8 => {
                 let ivf_model = make_ivf_model();
@@ -973,7 +974,7 @@ pub(crate) async fn build_distributed_vector_index(
                 .with_progress(progress.clone())
                 .build()
                 .await?;
-                return Ok((segment_uuid, summary.files));
+                return Ok((segment_uuid, summary));
             }
             _ => {
                 return Err(Error::index(format!(
@@ -1022,7 +1023,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    return Ok((segment_uuid, summary.files));
+                    return Ok((segment_uuid, summary));
                 }
             }
         }
@@ -1049,7 +1050,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         IndexType::IvfHnswFlat => {
@@ -1077,7 +1078,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    return Ok((segment_uuid, summary.files));
+                    return Ok((segment_uuid, summary));
                 }
                 _ => {
                     let summary = IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
@@ -1095,7 +1096,7 @@ pub(crate) async fn build_distributed_vector_index(
                     .with_progress(progress.clone())
                     .build()
                     .await?;
-                    return Ok((segment_uuid, summary.files));
+                    return Ok((segment_uuid, summary));
                 }
             }
         }
@@ -1137,7 +1138,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         IndexType::IvfHnswSq => {
@@ -1168,7 +1169,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         IndexType::IvfHnswRq => {
@@ -1200,7 +1201,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         IndexType::IvfRq => {
@@ -1232,7 +1233,7 @@ pub(crate) async fn build_distributed_vector_index(
             .with_progress(progress.clone())
             .build()
             .await?;
-            return Ok((segment_uuid, summary.files));
+            return Ok((segment_uuid, summary));
         }
 
         _ => {
@@ -1249,6 +1250,7 @@ pub(crate) async fn build_distributed_vector_index(
 /// optimize reads it back to decide splits and joins.
 pub(crate) struct BuiltVectorSegment {
     pub(crate) files: Vec<IndexFile>,
+    pub(crate) coarse_quantizer_fingerprint: Option<coarse_quantizer::CoarseQuantizerFingerprint>,
     /// `None` when the build was neither given a target nor derived one (a
     /// fragment subset, a multivector column, or a build that shuffled no
     /// vectors), so optimize falls back to the index type's default.
@@ -1457,6 +1459,7 @@ async fn build_vector_index_impl(
                         indices_merged: 0,
                         files,
                         num_vectors_shuffled: 0,
+                        coarse_quantizer_fingerprint: None,
                     })
                 }
                 IndexFileVersion::V3 => {
@@ -1709,6 +1712,7 @@ async fn build_vector_index_impl(
     });
     Ok(BuiltVectorSegment {
         files: summary.files,
+        coarse_quantizer_fingerprint: summary.coarse_quantizer_fingerprint,
         target_partition_size,
     })
 }
@@ -2414,6 +2418,14 @@ pub async fn initialize_vector_index(
     })?;
 
     let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
+    let index_details = with_fingerprint(
+        source_index
+            .index_details
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(details::vector_index_details_default),
+        summary.coarse_quantizer_fingerprint,
+    )?;
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -2422,7 +2434,7 @@ pub async fn initialize_vector_index(
         covering_fields: vec![],
         dataset_version: target_dataset.manifest.version,
         fragment_bitmap,
-        index_details: source_index.index_details.clone(),
+        index_details: Some(Arc::new(index_details)),
         index_version: source_index.index_version,
         created_at: Some(chrono::Utc::now()),
         base_id: None,

@@ -595,13 +595,13 @@ impl<'a> CreateIndexBuilder<'a> {
 
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
-                let (files, built_target) = if train {
+                let (files, built_target, coarse_quantizer_fingerprint) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
                         if vector_params_have_precomputed_ivf(vec_params) {
                             // For distributed indexing, build only on specified fragments
                             // This creates temporary index metadata without committing
-                            let (segment_uuid, files) = Box::pin(build_distributed_vector_index(
+                            let (segment_uuid, summary) = Box::pin(build_distributed_vector_index(
                                 self.dataset,
                                 column,
                                 &index_name,
@@ -613,7 +613,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             ))
                             .await?;
                             output_index_uuid = segment_uuid;
-                            (files, None)
+                            (summary.files, None, summary.coarse_quantizer_fingerprint)
                         } else {
                             let built = Box::pin(build_filtered_vector_index(
                                 self.dataset,
@@ -626,7 +626,7 @@ impl<'a> CreateIndexBuilder<'a> {
                                 progress.clone(),
                             ))
                             .await?;
-                            (built.files, built.target_partition_size)
+                            (built.files, built.target_partition_size, built.coarse_quantizer_fingerprint)
                         }
                     } else {
                         // Standard full dataset indexing
@@ -640,7 +640,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             progress.clone(),
                         ))
                         .await?;
-                        (built.files, built.target_partition_size)
+                        (built.files, built.target_partition_size, built.coarse_quantizer_fingerprint)
                     }
                 } else {
                     // Create empty vector index
@@ -652,10 +652,10 @@ impl<'a> CreateIndexBuilder<'a> {
                         vec_params,
                     )
                     .await?;
-                    (files, None)
+                    (files, None, None)
                 };
                 CreatedIndex {
-                    index_details: vector_index_details(vec_params, built_target),
+                    index_details: vector_index_details(vec_params, built_target, coarse_quantizer_fingerprint),
                     index_version,
                     files: table_files_to_index(files),
                 }
@@ -1192,6 +1192,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::{ColumnAlteration, WriteMode, WriteParams};
+    use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1207,6 +1208,7 @@ mod tests {
     use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::{
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
@@ -3219,9 +3221,22 @@ mod tests {
             .iter()
             .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
             .collect::<RoaringBitmap>();
-        let expected_merged_details = compatible_tail.last().unwrap().index_details.clone();
+        let expected_merged_details = compatible_tail
+            .last()
+            .unwrap()
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
         assert_ne!(
-            independent_segment.index_details, expected_merged_details,
+            independent_segment
+                .index_details
+                .as_ref()
+                .unwrap()
+                .to_msg::<VectorIndexDetails>()
+                .unwrap(),
+            expected_merged_details,
             "test setup must distinguish base and suffix metadata"
         );
         let mut segments = vec![independent_segment];
@@ -3258,8 +3273,15 @@ mod tests {
             merged.fragment_bitmap.as_ref().unwrap(),
             &expected_merged_fragments
         );
+        // Protobuf map ordering can change when the fingerprint is rewritten.
         assert_eq!(
-            merged.index_details, expected_merged_details,
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .to_msg::<VectorIndexDetails>()
+                .unwrap(),
+            expected_merged_details,
             "merged metadata must come from the selected suffix, not an incompatible base segment"
         );
     }
@@ -4983,7 +5005,7 @@ mod tests {
                     uuid,
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params, None)),
+                    Arc::new(vector_index_details(&params, None, None)),
                     IndexType::IvfHnswFlat.version(),
                     source_dataset_version,
                     vec![],
@@ -5009,7 +5031,7 @@ mod tests {
                     Uuid::new_v4(),
                     dataset.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
-                    Arc::new(vector_index_details(&params, None)),
+                    Arc::new(vector_index_details(&params, None, None)),
                     IndexType::IvfHnswFlat.version(),
                     dataset.manifest.version + 1,
                     vec![],
@@ -5040,10 +5062,7 @@ mod tests {
             );
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::with_ivf_flat_params(
-            DistanceType::L2,
-            prepare_vector_ivf(&dataset, "vector").await,
-        );
+        let params = VectorIndexParams::ivf_flat(4, DistanceType::L2);
 
         let committed = dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -5061,6 +5080,7 @@ mod tests {
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].uuid, committed.uuid);
+        assert!(CoarseQuantizerFingerprint::from_metadata(&loaded[0]).is_some());
         assert!(
             loaded[0]
                 .files

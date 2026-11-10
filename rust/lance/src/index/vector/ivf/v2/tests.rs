@@ -37,6 +37,7 @@ use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
+use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
@@ -3013,6 +3014,19 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
         .commit_existing_index_segments("vector_idx", "vector", vec![merged])
         .await
         .unwrap();
+
+    let logical = dataset
+        .open_logical_vector_index("vector", "vector_idx")
+        .await
+        .unwrap();
+    let (metadata, index) = logical.iter().next().unwrap();
+    let expected =
+        CoarseQuantizerFingerprint::from_model(index.ivf_model(), index.metric_type()).unwrap();
+    assert_eq!(
+        CoarseQuantizerFingerprint::from_metadata(metadata),
+        Some(expected),
+        "distributed {expected_index_type} must preserve its final routing identity through merge"
+    );
 
     let stats = dataset.index_statistics("vector_idx").await.unwrap();
     let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
