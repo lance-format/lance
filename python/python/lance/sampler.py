@@ -99,7 +99,9 @@ def _efficient_sample(
 
         if local_sample_size < local_size:
             # Add more randomness within each chunk, if there is room.
-            offset = i + np.random.randint(0, local_size - local_sample_size)
+            offset = i + np.random.randint(
+                0, local_size - local_sample_size + 1, dtype=np.int64
+            )
         else:
             offset = i
 
@@ -206,6 +208,13 @@ def maybe_sample(
     -------
     Generator[pa.RecordBatch]
         A generator that yields [RecordBatch] of data.
+
+    Notes
+    -----
+    Unfiltered sampling uses NumPy's global random state. The bounded-memory
+    selection algorithm and corrected stratum window bounds change exact sampled
+    rows and random-state advancement for a given seed compared with earlier
+    implementations.
     """
     if n < 0:
         raise ValueError(f"n must be non-negative, got {n}")
