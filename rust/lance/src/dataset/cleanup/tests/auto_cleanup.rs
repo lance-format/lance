@@ -24,9 +24,10 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
 ) {
     // A file referenced by no manifest (e.g. abandoned `write_fragments`
     // output, or the transaction and deletion files of a commit that never
-    // landed) is deleted based on its age, and its mtime is unrelated to the
-    // retained floor. Files a retained version references stay, even when they
-    // are newer than that floor.
+    // landed) is deleted once it ages past the unverified threshold, or at once
+    // under `delete_unverified`, and its mtime is unrelated to the retained
+    // floor. Files a retained version references stay, even when they are newer
+    // than that floor.
     MockClock::set_system_time(std::time::Duration::from_secs(0));
     let fixture = MockDatasetFixture::try_new().unwrap();
     fixture.create_some_data().await.unwrap();
@@ -43,7 +44,7 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     );
     let num_rows = fixture.count_rows().await.unwrap();
 
-    // Newer than every manifest, and old enough to be aged out below.
+    // Newer than every manifest.
     MockClock::set_system_time(TimeDelta::try_days(3).unwrap().to_std().unwrap());
     let dataset = fixture.open().await.unwrap();
     let orphans = [

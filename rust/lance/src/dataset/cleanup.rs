@@ -504,16 +504,14 @@ struct CleanupInspection {
 impl CleanupInspection {
     /// Retained-manifest floor of the cutoff for `read_dir_all(..., unmodified_since)`.
     ///
-    /// Listing only files with `last_modified <= earliest_retained` is valid
-    /// when the working set is a time suffix: every retained version is newer
-    /// than every deleted one. A tagged old version (or any other sparse
-    /// retain) pulls that cutoff backwards, so files from newer deleted
-    /// versions are never listed. Their manifests are still removed, which
-    /// permanently orphans the data files ([#8705](https://github.com/lance-format/lance/issues/8705)).
-    ///
-    /// When a deleted manifest is newer than the earliest retained one, drop
-    /// the cutoff and scan the whole subtree — the same approach already used
-    /// for `_indices/`.
+    /// When every retained version is newer than every deleted one, the files of
+    /// deleted versions are all at or below this floor. A tagged old version (or
+    /// any other sparse retain) pulls it below files of newer deleted versions
+    /// ([#8705](https://github.com/lance-format/lance/issues/8705)), so the cutoff
+    /// is dropped then, as for `_indices/`. Callers raise it to the unverified
+    /// threshold, since files no manifest references can be newer than the floor.
+    /// Only meaningful when `delete_unverified` is off: the fast path in
+    /// `process_manifest_file` does not record commit times.
     fn listing_unmodified_since(&self) -> Option<DateTime<Utc>> {
         match (
             self.earliest_retained_manifest_time,
