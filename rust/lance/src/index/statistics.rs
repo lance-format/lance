@@ -357,6 +357,10 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn details(&self) -> Result<String> {
+        // System index metadata is internal and has no scalar index plugin.
+        if is_system_index(&self.segments[0]) {
+            return Ok("{}".to_string());
+        }
         let Some(details) = self.details.as_ref() else {
             return Ok("{}".to_string());
         };
