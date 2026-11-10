@@ -35,7 +35,7 @@ The caller supplies a canonical `table_identity` that distinguishes table
 incarnations and storage/catalog authorities. A URI or catalog name alone is
 insufficient when tables can be recreated or different storage endpoints use the
 same URI. The snapshot binds the resolved branch, version, manifest path, and a
-BLAKE3 digest of the original manifest protobuf bytes. When available, the commit
+BLAKE3 digest of the complete original manifest file. When available, the commit
 handler's authoritative record identity is included. An ETag is not used as a
 table-incarnation or content identity.
 

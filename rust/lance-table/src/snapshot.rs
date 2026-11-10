@@ -41,7 +41,7 @@ pub struct SnapshotRef {
 }
 
 impl SnapshotRef {
-    /// Describe a resolved manifest using a digest of its original protobuf bytes.
+    /// Describe a resolved manifest using a digest of its complete original file.
     ///
     /// `branch = None` identifies the main branch; a named branch must be resolved
     /// to `location.version`. `table_uri` is the absolute root, without a branch
@@ -127,7 +127,7 @@ impl SnapshotRef {
     pub fn manifest_path(&self) -> &str {
         &self.proto.manifest_path
     }
-    /// BLAKE3 digest of the original manifest protobuf bytes.
+    /// BLAKE3 digest of the complete original manifest file, including all sections.
     pub fn manifest_digest(&self) -> &[u8] {
         &self.proto.manifest_digest
     }
@@ -212,14 +212,15 @@ impl From<&SnapshotRef> for pb::SnapshotRef {
     }
 }
 
-/// Hash original manifest protobuf bytes without joining their storage chunks.
+/// Hash a complete original manifest file without joining its storage chunks.
 ///
-/// Exclude the message length prefix and file footer. Do not re-encode a decoded
-/// manifest: protobuf map ordering and hydrated dictionaries can change its bytes.
+/// Include index metadata, inline transactions, dictionaries, length prefixes, and
+/// the footer. Do not re-encode a decoded manifest: protobuf map ordering and
+/// hydrated dictionaries can change its bytes.
 ///
 /// ```
 /// use lance_table::snapshot::digest_manifest;
-/// let digest = digest_manifest(b"original protobuf bytes".as_slice());
+/// let digest = digest_manifest(b"original manifest file bytes".as_slice());
 /// assert_eq!(digest.len(), 32);
 /// ```
 pub fn digest_manifest(mut bytes: impl Buf) -> [u8; 32] {

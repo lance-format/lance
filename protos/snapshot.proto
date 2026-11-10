@@ -20,8 +20,9 @@ message SnapshotRef {
   uint64 version = 5;
   // Exact resolved manifest object path in the source object store.
   string manifest_path = 6;
-  /* BLAKE3 of the original manifest protobuf bytes, excluding its length prefix
-   * and file footer. Hash the original bytes: protobuf re-encoding is not canonical.
+  /* BLAKE3 of the complete original manifest file, including index metadata,
+   * inline transactions, dictionaries, length prefixes, and the footer.
+   * Hash the original bytes: protobuf re-encoding is not canonical.
    */
   bytes manifest_digest = 7;
   /* Optional authoritative commit-store record identity. Absent means the

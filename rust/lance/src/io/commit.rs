@@ -1751,7 +1751,7 @@ async fn record_successful_commit(
         Arc::new(tokio::sync::OnceCell::new()),
     )
     .await;
-    if !indices.is_empty() {
+    if !indices.is_empty() && location.e_tag.is_some() {
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.object_store.store_prefix,

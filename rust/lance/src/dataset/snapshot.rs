@@ -5,12 +5,8 @@
 
 use std::sync::Arc;
 
-use bytes::Buf;
 use lance_core::{Error, Result};
-use lance_table::format::{Manifest, pb};
-use lance_table::io::manifest::read_manifest_bytes;
-use lance_table::snapshot::digest_manifest;
-use prost::Message;
+use lance_table::format::Manifest;
 
 pub use lance_table::snapshot::SnapshotRef;
 
@@ -130,17 +126,14 @@ impl Dataset {
                 {
                     return Ok(*digest);
                 }
-                let bytes = read_manifest_bytes(
+                let (observed, digest) = Self::load_manifest_with_digest(
                     &self.object_store,
-                    &self.manifest_location.path,
-                    self.manifest_location.size,
+                    &self.manifest_location,
+                    self.uri(),
+                    &self.session,
                 )
                 .await?;
-                let digest = digest_manifest(bytes.clone());
-                let length = bytes.remaining();
-                let mut observed = Manifest::try_from(pb::Manifest::decode(bytes)?)?;
-                observed.detach_sparse_inline_row_ids(length);
-                if !matches_loaded_manifest(&observed, &self.manifest) {
+                if !matches_loaded_manifest(observed, &self.manifest) {
                     return Err(Error::invalid_input(format!(
                         "Manifest {} no longer matches the loaded snapshot at version {}",
                         self.manifest_location.path, self.manifest.version,
@@ -161,25 +154,36 @@ impl Dataset {
     }
 }
 
-fn matches_loaded_manifest(observed: &Manifest, loaded: &Manifest) -> bool {
-    // Writes hydrate dictionaries that are absent from persisted schema metadata.
+fn matches_loaded_manifest(mut observed: Manifest, loaded: &Manifest) -> bool {
+    // Writes and reads can hydrate different dictionary values. Compare the
+    // persisted schema metadata; the digest covers any persisted dictionary bytes.
     let mut expected = loaded.clone();
-    let mut fields = expected.schema.fields.iter_mut().collect::<Vec<_>>();
-    while let Some(field) = fields.pop() {
-        if let Some(dictionary) = &mut field.dictionary {
-            dictionary.values = None;
+    for manifest in [&mut observed, &mut expected] {
+        let mut fields = manifest.schema.fields.iter_mut().collect::<Vec<_>>();
+        while let Some(field) = fields.pop() {
+            if let Some(dictionary) = &mut field.dictionary {
+                dictionary.values = None;
+            }
+            fields.extend(&mut field.children);
         }
-        fields.extend(&mut field.children);
     }
-    observed == &expected
+    observed == expected
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dataset::{DatasetBuilder, WriteMode, WriteParams};
-    use arrow_array::{RecordBatchIterator, record_batch};
+    use crate::index::DatasetIndexExt;
+    use arrow_array::{
+        ArrayRef, RecordBatch, RecordBatchIterator, builder::StringDictionaryBuilder, record_batch,
+        types::Int8Type,
+    };
+    use byteorder::{ByteOrder, LittleEndian};
+    use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_table::format::pb;
     use object_store::ObjectStoreExt;
+    use prost::Message;
     use rstest::rstest;
 
     #[cfg_attr(coverage, coverage(off))]
@@ -195,6 +199,120 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    async fn write_indexed_dataset(
+        uri: &str,
+        max_rows_per_file: usize,
+        name: &str,
+        is_outside_tail: bool,
+    ) -> Dataset {
+        let mut dataset = write_dataset(uri, max_rows_per_file).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some(name.to_string()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        if is_outside_tail {
+            let padding = "x".repeat(2 * dataset.object_store.block_size());
+            dataset
+                .update_schema_metadata([("padding", padding.as_str())])
+                .await
+                .unwrap();
+        }
+        dataset
+    }
+
+    #[rstest]
+    #[case::index_metadata(false)]
+    #[case::inline_transaction(true)]
+    #[tokio::test]
+    async fn changed_outer_section_rejects_old_snapshot(
+        #[case] is_transaction: bool,
+        #[values(false, true)] is_outside_tail: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().join("table");
+        let dataset =
+            write_indexed_dataset(uri.to_str().unwrap(), 2, "old_idx", is_outside_tail).await;
+        let snapshot = dataset.snapshot_ref("catalog/table").await.unwrap();
+        let path = &dataset.manifest_location.path;
+        let original = dataset
+            .object_store
+            .inner
+            .get(path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.manifest_digest(),
+            blake3::hash(&original).as_bytes()
+        );
+        let manifest_offset = LittleEndian::read_u64(&original[original.len() - 16..]) as usize;
+        let mut changed = original.to_vec();
+        let section_offset = if is_transaction {
+            dataset.manifest.transaction_section.unwrap()
+        } else {
+            dataset.manifest.index_section.unwrap()
+        };
+        assert_eq!(
+            original.len() - section_offset > dataset.object_store.block_size(),
+            is_outside_tail
+        );
+        let length = LittleEndian::read_u32(&original[section_offset..]) as usize;
+        let section_range = section_offset + 4..section_offset + 4 + length;
+        let replacement = if is_transaction {
+            let mut transaction =
+                pb::Transaction::decode(&original[section_range.clone()]).unwrap();
+            transaction.uuid = uuid::Uuid::new_v4().to_string();
+            transaction.encode_to_vec()
+        } else {
+            let mut section = pb::IndexSection::decode(&original[section_range.clone()]).unwrap();
+            section.indices[0].name = "new_idx".into();
+            section.encode_to_vec()
+        };
+        assert_eq!(replacement.len(), section_range.len());
+        changed[section_range].copy_from_slice(&replacement);
+        assert_eq!(&changed[manifest_offset..], &original[manifest_offset..]);
+        dataset
+            .object_store
+            .inner
+            .put(path, changed.into())
+            .await
+            .unwrap();
+
+        let reopened = Dataset::open(uri.to_str().unwrap()).await.unwrap();
+        if !is_transaction {
+            assert_eq!(reopened.load_indices().await.unwrap()[0].name, "new_idx");
+        }
+        assert_ne!(
+            reopened
+                .snapshot_ref("catalog/table")
+                .await
+                .unwrap()
+                .manifest_digest(),
+            snapshot.manifest_digest()
+        );
+        let error = DatasetBuilder::from_snapshot(snapshot)
+            .with_session(dataset.session())
+            .load()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot"),
+            "{error}"
+        );
     }
 
     #[rstest]
@@ -273,6 +391,68 @@ mod tests {
         let six = six.snapshot_ref("catalog/table").await.unwrap();
         assert_eq!(one.encode().len(), six.encode().len());
         assert_ne!(one.manifest_digest(), six.manifest_digest());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn stale_manifest_size_does_not_change_digest(#[values(-1, 1)] size_delta: i64) {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = write_dataset(directory.path().join("table").to_str().unwrap(), 2).await;
+        let snapshot = dataset.snapshot_ref("catalog/table").await.unwrap();
+        let mut location = dataset.manifest_location.clone();
+        location.size = Some(
+            dataset
+                .object_store
+                .size(&location.path)
+                .await
+                .unwrap()
+                .checked_add_signed(size_delta)
+                .unwrap(),
+        );
+        let (manifest, digest) = Dataset::load_manifest_with_digest(
+            &dataset.object_store,
+            &location,
+            dataset.uri(),
+            &dataset.session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest, *dataset.manifest);
+        assert_eq!(digest.as_slice(), snapshot.manifest_digest());
+    }
+
+    #[tokio::test]
+    async fn dictionary_snapshot_capture_matches_reopened_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().join("table");
+        let mut dictionary = StringDictionaryBuilder::<Int8Type>::new();
+        for value in ["one", "two", "one", "two", "one", "two"] {
+            dictionary.append(value).unwrap();
+        }
+        let batch =
+            RecordBatch::try_from_iter([("category", Arc::new(dictionary.finish()) as ArrayRef)])
+                .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let snapshot = dataset.snapshot_ref("catalog/table").await.unwrap();
+        let reopened = DatasetBuilder::from_snapshot(snapshot.clone())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.get_fragments().len(), 3);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
+        assert_eq!(
+            reopened.snapshot_ref("catalog/table").await.unwrap(),
+            snapshot
+        );
     }
 
     #[tokio::test]
@@ -362,7 +542,7 @@ mod tests {
     async fn missing_generation_token_cannot_reuse_an_old_digest() {
         let directory = tempfile::tempdir().unwrap();
         let uri = directory.path().join("table");
-        let dataset = write_dataset(uri.to_str().unwrap(), 2).await;
+        let mut dataset = write_indexed_dataset(uri.to_str().unwrap(), 2, "old_idx", true).await;
         let mut location = dataset.manifest_location.clone();
         location.e_tag = None;
         location.size = Some(dataset.object_store.size(&location.path).await.unwrap());
@@ -374,8 +554,14 @@ mod tests {
         )
         .await
         .unwrap();
+        let index_offset = old_manifest.index_section.unwrap();
+        assert!(location.size.unwrap() as usize - index_offset > dataset.object_store.block_size());
+        dataset.manifest = old_manifest.clone();
+        dataset.manifest_location = location.clone();
+        dataset.snapshot_digest = old_digest.clone();
+        assert_eq!(dataset.load_indices().await.unwrap()[0].name, "old_idx");
         std::fs::remove_dir_all(&uri).unwrap();
-        let recreated = write_dataset(uri.to_str().unwrap(), 3).await;
+        let recreated = write_indexed_dataset(uri.to_str().unwrap(), 3, "new_idx", true).await;
         location.size = Some(recreated.object_store.size(&location.path).await.unwrap());
         let (new_manifest, new_digest) = Dataset::get_manifest(
             &recreated.object_store,
@@ -388,6 +574,10 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_manifest, &new_manifest));
         assert_ne!(old_digest.get().unwrap(), new_digest.get().unwrap());
         assert_eq!(new_manifest.fragments.len(), 2);
+        dataset.manifest = new_manifest;
+        dataset.manifest_location = location;
+        dataset.snapshot_digest = new_digest;
+        assert_eq!(dataset.load_indices().await.unwrap()[0].name, "new_idx");
     }
 
     #[rstest]
@@ -513,7 +703,7 @@ mod tests {
         assert_eq!(restored.count_rows(None).await.unwrap(), 6);
         assert!(restored.snapshot_digest.get().is_none());
         let error = restored.snapshot_ref("catalog/table").await.unwrap_err();
-        assert!(matches!(error, Error::NotFound { .. }), "{error}");
+        assert!(matches!(error, Error::DatasetNotFound { .. }), "{error}");
         assert!(error.to_string().contains("manifest"), "{error}");
     }
 

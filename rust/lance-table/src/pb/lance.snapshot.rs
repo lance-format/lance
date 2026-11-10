@@ -23,8 +23,9 @@ pub struct SnapshotRef {
     /// Exact resolved manifest object path in the source object store.
     #[prost(string, tag = "6")]
     pub manifest_path: ::prost::alloc::string::String,
-    /// BLAKE3 of the original manifest protobuf bytes, excluding its length prefix
-    /// and file footer. Hash the original bytes: protobuf re-encoding is not canonical.
+    /// BLAKE3 of the complete original manifest file, including index metadata,
+    /// inline transactions, dictionaries, length prefixes, and the footer.
+    /// Hash the original bytes: protobuf re-encoding is not canonical.
     #[prost(bytes = "vec", tag = "7")]
     pub manifest_digest: ::prost::alloc::vec::Vec<u8>,
     /// Optional authoritative commit-store record identity. Absent means the

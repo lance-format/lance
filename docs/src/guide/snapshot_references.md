@@ -13,7 +13,7 @@ SnapshotRef
 +-- absolute table root URI
 +-- resolved branch and numeric version
 +-- exact manifest object path
-+-- BLAKE3 digest of the original manifest protobuf bytes
++-- BLAKE3 digest of the complete original manifest file
 +-- optional authoritative commit-store record identity
 ```
 
@@ -61,9 +61,10 @@ resolver must verify that authority and supply the correct credentials, commit
 handler, storage endpoint, and per-base routing. The reference contains no
 credentials, native handles, or access rights.
 
-The manifest digest hashes the original protobuf message, excluding its length
-prefix and the file footer. It is computed over chunks without joining them into
-another manifest-sized buffer. Re-encoding a decoded manifest is unsuitable:
+The manifest digest hashes the complete original manifest file, including index
+metadata, inline transactions, dictionaries, length prefixes, and the footer.
+It is computed over chunks without joining them into another manifest-sized
+buffer. Re-encoding a decoded manifest is unsuitable:
 protobuf maps and hydrated dictionary values can change its bytes. Datasets opened
 from storage share this digest with their cached manifest. Cache reuse is scoped to
 the object store, resolved manifest path, commit identity, and generation token.

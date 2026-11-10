@@ -6,6 +6,7 @@
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Buf;
 use chrono::{Duration, prelude::*};
 use futures::future::BoxFuture;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -36,7 +37,10 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{CachedFileSize, read_last_block, read_message, read_metadata_offset};
+use lance_io::utils::{
+    CachedFileSize, ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_last_block, read_message,
+    read_metadata_offset, read_range_in_chunks,
+};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
@@ -926,36 +930,41 @@ impl Dataset {
             ));
         }
 
-        let last_block =
-            read_last_block(object_reader.as_ref())
-                .await
-                .map_err(|err| match err {
-                    object_store::Error::NotFound { path, source } => {
-                        Error::dataset_not_found(path, source)
-                    }
-                    _ => Error::io(format!(
-                        "failed to read manifest {}: {}",
-                        manifest_location.path, err
-                    )),
-                })?;
-
-        // A stale cached size yields a bogus footer offset. Detect it (the block
-        // lacks the trailing magic) and retry with the true size, like
-        // read_manifest. At the true size, the file itself is damaged.
-        if !last_block.ends_with(MAGIC) {
-            if manifest_location.size.is_some() {
-                let manifest_location = ManifestLocation {
-                    size: None,
-                    ..manifest_location.clone()
-                };
-                return Box::pin(Self::load_manifest_with_digest(
-                    object_store,
-                    &manifest_location,
-                    uri,
-                    session,
-                ))
-                .await;
+        let last_block = read_last_block(object_reader.as_ref()).await;
+        // A stale cached size can truncate the footer, produce a short tail, or
+        // make a backend reject the range. Retry once using the actual size.
+        let should_retry_size = manifest_location.size.is_some()
+            && match &last_block {
+                Ok(block) => {
+                    !block.ends_with(MAGIC)
+                        || block.len() != manifest_size.min(object_reader.block_size())
+                }
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(_) => true,
+            };
+        if should_retry_size {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest_with_digest(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+            ))
+            .await;
+        }
+        let last_block = last_block.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
             }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
+        if !last_block.ends_with(MAGIC) {
             return Err(Error::corrupt_file(
                 manifest_location.path.clone(),
                 format!(
@@ -966,31 +975,53 @@ impl Dataset {
 
         let offset = read_metadata_offset(&last_block)?;
 
-        // If manifest is in the last block, we can decode directly from memory.
-        let manifest_size = object_reader.size().await?;
-        let (mut manifest, digest) = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            (
-                Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?,
-                lance_table::snapshot::digest_manifest(message_data),
-            )
-        } else {
-            let bytes = lance_table::io::manifest::read_manifest_bytes(
-                object_store,
-                &manifest_location.path,
-                Some(manifest_size as u64),
-            )
-            .await?;
-            let digest = lance_table::snapshot::digest_manifest(bytes.clone());
-            let mut manifest =
-                Manifest::try_from(lance_table::format::pb::Manifest::decode(bytes)?)?;
-            manifest.detach_sparse_inline_row_ids(manifest_size - offset);
-            (manifest, digest)
-        };
+        if offset
+            .checked_add(4)
+            .is_none_or(|end| end > manifest_size - 16)
+        {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!("Invalid manifest offset {offset} for file size {manifest_size}"),
+            ));
+        }
+
+        // Snapshot identity includes sections preceding the manifest protobuf.
+        // Reuse the tail and fetch only the remaining prefix, without joining chunks.
+        let mut bytes = ChunkedBuf::default();
+        {
+            let mut chunks = read_range_in_chunks(
+                object_reader.as_ref(),
+                0..manifest_size - last_block.len(),
+                METADATA_READ_CHUNK_SIZE,
+            );
+            while let Some(chunk) = chunks.try_next().await? {
+                bytes.push(chunk);
+            }
+        }
+        bytes.push(last_block.clone());
+        let digest = lance_table::snapshot::digest_manifest(bytes.clone());
+        bytes.advance(offset);
+        let message_len = bytes.get_u32_le() as usize;
+        bytes.truncate(bytes.remaining() - 16);
+        if message_len == 0 {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest at offset {offset} of {manifest_size} bytes has version 0"
+                ),
+            ));
+        }
+        if bytes.remaining() != message_len {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest length does not match. Expected {message_len}, got {}",
+                    bytes.remaining(),
+                ),
+            ));
+        }
+        let mut manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(bytes)?)?;
+        manifest.detach_sparse_inline_row_ids(manifest_size);
 
         // A zeroed length prefix decodes to an empty message without an error, which would
         // open as an empty dataset. Versions start at 1.
@@ -1010,6 +1041,7 @@ impl Dataset {
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
         if let Some(index_offset) = manifest.index_section
+            && manifest_location.e_tag.is_some()
             && manifest_size - index_offset <= last_block.len()
         {
             let offset_in_block = last_block.len() - (manifest_size - index_offset);
