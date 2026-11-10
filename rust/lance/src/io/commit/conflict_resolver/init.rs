@@ -47,7 +47,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments,
-                    read_version_fragments: None,
                     read_schema,
                     reuse: Default::default(),
                     staged_replay: false,
@@ -85,7 +84,6 @@ impl<'a> TransactionRebase<'a> {
                         current_live: None,
                         current_schema: None,
                         read_fragments: None,
-                        read_version_fragments: None,
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
@@ -107,7 +105,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
-                    read_version_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
@@ -147,7 +144,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
-                    read_version_fragments: None,
                     read_schema: None,
                     reuse,
                     staged_replay: false,
@@ -171,7 +167,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
-                    read_version_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
@@ -195,7 +190,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
-                    read_version_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
@@ -218,7 +212,6 @@ impl<'a> TransactionRebase<'a> {
                     current_live: None,
                     current_schema: None,
                     read_fragments: None,
-                    read_version_fragments: None,
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
@@ -251,12 +244,14 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    /// Record the fragments live in the snapshot the transaction read, which
-    /// the undeferrable withdrawal of a rebased CreateIndex is measured
-    /// against. See `read_version_fragments`.
-    pub(crate) fn with_read_version_fragments(mut self, fragments: Arc<Vec<Fragment>>) -> Self {
+    /// Take a CreateIndex's `read_fragments` and `read_schema` from the
+    /// snapshot its `read_version` names. The handle passed to
+    /// [`Self::try_new`] may already be past rewrites the index must be
+    /// rebased over, which would hide them from the comparison.
+    pub(crate) fn with_read_version(mut self, read_version_dataset: &Dataset) -> Self {
         if matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
-            self.read_version_fragments = Some(fragments);
+            self.read_fragments = Some(read_version_dataset.fragments().clone());
+            self.read_schema = Some(read_version_dataset.schema().clone());
         }
         self
     }
