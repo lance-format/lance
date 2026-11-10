@@ -29,7 +29,9 @@ use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
-use arrow_array::{Array, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array};
+use arrow_array::{
+    Array, BooleanArray, GenericStringArray, LargeListArray, ListArray, StructArray, UInt64Array,
+};
 use arrow_array::{
     ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     builder::StringDictionaryBuilder,
@@ -528,9 +530,13 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
     let test_uri = TempStrDir::default();
     let num_rows = 10_000u64;
     let values: Int32Array = (0..num_rows).map(|id| (id % 5 == 0).then_some(7)).collect();
+    let flags: BooleanArray = (0..num_rows)
+        .map(|id| (id % 3 != 0).then_some(id % 2 == 0))
+        .collect();
     let ids = UInt64Array::from_iter_values(0..num_rows);
     let batch = RecordBatch::try_from_iter(vec![
         ("value", Arc::new(values) as ArrayRef),
+        ("flag", Arc::new(flags) as ArrayRef),
         ("id", Arc::new(ids) as ArrayRef),
     ])
     .unwrap();
@@ -558,6 +564,16 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         )
         .await
         .unwrap();
+    dataset
+        .create_index(
+            &["flag"],
+            IndexType::BTree,
+            Some("flag_btree".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
 
     for predicate in [
         "value = 7",
@@ -566,6 +582,23 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
         "NOT (value = 7)",
         "NOT (value = 99 OR value = 7)",
         "NOT (NOT (value = 7))",
+        // NULL rows are distinct from a value, and are neither TRUE nor FALSE.
+        "value IS NOT DISTINCT FROM 7",
+        "value IS DISTINCT FROM 7",
+        "value IS DISTINCT FROM 99",
+        "NOT (value IS DISTINCT FROM 7)",
+        "value IS NOT DISTINCT FROM NULL",
+        "(value IN (7, 99)) IS NOT TRUE",
+        "(value = 7) IS FALSE",
+        "(value != 7) IS NOT FALSE",
+        "flag IS TRUE",
+        "NOT (flag IS TRUE)",
+        "flag IS NOT FALSE",
+        // Predicates compared with each other are NULL where either one is.
+        "(value > 6) != (value < 7)",
+        "(value > 6) = (value < 7)",
+        "NOT ((value > 6) != (value < 8))",
+        "flag != (value = 7)",
         "value = 99 OR value = 7",
         // Float operands are rewritten exactly onto the integer column.
         "value > 6.5",
@@ -609,6 +642,57 @@ async fn test_btree_nullable_filters_match_unindexed_scan() {
             sorted_ids(&baseline),
             "indexed result differs for {predicate}"
         );
+    }
+}
+
+/// The FM index reports NULL text rows as FALSE rather than NULL, so a
+/// comparison between FM predicates must not be planned by negating them.
+#[tokio::test]
+async fn test_fm_predicate_equality_keeps_null_rows_null() {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("t", Utf8, [None, Some("needle"), Some("other")]),
+        ("u", Utf8, [Some("other"), Some("needle"), Some("needle")]),
+        ("id", UInt64, [0, 1, 2])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader, &test_uri, Some(write_params))
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+    for column in ["t", "u"] {
+        dataset
+            .create_index(&[column], IndexType::Fm, None, &params, true)
+            .await
+            .unwrap();
+    }
+
+    // Row 0 is NULL in both comparisons, so neither keeps it.
+    for (predicate, expected) in [
+        ("contains(t, 'needle') = contains(u, 'needle')", vec![1]),
+        ("contains(t, 'needle') != contains(u, 'needle')", vec![2]),
+    ] {
+        for use_scalar_index in [true, false] {
+            let mut scan = dataset.scan();
+            scan.use_scalar_index(use_scalar_index)
+                .filter(predicate)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            let mut ids = batch["id"].as_primitive::<UInt64Type>().values().to_vec();
+            ids.sort_unstable();
+            assert_eq!(
+                ids, expected,
+                "{predicate}, use_scalar_index={use_scalar_index}"
+            );
+        }
     }
 }
 

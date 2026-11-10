@@ -8,7 +8,7 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -281,6 +281,95 @@ impl Dataset {
         )?;
         Ok(catchup_of(&speculative)? != catchup_of(indices)?)
     }
+
+    /// The tagged reader's derived index listing for this snapshot, with the
+    /// flag telling whether a segment is absent from it only because its
+    /// format marker could not be read.
+    ///
+    /// [`DatasetIndexExt::load_indices`] drops the flag once it has decided
+    /// whether to cache; a caller that caches a SECOND derivation of its own
+    /// (the FRI query plan) needs the same flag for the same reason, so the
+    /// decision is made from one source here instead of re-derived from the
+    /// plan's contents.
+    pub(crate) async fn derived_index_listing(&self) -> Result<DerivedIndexListing> {
+        let indices = load_all_indices(self).await?;
+        self.derive_index_listing(indices).await
+    }
+
+    /// [`Self::derived_index_listing`] for a raw listing the caller already
+    /// loaded, so a caller that must inspect the raw listing first does not
+    /// load it twice.
+    async fn derive_index_listing(
+        &self,
+        indices: Arc<Vec<IndexMetadata>>,
+    ) -> Result<DerivedIndexListing> {
+        // Readers apply the fragment reuse index to every index they open.
+        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+            && indices.iter().any(is_hidden_by_frag_reuse)
+        {
+            Arc::new(
+                indices
+                    .iter()
+                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            indices
+        };
+        let tagged = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .map(|fri| fri.index_version);
+        match tagged {
+            // Legacy FRI index version 0 already had its fragment coverage
+            // remapped in load_all_indices().
+            None | Some(0) => Ok(DerivedIndexListing {
+                indices: filter_unusable(indices),
+                unverifiable: BTreeSet::new(),
+            }),
+            Some(1) => {
+                let fri = indices
+                    .iter()
+                    .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+                    .expect("the v1 FRI entry was just located");
+                let (derived, unverifiable) =
+                    frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                Ok(DerivedIndexListing {
+                    indices: derived,
+                    unverifiable,
+                })
+            }
+            Some(version) => Err(Error::not_supported(format!(
+                "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+            ))),
+        }
+    }
+}
+
+/// The index listing a snapshot's readers see, with what the caller needs to
+/// decide whether to cache it.
+pub struct DerivedIndexListing {
+    pub indices: Arc<Vec<IndexMetadata>>,
+    /// Logical indices with at least one segment whose format marker could not
+    /// be read; empty when every segment was verified. Those indices' listings
+    /// hold for this call alone.
+    pub unverifiable: BTreeSet<String>,
+}
+
+/// Drop the segments no reader can open, keeping the input allocation when
+/// every segment is usable.
+fn filter_unusable(indices: Arc<Vec<IndexMetadata>>) -> Arc<Vec<IndexMetadata>> {
+    if indices.iter().all(index_is_usable) {
+        return indices;
+    }
+    Arc::new(
+        indices
+            .iter()
+            .filter(|idx| index_is_usable(idx))
+            .cloned()
+            .collect(),
+    )
 }
 
 #[async_trait]
@@ -535,66 +624,22 @@ impl DatasetIndexExt for Dataset {
         });
         let derive = || async {
             let indices = load_all_indices(self).await?;
-            // Failed legacy inference is best-effort. Preserve retries on later calls
-            // instead of treating an incomplete listing as final for this snapshot.
+            // Best-effort inference and unreadable format markers must be
+            // retried on later calls instead of freezing an incomplete listing.
             let retry_inference = indices
                 .iter()
                 .any(|idx| needs_vector_details_inference(idx, self.schema()));
-            // Readers apply the fragment reuse index to every index they open.
-            let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
-                && indices.iter().any(is_hidden_by_frag_reuse)
-            {
-                Arc::new(
-                    indices
-                        .iter()
-                        .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                        .cloned()
-                        .collect(),
-                )
-            } else {
-                indices
-            };
-            if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-                match fri.index_version {
-                    // Legacy FRI index version 0 already had its fragment coverage
-                    // remapped in load_all_indices().
-                    0 => {}
-                    1 => {
-                        let derived = frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                        return Ok(QueryIndexListing {
-                            indices: derived,
-                            retry_inference,
-                        });
-                    }
-                    version => {
-                        return Err(Error::not_supported(format!(
-                            "FRI index_version {version} is unsupported. Please upgrade to a newer version",
-                        )));
-                    }
-                }
-            }
-            if indices.iter().all(index_is_usable) {
-                return Ok(QueryIndexListing {
-                    indices,
-                    retry_inference,
-                });
-            }
+            let listing = self.derive_index_listing(indices).await?;
             Ok(QueryIndexListing {
-                indices: Arc::new(
-                    indices
-                        .iter()
-                        .filter(|idx| index_is_usable(idx))
-                        .cloned()
-                        .collect(),
-                ),
-                retry_inference,
+                indices: listing.indices,
+                retry_derivation: retry_inference || !listing.unverifiable.is_empty(),
             })
         };
         let (listing, was_cached) = self
             .index_cache
             .get_or_insert_with_key_hit(derived_key, derive)
             .await?;
-        if was_cached && listing.retry_inference {
+        if was_cached && listing.retry_derivation {
             let refreshed = Arc::new(derive().await?);
             self.index_cache
                 .insert_with_key(&derived_key, refreshed.clone())

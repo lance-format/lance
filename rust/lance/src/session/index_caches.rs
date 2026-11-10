@@ -313,7 +313,8 @@ impl CacheKey for IndexMetadataKey<'_> {
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
 /// listing. Retained with its original value type for callers using this public
 /// key. Query loading now uses a separate internal key that also records whether
-/// incomplete legacy metadata needs another inference attempt. Keyed by the same
+/// incomplete metadata needs another inference or format-verification attempt.
+/// Keyed by the same
 /// snapshot identity: a different table (`store_identity`), a different snapshot
 /// (`version`), or any index add/replace (which commits a new manifest and bumps
 /// `version`/`e_tag`) yields a different key, so a stale derived listing is never
@@ -333,11 +334,11 @@ pub struct DerivedIndexListingKey<'a> {
     pub e_tag: Option<&'a str>,
 }
 
-/// Query-visible metadata and whether a later call should retry legacy inference.
+/// Query-visible metadata and whether a later call should retry derivation.
 #[derive(Debug)]
 pub(crate) struct QueryIndexListing {
     pub(crate) indices: Arc<Vec<IndexMetadata>>,
-    pub(crate) retry_inference: bool,
+    pub(crate) retry_derivation: bool,
 }
 
 impl DeepSizeOf for QueryIndexListing {

@@ -401,6 +401,12 @@ pub(crate) enum TaggedTrimOutcome {
 /// for every fragment another segment covers directly, so removing a
 /// qualifying X cannot change any query result.
 ///
+/// Refused outright when the derived listing could not verify every segment:
+/// an unreadable index file leaves a healthy segment's translated coverage
+/// invisible, which reads as superseded. This decision spans the whole table,
+/// so any unverifiable logical index refuses it, not only the one that cannot
+/// be verified.
+///
 /// Deterministic fixed point for mutual redundancy: segments are confirmed
 /// newest-first (dataset_version, then uuid), and a segment is prunable only
 /// against the direct coverage of segments already confirmed KEPT -- so of
@@ -436,9 +442,22 @@ pub(crate) async fn derive_superseded_segments(
         }
     }
     // The reader's own coverage derivation (translated through the ledger,
-    // direct-coverage-wins applied); not reimplemented here.
-    use crate::index::DatasetIndexExt;
-    let derived = dataset.load_indices().await?;
+    // direct-coverage-wins applied); not reimplemented here. Taken through
+    // the listing that carries its own certainty: a segment the reader
+    // dropped because its format marker could not be read is simply absent
+    // from `load_indices`, so its translated coverage would look empty and
+    // the subset check below would prune a healthy segment. The prune commits
+    // one table-wide decision, so it stays fail-closed on any uncertain group.
+    let listing = dataset.derived_index_listing().await?;
+    if !listing.unverifiable.is_empty() {
+        let names: Vec<&str> = listing.unverifiable.iter().map(String::as_str).collect();
+        return Err(Error::index(format!(
+            "could not verify the coverage of index segments before pruning superseded \
+             segments: an index file of {} could not be read",
+            names.join(", ")
+        )));
+    }
+    let derived = listing.indices;
     let derived_by_uuid: HashMap<uuid::Uuid, &RoaringBitmap> = derived
         .iter()
         .filter_map(|idx| {

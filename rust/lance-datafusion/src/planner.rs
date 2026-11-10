@@ -342,6 +342,16 @@ impl Planner {
         }
     }
 
+    /// Like [`Self::new`], but resolves functions against `session` instead of
+    /// Lance's default session, so functions registered on it can be planned.
+    pub fn new_with_session(schema: SchemaRef, session: SessionContext) -> Self {
+        Self {
+            schema,
+            context_provider: LanceContextProvider::new(session),
+            enable_relations: false,
+        }
+    }
+
     /// If passed with `true`, then the first identifier in column reference
     /// is parsed as the relation. For example, `table.field.inner` will be
     /// read as the nested field `field.inner` (`inner` on struct field `field`)
@@ -2749,6 +2759,30 @@ mod tests {
                 .udf_names()
                 .contains(&"registered_later".to_string())
         );
+    }
+
+    #[test]
+    fn test_planner_with_session_plans_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "echo",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        let batch = arrow_array::record_batch!(("s", Utf8, ["a", "b"])).unwrap();
+
+        let err = Planner::new(batch.schema())
+            .parse_expr("echo(s)")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid function 'echo'"), "{err}");
+
+        let planner = Planner::new_with_session(batch.schema(), session);
+        let expr = planner.parse_expr("echo(s)").unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        assert_eq!(result.as_ref(), batch.column(0).as_ref());
     }
 
     #[test]
