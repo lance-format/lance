@@ -637,7 +637,14 @@ impl Scanner {
                         .await?;
                     self.fts_rerank(vector_plan, query).await?
                 }
-                None => self.fts(&filter_plan.expr_filter_plan, query).await?,
+                None => {
+                    self.fts(
+                        &filter_plan.expr_filter_plan,
+                        query,
+                        self.fts_page_params(query),
+                    )
+                    .await?
+                }
             };
             // If we are prefiltering then the fts node will take care of the filter
             filter_plan.disable_refine();
@@ -645,8 +652,13 @@ impl Scanner {
         } else {
             // If we are postfiltering then we can't use scalar indices for the filter
             // and will need to run the postfilter in memory
+            let params = if filter_plan.vector_filter().is_some() {
+                query.params()
+            } else {
+                self.fts_page_params(query)
+            };
             filter_plan.make_refine_only();
-            self.fts(&ExprFilterPlan::default(), query).await
+            self.fts(&ExprFilterPlan::default(), query, params).await
         }
     }
 
@@ -1104,23 +1116,34 @@ impl Scanner {
         Ok(resolved)
     }
 
+    /// The search parameters of an FTS query whose relevance order selects the
+    /// scan's page, so it only needs the first `limit + offset` results.
+    ///
+    /// An FTS query combined with a vector search (as its filter, re-ranking its
+    /// candidates, or re-ranked by it) must use [`FullTextSearchQuery::params`]
+    /// instead: the vector search bounds the candidates the page is taken from.
+    fn fts_page_params(&self, query: &FullTextSearchQuery) -> FtsSearchParams {
+        let params = query.params();
+        // A column sort must select the page before relevance can truncate its candidates.
+        if params.limit.is_some() || self.ordering.is_some() {
+            return params;
+        }
+        let search_limit = match (self.limit, self.offset) {
+            (Some(limit), Some(offset)) => Some((limit + offset) as usize),
+            (Some(limit), None) => Some(limit as usize),
+            (None, Some(_)) => None, // No limit but has offset - fetch all and let limit_node handle
+            (None, None) => None,
+        };
+        params.with_limit(search_limit)
+    }
+
     // Create an execution plan to do full text search
     pub(super) async fn fts(
         &self,
         filter_plan: &ExprFilterPlan,
         query: &FullTextSearchQuery,
+        params: FtsSearchParams,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut params = query.params();
-        // A column sort must select the page before relevance can truncate its candidates.
-        if params.limit.is_none() && self.ordering.is_none() {
-            let search_limit = match (self.limit, self.offset) {
-                (Some(limit), Some(offset)) => Some((limit + offset) as usize),
-                (Some(limit), None) => Some(limit as usize),
-                (None, Some(_)) => None, // No limit but has offset - fetch all and let limit_node handle
-                (None, None) => None,
-            };
-            params = params.with_limit(search_limit);
-        }
         let query = &query.query;
         validate_fts_query_contract(query)?;
 
@@ -2812,7 +2835,7 @@ impl Scanner {
             }
             _ => {
                 let default_filter = ExprFilterPlan::default();
-                let fts_plan = self.fts(&default_filter, q).await?;
+                let fts_plan = self.fts(&default_filter, q, q.params()).await?;
 
                 let vector_row_id = Column::new_with_schema(ROW_ID, input.schema().as_ref())?;
                 let fts_row_id = Column::new_with_schema(ROW_ID, fts_plan.schema().as_ref())?;
