@@ -2836,8 +2836,7 @@ mod integration_tests {
         };
 
         // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active). The
-        // projection leaves out the key; `id = 3` and `id IN (..)` take the
-        // point-lookup route.
+        // projection leaves out the key.
         for (filter, offset, expected) in [
             ("id > 0", None, 4),
             ("name != 'base_2'", None, 3),
@@ -2846,6 +2845,16 @@ mod integration_tests {
             ("id IN (1, 4, 5, 6)", None, 2),
             ("id > 0", Some(1), 3),
         ] {
+            if filter.starts_with("id =") || filter.starts_with("id IN") {
+                let plan = scanner(filter, offset).create_plan().await.unwrap();
+                let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert!(
+                    plan.contains("OneShotStream"),
+                    "{filter} must take the point-lookup route:\n{plan}"
+                );
+            }
             let batches: Vec<RecordBatch> = scanner(filter, offset)
                 .try_into_stream()
                 .await
