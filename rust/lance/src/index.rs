@@ -18,6 +18,7 @@ mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
+mod frag_reuse_v0_cache;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 mod lifecycle;
 pub(crate) mod loading;

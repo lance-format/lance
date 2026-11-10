@@ -12,6 +12,10 @@
 # `handle` must match the member's GitHub login exactly (case-insensitive when
 # matched). `ecosystem_roles` is free-form markdown and may be empty.
 members:
+  - name: Wyatt Alt
+    handle: wkalt
+    affiliation: LanceDB
+    ecosystem_roles: ""
   - name: Yang Cen
     handle: BubbleCal
     affiliation: LanceDB
@@ -56,6 +60,10 @@ members:
     handle: calvinqi
     affiliation: Harvey.ai
     ecosystem_roles: ""
+  - name: Lu Qiu
+    handle: LuQQiu
+    affiliation: LanceDB
+    ecosystem_roles: Alluxio PMC Member
   - name: Prashanth Rao
     handle: prrao87
     affiliation: LanceDB

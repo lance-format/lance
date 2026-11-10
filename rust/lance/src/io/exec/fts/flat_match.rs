@@ -626,8 +626,9 @@ impl ExecutionPlan for FlatMatchFilterExec {
         self.input.properties()
     }
 
+    // Drops rows that do not match the query, so a limit cannot move below it.
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        false
     }
 }
 
