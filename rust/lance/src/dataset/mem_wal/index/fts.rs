@@ -55,7 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use crossbeam_skiplist::SkipMap;
-use fst::{Map, Streamer};
+use fst::automaton::{Automaton, Levenshtein, Str};
+use fst::{IntoStreamer, Map, Streamer};
 use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::datatypes::Schema as LanceSchema;
@@ -703,6 +704,18 @@ fn char_prefix(term: &str, prefix_length: u32) -> &str {
         .nth(prefix_length as usize)
         .map(|(idx, _)| &term[..idx])
         .unwrap_or(term)
+}
+
+// Counts dictionary terms whose edit distance `expand_fuzzy_term` computed for
+// a partition, so tests can tell an automaton search from a dictionary scan.
+#[cfg(test)]
+thread_local! {
+    static FUZZY_DISTANCES_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_fuzzy_distance_computed() {
+    FUZZY_DISTANCES_COMPUTED.with(|count| count.set(count.get() + 1));
 }
 
 fn query_tokens_to_vec(tokens: &Tokens) -> Vec<String> {
@@ -2746,14 +2759,47 @@ impl FtsMemIndex {
                 matches.insert(key.to_string(), dist);
             }
         }
+        // A partition's dictionary is an FST, so a Levenshtein automaton
+        // visits only the terms within `max_distance`, as the committed index
+        // does. `fst`'s automaton can miss matches for a non-ASCII query
+        // (lance-index keeps its own Unicode automaton for those), so such a
+        // query, or one too large to compile, scans the dictionary instead.
+        let automaton = term
+            .is_ascii()
+            .then(|| Levenshtein::new(term, max_distance).ok())
+            .flatten();
         for p in st.partitions.iter() {
-            for key in p.collect_terms() {
-                if !key.starts_with(prefix) {
-                    continue;
+            match &automaton {
+                Some(automaton) => {
+                    let mut stream = p
+                        .term_fst
+                        .search(automaton.intersection(Str::new(prefix).starts_with()))
+                        .into_stream();
+                    // Matches stream in term order, and only the
+                    // `max_expansions` smallest are kept overall.
+                    let mut kept = 0;
+                    while kept < max_expansions
+                        && let Some((key, _)) = stream.next()
+                    {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        matches.insert(key.to_string(), levenshtein_distance(term, key));
+                        kept += 1;
+                    }
                 }
-                let dist = levenshtein_distance(term, key.as_ref());
-                if dist <= max_distance {
-                    matches.insert(key.to_string(), dist);
+                None => {
+                    for key in p.collect_terms() {
+                        if !key.starts_with(prefix) {
+                            continue;
+                        }
+                        #[cfg(test)]
+                        count_fuzzy_distance_computed();
+                        let dist = levenshtein_distance(term, key.as_ref());
+                        if dist <= max_distance {
+                            matches.insert(key.to_string(), dist);
+                        }
+                    }
                 }
             }
         }
@@ -6850,6 +6896,103 @@ mod tests {
 
         let matches = index.expand_fuzzy("a", 10, 3);
         assert!(matches.len() <= 3);
+    }
+
+    /// Partitions expand an ASCII term with a Levenshtein automaton over their
+    /// term FST; the result must equal a scan of every dictionary term,
+    /// including non-ASCII terms, prefix lengths, and a `max_expansions` cap.
+    #[rstest]
+    #[case::one_edit("cafe", 1, 0, 50)]
+    #[case::two_edits("bravo", 2, 0, 50)]
+    #[case::prefix("bravo", 2, 1, 50)]
+    #[case::capped("cafe", 2, 0, 3)]
+    #[case::non_ascii_query("café", 1, 0, 50)]
+    fn test_expand_fuzzy_matches_dictionary_scan(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] prefix_length: u32,
+        #[case] max_expansions: usize,
+    ) {
+        let schema = create_test_schema();
+        let params = InvertedIndexParams::default()
+            .ascii_folding(false)
+            .stem(false)
+            .remove_stop_words(false);
+        let mut index = FtsMemIndex::with_params(1, "description".to_string(), params)
+            .with_freeze_threshold_rows(1);
+        let rows = [
+            "cafe café cave care face cafes bravo brave bravos grave crave",
+            "cafe cake safe caff brava bravi bravo drove über uber naïve naive",
+            "zebra cafeteria calf cage bravado bravery",
+        ];
+        let batch = |text: &str| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![0])),
+                    Arc::new(StringArray::from(vec![text])),
+                ],
+            )
+            .unwrap()
+        };
+        // The first two rows freeze into separate partitions, the third stays
+        // in the tail.
+        index.insert(&batch(rows[0]), 0).unwrap();
+        index.insert(&batch(rows[1]), 1).unwrap();
+        index.freeze_threshold_rows = usize::MAX;
+        index.insert(&batch(rows[2]), 2).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 2);
+
+        let prefix = char_prefix(term, prefix_length);
+        let mut dictionary: BTreeMap<String, u32> = BTreeMap::new();
+        let tail_terms = st.tail.terms.iter().map(|entry| entry.key().to_string());
+        let partition_terms = st
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.collect_terms())
+            .map(|key| key.to_string());
+        for key in tail_terms.chain(partition_terms) {
+            let distance = levenshtein_distance(term, &key);
+            if key.starts_with(prefix) && distance <= max_distance {
+                dictionary.insert(key, distance);
+            }
+        }
+        let expected: Vec<(String, u32)> = dictionary.into_iter().take(max_expansions).collect();
+        assert!(!expected.is_empty());
+
+        FUZZY_DISTANCES_COMPUTED.with(|count| count.set(0));
+        let expanded =
+            index.expand_fuzzy_term(&st, term, max_distance, prefix_length, max_expansions, true);
+        assert_eq!(expanded, expected);
+
+        // An ASCII term reaches only the matching partition terms; a
+        // non-ASCII one scans every partition term.
+        let partition_matches: usize = st
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| {
+                        key.starts_with(prefix) && levenshtein_distance(term, key) <= max_distance
+                    })
+                    .count()
+                    .min(max_expansions)
+            })
+            .sum();
+        let partition_terms: usize = st
+            .partitions
+            .iter()
+            .map(|partition| partition.term_fst.len())
+            .sum();
+        let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
+        if term.is_ascii() {
+            assert_eq!(computed, partition_matches);
+        } else {
+            assert_eq!(computed, partition_terms);
+        }
     }
 
     #[test]
