@@ -121,6 +121,13 @@ delete** files that version might need.
 
 Acquisition does not cancel deletions that cleanup approved before it.
 
+### Unreferenced files
+
+A holder's staged output, such as index segments, is unreferenced until
+publication. While leases are listed, cleanup **must not delete** an
+unreferenced file whose last-modified time is at or after the oldest listed
+lease's `created_at`, less a margin for clock skew between writers and storage.
+
 ### Required transitions
 
 The required transitions are found from the fragment IDs of each leased
@@ -136,7 +143,9 @@ version, using the [FRI history](../index/system/frag_reuse.md#fri-index-version
 
 FRI trimming **must retain** the union of the transitions required by listed
 leases and by existing indices. Compaction **must record** the
-transitions listed leases require, even when no index needs them. Every rewrite
+transitions listed leases require, even when no index needs them. If the table
+has no FRI, compaction creates one at index version 1, which sets the sticky
+`FLAG_FRAGMENT_REUSE_INDEX` reader and writer flags. Every rewrite
 or trim **must recheck** these requirements against its predecessor before
 committing, including after conflicts.
 
