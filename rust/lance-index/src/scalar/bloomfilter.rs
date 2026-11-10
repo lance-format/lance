@@ -50,7 +50,7 @@ use super::zoned::{
     ParallelZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones_parallel, search_zones,
 };
 
-const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
+pub const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";

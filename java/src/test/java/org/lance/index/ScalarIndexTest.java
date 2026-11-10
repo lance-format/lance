@@ -13,10 +13,12 @@
  */
 package org.lance.index;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.WriteParams;
 import org.lance.index.scalar.FmIndexParams;
 import org.lance.index.scalar.InvertedIndexParams;
@@ -24,6 +26,7 @@ import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.operation.CreateIndex;
 import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -2364,6 +2367,147 @@ public class ScalarIndexTest {
         assertTrue(
             dataset.listIndexes().contains("rtree_geometry_index"),
             "Expected 'rtree_geometry_index' in: " + dataset.listIndexes());
+      }
+    }
+  }
+
+  @Test
+  public void testGetIndexesInfersTypeWhenIndexDetailsAbsent(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("index_type_without_details").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_btree_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BITMAP,
+            Optional.of("id_bitmap_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("bitmap")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.ZONEMAP,
+            Optional.of("id_zonemap_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("zonemap")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("name"),
+            IndexType.INVERTED,
+            Optional.of("name_inverted_idx"),
+            createInvertedIndexParams(),
+            false);
+
+        List<Index> originalIndices = dataset.getIndexes();
+        assertEquals(4, originalIndices.size());
+
+        List<Index> strippedIndices = new ArrayList<>();
+        for (Index original : originalIndices) {
+          strippedIndices.add(
+              Index.builder()
+                  .uuid(original.uuid())
+                  .fields(original.fields())
+                  .coveringFields(original.coveringFields())
+                  .name(original.name())
+                  .datasetVersion(original.datasetVersion())
+                  .fragments(original.fragments().orElse(null))
+                  .indexVersion(0)
+                  .createdAt(original.createdAt().orElse(null))
+                  .baseId(original.baseId().orElse(null))
+                  .build());
+        }
+
+        try (Transaction tx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    CreateIndex.builder()
+                        .withNewIndices(strippedIndices)
+                        .withRemovedIndices(originalIndices)
+                        .build())
+                .build()) {
+          try (Dataset committed = new CommitBuilder(dataset).execute(tx)) {
+            Map<String, Index> byName =
+                committed.getIndexes().stream()
+                    .collect(java.util.stream.Collectors.toMap(Index::name, idx -> idx));
+            assertEquals(4, byName.size());
+
+            for (Index idx : byName.values()) {
+              assertTrue(
+                  idx.indexDetails().isEmpty(),
+                  "Expected indexDetails to remain empty for " + idx.name());
+            }
+
+            assertEquals(IndexType.BTREE, byName.get("id_btree_idx").indexType());
+            assertEquals(IndexType.BITMAP, byName.get("id_bitmap_idx").indexType());
+            assertEquals(IndexType.ZONEMAP, byName.get("id_zonemap_idx").indexType());
+            assertEquals(IndexType.INVERTED, byName.get("name_inverted_idx").indexType());
+
+            for (IndexDescription desc : committed.describeIndices()) {
+              Index segment = desc.getMetadata().get(0);
+              assertEquals(byName.get(desc.getName()).indexType(), segment.indexType());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"FM", "MINHASH_LSH"})
+  public void testMissingDetailsRetainsRecognizableType(IndexType type, @TempDir Path dir)
+      throws Exception {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, dir.resolve("data").toString());
+      fixture.createEmptyDataset().close();
+      try (Dataset dataset = fixture.write(1, 10)) {
+        ScalarIndexParams params =
+            type == IndexType.FM
+                ? FmIndexParams.builder().build()
+                : MinHashLshIndexParams.builder().build();
+        dataset.createIndex(
+            Collections.singletonList("name"),
+            type,
+            Optional.of("text_idx"),
+            IndexParams.builder().setScalarIndexParams(params).build(),
+            false);
+        List<Index> original = dataset.getIndexes();
+        Index old = original.get(0);
+        assertEquals(type, old.indexType());
+        Index stripped =
+            Index.builder()
+                .uuid(old.uuid())
+                .fields(old.fields())
+                .name(old.name())
+                .datasetVersion(old.datasetVersion())
+                .fragments(old.fragments().orElse(null))
+                .files(old.getFiles().orElse(null))
+                .indexVersion(0)
+                .build();
+        try (Transaction tx =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(
+                        CreateIndex.builder()
+                            .withNewIndices(Collections.singletonList(stripped))
+                            .withRemovedIndices(original)
+                            .build())
+                    .build();
+            Dataset committed = new CommitBuilder(dataset).execute(tx)) {
+          Index actual = committed.getIndexes().get(0);
+          assertTrue(actual.indexDetails().isEmpty());
+          assertEquals(type, actual.indexType());
+        }
       }
     }
   }

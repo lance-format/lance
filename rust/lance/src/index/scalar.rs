@@ -47,23 +47,30 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::pb::VectorIndexDetails;
+use lance_index::pb::{
+    BloomFilterIndexDetails, FmIndexDetails, MinHashLshIndexDetails, RTreeIndexDetails,
+    VectorIndexDetails,
+};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
+    NGramIndexDetails, ZoneMapIndexDetails,
 };
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
+use lance_index::scalar::bloomfilter::BLOOMFILTER_FILENAME;
+use lance_index::scalar::btree::BTREE_LOOKUP_NAME;
 use lance_index::scalar::inverted::builder::resolve_num_workers;
 use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
+use lance_index::scalar::ngram::POSTINGS_FILENAME;
 use lance_index::scalar::registry::{
     ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
     VALUE_COLUMN_NAME,
 };
-use lance_index::scalar::zonemap::ZoneMapIndexBuilderParams;
+use lance_index::scalar::zonemap::{ZONEMAP_INDEX_FILENAME, ZoneMapIndexBuilderParams};
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
 use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, bitmap::BITMAP_LOOKUP_NAME, inverted::INVERT_LIST_FILE,
@@ -997,19 +1004,32 @@ pub(crate) async fn infer_scalar_index_details(
     let index_dir = dataset
         .indice_files_dir(index)?
         .join(index.uuid.to_string());
-    let col = dataset
-        .schema()
-        .field(column)
-        .ok_or(Error::internal(format!(
-            "Index refers to column {} which does not exist in dataset schema",
-            column
-        )))?;
+    let col = index
+        .keyed_field()
+        .and_then(|id| dataset.schema().field_by_id(id))
+        .or_else(|| dataset.schema().field(column))
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "Index refers to column {} which does not exist in dataset schema",
+                column
+            ))
+        })?;
 
-    let bitmap_page_lookup = index_dir.clone().join(BITMAP_LOOKUP_NAME);
-    let inverted_list_lookup = index_dir.clone().join(METADATA_FILE);
-    let legacy_inverted_list_lookup = index_dir.clone().join(INVERT_LIST_FILE);
     let object_store = dataset.object_store_for_index(index).await?;
-    let index_details = if object_store.exists(&inverted_list_lookup).await? {
+    let has_index_file = |file_name: &'static str| {
+        let index_dir = index_dir.clone();
+        let object_store = &object_store;
+        async move {
+            if let Some(files) = index.files.as_ref()
+                && !files.is_empty()
+            {
+                return Ok::<bool, Error>(files.iter().any(|f| f.path == file_name));
+            }
+            object_store.exists(&index_dir.join(file_name)).await
+        }
+    };
+
+    let index_details = if has_index_file(METADATA_FILE).await? {
         // Try to infer inverted index details from metadata file to capture with_position and other params
         // Fall back to defaults if anything goes wrong
         let default_details = prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap();
@@ -1024,12 +1044,31 @@ pub(crate) async fn infer_scalar_index_details(
             Some(prost_types::Any::from_msg(&details).unwrap())
         };
         parse_params().await.unwrap_or(default_details)
-    } else if object_store.exists(&legacy_inverted_list_lookup).await? {
+    } else if has_index_file(INVERT_LIST_FILE).await? {
         prost_types::Any::from_msg(&InvertedIndexDetails::default()).unwrap()
     } else if let DataType::List(_) | DataType::LargeList(_) = col.data_type() {
         prost_types::Any::from_msg(&LabelListIndexDetails::default()).unwrap()
-    } else if object_store.exists(&bitmap_page_lookup).await? {
+    } else if has_index_file(BITMAP_LOOKUP_NAME).await? {
         prost_types::Any::from_msg(&BitmapIndexDetails::default()).unwrap()
+    } else if has_index_file(BTREE_LOOKUP_NAME).await? {
+        prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
+    } else if has_index_file(ZONEMAP_INDEX_FILENAME).await? {
+        prost_types::Any::from_msg(&ZoneMapIndexDetails::default()).unwrap()
+    } else if has_index_file(BLOOMFILTER_FILENAME).await? {
+        prost_types::Any::from_msg(&BloomFilterIndexDetails::default()).unwrap()
+    } else if has_index_file(POSTINGS_FILENAME).await? {
+        prost_types::Any::from_msg(&NGramIndexDetails::default()).unwrap()
+    } else if has_index_file("signatures.lance").await? || has_index_file("bands.lance").await? {
+        prost_types::Any::from_msg(&MinHashLshIndexDetails::default()).unwrap()
+    } else if index
+        .files
+        .as_ref()
+        .is_some_and(|files| files.iter().any(|f| f.path.ends_with("_fm.lance")))
+        || has_index_file("part_0_fm.lance").await?
+    {
+        prost_types::Any::from_msg(&FmIndexDetails::default()).unwrap()
+    } else if has_index_file("nulls.lance").await? {
+        prost_types::Any::from_msg(&RTreeIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };
@@ -3119,5 +3158,89 @@ mod tests {
             "deleted fragment rows (id 10-19) must not appear after index update; got: {:?}",
             ids
         );
+    }
+
+    #[tokio::test]
+    async fn test_infer_scalar_index_details_for_builtin_types() {
+        use arrow::datatypes::Int32Type;
+        use lance_datagen::{ByteCount, array};
+        use lance_index::IndexType;
+        use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+
+        let mut ds = lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("text", array::rand_utf8(ByteCount::from(12), false))
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+
+        let cases = [
+            (
+                "id",
+                "btree_idx",
+                ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                "/lance.table.BTreeIndexDetails",
+            ),
+            (
+                "id",
+                "bitmap_idx",
+                ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                "/lance.table.BitmapIndexDetails",
+            ),
+            (
+                "id",
+                "zonemap_idx",
+                ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                "/lance.table.ZoneMapIndexDetails",
+            ),
+            (
+                "id",
+                "bloom_idx",
+                ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
+                "/lance.index.pb.BloomFilterIndexDetails",
+            ),
+            (
+                "text",
+                "ngram_idx",
+                ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+                "/lance.table.NGramIndexDetails",
+            ),
+        ];
+
+        for (col, idx_name, params, expected_type_url) in cases {
+            ds.create_index(
+                &[col],
+                IndexType::Scalar,
+                Some(idx_name.to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+            let mut idx = ds
+                .load_indices_by_name(idx_name)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            idx.index_details = None;
+
+            // 1. Infer using `idx.files` when present
+            let inferred = super::infer_scalar_index_details(&ds, col, &idx)
+                .await
+                .unwrap();
+            assert_eq!(inferred.type_url, expected_type_url);
+
+            // 2. Infer via object store fallback when `idx.files` is absent (new UUID to bypass cache)
+            let mut idx_no_files = idx.clone();
+            idx_no_files.files = None;
+            ds.index_cache.clear().await;
+            let inferred_no_files = super::infer_scalar_index_details(&ds, col, &idx_no_files)
+                .await
+                .unwrap();
+            assert_eq!(inferred_no_files.type_url, expected_type_url);
+        }
     }
 }
