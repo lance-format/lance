@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
-use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
-use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::registry::{
-    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-};
-use crate::scalar::rtree::sort::Sorter;
-use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
-    IndexWriter, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
-    UpdateCriteria,
-};
-use crate::{Index, IndexType, pb};
+use crate::bbox::{BoundingBox, bounding_box, total_bounds};
+use crate::query::{GeoQuery, GeoQueryParser};
+use crate::rtree::sort::Sorter;
 use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
@@ -25,6 +15,7 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
+use geo_types::Coord;
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
@@ -40,7 +31,18 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
-pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::scalar::expression::ScalarQueryParser;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+};
+use lance_index::scalar::{
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
+    OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
+    UpdateCriteria,
+};
+use lance_index::{Index, IndexType, pb};
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
@@ -233,10 +235,24 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
                 .map(|bs| bs.parse().unwrap_or(0))
                 .unwrap_or(0)
         };
+        // Search uses the total bbox only to skip the tree. serde_json writes an
+        // infinite bound as null, which does not parse back, so a bbox that
+        // cannot be read must cover every query instead of none.
         let bbox = metadata
             .get("bbox")
-            .map(|bs| serde_json::from_str(bs).unwrap_or_default())
-            .unwrap_or_default();
+            .and_then(|bs| serde_json::from_str(bs).ok())
+            .unwrap_or_else(|| {
+                BoundingBox::new_with_coords(&[
+                    Coord {
+                        x: f64::NEG_INFINITY,
+                        y: f64::NEG_INFINITY,
+                    },
+                    Coord {
+                        x: f64::INFINITY,
+                        y: f64::INFINITY,
+                    },
+                ])
+            });
         Self::new(page_size, num_pages, num_items, bbox)
     }
 }
@@ -622,7 +638,7 @@ fn remap_rtree_data_async(
 /// use lance_core::Result;
 /// use lance_index::scalar::OldIndexDataFilter;
 /// use lance_index::scalar::lance_format::LanceIndexStore;
-/// use lance_index::scalar::rtree::{RTreeIndex, merge_rtree_indices};
+/// use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
 ///
 /// async fn merge(
 ///     segments: &[Arc<RTreeIndex>],
@@ -841,7 +857,7 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let (old_data, null_map) = self.retained_data(old_data_filter.as_ref()).await?;
@@ -1220,7 +1236,7 @@ impl BasicTrainer for RTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        _progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         Self::validate_schema(&data.schema())?;
 
@@ -1322,9 +1338,7 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use crate::bbox::is_empty_rect;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
     use geo_types::{LineString, Rect, coord, line_string};
@@ -1332,7 +1346,9 @@ mod tests {
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
     use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_geo::bbox::is_empty_rect;
+    use lance_index::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::registry::VALUE_COLUMN_NAME;
     use rand::Rng;
 
     #[rstest::rstest]
@@ -1506,7 +1522,7 @@ mod tests {
                     page_size: Some(page_size),
                 })),
                 None,
-                crate::progress::noop_progress(),
+                lance_index::progress::noop_progress(),
             )
             .await
             .unwrap();
@@ -1721,6 +1737,58 @@ mod tests {
         assert!(analyzed.try_next().await.unwrap().is_none());
     }
 
+    /// An infinite coordinate makes the stored total bbox unreadable (serde_json
+    /// writes the bound as null). After a reload the index must still search
+    /// the tree instead of treating the dataset as empty.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_search_after_reload_with_infinite_bound() {
+        let rect_type = RectType::new(Dimension::XY, Default::default());
+        let mut builder = RectBuilder::new(rect_type);
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: f64::NEG_INFINITY, y: 1.0 },
+            coord! { x: 2.0, y: 3.0 },
+        )));
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: 10.0, y: 10.0 },
+            coord! { x: 11.0, y: 11.0 },
+        )));
+        let bounds = builder.finish();
+
+        let (index, store, _tmpdir) = train_index(&bounds, Some(4)).await;
+        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await.unwrap();
+        assert!(pages_reader.schema().metadata["bbox"].contains("null"));
+
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 9.0, y: 9.0 },
+            coord! { x: 12.0, y: 12.0 },
+        ));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert(1);
+        assert_eq!(
+            index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected
+        );
+
+        // The row holding the infinite coordinate must be found too.
+        let query = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: -5.0, y: 1.0 },
+            coord! { x: -1.0, y: 2.0 },
+        ));
+        let mut expected = RowAddrTreeMap::new();
+        expected.insert(0);
+        assert_eq!(
+            index
+                .search_bbox(query, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
     #[rstest::rstest]
     #[case::unmapped_rows("none", "rows")]
     #[case::sync_rows("sync", "rows")]
@@ -1764,7 +1832,7 @@ mod tests {
                     page_size: Some(4),
                 })),
                 None,
-                crate::progress::noop_progress(),
+                lance_index::progress::noop_progress(),
             )
             .await
             .unwrap();

@@ -539,7 +539,11 @@ def _build_vector_search_query(
         Initial IVF search budget, a finite value in [0, 1]. None resolves
         to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
         available partition); one starts at all available partitions, subject
-        to maximum_nprobes. Intermediate values interpolate geometrically.
+        to maximum_nprobes. For L2, cosine and dot with k <= 100000, efforts
+        0.1, 0.25 and 0.5 target 80%, 90% and 95% mean partition-routing recall,
+        respectively. Intermediate budgets interpolate geometrically between
+        these anchors. These empirical targets do not guarantee end-to-end
+        Recall@k. Hamming and larger k retain uncalibrated interpolation.
         Later expansion to find enough candidates is unchanged. This is
         independent of approx_mode, ef and refinement, and is not a recall
         guarantee. When supplied, effort ignores nprobes, including an explicit
@@ -1053,7 +1057,11 @@ class ScannerBuilder:
             Initial IVF search budget, a finite value in [0, 1]. None resolves
             to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
             available partition); one starts at all available partitions, subject
-            to maximum_nprobes. Intermediate values interpolate geometrically.
+            to maximum_nprobes. For L2, cosine and dot with k <= 100000, efforts
+            0.1, 0.25 and 0.5 target 80%, 90% and 95% mean partition-routing recall,
+            respectively. Intermediate budgets interpolate geometrically between
+            these anchors. These empirical targets do not guarantee end-to-end
+            Recall@k. Hamming and larger k retain uncalibrated interpolation.
             Later expansion to find enough candidates is unchanged. This is
             independent of approx_mode, ef and refinement, and is not a recall
             guarantee. When supplied, effort ignores nprobes, including an explicit

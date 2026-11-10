@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
-use arrow_array::{RecordBatch, RecordBatchReader, make_array};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, make_array};
 use arrow_cast::cast_with_options;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder, parse_cleanup_policy};
 use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, RowAddrMask,
@@ -783,6 +784,33 @@ impl Dataset {
             })?;
 
         Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
+    }
+
+    /// Look up the current row address of each row id. Null ids and ids that
+    /// aren't live in this version come back as null. Without stable row ids,
+    /// row ids are row addresses, so non-null ids are returned unchanged.
+    fn row_ids_to_row_addrs(
+        &self,
+        py: Python,
+        row_ids: PyArrowType<ArrayData>,
+    ) -> PyResult<PyArrowType<ArrayData>> {
+        let array = make_array(row_ids.0);
+        let row_ids = array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("row ids must be uint64, got {}", array.data_type()))
+            })?;
+        let valid: Vec<u64> = row_ids.iter().flatten().collect();
+        let mut addrs = rt()
+            .block_on(Some(py), row_ids_to_row_addrs(self.ds.as_ref(), &valid))?
+            .infer_error()?
+            .into_iter();
+        let result: UInt64Array = row_ids
+            .iter()
+            .map(|id| id.and_then(|_| addrs.next().flatten()))
+            .collect();
+        Ok(PyArrowType(result.to_data()))
     }
 
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
@@ -2294,7 +2322,7 @@ impl Dataset {
             "INVERTED" | "FTS" => IndexType::Inverted,
             "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
-            | "IVF_HNSW_SQ" => IndexType::Vector,
+            | "IVF_HNSW_SQ" | "IVF_HNSW_RQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -4563,6 +4591,13 @@ fn prepare_vector_index_params(
             ivf_params,
             hnsw_params,
             sq_params,
+        ))),
+
+        "IVF_HNSW_RQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_rq_params(
+            m_type,
+            ivf_params,
+            hnsw_params,
+            rq_params,
         ))),
 
         _ => Err(PyValueError::new_err(format!(

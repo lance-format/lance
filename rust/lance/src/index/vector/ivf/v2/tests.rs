@@ -37,11 +37,13 @@ use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
-use crate::index::vector::details::target_partition_size_from_details;
+use crate::index::vector::details::{
+    target_partition_size_from_details, vector_index_details_default,
+};
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
-use crate::utils::test::copy_test_data_to_tmp;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{
     Dataset,
     index::vector::{VectorIndex, VectorIndexParams},
@@ -63,6 +65,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::prefilter::{NoFilter, PreFilter};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::vector::DIST_COL;
+use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::hnsw::builder::{HNSW_METADATA_KEY, HnswBuildParams};
@@ -70,7 +73,7 @@ use lance_index::vector::hnsw::{HNSW, HnswMetadata};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
-use lance_index::vector::quantizer::QuantizerMetadata;
+use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
@@ -92,7 +95,9 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_fsl;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
-use lance_testing::datagen::{generate_random_array, generate_random_array_with_range};
+use lance_testing::datagen::{
+    generate_random_array, generate_random_array_with_range, generate_random_array_with_seed,
+};
 use rand::distr::{Distribution, StandardUniform, uniform::SampleUniform};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rstest::rstest;
@@ -1909,18 +1914,29 @@ fn multivec_ground_truth(
         .collect()
 }
 
-const TWO_FRAG_NUM_ROWS: usize = 2000;
-const TWO_FRAG_DIM: usize = 128;
+const TWO_FRAG_NUM_ROWS: usize = 512;
+const TWO_FRAG_ROWS_PER_FILE: usize = 128;
+const TWO_FRAG_DIM: usize = 32;
 const TWO_FRAG_NUM_PARTITIONS: usize = 4;
-const TWO_FRAG_NUM_SUBVECTORS: usize = 16;
+const TWO_FRAG_NUM_SUBVECTORS: usize = 8;
 const TWO_FRAG_NUM_BITS: usize = 8;
 const TWO_FRAG_SAMPLE_RATE: usize = 7;
-const TWO_FRAG_MAX_ITERS: u32 = 20;
+const TWO_FRAG_MAX_ITERS: u32 = 4;
 
 fn make_two_fragment_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
     let ids = Arc::new(UInt64Array::from_iter_values(0..TWO_FRAG_NUM_ROWS as u64));
 
-    let values = generate_random_array_with_range(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, 0.0..1.0);
+    // Seeded so the single-vs-segmented equality checks run on fixed data.
+    let mut values: Vec<f32> =
+        generate_random_array_with_seed::<Float32Type>(TWO_FRAG_NUM_ROWS * TWO_FRAG_DIM, [42; 32])
+            .values()
+            .to_vec();
+    // Pin the value range in every fragment so per-segment SQ bounds equal the
+    // whole-dataset bounds and segmented SQ search ranks rows identically.
+    for row in (0..TWO_FRAG_NUM_ROWS).step_by(TWO_FRAG_ROWS_PER_FILE) {
+        values[row * TWO_FRAG_DIM] = 0.0;
+        values[row * TWO_FRAG_DIM + 1] = 1.0;
+    }
     let vectors = Arc::new(
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), TWO_FRAG_DIM as i32)
             .unwrap(),
@@ -1940,7 +1956,8 @@ async fn write_dataset_from_batches(
     schema: Arc<Schema>,
     batches: Vec<RecordBatch>,
 ) -> Dataset {
-    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, 500).await
+    write_dataset_from_batches_with_max_rows(test_uri, schema, batches, TWO_FRAG_ROWS_PER_FILE)
+        .await
 }
 
 async fn write_dataset_from_batches_with_max_rows(
@@ -2703,22 +2720,80 @@ async fn test_distributed_vector_plan_rejects_overlapping_fragment_coverage() {
     assert!(err.to_string().contains("overlapping fragment coverage"));
 }
 
-async fn build_ivf_flat_segment(
+/// Four 64-row fragments of 16-dimensional vectors in two columns, `vector`
+/// and `vector2`: small enough that a test builds several segments quickly.
+async fn write_small_vector_dataset(uri: &str) -> Dataset {
+    gen_batch()
+        .col("id", array::step::<UInt64Type>())
+        .col(
+            "vector",
+            array::rand_vec::<Float32Type>(Dimension::from(16)),
+        )
+        .col(
+            "vector2",
+            array::rand_vec::<Float32Type>(Dimension::from(16)),
+        )
+        .into_dataset(uri, FragmentCount::from(4), FragmentRowCount::from(64))
+        .await
+        .unwrap()
+}
+
+async fn build_vector_segment(
     dataset: &mut Dataset,
-    metric: DistanceType,
+    params: &VectorIndexParams,
     fragment_ids: Vec<u32>,
 ) -> IndexMetadata {
     // Each segment trains its own IVF model, as distributed workers do.
     // The build name differs from the committed index name on purpose:
     // builders may not reuse the name of an existing index.
-    let params = VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, metric);
     dataset
-        .create_index_builder(&["vector"], IndexType::Vector, &params)
+        .create_index_builder(&["vector"], IndexType::Vector, params)
         .name("worker_idx".to_string())
         .fragments(fragment_ids)
         .execute_uncommitted()
         .await
         .unwrap()
+}
+
+async fn build_ivf_flat_segment(
+    dataset: &mut Dataset,
+    metric: DistanceType,
+    fragment_ids: Vec<u32>,
+) -> IndexMetadata {
+    let params = VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, metric);
+    build_vector_segment(dataset, &params, fragment_ids).await
+}
+
+/// Commits named segments with a raw `CreateIndex` transaction, which a
+/// coordinator can do without `commit_existing_index_segments`.
+async fn commit_raw_index_segments(
+    dataset: &Dataset,
+    new_segments: Vec<(&str, IndexMetadata)>,
+    removed_indices: Vec<IndexMetadata>,
+    detached: bool,
+) -> Result<Dataset> {
+    use crate::dataset::CommitBuilder;
+    use crate::dataset::transaction::{Operation, Transaction};
+
+    let new_indices = new_segments
+        .into_iter()
+        .map(|(name, segment)| IndexMetadata {
+            name: name.to_string(),
+            ..segment
+        })
+        .collect();
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        },
+        None,
+    );
+    CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_detached(detached)
+        .execute(transaction)
+        .await
 }
 
 #[tokio::test]
@@ -2843,6 +2918,1271 @@ async fn test_commit_index_segments_allows_metric_change_on_full_replacement() {
     assert_eq!(indices.len(), 1);
 }
 
+/// What the incoming segment's metadata states about its index details.
+#[derive(Clone, Copy, Debug)]
+enum IncomingDetails {
+    /// The details its build recorded.
+    Recorded,
+    /// Empty `VectorIndexDetails`, as segments written before details existed carry.
+    Blank,
+    /// Neither details nor a file list, the defaults of a hand-built Python `Index`.
+    Missing,
+    /// A scalar index's details, which a search does not consult once it has
+    /// picked the index by name.
+    Scalar,
+    /// A version newer than this build reads, which a newer build merges.
+    Newer,
+}
+
+#[rstest]
+#[case::metric(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Recorded,
+    false,
+    "Dot"
+)]
+#[case::quantization(
+    VectorIndexParams::with_ivf_sq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(TWO_FRAG_NUM_PARTITIONS),
+        SQBuildParams::default(),
+    ),
+    IncomingDetails::Recorded,
+    false,
+    "IVF_SQ"
+)]
+#[case::sub_index(
+    VectorIndexParams::ivf_hnsw(
+        DistanceType::L2,
+        IvfBuildParams::new(TWO_FRAG_NUM_PARTITIONS),
+        HnswBuildParams::default(),
+    ),
+    IncomingDetails::Recorded,
+    false,
+    "IVF_HNSW_FLAT"
+)]
+#[case::blank_details(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Blank,
+    false,
+    "Dot"
+)]
+#[case::missing_details(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Missing,
+    false,
+    "Dot"
+)]
+#[case::scalar_details(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Scalar,
+    false,
+    "Dot"
+)]
+#[case::newer_version(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Newer,
+    false,
+    "Dot"
+)]
+#[case::detached(
+    VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::Dot),
+    IncomingDetails::Recorded,
+    true,
+    "Dot"
+)]
+#[tokio::test]
+async fn test_raw_index_commit_rejects_incompatible_vector_segment(
+    #[case] incoming_params: VectorIndexParams,
+    #[case] incoming_details: IncomingDetails,
+    #[case] detached: bool,
+    #[case] mismatch: &str,
+) {
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_incompatible_segment", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    assert!(fragments.len() >= 2);
+    let l2_segment = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::L2,
+        vec![fragments[0].id() as u32],
+    )
+    .await;
+    let mut dataset =
+        commit_raw_index_segments(&dataset, vec![("shared", l2_segment)], vec![], false)
+            .await
+            .unwrap();
+    let mut incoming = build_vector_segment(
+        &mut dataset,
+        &incoming_params,
+        vec![fragments[1].id() as u32],
+    )
+    .await;
+    match incoming_details {
+        IncomingDetails::Recorded => {}
+        IncomingDetails::Blank => {
+            incoming.index_details = Some(Arc::new(vector_index_details_default()));
+        }
+        IncomingDetails::Missing => {
+            incoming.index_details = None;
+            incoming.files = None;
+        }
+        IncomingDetails::Scalar => {
+            incoming.index_details = Some(Arc::new(
+                prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
+                    .unwrap(),
+            ));
+            incoming.index_version = 0;
+        }
+        IncomingDetails::Newer => {
+            incoming.index_version = i32::MAX;
+        }
+    }
+
+    let transactions_dir = format!("{dataset_uri}/_transactions");
+    let versions_dir = format!("{dataset_uri}/_versions");
+    let transaction_files = count_entries(&transactions_dir);
+    let manifests = count_entries(&versions_dir);
+    let version_before = dataset.manifest.version;
+    let err = commit_raw_index_segments(&dataset, vec![("shared", incoming)], vec![], detached)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(mismatch),
+        "error should name the mismatch {mismatch}: {err}"
+    );
+    assert_eq!(
+        count_entries(&transactions_dir),
+        transaction_files,
+        "a refused commit must remove its transaction file"
+    );
+    // A detached commit leaves the latest version alone even when it
+    // succeeds, so only its missing manifest shows that it was refused.
+    assert_eq!(
+        count_entries(&versions_dir),
+        manifests,
+        "a refused commit must not write a manifest"
+    );
+    let latest = Dataset::open(&dataset_uri).await.unwrap();
+    assert_eq!(latest.manifest.version, version_before);
+    assert_eq!(
+        latest.load_indices_by_name("shared").await.unwrap().len(),
+        1
+    );
+}
+
+/// Entries in a dataset directory, none when it was never created.
+fn count_entries(dir: &str) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| entries.count())
+}
+
+/// Which segment carries the details another segment's build recorded.
+#[derive(Clone, Copy, Debug)]
+enum CopiedDetails {
+    /// The segment the commit adds.
+    Incoming,
+    /// The segment already under the index name, committed alone and so
+    /// compared with nothing.
+    Retained,
+}
+
+/// The caller of a raw transaction sets every field of its segments'
+/// metadata, so a Dot segment can carry the details an L2 build recorded,
+/// runtime hints and all. The commit reads both segments' index files and
+/// tells them apart.
+#[rstest]
+#[case::incoming(CopiedDetails::Incoming)]
+#[case::retained(CopiedDetails::Retained)]
+#[tokio::test]
+async fn test_raw_index_commit_reads_segments_with_copied_details(#[case] copied: CopiedDetails) {
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_copied_details", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    let l2_segment = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::L2,
+        vec![fragments[0].id() as u32],
+    )
+    .await;
+    let mut dot_segment = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::Dot,
+        vec![fragments[1].id() as u32],
+    )
+    .await;
+    let recorded = l2_segment
+        .index_details
+        .as_deref()
+        .unwrap()
+        .to_msg::<lance_index::pb::VectorIndexDetails>()
+        .unwrap();
+    assert_eq!(
+        recorded.metric_type,
+        lance_index::pb::VectorMetricType::L2 as i32
+    );
+    assert!(!recorded.runtime_hints.is_empty());
+    dot_segment.index_details = l2_segment.index_details.clone();
+    let uuids = [l2_segment.uuid.to_string(), dot_segment.uuid.to_string()];
+
+    let (first, second) = match copied {
+        CopiedDetails::Incoming => (l2_segment, dot_segment),
+        CopiedDetails::Retained => (dot_segment, l2_segment),
+    };
+    let dataset = commit_raw_index_segments(&dataset, vec![("shared", first)], vec![], false)
+        .await
+        .unwrap();
+    let version_before = dataset.manifest.version;
+    let err = commit_raw_index_segments(&dataset, vec![("shared", second)], vec![], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("Dot") && message.contains("L2"),
+        "{message}"
+    );
+    for uuid in &uuids {
+        assert!(
+            message.contains(uuid),
+            "the error should name segment {uuid}: {message}"
+        );
+    }
+    assert_eq!(
+        Dataset::open(&dataset_uri).await.unwrap().manifest.version,
+        version_before
+    );
+}
+
+#[tokio::test]
+async fn test_raw_index_commit_rejects_incompatible_segments_in_one_transaction() {
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_incompatible_transaction", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    assert!(fragments.len() >= 4);
+    // Every name the transaction touches is checked, not only the first, and
+    // a name with one segment, compared with nothing, does not end the check.
+    let mut new_segments = Vec::new();
+    let mut mixed_uuids = Vec::new();
+    for (name, metric, fragment) in [
+        ("alone", DistanceType::Dot, &fragments[0]),
+        ("compatible", DistanceType::L2, &fragments[0]),
+        ("compatible", DistanceType::L2, &fragments[1]),
+        ("mixed", DistanceType::L2, &fragments[2]),
+        ("mixed", DistanceType::Dot, &fragments[3]),
+    ] {
+        let segment =
+            build_ivf_flat_segment(&mut dataset, metric, vec![fragment.id() as u32]).await;
+        if name == "mixed" {
+            mixed_uuids.push(segment.uuid.to_string());
+        }
+        new_segments.push((name, segment));
+    }
+
+    let version_before = dataset.manifest.version;
+    let err = commit_raw_index_segments(&dataset, new_segments, vec![], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("'mixed'") && message.contains("Dot") && message.contains("L2"),
+        "{message}"
+    );
+    for uuid in &mixed_uuids {
+        assert!(
+            message.contains(uuid),
+            "the error should name segment {uuid}: {message}"
+        );
+    }
+    let latest = Dataset::open(&dataset_uri).await.unwrap();
+    assert_eq!(latest.manifest.version, version_before);
+    assert!(latest.load_indices().await.unwrap().is_empty());
+}
+
+/// Segments that agree on metric and index type commit together, however many
+/// partitions each one trained and whether its details were recorded.
+#[tokio::test]
+async fn test_raw_index_commit_accepts_compatible_vector_segments() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+
+    let fragments = dataset.get_fragments();
+    assert!(fragments.len() >= 3);
+    let four_partitions = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::L2,
+        vec![fragments[0].id() as u32],
+    )
+    .await;
+    let two_partitions = build_vector_segment(
+        &mut dataset,
+        &VectorIndexParams::ivf_flat(2, DistanceType::L2),
+        vec![fragments[1].id() as u32],
+    )
+    .await;
+    let mut blank_details = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::L2,
+        vec![fragments[2].id() as u32],
+    )
+    .await;
+    blank_details.index_details = Some(Arc::new(vector_index_details_default()));
+    for segment in [four_partitions, two_partitions, blank_details] {
+        dataset = commit_raw_index_segments(&dataset, vec![("shared", segment)], vec![], false)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        dataset.load_indices_by_name("shared").await.unwrap().len(),
+        3
+    );
+}
+
+/// Only segments that stay together under one name are compared: another
+/// index on the same column may rank by another metric, and replacing all
+/// segments of an index may change its metric and index type, while replacing
+/// some of them leaves the rest to be compared.
+#[tokio::test]
+async fn test_raw_index_commit_compares_only_coexisting_segments() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+
+    let fragments = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    // Committed first, so the manifest lists it before the index the later
+    // commits touch.
+    let other = build_ivf_flat_segment(&mut dataset, DistanceType::Dot, vec![fragments[0]]).await;
+    dataset = commit_raw_index_segments(&dataset, vec![("other", other)], vec![], false)
+        .await
+        .unwrap();
+    for &fragment in &fragments[..2] {
+        let segment = build_ivf_flat_segment(&mut dataset, DistanceType::L2, vec![fragment]).await;
+        dataset = commit_raw_index_segments(&dataset, vec![("shared", segment)], vec![], false)
+            .await
+            .unwrap();
+    }
+
+    let replaced = dataset.load_indices_by_name("shared").await.unwrap();
+    let (on_first_fragment, kept): (Vec<_>, Vec<_>) =
+        replaced.iter().cloned().partition(|segment| {
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.contains(fragments[0]))
+        });
+    let replacement = build_vector_segment(
+        &mut dataset,
+        &VectorIndexParams::ivf_pq(2, 4, 4, DistanceType::Dot, 5),
+        vec![fragments[0]],
+    )
+    .await;
+    let replacement_uuid = replacement.uuid;
+    let err = commit_raw_index_segments(
+        &dataset,
+        vec![("shared", replacement.clone())],
+        on_first_fragment,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&kept[0].uuid.to_string()),
+        "the error should name the segment the commit keeps: {err}"
+    );
+
+    dataset = commit_raw_index_segments(&dataset, vec![("shared", replacement)], replaced, false)
+        .await
+        .unwrap();
+    let shared = dataset.load_indices_by_name("shared").await.unwrap();
+    assert_eq!(
+        shared
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>(),
+        vec![replacement_uuid]
+    );
+}
+
+/// Legacy IVF_PQ segments are compared with a new segment: a protobuf file
+/// (0,1), which the commit opens, and an early v3 file that keeps the
+/// codebook in its schema (0,3), whose index metadata it reads. A search then
+/// runs across them and a new IVF_PQ segment.
+#[rstest]
+#[case::protobuf("v0.21.0/bad_index_fragment_bitmap", (0, 1))]
+#[case::pq_in_schema("v0.27.1/pq_in_schema", (0, 3))]
+#[tokio::test]
+async fn test_raw_index_commit_opens_legacy_segments(
+    #[case] fixture: &str,
+    #[case] file_version: (u16, u16),
+) {
+    let test_dir = copy_test_data_to_tmp(fixture).unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let legacy = dataset.load_indices().await.unwrap();
+    assert!(!legacy.is_empty());
+    for segment in legacy.iter() {
+        assert_eq!(index_file_version(&dataset, segment).await, file_version);
+    }
+    let index_name = legacy[0].name.clone();
+    let column = dataset.schema().field_path(legacy[0].fields[0]).unwrap();
+
+    // A fragment the legacy segments do not cover, enough rows for PQ.
+    let schema = Arc::new(Schema::from(dataset.schema()));
+    let batch = lance_datagen::rand(&schema)
+        .into_batch_rows(RowCount::from(512))
+        .unwrap();
+    let query = batch
+        .column_by_name(&column)
+        .unwrap()
+        .as_fixed_size_list()
+        .value(0);
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    let new_fragment = dataset.get_fragments().last().unwrap().id() as u32;
+
+    let build = |params: VectorIndexParams| {
+        let mut dataset = dataset.clone();
+        let column = column.clone();
+        async move {
+            dataset
+                .create_index_builder(&[column.as_str()], IndexType::Vector, &params)
+                .name("worker_idx".to_string())
+                .fragments(vec![new_fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+    };
+    let flat = build(VectorIndexParams::ivf_flat(1, DistanceType::L2)).await;
+    let err = commit_raw_index_segments(&dataset, vec![(&index_name, flat)], vec![], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("IVF_PQ") && err.to_string().contains("IVF_FLAT"),
+        "{err}"
+    );
+
+    let pq = build(VectorIndexParams::ivf_pq(1, 8, 4, DistanceType::L2, 10)).await;
+    let dataset = commit_raw_index_segments(&dataset, vec![(&index_name, pq)], vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .load_indices_by_name(&index_name)
+            .await
+            .unwrap()
+            .len(),
+        legacy.len() + 1
+    );
+    let mut scan = dataset.scan();
+    scan.nearest(&column, query.as_ref(), 10).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains(&format!("deltas={}", legacy.len() + 1)),
+        "the search should run across every segment: {plan}"
+    );
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 10);
+}
+
+/// Which segment of the commit has an index file that cannot be read.
+#[derive(Clone, Copy, Debug)]
+enum UnreadableSegment {
+    /// The segment the commit adds.
+    Incoming,
+    /// The segment already under the index name.
+    Retained,
+}
+
+/// Every vector segment's index file is read to be compared, so while one
+/// cannot be read the commit is refused rather than published unchecked. The
+/// segments a commit removes are not read, so a commit can still replace one
+/// whose file is damaged.
+#[rstest]
+#[case::incoming(UnreadableSegment::Incoming)]
+#[case::retained(UnreadableSegment::Retained)]
+#[tokio::test]
+async fn test_raw_index_commit_refuses_unreadable_vector_segment(
+    #[case] unreadable: UnreadableSegment,
+) {
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_unreadable_segment", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    let mut segments = Vec::new();
+    for fragment in &fragments[..3] {
+        segments.push(
+            build_ivf_flat_segment(&mut dataset, DistanceType::L2, vec![fragment.id() as u32])
+                .await,
+        );
+    }
+    let incoming = segments.pop().unwrap();
+    let retained_uuid = segments[1].uuid;
+    let dataset = commit_raw_index_segments(
+        &dataset,
+        segments
+            .into_iter()
+            .map(|segment| ("shared", segment))
+            .collect(),
+        vec![],
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Damaged, not deleted: the file is there and cannot be read.
+    let unreadable_uuid = match unreadable {
+        UnreadableSegment::Incoming => incoming.uuid,
+        UnreadableSegment::Retained => retained_uuid,
+    }
+    .to_string();
+    let index_file = format!("{dataset_uri}/_indices/{unreadable_uuid}/index.idx");
+    let original = std::fs::read(&index_file).unwrap();
+    std::fs::write(&index_file, b"not an index file").unwrap();
+
+    let transactions_dir = format!("{dataset_uri}/_transactions");
+    let transaction_files = std::fs::read_dir(&transactions_dir).unwrap().count();
+    let version_before = dataset.manifest.version;
+    let err =
+        commit_raw_index_segments(&dataset, vec![("shared", incoming.clone())], vec![], false)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::IO { .. }),
+        "expected IO, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&unreadable_uuid) && err.to_string().contains("'shared'"),
+        "error should name the unreadable segment and its index: {err}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&transactions_dir).unwrap().count(),
+        transaction_files,
+        "a refused commit must remove its transaction file"
+    );
+    assert_eq!(
+        Dataset::open(&dataset_uri).await.unwrap().manifest.version,
+        version_before
+    );
+
+    match unreadable {
+        // Only the read failed: once the file is back, the same commit succeeds.
+        UnreadableSegment::Incoming => {
+            std::fs::write(&index_file, original).unwrap();
+            let dataset =
+                commit_raw_index_segments(&dataset, vec![("shared", incoming)], vec![], false)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                dataset.load_indices_by_name("shared").await.unwrap().len(),
+                3
+            );
+        }
+        UnreadableSegment::Retained => {
+            let removed = dataset
+                .load_indices_by_name("shared")
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|segment| segment.uuid == retained_uuid)
+                .collect();
+            let dataset =
+                commit_raw_index_segments(&dataset, vec![("shared", incoming)], removed, false)
+                    .await
+                    .unwrap();
+            let kept = dataset.load_indices_by_name("shared").await.unwrap();
+            assert_eq!(kept.len(), 2);
+            assert!(kept.iter().all(|segment| segment.uuid != retained_uuid));
+        }
+    }
+}
+
+/// Which segment of the commit has no index file.
+#[derive(Clone, Copy, Debug)]
+enum WithoutIndexFile {
+    /// The retained vector segment, whose file is gone, as when the base a
+    /// clone inherited it from is out of reach.
+    RetainedFileGone,
+    /// The segment the commit adds, whose recorded files name no index file,
+    /// as a scalar segment's do.
+    IncomingRecordsNone,
+}
+
+/// A search opens every segment of an index as a vector segment, so a segment
+/// without an index file cannot remain beside one that has it.
+#[rstest]
+#[case::retained_file_gone(WithoutIndexFile::RetainedFileGone)]
+#[case::incoming_records_none(WithoutIndexFile::IncomingRecordsNone)]
+#[tokio::test]
+async fn test_raw_index_commit_refuses_segment_without_index_file(
+    #[case] without: WithoutIndexFile,
+) {
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_no_index_file", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    let retained = build_ivf_flat_segment(
+        &mut dataset,
+        DistanceType::L2,
+        vec![fragments[0].id() as u32],
+    )
+    .await;
+    let retained_uuid = retained.uuid;
+    let mut dataset =
+        commit_raw_index_segments(&dataset, vec![("shared", retained)], vec![], false)
+            .await
+            .unwrap();
+    let incoming = match without {
+        WithoutIndexFile::RetainedFileGone => {
+            std::fs::remove_file(format!("{dataset_uri}/_indices/{retained_uuid}/index.idx"))
+                .unwrap();
+            build_ivf_flat_segment(
+                &mut dataset,
+                DistanceType::L2,
+                vec![fragments[1].id() as u32],
+            )
+            .await
+        }
+        WithoutIndexFile::IncomingRecordsNone => {
+            let mut incoming = build_ivf_flat_segment(
+                &mut dataset,
+                DistanceType::Dot,
+                vec![fragments[1].id() as u32],
+            )
+            .await;
+            // The store is not asked for a file the list leaves out, so the
+            // other metric goes unread, and the segment is refused all the same.
+            let files = incoming.files.take().unwrap();
+            incoming.files = Some(
+                files
+                    .into_iter()
+                    .filter(|file| file.path != lance_index::INDEX_FILE_NAME)
+                    .collect(),
+            );
+            incoming
+        }
+    };
+    let (with_file, without_file) = match without {
+        WithoutIndexFile::RetainedFileGone => (incoming.uuid, retained_uuid),
+        WithoutIndexFile::IncomingRecordsNone => (retained_uuid, incoming.uuid),
+    };
+
+    let version_before = dataset.manifest.version;
+    let err = commit_raw_index_segments(&dataset, vec![("shared", incoming)], vec![], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("vector segment {with_file} "))
+            && message.contains(&format!(
+                "segment {without_file}, which has no vector index file"
+            )),
+        "{message}"
+    );
+    assert_eq!(
+        Dataset::open(&dataset_uri).await.unwrap().manifest.version,
+        version_before
+    );
+}
+
+/// What a commit does to an index whose segments an older release left
+/// mixed, with blank details.
+#[derive(Clone, Copy, Debug)]
+enum MixedIndexCommit {
+    /// Adds a segment with the metric of the listed segment at this position.
+    Add(usize),
+    /// Adds a segment with the metric of the last listed segment, after an
+    /// unrelated commit saved the details loading inferred.
+    AddAfterACommit,
+    /// Replaces the last listed segment with one of the first one's metric.
+    ReplaceTheLastSegment,
+    /// Adds a segment under another index name.
+    AddUnderAnotherName,
+}
+
+/// Loading infers one set of details for every segment of a name and the
+/// next commit saves it, so the details of a mixed index cannot tell its
+/// segments apart. The commit reads each segment's index file.
+#[rstest]
+#[case::adding_to_a_mixed_index(MixedIndexCommit::Add(1))]
+#[case::adding_the_first_listed_metric(MixedIndexCommit::Add(0))]
+#[case::after_a_commit_saved_the_details(MixedIndexCommit::AddAfterACommit)]
+#[case::replacing_the_last_segment(MixedIndexCommit::ReplaceTheLastSegment)]
+#[case::adding_under_another_name(MixedIndexCommit::AddUnderAnotherName)]
+#[tokio::test]
+async fn test_raw_index_commit_reads_each_segment_of_a_mixed_index(
+    #[case] commit: MixedIndexCommit,
+) {
+    let listed = [DistanceType::Dot, DistanceType::L2];
+    let mut dataset = write_small_vector_dataset("memory://").await;
+
+    // A manifest an older release could have written: blank details on a Dot
+    // and an L2 segment of one index, published without any check.
+    let fragments = dataset.get_fragments();
+    let mut mixed = Vec::new();
+    for (metric, fragment) in listed.into_iter().zip([&fragments[0], &fragments[1]]) {
+        let mut segment =
+            build_ivf_flat_segment(&mut dataset, metric, vec![fragment.id() as u32]).await;
+        segment.name = "shared".to_string();
+        segment.index_details = Some(Arc::new(vector_index_details_default()));
+        mixed.push(segment);
+    }
+    let last_uuid = mixed[1].uuid;
+    crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, mixed).await;
+    if matches!(commit, MixedIndexCommit::AddAfterACommit) {
+        dataset.delete("false").await.unwrap();
+        let saved = lance_table::io::manifest::read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|segment| segment.name == "shared")
+        .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].index_details, saved[1].index_details);
+        assert!(!saved[0].index_details.as_deref().unwrap().value.is_empty());
+    }
+    let loaded = dataset.load_indices_by_name("shared").await.unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(loaded[0].index_details, loaded[1].index_details);
+
+    let (name, metric, removed) = match commit {
+        MixedIndexCommit::Add(position) => ("shared", listed[position], vec![]),
+        MixedIndexCommit::AddAfterACommit => ("shared", listed[1], vec![]),
+        MixedIndexCommit::ReplaceTheLastSegment => (
+            "shared",
+            listed[0],
+            loaded
+                .into_iter()
+                .filter(|segment| segment.uuid == last_uuid)
+                .collect(),
+        ),
+        MixedIndexCommit::AddUnderAnotherName => ("other", listed[1], vec![]),
+    };
+    let incoming =
+        build_ivf_flat_segment(&mut dataset, metric, vec![fragments[2].id() as u32]).await;
+    let result = commit_raw_index_segments(&dataset, vec![(name, incoming)], removed, false).await;
+    match commit {
+        MixedIndexCommit::ReplaceTheLastSegment => {
+            // What is left shares one metric, so a search runs across it.
+            let dataset = result.unwrap();
+            assert_eq!(
+                dataset.load_indices_by_name("shared").await.unwrap().len(),
+                2
+            );
+            let query = Float32Array::from(vec![0.5f32; 16]);
+            let mut row_ids = Vec::new();
+            for use_index in [true, false] {
+                let mut scan = dataset.scan();
+                scan.with_row_id()
+                    .nearest("vector", &query, 10)
+                    .unwrap()
+                    .distance_metric(listed[0])
+                    .minimum_nprobes(TWO_FRAG_NUM_PARTITIONS)
+                    .use_index(use_index);
+                if use_index {
+                    let plan = scan.explain_plan(true).await.unwrap();
+                    assert!(
+                        plan.contains("deltas=2"),
+                        "the search should run across both segments: {plan}"
+                    );
+                }
+                let found = scan.try_into_batch().await.unwrap();
+                row_ids.push(
+                    found[ROW_ID]
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>(),
+                );
+            }
+            let recall = row_ids[0].intersection(&row_ids[1]).count() as f32 / 10.0;
+            assert_ge!(recall, 0.5);
+        }
+        MixedIndexCommit::AddUnderAnotherName => {
+            let dataset = result.unwrap();
+            assert_eq!(
+                dataset.load_indices_by_name("shared").await.unwrap().len(),
+                2
+            );
+        }
+        MixedIndexCommit::Add(_) | MixedIndexCommit::AddAfterACommit => {
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, lance_core::Error::InvalidInput { .. }),
+                "expected InvalidInput, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("Dot") && err.to_string().contains("L2"),
+                "error should name both metrics: {err}"
+            );
+        }
+    }
+}
+
+/// A shallow clone keeps the source's segments in the source's base, which
+/// can live in another store than the clone, so they are read through that
+/// base's store, and of a segment of the current format only its index file,
+/// whose metadata records its metric and type.
+#[tokio::test]
+async fn test_raw_index_commit_reads_cloned_segment_through_its_base() {
+    let source_dir = TempStrDir::default();
+    let clone_dir = TempStrDir::default();
+    let source_uri = format!("file-object-store://{}", source_dir.as_str());
+    let clone_uri = format!("file-object-store://{}", clone_dir.as_str());
+    let mut source = write_small_vector_dataset(&source_uri).await;
+
+    let fragments = source.get_fragments();
+    let retained = build_ivf_flat_segment(
+        &mut source,
+        DistanceType::L2,
+        vec![fragments[0].id() as u32],
+    )
+    .await;
+    let retained_uuid = retained.uuid;
+    let mut source = commit_raw_index_segments(&source, vec![("shared", retained)], vec![], false)
+        .await
+        .unwrap();
+    let version = source.manifest.version;
+    let cloned = source
+        .shallow_clone(&clone_uri, version, None)
+        .await
+        .unwrap();
+    let base = cloned.manifest.base_paths.values().next().unwrap().clone();
+
+    let base_tracker = Arc::new(lance_io::utils::tracking_store::IOTracker::default());
+    let own_tracker = Arc::new(lance_io::utils::tracking_store::IOTracker::default());
+    let mut cloned = crate::DatasetBuilder::from_uri(&clone_uri)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(own_tracker.clone()),
+            ..Default::default()
+        })
+        .with_base_store_params(
+            &base.path,
+            ObjectStoreParams {
+                object_store_wrapper: Some(base_tracker.clone()),
+                ..Default::default()
+            },
+        )
+        .with_session(Arc::new(crate::session::Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let incoming = build_ivf_flat_segment(
+        &mut cloned,
+        DistanceType::L2,
+        vec![fragments[1].id() as u32],
+    )
+    .await;
+    let incoming_uuid = incoming.uuid;
+
+    let _ = base_tracker.incremental_stats();
+    let _ = own_tracker.incremental_stats();
+    let cloned = commit_raw_index_segments(&cloned, vec![("shared", incoming)], vec![], false)
+        .await
+        .unwrap();
+    let base_requests = base_tracker.incremental_stats().requests;
+    let own_requests = own_tracker.incremental_stats().requests;
+    let read_paths = |requests: &[lance_io::utils::tracking_store::IoRequestRecord]| {
+        requests
+            .iter()
+            .map(|request| request.path.to_string())
+            .collect::<Vec<_>>()
+    };
+    let (base_paths, own_paths) = (read_paths(&base_requests), read_paths(&own_requests));
+    let reads_index_file = |paths: &[String], uuid: Uuid| {
+        paths.iter().any(|path| {
+            path.contains(&format!("_indices/{uuid}/"))
+                && path.ends_with(lance_index::INDEX_FILE_NAME)
+        })
+    };
+    assert!(
+        reads_index_file(&base_paths, retained_uuid),
+        "the retained segment's index file must be read through the source's base: \
+         {base_paths:?}"
+    );
+    assert!(
+        reads_index_file(&own_paths, incoming_uuid),
+        "the new segment's index file is read through the clone's store: {own_paths:?}"
+    );
+    assert!(
+        !base_paths
+            .iter()
+            .chain(own_paths.iter())
+            .any(|path| path.ends_with(lance_index::INDEX_AUXILIARY_FILE_NAME)),
+        "the check reads index metadata, not any segment's storage: \
+         {base_paths:?} {own_paths:?}"
+    );
+    assert_eq!(
+        cloned.load_indices_by_name("shared").await.unwrap().len(),
+        2
+    );
+}
+
+/// A search opens every segment of an index with the queried column, so a
+/// segment keyed on another column cannot join the index, even a vector one
+/// with the same dimension, metric and type, nor a scalar one listed first.
+#[rstest]
+#[case::another_vector_column("vector", "vector2")]
+#[case::a_scalar_segment_listed_first("id", "vector")]
+#[tokio::test]
+async fn test_raw_index_commit_rejects_segment_on_another_column(
+    #[case] retained_column: &str,
+    #[case] incoming_column: &str,
+) {
+    async fn build_segment(dataset: &mut Dataset, column: &str, fragment_id: u32) -> IndexMetadata {
+        let btree = lance_index::scalar::ScalarIndexParams::default();
+        let ivf_flat = VectorIndexParams::ivf_flat(TWO_FRAG_NUM_PARTITIONS, DistanceType::L2);
+        let (index_type, params): (IndexType, &dyn lance_index::IndexParams) = if column == "id" {
+            (IndexType::BTree, &btree)
+        } else {
+            (IndexType::Vector, &ivf_flat)
+        };
+        dataset
+            .create_index_builder(&[column], index_type, params)
+            .name("worker_idx".to_string())
+            .fragments(vec![fragment_id])
+            .execute_uncommitted()
+            .await
+            .unwrap()
+    }
+
+    let test_dir = TempStrDir::default();
+    let dataset_uri = format!("{}/raw_other_column", test_dir.as_str());
+    let mut dataset = write_small_vector_dataset(&dataset_uri).await;
+
+    let fragments = dataset.get_fragments();
+    let retained = build_segment(&mut dataset, retained_column, fragments[0].id() as u32).await;
+    let mut dataset =
+        commit_raw_index_segments(&dataset, vec![("shared", retained)], vec![], false)
+            .await
+            .unwrap();
+    let incoming = build_segment(&mut dataset, incoming_column, fragments[1].id() as u32).await;
+
+    let version_before = dataset.manifest.version;
+    let err = commit_raw_index_segments(&dataset, vec![("shared", incoming)], vec![], false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("(on {retained_column})"))
+            && message.contains(&format!("(on {incoming_column})")),
+        "{message}"
+    );
+    assert_eq!(
+        Dataset::open(&dataset_uri).await.unwrap().manifest.version,
+        version_before
+    );
+}
+
+/// A scalar index can be keyed on a vector-typed column, as a zone map on a
+/// fixed-size list is. Its segments have no index file, so the check does not
+/// compare them, and an index optimize can keep appending segments to it.
+#[tokio::test]
+async fn test_optimize_appends_to_a_scalar_index_on_a_vector_column() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::ZoneMap,
+            Some("vector_zones".to_string()),
+            &lance_index::scalar::ScalarIndexParams::for_builtin(
+                lance_index::scalar::BuiltinIndexType::ZoneMap,
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let rows = dataset
+            .scan()
+            .limit(Some(64), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        dataset
+            .load_indices_by_name("vector_zones")
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+/// The commit reads a segment of the current format from its index file's
+/// metadata without opening it; for every type the builders write, that
+/// agrees with what the opened segment reports.
+#[rstest]
+#[case::ivf_flat(VectorIndexParams::ivf_flat(2, DistanceType::Dot), IndexType::IvfFlat)]
+#[case::ivf_pq(
+    VectorIndexParams::ivf_pq(2, 4, 4, DistanceType::Cosine, 5),
+    IndexType::IvfPq
+)]
+#[case::ivf_sq(
+    VectorIndexParams::with_ivf_sq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        SQBuildParams::default(),
+    ),
+    IndexType::IvfSq
+)]
+#[case::ivf_rq(
+    VectorIndexParams::with_ivf_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        RQBuildParams::default(),
+    ),
+    IndexType::IvfRq
+)]
+#[case::ivf_hnsw_flat(
+    VectorIndexParams::ivf_hnsw(
+        DistanceType::Dot,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+    ),
+    IndexType::IvfHnswFlat
+)]
+#[case::ivf_hnsw_pq(
+    VectorIndexParams::with_ivf_hnsw_pq_params(
+        DistanceType::Cosine,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+        PQBuildParams {
+            num_sub_vectors: 4,
+            num_bits: 4,
+            ..Default::default()
+        },
+    ),
+    IndexType::IvfHnswPq
+)]
+#[case::ivf_hnsw_sq(
+    VectorIndexParams::with_ivf_hnsw_sq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+        SQBuildParams::default(),
+    ),
+    IndexType::IvfHnswSq
+)]
+#[case::ivf_hnsw_rq(
+    VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+        RQBuildParams::default(),
+    ),
+    IndexType::IvfHnswRq
+)]
+#[tokio::test]
+async fn test_vector_segment_contract_read_from_file_metadata(
+    #[case] params: VectorIndexParams,
+    #[case] index_type: IndexType,
+) {
+    use crate::index::vector::ivf::{VectorQueryContract, vector_segment_contract};
+
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let segment = dataset
+        .create_index_builder(&["vector"], IndexType::Vector, &params)
+        .name("vector_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert!(matches!(
+        index_file_version(&dataset, &segment).await,
+        (0, 3) | (2, _)
+    ));
+
+    let read = vector_segment_contract(&dataset, &segment)
+        .await
+        .unwrap()
+        .unwrap();
+    let opened = dataset
+        .open_vector_index_from_metadata_with_plan(
+            "vector",
+            &segment,
+            Some(&crate::index::frag_reuse::SegmentRemappingPlan::Identity),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+    assert_eq!(read, VectorQueryContract::of_index(opened.as_ref()));
+    assert_eq!(opened.index_type(), index_type);
+    assert_eq!(opened.metric_type(), params.metric_type);
+}
+
+/// The format version in the footer of a segment's index file, which decides
+/// the reader that opens the segment.
+async fn index_file_version(dataset: &Dataset, segment: &IndexMetadata) -> (u16, u16) {
+    let path = dataset
+        .indice_files_dir(segment)
+        .unwrap()
+        .join(segment.uuid.to_string())
+        .join(lance_index::INDEX_FILE_NAME);
+    let reader = dataset.object_store.open(&path).await.unwrap();
+    let footer = lance_io::utils::read_last_block(reader.as_ref())
+        .await
+        .unwrap();
+    lance_io::utils::read_version(&footer).unwrap()
+}
+
+/// 256 rows of 8-dimensional vectors in two fragments, enough to train the
+/// codebook of a legacy IVF_HNSW_PQ index.
+async fn write_legacy_v1_dataset(uri: &str) -> Dataset {
+    gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_dataset(uri, FragmentCount::from(2), FragmentRowCount::from(128))
+        .await
+        .unwrap()
+}
+
+/// Writes a legacy IVF_HNSW_PQ index, a v1 Lance file (0,2), over all rows of
+/// `dataset` and describes it as a segment of `shared` covering `fragments`,
+/// with the blank details the releases that wrote this format left.
+pub async fn build_legacy_v1_segment(
+    dataset: &Dataset,
+    metric: DistanceType,
+    fragments: Vec<u32>,
+) -> IndexMetadata {
+    let uuid = Uuid::new_v4();
+    crate::index::vector::ivf::build_ivf_hnsw_pq_index(
+        dataset,
+        "vector",
+        "shared",
+        uuid,
+        metric,
+        &IvfBuildParams {
+            num_partitions: Some(2),
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        },
+        &HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16),
+        &PQBuildParams {
+            num_sub_vectors: 2,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    IndexMetadata {
+        uuid,
+        name: "shared".to_string(),
+        fields: vec![dataset.schema().field("vector").unwrap().id],
+        covering_fields: vec![],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(fragments.into_iter().collect()),
+        index_details: Some(Arc::new(vector_index_details_default())),
+        index_version: IndexType::Vector.version(),
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: Default::default(),
+    }
+}
+
+/// A commit opens vector segments written as v1 Lance files, (0,2), with
+/// their own reader, the segment it adds included: it is not in the listing
+/// yet, so it opens from the metadata the commit gives it.
+#[rstest]
+#[case::same_metric(DistanceType::L2, true)]
+#[case::other_metric(DistanceType::Dot, false)]
+#[tokio::test]
+async fn test_raw_index_commit_opens_legacy_v1_segments(
+    #[case] incoming_metric: DistanceType,
+    #[case] accepted: bool,
+) {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let retained = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0]).await;
+    assert_eq!(index_file_version(&dataset, &retained).await, (0, 2));
+    let dataset = commit_raw_index_segments(&dataset, vec![("shared", retained)], vec![], false)
+        .await
+        .unwrap();
+    let incoming = build_legacy_v1_segment(&dataset, incoming_metric, vec![1]).await;
+    assert_eq!(index_file_version(&dataset, &incoming).await, (0, 2));
+
+    let result =
+        commit_raw_index_segments(&dataset, vec![("shared", incoming)], vec![], false).await;
+    if accepted {
+        let dataset = result.unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("shared").await.unwrap().len(),
+            2
+        );
+    } else {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Dot") && err.to_string().contains("IVF_HNSW_PQ"),
+            "{err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_distributed_vector_build_supports_hnsw_variants() {
     let test_dir = TempStrDir::default();
@@ -2856,7 +4196,7 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
     let params = VectorIndexParams::ivf_hnsw(
         DistanceType::L2,
         prepare_global_ivf(&dataset, "vector").await,
-        HnswBuildParams::default(),
+        lightweight_hnsw_params(),
     );
     let mut segments = Vec::new();
 
@@ -2898,12 +4238,18 @@ async fn test_distributed_vector_build_supports_hnsw_variants() {
     assert!(result.num_rows() > 0);
 }
 
+/// `rotation_type` only applies to IVF_HNSW_RQ.
 #[rstest]
-#[case::flat("IVF_HNSW_FLAT")]
-#[case::pq("IVF_HNSW_PQ")]
-#[case::sq("IVF_HNSW_SQ")]
+#[case::flat("IVF_HNSW_FLAT", RQRotationType::Fast)]
+#[case::pq("IVF_HNSW_PQ", RQRotationType::Fast)]
+#[case::sq("IVF_HNSW_SQ", RQRotationType::Fast)]
+#[case::rq("IVF_HNSW_RQ", RQRotationType::Fast)]
+#[case::rq_matrix("IVF_HNSW_RQ", RQRotationType::Matrix)]
 #[tokio::test]
-async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index_type: &str) {
+async fn test_merge_existing_hnsw_segments_rebuilds_graph(
+    #[case] expected_index_type: &str,
+    #[case] rotation_type: RQRotationType,
+) {
     let test_dir = TempStrDir::default();
     let base_uri = test_dir.as_str();
     let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
@@ -2911,7 +4257,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
     } else {
         let (schema, batches) = make_two_fragment_batches();
-        (schema, batches, 500)
+        (schema, batches, TWO_FRAG_ROWS_PER_FILE)
     };
     let dataset_uri = format!("{}/merge_hnsw_rebuilds_graph", base_uri);
     let mut dataset =
@@ -2924,7 +4270,7 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         "IVF_HNSW_FLAT" => VectorIndexParams::ivf_hnsw(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
         ),
         "IVF_HNSW_PQ" => {
             let (ivf_params, pq_params) = prepare_ivf_pq(
@@ -2948,9 +4294,27 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(#[case] expected_index
         "IVF_HNSW_SQ" => VectorIndexParams::with_ivf_hnsw_sq_params(
             DistanceType::L2,
             prepare_global_ivf(&dataset, "vector").await,
-            HnswBuildParams::default(),
+            lightweight_hnsw_params(),
             SQBuildParams::default(),
         ),
+        "IVF_HNSW_RQ" => {
+            // Shards merge only if they rotate vectors the same way.
+            let rotation = RabitQuantizer::new_with_rotation::<Float32Type>(
+                5,
+                TWO_FRAG_DIM as i32,
+                rotation_type,
+            )
+            .metadata(None);
+            VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                prepare_global_ivf(&dataset, "vector").await,
+                lightweight_hnsw_params(),
+                RQBuildParams {
+                    rotation: Some(rotation),
+                    ..RQBuildParams::with_rotation_type(5, rotation_type)
+                },
+            )
+        }
         other => panic!("unexpected HNSW index type {other}"),
     };
     let mut segments = Vec::new();
@@ -4184,14 +5548,26 @@ async fn test_build_ivf_rq_multi_bit_persists_split_codes_and_searches(
 #[case::fast(RQRotationType::Fast)]
 #[case::matrix(RQRotationType::Matrix)]
 #[tokio::test]
-async fn test_ivf_rq_rotation_type_after_optimize(#[case] rotation_type: RQRotationType) {
+async fn test_ivf_rq_rotation_type_after_optimize(
+    #[case] rotation_type: RQRotationType,
+    #[values(false, true)] hnsw: bool,
+) {
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
     let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
     let ivf_params = IvfBuildParams::new(4);
     let rq_params = RQBuildParams::with_rotation_type(1, rotation_type);
-    let params = VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params);
+    let params = if hnsw {
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            HnswBuildParams::default(),
+            rq_params,
+        )
+    } else {
+        VectorIndexParams::with_ivf_rq_params(DistanceType::L2, ivf_params, rq_params)
+    };
     dataset
         .create_index(&["vector"], IndexType::Vector, None, &params, true)
         .await
@@ -4240,12 +5616,25 @@ async fn test_create_ivf_hnsw_flat(
     let ivf_params = IvfBuildParams::new(nlist);
     let hnsw_params = HnswBuildParams::default();
     let params = VectorIndexParams::ivf_hnsw(distance_type, ivf_params, hnsw_params);
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors and remap don't depend on the float metric, so only L2 runs
+    // them; Hamming covers the u8 path.
+    if matches!(distance_type, DistanceType::L2 | DistanceType::Hamming) {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
 }
 
 #[rstest]
@@ -4267,15 +5656,203 @@ async fn test_create_ivf_hnsw_sq(
         hnsw_params,
         sq_params,
     );
-    // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
-    Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
-    if distance_type == DistanceType::Cosine {
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+    // f64 vectors, distance ranges, delete-all and remap don't depend on the
+    // metric, so only L2 runs them.
+    if distance_type == DistanceType::L2 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        test_distance_range(Some(params.clone()), nlist).await;
+        // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
     }
-    test_distance_range(Some(params.clone()), nlist).await;
-    // Boxed for CI clippy `large_futures`: the delete-all future grew past 16 KiB.
-    Box::pin(test_delete_all_rows(params.clone())).await;
-    test_remap(params, nlist, recall_requirement).await;
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
+}
+
+// Like flat IVF_RQ (see test_build_ivf_rq), 1 bit per dimension recalls far
+// less than 5 bits on this uniformly random data.
+#[rstest]
+#[case(4, DistanceType::L2, 5, 0.9)]
+#[case(4, DistanceType::Cosine, 5, 0.9)]
+#[case(4, DistanceType::Dot, 5, 0.85)]
+#[case(4, DistanceType::L2, 1, 0.5)]
+#[tokio::test]
+async fn test_create_ivf_hnsw_rq(
+    #[case] nlist: usize,
+    #[case] distance_type: DistanceType,
+    #[case] num_bits: u8,
+    #[case] recall_requirement: f32,
+) {
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        distance_type,
+        IvfBuildParams::new(nlist),
+        HnswBuildParams::default(),
+        RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
+    );
+    // f64 vectors, delete-all and remap don't depend on the metric or the bit
+    // width, so only the 5-bit L2 case runs them. test_distance_range pins the
+    // row-id order of range splits against the unfiltered top-k, which a 1-bit
+    // walk need not reproduce for every k.
+    if distance_type == DistanceType::L2 && num_bits == 5 {
+        // Boxed for CI clippy `large_futures`: the build-and-search future grew past 16 KiB.
+        Box::pin(test_index(params.clone(), nlist, recall_requirement, None)).await;
+        Box::pin(test_delete_all_rows(params.clone())).await;
+        test_remap(params.clone(), nlist, recall_requirement).await;
+    } else {
+        Box::pin(test_index_impl::<Float32Type>(
+            params.clone(),
+            nlist,
+            recall_requirement,
+            0.0..1.0,
+            None,
+        ))
+        .await;
+    }
+    if distance_type == DistanceType::Cosine {
+        test_index_multivec(params, nlist, recall_requirement).await;
+    }
+}
+
+async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
+    const K: usize = 10;
+
+    let mut scan = dataset.scan();
+    scan.nearest("vector", query, K)
+        .unwrap()
+        .minimum_nprobes(nlist)
+        .maximum_nprobes(nlist);
+    scan.with_row_id();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex"),
+        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
+    );
+
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), K);
+    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+    assert_eq!(
+        row_ids.iter().copied().collect::<HashSet<_>>().len(),
+        K,
+        "IVF_HNSW_RQ returned duplicate row ids"
+    );
+
+    let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
+    let recall = row_ids
+        .iter()
+        .filter(|row_id| ground_truth.contains(row_id))
+        .count() as f32
+        / K as f32;
+    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+}
+
+#[tokio::test]
+async fn test_ivf_hnsw_rq_stable_row_ids_lifecycle() {
+    const INDEX_NAME: &str = "ivf_hnsw_rq_stable";
+    const INITIAL_ROWS: usize = 256;
+    const APPEND_ROWS: usize = 32;
+    const NLIST: usize = 4;
+
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+    let (batch, schema) = make_seeded_vector_batch(INITIAL_ROWS + APPEND_ROWS);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let appended = batch.slice(INITIAL_ROWS, APPEND_ROWS);
+    let batches = RecordBatchIterator::new(vec![Ok(batch.slice(0, INITIAL_ROWS))], schema.clone());
+    let mut dataset = Dataset::write(
+        batches,
+        test_uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert!(
+        dataset.get_fragments().len() >= 2,
+        "stable-row-id fixture should span multiple fragments"
+    );
+    let stable_row_id = row_ids_matching(&dataset, "id = 0").await;
+    assert_eq!(stable_row_id.len(), 1);
+
+    let ivf_params = IvfBuildParams {
+        max_iters: 2,
+        sample_rate: 32,
+        ..IvfBuildParams::new(NLIST)
+    };
+    let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+        DistanceType::L2,
+        ivf_params,
+        lightweight_hnsw_params(),
+        RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::IvfHnswRq,
+            Some(INDEX_NAME.to_string()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
+
+    let appended = RecordBatchIterator::new(vec![Ok(appended)], schema);
+    dataset.append(appended, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "optimize should merge the appended stable-row-id data into one index"
+    );
+
+    drop(dataset);
+    let dataset = Dataset::open(test_uri).await.unwrap();
+    assert!(dataset.manifest().uses_stable_row_ids());
+    assert_eq!(
+        row_ids_matching(&dataset, "id = 0").await,
+        stable_row_id,
+        "optimize and reopen should preserve the row's stable id"
+    );
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(INDEX_NAME).await.unwrap()).unwrap();
+    assert_eq!(stats["index_type"], "IVF_HNSW_RQ");
+    assert_eq!(
+        dataset
+            .load_indices_by_name(INDEX_NAME)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_ivf_hnsw_rq_search(&dataset, &query, NLIST).await;
 }
 
 #[tokio::test]
@@ -6101,9 +7678,10 @@ async fn test_multivec_build_from_partition_count_records_no_target() {
 async fn test_partition_split_on_append_multivec() {
     const INDEX_NAME: &str = "vector_idx";
     const VECTORS_PER_ROW: usize = 3;
-    // 512 base rows and this append flatten to 33,036 vectors, just over
-    // the 32,768-vector IVF-PQ split threshold.
-    const APPEND_ROWS: usize = 10_500;
+    const TARGET_PARTITION_SIZE: usize = 512;
+    // 512 base rows and this append flatten to 2,136 vectors, just over
+    // the 2,048-vector split threshold of the target above.
+    const APPEND_ROWS: usize = 200;
 
     let test_dir = TempStrDir::default();
     let test_uri = test_dir.as_str();
@@ -6111,7 +7689,10 @@ async fn test_partition_split_on_append_multivec() {
     let (mut dataset, _) = generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::Cosine,
-        IvfBuildParams::new(1),
+        IvfBuildParams {
+            target_partition_size: Some(TARGET_PARTITION_SIZE),
+            ..IvfBuildParams::new(1)
+        },
         lightweight_pq_params(),
     );
     dataset
@@ -6137,8 +7718,7 @@ async fn test_partition_split_on_append_multivec() {
     let expected_rows = NUM_ROWS + APPEND_ROWS;
     // Every vector of a row counts towards the partition size, and the split
     // goes straight to the target size: ceil(vectors / target) pieces.
-    let expected_partitions =
-        (expected_rows * VECTORS_PER_ROW).div_ceil(IndexType::IvfPq.target_partition_size());
+    let expected_partitions = (expected_rows * VECTORS_PER_ROW).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -6186,9 +7766,10 @@ async fn test_partition_split_on_append_multivec() {
 async fn test_split_multiple_partitions_in_one_optimize() {
     const INDEX_NAME: &str = "vector_idx";
     const BASE_ROWS_PER_PARTITION: usize = 512;
-    // Each IVF-FLAT partition reaches 16,512 rows, just over its 16,384-row
-    // split threshold.
-    const APPEND_ROWS_PER_PARTITION: usize = 16_000;
+    const TARGET_PARTITION_SIZE: usize = 256;
+    // Each partition reaches 1,112 rows, just over the 1,024-row split
+    // threshold of the target above.
+    const APPEND_ROWS_PER_PARTITION: usize = 600;
     let offsets = [-50.0, 50.0];
 
     let test_dir = TempStrDir::default();
@@ -6208,10 +7789,10 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    // Pin the type default target so the threshold above is the one this test
-    // reasons about; a build from a partition count would record its own.
+    // Pin the target so the threshold above is the one this test reasons
+    // about; a build from a partition count would record its own.
     let ivf_params = IvfBuildParams {
-        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        target_partition_size: Some(TARGET_PARTITION_SIZE),
         ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
     };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
@@ -6247,8 +7828,8 @@ async fn test_split_multiple_partitions_in_one_optimize() {
 
     // Both partitions hold BASE + APPEND rows and are split straight to the
     // target size in one optimize: ceil(rows / target) pieces each.
-    let pieces_per_partition = (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION)
-        .div_ceil(IndexType::IvfFlat.target_partition_size());
+    let pieces_per_partition =
+        (BASE_ROWS_PER_PARTITION + APPEND_ROWS_PER_PARTITION).div_ceil(TARGET_PARTITION_SIZE);
     let final_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(
         final_ctx.num_partitions(),
@@ -6957,6 +8538,15 @@ impl lance_core::cache::CacheBackend for PartitionBypassCacheBackend {
         ),
         <PartitionEntry<HNSW, ScalarQuantizer> as CacheCodecImpl>::TYPE_ID
     )]
+#[case::ivf_hnsw_rq(
+        VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        ),
+        <PartitionEntry<HNSW, RabitQuantizer> as CacheCodecImpl>::TYPE_ID
+    )]
 #[tokio::test]
 async fn test_prewarm_and_query_with_serializing_backend(
     #[case] params: VectorIndexParams,
@@ -7188,6 +8778,7 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
     assert_ge!(recall, 0.5);
 }
 
+mod native_prewarm_tests;
 mod native_resident_tests;
 mod native_scan_tests;
 mod native_share_tests;
