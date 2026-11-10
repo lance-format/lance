@@ -31,7 +31,11 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-use lance_core::{Error, Result, cache::LanceCache, error::LanceOptionExt};
+use lance_core::{
+    Error, Result,
+    cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
+    error::LanceOptionExt,
+};
 
 use crate::{
     Index, IndexType,
@@ -42,8 +46,8 @@ use crate::{
         SearchResult, UpdateCriteria,
         expression::{IndexedExpression, ScalarIndexExpr, ScalarIndexSearch, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME,
+            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
+            TrainingRequest, VALUE_COLUMN_NAME,
         },
     },
 };
@@ -150,6 +154,7 @@ pub struct JsonIndex {
     ///
     /// `Unspecified` for an index built before the field existed.
     recorded_target_data_type: i32,
+    target_plugin_name: Option<String>,
 }
 
 impl JsonIndex {
@@ -158,6 +163,7 @@ impl JsonIndex {
             target_index,
             path,
             recorded_target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_plugin_name: None,
         }
     }
 
@@ -221,7 +227,66 @@ impl JsonIndex {
 
 impl DeepSizeOf for JsonIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.target_index.deep_size_of_children(context) + self.path.deep_size_of_children(context)
+        self.target_index.deep_size_of_children(context)
+            + self.path.deep_size_of_children(context)
+            + self.target_plugin_name.deep_size_of_children(context)
+    }
+}
+
+/// Only the wrapper metadata is retained here. The target plugin owns its cache
+/// representation and reconstructs it against each request's store/remapper.
+#[derive(Debug, DeepSizeOf)]
+struct JsonIndexState {
+    path: String,
+    target_data_type: i32,
+    target_plugin_name: String,
+}
+
+impl JsonIndexState {
+    fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let index = index
+            .as_any()
+            .downcast_ref::<JsonIndex>()
+            .ok_or_else(|| Error::internal("JSON cache received a non-JSON index"))?;
+        Ok(Self {
+            path: index.path.clone(),
+            target_data_type: index.recorded_target_data_type,
+            target_plugin_name: index
+                .target_plugin_name
+                .clone()
+                .ok_or_else(|| Error::internal("JSON cache index has no target plugin"))?,
+        })
+    }
+
+    fn wrap(&self, target_index: Arc<dyn ScalarIndex>) -> Arc<dyn ScalarIndex> {
+        Arc::new(JsonIndex {
+            target_index,
+            path: self.path.clone(),
+            recorded_target_data_type: self.target_data_type,
+            target_plugin_name: Some(self.target_plugin_name.clone()),
+        })
+    }
+}
+
+struct JsonIndexStateKey;
+
+impl CacheKey for JsonIndexStateKey {
+    type ValueType = JsonIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+
+    fn type_name() -> &'static str {
+        "JsonIndexState"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.json-index-state-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
     }
 }
 
@@ -561,6 +626,10 @@ impl AnyQuery for JsonQuery {
             Some(o) => self == o,
             None => false,
         }
+    }
+
+    fn reports_null_rows(&self) -> bool {
+        self.target_query.reports_null_rows()
     }
 }
 
@@ -1448,13 +1517,106 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
                 target_details,
                 target_index_version,
                 frag_reuse_index,
-                cache,
+                &cache.with_key_prefix("json_target"),
             )
             .await?;
-        Ok(Arc::new(
-            JsonIndex::new(target_index, json_details.path)
-                .with_target_data_type(json_details.target_data_type),
-        ))
+        let mut index = JsonIndex::new(target_index, json_details.path)
+            .with_target_data_type(json_details.target_data_type);
+        index.target_plugin_name = Some(target_plugin.name().to_string());
+        Ok(Arc::new(index))
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&JsonIndexStateKey).await else {
+            return Ok(None);
+        };
+        let registry = self.registry()?;
+        let plugin = registry.get_plugin_by_name(&state.target_plugin_name)?;
+        Ok(plugin
+            .get_from_cache(
+                index_store,
+                frag_reuse_index,
+                &cache.with_key_prefix("json_target"),
+            )
+            .await?
+            .map(|target| state.wrap(target)))
+    }
+
+    async fn put_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        let state = JsonIndexState::from_index(index.as_ref())?;
+        let json = index.as_any().downcast_ref::<JsonIndex>().expect_ok()?;
+        let registry = self.registry()?;
+        let plugin = registry.get_plugin_by_name(&state.target_plugin_name)?;
+        plugin
+            .put_in_cache(
+                index_store,
+                &cache.with_key_prefix("json_target"),
+                json.target_index.clone(),
+            )
+            .await?;
+        cache
+            .insert_with_key(&JsonIndexStateKey, Arc::new(state))
+            .await;
+        Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let registry = self.registry()?;
+        let target_cache = cache.with_key_prefix("json_target");
+        let mut pending_load = Some(load);
+        let mut loaded = None;
+        let state = cache
+            .get_or_insert_with_key(JsonIndexStateKey, || async {
+                let index = pending_load.take().expect_ok()?.await?;
+                let state = JsonIndexState::from_index(index.as_ref())?;
+                let json = index.as_any().downcast_ref::<JsonIndex>().expect_ok()?;
+                // Populate the target before publishing wrapper metadata so concurrent
+                // cold callers do not start a second target load in the gap.
+                registry
+                    .get_plugin_by_name(&state.target_plugin_name)?
+                    .put_in_cache(
+                        index_store.clone(),
+                        &target_cache,
+                        json.target_index.clone(),
+                    )
+                    .await?;
+                loaded = Some(index);
+                Ok(state)
+            })
+            .await?;
+        let plugin = registry.get_plugin_by_name(&state.target_plugin_name)?;
+        let target_load: ScalarIndexLoad = Box::pin(async move {
+            let index = match loaded {
+                Some(index) => index,
+                None => pending_load.take().expect_ok()?.await?,
+            };
+            Ok(index
+                .as_any()
+                .downcast_ref::<JsonIndex>()
+                .expect_ok()?
+                .target_index
+                .clone())
+        });
+        let target = plugin
+            .get_or_insert_in_cache(index_store, frag_reuse_index, &target_cache, target_load)
+            .await?;
+        Ok(state.wrap(target))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
@@ -1497,6 +1659,449 @@ mod tests {
     use rstest::rstest;
     use std::ops::Bound;
     use std::sync::Arc;
+
+    #[derive(Debug, Clone)]
+    struct RequestStore {
+        inner: Arc<dyn IndexStore>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        denied: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RequestStore {
+        fn new(inner: Arc<dyn IndexStore>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                opens: Arc::default(),
+                reads: Arc::default(),
+                denied: Arc::default(),
+            })
+        }
+    }
+
+    impl DeepSizeOf for RequestStore {
+        fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    struct RequestReader {
+        inner: Arc<dyn crate::scalar::IndexReader>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        denied: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl crate::scalar::IndexReader for RequestReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            if self.denied.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::not_supported("request binding is unavailable"));
+            }
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_range(
+            &self,
+            range: std::ops::Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            if self.denied.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::not_supported("request binding is unavailable"));
+            }
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
+
+    #[async_trait]
+    impl IndexStore for RequestStore {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn clone_arc(&self) -> Arc<dyn IndexStore> {
+            Arc::new(self.clone())
+        }
+
+        fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<Self>()
+                .is_some_and(|other| Arc::ptr_eq(&self.opens, &other.opens))
+        }
+
+        fn io_parallelism(&self) -> usize {
+            self.inner.io_parallelism()
+        }
+
+        async fn new_index_file(
+            &self,
+            name: &str,
+            schema: Arc<Schema>,
+        ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+            self.inner.new_index_file(name, schema).await
+        }
+
+        async fn open_index_file(&self, name: &str) -> Result<Arc<dyn crate::scalar::IndexReader>> {
+            if self.denied.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Error::not_supported("request binding is unavailable"));
+            }
+            self.opens
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Arc::new(RequestReader {
+                inner: self.inner.open_index_file(name).await?,
+                reads: self.reads.clone(),
+                denied: self.denied.clone(),
+            }))
+        }
+
+        fn with_io_priority(&self, _: u64) -> Arc<dyn IndexStore> {
+            self.clone_arc()
+        }
+
+        fn with_io_buffer_size(&self, _: u64) -> Arc<dyn IndexStore> {
+            self.clone_arc()
+        }
+
+        async fn copy_index_file(
+            &self,
+            name: &str,
+            dest: &dyn IndexStore,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.copy_index_file(name, dest).await
+        }
+
+        async fn rename_index_file(
+            &self,
+            name: &str,
+            new_name: &str,
+        ) -> Result<crate::scalar::IndexFile> {
+            self.inner.rename_index_file(name, new_name).await
+        }
+
+        async fn delete_index_file(&self, name: &str) -> Result<()> {
+            self.inner.delete_index_file(name).await
+        }
+
+        async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+            self.inner.list_files_with_sizes().await
+        }
+    }
+
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::ngram("ngram")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_cache_request_rotation(#[case] target: &str) {
+        use crate::metrics::NoOpMetricsCollector;
+        use lance_select::RowAddrTreeMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, _dir) = local_json_index_store();
+        let created = train_json_index(
+            store.clone(),
+            target,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v":"bravo"}"#, r#"{"v":null}"#, r#"{"v":"alpha"}"#],
+        )
+        .await;
+        let a = RequestStore::new(store.clone());
+        let b = RequestStore::new(store);
+        let weak_a = Arc::downgrade(&a);
+        let weak_b = Arc::downgrade(&b);
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let loads = AtomicUsize::new(0);
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let query: Arc<dyn AnyQuery> = if target == "btree" {
+            Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "bravo".into(),
+            ))))
+        } else {
+            Arc::new(TextQuery::StringContains("bravo".into()))
+        };
+
+        for (iteration, request) in [&a, &a, &b, &a].into_iter().enumerate() {
+            let index = plugin
+                .get_or_insert_in_cache(
+                    request.clone(),
+                    None,
+                    &cache,
+                    Box::pin(async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        plugin
+                            .load_index(
+                                request.clone(),
+                                &created.index_details,
+                                created.index_version,
+                                None,
+                                &cache,
+                            )
+                            .await
+                    }),
+                )
+                .await
+                .unwrap();
+            let reads_after_open =
+                a.reads.load(Ordering::Relaxed) + b.reads.load(Ordering::Relaxed);
+            assert_eq!(
+                reads_after_open,
+                usize::from(iteration == 0),
+                "target metadata must only be read once for {target}, iteration {iteration}"
+            );
+            let result = index
+                .search(
+                    &JsonQuery::new(query.clone(), "v".into()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            let selected = RowAddrTreeMap::from_iter([0]);
+            assert_eq!(
+                result,
+                if target == "btree" {
+                    SearchResult::exact(selected).with_nulls(RowAddrTreeMap::from_iter([1]))
+                } else {
+                    SearchResult::at_most(selected)
+                }
+            );
+            // Search pages/postings add reads; isolate target metadata loads.
+            a.reads.store(0, Ordering::Relaxed);
+            b.reads.store(0, Ordering::Relaxed);
+        }
+        assert_eq!(
+            loads.load(Ordering::Relaxed),
+            1,
+            "A-A-B-A target loads for {target}"
+        );
+        drop(a);
+        drop(b);
+        assert!(weak_a.upgrade().is_none(), "cache retains request A");
+        assert!(weak_b.upgrade().is_none(), "cache retains request B");
+    }
+
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::ngram("ngram")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_cache_concurrent_cold_open(#[case] target: &str) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, _dir) = local_json_index_store();
+        let created = train_json_index(
+            store.clone(),
+            target,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v":"alpha"}"#],
+        )
+        .await;
+        let requests = [RequestStore::new(store.clone()), RequestStore::new(store)];
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let loads = AtomicUsize::new(0);
+        let indices = futures::future::join_all(requests.iter().map(|request| {
+            plugin.get_or_insert_in_cache(
+                request.clone(),
+                None,
+                &cache,
+                Box::pin(async {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                    plugin
+                        .load_index(
+                            request.clone(),
+                            &created.index_details,
+                            created.index_version,
+                            None,
+                            &cache,
+                        )
+                        .await
+                }),
+            )
+        }))
+        .await;
+        for index in indices {
+            index.unwrap();
+        }
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+
+        cache.clear().await;
+        assert!(
+            plugin
+                .get_from_cache(requests[0].clone(), None, &cache)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let no_cache = LanceCache::no_cache();
+        for _ in 0..2 {
+            plugin
+                .get_or_insert_in_cache(
+                    requests[0].clone(),
+                    None,
+                    &no_cache,
+                    Box::pin(async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        plugin
+                            .load_index(
+                                requests[0].clone(),
+                                &created.index_details,
+                                created.index_version,
+                                None,
+                                &no_cache,
+                            )
+                            .await
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(loads.load(Ordering::Relaxed), 3);
+        let tiny_cache = LanceCache::with_capacity(1);
+        for _ in 0..2 {
+            plugin
+                .get_or_insert_in_cache(
+                    requests[0].clone(),
+                    None,
+                    &tiny_cache,
+                    Box::pin(async {
+                        loads.fetch_add(1, Ordering::Relaxed);
+                        plugin
+                            .load_index(
+                                requests[0].clone(),
+                                &created.index_details,
+                                created.index_version,
+                                None,
+                                &tiny_cache,
+                            )
+                            .await
+                    }),
+                )
+                .await
+                .unwrap();
+            // Moka applies weighted eviction asynchronously. The public size
+            // query runs its pending maintenance before reporting residency.
+            assert_eq!(tiny_cache.size_bytes().await, 0);
+        }
+        assert_eq!(loads.load(Ordering::Relaxed), 5);
+    }
+
+    #[rstest]
+    #[case::btree("btree")]
+    #[case::ngram("ngram")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_json_cached_state_uses_current_readers(#[case] target: &str) {
+        use crate::metrics::NoOpMetricsCollector;
+        use std::sync::atomic::Ordering;
+
+        let (store, _dir) = local_json_index_store();
+        let created = train_json_index(
+            store.clone(),
+            target,
+            TrainingOrdering::None,
+            "v",
+            &[r#"{"v":"alpha"}"#],
+        )
+        .await;
+        let a = RequestStore::new(store.clone());
+        let b = RequestStore::new(store);
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let index = plugin
+            .load_index(
+                a.clone(),
+                &created.index_details,
+                created.index_version,
+                None,
+                &cache,
+            )
+            .await
+            .unwrap();
+        plugin
+            .put_in_cache(a.clone(), &cache, index.clone())
+            .await
+            .unwrap();
+        a.denied.store(true, Ordering::Relaxed);
+        a.reads.store(0, Ordering::Relaxed);
+        let remapper = Arc::new(crate::scalar::lookup_test_util::CompactedToFragmentOne {
+            deleted: Default::default(),
+        });
+        let weak_remapper = Arc::downgrade(&remapper);
+        let rebound = plugin
+            .get_from_cache(b.clone(), Some(remapper.clone()), &cache)
+            .await
+            .unwrap()
+            .unwrap();
+        let query: Arc<dyn AnyQuery> = if target == "btree" {
+            Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
+                "alpha".into(),
+            ))))
+        } else {
+            Arc::new(TextQuery::StringContains("alpha".into()))
+        };
+        let result = rebound
+            .search(
+                &JsonQuery::new(query.clone(), "v".into()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.row_addrs().selected_rows(),
+            &lance_select::RowAddrTreeMap::from_iter([1u64 << 32])
+        );
+        assert!(b.opens.load(Ordering::Relaxed) > 0);
+        assert!(b.reads.load(Ordering::Relaxed) > 0);
+        assert_eq!(a.reads.load(Ordering::Relaxed), 0);
+        drop(rebound);
+        drop(remapper);
+        assert!(
+            weak_remapper.upgrade().is_none(),
+            "cache retains request remapper"
+        );
+        cache.clear().await;
+        plugin
+            .put_in_cache(a.clone(), &cache, index.clone())
+            .await
+            .unwrap();
+        b.denied.store(true, Ordering::Relaxed);
+        let error = match plugin.get_from_cache(b.clone(), None, &cache).await {
+            Err(error) => error,
+            Ok(Some(index)) => index
+                .search(&JsonQuery::new(query, "v".into()), &NoOpMetricsCollector)
+                .await
+                .unwrap_err(),
+            Ok(None) => panic!("target state was just cached"),
+        };
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("request binding is unavailable"));
+        drop(index);
+        let weak_a = Arc::downgrade(&a);
+        drop(a);
+        assert!(weak_a.upgrade().is_none());
+    }
 
     #[rstest]
     #[case::bare_key("name", true)]

@@ -105,7 +105,8 @@ use execution::{refuse_stale_output_clustering, rewrite_files};
 use planning::validate_fragment_groups_preserve_index_boundaries;
 pub use planning::{
     COMPACTION_CONFIG_PREFIX, CompactionGroup, CompactionMode, CompactionOptions, CompactionPlan,
-    CompactionPlanner, DefaultCompactionPlanner, IndexRemapMode, TaskData, plan_compaction,
+    CompactionPlanner, DefaultCompactionPlanner, IndexRemapMode, SourceBudgetMode, TaskData,
+    plan_compaction,
 };
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
 
