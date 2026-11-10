@@ -404,10 +404,7 @@ impl<'a> TransactionRebase<'a> {
                     .filter(|index| !is_system_index(index))
                     .filter_map(|index| index.fragment_bitmap.as_ref())
                     .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
-                let previously_deleted_fragments = self
-                    .read_version_fragments
-                    .as_ref()
-                    .unwrap_or(read_fragments)
+                let previously_deleted_fragments = read_fragments
                     .iter()
                     .filter(|fragment| fragment.deletion_file.is_some())
                     .map(|fragment| (fragment.id, fragment))
