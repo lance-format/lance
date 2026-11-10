@@ -705,11 +705,7 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
-        // An update that matched no rows changes nothing, so it must not take the
-        // manifest commit: an empty version pre-empts concurrent writers.
-
-        // An update that matched no rows changes nothing, so it must not take the
-        // manifest commit: an empty version pre-empts concurrent writers.
+        // Noop when no rows match so we don't bump the version or block other writers.
         if update_data.removed_fragment_ids.is_empty()
             && update_data.old_fragments.is_empty()
             && update_data.new_fragments.is_empty()
