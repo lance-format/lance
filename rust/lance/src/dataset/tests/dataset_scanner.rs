@@ -1637,18 +1637,27 @@ async fn test_any_element_edge_rows() {
     assert!(negated.contains(&4) && !negated.contains(&5));
 }
 
+/// A predicate that names a column outside the element, or calls a function
+/// that is not immutable (compiled predicates are reused across queries, so
+/// `now()` would freeze), is rejected before any data is read.
+#[rstest]
+#[case::outside_column("any_element(detections, 'width > 1')", "width")]
+#[case::stable_function("any_element(detections, 'now() IS NOT NULL')", "calls now()")]
 #[tokio::test]
-async fn test_any_element_rejects_columns_outside_the_element() {
+async fn test_any_element_rejects_invalid_predicates(#[case] filter: &str, #[case] reason: &str) {
     let dataset = detection_dataset().await;
     let mut scanner = dataset.scan();
-    scanner
-        .filter("any_element(detections, 'width > 1')")
-        .unwrap();
+    scanner.filter(filter).unwrap();
     let err = scanner.try_into_batch().await.unwrap_err();
     assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
     let message = err.to_string();
     assert!(
-        message.contains("any_element") && message.contains("width"),
+        message.contains("any_element") && message.contains(reason),
         "{message}"
     );
+    let err = dataset
+        .count_rows(Some(filter.to_string()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(reason), "{err}");
 }

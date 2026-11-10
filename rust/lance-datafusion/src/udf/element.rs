@@ -30,7 +30,8 @@
 //! - otherwise FALSE, which includes the empty list.
 //!
 //! The predicate is compiled once per (predicate, element type) and cached for
-//! the process.
+//! the process, so it may only call immutable functions: a call to `now()` or
+//! `random()` is rejected when the query is planned.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -43,6 +44,7 @@ use arrow_array::{
     RecordBatchOptions,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
     Volatility,
@@ -88,15 +90,40 @@ fn element_schema(list_type: &DataType) -> Result<SchemaRef> {
 
 /// Parse and optimize an `any_element` predicate over the elements of
 /// `list_type`, the way Lance plans a filter.
+///
+/// Compiled predicates are reused across queries, and optimizing folds a stable
+/// function such as `now()` into a constant. So the predicate is checked for
+/// functions that are not immutable before it is optimized.
 fn parse_element_predicate(planner: &Planner, predicate: &str) -> Result<Expr> {
-    planner
-        .parse_filter(predicate)
-        .and_then(|expr| planner.optimize_expr(expr))
-        .map_err(|err| {
-            Error::invalid_input(format!(
-                "{ANY_ELEMENT}: cannot plan the predicate '{predicate}' over the element fields: {err}"
-            ))
-        })
+    let cannot_plan = |err: Error| {
+        Error::invalid_input(format!(
+            "{ANY_ELEMENT}: cannot plan the predicate '{predicate}' over the element fields: {err}"
+        ))
+    };
+    let expr = planner.parse_filter(predicate).map_err(cannot_plan)?;
+    if let Some(function) = first_non_immutable_function(&expr)? {
+        return Err(Error::invalid_input(format!(
+            "{ANY_ELEMENT}: the predicate '{predicate}' calls {function}(), which is not \
+             immutable; {ANY_ELEMENT} predicates may only call immutable functions"
+        )));
+    }
+    planner.optimize_expr(expr).map_err(cannot_plan)
+}
+
+/// The first function `expr` calls whose result can change between calls with
+/// the same arguments, such as `now()` or `random()`.
+fn first_non_immutable_function(expr: &Expr) -> Result<Option<String>> {
+    let mut found = None;
+    expr.apply(|node| {
+        if let Expr::ScalarFunction(call) = node
+            && call.func.signature().volatility != Volatility::Immutable
+        {
+            found = Some(call.func.name().to_string());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
 }
 
 fn predicate_str(value: &ScalarValue) -> Option<&str> {
@@ -498,6 +525,8 @@ mod tests {
     #[case::outside_column("any_element(detections, 'width > 1')", "width")]
     #[case::not_a_list("any_element(width, 'x > 1')", "list<struct>")]
     #[case::not_boolean("any_element(detections, 'area + 1')", "not boolean")]
+    #[case::stable_function("any_element(detections, 'now() IS NOT NULL')", "calls now()")]
+    #[case::volatile_function("any_element(detections, 'confidence < random()')", "calls random()")]
     fn test_predicate_errors_are_clear(#[case] filter: &str, #[case] message: &str) {
         let err = try_eval(filter, false).unwrap_err();
         let text = err.to_string();

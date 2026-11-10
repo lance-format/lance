@@ -645,7 +645,8 @@ a car below 0.9 next to another object above it.
 The predicate is a string literal that refers to the element's fields by name,
 and accepts the same expressions as any other filter. Because it is a string,
 single quotes inside it are doubled. It cannot refer to columns outside the
-element; combine those with `AND` or `OR` outside the call.
+element; combine those with `AND` or `OR` outside the call. It may only call
+immutable functions, so functions such as `now()` and `random()` are rejected.
 
 The result follows SQL three-valued logic: NULL for a null list, TRUE if the
 predicate is TRUE on some element, otherwise NULL if it is NULL on some element,
