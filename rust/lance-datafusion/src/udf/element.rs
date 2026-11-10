@@ -41,7 +41,7 @@ use arrow_array::builder::BooleanBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, GenericListArray, OffsetSizeTrait, RecordBatch,
-    RecordBatchOptions,
+    RecordBatchOptions, StructArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -170,6 +170,42 @@ fn compile(predicate: &str, list_type: &DataType) -> Result<Compiled> {
     Ok(compiled)
 }
 
+/// `array` with `null_mask` (TRUE where NULL) applied, and every struct's nulls
+/// pushed down into its children, so a field read below a NULL struct is NULL.
+///
+/// Arrow allows any values under a NULL slot, and DataFusion's `get_field`
+/// returns a struct's child as stored, without the struct's own nulls.
+fn with_nulls_pushed_down(
+    array: &ArrayRef,
+    null_mask: Option<&BooleanArray>,
+) -> DFResult<ArrayRef> {
+    let array = match null_mask {
+        Some(mask) => nullif(array, mask)?,
+        None => array.clone(),
+    };
+    let DataType::Struct(fields) = array.data_type() else {
+        return Ok(array);
+    };
+    if fields.is_empty() {
+        return Ok(array);
+    }
+    let parent = array.as_struct();
+    let child_mask = parent
+        .nulls()
+        .filter(|nulls| nulls.null_count() > 0)
+        .map(|nulls| BooleanArray::new(!nulls.inner(), None));
+    let children = parent
+        .columns()
+        .iter()
+        .map(|child| with_nulls_pushed_down(child, child_mask.as_ref()))
+        .collect::<DFResult<Vec<ArrayRef>>>()?;
+    Ok(Arc::new(StructArray::try_new(
+        fields.clone(),
+        children,
+        parent.nulls().cloned(),
+    )?))
+}
+
 /// Evaluate `predicate` on every element of `list` and fold the element
 /// results into one value per list, in SQL three-valued logic.
 fn any_element<O: OffsetSizeTrait>(
@@ -182,18 +218,16 @@ fn any_element<O: OffsetSizeTrait>(
     let end = offsets[list.len()].as_usize();
     let elements = list.values().slice(start, end - start);
     let elements = elements.as_struct();
-    // A NULL element reads as NULL in every field, whatever its child slots hold.
+    // A NULL element reads as NULL in every field, at every nesting level,
+    // whatever its child slots hold.
     let element_is_null = (elements.null_count() > 0)
         .then(|| is_null(elements))
         .transpose()?;
     let columns = elements
         .columns()
         .iter()
-        .map(|column| match &element_is_null {
-            Some(mask) => nullif(column, mask),
-            None => Ok(column.clone()),
-        })
-        .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
+        .map(|column| with_nulls_pushed_down(column, element_is_null.as_ref()))
+        .collect::<DFResult<Vec<ArrayRef>>>()?;
     let batch = RecordBatch::try_new_with_options(
         schema.clone(),
         columns,
@@ -324,7 +358,7 @@ mod tests {
     use super::*;
 
     use arrow::compute::cast;
-    use arrow_array::{Float32Array, Int32Array, ListArray, StringArray, StructArray};
+    use arrow_array::{Float32Array, Int32Array, ListArray, StringArray};
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::Fields;
     use rstest::rstest;
@@ -508,6 +542,68 @@ mod tests {
         for (filter, want) in cases {
             assert_eq!(eval(filter, false), BooleanArray::from(want), "{filter}");
         }
+    }
+
+    /// A field read below a NULL struct is NULL, whether the NULL is the
+    /// element itself or a struct field of the element.
+    #[test]
+    fn test_nested_fields_below_a_null_struct_are_null() {
+        let label = Field::new("label", DataType::Utf8, true);
+        let element_fields = Fields::from(vec![Field::new(
+            "details",
+            DataType::Struct(Fields::from(vec![label.clone()])),
+            true,
+        )]);
+        // Every hidden label is 'car': under a NULL element (row 0) and under a
+        // NULL `details` (row 1). Rows 2 and 3 hold a car and a truck.
+        let details = StructArray::try_new(
+            Fields::from(vec![label]),
+            vec![Arc::new(StringArray::from(vec!["car", "car", "car", "truck"])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        )
+        .unwrap();
+        let elements = StructArray::try_new(
+            element_fields.clone(),
+            vec![Arc::new(details) as ArrayRef],
+            Some(NullBuffer::from(vec![false, true, true, true])),
+        )
+        .unwrap();
+        let item = Arc::new(Field::new("item", DataType::Struct(element_fields), true));
+        let list = ListArray::try_new(
+            item.clone(),
+            OffsetBuffer::from_lengths([1, 1, 1, 1]),
+            Arc::new(elements),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "detections",
+            DataType::List(item),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+        let planner = Planner::new(schema);
+        let eval = |filter: &str| {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            let physical = planner.create_physical_expr(&expr).unwrap();
+            physical
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+                .as_boolean()
+                .clone()
+        };
+        assert_eq!(
+            eval("any_element(detections, 'details.label = ''car''')"),
+            BooleanArray::from(vec![N, N, T, F])
+        );
+        assert_eq!(
+            eval("any_element(detections, 'details.label IS NULL')"),
+            BooleanArray::from(vec![T, T, F, F])
+        );
     }
 
     #[test]
