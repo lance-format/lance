@@ -82,7 +82,8 @@ impl ProbeBounds {
 ///         … one per SSTable gen …
 ///         ProjectionExec (canonical output schema)
 ///           PkBlockFilterExec: block-list                     (base)
-///             KNNExec: base table, k (fast_search|flat)[.refine()?]
+///             ProjectionExec (_distance rescaled, flat unrefined only)
+///               KNNExec: base table, k (fast_search|flat)[.refine()?]
 /// ```
 ///
 /// # Index-Only Search (fast_search)
@@ -90,9 +91,10 @@ impl ProbeBounds {
 /// The base table and each SSTable are searched with `fast_search()` —
 /// index-only — when they hold a vector index usable for the query (matching
 /// column and metric); otherwise the arm falls back to the scanner's flat
-/// KNN, which reports exact distances. `fast_search()` over a source without
-/// a usable index returns nothing, so gating it is what keeps an unindexed
-/// base or generation visible instead of silently dropping its rows.
+/// KNN, which reports exact distances, rescaled to the plan's scale.
+/// `fast_search()` over a source without a usable index returns nothing, so
+/// gating it is what keeps an unindexed base or generation visible instead of
+/// silently dropping its rows.
 pub struct LsmVectorSearchPlanner {
     /// Data source collector.
     collector: LsmDataSourceCollector,
@@ -640,7 +642,23 @@ impl LsmVectorSearchPlanner {
                 }
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
-                scanner.distance_range(self.distance_range.0, self.distance_range.1);
+                // The base may have no vector index on the column, or only one
+                // whose metric differs from the query's. `fast_search` over
+                // such a base is empty, so search it flat. An indexed base
+                // already reports on the plan's scale (see
+                // `with_distance_scale`); a flat one reports exact distances.
+                let indexed =
+                    has_usable_vector_index(dataset, &self.vector_column, self.distance_type)
+                        .await?;
+                let scale = if indexed {
+                    1.0
+                } else {
+                    self.arm_scale(refine_factor, 1.0)
+                };
+                scanner.distance_range(
+                    self.distance_range.0.map(|lower| lower / scale),
+                    self.distance_range.1.map(|upper| upper / scale),
+                );
                 if let Some(minimum_nprobes) = probe_bounds.minimum_nprobes {
                     scanner.minimum_nprobes(minimum_nprobes);
                 }
@@ -651,21 +669,13 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = indexed_arm_ef(self.ef, requested_k, k, refine_factor) {
                     scanner.ef(ef);
                 }
-                // The base can predate index build on the column (a bulk
-                // load under `initialize_mem_wal`, rows folded in by
-                // compaction) or hold only an index whose metric differs from
-                // the query's. `fast_search` over such a base is empty, so
-                // search it flat, reporting exact distances.
-                let indexed =
-                    has_usable_vector_index(dataset, &self.vector_column, self.distance_type)
-                        .await?;
                 if indexed {
                     scanner.fast_search();
+                    if let Some(refine_factor) = refine_factor {
+                        scanner.refine(refine_factor);
+                    }
                 }
-                if indexed && let Some(refine_factor) = refine_factor {
-                    scanner.refine(refine_factor);
-                }
-                scanner.create_plan().await
+                scale_distance(scanner.create_plan().await?, scale)
             }
             LsmDataSource::SsTable { path, .. } => {
                 let dataset = open_sstable(
@@ -1602,8 +1612,9 @@ mod tests {
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
-        // Base rows are far and unindexed, so `fast_search` contributes nothing;
-        // the test isolates the memtable arms.
+        // Base rows are unindexed, so they are searched flat. They are far from
+        // the query, so they rank behind the memtable rows at k=2 and fail the
+        // upper bound, which isolates the memtable arms.
         let base_dataset = Arc::new(
             create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
         );
@@ -3801,10 +3812,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_base_without_vector_index_is_searched_flat() {
-        // A base table can predate any index build on the searched column (a
-        // bulk-loaded base under `initialize_mem_wal`, or rows folded in by
-        // compaction): `fast_search` over it returned an EmptyExec and its rows
-        // silently vanished from every vector search.
+        // A base with no vector index usable for the query (none on the
+        // column, or one with another metric): `fast_search` over it returned
+        // an EmptyExec and its rows silently vanished from every vector search.
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3832,44 +3842,67 @@ mod tests {
         rows.extend((10..=20).map(|id| (id, at(1.9, 1.0))));
         let mut base_dataset = create_dataset(&base_uri, vec![batch_rows(&schema, &rows)]).await;
 
-        let search = |base_dataset: &Dataset, distance_type: DistanceType| {
-            let planner = LsmVectorSearchPlanner::new(
-                LsmDataSourceCollector::new(Arc::new(base_dataset.clone()), vec![]),
-                vec!["id".to_string()],
-                schema.clone(),
-                "vector".to_string(),
-                distance_type,
-            );
-            let query = query.clone();
-            async move {
-                let plan = planner
-                    .plan_search(&query, 2, 1, None, false, 1.0)
-                    .await
-                    .unwrap();
-                let batches: Vec<RecordBatch> = plan
-                    .execute(0, SessionContext::new().task_ctx())
-                    .unwrap()
-                    .try_collect()
-                    .await
-                    .unwrap();
-                collect_id_dist(&batches)
-            }
-        };
-        let assert_rows = |what: &str, rows: &[(i32, f32)]| {
-            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
-            assert_eq!(ids, vec![1, 2], "{what}: got {rows:?}");
-            for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
-                assert!(
-                    (distance - exact).abs() < 1e-4,
-                    "{what}: id={id} reported {distance}, expected {exact}"
+        let search =
+            |base_dataset: &Dataset, scale: f32, refine: Option<u32>, upper: Option<f32>| {
+                let planner = LsmVectorSearchPlanner::new(
+                    LsmDataSourceCollector::new(Arc::new(base_dataset.clone()), vec![]),
+                    vec!["id".to_string()],
+                    schema.clone(),
+                    "vector".to_string(),
+                    DistanceType::Cosine,
+                )
+                .with_distance_scale(scale)
+                .with_refine_factor(refine)
+                .with_distance_range(None, upper);
+                let query = query.clone();
+                async move {
+                    let plan = planner
+                        .plan_search(&query, 2, 1, None, false, 1.0)
+                        .await
+                        .unwrap();
+                    let batches: Vec<RecordBatch> = plan
+                        .execute(0, SessionContext::new().task_ctx())
+                        .unwrap()
+                        .try_collect()
+                        .await
+                        .unwrap();
+                    collect_id_dist(&batches)
+                }
+            };
+        let check = async |what: &str, base_dataset: &Dataset| {
+            // Flat distances are exact, so they are reported on the plan's
+            // scale unless the search is refined.
+            for (scale, refine, reported) in
+                [(1.0, None, 1.0), (2.0, None, 2.0), (2.0, Some(1), 1.0)]
+            {
+                let rows = search(base_dataset, scale, refine, None).await;
+                let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+                assert_eq!(
+                    ids,
+                    vec![1, 2],
+                    "{what}, scale={scale} refine={refine:?}: got {rows:?}"
                 );
+                for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
+                    assert!(
+                        (distance - exact * reported).abs() < 1e-4,
+                        "{what}, scale={scale} refine={refine:?}: id={id} reported \
+                         {distance}, expected {}",
+                        exact * reported
+                    );
+                }
             }
+            // The range is given on the plan's scale: on the 2x scale, an upper
+            // bound of 0.5 is an exact distance of 0.25, which only id=1 passes.
+            let rows = search(base_dataset, 2.0, None, Some(0.5)).await;
+            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(
+                ids,
+                vec![1],
+                "{what}, bounded on the 2x scale: got {rows:?}"
+            );
         };
 
-        // No vector index on the base: it is searched flat, reporting exact
-        // distances.
-        let rows = search(&base_dataset, DistanceType::Cosine).await;
-        assert_rows("unindexed base", &rows);
+        check("unindexed base", &base_dataset).await;
 
         // An index whose metric differs from the query's is not usable either;
         // the arm must fall back to flat instead of returning nothing.
@@ -3878,8 +3911,7 @@ mod tests {
             .create_index(&["vector"], IndexType::Vector, None, &l2_index, true)
             .await
             .unwrap();
-        let rows = search(&base_dataset, DistanceType::Cosine).await;
-        assert_rows("metric-mismatched base index", &rows);
+        check("metric-mismatched base index", &base_dataset).await;
     }
 
     #[tokio::test]
