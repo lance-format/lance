@@ -757,16 +757,11 @@ pub async fn merge_rtree_indices(
         .unwrap_or(&source_indices[0]);
     let page_size = first_contributing.metadata.page_size;
     validate_page_size(page_size)?;
+    // Every source must already agree on this (see the doc comment above);
+    // the caller is responsible for enforcing it, same as
+    // `NGramIndex::merge_segments`'s equivalent `results_are_row_addresses`
+    // parameter.
     let results_are_row_addresses = source_indices[0].results_are_row_addresses;
-    if source_indices
-        .iter()
-        .any(|source| source.results_are_row_addresses != results_are_row_addresses)
-    {
-        return Err(Error::invalid_input(
-            "cannot merge RTree segments that disagree on whether they store row ids or row \
-             addresses -- rebuild them into one segment first",
-        ));
-    }
     let mut data_streams = Vec::with_capacity(source_indices.len());
     let mut null_map = RowAddrTreeMap::new();
 
