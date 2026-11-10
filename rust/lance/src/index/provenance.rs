@@ -504,8 +504,8 @@ fn indexed_overlays<'a>(
 /// Whether a row deleted in `before` is live again in `after` (only a restore
 /// does this; an index built in between never saw the row).
 async fn revives_rows<T: TableVersion>(
-    before: &Snapshot<T>,
-    after: &Snapshot<T>,
+    before: &T,
+    after: &T,
     then: &Fragment,
     now: &Fragment,
 ) -> Result<bool> {
@@ -518,9 +518,42 @@ async fn revives_rows<T: TableVersion>(
     if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
         return Ok(false);
     }
-    let rows_then = before.table.deleted_rows(then, deleted_then).await?;
-    let rows_now = after.table.deleted_rows(now, deleted_now).await?;
+    let rows_then = before.deleted_rows(then, deleted_then).await?;
+    let rows_now = after.deleted_rows(now, deleted_now).await?;
     Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+}
+
+/// The fragments of `covered` in which a row deleted in `before` is live in
+/// `after` ([`revives_rows`]): an index built at `before` is missing that row.
+/// Both deletion files are read through `dataset`. A deletion file that
+/// cleanup removed cannot rule out a revival, so its fragment counts as one.
+pub(crate) async fn revived_fragments(
+    dataset: &Dataset,
+    before: &[Fragment],
+    after: &[Fragment],
+    covered: &RoaringBitmap,
+) -> Result<RoaringBitmap> {
+    let after = after
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect::<HashMap<_, _>>();
+    let mut revived = RoaringBitmap::new();
+    for then in before {
+        let (Ok(id), Some(now)) = (u32::try_from(then.id), after.get(&then.id)) else {
+            continue;
+        };
+        if !covered.contains(id) {
+            continue;
+        }
+        match revives_rows(dataset, dataset, then, now).await {
+            Ok(false) => {}
+            Ok(true) | Err(Error::NotFound { .. }) => {
+                revived.insert(id);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(revived)
 }
 
 /// Whether `fragment`'s indexed data differs between `before` and `after`: a
@@ -542,7 +575,7 @@ async fn indexed_data_differs<T: TableVersion>(
     {
         return Ok(true);
     }
-    revives_rows(before, after, then, now).await
+    revives_rows(&before.table, &after.table, then, now).await
 }
 
 /// The fragments of a segment's build snapshot that the recorded rewrites
@@ -842,6 +875,19 @@ pub(crate) async fn prune_stale_segment_coverage(
             .iter()
             .map(|fragment| (fragment.id as u32, fragment))
             .collect::<HashMap<_, _>>();
+        let covered = segments
+            .iter()
+            .filter(|segment| segment.dataset_version() == version)
+            .fold(RoaringBitmap::new(), |covered, segment| {
+                covered | segment.fragment_bitmap()
+            });
+        let revived = revived_fragments(
+            dataset,
+            historical.fragments(),
+            dataset.fragments(),
+            &covered,
+        )
+        .await?;
 
         for segment in segments
             .iter_mut()
@@ -889,7 +935,7 @@ pub(crate) async fn prune_stale_segment_coverage(
                             &indexed_field_ids,
                             dataset.schema(),
                         );
-                    changed_files || changed_overlays
+                    changed_files || changed_overlays || revived.contains(*fragment_id)
                 })
                 .collect::<Vec<_>>();
             for fragment_id in stale_fragments {

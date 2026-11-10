@@ -308,6 +308,67 @@ async fn index_build_after_cleanup_withdraws_rewritten_retired_provenance(
     );
 }
 
+/// A segment built while a row was deleted never indexed it. A restore that
+/// revives the row must withdraw the fragment from the segment's coverage,
+/// whether the restore is hidden by cleanup (committed through the stale
+/// handle) or validated against history (committed through the latest handle).
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn index_built_before_a_restore_withdraws_revived_rows(
+    #[values(false, true)] has_cleanup: bool,
+    #[values(false, true)] deletes_after_restore: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut stale = fixture(dir.as_str()).await;
+    stale.delete("i = 1").await.unwrap();
+    let segment = stage(&stale, "i", IndexType::BTree, vec![0, 1]).await.1;
+
+    let mut latest = stale.checkout_version(1).await.unwrap();
+    latest.restore().await.unwrap();
+    if deletes_after_restore {
+        latest.delete("i = 2").await.unwrap();
+    }
+    let window_end = latest.version().version;
+    let mut latest = crate::dataset::CommitBuilder::new(Arc::new(latest))
+        .execute(Transaction::new(
+            window_end,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        ))
+        .await
+        .unwrap();
+    if has_cleanup {
+        let stats = latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions((1..=window_end).collect())
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, window_end);
+        stale
+            .commit_existing_index_segments("idx", "i", vec![segment])
+            .await
+            .unwrap();
+    } else {
+        latest
+            .commit_existing_index_segments("idx", "i", vec![segment])
+            .await
+            .unwrap();
+    }
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(assert_index_serves(&dataset, "i = 1").await, vec![1]);
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    assert_eq!(stored_bitmap(&stored), RoaringBitmap::from_iter([1u32]));
+}
+
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn multi_segment_fmindex_after_cleanup_returns_empty_definition_and_scans() {

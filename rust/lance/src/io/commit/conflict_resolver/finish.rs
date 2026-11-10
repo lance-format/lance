@@ -397,6 +397,28 @@ impl<'a> TransactionRebase<'a> {
                     dataset.fragment_bitmap.as_ref(),
                     self.current_lineage.as_ref(),
                 );
+
+                // Cleanup can also hide a restore that revived rows deleted
+                // in the build snapshot, which the index never saw.
+                let covered = new_indices
+                    .iter()
+                    .filter(|index| !is_system_index(index))
+                    .filter_map(|index| index.fragment_bitmap.as_ref())
+                    .fold(RoaringBitmap::new(), |covered, bitmap| covered | bitmap);
+                let revived = crate::index::provenance::revived_fragments(
+                    dataset,
+                    read_fragments,
+                    dataset.fragments(),
+                    &covered,
+                )
+                .await?;
+                for index in new_indices.iter_mut() {
+                    if !is_system_index(index)
+                        && let Some(bitmap) = &mut index.fragment_bitmap
+                    {
+                        *bitmap -= &revived;
+                    }
+                }
             }
 
             // A rewrite committed since this build started retired its source
