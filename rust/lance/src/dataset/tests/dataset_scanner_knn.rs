@@ -226,21 +226,24 @@ async fn test_cross_column_refinement_validation_and_reset() {
     let mut scan = dataset.scan();
     let error = scan
         .with_refine_column("full", &full, MetricType::Cosine)
-        .unwrap_err();
+        .err()
+        .unwrap();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("nearest must be set"));
 
     scan.nearest("coarse", &coarse, 2).unwrap();
     let error = scan
         .with_refine_column("id", &full, MetricType::Cosine)
-        .unwrap_err();
+        .err()
+        .unwrap();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("vector"));
 
     let wrong_type = arrow_array::Float64Array::from(vec![0.1; 8]);
     let error = scan
         .with_refine_column("full", &wrong_type, MetricType::Cosine)
-        .unwrap_err();
+        .err()
+        .unwrap();
     assert!(matches!(error, Error::InvalidInput { .. }));
     assert!(error.to_string().contains("Float32"));
 

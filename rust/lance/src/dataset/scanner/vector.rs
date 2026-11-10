@@ -151,7 +151,7 @@ impl Scanner {
 
         if let Some(refine) = &self.nearest_refine {
             if self.is_batch_nearest {
-                return self.batch_per_query_vector_search(filter_plan, q).await;
+                return self.batch_per_query_vector_search(filter_plan, &q).await;
             }
             return self
                 .cross_column_vector_search(filter_plan, &q, refine)
