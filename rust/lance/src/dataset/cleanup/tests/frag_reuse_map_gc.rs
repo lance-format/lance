@@ -449,7 +449,7 @@ async fn reference_resolution_reads_external_entries() {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value: reader_tests::field(1, &unknown_content),
         })),
-        ..entry
+        ..entry.clone()
     };
     let mut inspection = CleanupInspection::default();
     inspection
@@ -459,6 +459,25 @@ async fn reference_resolution_reads_external_entries() {
         !task.resolve_frag_reuse_map_ids(&mut inspection).await,
         "an unknown envelope record must disable _fri collection"
     );
+
+    // An entry whose content an earlier release removed is skipped when
+    // only detached versions carry it, and still disables `_fri`
+    // collection when an attached version does.
+    dataset.object_store.delete(&details_path).await.unwrap();
+    for attached in [false, true] {
+        let mut inspection = CleanupInspection::default();
+        inspection
+            .frag_reuse_entries
+            .insert(uuid, (entry.clone(), true));
+        if attached {
+            inspection.attached_frag_reuse_entries.insert(uuid);
+        }
+        assert_eq!(
+            task.resolve_frag_reuse_map_ids(&mut inspection).await,
+            !attached
+        );
+        assert!(inspection.referenced_files.frag_reuse_map_ids.is_empty());
+    }
 }
 
 /// E: the full lifecycle, asserting every stage. A stable-partition

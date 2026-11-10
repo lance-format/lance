@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use crate::dataset::optimize::planning::{
     CandidateBin, CompactionCandidacy, FragmentMetrics, HELD_BACK_SAMPLE_LIMIT, describe_held,
-    fragment_file_bytes,
+    fragment_file_bytes, limit_tasks_to_source_budget,
 };
 
 /// The hold-back log names at most [`HELD_BACK_SAMPLE_LIMIT`] fragment ids,
@@ -596,6 +596,35 @@ async fn grouped_compaction_replaces_only_the_selected_fragments() {
 
     // The non-adjacent remainder under a fragment budget: over budget is
     // not planned and nothing is written; within budget it compacts.
+    let mut missing_size = dataset.clone();
+    let manifest = Arc::make_mut(&mut missing_size.manifest);
+    Arc::make_mut(&mut manifest.fragments)[0].files[0].file_size_bytes = CachedFileSize::unknown();
+    let groups = vec![group(&[&after[0], &after[1]], &[("group", "b")])];
+
+    let soft_plan = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..options.clone()
+    })
+    .unwrap()
+    .plan_groups(&missing_size, groups.clone())
+    .await
+    .unwrap();
+    assert_eq!(soft_plan.tasks.len(), 1);
+    assert_eq!(soft_plan.tasks[0].fragments.len(), 2);
+
+    let hard_plan = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        ..options.clone()
+    })
+    .unwrap()
+    .plan_groups(&missing_size, groups)
+    .await
+    .unwrap();
+    assert!(hard_plan.tasks.is_empty(), "{:?}", hard_plan.tasks);
+
     let metrics = compact_files_with_planner(
         &mut dataset,
         None,
@@ -2251,6 +2280,10 @@ fn test_from_dataset_config() {
             "lance.compaction.max_source_bytes".to_string(),
             "1073741824".to_string(),
         ),
+        (
+            "lance.compaction.source_budget_mode".to_string(),
+            "soft".to_string(),
+        ),
     ]);
 
     let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -2270,23 +2303,25 @@ fn test_from_dataset_config() {
     assert_eq!(opts.max_source_fragments, Some(20));
     assert_eq!(opts.max_source_rows, Some(1_000_000));
     assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
+    assert_eq!(opts.source_budget_mode, SourceBudgetMode::Soft);
 
     let mut serialized = serde_json::to_value(&opts).unwrap();
     assert_eq!(
         serde_json::from_value::<CompactionOptions>(serialized.clone()).unwrap(),
         opts
     );
-    // Older serialized options omit the byte threshold.
+    // Older serialized options omit newer defaults.
     serialized
         .as_object_mut()
         .unwrap()
         .remove("min_bytes_per_file");
-    assert_eq!(
-        serde_json::from_value::<CompactionOptions>(serialized)
-            .unwrap()
-            .min_bytes_per_file,
-        None
-    );
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("source_budget_mode");
+    let decoded = serde_json::from_value::<CompactionOptions>(serialized).unwrap();
+    assert_eq!(decoded.min_bytes_per_file, None);
+    assert_eq!(decoded.source_budget_mode, SourceBudgetMode::Hard);
 }
 #[test]
 fn test_from_dataset_config_empty() {
@@ -2414,6 +2449,17 @@ fn test_from_dataset_config_invalid_compaction_mode() {
     let result = CompactionOptions::from_dataset_config(&config);
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("invalid_mode"));
+}
+
+#[test]
+fn test_from_dataset_config_invalid_source_budget_mode() {
+    let config = HashMap::from([(
+        "lance.compaction.source_budget_mode".to_string(),
+        "invalid".to_string(),
+    )]);
+
+    let err = CompactionOptions::from_dataset_config(&config).unwrap_err();
+    assert!(err.to_string().contains("Invalid source budget mode"));
 }
 #[test]
 fn test_from_dataset_config_max_overlays_per_fragment() {
@@ -2612,6 +2658,177 @@ async fn test_max_source_rows() {
         .sum();
     assert_eq!(physical_rows, 300);
 }
+
+#[tokio::test]
+async fn test_soft_source_budget_admits_one_oversized_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+    // The first task contains three fragments and 250 live rows, and its
+    // source files are larger than one byte. In soft mode it is admitted
+    // so compaction can make progress, but the next task is not.
+    let opts = CompactionOptions {
+        target_rows_per_fragment: 250,
+        max_source_fragments: Some(1),
+        max_source_rows: Some(1),
+        max_source_bytes: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &opts).await.unwrap();
+
+    assert_eq!(plan.num_tasks(), 1);
+    assert_eq!(plan.tasks()[0].fragments.len(), 3);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_missing_first_task_size() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    all_tasks[0].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let hard = CompactionOptions {
+        max_source_bytes: Some(1),
+        ..Default::default()
+    };
+    let err = limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+    assert!(err.to_string().contains("has no size recorded"));
+
+    let soft = CompactionOptions {
+        max_source_bytes: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_keeps_prefix_before_unknown_later_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    assert!(
+        all_tasks[0].0.fragments[0].files[0]
+            .file_size_bytes
+            .get()
+            .is_some()
+    );
+    all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let hard = CompactionOptions {
+        max_source_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    let err = limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+    assert!(err.to_string().contains("has no size recorded"));
+
+    let soft = CompactionOptions {
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_stops_after_oversized_first_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    // The first task has known source sizes and exceeds the row budget.
+    // The second task's unknown size must not be inspected after soft mode
+    // admits the first task, because the plan must stop at that point.
+    assert!(
+        all_tasks[0].0.fragments[0].files[0]
+            .file_size_bytes
+            .get()
+            .is_some()
+    );
+    all_tasks[0].1 = 2;
+    all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let soft = CompactionOptions {
+        max_source_rows: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_uses_cumulative_totals_after_first_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 2);
+
+    // Each task's synthetic row count fits the budget independently. The
+    // first two fit cumulatively, but adding the third exceeds the total.
+    let all_tasks = plan
+        .tasks
+        .into_iter()
+        .take(3)
+        .map(|task| (task, 2))
+        .collect::<Vec<_>>();
+    let hard = CompactionOptions {
+        max_source_rows: Some(5),
+        ..Default::default()
+    };
+    let soft = CompactionOptions {
+        max_source_rows: Some(5),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+
+    let hard_selected =
+        limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap();
+    let soft_selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(hard_selected.len(), 2);
+    assert_eq!(soft_selected, hard_selected);
+}
+
 #[tokio::test]
 async fn test_max_source_bytes() {
     let test_dir = TempStrDir::default();

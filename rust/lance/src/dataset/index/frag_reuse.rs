@@ -281,12 +281,21 @@ pub(crate) fn is_index_remap_caught_up(
         return Ok(true);
     }
 
+    index_postdates_rewrite(frag_reuse_version, index_meta)
+}
+
+/// Built after the rewrite and covering none of its sources. No disjoint
+/// shortcut: coverage can be withdrawn while the index data keeps the rows.
+pub(crate) fn index_postdates_rewrite(
+    frag_reuse_version: &FragReuseVersion,
+    index_meta: &IndexMetadata,
+) -> lance_core::Result<bool> {
     // Inclusive: an index built at dataset_version predates the rewrite.
     if index_meta.dataset_version <= frag_reuse_version.dataset_version {
         return Ok(false);
     }
 
-    match index_meta.fragment_bitmap.clone() {
+    match &index_meta.fragment_bitmap {
         Some(index_frag_bitmap) => {
             for group in frag_reuse_version.groups.iter() {
                 let mut old_frag_in_index = 0;
@@ -963,7 +972,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
     use crate::index::DatasetIndexExt;
@@ -986,7 +995,7 @@ mod tests {
         }
     }
 
-    fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
+    pub fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
         FragReuseVersion {
             dataset_version,
             groups: vec![lance_index::frag_reuse::FragReuseGroup {
@@ -997,7 +1006,7 @@ mod tests {
         }
     }
 
-    fn index_covering(dataset_version: u64, covered: &[u32]) -> IndexMetadata {
+    pub fn index_covering(dataset_version: u64, covered: &[u32]) -> IndexMetadata {
         IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             fields: vec![0],

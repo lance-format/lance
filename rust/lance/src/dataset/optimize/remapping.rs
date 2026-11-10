@@ -4280,6 +4280,83 @@ mod tests {
             }
         }
 
+        /// A remap commits each vector segment it translates as a
+        /// `CreateIndex`, whose check reads every segment of the index. A
+        /// sibling the history cannot translate, here one without a fragment
+        /// bitmap, is left for a rebuild, and its commit check reads it from
+        /// its file rather than through the history.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn vector_remap_beside_an_untranslatable_segment() {
+            use crate::index::frag_reuse::{MissingCoverageReason, segment_coverage_reason};
+            use crate::index::vector::VectorIndexParams;
+            use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+            use arrow_array::types::Float32Type;
+            use lance_datagen::Dimension;
+            use lance_linalg::distance::DistanceType;
+
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .col(
+                    "vec",
+                    lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(VEC_DIM)),
+                )
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+                .await
+                .unwrap();
+            let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+            dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("vec_idx".into()),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+            let translated = stored_index(&dataset, "vec_idx").await.uuid;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+            let mut sibling = dataset
+                .create_index_builder(&["vec"], IndexType::Vector, &params)
+                .name("worker_idx".into())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            sibling.name = "vec_idx".into();
+            sibling.fragment_bitmap = None;
+            let mut indices = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .as_ref()
+                .clone();
+            indices.push(sibling.clone());
+            reader_tests::persist_fixture(&mut dataset, indices).await;
+            assert_eq!(
+                segment_coverage_reason(&dataset, &sibling).await.unwrap(),
+                Some(MissingCoverageReason::Unsupported)
+            );
+
+            remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+                .await
+                .unwrap();
+            let segments = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "vec_idx")
+                .map(|index| (index.uuid, index.fragment_bitmap.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(segments.len(), 2, "{segments:?}");
+            assert!(segments.contains(&(sibling.uuid, None)), "{segments:?}");
+            assert!(
+                segments.iter().all(|(uuid, _)| *uuid != translated),
+                "the translatable segment is replaced by its remap: {segments:?}"
+            );
+        }
+
         // ------------------------------------------------------------------
         // One call visits every stored segment of the name.
         // ------------------------------------------------------------------
