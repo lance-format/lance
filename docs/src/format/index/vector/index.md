@@ -61,14 +61,17 @@ row ids throughout, and merging never combines segments of differing domain.
 
 ## Coarse-routing fingerprint
 
-The manifest's per-segment `VectorIndexDetails` may contain
-`coarse_quantizer_fingerprint` (optional bytes, protobuf field 10). The value is
-the raw 32-byte output of unkeyed BLAKE3, not a hexadecimal string. It identifies
-the effective IVF coarse-routing model, not the entire index or its data.
-It does not establish compatibility of quantization codebooks or permit physical
-segment merging by itself.
+Each segment's manifest `VectorIndexDetails` may contain
+`coarse_quantizer_fingerprint` (optional bytes, field 10): the raw 32-byte output
+of unkeyed BLAKE3, not hexadecimal text. It identifies the final persisted IVF
+coarse-routing state, not the entire index, quantization codebook compatibility,
+or eligibility for physical segment merging.
 
-### Canonical input encoding
+Writers must recompute the fingerprint when routing state changes, and omit or
+clear it when no reliable fingerprint can be computed. An unchanged routing
+state may retain its fingerprint.
+
+### Encoding
 
 Hash the concatenation of the following bytes, in this order, without padding,
 length prefixes other than the two dimensions below, or a trailing terminator:
@@ -90,41 +93,25 @@ length prefixes other than the two dimensions below, or a trailing terminator:
    complement byte. Do not round, cast, reorder, or normalize values while
    hashing; signed zeros and NaN payloads retain their distinct bit patterns.
 
-Arrow field names, nullability annotations, allocation layout, partition offsets
-and lengths, training loss, and quantization state are not hash inputs. Missing
-centroids, null centroid rows or scalar values, and unlisted scalar types cannot
-be represented by this encoding; writers omit the field for those models.
-The encoding describes routing determined solely by the centroids and metric.
-Routers with additional effective state, such as a query pre-transform or an
-approximate coarse-search graph, must not emit this encoding for that state.
+Only the inputs above are hashed; Arrow metadata, storage layout, training loss,
+and quantization state are excluded. Writers omit the field for missing centroids,
+null rows or scalar values, unlisted scalar types, or additional routing state
+not covered by this encoding, such as a query pre-transform or coarse-search graph.
 
-### Writer lifecycle
+### Compatibility
 
-A present fingerprint must describe the final model written to the segment,
-after training, conversion, and partition splitting or joining. Creating or
-appending a segment, retraining, or rebalancing requires computing the identity
-from that final model, not from requested build parameters or another segment's
-metadata. A pure remap or file copy may preserve the identity when routing is
-unchanged. A compatible physical merge may preserve a common identity only when
-all inputs carry that identity and the output retains the same routing model;
-otherwise compute it from the final output model or omit it. Writers must clear
-an inherited identity when they cannot establish this invariant.
+Readers may reuse routing among segments with equal, exactly 32-byte fingerprints;
+each segment still searches its own partitions. Missing fields, undecodable vector
+metadata, or other byte lengths require independent routing for that segment,
+without preventing reuse among the remaining compatible segments. Unequal
+fingerprints must not share routing. The fingerprint is a writer assertion,
+not an index-file integrity checksum.
 
-### Reader behavior and evolution
-
-Readers may group segments with equal, exactly 32-byte fingerprints and evaluate
-centroid routing once per group for a query. Each segment still searches its own
-partitions. A missing field, undecodable vector metadata, or any other byte
-length disables sharing for that segment; unequal identities are never grouped.
-The remaining compatible segments may still share routing. The identity is a
-writer assertion, not a checksum that authenticates the index files.
-
-Older readers ignore the optional field. Existing indices do not require a
-rewrite: segments without the field continue independent routing. The encoding
-above must not be repurposed for different routing semantics. Any future
-identity encoding requires a separately specified domain and must not make
-incompatible routing states compare equal; until then, unsupported writers omit
-the field. There is no separate version byte in the stored digest.
+Older readers may ignore the optional field; existing indices need no rewrite
+and use independent routing when it is absent. This encoding must not be
+repurposed for different routing semantics. Future encodings require a separately
+specified domain and must not make incompatible routing states compare equal.
+The stored digest has no separate version byte.
 
 ## PCA Pre-transform
 
