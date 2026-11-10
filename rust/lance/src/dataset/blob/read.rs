@@ -1382,7 +1382,7 @@ mod tests {
         .unwrap();
 
         let mut source = Dataset::open(source_dir.as_ref()).await.unwrap();
-        let source_blobs = source
+        let source_blobs = Arc::new(source.clone())
             .take_blobs_by_indices(&[2, 1, 0], "blob")
             .await
             .unwrap();
@@ -1411,7 +1411,7 @@ mod tests {
             .shallow_clone(clone_dir.as_ref(), source.version_id(), None)
             .await
             .unwrap();
-        let cloned = Dataset::open(clone_dir.as_ref()).await.unwrap();
+        let cloned = Arc::new(Dataset::open(clone_dir.as_ref()).await.unwrap());
         let data_file = cloned.get_fragments()[0].metadata.files[0].clone();
         assert!(
             data_file.base_id.is_some(),
