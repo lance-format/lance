@@ -487,12 +487,13 @@ impl IntoJava for &CompactionOptions {
             SourceBudgetMode::Hard => "HARD",
             SourceBudgetMode::Soft => "SOFT",
         };
-        let source_budget_mode = env.get_static_field(
-            SOURCE_BUDGET_MODE_CLASS,
-            source_budget_mode_name,
-            format!("L{};", SOURCE_BUDGET_MODE_CLASS),
-        )?
-        .l()?;
+        let source_budget_mode = env
+            .get_static_field(
+                SOURCE_BUDGET_MODE_CLASS,
+                source_budget_mode_name,
+                format!("L{};", SOURCE_BUDGET_MODE_CLASS),
+            )?
+            .l()?;
         let source_budget_mode_opt = to_java_optional(env, source_budget_mode)?;
 
         Ok(env.new_object(

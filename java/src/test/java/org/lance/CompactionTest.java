@@ -74,8 +74,7 @@ public class CompactionTest {
         assertEquals(
             Optional.of(version.toRustString()), compactionOptions.getDataStorageVersion());
         assertEquals(
-            Optional.of(SourceBudgetMode.SOFT.getValue()),
-            compactionOptions.getSourceBudgetMode());
+            Optional.of(SourceBudgetMode.SOFT.getValue()), compactionOptions.getSourceBudgetMode());
         if (version == DataStorageVersion.LEGACY) {
           CompactionOptions legacyOptions = compactionOptions;
           IllegalArgumentException error =
