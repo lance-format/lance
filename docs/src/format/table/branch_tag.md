@@ -5,6 +5,11 @@
 Lance supports branching and tagging for managing multiple independent version histories and creating named references to specific versions.
 Branches enable parallel development workflows, while tags provide stable named references for important versions.
 
+For tables with [atomic snapshot retention](snapshot_retention.md) activated,
+`_refs/retention/state.json` is authoritative for new and changed references.
+Its maps overlay the historical files below; tombstones suppress deleted
+references. Retention tokens and operation journals are persisted metadata.
+
 ## Branching
 
 ### Branch Name

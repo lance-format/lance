@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.dataset.retention;
+
+/* Persisted explicit-release snapshot protection token, encoded as hexadecimal
+ * in table-root references, reference-operation journals, and query projections.
+ * Decoding does not acquire protection. See the atomic snapshot retention spec.
+ */
+message SnapshotRetention {
+  uint32 protocol_version = 1;
+  // Encoded compact lance.snapshot.SnapshotRef, without manifest contents.
+  bytes snapshot = 2;
+  string tag_name = 3;
+}

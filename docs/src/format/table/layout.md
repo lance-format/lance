@@ -53,6 +53,12 @@ A Lance dataset in its basic form stores all files within the dataset root direc
             
 ```
 
+Activated [atomic snapshot retention](snapshot_retention.md) adds
+`_refs/retention/`, containing the authoritative root, permanent per-manifest
+retirement records, publication intents, reference journals, exact deletion
+plans, and permanent retired-name shards. The root overlays historical tag and
+branch metadata. Ordinary inactive tables retain the layout above.
+
 ## Base Path System
 
 ### BasePath Message
