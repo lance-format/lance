@@ -8,6 +8,7 @@ import time
 import traceback
 from enum import Enum
 from multiprocessing import Process, Queue, Value
+from multiprocessing.reduction import ForkingPickler
 from queue import Empty, Full
 from typing import Callable, Iterable
 
@@ -27,6 +28,11 @@ class _Message(Enum):
 
 
 def _send(queue: Queue, shutdown: Value, message: tuple[_Message, object]) -> bool:
+    if shutdown.value:
+        return False
+    if message[0] is _Message.DATA:
+        # Queue's feeder thread cannot propagate serialization failures to us.
+        message = (_Message.DATA, bytes(ForkingPickler.dumps(message[1])))
     while not shutdown.value:
         try:
             queue.put(message, timeout=_QUEUE_POLL_SECONDS)
@@ -74,10 +80,13 @@ class AsyncDataset(IterableDataset):
     """Prefetch epochs in one persistent worker process.
 
     Worker exceptions and unexpected exits raise :class:`RuntimeError` in the
-    consumer. Close the dataset, or use :func:`async_dataset`, when abandoning
-    an epoch. Closing its iterator also closes the dataset, so partially consumed
-    epochs cannot be mistaken for a fresh epoch. Closing an unused dataset never
-    starts a worker, and repeated calls to :meth:`close` are harmless.
+    consumer, including errors serializing a yielded item. After abandoning an
+    epoch, the next iterator discards its remaining items through the epoch-end
+    marker before yielding a fresh epoch from the same worker. Close a retained
+    iterator before starting another; overlapping iterators are not supported.
+    Use :meth:`close` or :func:`async_dataset` to stop prefetching when finished.
+    Closing an unused dataset never starts a worker, and repeated calls to
+    :meth:`close` are harmless.
 
     Parameters
     ----------
@@ -98,6 +107,8 @@ class AsyncDataset(IterableDataset):
         self.queue = Queue(maxsize=queue_size)
         self.started = False
         self._closed = False
+        self._iterating = False
+        self._epoch_pending = False
 
         # Only the parent writes this byte. A process lock could be left held by
         # a killed worker and prevent even the bounded shutdown from starting.
@@ -123,47 +134,70 @@ class AsyncDataset(IterableDataset):
         # EOF from interrupting a partial-frame read after the worker dies.
         self.queue._writer.close()
 
+    def _receive(self) -> tuple[_Message, object]:
+        while not self._closed:
+            try:
+                kind, payload = self.queue.get(timeout=_QUEUE_POLL_SECONDS)
+                if kind is _Message.DATA:
+                    payload = ForkingPickler.loads(payload)
+            except Empty:
+                if not self.worker.is_alive():
+                    raise RuntimeError(
+                        "AsyncDataset worker exited unexpectedly "
+                        f"with exit code {self.worker.exitcode}"
+                    ) from None
+                continue
+            except (EOFError, OSError) as error:
+                self.worker.join(timeout=_QUEUE_POLL_SECONDS)
+                exit_code = self.worker.exitcode
+                status = (
+                    f"exited unexpectedly with exit code {exit_code}"
+                    if exit_code is not None
+                    else "connection failed while still running"
+                )
+                raise RuntimeError(
+                    f"AsyncDataset worker {status} during a transfer"
+                ) from error
+            if kind is _Message.ERROR:
+                raise RuntimeError(f"AsyncDataset worker failed:\n{payload}")
+            if kind is _Message.SHUTDOWN:
+                raise RuntimeError(
+                    "AsyncDataset worker shut down before epoch completion"
+                )
+            if kind not in (_Message.DATA, _Message.EPOCH_END):
+                raise RuntimeError(f"Unexpected AsyncDataset message: {kind!r}")
+            return kind, payload
+        raise RuntimeError("AsyncDataset is closed")
+
     def __iter__(self):
         self._start()
-        epoch_complete = False
+        if self._iterating:
+            raise RuntimeError(
+                "An AsyncDataset iterator is already active; close it before "
+                "starting another epoch"
+            )
+        self._iterating = True
         try:
+            while self._epoch_pending and not self._closed:
+                kind, _ = self._receive()
+                if kind is _Message.EPOCH_END:
+                    self._epoch_pending = False
+            if self._closed:
+                return
+            self._epoch_pending = True
             while not self._closed:
-                try:
-                    kind, payload = self.queue.get(timeout=_QUEUE_POLL_SECONDS)
-                except Empty:
-                    if not self.worker.is_alive():
-                        raise RuntimeError(
-                            "AsyncDataset worker exited unexpectedly "
-                            f"with exit code {self.worker.exitcode}"
-                        ) from None
-                    continue
-                except (EOFError, OSError) as error:
-                    self.worker.join(timeout=_QUEUE_POLL_SECONDS)
-                    exit_code = self.worker.exitcode
-                    status = (
-                        f"exited unexpectedly with exit code {exit_code}"
-                        if exit_code is not None
-                        else "connection failed while still running"
-                    )
-                    raise RuntimeError(
-                        f"AsyncDataset worker {status} during a transfer"
-                    ) from error
-                if kind is _Message.DATA:
-                    yield payload
-                elif kind is _Message.EPOCH_END:
-                    epoch_complete = True
+                kind, payload = self._receive()
+                if kind is _Message.EPOCH_END:
+                    self._epoch_pending = False
                     return
-                elif kind is _Message.ERROR:
-                    raise RuntimeError(f"AsyncDataset worker failed:\n{payload}")
-                elif kind is _Message.SHUTDOWN:
-                    raise RuntimeError(
-                        "AsyncDataset worker shut down before epoch completion"
-                    )
-                else:
-                    raise RuntimeError(f"Unexpected AsyncDataset message: {kind!r}")
+                yield payload
+        except GeneratorExit:
+            raise
+        except BaseException:
+            self.close()
+            raise
         finally:
-            if not epoch_complete:
-                self.close()
+            self._iterating = False
 
     def close(self):
         """Release queues and stop the worker, with bounded waits for shutdown.
@@ -223,6 +257,7 @@ def async_dataset(
         if __name__ == "__main__":
             with async_dataset(Rows) as dataset:
                 assert list(dataset) == [0, 1, 2]
+                assert next(iter(dataset)) == 0
                 assert list(dataset) == [0, 1, 2]
     """
     ds = AsyncDataset(dataset_creator, queue_size=queue_size)

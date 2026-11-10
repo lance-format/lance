@@ -94,6 +94,20 @@ class _FailureDataset(torch.utils.data.IterableDataset):
         raise ValueError("iteration exploded")
 
 
+class _SerializationFailureDataset(torch.utils.data.IterableDataset):
+    def __init__(self, kind, after_item):
+        self.kind = kind
+        self.after_item = after_item
+
+    def __iter__(self):
+        if self.after_item:
+            yield torch.tensor([17])
+        if self.kind == "unpicklable":
+            yield lambda: None
+        else:
+            yield torch.ones(1, requires_grad=True) * 2
+
+
 class _EpochDataset(torch.utils.data.IterableDataset):
     def __init__(self):
         self.epoch = 0
@@ -175,19 +189,67 @@ def _async_lifecycle_scenario(scenario, start_method):
             if scenario != "abrupt_exit":
                 assert "Traceback" in str(error.value)
             dataset.close()
-    elif scenario in ("early_exit", "iterator_close", "repeated_close"):
+    elif scenario.startswith(("unpicklable_", "nonleaf_")):
+        after_item = scenario.endswith("after_item")
+        kind = scenario.split("_", 1)[0]
+        creator = partial(_SerializationFailureDataset, kind, after_item)
+        message = "local object" if kind == "unpicklable" else "non-leaf tensor"
+        with async_dataset(creator, queue_size=1) as dataset:
+            batches = iter(dataset)
+            if after_item:
+                assert torch.equal(next(batches), torch.tensor([17]))
+            with pytest.raises(RuntimeError, match=message) as error:
+                next(batches)
+            assert "Traceback" in str(error.value)
+    elif scenario in ("early_exit", "repeated_close"):
         with async_dataset(_EpochDataset, queue_size=1) as dataset:
             batches = iter(dataset)
             assert next(batches) is None
-            if scenario == "iterator_close":
-                batches.close()
-                with pytest.raises(RuntimeError, match="AsyncDataset is closed"):
-                    next(iter(dataset))
-            elif scenario == "repeated_close":
+            if scenario == "repeated_close":
                 dataset.close()
                 dataset.close()
             # Leave the epoch partially consumed when the context exits.
         batches.close()
+    elif scenario in (
+        "iterator_close",
+        "break_epoch",
+        "caught_exception",
+        "peek_epoch",
+        "overlapping_iterators",
+    ):
+        with async_dataset(_EpochDataset, queue_size=1) as dataset:
+            if scenario in ("iterator_close", "overlapping_iterators"):
+                batches = iter(dataset)
+                assert next(batches) is None
+                if scenario == "overlapping_iterators":
+                    with pytest.raises(
+                        RuntimeError, match="iterator is already active"
+                    ):
+                        next(iter(dataset))
+                batches.close()
+            elif scenario == "break_epoch":
+                for item in dataset:
+                    assert item is None
+                    break
+            elif scenario == "caught_exception":
+                with pytest.raises(ValueError, match="consumer failed"):
+                    for _ in dataset:
+                        raise ValueError("consumer failed")
+            else:
+                assert next(iter(dataset)) is None
+            worker_pid = dataset.worker.pid
+            for epoch in (2, 3):
+                batches = list(dataset)
+                assert len(batches) == 2
+                assert batches[0] is None
+                assert batches[1]["epoch"] == epoch
+                assert batches[1]["pid"] == worker_pid
+                assert torch.equal(batches[1]["tensor"], torch.tensor([1, 2]))
+    elif scenario == "discard_failure":
+        with async_dataset(_FailureDataset, queue_size=1) as dataset:
+            assert torch.equal(next(iter(dataset)), torch.tensor([17]))
+            with pytest.raises(RuntimeError, match="ValueError: iteration exploded"):
+                next(iter(dataset))
     elif scenario in ("partial_transfer", "large_transfer"):
         with async_dataset(_LargeItemDataset, queue_size=1) as dataset:
             if scenario == "partial_transfer":
@@ -276,11 +338,20 @@ def _async_lifecycle_scenario(scenario, start_method):
             "start_failure",
             "creator_failure",
             "iteration_failure",
+            "unpicklable_empty_epoch",
+            "unpicklable_after_item",
+            "nonleaf_empty_epoch",
+            "nonleaf_after_item",
             "abrupt_exit",
             "partial_transfer",
             "large_transfer",
             "early_exit",
             "iterator_close",
+            "break_epoch",
+            "caught_exception",
+            "peek_epoch",
+            "overlapping_iterators",
+            "discard_failure",
             "repeated_close",
             "blocked_producer",
             "blocked_user_code",
@@ -292,7 +363,15 @@ def _async_lifecycle_scenario(scenario, start_method):
     + (
         [
             (scenario, "forkserver")
-            for scenario in ("repeated_epochs", "partial_transfer", "large_transfer")
+            for scenario in (
+                "repeated_epochs",
+                "partial_transfer",
+                "large_transfer",
+                "unpicklable_after_item",
+                "nonleaf_after_item",
+                "peek_epoch",
+                "discard_failure",
+            )
         ]
         if "forkserver" in multiprocessing.get_all_start_methods()
         else []
