@@ -21,7 +21,7 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
-use crate::index::scalar::inverted::{load_segment_details, load_segments};
+use crate::index::scalar::inverted::{load_segment_details, load_segment_params, load_segments};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::utils::{
     PreFilterMasks, build_prefilter, build_prefilter_restricted_to_fragments,
@@ -455,16 +455,21 @@ pub(super) async fn open_combined_fields_scan(
         // has no indexed rows. Validate before pruning so a flat-only shard need
         // not open an unrelated segment just to borrow its tokenizer.
         if let Some(segments) = &segments {
-            let details = load_segment_details(dataset, column, segments).await?;
-            let params = InvertedIndexParams::try_from(&details)?;
-            if let Some((reference, expected)) = &tokenizer_params {
-                if !expected.same_tokenization(&params) {
-                    return Err(DataFusionError::Execution(format!(
-                        "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
-                    )));
+            load_segment_details(dataset, column, segments).await?;
+            // Manifest details omit the document tokenizer (including explicit
+            // overrides). Read complete parameters without opening partitions;
+            // schema inference would lose valid JSON tokenizers on text fields.
+            for segment in segments.iter() {
+                let params = load_segment_params(dataset, segment).await?;
+                if let Some((reference, expected)) = &tokenizer_params {
+                    if !expected.same_tokenization(&params) {
+                        return Err(DataFusionError::Execution(format!(
+                            "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
+                        )));
+                    }
+                } else {
+                    tokenizer_params = Some((column, params));
                 }
-            } else {
-                tokenizer_params = Some((column, params));
             }
         }
         let segments = segments.map(|segments| {
@@ -765,15 +770,21 @@ mod tests {
     use lance_index::scalar::inverted::query::Operator;
 
     #[rstest::rstest]
-    #[case::same_analyzer(false)]
-    #[case::incompatible_analyzer(true)]
+    #[case::same_analyzer("text", "text", false)]
+    #[case::incompatible_analyzer("text", "text", true)]
+    #[case::explicit_json_on_text("json", "json", false)]
+    #[case::incompatible_document_tokenizer("json", "text", false)]
     #[tokio::test]
     async fn flat_shard_uses_metadata_without_opening_unrelated_indices(
-        #[case] incompatible: bool,
+        #[case] title_tokenizer: &str,
+        #[case] body_tokenizer: &str,
+        #[case] incompatible_analyzer: bool,
     ) {
-        let batch =
-            arrow_array::record_batch!(("title", Utf8, ["Alpha"]), ("body", Utf8, ["beta"]))
-                .unwrap();
+        let batch = arrow_array::record_batch!(
+            ("title", Utf8, [r#"{"title":"Alpha"}"#]),
+            ("body", Utf8, [r#"{"title":"beta"}"#])
+        )
+        .unwrap();
         let schema = batch.schema();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(batch)], schema),
@@ -785,17 +796,25 @@ mod tests {
         )
         .await
         .unwrap();
-        for column in ["title", "body"] {
-            let params =
-                InvertedIndexParams::default().lower_case(!(incompatible && column == "body"));
+        for (column, tokenizer) in [("title", title_tokenizer), ("body", body_tokenizer)] {
+            let params = InvertedIndexParams::default()
+                .lance_tokenizer(tokenizer.to_string())
+                .lower_case(!(incompatible_analyzer && column == "body"));
             dataset
                 .create_index(&[column], IndexType::Inverted, None, &params, true)
                 .await
                 .unwrap();
         }
-        let query =
-            CombinedFieldsQuery::try_new("ALPHA beta".into(), vec!["title".into(), "body".into()])
-                .unwrap();
+        let (terms, expected_tokens) = if title_tokenizer == "json" {
+            (
+                "title,str,ALPHA beta",
+                ["title,str,alpha", "title,str,beta"],
+            )
+        } else {
+            ("ALPHA beta", ["alpha", "beta"])
+        };
+        let query = CombinedFieldsQuery::try_new(terms.into(), vec!["title".into(), "body".into()])
+            .unwrap();
         let scope = roaring::RoaringBitmap::from_iter([1]);
         let metrics = FtsIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let scan = open_combined_fields_scan(
@@ -808,20 +827,17 @@ mod tests {
             &metrics,
         )
         .await;
-        if incompatible {
-            assert!(
-                scan.err()
-                    .unwrap()
-                    .to_string()
-                    .contains("share the same tokenizer")
-            );
+        if incompatible_analyzer || title_tokenizer != body_tokenizer {
+            let error = scan.err().unwrap();
+            assert!(matches!(&error, DataFusionError::Execution(_)));
+            assert!(error.to_string().contains("share the same tokenizer"));
         } else {
             let scan = scan.unwrap();
             assert!(scan.segments.is_empty());
             assert!(scan.columns.iter().all(|column| column.indices.is_empty()));
             assert_eq!(scan.tokens.len(), 2);
-            assert_eq!(scan.tokens.get_token(0), "alpha");
-            assert_eq!(scan.tokens.get_token(1), "beta");
+            assert_eq!(scan.tokens.get_token(0), expected_tokens[0]);
+            assert_eq!(scan.tokens.get_token(1), expected_tokens[1]);
         }
     }
 
