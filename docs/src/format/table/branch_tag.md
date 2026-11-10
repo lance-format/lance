@@ -125,3 +125,66 @@ Each tag file is a JSON file with the following fields:
 | `updatedAt`     | string | Yes      | RFC 3339 timestamp for the latest tag reference update.                 |
 | `manifestSize`  | number |          | Size of the manifest file in bytes. Used for efficient manifest loading. |
 | `metadata`      | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object. |
+
+## History Retention
+
+Cleanup can run at the same time as operations that publish a reference to an old version: tag
+creation and update, branch creation, and restore. To stop a reference from being published to a
+version that cleanup is deleting, cleanup records which versions it **soft-deletes** in two
+[table config](table_config.md) keys before it deletes anything:
+
+| Key                            | Value                                                                                  |
+|--------------------------------|----------------------------------------------------------------------------------------|
+| `lance.history.deleted_before` | A decimal version number `F`.                                                          |
+| `lance.history.retained`       | Ascending, comma-separated decimal version numbers below `F` that cleanup keeps. Missing or empty means none. |
+
+A version `v` of a branch is **soft-deleted** when that branch's latest manifest has
+`v < F` and `v` is not listed in `lance.history.retained`. Retained versions are typically tagged
+versions, branch points, and versions kept by thinning retention rules.
+
+The keys are per branch and apply only to versions of that branch. A branch continues its parent's
+numbering (a branch created from version 50 starts at version 51), so values copied from the parent
+never match a version of the branch.
+
+The keys are table config rather than manifest fields so that writers that do not recognize them
+carry them forward unchanged. The protection is best-effort. A writer that does not implement this
+section may change or drop the keys, and missing or malformed values must be treated as soft-deleting
+nothing. In those cases references and cleanup race as they would without these keys.
+
+### Cleanup
+
+Before deleting any manifest, cleanup must:
+
+1. Determine the versions it will delete and the versions below `F` it will keep.
+2. Commit an [UpdateConfig](transaction.md#updateconfig) that sets both keys, with `F` greater than
+   every version it will delete. `F` must not be lower than the current value. If neither key would
+   change, the commit is skipped.
+3. After that commit succeeds, list tags and branches and keep every version they reference.
+4. Delete.
+
+A version kept in step 3 stays soft-deleted until a later cleanup lists it as retained. Committed
+keys remain valid if cleanup stops before deleting, and a later cleanup continues from them.
+
+If the commit conflicts with a concurrent commit that sets the keys, cleanup rebases onto the new
+values `(F', R')`. It writes `F = max(F_own, F')`, and lists as retained exactly the versions below
+`F` that neither rule soft-deletes: those with `v >= F_own` or `v` in `R_own`, and also `v >= F'` or
+`v` in `R'`.
+
+### Publishing References
+
+Tag creation, tag update, and branch creation that target version `v` of branch `b` must write the
+reference first and then read the latest manifest of `b`. If `v` is soft-deleted there, the writer
+must remove the reference it wrote and fail. Implementations may offer an explicit option that skips
+this check. Restore follows the conflict rules in [Restore Compatibility](transaction.md#restore-compatibility).
+
+### Writer Rules
+
+- Only cleanup, including version expiration, sets these keys. Other UpdateConfig operations must not set or remove them.
+- Restore must carry the keys of the manifest it rebases onto, not those of the restored version.
+- Branch creation should not copy the keys into the new branch.
+
+### Guarantees
+
+When cleanup and the publishing writer both implement this section, a reference published while
+cleanup runs either keeps its version from deletion or is rejected. There is no guarantee when
+either side does not implement it, or when the keys were dropped or malformed.

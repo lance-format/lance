@@ -343,6 +343,11 @@ other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
 - UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
+- UpdateConfig that sets the [history retention](branch_tag.md#history-retention) keys, if the
+  restored version is soft-deleted under the new values
+
+A Restore that rebases over history retention keys without conflicting keeps those keys rather than
+the restored version's.
 
 ### ReserveFragments
 
@@ -440,7 +445,9 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
-- Restore (only if the UpdateConfig updates schema or field metadata)
+- Restore (only if the UpdateConfig updates schema or field metadata, or sets the
+  [history retention](branch_tag.md#history-retention) keys; cleanup must then plan again, because
+  the restored version's files are referenced again)
 - UpdateConfig (only if the two operations modify the same config)
 
 ### DataReplacement
