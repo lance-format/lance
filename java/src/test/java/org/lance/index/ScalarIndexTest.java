@@ -2459,4 +2459,56 @@ public class ScalarIndexTest {
       }
     }
   }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"FM", "MINHASH_LSH"})
+  public void testMissingDetailsRetainsRecognizableType(IndexType type, @TempDir Path dir)
+      throws Exception {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, dir.resolve("data").toString());
+      fixture.createEmptyDataset().close();
+      try (Dataset dataset = fixture.write(1, 10)) {
+        ScalarIndexParams params =
+            type == IndexType.FM
+                ? FmIndexParams.builder().build()
+                : MinHashLshIndexParams.builder().build();
+        dataset.createIndex(
+            Collections.singletonList("name"),
+            type,
+            Optional.of("text_idx"),
+            IndexParams.builder().setScalarIndexParams(params).build(),
+            false);
+        List<Index> original = dataset.getIndexes();
+        Index old = original.get(0);
+        assertEquals(type, old.indexType());
+        Index stripped =
+            Index.builder()
+                .uuid(old.uuid())
+                .fields(old.fields())
+                .name(old.name())
+                .datasetVersion(old.datasetVersion())
+                .fragments(old.fragments().orElse(null))
+                .files(old.getFiles().orElse(null))
+                .indexVersion(0)
+                .build();
+        try (Transaction tx =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(
+                        CreateIndex.builder()
+                            .withNewIndices(Collections.singletonList(stripped))
+                            .withRemovedIndices(original)
+                            .build())
+                    .build();
+            Dataset committed = new CommitBuilder(dataset).execute(tx)) {
+          Index actual = committed.getIndexes().get(0);
+          assertTrue(actual.indexDetails().isEmpty());
+          assertEquals(type, actual.indexType());
+        }
+      }
+    }
+  }
 }

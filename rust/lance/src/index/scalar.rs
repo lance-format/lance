@@ -47,7 +47,10 @@ use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
-use lance_index::pb::{BloomFilterIndexDetails, VectorIndexDetails};
+use lance_index::pb::{
+    BloomFilterIndexDetails, FmIndexDetails, MinHashLshIndexDetails, RTreeIndexDetails,
+    VectorIndexDetails,
+};
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
     NGramIndexDetails, ZoneMapIndexDetails,
@@ -1055,6 +1058,17 @@ pub(crate) async fn infer_scalar_index_details(
         prost_types::Any::from_msg(&BloomFilterIndexDetails::default()).unwrap()
     } else if has_index_file(POSTINGS_FILENAME).await? {
         prost_types::Any::from_msg(&NGramIndexDetails::default()).unwrap()
+    } else if has_index_file("signatures.lance").await? || has_index_file("bands.lance").await? {
+        prost_types::Any::from_msg(&MinHashLshIndexDetails::default()).unwrap()
+    } else if index
+        .files
+        .as_ref()
+        .is_some_and(|files| files.iter().any(|f| f.path.ends_with("_fm.lance")))
+        || has_index_file("part_0_fm.lance").await?
+    {
+        prost_types::Any::from_msg(&FmIndexDetails::default()).unwrap()
+    } else if has_index_file("nulls.lance").await? {
+        prost_types::Any::from_msg(&RTreeIndexDetails::default()).unwrap()
     } else {
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap()
     };

@@ -367,10 +367,13 @@ fn resolve_index_type_name(
         Some(IndexType::FragmentReuse) => Some("FRAGMENT_REUSE"),
         Some(IndexType::MemWal) => Some("MEM_WAL"),
         _ => {
-            if let Some(details) = index_meta.index_details.as_deref().or(fallback_details) {
+            if let Some(details) = index_meta.index_details.as_deref() {
                 determine_index_type_from_type_url(&details.type_url)
             } else {
-                infer_index_type_from_files(index_meta)
+                infer_index_type_from_files(index_meta).or_else(|| {
+                    fallback_details
+                        .and_then(|details| determine_index_type_from_type_url(&details.type_url))
+                })
             }
         }
     }
