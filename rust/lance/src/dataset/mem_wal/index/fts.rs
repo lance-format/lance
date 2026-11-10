@@ -6969,7 +6969,7 @@ mod tests {
         assert_eq!(expanded, expected);
 
         // The automaton reaches only the matching partition terms; the
-        // fallback scans every partition term.
+        // fallback scans every partition term with the prefix.
         let partition_matches: usize = st
             .partitions
             .iter()
@@ -6987,7 +6987,13 @@ mod tests {
         let partition_terms: usize = st
             .partitions
             .iter()
-            .map(|partition| partition.term_fst.len())
+            .map(|partition| {
+                partition
+                    .collect_terms()
+                    .iter()
+                    .filter(|key| key.starts_with(prefix))
+                    .count()
+            })
             .sum();
         let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
         assert_eq!(
