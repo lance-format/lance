@@ -87,6 +87,7 @@ pub mod optimize;
 pub(crate) mod overlay;
 pub mod progress;
 pub mod refs;
+mod retention_lease;
 pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
@@ -171,6 +172,7 @@ use lance_table::feature_flags::{
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 pub use overlay::writer::{OverlayWriter, WriteOverlayError};
+pub use retention_lease::{LeaseOptions, RetentionLease};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
