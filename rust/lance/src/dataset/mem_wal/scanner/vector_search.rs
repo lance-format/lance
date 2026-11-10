@@ -78,20 +78,21 @@ impl ProbeBounds {
 ///           ProjectionExec (null_columns _rowid)
 ///             PkBlockFilterExec: block-list                   (SSTable)
 ///               ProjectionExec (_distance rescaled, unrefined only)
-///                 KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search)[.refine()?]
+///                 KNNExec: SSTable gen N, fetch=ceil(k*overfetch) (fast_search|flat)[.refine()?]
 ///         … one per SSTable gen …
 ///         ProjectionExec (canonical output schema)
 ///           PkBlockFilterExec: block-list                     (base)
-///             KNNExec: base table, k (fast_search)[.refine()?]
+///             KNNExec: base table, k (fast_search|flat)[.refine()?]
 /// ```
 ///
 /// # Index-Only Search (fast_search)
 ///
-/// For base table and SSTables we use `fast_search()` to only
-/// search indexed data. This is correct because:
-/// - Each SSTable has its own vector index built during flush.
-/// - The active memtable covers any unindexed data.
-/// - Searching unindexed data in base/SSTable would be redundant.
+/// The base table and each SSTable are searched with `fast_search()` —
+/// index-only — when they hold a vector index usable for the query (matching
+/// column and metric); otherwise the arm falls back to the scanner's flat
+/// KNN, which reports exact distances. `fast_search()` over a source without
+/// a usable index returns nothing, so gating it is what keeps an unindexed
+/// base or generation visible instead of silently dropping its rows.
 pub struct LsmVectorSearchPlanner {
     /// Data source collector.
     collector: LsmDataSourceCollector,
@@ -650,9 +651,18 @@ impl LsmVectorSearchPlanner {
                 if let Some(ef) = indexed_arm_ef(self.ef, requested_k, k, refine_factor) {
                     scanner.ef(ef);
                 }
-                // Memtables cover unindexed rows; only search indexed data here.
-                scanner.fast_search();
-                if let Some(refine_factor) = refine_factor {
+                // The base can predate index build on the column (a bulk
+                // load under `initialize_mem_wal`, rows folded in by
+                // compaction) or hold only an index whose metric differs from
+                // the query's. `fast_search` over such a base is empty, so
+                // search it flat, reporting exact distances.
+                let indexed =
+                    has_usable_vector_index(dataset, &self.vector_column, self.distance_type)
+                        .await?;
+                if indexed {
+                    scanner.fast_search();
+                }
+                if indexed && let Some(refine_factor) = refine_factor {
                     scanner.refine(refine_factor);
                 }
                 scanner.create_plan().await
@@ -1481,8 +1491,9 @@ mod tests {
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
-        // Base rows are far from the query and unindexed, so `fast_search`
-        // contributes nothing; the test isolates the memtable prefilter.
+        // Base rows are far from the query and unindexed, so they are
+        // searched flat; they pass `id >= 2` and rank behind every memtable
+        // row, which still isolates the memtable prefilter for the top slots.
         let base_dataset = Arc::new(
             create_dataset(&base_uri, vec![create_test_batch(&schema, &[100, 200])]).await,
         );
@@ -1562,8 +1573,9 @@ mod tests {
         sorted.sort();
         assert_eq!(
             sorted,
-            vec![2, 3],
-            "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`)"
+            vec![2, 3, 100, 200],
+            "prefilter must drop id=0 and id=1 (nearer but failing `id >= 2`); \
+             the unindexed base rows pass the filter and are searched flat"
         );
     }
 
@@ -1962,9 +1974,10 @@ mod tests {
             .unwrap()
         };
 
-        // Base is unindexed, so `fast_search` contributes nothing; the test
-        // isolates the active-memtable dedup-before-filter behavior. Use a
-        // non-conflicting id to avoid any PK confusion.
+        // The base holds a single far 'active' row: the unindexed base is
+        // searched flat, making it the filter's only legitimate match, so a
+        // leaked pk=5 would show up as a second row. (Use a non-conflicting
+        // id to avoid any PK confusion.)
         let temp_dir = tempfile::tempdir().unwrap();
         let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
         let mut fb = FixedSizeListBuilder::new(Float32Builder::new(), 4);
@@ -2032,11 +2045,14 @@ mod tests {
         let ctx = SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx()).unwrap();
         let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
-        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let rows = collect_id_dist(&batches);
+        let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
         assert_eq!(
-            total, 0,
+            ids,
+            vec![999],
             "pk=5's current version is 'archived' and must be excluded; a stale \
-             'active' older version must not leak (filter evaluated on newest)"
+             'active' older version must not leak (filter evaluated on newest). \
+             Only the base's own far 'active' row may match."
         );
     }
 
@@ -3781,6 +3797,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_base_without_vector_index_is_searched_flat() {
+        // A base table can predate any index build on the searched column (a
+        // bulk-loaded base under `initialize_mem_wal`, or rows folded in by
+        // compaction): `fast_search` over it returned an EmptyExec and its rows
+        // silently vanished from every vector search.
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use datafusion::prelude::SessionContext;
+        use futures::TryStreamExt;
+        use lance_index::IndexType;
+        use lance_linalg::distance::DistanceType;
+
+        let at = |cos_distance: f32, norm: f32| {
+            let cos = 1.0 - cos_distance;
+            [norm * cos, norm * (1.0 - cos * cos).sqrt(), 0.0, 0.0]
+        };
+        let query = {
+            use arrow_array::builder::Float32Builder;
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), 4);
+            builder.values().append_slice(&[1.0, 0.0, 0.0, 0.0]);
+            builder.append(true);
+            builder.finish()
+        };
+        let expected = [(1, 0.05), (2, 0.4)];
+
+        let schema = create_vector_schema();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp_dir.path().to_str().unwrap());
+        let mut rows = vec![(1, at(0.05, 3.0)), (2, at(0.4, 2.0))];
+        rows.extend((10..=20).map(|id| (id, at(1.9, 1.0))));
+        let mut base_dataset = create_dataset(&base_uri, vec![batch_rows(&schema, &rows)]).await;
+
+        let search = |base_dataset: &Dataset, distance_type: DistanceType| {
+            let planner = LsmVectorSearchPlanner::new(
+                LsmDataSourceCollector::new(Arc::new(base_dataset.clone()), vec![]),
+                vec!["id".to_string()],
+                schema.clone(),
+                "vector".to_string(),
+                distance_type,
+            );
+            let query = query.clone();
+            async move {
+                let plan = planner
+                    .plan_search(&query, 2, 1, None, false, 1.0)
+                    .await
+                    .unwrap();
+                let batches: Vec<RecordBatch> = plan
+                    .execute(0, SessionContext::new().task_ctx())
+                    .unwrap()
+                    .try_collect()
+                    .await
+                    .unwrap();
+                collect_id_dist(&batches)
+            }
+        };
+        let assert_rows = |what: &str, rows: &[(i32, f32)]| {
+            let ids: Vec<i32> = rows.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids, vec![1, 2], "{what}: got {rows:?}");
+            for ((id, distance), (_, exact)) in rows.iter().zip(expected) {
+                assert!(
+                    (distance - exact).abs() < 1e-4,
+                    "{what}: id={id} reported {distance}, expected {exact}"
+                );
+            }
+        };
+
+        // No vector index on the base: it is searched flat, reporting exact
+        // distances.
+        let rows = search(&base_dataset, DistanceType::Cosine).await;
+        assert_rows("unindexed base", &rows);
+
+        // An index whose metric differs from the query's is not usable either;
+        // the arm must fall back to flat instead of returning nothing.
+        let l2_index = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &l2_index, true)
+            .await
+            .unwrap();
+        let rows = search(&base_dataset, DistanceType::Cosine).await;
+        assert_rows("metric-mismatched base index", &rows);
     }
 
     #[tokio::test]
