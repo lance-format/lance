@@ -141,10 +141,25 @@ public class Index {
     return datasetVersion;
   }
 
+  /**
+   * Fragment IDs recorded in this index segment's manifest bitmap.
+   *
+   * <p>This reflects the raw fragment bitmap stored for the segment and may still include fragment
+   * IDs that have since been removed by deletes or compactions until index maintenance rewrites the
+   * segment.
+   *
+   * @return the recorded fragment IDs, or empty if no fragment bitmap is present
+   */
   public Optional<List<Integer>> fragments() {
     return Optional.ofNullable(fragments);
   }
 
+  /**
+   * Raw protobuf-encoded {@code google.protobuf.Any} index details stored in the manifest, or empty
+   * when the segment was committed without index details.
+   *
+   * @return the encoded index details bytes, or empty if absent
+   */
   public Optional<byte[]> indexDetails() {
     return Optional.ofNullable(indexDetails);
   }
@@ -189,6 +204,9 @@ public class Index {
 
   /**
    * Get the type of the index (e.g., BTREE, BITMAP, VECTOR).
+   *
+   * <p>Resolved from {@link #indexDetails()} when present, or inferred from the index metadata and
+   * dataset files when {@code index_details} was not persisted in the manifest.
    *
    * @return the index type, or null if unknown
    */
