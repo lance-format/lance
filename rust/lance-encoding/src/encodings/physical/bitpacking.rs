@@ -15,64 +15,28 @@
 //! The encoding is transparent because the output has a fixed width (just like the input) and
 //! we can easily jump to the correct value.
 //!
-//! # u128 inline-bitpacking dispatch (decimal128)
+//! # 128-bit values
 //!
-//! For 128-bit-wide columns (`bits_per_value = 128`, e.g. `Decimal128`) the [`InlineBitpacking`]
-//! encoder dispatches per chunk into one of five kernels based on the chunk's `Stat::BitWidth`.
-//! The kernel is selected by `u128_kernel_for(bit_width)`, which is the single source of truth
-//! for both encode and decode and uses a `match` over disjoint width ranges (so the order of
-//! the rows below is the dispatch order):
+//! Lance 2.3 also bitpacks 128-bit values (e.g. `Decimal128`). Each block of 1024 values is
+//! packed by the kernel `u128_kernel_for` picks from the block's bit width:
 //!
-//! | bit_width | kernel                                         | layout            |
-//! |-----------|------------------------------------------------|-------------------|
-//! | 0         | zero-fill (no body bytes written)              | empty             |
-//! | 1..=32    | reinterpret as `&[u32]`, pack with FastLanes  | u32 lane×row      |
-//! | 33..=64   | reinterpret as `&[u64]`, pack with FastLanes  | u64 lane×row      |
-//! | 65..=127  | scalar u128 sequential bit-stream              | sequential        |
-//! | 128       | memcpy identity (each value occupies one word) | sequential        |
+//! | bit_width | kernel                                           |
+//! |-----------|--------------------------------------------------|
+//! | 0         | none, the block is empty                         |
+//! | 1..=32    | low 32 bits of each value, FastLanes u32 packing |
+//! | 33..=64   | low 64 bits of each value, FastLanes u64 packing |
+//! | 65..=127  | sequential u128 bit stream                       |
+//! | 128       | values copied as-is                              |
 //!
-//! **Scope:** this dispatch lives only in the `InlineBitpacking` (miniblock) path. The
-//! `OutOfLineBitpacking` (full-zip) path is intentionally **not** touched — full-zip frames
-//! whole pages with a single `bit_width` and has no per-chunk header to carry a kernel
-//! selector, so the same machinery would either need a new format field or change cross-page
-//! framing semantics. Both are out of scope here.
+//! Every kernel writes `bit_width * 128` bytes per block. Inline chunks carry the width in
+//! their header and out-of-line payloads use the encoding's single width; both go through
+//! `pack_u128_chunk` / `unpack_u128_chunk`. The table is part of the file format (see the
+//! Bitpacking section of `docs/src/format/file/encoding.md`), so moving a width to another
+//! kernel changes how existing files decode.
 //!
-//! ## Design: bit_width is the kernel selector
-//!
-//! There is **no separate negotiation channel** that records which kernel produced a chunk's
-//! body bytes — `bit_width` (already written to the chunk header on the encode path) is reused
-//! as the implicit selector. The framing-level invariants are preserved: the 16-byte chunk
-//! header layout is unchanged, and the body **byte count** still follows the canonical
-//! `bit_width * ELEMS_PER_CHUNK / 8` formula for every kernel (see the `pack_u128_chunk`
-//! `# Safety` block for the per-kernel proof).
-//!
-//! What **does** change is the body **byte interpretation**: at the same `bit_width`, an old
-//! single-kernel u128 reader and the new dispatched reader will not agree on the meaning of
-//! the bits. Concretely, a chunk written by this encoder at `bit_width = 24` is a FastLanes
-//! u32 lane×row interleaved layout, not a sequential u128 bit-stream — an older reader that
-//! always uses the sequential u128 unpack would silently produce garbage. Both encode and
-//! decode therefore **must** route through `u128_kernel_for(bit_width)`; that mapping is the
-//! format contract, not an implementation detail. Adding a new u128 kernel without updating
-//! both sides — or introducing a real negotiation field with an explicit version bump — would
-//! corrupt every file written under the new mapping.
-//!
-//! There is **no cross-version interop**: a chunk written by this encoder cannot be read by a
-//! reader that lacks the per-chunk dispatch. That is why only the 2.3 strategy composes the
-//! selector that offers 128-bit widths (`try_wide_bitpacking_miniblock` /
-//! `try_wide_bitpacking_block`); every earlier version composes the narrow pair.
-//! A reader that accepts a 2.3 file implements this dispatch; readers limited to older versions
-//! never receive a 128-bit bitpacked page, so there is no chunk they could decode incorrectly.
-//!
-//! ## Sign safety
-//!
-//! The narrow branches (1..=32 and 33..=64) reinterpret `&[u128]` as `&[u32] / &[u64]` and rely
-//! on every value satisfying `v >> bit_width == 0`. This invariant is supplied by
-//! `FixedWidthDataBlock::max_bit_widths` (see `crate::statistics`), whose OR-fold + `leading_zeros`
-//! algorithm guarantees the high lanes are all zero for any `bit_width < 128`. Negative `i128`
-//! values (after `bytemuck::cast_slice` to `u128`) have the high bit set and therefore force
-//! `bit_width = 128` for the entire chunk, routing them into the memcpy branch.
-//!
-//! See `pack_u128_chunk` / `unpack_u128_chunk` for per-branch contracts and `# Safety`.
+//! The narrow kernels drop the high bits of each value. That is lossless because
+//! `Stat::BitWidth` is computed from the OR of every value in the block, so a negative `i128`
+//! (top bit set) forces width 128.
 
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, PrimitiveArray};
@@ -358,17 +322,6 @@ impl InlineBitpacking {
                 "Stat::BitWidth must be UInt64Array (FixedWidthDataBlock::max_bit_widths contract)",
             );
 
-        // Hard-assert at least one chunk's worth of statistics. The trailing-chunk
-        // path below indexes `bit_widths_array.len() - 1`, which would underflow on
-        // an empty input. `data.num_values > 0` is asserted above (debug-only), so
-        // this is the release-build defence for that contract.
-        assert!(
-            !bit_widths_array.is_empty(),
-            "bitpack_chunked_u128_dispatch: Stat::BitWidth must produce at least one entry \
-             (data.num_values={}, bits_per_value=128)",
-            data.num_values
-        );
-
         // Same chunk-size accounting as the generic path: body bytes = bit_width * ELEMS_PER_CHUNK / 8.
         // Expressed in u128 units that's `ELEMS_PER_CHUNK * bit_width / 128 = 8 * bit_width`. The
         // header is 1 u128 per chunk. We size the output buffer in u128 units regardless
@@ -573,35 +526,45 @@ impl InlineBitpacking {
     /// dispatch the body decode to the matching narrow kernel (u32 / u64 / u128).
     fn unchunk_u128_dispatch(data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         if data.len() < std::mem::size_of::<u128>() {
-            return Err(Error::invalid_input(format!(
-                "bitpacking buffer too short for u128 header: got {} bytes, need at least {}",
-                data.len(),
-                std::mem::size_of::<u128>()
-            )));
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "bitpacking buffer too short for u128 header: got {} bytes, need at least {}",
+                    data.len(),
+                    std::mem::size_of::<u128>()
+                ),
+            ));
         }
         if num_values > ELEMS_PER_CHUNK {
-            return Err(Error::invalid_input(format!(
-                "bitpacking num_values {num_values} exceeds chunk capacity {ELEMS_PER_CHUNK}"
-            )));
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "bitpacking num_values {num_values} exceeds chunk capacity {ELEMS_PER_CHUNK}"
+                ),
+            ));
         }
 
         let header_bytes = &data[..std::mem::size_of::<u128>()];
         let raw = LittleEndian::read_u128(header_bytes);
         if raw > 128 {
-            return Err(Error::invalid_input(format!(
-                "bitpacking header out of range: {raw} > 128"
-            )));
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!("bitpacking header out of range: {raw} > 128"),
+            ));
         }
         let bit_width = raw as usize;
 
         let body = &data[std::mem::size_of::<u128>()..];
         let expected_bytes = bit_width * ELEMS_PER_CHUNK as usize / 8;
         if body.len() != expected_bytes {
-            return Err(Error::invalid_input(format!(
-                "bitpacking chunk body length mismatch: got {} bytes, \
-                 expected {expected_bytes} bytes for bit_width={bit_width}",
-                body.len()
-            )));
+            return Err(Error::corrupt_file_named(
+                "inline_bitpacking",
+                format!(
+                    "bitpacking chunk body length mismatch: got {} bytes, \
+                     expected {expected_bytes} bytes for bit_width={bit_width}",
+                    body.len()
+                ),
+            ));
         }
 
         let mut decompressed = vec![0u128; ELEMS_PER_CHUNK as usize];
@@ -732,7 +695,9 @@ impl BlockCompressor for InlineBitpacking {
 
 impl MiniBlockDecompressor for InlineBitpacking {
     fn inline_bitpacking_width(&self) -> Option<u64> {
-        Some(self.uncompressed_bit_width)
+        // The direct decode path unpacks with `T::unchecked_unpack_uninit`, the sequential
+        // kernel for u128, but 128-bit chunks are laid out by `u128_kernel_for`.
+        (self.uncompressed_bit_width != 128).then_some(self.uncompressed_bit_width)
     }
 
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
@@ -1116,6 +1081,97 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
     }
 }
 
+/// Out-of-line bitpacking for 128-bit values. Every complete block of 1024 values goes
+/// through `pack_u128_chunk`, so the payload uses the same per-width layout as inline chunks.
+/// The tail is padded or stored raw by the same rule as [`bitpack_out_of_line_vec`].
+fn bitpack_out_of_line_u128(data: FixedWidthDataBlock, compressed_bit_width: usize) -> LanceBuffer {
+    let values = data.data.borrow_to_typed_slice::<u128>();
+    let values = values.as_ref();
+    let chunk_len = ELEMS_PER_CHUNK as usize;
+    let words_per_chunk = chunk_len * compressed_bit_width / 128;
+    let num_whole_chunks = values.len() / chunk_len;
+    let tail = &values[num_whole_chunks * chunk_len..];
+    let pad_tail = !tail.is_empty()
+        && compressed_bit_width * (chunk_len - tail.len())
+            < 128_usize.saturating_sub(compressed_bit_width) * tail.len();
+    let tail_words = if pad_tail {
+        words_per_chunk
+    } else {
+        tail.len()
+    };
+    let tail_start = num_whole_chunks * words_per_chunk;
+    let mut output = vec![0u128; tail_start + tail_words];
+
+    for chunk_idx in 0..num_whole_chunks {
+        let src = &values[chunk_idx * chunk_len..][..chunk_len];
+        let dest = &mut output[chunk_idx * words_per_chunk..][..words_per_chunk];
+        // SAFETY: `src` is one block, `dest` holds `compressed_bit_width * 8` words, and
+        // `compress` rejects widths above 128. The selector passes the block's maximum
+        // `Stat::BitWidth`, so every value fits; a value that does not fit loses bits but is
+        // never read or written out of bounds.
+        unsafe { pack_u128_chunk(compressed_bit_width, src, dest) };
+    }
+    if pad_tail {
+        let mut padded = vec![0u128; chunk_len];
+        padded[..tail.len()].copy_from_slice(tail);
+        // SAFETY: as above; zero padding fits in any width.
+        unsafe { pack_u128_chunk(compressed_bit_width, &padded, &mut output[tail_start..]) };
+    } else {
+        output[tail_start..].copy_from_slice(tail);
+    }
+    LanceBuffer::reinterpret_vec(output)
+}
+
+/// Inverse of [`bitpack_out_of_line_u128`]. The caller has checked that `data` has the
+/// raw-tail or padded-tail length for `num_values` (`out_of_line_payload_byte_lengths`).
+fn unpack_out_of_line_u128(
+    data: &LanceBuffer,
+    num_values: usize,
+    compressed_bit_width: usize,
+) -> FixedWidthDataBlock {
+    let chunk_len = ELEMS_PER_CHUNK as usize;
+    let body_bytes = chunk_len * compressed_bit_width / 8;
+    let num_whole_chunks = num_values / chunk_len;
+    let tail_len = num_values % chunk_len;
+    let tail_start = num_whole_chunks * body_bytes;
+    // At equal lengths the writer stores the tail raw, so check that layout first.
+    let tail_is_raw = tail_len > 0 && data.len() == tail_start + tail_len * 16;
+    let tail_values = if tail_is_raw || tail_len == 0 {
+        tail_len
+    } else {
+        chunk_len
+    };
+    let mut decoded = vec![0u128; num_whole_chunks * chunk_len + tail_values];
+
+    for chunk_idx in 0..num_whole_chunks {
+        let body = &data[chunk_idx * body_bytes..][..body_bytes];
+        let dest = &mut decoded[chunk_idx * chunk_len..][..chunk_len];
+        // SAFETY: the payload length check covers every complete block; `dest` is one block.
+        unsafe { unpack_u128_chunk(compressed_bit_width, body, dest) };
+    }
+    let tail_dest = &mut decoded[num_whole_chunks * chunk_len..];
+    if tail_is_raw {
+        bytemuck::cast_slice_mut::<u128, u8>(tail_dest).copy_from_slice(&data[tail_start..]);
+    } else if tail_len > 0 {
+        // SAFETY: a padded tail is one full packed block and `tail_dest` is one block.
+        unsafe {
+            unpack_u128_chunk(
+                compressed_bit_width,
+                &data[tail_start..][..body_bytes],
+                tail_dest,
+            )
+        };
+        decoded.truncate(num_values);
+    }
+
+    FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(decoded),
+        bits_per_value: 128,
+        num_values: num_values as u64,
+        block_info: BlockInfo::new(),
+    }
+}
+
 /// Bitpacks a FixedWidthDataBlock with a given bit width.
 ///
 /// Each chunk of 1024 values is packed with a constant bit width. For the tail we compare the
@@ -1300,18 +1356,6 @@ pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
 ///
 /// However, this logic isn't expressible with the per-value traits we have today.  We can
 /// enhance these traits should we need to support it at some point in the future.
-///
-/// # u128 path note (Inline-vs-OutOfLine asymmetry)
-///
-/// The u128 dispatch added by this PR (per-chunk routing to u32/u64 FastLanes SIMD via
-/// `pack_u128_chunk` / `unpack_u128_chunk`) lives only on the **inline** miniblock path.
-/// `OutOfLineBitpacking` for `bits_per_value == 128` continues to call the scalar
-/// `bitpack_out_of_line::<u128>` kernel (line 1161) — there is no per-chunk dispatch on
-/// values, no narrow-lane fast path, and no SIMD. This is intentional for the scope of
-/// this PR: the perf hotspot motivating the dispatch (q4 over decimal128 store_sales) is
-/// served by the inline miniblock encoder, and full-zip bitpacking is out of scope.
-/// Expect the OutOfLine u128 path to be slower than the inline path on identical data;
-/// fixing it would require a parallel per-chunk dispatch refactor in `bitpack_out_of_line`.
 #[derive(Debug)]
 pub struct OutOfLineBitpacking {
     compressed_bit_width: u64,
@@ -1340,12 +1384,18 @@ impl BlockCompressor for OutOfLineBitpacking {
                 self.uncompressed_bit_width, fixed_width.bits_per_value
             )));
         }
+        if self.compressed_bit_width > self.uncompressed_bit_width {
+            return Err(Error::invalid_input(format!(
+                "Out-of-line bitpacking width {} exceeds {}-bit values",
+                self.compressed_bit_width, self.uncompressed_bit_width
+            )));
+        }
         let compressed = match fixed_width.bits_per_value {
             8 => bitpack_out_of_line::<u8>(fixed_width, self.compressed_bit_width as usize),
             16 => bitpack_out_of_line::<u16>(fixed_width, self.compressed_bit_width as usize),
             32 => bitpack_out_of_line::<u32>(fixed_width, self.compressed_bit_width as usize),
             64 => bitpack_out_of_line::<u64>(fixed_width, self.compressed_bit_width as usize),
-            128 => bitpack_out_of_line::<u128>(fixed_width, self.compressed_bit_width as usize),
+            128 => bitpack_out_of_line_u128(fixed_width, self.compressed_bit_width as usize),
             w => {
                 return Err(Error::invalid_input(format!(
                     "Bitpacking word size must be 8, 16, 32, 64, or 128, got {w}"
@@ -1485,7 +1535,7 @@ impl BlockDecompressor for OutOfLineBitpacking {
             32 => unpack_out_of_line::<u32>(block, num_values, self.compressed_bit_width as usize),
             64 => unpack_out_of_line::<u64>(block, num_values, self.compressed_bit_width as usize),
             128 => {
-                unpack_out_of_line::<u128>(block, num_values, self.compressed_bit_width as usize)
+                unpack_out_of_line_u128(&block.data, num_values, self.compressed_bit_width as usize)
             }
             _ => unreachable!(),
         };
@@ -1853,12 +1903,23 @@ mod test {
     }
 
     // End-to-end guard for the version gate: on 2.3 (the only version whose strategy composes
-    // the wide bitpacking selector) the chooser must pick inline bitpacking for low-magnitude
-    // Decimal128 data and the file must round-trip. `TestEncoding::StructuralSparse` is the 2.3
-    // shape, so this exercises the encode to decode path through the per-chunk u128 dispatch
-    // rather than just the kernel.
+    // the wide bitpacking selector) the chooser must pick inline bitpacking for Decimal128 data
+    // and the file must round-trip through the per-chunk u128 dispatch. Every value is distinct
+    // so the page is not dictionary encoded; otherwise only the dictionary indices would be
+    // bitpacked and the u128 path would never run. The non-null cases pin that 128-bit pages
+    // stay off the direct inline-bitpacking decode path; the nullable case adds definition
+    // levels, which takes the generic path regardless.
+    #[rstest]
+    #[case::narrow_u32(24, false)]
+    #[case::narrow_u64(40, false)]
+    #[case::sequential_u128(100, false)]
+    #[case::narrow_then_memcpy(128, false)]
+    #[case::narrow_u32_with_nulls(24, true)]
     #[test_log::test(tokio::test)]
-    async fn test_decimal128_u128_bitpacking_round_trips_on_2_3() {
+    async fn test_decimal128_u128_bitpacking_round_trips_on_2_3(
+        #[case] bit_width: u32,
+        #[case] with_nulls: bool,
+    ) {
         use crate::testing::TestEncoding;
         use arrow_array::Decimal128Array;
 
@@ -1866,16 +1927,55 @@ mod test {
             .with_expected_encoding("inline_bitpacking")
             .with_encodings([TestEncoding::StructuralSparse]);
 
-        // 2048 small-magnitude values (bit width well under 128) spanning two 1024-value chunks.
-        let values: Vec<i128> = (0..2048).map(|i| (i % 1000) as i128).collect();
-        let array = Decimal128Array::from(values)
+        // 2048 distinct values spanning two 1024-value chunks. Setting bit `bit_width - 1`
+        // pins each chunk's bit width. A page of only full-width chunks is not bitpacked at
+        // all, so the 128-bit case packs a narrow first chunk and a negative second chunk.
+        let pinned_width = if bit_width == 128 { 24 } else { bit_width };
+        let values = (0..2048_i128).map(|i| {
+            let value = if bit_width == 128 && i >= 1024 {
+                -i
+            } else {
+                (1_i128 << (pinned_width - 1)) | i
+            };
+            (!with_nulls || i % 7 != 0).then_some(value)
+        });
+        let array = Decimal128Array::from_iter(values)
             .with_precision_and_scale(38, 0)
             .unwrap();
         let arrays = vec![Arc::new(array) as Arc<dyn Array>];
 
-        // Disable BSS so bitpacking (not byte-stream split) is the selected encoding.
-        let mut metadata = HashMap::new();
-        metadata.insert("lance-encoding:bss".to_string(), "off".to_string());
+        // Disable BSS so bitpacking (not byte-stream split) is the selected encoding, and
+        // dictionary encoding so the values themselves are bitpacked.
+        let metadata = HashMap::from([
+            ("lance-encoding:bss".to_string(), "off".to_string()),
+            (
+                "lance-encoding:dict-divisor".to_string(),
+                "100000".to_string(),
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
+    }
+
+    /// `FixedSizeBinary(16)` reaches the same 128-bit selector as `Decimal128`.
+    #[test_log::test(tokio::test)]
+    async fn test_fixed_size_binary_16_bitpacking_round_trips_on_2_3() {
+        use crate::testing::TestEncoding;
+        use arrow_array::FixedSizeBinaryArray;
+
+        let test_cases = TestCases::default()
+            .with_expected_encoding("inline_bitpacking")
+            .with_encodings([TestEncoding::StructuralSparse]);
+        let values = (0..2048_u128).map(|i| ((1 << 23) | i).to_le_bytes());
+        let array = FixedSizeBinaryArray::try_from_iter(values).unwrap();
+        let arrays = vec![Arc::new(array) as Arc<dyn Array>];
+        let metadata = HashMap::from([
+            ("lance-encoding:bss".to_string(), "off".to_string()),
+            (
+                "lance-encoding:dict-divisor".to_string(),
+                "100000".to_string(),
+            ),
+        ]);
 
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
     }
@@ -2046,41 +2146,127 @@ mod test {
         assert_eq!(decoded_values.as_ref(), values.as_slice());
     }
 
-    #[test]
-    fn test_out_of_line_bitpack_u128_raw_tail_roundtrip() {
-        // u128 mirror of `test_out_of_line_bitpack_raw_tail_roundtrip`. Reachable
-        // from `try_bitpack_for_block` when `num_values > 1024 && bits_per_value
-        // == 128`, so the OutOfLine path must round-trip for u128 just like the
-        // Inline path covered by `test_inline_bitpack_u128_width_24_narrow_u32`.
-        // 1025 values trips the runt-tail branch (one packed chunk + raw tail).
-        let bit_width = 24usize;
-        let word_bits = std::mem::size_of::<u128>() as u64 * 8;
-        let values: Vec<u128> = (0..1025).map(|i| (i as u128) & 0xFFFFFF).collect();
-        let input = FixedWidthDataBlock {
+    /// 128-bit blocks (2.3 dictionary items) through the selector, `BlockCompressor`, and the
+    /// decompressor built from the written encoding. 1024 values or fewer use inline
+    /// bitpacking; larger blocks use out-of-line bitpacking with a raw or padded tail.
+    #[rstest]
+    #[case::inline(1000, false)]
+    #[case::inline_full_chunk(1024, false)]
+    #[case::raw_tail(1025, true)]
+    #[case::padded_tail(2000, true)]
+    #[case::no_tail(2048, true)]
+    // 192 = 8 * 24 tail values: the raw and padded tails are both 3072 bytes, and the raw
+    // layout must win on both sides.
+    #[case::equal_length_tail(1216, true)]
+    fn test_u128_block_round_trip(#[case] num_values: u64, #[case] is_out_of_line: bool) {
+        use crate::compression::{
+            DecompressionStrategy, DefaultDecompressionStrategy, try_wide_bitpacking_block,
+        };
+        use crate::format::metadata::compressive_encoding::Compression;
+
+        let values: Vec<u128> = (0..num_values as u128).map(|i| (1 << 23) | i).collect();
+        let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::reinterpret_vec(values.clone()),
-            bits_per_value: word_bits,
-            num_values: values.len() as u64,
+            bits_per_value: 128,
+            num_values,
             block_info: BlockInfo::new(),
-        };
+        });
+        block.compute_stat();
 
-        let compressed = bitpack_out_of_line::<u128>(input, bit_width);
-        let compressed_words = compressed.borrow_to_typed_slice::<u128>().to_vec();
-        let words_per_chunk = (ELEMS_PER_CHUNK as usize * bit_width).div_ceil(word_bits as usize);
+        let compressor = try_wide_bitpacking_block(&block).expect("128-bit block is bitpacked");
+        let (payload, encoding) = compressor.compress(block).unwrap();
         assert_eq!(
-            compressed_words.len(),
-            words_per_chunk + (values.len() - ELEMS_PER_CHUNK as usize),
+            matches!(
+                encoding.compression,
+                Some(Compression::OutOfLineBitpacking(_))
+            ),
+            is_out_of_line,
+            "{encoding:?}"
         );
+        let decompressor = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&encoding)
+            .unwrap();
+        let decoded = decompressor.decompress(payload, num_values).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("expected fixed-width data");
+        };
+        assert_eq!(
+            decoded.data.borrow_to_typed_slice::<u128>().as_ref(),
+            values
+        );
+    }
 
-        let compressed_block = FixedWidthDataBlock {
-            data: LanceBuffer::reinterpret_vec(compressed_words.clone()),
-            bits_per_value: word_bits,
-            num_values: compressed_words.len() as u64,
-            block_info: BlockInfo::new(),
+    /// Pins the per-width layout of a 128-bit packed block, the format contract in the
+    /// Bitpacking section of the spec: inline chunk bodies and out-of-line blocks must be the
+    /// bytes the table's kernel writes.
+    #[rstest]
+    #[case::zero(0)]
+    #[case::narrow_u32(24)]
+    #[case::narrow_u64(40)]
+    #[case::sequential_u128(100)]
+    #[case::full_width(128)]
+    fn test_u128_block_layout_follows_kernel_table(#[case] bit_width: usize) {
+        let values: Vec<u128> = (0..ELEMS_PER_CHUNK as u128)
+            .map(|i| match bit_width {
+                0 => 0,
+                128 => u128::MAX - i,
+                w => (1 << (w - 1)) | (i * 0x9E37_79B9) & ((1 << (w - 1)) - 1),
+            })
+            .collect();
+        let expected: Vec<u8> = match bit_width {
+            0 => Vec::new(),
+            1..=32 => {
+                let narrow: Vec<u32> = values.iter().map(|&v| v as u32).collect();
+                let mut packed = vec![0u32; ELEMS_PER_CHUNK as usize * bit_width / 32];
+                unsafe { BitPacking::unchecked_pack(bit_width, &narrow, &mut packed) };
+                bytemuck::cast_slice(&packed).to_vec()
+            }
+            33..=64 => {
+                let narrow: Vec<u64> = values.iter().map(|&v| v as u64).collect();
+                let mut packed = vec![0u64; ELEMS_PER_CHUNK as usize * bit_width / 64];
+                unsafe { BitPacking::unchecked_pack(bit_width, &narrow, &mut packed) };
+                bytemuck::cast_slice(&packed).to_vec()
+            }
+            65..=127 => {
+                // Value `i` occupies stream bits `i * w ..(i + 1) * w`, least significant first.
+                let mut packed = vec![0u128; ELEMS_PER_CHUNK as usize * bit_width / 128];
+                for (i, &value) in values.iter().enumerate() {
+                    for bit in 0..bit_width {
+                        let pos = i * bit_width + bit;
+                        packed[pos / 128] |= ((value >> bit) & 1) << (pos % 128);
+                    }
+                }
+                packed.iter().flat_map(|w| w.to_le_bytes()).collect()
+            }
+            _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
         };
 
-        let decoded = unpack_out_of_line::<u128>(compressed_block, values.len(), bit_width);
-        let decoded_values = decoded.data.borrow_to_typed_slice::<u128>();
-        assert_eq!(decoded_values.as_ref(), values.as_slice());
+        let block = || {
+            let mut block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(values.clone()),
+                bits_per_value: 128,
+                num_values: ELEMS_PER_CHUNK,
+                block_info: BlockInfo::new(),
+            });
+            block.compute_stat();
+            block
+        };
+        let (inline, _) = MiniBlockCompressor::compress(
+            &InlineBitpacking::new(128),
+            test_compression_context(),
+            block(),
+        )
+        .unwrap();
+        let inline = inline.data[0].as_ref();
+        assert_eq!(&inline[..16], &(bit_width as u128).to_le_bytes());
+        assert_eq!(&inline[16..], expected.as_slice());
+
+        if bit_width < 128 {
+            let (out_of_line, _) = OutOfLineBitpacking::new(bit_width as u64, 128)
+                .compress(block())
+                .unwrap();
+            assert_eq!(out_of_line.unwrap().as_ref(), expected.as_slice());
+        }
     }
 
     /// Build a `LanceBuffer` for `InlineBitpacking::unchunk::<u128>` whose 16-byte
@@ -2097,7 +2283,7 @@ mod test {
     #[test]
     fn test_inline_bitpack_u128_corrupt_header_returns_err() {
         // Header advertises bit_width = 200, which exceeds the 128-bit ceiling.
-        // This must surface as `InvalidInput` rather than wrapping silently and
+        // This must surface as `CorruptFile` rather than wrapping silently and
         // feeding an out-of-range width into `unchecked_unpack` (UB).
         let body_words = (200 * ELEMS_PER_CHUNK) as usize / (8 * 16);
         let buf = make_u128_inline_buffer(200, body_words);
@@ -2106,8 +2292,8 @@ mod test {
         let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK)
             .expect_err("corrupt u128 header must yield Err");
         assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "expected InvalidInput, got: {err:?}"
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
         );
     }
 
@@ -2121,15 +2307,15 @@ mod test {
         let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK)
             .expect_err("body-length mismatch must yield Err");
         assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "expected InvalidInput, got: {err:?}"
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
         );
     }
 
     #[test]
     fn test_inline_bitpack_u128_buffer_too_short_returns_err() {
         // Buffer is 15 bytes, one short of the 16-byte u128 header. The entry-point
-        // validation in `unchunk_u128_dispatch` must reject this with `InvalidInput`
+        // validation in `unchunk_u128_dispatch` must reject this with `CorruptFile`
         // rather than letting `LittleEndian::read_u128` panic on an under-length slice.
         // `num_values` has to be nonzero: an empty page returns an empty block before
         // any header is read.
@@ -2139,15 +2325,15 @@ mod test {
         let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], 1)
             .expect_err("under-length buffer must yield Err");
         assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "expected InvalidInput, got: {err:?}"
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
         );
     }
 
     #[test]
     fn test_inline_bitpack_u128_num_values_exceeds_chunk_returns_err() {
         // num_values > ELEMS_PER_CHUNK (1024) violates the per-chunk capacity
-        // invariant. `unchunk_u128_dispatch:511` must reject this before
+        // invariant. `unchunk_u128_dispatch` must reject this before
         // dispatching to a kernel — otherwise the post-unpack
         // `decompressed.truncate(num_values)` would silently no-op (per
         // `Vec::truncate` semantics: when `new_len >= self.len()` truncate
@@ -2160,8 +2346,8 @@ mod test {
         let err = MiniBlockDecompressor::decompress(&decoder, vec![buf], ELEMS_PER_CHUNK + 1)
             .expect_err("num_values > ELEMS_PER_CHUNK must yield Err");
         assert!(
-            matches!(err, Error::InvalidInput { .. }),
-            "expected InvalidInput, got: {err:?}"
+            matches!(err, Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {err:?}"
         );
     }
 
@@ -2355,6 +2541,25 @@ mod test {
         assert_eq!(decoded, values);
     }
 
+    #[rstest]
+    fn test_inline_bitpack_u128_adjacent_kernels(
+        #[values(0, 24, 40, 100, 128)] first_width: u32,
+        #[values(0, 24, 40, 100, 128)] second_width: u32,
+    ) {
+        let chunk = |width: u32| -> Vec<u128> {
+            (0..ELEMS_PER_CHUNK as u128)
+                .map(|i| match width {
+                    0 => 0,
+                    128 => u128::MAX - i,
+                    w => (1 << (w - 1)) | i,
+                })
+                .collect()
+        };
+        let mut values = chunk(first_width);
+        values.extend(chunk(second_width));
+        assert_eq!(u128_compress_decompress_roundtrip(values.clone()), values);
+    }
+
     #[test]
     fn test_u128_kernel_for_exhaustive_table_and_roundtrip() {
         // Pin the dispatch table for every legal `bit_width` (0..=128). The
@@ -2512,15 +2717,21 @@ mod test {
         /// (e.g. shared mutable state in the encoder, off-by-one in the
         /// per-chunk slice math, or a stale `bit_width` reused across chunks).
         ///
-        /// Strategy: pick 1..=3 chunk widths from the full `0..=128` range,
-        /// fill `ELEMS_PER_CHUNK` values per chunk masked to that chunk's
-        /// width, and assert the round-trip is bit-exact. With multiple
-        /// chunks per case, all 5×5 kernel-transition combinations
-        /// (zero/u32/u64/u128/memcpy → zero/u32/u64/u128/memcpy) are reached
-        /// in expectation across the 128-case proptest budget.
+        /// Strategy: pick 1..=3 chunk widths, each kernel equally likely, fill
+        /// `ELEMS_PER_CHUNK` values per chunk masked to that chunk's width, and
+        /// assert the round-trip is bit-exact.
         #[test]
         fn proptest_inline_bitpack_u128_mixed_widths(
-            bit_widths in prop::collection::vec(0usize..=128, 1..=3),
+            bit_widths in prop::collection::vec(
+                prop_oneof![
+                    Just(0usize),
+                    1usize..=32,
+                    33usize..=64,
+                    65usize..=127,
+                    Just(128usize),
+                ],
+                1..=3,
+            ),
             seed in any::<u64>(),
         ) {
             // Deterministic per-chunk payload from the shrinkable seed so
@@ -2623,6 +2834,29 @@ mod test {
             panic!("expected fixed-width data");
         };
         assert_eq!(decoded.data.borrow_to_typed_slice::<u32>().as_ref(), values);
+    }
+
+    #[rstest]
+    #[case::u16(17, 16)]
+    #[case::u128(129, 128)]
+    fn test_out_of_line_bitpack_rejects_width_above_value_width(
+        #[case] compressed_bit_width: u64,
+        #[case] uncompressed_bit_width: u64,
+    ) {
+        let num_values = ELEMS_PER_CHUNK;
+        let error = OutOfLineBitpacking::new(compressed_bit_width, uncompressed_bit_width)
+            .compress(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::from(vec![
+                    0_u8;
+                    (num_values * uncompressed_bit_width / 8) as usize
+                ]),
+                bits_per_value: uncompressed_bit_width,
+                num_values,
+                block_info: BlockInfo::new(),
+            }))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("exceeds"), "{error}");
     }
 
     #[rstest]

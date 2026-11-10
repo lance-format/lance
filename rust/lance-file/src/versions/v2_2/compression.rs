@@ -170,14 +170,22 @@ mod tests {
     fn u128_values_are_not_bitpacked() {
         let strategy = Strategy::new(CompressionParams::default());
 
-        let compressor = strategy
-            .create_block_compressor(&decimal_field(), &decimal128_block())
+        let miniblock = strategy
+            .create_miniblock_compressor(&decimal_field(), &decimal128_block())
             .unwrap();
-
-        let debug_str = format!("{compressor:?}");
+        let debug_str = format!("{miniblock:?}");
         assert!(
             !debug_str.contains("Bitpacking"),
-            "2.2 must not bitpack 128-bit values, got: {debug_str}"
+            "2.2 must not bitpack 128-bit mini-block values, got: {debug_str}"
+        );
+
+        let block = strategy
+            .create_block_compressor(&decimal_field(), &decimal128_block())
+            .unwrap();
+        let debug_str = format!("{block:?}");
+        assert!(
+            !debug_str.contains("Bitpacking"),
+            "2.2 must not bitpack 128-bit blocks, got: {debug_str}"
         );
     }
 }

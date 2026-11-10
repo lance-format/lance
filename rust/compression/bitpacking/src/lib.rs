@@ -1813,8 +1813,8 @@ pack_64!(pack_64_64, 64);
 //   * Rust has no native 128-bit SIMD lowering; a transposed kernel would still emit
 //     scalar IR on most targets.
 //
-// The on-disk format is `width` alone — a transposed (FastLanes-style) kernel can be
-// added later as a drop-in replacement without changing the format.
+// Lance files store this sequential layout for 128-bit bitpacking at widths 65..=127, so a
+// different kernel here would change how existing files decode.
 impl BitPackingUninit for u128 {
     /// # Safety
     /// `input.len()` must be `1024` and `output.len()` must be `1024 * width / Self::T`.
@@ -2403,7 +2403,8 @@ mod test {
                 *value = ((hi << 64) | lo) & mask;
             }
         }
-        let mut packed = vec![0u128; 1024 * bit_width / u128::T];
+        // Start from all-ones: the kernel must zero its output before OR-ing bits into it.
+        let mut packed = vec![u128::MAX; 1024 * bit_width / u128::T];
         unsafe {
             BitPacking::unchecked_pack(bit_width, &values, &mut packed);
         }

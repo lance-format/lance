@@ -1162,8 +1162,9 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     }
 
     /// Returns the output bit width when this is the single-buffer inline
-    /// bitpacking codec. The mini-block reader uses this optional capability
-    /// to unpack directly into a typed output buffer; other codecs keep the
+    /// bitpacking codec of 8, 16, 32 or 64-bit values. The mini-block reader
+    /// uses this optional capability to unpack directly into a typed output
+    /// buffer; other codecs, 128-bit inline bitpacking included, keep the
     /// generic path.
     fn inline_bitpacking_width(&self) -> Option<u64> {
         None
@@ -1362,11 +1363,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(description) => {
-                if !matches!(description.uncompressed_bits_per_value, 8 | 16 | 32 | 64)
-                    || description.values.is_some()
+                if !matches!(
+                    description.uncompressed_bits_per_value,
+                    8 | 16 | 32 | 64 | 128
+                ) || description.values.is_some()
                 {
                     return Err(Error::invalid_input(
-                        "Inline bitpacking requires an 8, 16, 32, or 64-bit width and no leaf compression",
+                        "Inline bitpacking requires an 8, 16, 32, 64, or 128-bit width and no leaf compression",
                     ));
                 }
                 Ok(Box::new(InlineBitpacking::from_description(description)))
