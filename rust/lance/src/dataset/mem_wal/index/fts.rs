@@ -7841,8 +7841,8 @@ mod tests {
     }
 
     /// Phrase scores are exact BM25 sums on both the partition and the tail
-    /// path. Docs differ in length and per-token frequency, so pairing a
-    /// token's weight with another token's frequency changes the score.
+    /// path. Row 1 has different frequencies for the two tokens, so pairing a
+    /// token's weight with the other token's frequency changes its score.
     #[rstest]
     #[case::partition(3, 1)]
     #[case::tail(usize::MAX, 0)]
