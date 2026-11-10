@@ -56,6 +56,7 @@ use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
+use crate::encodings::physical::try_vec_with_capacity;
 use crate::format::metadata::CompressiveEncoding;
 use crate::format::{EncodingUtils, metadata};
 use crate::statistics::{GetStat, Stat};
@@ -1124,11 +1125,12 @@ fn bitpack_out_of_line_u128(data: FixedWidthDataBlock, compressed_bit_width: usi
 
 /// Inverse of [`bitpack_out_of_line_u128`]. The caller has checked that `data` has the
 /// raw-tail or padded-tail length for `num_values` (`out_of_line_payload_byte_lengths`).
+/// A zero-width payload is empty, so only the allocation bounds `num_values`.
 fn unpack_out_of_line_u128(
     data: &LanceBuffer,
     num_values: usize,
     compressed_bit_width: usize,
-) -> FixedWidthDataBlock {
+) -> Result<FixedWidthDataBlock> {
     let chunk_len = ELEMS_PER_CHUNK as usize;
     let body_bytes = chunk_len * compressed_bit_width / 8;
     let num_whole_chunks = num_values / chunk_len;
@@ -1141,7 +1143,10 @@ fn unpack_out_of_line_u128(
     } else {
         chunk_len
     };
-    let mut decoded = vec![0u128; num_whole_chunks * chunk_len + tail_values];
+    let decoded_len = num_whole_chunks * chunk_len + tail_values;
+    let mut decoded: Vec<u128> =
+        try_vec_with_capacity(decoded_len as u64, "Out-of-line bitpacking output")?;
+    decoded.resize(decoded_len, 0);
 
     for chunk_idx in 0..num_whole_chunks {
         let body = &data[chunk_idx * body_bytes..][..body_bytes];
@@ -1164,12 +1169,12 @@ fn unpack_out_of_line_u128(
         decoded.truncate(num_values);
     }
 
-    FixedWidthDataBlock {
+    Ok(FixedWidthDataBlock {
         data: LanceBuffer::reinterpret_vec(decoded),
         bits_per_value: 128,
         num_values: num_values as u64,
         block_info: BlockInfo::new(),
-    }
+    })
 }
 
 /// Bitpacks a FixedWidthDataBlock with a given bit width.
@@ -1534,9 +1539,11 @@ impl BlockDecompressor for OutOfLineBitpacking {
             16 => unpack_out_of_line::<u16>(block, num_values, self.compressed_bit_width as usize),
             32 => unpack_out_of_line::<u32>(block, num_values, self.compressed_bit_width as usize),
             64 => unpack_out_of_line::<u64>(block, num_values, self.compressed_bit_width as usize),
-            128 => {
-                unpack_out_of_line_u128(&block.data, num_values, self.compressed_bit_width as usize)
-            }
+            128 => unpack_out_of_line_u128(
+                &block.data,
+                num_values,
+                self.compressed_bit_width as usize,
+            )?,
             _ => unreachable!(),
         };
         Ok(DataBlock::FixedWidth(unpacked))
@@ -2834,6 +2841,23 @@ mod test {
             panic!("expected fixed-width data");
         };
         assert_eq!(decoded.data.borrow_to_typed_slice::<u32>().as_ref(), values);
+    }
+
+    /// A zero-width 128-bit payload is empty, so a declared count too large to allocate
+    /// must be an error rather than a panic or an abort.
+    #[test]
+    fn test_u128_out_of_line_zero_width_rejects_unallocatable_count() {
+        let decompressor = OutOfLineBitpacking::new(0, 128);
+        for num_values in [
+            u64::MAX - 2048,
+            isize::MAX as u64 / 16 + 1,
+            (1_u64 << 60) / 16,
+        ] {
+            let error = decompressor
+                .decompress(Some(LanceBuffer::empty()), num_values)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        }
     }
 
     #[rstest]
