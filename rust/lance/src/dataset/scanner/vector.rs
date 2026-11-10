@@ -46,11 +46,12 @@ use roaring::RoaringBitmap;
 
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::io::exec::knn::warp::{WarpParams, warp_select};
+use crate::io::exec::knn::warp::{WarpParams, warp_score, warp_select};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
     knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
@@ -1351,8 +1352,8 @@ impl Scanner {
     /// 1. WARPselect ([`warp_select`]): score every query token against the IVF
     ///    centroids once, choose each token's partitions, and derive per-token
     ///    missing-similarity estimates from the centroid scores.
-    /// 2. Candidate generation: score the compressed residuals in the selected
-    ///    partitions without decompressing them.
+    /// 2. Candidate generation ([`warp_score`]): score every token of the
+    ///    selected partitions through each segment's own quantizer.
     /// 3. Reduction: max-reduce scores per (token, document), then sum across
     ///    tokens, filling gaps with the step 1 estimates, and keep the top k.
     async fn multivec_warp_ann(
@@ -1360,7 +1361,7 @@ impl Scanner {
         q: &Query,
         index: &[IndexMetadata],
         _filter_plan: &ExprFilterPlan,
-        _overlay_block: Option<RowAddrMask>,
+        overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
         let params = WarpParams {
@@ -1369,9 +1370,9 @@ impl Scanner {
                 .warp_imputation_rank
                 .unwrap_or(q.k * *DEFAULT_XTR_OVERFETCH as usize),
         };
-        // TODO: move into the WARP execution node once candidate generation
-        // exists, so planning does not open index segments.
-        let _selection = warp_select(
+        // TODO: move into a WARP execution node once the reduction exists, so
+        // planning does not search the index.
+        let selection = warp_select(
             &self.dataset,
             &q.column,
             index,
@@ -1381,8 +1382,20 @@ impl Scanner {
             &NoOpMetricsCollector,
         )
         .await?;
+        // TODO: apply the query filter and the external row mask, as ANN search does.
+        let mut pre_filter = DatasetPreFilter::new(self.dataset.clone(), index, None);
+        if let Some(overlay_block) = overlay_block {
+            pre_filter = pre_filter.with_overlay_block(overlay_block);
+        }
+        let _strides = warp_score(
+            &self.dataset,
+            &selection,
+            Arc::new(pre_filter),
+            &NoOpMetricsCollector,
+        )
+        .await?;
         Err(Error::not_supported(
-            "WARP candidate generation is not implemented yet; use MultivectorAlgorithm::Xtr",
+            "the WARP reduction is not implemented yet; use MultivectorAlgorithm::Xtr",
         ))
     }
 
