@@ -344,7 +344,7 @@ other operation. Here are the operations that conflict with Restore:
 - UpdateMemWalState
 - UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
 - UpdateConfig that sets the [history retention](branch_tag.md#history-retention) keys, if the
-  restored version is soft-deleted under the new values
+  restored version is expired under the new values
 
 A Restore that rebases over history retention keys without conflicting keeps those keys rather than
 the restored version's.
