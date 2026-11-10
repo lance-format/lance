@@ -38,18 +38,17 @@ use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
+use crate::dataset::rowids::live_row_addrs_to_row_ids;
 use crate::dataset::{row_offsets_to_row_addresses, versions};
 use crate::datatypes::Schema;
-use crate::index::scalar_logical::load_named_scalar_segments;
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode,
 };
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceFilterExec, LancePushdownScanExec,
-    LanceScanConfig, LanceScanExec, Planner, ScanConfig, TakeExec, project,
+    LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec, ScanConfig, TakeExec, project,
 };
 use crate::{Error, Result};
 
@@ -444,8 +443,11 @@ impl Scanner {
         // touched an indexed field can no longer be trusted to that index. Block just those rows
         // from the index result (their fragments stay indexed, so non-stale rows keep the index)
         // and re-evaluate them on a targeted take path below — O(stale_rows), not O(fragment).
-        let mut overlay_stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
-        if let Some(index_query) = filter_plan.index_query.as_ref() {
+        let mut overlay_stale_rows =
+            IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new());
+        // An external mask is already the row source and reads current values.
+        // It has no stale index entries to exclude or replay outside that mask.
+        if !use_external_mask && let Some(index_query) = filter_plan.index_query.as_ref() {
             let candidate_frags = read_options
                 .fragments
                 .clone()
@@ -453,7 +455,7 @@ impl Scanner {
             overlay_stale_rows = self
                 .overlay_stale_index_rows(index_query, &candidate_frags)
                 .await?;
-            if let Some(block) = self.stale_rows_block_mask(&overlay_stale_rows).await? {
+            if let Some(block) = overlay_stale_rows.block_mask().await? {
                 read_options = read_options.with_overlay_block(block);
             }
         }
@@ -510,9 +512,31 @@ impl Scanner {
         let filter_cols = Planner::column_names_in_expr(filter);
         let take_projection = user_projection.union_columns(filter_cols, OnMissing::Error)?;
 
-        let stale_node = self
-            .stale_rows_take(&overlay_stale_rows, take_projection)
-            .await?;
+        // Replay in physical coordinates, which visibility already resolved.
+        // Taking by stable ID would serialize the selection and translate it
+        // back to addresses before reading the same current values.
+        let mut physical_rows = overlay_stale_rows.physical_selection();
+        if let Some(selection) = &self.physical_row_addr_prefilter {
+            physical_rows &= selection.as_ref();
+        }
+        let take_projection = if self.external_row_mask.is_some() {
+            take_projection.with_row_id()
+        } else {
+            take_projection
+        };
+        let mut stale_options = FilteredReadOptions::new(take_projection)
+            .with_physical_row_addr_prefilter(Arc::new(physical_rows));
+        if let Some(fragments) = &self.fragments {
+            stale_options = stale_options.with_fragments(Arc::new(fragments.clone()));
+        }
+        let mut stale_node: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            stale_options,
+            None,
+        )?);
+        if let Some(mask) = &self.external_row_mask {
+            stale_node = Arc::new(RowAddrMaskFilterExec::new(stale_node, mask.clone()));
+        }
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
         let filtered = Arc::new(match session {
@@ -743,25 +767,22 @@ impl Scanner {
         .await
     }
 
-    /// Per-row stale offsets for each fragment whose indexed values may be stale because an
-    /// overlay committed *after* an index was built touches a field that index covers.
-    ///
-    /// The check is field-aware (an overlay touching only unindexed fields excludes nothing) and
-    /// version-gated (an overlay with `committed_version <= index.dataset_version` is already
-    /// incorporated by the index), via
-    /// [`lance_table::format::overlay::staleness::overlay_exclusion_offsets`].
+    /// Conservatively union stale rows across the scalar expression's selected leaves.
+    /// The full predicate is replayed, so exclusions also survive expression negation.
     pub(super) async fn overlay_stale_index_rows(
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: &[Fragment],
-    ) -> Result<HashMap<u32, RoaringBitmap>> {
-        // Overlays are rare; skip all index loading when none of the candidate fragments has one.
-        let overlaid_frags = overlaid_fragments(fragments);
-        if overlaid_frags.is_empty() {
-            return Ok(HashMap::new());
+    ) -> Result<IndexVisibility> {
+        if fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+        {
+            return Ok(IndexVisibility::from_physical_rows(
+                self.dataset.clone(),
+                HashMap::new(),
+            ));
         }
-
-        // Walk the (boolean) index expression tree to collect leaf searches.
         let mut searches = Vec::new();
         let mut stack = vec![index_expr];
         while let Some(expr) = stack.pop() {
@@ -771,113 +792,42 @@ impl Scanner {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
-                ScalarIndexExpr::Query(search) => searches.push(search),
+                ScalarIndexExpr::Query(search) => {
+                    searches.push((search.column.as_str(), search.index_name.as_str()))
+                }
             }
         }
-
-        // `load_named_scalar_segments` returns cached index metadata — no disk I/O on the hot
-        // path. Even without the cache, this code is only reached when at least one fragment has
-        // overlays (rare), so the per-leaf cost is acceptable.
-        let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
-        for search in searches {
-            let segments = load_named_scalar_segments(
-                self.dataset.as_ref(),
-                &search.column,
-                &search.index_name,
-            )
-            .await?;
-            for segment in &segments {
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut stale,
-                    self.dataset.schema(),
-                )?;
-            }
-        }
-        Ok(stale)
+        IndexVisibility::for_scalar_indices(
+            self.dataset.clone(),
+            &searches,
+            fragments,
+            self.scalar_index_selection
+                .as_ref()
+                .and_then(|selection| selection.segment_uuids.as_deref()),
+        )
+        .await
     }
 
-    /// Compute per-row stale data for a vector index's segments.
-    ///
-    /// Returns a map from fragment_id to the set of row offsets within that fragment that are stale
-    /// (their vector values have been updated by a newer overlay since the index was built). An
-    /// empty map means no stale rows — the fast path where no masking is needed.
+    /// Resolve stale vector entries within the requested fragment scope.
     pub(super) fn overlay_stale_vector_rows(
         &self,
         segments: &[IndexMetadata],
-    ) -> Result<HashMap<u32, RoaringBitmap>> {
-        // Scope to the query's target fragments (all dataset fragments if unscoped).
-        let dataset_frags = self.dataset.fragments();
-        let fragments: &[Fragment] = match self.fragments.as_ref() {
-            Some(f) => f.as_slice(),
-            None => dataset_frags.as_slice(),
-        };
-        let overlaid_frags = overlaid_fragments(fragments);
-        if overlaid_frags.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
-        for segment in segments {
-            collect_overlay_stale_rows_for_segment(
-                segment,
-                &overlaid_frags,
-                &mut stale,
-                self.dataset.schema(),
-            )?;
-        }
-        Ok(stale)
+    ) -> Result<IndexVisibility> {
+        let fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
+        IndexVisibility::from_segments(self.dataset.clone(), segments, fragments)
     }
 
-    /// Collect the stale rows into a [`RowAddrTreeMap`] in the domain the index results use.
-    ///
-    /// Index results are in the row-id domain (see `ScalarQuery::evaluate_nullable`), and a
-    /// physical row address equals its row id only when the dataset does not use stable row ids.
-    /// Under stable row ids the addresses are translated to their row ids so the result lines up
-    /// with the index output it is combined with (block mask) or taken against.
-    pub(super) async fn stale_rows_in_id_domain(
+    /// Read a result-domain ID selection against current values and the same
+    /// fragment and physical-row restrictions as the indexed branch.
+    pub(super) fn row_ids_take(
         &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
-    ) -> Result<RowAddrTreeMap> {
-        let mut tree_map = RowAddrTreeMap::new();
-        for (&frag_id, offsets) in stale_rows {
-            tree_map.insert_bitmap(frag_id, offsets.clone());
-        }
-        if self.dataset.manifest.uses_stable_row_ids() {
-            tree_map = translate_addr_treemap_to_row_ids(&self.dataset, &tree_map).await?;
-        }
-        Ok(tree_map)
-    }
-
-    /// Build a block-list mask over stale rows, or `None` when there are none.
-    ///
-    /// The mask removes these rows from an index result so the index never emits them; they
-    /// are re-evaluated against their current (overlay-merged) values on a targeted take path
-    /// (see [`Self::stale_rows_take`]).
-    pub(super) async fn stale_rows_block_mask(
-        &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
-    ) -> Result<Option<RowAddrMask>> {
-        if stale_rows.is_empty() {
-            return Ok(None);
-        }
-        let tree_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        Ok(Some(RowAddrMask::from_block(tree_map)))
-    }
-
-    /// Take the stale rows by physical address, projecting `projection`, to re-evaluate only
-    /// those rows (rather than their whole fragments) against their current overlay-merged values.
-    ///
-    /// The rows are identified by an address allow list routed through `FilteredReadExec`, not a
-    /// `_rowid` column (`_rowid` and row address diverge under stable row ids — see
-    /// [`Self::stale_rows_in_id_domain`]).
-    pub(super) async fn stale_rows_take(
-        &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
+        rows: RowAddrTreeMap,
         projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let take_id_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        let index_input = self.row_ids_as_take_input(take_id_map)?;
+        let index_input = self.row_ids_as_take_input(rows)?;
         let mut read_options = FilteredReadOptions::new(projection);
         if let Some(fragments) = self.fragments.as_ref() {
             read_options = read_options.with_fragments(Arc::new(fragments.clone()));
@@ -931,7 +881,7 @@ impl Scanner {
         {
             mat_exec = mat_exec.with_segment_uuids(segment_uuids);
         }
-        let mat_exec = match self.stale_rows_block_mask(&stale_rows).await? {
+        let mat_exec = match stale_rows.block_mask().await? {
             Some(block) => mat_exec.with_overlay_block(block),
             None => mat_exec,
         };
@@ -1054,7 +1004,8 @@ impl Scanner {
             let filter = filter_plan.full_expr.as_ref().expect_ok()?;
             let take_projection = fallback_projection.expect_ok()?;
 
-            let stale_node = self.stale_rows_take(&stale_rows, take_projection).await?;
+            let stale_node =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_projection)?;
 
             let planner = Planner::new(stale_node.schema());
             let optimized_filter = planner.optimize_expr(filter.clone())?;
