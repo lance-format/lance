@@ -28,8 +28,31 @@ fn test_path_exists() {
     let sources = vec![
         (r#"{"a":1,"b":2}"#, r#"$.a"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.c"#, false),
+        (r#"{"1example":1}"#, r#"1example"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.a ? (@ == 1)"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.a ? (@ > 1)"#, false),
+        (
+            r#"[{"confidence":0.8},{"confidence":0.95}]"#,
+            r#"$[*] ? (@.confidence > 0.9)"#,
+            true,
+        ),
+        (
+            r#"[{"confidence":0.8},{"confidence":0.9}]"#,
+            r#"$[*] ? (@.confidence > 9E-1)"#,
+            false,
+        ),
+        (r#"[1234,1235]"#, r#"$[*] ? (@ > 1234.5)"#, true),
+        (r#"[-1,0]"#, r#"$[*] ? (@ < -0.5)"#, true),
+        (
+            r#"[9007199254740992,9007199254740993]"#,
+            r#"$[*] ? (@ == 9007199254740993)"#,
+            true,
+        ),
+        (
+            r#"[9007199254740992]"#,
+            r#"$[*] ? (@ == 9007199254740993)"#,
+            false,
+        ),
         (r#"{"a":1,"b":[1,2,3]}"#, r#"$.b[0]"#, true),
         (r#"{"a":1,"b":[1,2,3]}"#, r#"$.b[3]"#, false),
         (
@@ -215,6 +238,8 @@ fn test_select_by_path() {
         (r#"+$.numbers"#, vec![r#"2"#, r#"3"#, r#"4"#]),
         (r#"-$.numbers"#, vec![r#"-2"#, r#"-3"#, r#"-4"#]),
         (r#"$.numbers[1] / 2"#, vec![r#"1.5"#]),
+        (r#"$.numbers[0]+0.9"#, vec!["2.9"]),
+        (r#"9E-1+$.numbers[0]"#, vec!["2.9"]),
     ];
 
     let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();

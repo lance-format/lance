@@ -5140,6 +5140,7 @@ dependencies = [
  "num-traits",
  "ordered-float 5.3.0",
  "proptest",
+ "rstest",
  "serde",
  "serde_json",
  "zmij",
