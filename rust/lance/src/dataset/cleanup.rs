@@ -505,7 +505,7 @@ struct CleanupInspection {
 }
 
 impl CleanupInspection {
-    /// Cutoff for `read_dir_all(..., unmodified_since)`.
+    /// Retained-manifest floor of the cutoff for `read_dir_all(..., unmodified_since)`.
     ///
     /// Listing only files with `last_modified <= earliest_retained` is valid
     /// when the working set is a time suffix: every retained version is newer
@@ -1723,15 +1723,17 @@ impl<'a> CleanupTask<'a> {
         // Drop the retained-manifest cutoff when a sparse retain (e.g. a tag)
         // would hide files that belong to newer deleted versions. See
         // [`CleanupInspection::listing_unmodified_since`].
-        let unmodified_since = inspection.listing_unmodified_since();
-        // Data files owned by no manifest can be newer than the retained
-        // manifest floor. List through the moving verification threshold so
-        // they become candidates once old enough, or list all data files when
-        // the caller explicitly permits deleting unverified files.
-        let data_unmodified_since = if self.policy.delete_unverified {
+        // Files owned by no manifest, such as those of a failed commit, can be
+        // newer than the retained manifest floor. List through the moving
+        // verification threshold so they become candidates once old enough, or
+        // list everything when the caller explicitly permits deleting unverified
+        // files.
+        let unmodified_since = if self.policy.delete_unverified {
             None
         } else {
-            unmodified_since.map(|cutoff| cutoff.max(verification_threshold))
+            inspection
+                .listing_unmodified_since()
+                .map(|cutoff| cutoff.max(verification_threshold))
         };
         let mut streams = vec![
             // Staging manifests can be newer than the latest retained manifest,
@@ -1739,11 +1741,8 @@ impl<'a> CleanupTask<'a> {
             // paths are revalidated against the commit handler instead.
             build_listing_stream(self.dataset.versions_dir(), None),
             build_listing_stream(self.dataset.transactions_dir(), unmodified_since),
-            build_listing_stream(self.dataset.data_dir(), data_unmodified_since),
-            build_listing_stream(
-                self.dataset.base.clone().join("_blobs"),
-                data_unmodified_since,
-            ),
+            build_listing_stream(self.dataset.data_dir(), unmodified_since),
+            build_listing_stream(self.dataset.base.clone().join("_blobs"), unmodified_since),
             // Index UUIDs from manifests being removed are proof that their files are
             // safe to delete. Scan every index artifact while that proof is available;
             // a retained-manifest cutoff can otherwise skip newer artifacts and lose

@@ -22,9 +22,10 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     #[case] delete_unverified: bool,
     #[case] cleanup_day: i64,
 ) {
-    // A data file referenced by no manifest (e.g. abandoned
-    // `write_fragments` output) is deleted based on its age, and its mtime
-    // is unrelated to the retained floor.
+    // A file referenced by no manifest (e.g. abandoned `write_fragments`
+    // output, or the transaction and deletion files of a commit that never
+    // landed) is deleted based on its age, and its mtime is unrelated to the
+    // retained floor.
     MockClock::set_system_time(std::time::Duration::from_secs(0));
     let fixture = MockDatasetFixture::try_new().unwrap();
     fixture.create_some_data().await.unwrap();
@@ -36,12 +37,19 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     // Newer than every manifest, and old enough to be aged out below.
     MockClock::set_system_time(TimeDelta::try_days(3).unwrap().to_std().unwrap());
     let dataset = fixture.open().await.unwrap();
-    let orphan = dataset.data_dir().join(format!("{}.lance", Uuid::new_v4()));
-    dataset
-        .object_store
-        .put(&orphan, &[0u8; 1024])
-        .await
-        .unwrap();
+    for orphan in [
+        dataset.data_dir().join(format!("{}.lance", Uuid::new_v4())),
+        dataset
+            .transactions_dir()
+            .join(format!("3-{}.txn", Uuid::new_v4())),
+        dataset.deletions_dir().join("0-3-99.arrow"),
+    ] {
+        dataset
+            .object_store
+            .put(&orphan, &[0u8; 1024])
+            .await
+            .unwrap();
+    }
     drop(dataset);
 
     MockClock::set_system_time(TimeDelta::try_days(cleanup_day).unwrap().to_std().unwrap());
@@ -49,6 +57,8 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
     let before_count = fixture.count_files().await.unwrap();
     assert_eq!(before_count.num_data_files, 4);
     assert_eq!(before_count.num_manifest_files, 3);
+    assert_eq!(before_count.num_tx_files, 4);
+    assert_eq!(before_count.num_delete_files, 1);
 
     // Suffix-only retention: the two oldest versions go, the latest stays.
     let removed = fixture
@@ -62,11 +72,16 @@ async fn cleanup_deletes_aged_orphan_newer_than_retained_manifests(
 
     assert_eq!(removed.old_versions, 2);
     assert_eq!(removed.data_files_removed, 1);
+    // The two expired versions' transaction files, and the orphan.
+    assert_eq!(removed.transaction_files_removed, 3);
+    assert_eq!(removed.deletion_files_removed, 1);
 
     let after_count = fixture.count_files().await.unwrap();
     assert_eq!(after_count.num_manifest_files, 1);
     // Appends leave every fragment referenced by the latest version.
     assert_eq!(after_count.num_data_files, 3);
+    assert_eq!(after_count.num_tx_files, 1);
+    assert_eq!(after_count.num_delete_files, 0);
 }
 #[tokio::test]
 async fn auto_cleanup_old_versions() {
