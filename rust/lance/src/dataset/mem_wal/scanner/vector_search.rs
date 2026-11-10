@@ -82,7 +82,8 @@ impl ProbeBounds {
 ///         … one per SSTable gen …
 ///         ProjectionExec (canonical output schema)
 ///           PkBlockFilterExec: block-list                     (base)
-///             ProjectionExec (_distance rescaled, flat unrefined only)
+///             ProjectionExec (_distance rescaled, flat unrefined only;
+///                             never under a block-list, which refines)
 ///               KNNExec: base table, k (fast_search|flat)[.refine()?]
 /// ```
 ///
@@ -3870,8 +3871,8 @@ mod tests {
                 }
             };
         let check = async |what: &str, base_dataset: &Dataset| {
-            // Flat distances are exact, so they are reported on the plan's
-            // scale unless the search is refined.
+            // Flat distances are exact, rescaled to the plan's scale; a refined
+            // plan reports exact distances.
             for (scale, refine, reported) in
                 [(1.0, None, 1.0), (2.0, None, 2.0), (2.0, Some(1), 1.0)]
             {
@@ -3912,6 +3913,21 @@ mod tests {
             .await
             .unwrap();
         check("metric-mismatched base index", &base_dataset).await;
+
+        // A usable index already reports on the plan's scale, so an indexed
+        // base is never rescaled.
+        let cosine_index = VectorIndexParams::ivf_flat(1, DistanceType::Cosine);
+        base_dataset
+            .create_index(&["vector"], IndexType::Vector, None, &cosine_index, true)
+            .await
+            .unwrap();
+        let native = search(&base_dataset, 1.0, None, None).await;
+        let on_2x_scale = search(&base_dataset, 2.0, None, None).await;
+        assert_eq!(native.len(), 2, "indexed base: got {native:?}");
+        assert_eq!(
+            on_2x_scale, native,
+            "an indexed base must report the index's distances unchanged"
+        );
     }
 
     #[tokio::test]
