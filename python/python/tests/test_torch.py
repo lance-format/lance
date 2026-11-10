@@ -105,14 +105,20 @@ class _EpochDataset(torch.utils.data.IterableDataset):
 
 
 class _FullQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(self, ready):
+    def __init__(self, ready, cancelled, finish_cleanup):
         self.ready = ready
+        self.cancelled = cancelled
+        self.finish_cleanup = finish_cleanup
 
     def __iter__(self):
-        # The first item fills both the queue slot and its feeder's pipe.
-        yield bytes(1024 * 1024)
-        self.ready.set()
-        yield 2
+        try:
+            # The first item fills both the queue slot and its feeder's pipe.
+            yield bytes(1024 * 1024)
+            self.ready.set()
+            yield 2
+        finally:
+            self.cancelled.set()
+            self.finish_cleanup.wait()
 
 
 class _LargeItemDataset(torch.utils.data.IterableDataset):
@@ -200,7 +206,9 @@ def _async_lifecycle_scenario(scenario, start_method):
     elif scenario in ("blocked_producer", "blocked_user_code", "ignored_termination"):
         ready = multiprocessing.Event()
         if scenario == "blocked_producer":
-            creator = partial(_FullQueueDataset, ready)
+            cancelled = multiprocessing.Event()
+            finish_cleanup = multiprocessing.Event()
+            creator = partial(_FullQueueDataset, ready, cancelled, finish_cleanup)
         else:
             creator = partial(
                 _BlockedDataset,
@@ -212,6 +220,18 @@ def _async_lifecycle_scenario(scenario, start_method):
         try:
             dataset._start()
             assert ready.wait(5), "Worker never reached the blocking operation"
+            if scenario == "blocked_producer":
+                # Prove cancellation while cleanup is deliberately held open.
+                # Process teardown may exceed close()'s grace period under load.
+                dataset.shutdown.value = True
+                assert cancelled.wait(5), (
+                    "Full queue prevented cooperative cancellation"
+                )
+                assert dataset.worker.is_alive()
+                finish_cleanup.set()
+                dataset.worker.join(timeout=5)
+                assert not dataset.worker.is_alive(), "Worker did not finish cleanup"
+                assert dataset.worker.exitcode == 0
             with (
                 patch.object(
                     dataset.worker, "terminate", wraps=dataset.worker.terminate
@@ -222,6 +242,8 @@ def _async_lifecycle_scenario(scenario, start_method):
                 assert terminate.call_count == int(scenario != "blocked_producer")
                 assert kill.call_count == int(scenario == "ignored_termination")
         finally:
+            if scenario == "blocked_producer":
+                finish_cleanup.set()
             dataset.close()
         dataset.close()
     elif scenario in ("repeated_epochs", "empty_epochs"):
@@ -239,6 +261,7 @@ def _async_lifecycle_scenario(scenario, start_method):
                     assert torch.equal(batches[1]["tensor"], torch.tensor([1, 2]))
     else:
         raise AssertionError(f"Unknown lifecycle scenario: {scenario}")
+    assert dataset.shutdown.value, "Closing AsyncDataset did not signal cancellation"
     assert not multiprocessing.active_children(), "AsyncDataset leaked a worker"
 
 
