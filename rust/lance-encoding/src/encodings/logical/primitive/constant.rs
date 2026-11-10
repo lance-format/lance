@@ -116,6 +116,7 @@ struct ConstantBufferLayout {
 
 #[derive(Debug)]
 pub struct ConstantPageScheduler {
+    pub(super) structural_projection: Option<super::structure::StructuralProjection>,
     scalar_source: ScalarSource,
     data_type: DataType,
     def_meaning: Arc<[DefinitionInterpretation]>,
@@ -195,6 +196,7 @@ impl ConstantPageScheduler {
 
         Ok(Self {
             scalar_source,
+            structural_projection: None,
             data_type,
             def_meaning,
             max_rep,
@@ -209,7 +211,10 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
     fn init_layout(&self) -> Result<PageInitialization> {
         // Order must match `init_from_buffers`' consumption: scalar, rep, def.
         Ok(PageInitialization::new([
-            self.layout.scalar.clone(),
+            self.layout
+                .scalar
+                .clone()
+                .filter(|_| self.structural_projection.is_none()),
             self.layout.rep.clone(),
             self.layout.def.clone(),
         ]))
@@ -224,21 +229,33 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
         // declared them, using the shared layout's presence flags.
         let scalar_source = self.scalar_source.clone();
         let data_type = self.data_type.clone();
+        let structural_projection = self.structural_projection.clone();
         async move {
             let [scalar_buffer, rep_buffer, def_buffer] = buffers.try_into_array("constant")?;
 
-            let scalar = match (scalar_source, scalar_buffer) {
-                (ScalarSource::Inline(inline), None) => {
-                    lance_arrow::scalar::decode_scalar_from_inline_value(&data_type, &inline)?
-                }
-                (ScalarSource::ValueBuffer(_), Some(bytes)) => {
-                    let buf = LanceBuffer::from_bytes(bytes, 1);
-                    lance_arrow::scalar::decode_scalar_from_value_buffer(&data_type, buf.as_ref())?
-                }
-                _ => {
-                    return Err(Error::internal(
-                        "Constant page scalar buffer does not match its initialization layout",
-                    ));
+            let scalar = if let Some(projection) = structural_projection {
+                arrow_array::make_array(
+                    projection
+                        .placeholder_values(1)?
+                        .into_arrow(data_type, true)?,
+                )
+            } else {
+                match (scalar_source, scalar_buffer) {
+                    (ScalarSource::Inline(inline), None) => {
+                        lance_arrow::scalar::decode_scalar_from_inline_value(&data_type, &inline)?
+                    }
+                    (ScalarSource::ValueBuffer(_), Some(bytes)) => {
+                        let buf = LanceBuffer::from_bytes(bytes, 1);
+                        lance_arrow::scalar::decode_scalar_from_value_buffer(
+                            &data_type,
+                            buf.as_ref(),
+                        )?
+                    }
+                    _ => {
+                        return Err(Error::internal(
+                            "Constant page scalar buffer does not match its initialization layout",
+                        ));
+                    }
                 }
             };
 

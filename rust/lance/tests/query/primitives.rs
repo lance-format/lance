@@ -101,6 +101,20 @@ async fn test_query_integer(#[case] data_type: DataType) {
                 "NOT ((value != 5) OR ((value != 52) OR (value IS NULL)))",
             )
             .await;
+            // `id` has no index, so these OR an index search with a refine
+            test_filter(&original, &ds, "(value > 20 AND id < 30) OR value < 5").await;
+            test_filter(
+                &original,
+                &ds,
+                "(value > 20 AND id < 30) OR (value < 5 AND id >= 30)",
+            )
+            .await;
+            test_filter(
+                &original,
+                &ds,
+                "NOT ((value > 20 AND id < 30) OR value < 5)",
+            )
+            .await;
         })
         .await
 }
@@ -139,6 +153,96 @@ async fn test_btree_nullable_or_with_absent_value() {
             test_filter(&original, &ds, "value is not null").await;
         })
         .await;
+}
+
+/// An OR keeps the scalar index when a branch also filters on an unindexed column:
+/// the OR of the index searches finds the candidate rows and the whole OR filters
+/// them. Rows appended after the index was built and NULL values are answered too.
+#[tokio::test]
+async fn test_or_with_refine_uses_scalar_index() {
+    let batch = |ids: std::ops::Range<i32>| {
+        let value: Int32Array = ids
+            .clone()
+            .map(|i| if i % 5 == 0 { None } else { Some(i % 10) })
+            .collect();
+        let size: Int32Array = ids
+            .clone()
+            .map(|i| if i % 7 == 0 { None } else { Some(i) })
+            .collect();
+        RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(ids)) as ArrayRef,
+            ),
+            ("value", Arc::new(value) as ArrayRef),
+            ("size", Arc::new(size) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    let mut ds = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 20,
+            ..Default::default()
+        })
+        .execute(vec![batch(0..40)])
+        .await
+        .unwrap();
+    ds.create_index(
+        &["value"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    let ds = InsertBuilder::new(Arc::new(ds))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch(40..60)])
+        .await
+        .unwrap();
+    assert_eq!(ds.get_fragments().len(), 3);
+
+    for (predicate, expected_ids) in [
+        (
+            "(value = 3 AND size > 20) OR value = 4",
+            &[4, 14, 23, 24, 33, 34, 43, 44, 53, 54][..],
+        ),
+        (
+            "(value = 3 AND size > 20) OR (value = 4 AND size < 20)",
+            &[4, 23, 33, 43, 53][..],
+        ),
+        (
+            "(value = 4 AND size IS NULL) OR value IS NULL",
+            &[0, 5, 10, 14, 15, 20, 25, 30, 35, 40, 45, 50, 55][..],
+        ),
+    ] {
+        let plan = ds
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery"),
+            "`{predicate}` should use the scalar index, got plan:\n{plan}"
+        );
+        assert_filter_ids(&ds, predicate, expected_ids).await;
+    }
+    // NOT of an index search with a refine is answered without the index
+    assert_filter_ids(
+        &ds,
+        "NOT ((value = 3 AND size > 20) OR value IS NULL)",
+        &[
+            1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 24, 26, 27, 28, 29, 31,
+            32, 34, 36, 37, 38, 39, 41, 42, 44, 46, 47, 48, 49, 51, 52, 54, 56, 57, 58, 59,
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]

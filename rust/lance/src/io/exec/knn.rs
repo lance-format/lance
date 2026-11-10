@@ -72,6 +72,7 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader, mask_selects_nothing};
+use crate::index::vector::ivf::VectorQueryContract;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
@@ -193,6 +194,28 @@ async fn find_partitions_batch_on_cpu(
     })
     .await
     .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {e}")))
+}
+
+/// Holds the segments of one search to the contract of the first one opened:
+/// merging distances ranked by different metrics or index types would rank
+/// part of the data by the wrong one, whichever path left them under one name.
+fn check_segment_contract(
+    first: &mut Option<(Uuid, VectorQueryContract)>,
+    uuid: Uuid,
+    contract: VectorQueryContract,
+) -> Result<()> {
+    match first {
+        None => {
+            *first = Some((uuid, contract));
+            Ok(())
+        }
+        Some((first_uuid, expected)) if *expected != contract => Err(Error::index(format!(
+            "vector index segments {first_uuid} ({expected}) and {uuid} ({contract}) cannot \
+             answer one search: a search ranks every segment of an index by one metric and \
+             index type; replace all segments of the index in one commit"
+        ))),
+        Some(_) => Ok(()),
+    }
 }
 
 fn normalize_query_for_index(index: &dyn VectorIndex, query: Query) -> DataFusionResult<Query> {
@@ -1499,6 +1522,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         ds.open_vector_index(&query.column, &uuid, &metrics.index_metrics)
                             .await?
                     };
+                    let contract = VectorQueryContract::of_index(index.as_ref());
                     // Normalize cosine queries once before partition ranking.
                     let query = normalize_query_for_index(index.as_ref(), query.clone())?;
 
@@ -1529,10 +1553,20 @@ impl ExecutionPlan for ANNIvfPartitionExec {
                         ],
                     )?;
                     metrics.baseline_metrics.record_output(batch.num_rows());
-                    Ok::<_, DataFusionError>(batch)
+                    Ok::<_, DataFusionError>((batch, uuid, contract))
                 }
             })
             .buffered(self.index_uuids.len().min(target_partitions).max(1))
+            .map({
+                // `buffered` keeps the order, so the first segment listed sets
+                // the contract.
+                let mut first = None;
+                move |opened| {
+                    let (batch, uuid, contract) = opened?;
+                    check_segment_contract(&mut first, uuid, contract)?;
+                    Ok(batch)
+                }
+            })
             .finally(move || {
                 // Partition ranking reads centroids from memory, so this is
                 // typically zero; flushed for symmetry with ANNSubIndex.
@@ -1821,6 +1855,13 @@ impl PreFilter for SegmentPreFilter {
         self.base.wait_for_ready().await?;
         let mut final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_insert_with(|| {
+            // The ownership mask is an allow list of the live rows of this segment's
+            // fragments at the dataset's current version, all of which a deletions-only
+            // base also selects, so the intersection is the ownership mask itself.
+            // Reusing it avoids copying the dataset-wide mask for every segment.
+            if self.base.only_deletions() {
+                return self.ownership_mask.clone();
+            }
             Arc::new(self.base.mask().as_ref().clone() & self.ownership_mask.as_ref().clone())
         });
         Ok(())
@@ -3014,6 +3055,7 @@ impl ExecutionPlan for ANNIvfBatchExec {
             let mut candidates = (0..query_count)
                 .map(|_| TopHits::new(query.k))
                 .collect::<Vec<_>>();
+            let mut first_contract = None;
 
             for index_meta in &indices {
                 // A segment's index file may still hold rows for fragments pruned from
@@ -3034,6 +3076,11 @@ impl ExecutionPlan for ANNIvfBatchExec {
                     ds.open_vector_index(&column, &index_meta.uuid, &metrics.index_metrics)
                         .await?
                 };
+                check_segment_contract(
+                    &mut first_contract,
+                    index_meta.uuid,
+                    VectorQueryContract::of_index(index.as_ref()),
+                )?;
                 // The scanner's `batch_index_search_supported` gate decides which
                 // indices reach this node; this check only guards against that
                 // gate and the index implementation disagreeing (an internal
@@ -4091,6 +4138,9 @@ mod tests {
             &first_mask,
             cached_mask.as_ref().as_ref().unwrap()
         ));
+        // The base only removes deleted rows (none here), so the segment reuses its
+        // ownership mask instead of intersecting a copy of the dataset-wide mask.
+        assert!(Arc::ptr_eq(&segment_prefilter.mask(), &first_mask));
 
         assert!(
             !segment_prefilter.is_empty(),

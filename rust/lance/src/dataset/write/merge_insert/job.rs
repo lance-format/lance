@@ -26,7 +26,7 @@ use crate::index::DatasetIndexExt;
 use crate::index::scalar_logical::load_named_scalar_segments;
 use crate::{
     Dataset,
-    datafusion::dataframe::SessionContextExt,
+    datafusion::dataframe::{LanceTableProvider, SessionContextExt},
     dataset::{
         transaction::{Operation, Transaction},
         versions,
@@ -48,10 +48,10 @@ use datafusion::{
     execution::context::{SessionConfig, SessionContext},
     logical_expr::{self, Expr, Extension, JoinType, LogicalPlan},
     physical_plan::{
-        ExecutionPlan, PhysicalExpr, SendableRecordBatchStream, display::DisplayableExecutionPlan,
-        joins::SortMergeJoinExec, projection::ProjectionExec, repartition::RepartitionExec,
-        sorts::sort::SortExec, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
-        union::UnionExec,
+        ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+        coalesce_partitions::CoalescePartitionsExec, display::DisplayableExecutionPlan,
+        joins::SortMergeJoinExec, projection::ProjectionExec, sorts::sort::SortExec,
+        stream::RecordBatchStreamAdapter, streaming::PartitionStream, union::UnionExec,
     },
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     prelude::DataFrame,
@@ -70,10 +70,10 @@ use lance_core::{
 };
 use lance_datafusion::{
     exec::{
-        HardCapBatchSizeExec, LanceExecutionOptions, analyze_plan,
+        HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, analyze_plan,
         execute_plan_with_session_context, new_session_context, provider_to_stream,
     },
-    spill::spilling_table_provider_with_job_disk_manager,
+    spill::{materialize_stream, spilling_table_provider_with_job_disk_manager},
     utils::StreamingWriteSource,
 };
 use lance_index::IndexCriteria;
@@ -434,11 +434,10 @@ impl MergeInsertJob {
                 .create_plan()
                 .await?;
             let unioned = UnionExec::try_new(vec![target, fallback_data])?;
-            // Enforce only 1 partition.
-            target = Arc::new(RepartitionExec::try_new(
-                unioned,
-                datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-            )?);
+            // Enforce only 1 partition. RepartitionExec would take a share of the fair pool
+            // from the target sort, and until DataFusion 56 spilling from two inputs can
+            // deadlock it (apache/datafusion#24883).
+            target = Arc::new(CoalescePartitionsExec::new(unioned));
         }
 
         // We need to prefix the fields in the target with target_ so that we don't have any duplicate
@@ -507,7 +506,22 @@ impl MergeInsertJob {
         }
         let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
         let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
-        let source_input = Arc::new(SortExec::new(source_ordering, source_input));
+        // A sort spilled to several runs keeps a merge reservation until its output is read,
+        // and that reservation grows with the number of runs, up to the whole pool. Finish
+        // the source sort first, so that each sort has the pool to itself.
+        let sorted_source = execute_plan_with_session_context(
+            Arc::new(SortExec::new(source_ordering, source_input)),
+            execution_options.clone(),
+            session_ctx,
+        )?;
+        let (sorted_source, _) = materialize_stream(
+            sorted_source,
+            session_ctx.runtime_env(),
+            execution_options.mem_pool_size() as usize / 8,
+            "materializing sorted merge insert source",
+        )
+        .await?;
+        let source_input = Arc::new(OneShotExec::new(sorted_source));
         let target = Arc::new(SortExec::new(target_ordering, target));
         let joined: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
             source_input,
@@ -719,6 +733,49 @@ impl MergeInsertJob {
             .await
     }
 
+    fn dataset_source_provider(source: Arc<Dataset>) -> Arc<dyn TableProvider> {
+        Arc::new(
+            LanceTableProvider::new(source, false, false)
+                .with_blob_handling(lance_core::datatypes::BlobHandling::default()),
+        )
+    }
+
+    /// Executes the merge insert job from a native Lance dataset source.
+    ///
+    /// The dataset handle is scanned directly through [`LanceTableProvider`],
+    /// including on conflict retries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # use std::sync::Arc;
+    /// # async fn example(source: Arc<Dataset>, target: Arc<Dataset>) -> Result<()> {
+    /// let (merged, _stats) =
+    ///     MergeInsertBuilder::try_new(target.clone(), vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_dataset(source.clone())
+    ///         .await?;
+    /// let _ = merged;
+    ///
+    /// let plan = MergeInsertBuilder::try_new(target, vec!["id".to_string()])?
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .when_not_matched(WhenNotMatched::InsertAll)
+    ///     .try_build()?
+    ///     .analyze_plan_dataset(source)
+    ///     .await?;
+    /// let _ = plan;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_dataset(self, source: Arc<Dataset>) -> Result<(Arc<Dataset>, MergeStats)> {
+        self.execute_provider(Self::dataset_source_provider(source))
+            .await
+    }
+
     /// Executes the merge insert job from materialized record batches.
     ///
     /// The batches are wrapped in an in-memory [`MemTable`], which is re-scannable
@@ -743,6 +800,61 @@ impl MergeInsertJob {
     ) -> Result<UncommittedMergeInsert> {
         let provider = self.batches_to_provider(batches)?;
         self.execute_uncommitted_impl(provider, SourceProviderMode::StableSnapshot)
+            .await
+    }
+
+    /// Like [`Self::execute_uncommitted_batches`] for a native Lance dataset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use datafusion::catalog::TableProvider;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # use std::sync::Arc;
+    /// # async fn example(
+    /// #     source: Arc<Dataset>,
+    /// #     provider: Arc<dyn TableProvider>,
+    /// #     target: Arc<Dataset>,
+    /// # ) -> Result<()> {
+    /// let dataset_result =
+    ///     MergeInsertBuilder::try_new(target.clone(), vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_uncommitted_dataset(source)
+    ///         .await?;
+    ///
+    /// let provider_result =
+    ///     MergeInsertBuilder::try_new(target, vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_uncommitted_provider(provider)
+    ///         .await?;
+    /// let _ = (dataset_result, provider_result);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_uncommitted_dataset(
+        self,
+        source: Arc<Dataset>,
+    ) -> Result<UncommittedMergeInsert> {
+        self.execute_uncommitted_impl(
+            Self::dataset_source_provider(source),
+            SourceProviderMode::Rescannable,
+        )
+        .await
+    }
+
+    /// Like [`Self::execute_uncommitted_batches`] for a re-scannable provider.
+    ///
+    /// See [`Self::execute_uncommitted_dataset`] for a compiling example.
+    pub async fn execute_uncommitted_provider(
+        self,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<UncommittedMergeInsert> {
+        self.execute_uncommitted_impl(provider, SourceProviderMode::Rescannable)
             .await
     }
 
@@ -1903,6 +2015,14 @@ impl MergeInsertJob {
             .collect();
 
         Ok(filtered_lines.join("\n"))
+    }
+
+    /// [`Self::analyze_plan_provider`] for a native Lance dataset.
+    ///
+    /// See [`Self::execute_dataset`] for a compiling example.
+    pub async fn analyze_plan_dataset(&self, source: Arc<Dataset>) -> Result<String> {
+        self.analyze_plan_provider(Self::dataset_source_provider(source))
+            .await
     }
 
     /// Delete the files an executed-but-uncommitted merge wrote.
