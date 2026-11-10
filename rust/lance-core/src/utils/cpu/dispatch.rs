@@ -111,13 +111,32 @@ macro_rules! impl_call {
     };
 }
 
+impl_call!(<A: ?Sized> fn(a: &A));
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
+impl_call!(<A: ?Sized, B: ?Sized> fn(a: &mut A, b: &B));
+impl_call!(<A: ?Sized> fn(a: &A, b: usize, c: u32));
 impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
+impl_call!(<A: ?Sized, B: ?Sized, C: ?Sized> fn(a: &A, b: &B, c: &mut C));
+impl_call!(<A: ?Sized, B: ?Sized, C: ?Sized> fn(a: &A, b: &mut B, c: &mut C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
 impl_call!(<A: ?Sized, D: ?Sized> fn(a: &A, b: f32, c: f32, d: &D));
+impl_call!(<A: ?Sized, D: ?Sized> fn(a: &A, b: f32, c: f32, d: &mut D));
+impl_call!(<A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: &mut C, d: &mut D));
 impl_call!(
     <A: ?Sized, B: ?Sized, D: ?Sized, E: ?Sized>
     fn(a: &A, b: &B, c: usize, d: &D, e: &mut E)
+);
+impl_call!(
+    <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: &mut C, d: &mut D, e: &mut E)
+);
+impl_call!(
+    <A: ?Sized, B: ?Sized, D: ?Sized, F: ?Sized>
+    fn(a: &A, b: &B, c: u64, d: &D, e: i64, f: &mut F)
+);
+impl_call!(
+    <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: &C, d: &D, e: &E, f: f32, g: Option<f32>)
 );
 
 /// One operation's kernels, best first, with the host's choice made once.
