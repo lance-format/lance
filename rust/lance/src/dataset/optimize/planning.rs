@@ -7,7 +7,7 @@
 //! and [`TaskData`] contracts, but never rewrites data or publishes a manifest.
 //! Tests live in `optimize/tests/planning.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -32,13 +32,16 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::index::{
     load_indices_for_remapping, vector_segment_merge_groups_for_compaction,
 };
-use crate::dataset::versions;
+use crate::dataset::{WriteParams, versions};
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
 use crate::index::{
     loading::{DatasetIndexInternalExt, load_all_indices},
     segment::{index_is_usable, segment_has_vector_details},
 };
+
+/// Default small-file threshold as a percentage of the maximum file size.
+const DEFAULT_MIN_FILE_SIZE_PERCENT: u128 = 95;
 
 /// Controls how data is rewritten during compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -61,6 +64,39 @@ impl TryFrom<&str> for CompactionMode {
             "force_binary_copy" => Ok(Self::ForceBinaryCopy),
             _ => Err(Error::invalid_input(format!(
                 "Invalid compaction mode \"{}\". Valid values: \"reencode\", \"try_binary_copy\", \"force_binary_copy\"",
+                value
+            ))),
+        }
+    }
+}
+
+/// Controls how compaction planning applies the configured source budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SourceBudgetMode {
+    /// Reject a task when adding it would make any cumulative source total
+    /// exceed its configured budget.
+    ///
+    /// If the first indivisible compaction task exceeds any budget, the plan
+    /// is empty. This preserves the historical behavior.
+    #[default]
+    Hard,
+    /// Always admit the first indivisible compaction task, even when it exceeds
+    /// a configured cumulative source budget.
+    ///
+    /// If the first task exceeds a budget, the plan stops there. Otherwise,
+    /// later tasks use the same cumulative checks as [`SourceBudgetMode::Hard`].
+    Soft,
+}
+
+impl TryFrom<&str> for SourceBudgetMode {
+    type Error = Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        match value.to_lowercase().as_str() {
+            "hard" => Ok(Self::Hard),
+            "soft" => Ok(Self::Soft),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid source budget mode \"{}\". Valid values: \"hard\", \"soft\"",
                 value
             ))),
         }
@@ -105,9 +141,8 @@ impl TryFrom<&str> for IndexRemapMode {
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
     ///
-    /// This is used to determine which fragments need compaction, as any
-    /// fragments that have fewer rows than this value will be candidates for
-    /// compaction.
+    /// Fragments below this row target are candidates for ordinary consolidation
+    /// unless a reliable main data file already meets [`Self::min_bytes_per_file`].
     pub target_rows_per_fragment: usize,
     /// Max number of rows per group
     ///
@@ -116,17 +151,23 @@ pub struct CompactionOptions {
     pub max_rows_per_group: usize,
     /// Max number of bytes per output data file.
     ///
-    /// By default, this only affects how selected fragments are rewritten.
-    /// With [`DefaultCompactionPlanner::with_byte_aware_consolidation`], the
-    /// effective limit also gates ordinary consolidation when the fragment's
-    /// main-file size is reliable: one data file, without deletions, overlays,
-    /// or obsolete columns. In that case, fragments at or above 95% of the
-    /// limit are left out of ordinary consolidation, while forced deletion,
-    /// overlay, and dead-column rewrites remain eligible. Unknown and complex
-    /// layouts retain row-only candidacy.
-    ///
-    /// If not specified then the default (see [`crate::dataset::WriteParams`]) will be used.
+    /// Defaults to [`crate::dataset::WriteParams::max_bytes_per_file`].
+    /// See [`Self::min_bytes_per_file`] for small-file selection.
     pub max_bytes_per_file: Option<usize>,
+    /// Files at or above this size are excluded from small-file compaction.
+    /// Defaults to 95% of [`Self::max_bytes_per_file`].
+    /// Must be greater than zero and no greater than that limit.
+    /// Files needing cleanup may still be compacted.
+    ///
+    /// ```
+    /// use lance::dataset::optimize::CompactionOptions;
+    /// let options = CompactionOptions {
+    ///     min_bytes_per_file: Some(512 * 1024 * 1024),
+    ///     ..Default::default()
+    /// };
+    /// ```
+    #[serde(default)]
+    pub min_bytes_per_file: Option<usize>,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
     pub materialize_deletions: bool,
@@ -208,6 +249,21 @@ pub struct CompactionOptions {
     /// columns.
     /// Defaults to `None` (no limit).
     pub max_source_bytes: Option<u64>,
+    /// Controls whether `max_source_fragments`, `max_source_rows`, and
+    /// `max_source_bytes` are hard or soft limits.
+    ///
+    /// Budgets apply to cumulative totals across the tasks selected for one
+    /// plan. In [`SourceBudgetMode::Hard`] mode, a task is rejected when adding
+    /// it would exceed any budget. In [`SourceBudgetMode::Soft`] mode, the first
+    /// task is always admitted. If it exceeds a budget, the plan stops there;
+    /// otherwise later tasks use the same cumulative checks as hard mode.
+    /// If a task has a source file without a recorded size while a byte budget
+    /// is configured, soft mode stops at that task because it cannot be safely
+    /// compared with the budget. The task is admitted only when it is first,
+    /// preserving the soft-mode progress guarantee. Hard mode reports an error.
+    /// Defaults to [`SourceBudgetMode::Hard`].
+    #[serde(default)]
+    pub source_budget_mode: SourceBudgetMode,
     /// Fragment IDs to exclude from compaction planning.
     ///
     /// Excluded fragments act as boundaries between adjacent compaction candidates,
@@ -283,6 +339,7 @@ impl Default for CompactionOptions {
             materialize_deletions_threshold: 0.1,
             num_threads: None,
             max_bytes_per_file: None,
+            min_bytes_per_file: None,
             batch_size: None,
             io_buffer_size: None,
             defer_index_remap: false,
@@ -294,6 +351,7 @@ impl Default for CompactionOptions {
             max_source_fragments: None,
             max_source_rows: None,
             max_source_bytes: None,
+            source_budget_mode: SourceBudgetMode::Hard,
             excluded_fragment_ids: Vec::new(),
             max_overlays_per_fragment: Some(10),
             data_storage_version: None,
@@ -316,6 +374,7 @@ impl CompactionOptions {
     /// - `lance.compaction.target_rows_per_fragment`
     /// - `lance.compaction.max_rows_per_group`
     /// - `lance.compaction.max_bytes_per_file`
+    /// - `lance.compaction.min_bytes_per_file`
     /// - `lance.compaction.materialize_deletions`
     /// - `lance.compaction.materialize_deletions_threshold`
     /// - `lance.compaction.defer_index_remap`
@@ -327,6 +386,7 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_fragments`
     /// - `lance.compaction.max_source_rows`
     /// - `lance.compaction.max_source_bytes`
+    /// - `lance.compaction.source_budget_mode`
     /// - `lance.compaction.max_overlays_per_fragment`
     /// - `lance.compaction.data_storage_version`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
@@ -365,6 +425,14 @@ impl CompactionOptions {
                     self.max_bytes_per_file = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "min_bytes_per_file" => {
+                    self.min_bytes_per_file = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a positive integer)",
                             key, value
                         ))
                     })?);
@@ -463,6 +531,9 @@ impl CompactionOptions {
                         ))
                     })?);
                 }
+                "source_budget_mode" => {
+                    self.source_budget_mode = SourceBudgetMode::try_from(value.as_str())?;
+                }
                 "max_overlays_per_fragment" => {
                     // The default is `Some(10)`, so an explicit "none" is the only
                     // way to disable the trigger through the manifest config.
@@ -485,6 +556,17 @@ impl CompactionOptions {
     }
 
     pub fn validate(&mut self) -> Result<()> {
+        let max_bytes = self
+            .max_bytes_per_file
+            .unwrap_or_else(|| WriteParams::default().max_bytes_per_file);
+        if let Some(min_bytes) = self.min_bytes_per_file
+            && (min_bytes == 0 || min_bytes > max_bytes)
+        {
+            return Err(Error::invalid_input(format!(
+                "CompactionOptions::min_bytes_per_file must be greater than 0 and at most max_bytes_per_file ({max_bytes}), got {min_bytes}"
+            )));
+        }
+
         // If threshold is 100%, same as turning off deletion materialization.
         if self.materialize_deletions && self.materialize_deletions_threshold >= 1.0 {
             self.materialize_deletions = false;
@@ -623,7 +705,6 @@ pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
     excluded_fragment_ids: RoaringBitmap,
     can_replace_vector_segments: bool,
-    byte_aware_consolidation: bool,
 }
 
 impl DefaultCompactionPlanner {
@@ -634,28 +715,7 @@ impl DefaultCompactionPlanner {
             options,
             excluded_fragment_ids,
             can_replace_vector_segments: false,
-            byte_aware_consolidation: false,
         })
-    }
-
-    /// Leave byte-full fragments out of ordinary consolidation.
-    ///
-    /// Deletion and overlay rewrites remain eligible. Unknown sizes retain
-    /// row-only behavior. See [`super::consolidation`] for measurement details.
-    ///
-    /// ```
-    /// use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner};
-    /// let options = CompactionOptions {
-    ///     max_bytes_per_file: Some(64 * 1024 * 1024),
-    ///     ..Default::default()
-    /// };
-    /// let planner = DefaultCompactionPlanner::new(options)?
-    ///     .with_byte_aware_consolidation();
-    /// # Ok::<(), lance::Error>(())
-    /// ```
-    pub fn with_byte_aware_consolidation(mut self) -> Self {
-        self.byte_aware_consolidation = true;
-        self
     }
 
     /// Select the publication contract used by this plan. Without an explicit
@@ -678,7 +738,7 @@ impl DefaultCompactionPlanner {
 impl DefaultCompactionPlanner {
     /// Why one fragment is a compaction candidate, if it is: the same rule for
     /// ordinary planning and for caller-chosen groups.
-    fn candidacy_of(
+    pub(super) fn candidacy_of(
         &self,
         fragment: &Fragment,
         metrics: &FragmentMetrics,
@@ -703,17 +763,23 @@ impl DefaultCompactionPlanner {
             && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
         {
             Some(CompactionCandidacy::CompactItself)
-        } else if metrics.physical_rows < self.options.target_rows_per_fragment
-            && (!self.byte_aware_consolidation
-                || super::consolidation::needs_consolidation(
-                    metrics.physical_rows as u64,
-                    super::consolidation::fragment_file_bytes(fragment, schema_field_ids),
-                    self.options.target_rows_per_fragment,
-                    self.options.max_bytes_per_file,
-                ))
-        {
+        } else if metrics.physical_rows < self.options.target_rows_per_fragment {
+            let min_bytes_per_file = self.options.min_bytes_per_file.map_or_else(
+                || {
+                    let max_bytes_per_file = self
+                        .options
+                        .max_bytes_per_file
+                        .unwrap_or_else(|| WriteParams::default().max_bytes_per_file);
+
+                    (max_bytes_per_file as u128 * DEFAULT_MIN_FILE_SIZE_PERCENT).div_ceil(100)
+                        as u64
+                },
+                |bytes| bytes as u64,
+            );
             // Worth compacting only with neighbors, to make a larger fragment.
-            Some(CompactionCandidacy::CompactWithNeighbors)
+            fragment_file_bytes(fragment, schema_field_ids)
+                .is_none_or(|bytes| bytes < min_bytes_per_file)
+                .then_some(CompactionCandidacy::CompactWithNeighbors)
         } else {
             None
         }
@@ -755,11 +821,13 @@ impl DefaultCompactionPlanner {
     ///
     /// Refused before anything is written: an empty group, a group out of
     /// ascending id order, a fragment absent from the dataset, named by two
-    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`]; and
-    /// a selected source covered by an index this build cannot read (a member
-    /// left alone may be covered). `max_source_fragments`,
-    /// `max_source_rows` and `max_source_bytes` bound the selected tasks, in
-    /// group order.
+    /// groups, or excluded by [`CompactionOptions::excluded_fragment_ids`].
+    /// A member covered by an index this build cannot read is held back
+    /// instead of refusing the plan: no metric of it is read, it is left out of
+    /// every task, one log line names a bounded sample of the held ids, and
+    /// the rest of its group and every other group still plan.
+    /// `max_source_fragments`, `max_source_rows` and `max_source_bytes` bound
+    /// the selected tasks, in group order.
     pub async fn plan_groups(
         &self,
         dataset: &Dataset,
@@ -835,16 +903,65 @@ impl DefaultCompactionPlanner {
                 }
             }
         }
-        // Coverage by an index this build cannot read is checked against the
-        // sources actually selected below, not against every named member:
-        // a member ordinary candidacy leaves alone is never rewritten, so its
-        // coverage is no obstacle to the rest of its group.
+        // A fragment covered by an index this build cannot read is held out of
+        // every group before binning, for the reason ordinary planning folds
+        // that coverage into its exclusions: the index is left addressing the
+        // rows it already addresses, and the other members of the same group
+        // and of every other group still plan. Group boundaries are untouched.
         let unreadable_coverage =
             if !dataset.manifest.uses_stable_row_ids() && !self.options.defer_index_remap {
                 unremappable_index_coverage(dataset).await?
             } else {
                 Vec::new()
             };
+        let held_back =
+            unreadable_coverage
+                .iter()
+                .fold(RoaringBitmap::new(), |mut covered, (_, fragments)| {
+                    covered |= fragments;
+                    covered
+                });
+        // Otherwise a group that plans nothing looks like a group with nothing
+        // to do. One summary line per plan, over the requested fragments only:
+        // coverage of fragments no group named changes nothing here. The ids
+        // are sampled, so coverage of an arbitrarily wide index cannot turn one
+        // plan into an unbounded line; which group and which index held each
+        // one is a debug detail.
+        let held: BTreeSet<u64> = groups
+            .iter()
+            .flat_map(|group| group.fragments.iter().map(|fragment| fragment.id))
+            .filter(|id| u32::try_from(*id).is_ok_and(|id| held_back.contains(id)))
+            .collect();
+        if !held.is_empty() {
+            log::info!(
+                "holding {} of this plan's {} requested fragment(s) back from compaction, \
+                 including {}: they are covered by an index this build cannot read, and so \
+                 cannot be remapped here",
+                held.len(),
+                named.len(),
+                describe_held(&held),
+            );
+            if log::log_enabled!(log::Level::Debug) {
+                for (group_index, group) in groups.iter().enumerate() {
+                    for (index, covered) in &unreadable_coverage {
+                        let held_here: BTreeSet<u64> = group
+                            .fragments
+                            .iter()
+                            .map(|fragment| fragment.id)
+                            .filter(|id| u32::try_from(*id).is_ok_and(|id| covered.contains(id)))
+                            .collect();
+                        if !held_here.is_empty() {
+                            log::debug!(
+                                "compaction group {} holds back {}, covered by index {:?}",
+                                group_index,
+                                describe_held(&held_here),
+                                index,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let schema_field_ids = dataset
             .schema()
@@ -856,64 +973,86 @@ impl DefaultCompactionPlanner {
             CompactionMode::ForceBinaryCopy
         );
 
-        // One candidate bin per group: its members that ordinary planning
-        // would compact, in order. A member it would leave alone stays out of
-        // the bin and untouched.
-        // Metrics for every member of every group, read with the same bounded
+        // Metrics for every measured member of every group, read with the same bounded
         // parallelism as ordinary planning; `buffered` keeps input order, so
-        // the results line up with the groups.
+        // the results line up with the groups. A held-back member is a `None`
+        // sentinel instead: no metric of it is read, since it will not be
+        // planned either way, and the sentinel keeps the gap it leaves visible
+        // to the binning below.
         let present = &present;
+        let held_back = &held_back;
         let members = groups
             .iter()
             .enumerate()
             .flat_map(|(group_index, group)| {
-                group
-                    .fragments
-                    .iter()
-                    .map(move |listed| (group_index, present[&listed.id].clone()))
+                group.fragments.iter().map(move |listed| {
+                    let held = u32::try_from(listed.id).is_ok_and(|id| held_back.contains(id));
+                    (group_index, (!held).then(|| present[&listed.id].clone()))
+                })
             })
             .collect::<Vec<_>>();
-        let mut measured: Vec<(usize, Fragment, FragmentMetrics)> = futures::stream::iter(members)
-            .map(|(group_index, fragment)| async move {
-                collect_metrics(&fragment)
-                    .await
-                    .map(|metrics| (group_index, fragment.metadata, metrics))
-            })
-            .buffered(dataset.object_store.as_ref().io_parallelism())
-            .try_collect()
-            .await?;
+        let mut measured: Vec<(usize, Option<(Fragment, FragmentMetrics)>)> =
+            futures::stream::iter(members)
+                .map(|(group_index, fragment)| async move {
+                    let Some(fragment) = fragment else {
+                        return Ok((group_index, None));
+                    };
+                    collect_metrics(&fragment)
+                        .await
+                        .map(|metrics| (group_index, Some((fragment.metadata, metrics))))
+                })
+                .buffered(dataset.object_store.as_ref().io_parallelism())
+                .try_collect()
+                .await?;
         measured.reverse();
 
         let mut bins = Vec::with_capacity(groups.len());
         let mut properties = Vec::with_capacity(groups.len());
         for (group_index, group) in groups.into_iter().enumerate() {
-            let mut fragments = Vec::new();
-            let mut candidacy = Vec::new();
-            let mut row_counts = Vec::new();
+            // A held-back member is the only thing that terminates a run here:
+            // its rows stay addressed by an index this build cannot read, so
+            // the candidates on either side of it must not be planned
+            // together. Any other non-candidate - an over-target member, say -
+            // is skipped without ending the run, so the candidates around it
+            // still compact as one task. This is narrower than ordinary
+            // planning, which ends its bin at every non-candidate: a group is
+            // an explicit request to compact those fragments together, and
+            // only coverage this build cannot remap overrides it.
+            let mut runs: Vec<CandidateBin> = Vec::new();
+            let mut current: Option<CandidateBin> = None;
             for _ in &group.fragments {
-                let Some((measured_group, fragment, metrics)) = measured.pop() else {
+                let Some((measured_group, measured_member)) = measured.pop() else {
                     return Err(Error::internal(
                         "grouped compaction lost a fragment's metrics",
                     ));
                 };
                 debug_assert_eq!(measured_group, group_index);
+                let Some((fragment, metrics)) = measured_member else {
+                    runs.extend(current.take());
+                    continue;
+                };
                 if let Some(reason) =
                     self.candidacy_of(&fragment, &metrics, &schema_field_ids, is_binary_copy_only)
                 {
-                    candidacy.push(reason);
-                    row_counts.push(metrics.num_rows());
-                    fragments.push(fragment);
+                    let current = current.get_or_insert_with(|| CandidateBin {
+                        fragments: Vec::new(),
+                        pos_range: 0..0,
+                        candidacy: Vec::new(),
+                        row_counts: Vec::new(),
+                        indices: Vec::new(),
+                    });
+                    current.candidacy.push(reason);
+                    current.row_counts.push(metrics.num_rows());
+                    current.fragments.push(fragment);
+                    current.pos_range.end = current.fragments.len();
                 }
             }
-            let len = fragments.len();
-            bins.push(CandidateBin {
-                fragments,
-                pos_range: 0..len,
-                candidacy,
-                row_counts,
-                indices: Vec::new(),
-            });
-            properties.push((group.output_clustering_id, group.output_metadata));
+            runs.extend(current);
+            let properties_of_group = (group.output_clustering_id, group.output_metadata);
+            for run in runs {
+                bins.push(run);
+                properties.push(properties_of_group.clone());
+            }
         }
 
         // Split each group at index boundaries exactly as ordinary planning
@@ -995,10 +1134,14 @@ impl DefaultCompactionPlanner {
             );
         }
 
-        // Only the selected sources change identity, so `max_source_fragments`
-        // bounds them directly: tasks are kept in group order until the next
-        // would exceed it, as the row and byte budgets are applied below.
-        let all_tasks = if let Some(max_frags) = self.options.max_source_fragments {
+        // Hard mode has always applied the fragment budget before the shared
+        // limiter, which may inspect file sizes. Preserve that prefilter so a
+        // task it excludes because of its fragment count cannot fail later
+        // planning due to a missing byte size. Soft mode must reach the limiter
+        // so its first task can still make progress.
+        let all_tasks = if self.options.source_budget_mode == SourceBudgetMode::Hard
+            && let Some(max_frags) = self.options.max_source_fragments
+        {
             let num_candidate_tasks = all_tasks.len();
             let mut total = 0_usize;
             let mut kept = Vec::with_capacity(all_tasks.len());
@@ -1019,24 +1162,19 @@ impl DefaultCompactionPlanner {
         } else {
             all_tasks
         };
+
         let tasks = limit_tasks_to_source_budget(&self.options, dataset.schema(), all_tasks)?;
 
-        // Checked last, over the tasks the budgets kept: only a source that
-        // will really be rewritten can refuse the plan, the same set the
-        // commit's safeguard checks.
-        for (index, covered) in &unreadable_coverage {
-            if let Some(fragment) = tasks
+        // The hold-back above kept every covered fragment out of every bin, so
+        // no task can name one; `reject_unremappable_rewrite` checks the
+        // sources again at commit time, against the manifest of the moment.
+        debug_assert!(
+            !tasks
                 .iter()
                 .flat_map(|task| &task.fragments)
-                .find(|fragment| u32::try_from(fragment.id).is_ok_and(|id| covered.contains(id)))
-            {
-                return Err(Error::invalid_input(format!(
-                    "compaction group selects fragment {} for rewriting, which is covered by \
-                     index '{index}' that this build cannot read and so cannot remap",
-                    fragment.id
-                )));
-            }
-        }
+                .any(|fragment| u32::try_from(fragment.id).is_ok_and(|id| held_back.contains(id))),
+            "grouped compaction selected a held-back fragment"
+        );
 
         let mut options = self.options.clone();
         options.data_storage_version = Some(write_version.to_selector());
@@ -1322,7 +1460,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
 /// Information about a fragment used to decide its fate in compaction
 #[derive(Debug)]
-struct FragmentMetrics {
+pub(super) struct FragmentMetrics {
     /// The number of original rows in the fragment
     pub physical_rows: usize,
     /// The number of rows that have been deleted
@@ -1345,6 +1483,25 @@ impl FragmentMetrics {
     }
 }
 
+/// The number of held-back fragment ids a log line names before summarizing.
+pub(super) const HELD_BACK_SAMPLE_LIMIT: usize = 8;
+
+/// Render held-back fragment ids for a log line: the first
+/// [`HELD_BACK_SAMPLE_LIMIT`] in ascending order, then how many are left, so
+/// that coverage of an arbitrarily wide index cannot produce an unbounded line.
+pub(super) fn describe_held(ids: &BTreeSet<u64>) -> String {
+    let sample = ids
+        .iter()
+        .take(HELD_BACK_SAMPLE_LIMIT)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    match ids.len().saturating_sub(HELD_BACK_SAMPLE_LIMIT) {
+        0 => format!("fragment(s) {sample}"),
+        more => format!("fragment(s) {sample} and {more} more"),
+    }
+}
+
 async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
     let physical_rows = fragment.physical_rows();
     let num_deletions = fragment.count_deletions();
@@ -1354,6 +1511,30 @@ async fn collect_metrics(fragment: &FileFragment) -> Result<FragmentMetrics> {
         physical_rows,
         num_deletions,
     })
+}
+
+/// Read the main-file size when it reliably indicates whether merging can help.
+/// Multi-file, deleted, overlaid, and obsolete-column layouts return unknown.
+/// Blob sidecars are excluded because the byte cap applies to the main file.
+pub(super) fn fragment_file_bytes(
+    fragment: &Fragment,
+    schema_field_ids: &HashSet<i32>,
+) -> Option<u64> {
+    if fragment.files.len() != 1
+        || fragment.deletion_file.is_some()
+        || !fragment.overlays.is_empty()
+    {
+        return None;
+    }
+    let file = &fragment.files[0];
+    if file
+        .fields
+        .iter()
+        .any(|id| *id >= 0 && !schema_field_ids.contains(id))
+    {
+        return None;
+    }
+    file.file_size_bytes.get().map(|size| size.get())
 }
 
 /// Whether one of `fragment`'s data files is referenced only for the row
@@ -1396,14 +1577,15 @@ pub(super) fn pins_dead_user_columns_for_lineage(
 /// Truncates a planned task list to the configured per-run source budgets
 /// (`max_source_fragments`, `max_source_rows`, `max_source_bytes`).
 ///
-/// All configured budgets apply together: tasks are kept, in order, until
-/// adding the next task would exceed any one of them. The budgets are hard
-/// upper bounds, so if the first task already exceeds one of them the
-/// returned plan is empty and a warning is logged, since compaction would
-/// otherwise stall silently.
+/// All configured budgets apply together to cumulative totals across selected
+/// tasks. Tasks are kept, in order, until adding the next task would exceed any
+/// one of them. In [`SourceBudgetMode::Hard`] mode the returned plan is empty if
+/// the first task exceeds a budget. [`SourceBudgetMode::Soft`] always admits the
+/// first task. If it exceeds a budget, the plan stops there; otherwise later
+/// tasks use the same cumulative checks as hard mode.
 ///
 /// Each task is paired with the number of live rows in its source fragments.
-fn limit_tasks_to_source_budget(
+pub(super) fn limit_tasks_to_source_budget(
     options: &CompactionOptions,
     schema: &lance_core::datatypes::Schema,
     all_tasks: Vec<(TaskData, usize)>,
@@ -1433,7 +1615,18 @@ fn limit_tasks_to_source_budget(
         total_fragments += task.fragments.len();
         total_rows = total_rows.saturating_add(live_rows);
         if options.max_source_bytes.is_some() {
-            total_bytes = total_bytes.saturating_add(task_source_bytes(&task, &schema_field_ids)?);
+            let allow_missing_size = options.source_budget_mode == SourceBudgetMode::Soft;
+            let Some(task_bytes) = task_source_bytes(&task, &schema_field_ids, allow_missing_size)?
+            else {
+                // Soft mode stops at a task whose source size is unavailable.
+                // Admit it only when it is first so planning still makes
+                // progress; otherwise keep the already-safe selected prefix.
+                if tasks.is_empty() {
+                    tasks.push(task);
+                }
+                break;
+            };
+            total_bytes = total_bytes.saturating_add(task_bytes);
         }
 
         let over_budget = options
@@ -1443,7 +1636,12 @@ fn limit_tasks_to_source_budget(
             || options
                 .max_source_bytes
                 .is_some_and(|max| total_bytes > max);
+        let admit_oversized_first_task =
+            tasks.is_empty() && options.source_budget_mode == SourceBudgetMode::Soft;
         if over_budget {
+            if admit_oversized_first_task {
+                tasks.push(task);
+            }
             break;
         }
 
@@ -1470,10 +1668,15 @@ fn limit_tasks_to_source_budget(
 /// Files whose fields are all absent from `schema_field_ids` only back
 /// dropped columns; compaction does not read them, so they are neither
 /// counted nor required to have a recorded size.
-/// Only sizes recorded in the manifest are used: a missing size is an error
-/// rather than a metadata request against object storage, which would turn
-/// planning into one round trip per file. Deletion files are not counted.
-fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result<u64> {
+/// Only sizes recorded in the manifest are used rather than issuing metadata
+/// requests against object storage, which would turn planning into one round
+/// trip per file. A missing size returns `None` only when `allow_missing_size`
+/// is true; otherwise it is an error. Deletion files are not counted.
+fn task_source_bytes(
+    task: &TaskData,
+    schema_field_ids: &HashSet<i32>,
+    allow_missing_size: bool,
+) -> Result<Option<u64>> {
     let mut total_bytes = 0_u64;
     for fragment in &task.fragments {
         let overlay_files = fragment.overlays.iter().map(|overlay| &overlay.data_file);
@@ -1485,17 +1688,20 @@ fn task_source_bytes(task: &TaskData, schema_field_ids: &HashSet<i32>) -> Result
             {
                 continue;
             }
-            let size = data_file.file_size_bytes.get().ok_or_else(|| {
-                Error::invalid_input(format!(
+            let Some(size) = data_file.file_size_bytes.get() else {
+                if allow_missing_size {
+                    return Ok(None);
+                }
+                return Err(Error::invalid_input(format!(
                     "max_source_bytes is set but file '{}' of fragment {} has no size recorded \
                      in the manifest; unset max_source_bytes to compact this dataset",
                     data_file.path, fragment.id
-                ))
-            })?;
+                )));
+            };
             total_bytes = total_bytes.saturating_add(size.get());
         }
     }
-    Ok(total_bytes)
+    Ok(Some(total_bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1715,11 @@ pub(super) enum CompactionCandidacy {
 /// Internal struct used for planning compaction.
 pub(super) struct CandidateBin {
     pub fragments: Vec<Fragment>,
+    /// Where these fragments sit in the sequence this run binned, not in the
+    /// manifest: the whole-dataset planner counts the fragments it considered,
+    /// and grouped planning counts within the group's own run. Only
+    /// [`Self::split_for_size`] and the planning logs read it, both of which
+    /// just need the ranges of one run to partition that run.
     pub pos_range: Range<usize>,
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,

@@ -176,12 +176,17 @@ pub struct Query {
     /// ALL partitions will be searched, if needed, to satisfy k results.
     pub maximum_nprobes: Option<usize>,
 
-    /// Continuous initial IVF search budget in [0, 1], default 0.5.
+    /// Initial IVF search effort in [0, 1], default 0.5.
     ///
     /// At 0.5, preserve Auto probing. At 0, start at the caller minimum (at
     /// least one available partition); at 1, start at all available partitions,
-    /// subject to the caller maximum. Intermediate values interpolate
-    /// geometrically around Auto. Later candidate-count expansion is unchanged.
+    /// subject to the caller maximum. For L2, cosine and dot with k <= 100000,
+    /// 0.1 and 0.25 select profiles targeting 80% and 90% mean partition-routing
+    /// recall; 0.5 retains Auto's nominal 95% target. These are empirical targets,
+    /// not per-query guarantees or end-to-end Recall@k guarantees. Intermediate
+    /// budgets interpolate geometrically between these anchors. Hamming and
+    /// larger k interpolate around their existing Auto budget without calibrated
+    /// targets. Later candidate-count expansion is unchanged.
     /// Caller options are resolved by [`ProbeParams`] before execution: an explicit
     /// effort ignores fixed `nprobes`, while explicit minimum/maximum bounds remain.
     /// This does not control quantization accuracy, HNSW ef, or refinement.

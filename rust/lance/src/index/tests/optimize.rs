@@ -8,7 +8,7 @@ use crate::dataset::transaction::RewriteGroup;
 use crate::index::frag_reuse::{
     MissingCoverageReason, frag_reuse_entry_appending, segment_coverage_reason,
 };
-use crate::index::frag_reuse_reader::tests::prepare_partition;
+use crate::index::frag_reuse_reader::tests::{persist_fixture, prepare_partition};
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{IndexStore, index_files_to_table};
@@ -1088,9 +1088,13 @@ async fn test_optimize_reports_segment_open_errors(
 }
 
 #[rstest]
+#[case::unsupported(false, MissingCoverageReason::Unsupported)]
+#[case::withdrawn(false, MissingCoverageReason::Withdrawn)]
+#[case::empty(true, MissingCoverageReason::Withdrawn)]
 #[tokio::test]
 async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
-    #[values(false, true)] is_empty: bool,
+    #[case] is_empty: bool,
+    #[case] expected_reason: MissingCoverageReason,
 ) {
     let mut dataset = gen_batch()
         .col("i", array::step::<Int32Type>())
@@ -1115,6 +1119,10 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
         )
         .await
         .unwrap();
+    let original = load_all_indices_by_name(&dataset, "text_idx")
+        .await
+        .unwrap()[0]
+        .clone();
     if is_empty {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
         let reader = gen_batch()
@@ -1218,17 +1226,28 @@ async fn test_optimize_skips_an_index_without_fragment_reuse_translation(
         )
         .await
         .unwrap();
+    if expected_reason == MissingCoverageReason::Unsupported {
+        // Current compaction withdraws this coverage. Preserve a fixture with
+        // retained coverage to exercise readers of existing tagged histories.
+        let mut indices = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let segment = indices
+            .iter_mut()
+            .find(|segment| segment.uuid == original.uuid)
+            .unwrap();
+        *segment = original;
+        persist_fixture(&mut dataset, indices).await;
+    }
     let before = load_all_indices_by_name(&dataset, "text_idx")
         .await
         .unwrap();
     assert_eq!(before.len(), 2);
     assert_eq!(
         segment_coverage_reason(&dataset, &before[0]).await.unwrap(),
-        Some(if is_empty {
-            MissingCoverageReason::Withdrawn
-        } else {
-            MissingCoverageReason::Unsupported
-        })
+        Some(expected_reason)
     );
     assert_eq!(
         segment_coverage_reason(&dataset, &before[1]).await.unwrap(),

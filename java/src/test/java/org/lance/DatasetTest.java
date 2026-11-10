@@ -1636,6 +1636,46 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetRowAddresses(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build());
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        // Row ids 0-4 live in the first fragment and 5-9 in the second.
+        long second = ds.getFragments().get(1).getId();
+        assertEquals(
+            Arrays.asList(second << 32 | 2, null), ds.getRowAddresses(Arrays.asList(7L, 99L)));
+
+        // Compaction moves every row into one new fragment but keeps its id; deleted rows
+        // (ids 2 and 7 hold id = 2) no longer resolve.
+        ds.compact();
+        ds.delete("id = 2");
+        assertEquals(1, ds.getFragments().size());
+        long compacted = ds.getFragments().get(0).getId();
+        assertEquals(
+            Arrays.asList(compacted << 32 | 8, null, compacted << 32 | 1, compacted << 32 | 8),
+            ds.getRowAddresses(Arrays.asList(8L, 7L, 1L, 8L)));
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("plain").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset ds = testDataset.write(1, 5)) {
+        // Without stable row ids a row id is its address, so ids pass through unchanged.
+        List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
+        assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -2084,8 +2124,32 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
-                  // Delete branch1 and verify listing
+                  // Delete branch2 and reject checkout and writes through its stale handle.
                   mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
+                  RuntimeException deletedBranch =
+                      assertThrows(
+                          RuntimeException.class, () -> mainV2.checkout(Ref.ofBranch("branch2")));
+                  assertTrue(
+                      deletedBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      deletedBranch.getMessage());
+                  RuntimeException staleCommit =
+                      assertThrows(
+                          RuntimeException.class,
+                          () ->
+                              branch2V4
+                                  .newTransactionBuilder()
+                                  .operation(appendC)
+                                  .build()
+                                  .commit());
+                  assertTrue(
+                      staleCommit
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      staleCommit.getMessage());
+                  assertEquals(4, branch2V4.version());
                   assertEquals(1, mainV2.branches().list().size());
 
                   // Step 6. use checkout_branch to checkout branch1
@@ -2145,11 +2209,15 @@ public class DatasetTest {
                     assertEquals(8, opened.countRows()); // A(5) + B(3)
                     assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
                   }
-                  IOException missing =
+                  RuntimeException missingBranch =
                       assertThrows(
-                          IOException.class,
+                          RuntimeException.class,
                           () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
-                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  assertTrue(
+                      missingBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch no_such_branch does not exist"),
+                      missingBranch.getMessage());
                   RuntimeException missingTag =
                       assertThrows(
                           RuntimeException.class,

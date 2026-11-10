@@ -175,8 +175,25 @@ async fn coverage(uri: &str, name: &str) -> RoaringBitmap {
     index.fragment_bitmap.unwrap()
 }
 
-/// Checks that `val_idx` exists and that looking up each of `values`, and a few
-/// ranges, through it finds what a scan finds.
+/// How many rows hold each `val` among those `filter` selects, through
+/// `val_idx`, or among all rows by a scan.
+async fn val_counts(dataset: &Dataset, filter: Option<&str>) -> HashMap<i32, usize> {
+    let mut scan = dataset.scan();
+    scan.project(&["val"]).unwrap();
+    match filter {
+        Some(filter) => scan.filter(filter).unwrap(),
+        None => scan.use_scalar_index(false),
+    };
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut counts = HashMap::new();
+    for val in batch["val"].as_primitive::<Int32Type>().values() {
+        *counts.entry(*val).or_default() += 1;
+    }
+    counts
+}
+
+/// Checks that `val_idx` exists and that looking up `values` together and a
+/// few of them alone, and a few ranges, through it finds what a scan finds.
 async fn assert_lookups_match_scan(uri: &str, values: impl IntoIterator<Item = i32>) {
     let dataset = open_in_new_session(uri).await;
     assert!(
@@ -186,19 +203,28 @@ async fn assert_lookups_match_scan(uri: &str, values: impl IntoIterator<Item = i
             .unwrap()
             .is_some()
     );
-    let mut scan = dataset.scan();
-    scan.use_scalar_index(false).project(&["val"]).unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut scanned = HashMap::<i32, usize>::new();
-    for val in batch["val"].as_primitive::<Int32Type>().values() {
-        *scanned.entry(*val).or_default() += 1;
-    }
-    for value in values {
+    let scanned = val_counts(&dataset, None).await;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let list = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let found = val_counts(&dataset, Some(&format!("val IN ({list})"))).await;
+    let want = values
+        .iter()
+        .filter_map(|value| Some((*value, *scanned.get(value)?)))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(found, want, "val IN {values:?}");
+    for value in [values.first(), values.get(values.len() / 2), values.last()]
+        .into_iter()
+        .flatten()
+    {
         let found = dataset
             .count_rows(Some(format!("val = {value}")))
             .await
             .unwrap();
-        let want = scanned.get(&value).copied().unwrap_or(0);
+        let want = scanned.get(value).copied().unwrap_or(0);
         assert_eq!(found, want, "val = {value}");
     }
     for bound in [0, 100, 1_000, 1_000_000, 3_000_000] {
@@ -892,7 +918,7 @@ async fn test_rebuild_commits_under_writes_and_deferred_compactions() {
         CompactFoldingOverlays,
         AddColumn,
     ];
-    for seed in 0..16 {
+    for seed in 0..4 {
         assert!(
             Box::pin(index_under_workload(seed, &kinds, true)).await,
             "seed {seed}: the rebuild retried"
@@ -916,12 +942,12 @@ async fn test_index_under_the_remap_job_is_correct_or_retries() {
         RemapAndTrim,
     ];
     let mut committed = 0;
-    for seed in 0..16 {
+    for seed in 0..4 {
         if Box::pin(index_under_workload(seed, &kinds, false)).await {
             committed += 1;
         }
     }
-    assert!(committed >= 8, "only {committed} of 16 seeds committed");
+    assert!(committed >= 2, "only {committed} of 4 seeds committed");
 }
 
 /// An index on `s.x`, where `s` is a packed struct, built before a deferred

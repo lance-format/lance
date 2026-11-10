@@ -46,7 +46,7 @@ ds.create_scalar_index(
     with_position=False,  # Set True to enable phrase queries
     base_tokenizer="simple",  # "simple", "whitespace", "raw", "icu", or "ngram"
     language="English",  # Language for stemming and stop words
-    max_token_length=40,  # Drop tokens longer than this length
+    max_token_length=40,  # Drop tokens of 40 UTF-8 bytes or more
     lower_case=True,  # Lowercase text before tokenization
     stem=True,  # Stem tokens (language-dependent)
     remove_stop_words=True,  # Remove stop words (language-dependent)

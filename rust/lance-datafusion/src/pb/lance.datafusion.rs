@@ -150,7 +150,7 @@ impl ::prost::Name for FilteredReadThreadingModeProto {
     }
 }
 /// Serializable form of FilteredReadOptions.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FilteredReadOptionsProto {
     #[prost(message, optional, tag = "1")]
     pub scan_range_before_filter: ::core::option::Option<U64Range>,
@@ -199,6 +199,50 @@ pub struct FilteredReadOptionsProto {
     /// refer to the exact dataset snapshot used to plan the scan.
     #[prost(bytes = "vec", optional, tag = "15")]
     pub physical_row_addr_allowlist: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// List field IDs whose consumers need only the specified structural property.
+    /// Element values are placeholders and must not be consumed or returned.
+    /// An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+    /// Older executors may ignore this field and read full values, preserving results
+    /// but losing the optimization. These modes apply only to this read, not the dataset.
+    #[prost(
+        map = "int32, enumeration(filtered_read_options_proto::ListReadMode)",
+        tag = "16"
+    )]
+    pub list_structure: ::std::collections::HashMap<i32, i32>,
+}
+/// Nested message and enum types in `FilteredReadOptionsProto`.
+pub mod filtered_read_options_proto {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum ListReadMode {
+        Unspecified = 0,
+        /// Preserve exact outer list lengths and validity without element payloads.
+        Length = 1,
+        /// Preserve outer validity and emptiness; nonempty lengths may become one.
+        NonEmpty = 2,
+    }
+    impl ListReadMode {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "LIST_READ_MODE_UNSPECIFIED",
+                Self::Length => "LIST_READ_MODE_LENGTH",
+                Self::NonEmpty => "LIST_READ_MODE_NON_EMPTY",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "LIST_READ_MODE_UNSPECIFIED" => Some(Self::Unspecified),
+                "LIST_READ_MODE_LENGTH" => Some(Self::Length),
+                "LIST_READ_MODE_NON_EMPTY" => Some(Self::NonEmpty),
+                _ => None,
+            }
+        }
+    }
 }
 impl ::prost::Name for FilteredReadOptionsProto {
     const NAME: &'static str = "FilteredReadOptionsProto";

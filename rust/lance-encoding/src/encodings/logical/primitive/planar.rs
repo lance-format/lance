@@ -4,8 +4,8 @@
 //! The 2.3 writer chooses structure independently from value storage.
 
 use super::structural_encoder::{
-    ComplexNullEncoding, ConstantPrimitiveEncoding, DictionaryEncodingPolicy, MiniblockChunkSize,
-    PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
+    ComplexNullEncoding, ConstantPrimitiveEncoding, DensePageEncoding, DictionaryEncodingPolicy,
+    MiniblockChunkSize, PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
     PrimitivePageEncodingBehavior, PrimitivePageStructure, PrimitivePlanContext,
 };
 use super::*;
@@ -234,6 +234,9 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
                 ));
             }
             PrimitiveEncodeAttempt::Unhandled(page) => page,
+            PrimitiveEncodeAttempt::FullZip(request) => {
+                return Ok(PrimitiveEncodeAttempt::FullZip(request));
+            }
         };
         let mut dense_ctx = ctx.clone();
         if dense_ctx
@@ -245,14 +248,20 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
             metadata.remove(STRUCTURAL_ENCODING_META_KEY);
             dense_ctx.encoding_metadata = Arc::new(metadata);
         }
-        let mut encoded = PrimitiveStructuralEncoder::encode_dense_page(
+        let mut encoded = match PrimitiveStructuralEncoder::encode_dense_page(
             dense_ctx,
             page,
             self.compression.clone(),
             MiniblockChunkSize::U32,
             ComplexNullEncoding::CompressedLevels,
             DictionaryEncodingPolicy::Planar,
-        )?;
+        )? {
+            DensePageEncoding::Encoded(page) => page,
+            DensePageEncoding::FullZip(mut request) => {
+                request.planar = true;
+                return Ok(PrimitiveEncodeAttempt::FullZip(request));
+            }
+        };
         let PageEncoding::Structural(layout) = encoded.description else {
             return Err(Error::internal(
                 "Dense encoder returned unexpected metadata",

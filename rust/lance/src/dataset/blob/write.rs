@@ -410,6 +410,7 @@ impl BlobPreprocessor {
         source_store_params: ObjectStoreParams,
         pack_file_size_override: Option<usize>,
     ) -> Result<Self> {
+        schema.check_blob_nesting(lance_core::datatypes::Field::is_blob_v2)?;
         let arrow_schema = arrow_schema::Schema::from(schema);
         let field_processors = arrow_schema
             .fields()
