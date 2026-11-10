@@ -2768,6 +2768,93 @@ mod integration_tests {
         );
     }
 
+    /// `count_rows` plans its own scan, without the caller's projection; it
+    /// must count what the scan returns across base, an SSTable and the
+    /// active memtable: an overwritten key once, a deleted key not at all,
+    /// and a filter on a column the projection leaves out.
+    #[tokio::test]
+    async fn test_lsm_count_rows_matches_scan_across_sources() {
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3, 4, 5], "base")],
+            )
+            .await,
+        );
+        // SSTable gen 1 overwrites id=3 and deletes id=4.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(
+            &gen1_uri,
+            vec![ts_batch(
+                &mem_schema,
+                &[(3, Some("gen1_3"), false), (4, None, true)],
+            )],
+        )
+        .await;
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        // The active memtable overwrites id=1, deletes id=5 and adds id=6.
+        let active_batch = ts_batch(
+            &mem_schema,
+            &[
+                (1, Some("active_1"), false),
+                (5, None, true),
+                (6, Some("active_6"), false),
+            ],
+        );
+        let (bs, ix) = pk_indexed(&[active_batch]);
+        let scanner = |filter: &str| {
+            LsmScanner::new(
+                base.clone(),
+                vec![shard_snapshot.clone()],
+                vec!["id".to_string()],
+            )
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: bs.clone(),
+                        index_store: ix.clone(),
+                        schema: mem_schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+        };
+
+        // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active).
+        for (filter, expected) in [
+            ("id > 0", vec![1, 2, 3, 6]),
+            ("name != 'base_2'", vec![1, 3, 6]),
+            ("name LIKE 'base%'", vec![2]),
+        ] {
+            let batches: Vec<RecordBatch> = scanner(filter)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(collect_sorted_ids(&batches), expected, "scan, {filter}");
+            assert_eq!(
+                scanner(filter).count_rows().await.unwrap(),
+                expected.len() as u64,
+                "count_rows, {filter}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_lsm_scan_tombstone_does_not_consume_limit() {
         // A single (newest) SSTable holds both tombstones and live

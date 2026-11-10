@@ -597,8 +597,9 @@ impl LsmScanner {
 
     /// Whether the projection requests any system column (e.g. `_rowaddr`,
     /// `_memtable_gen`), which only the union scan path can produce.
-    fn projection_has_system_columns(projection: Option<&[String]>) -> bool {
-        projection
+    fn projection_has_system_columns(&self) -> bool {
+        self.projection
+            .as_ref()
             .map(|p| p.iter().any(|c| is_system_column(c)))
             .unwrap_or(false)
     }
@@ -748,13 +749,14 @@ impl LsmScanner {
 
     /// Plain (filter / projection / limit) scan over base ∪ SSTables ∪ in-memory.
     ///
-    /// `projection` is the effective output projection to push into every
-    /// source scan; `count_rows` passes an empty list so sources scan only
-    /// the PK columns dedup already requires.
+    /// `projection` is what the sources read and the plan returns: the
+    /// caller's projection, or an empty one for `count_rows`, which still
+    /// reads the key columns dedup needs. Validation and routing follow the
+    /// caller's projection either way.
     async fn plan_scan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
-        validate_projection_names(projection, &base_schema, &[])?;
+        validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
 
         // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter on the
         // single pk column — with no offset and no scan-only system columns —
@@ -766,7 +768,7 @@ impl LsmScanner {
             && self.offset.is_none()
             && !self.with_memtable_gen
             && !self.with_row_address
-            && !Self::projection_has_system_columns(projection)
+            && !self.projection_has_system_columns()
             && let Some(filter) = &self.filter
             && let Ok(pk_field) = base_schema.field_with_name(&self.pk_columns[0])
             && let Some(keys) =
@@ -882,22 +884,15 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        // Counting needs no JSON conversion, so skip decoding the values. It
-        // needs no projected columns either: plan the plain scan with an empty
-        // projection so sources scan only the PK/_rowaddr columns dedup
-        // already requires, instead of decoding the caller's (possibly wide)
-        // projection just to sum `num_rows`. The caller's names are validated
-        // first so a bad projection still errors exactly as `plan_scan` would.
-        // The search arms keep their normal plan: their planners validate and
-        // honor the projection themselves, and their fetch is bounded by k.
+        // Counting needs no JSON conversion, so skip decoding the values. A
+        // plain scan needs none of the projected columns either, so it reads
+        // only what dedup needs instead of decoding a possibly wide projection.
+        // A search keeps its plan: its fetch is bounded by k.
         let plan = if self.nearest.is_some() || self.full_text_query.is_some() {
             self.create_plan().await?
         } else {
-            validate_projection_names(self.projection.as_deref(), &self.schema(), &[])?;
             self.plan_scan(Some(&[])).await?
         };
-        // Fold per batch instead of collecting: a count never needs more than
-        // one batch of rows in memory at a time.
         Self::execute_created_plan(plan)?
             .try_fold(0u64, |count, batch| async move {
                 Ok(count + batch.num_rows() as u64)
