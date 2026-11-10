@@ -12,6 +12,8 @@ mod prepared;
 mod read;
 mod rewrite;
 #[cfg(test)]
+mod rewrite_tests;
+#[cfg(test)]
 pub mod test_util;
 mod write;
 
