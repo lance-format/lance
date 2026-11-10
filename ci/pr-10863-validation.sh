@@ -36,6 +36,25 @@ run_step() {
     return "$status"
 }
 
+run_test_step() {
+    local name=$1
+    local test_name=$2
+    shift 2
+
+    run_step "$name" "$@"
+    local log="$log_dir/$name.log"
+    if ! grep -Eq "^test .*${test_name}.* \\.\\.\\. ok$" "$log"; then
+        printf '%s did not execute %s\n' "$name" "$test_name" >&2
+        printf '%s\tmissing-test\n' "$name" >>"$status_log"
+        return 1
+    fi
+    if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed;' "$log"; then
+        printf '%s did not report a nonzero passing test count\n' "$name" >&2
+        printf '%s\tzero-passed\n' "$name" >>"$status_log"
+        return 1
+    fi
+}
+
 cd "$(git rev-parse --show-toplevel)"
 
 {
@@ -64,14 +83,14 @@ run_step proto_comments \
     python3 ci/check_proto_comments.py protos/filtered_read.proto
 run_step root_fmt \
     cargo fmt --all -- --check
-run_step options_none \
-    cargo test --profile ci -p lance --lib test_options_roundtrip_basic
-run_step options_nonempty_legacy \
-    cargo test --profile ci -p lance --lib test_options_roundtrip_with_fragments
-run_step exec_codec_none \
-    cargo test --profile ci -p lance --lib test_exec_to_proto_roundtrip
-run_step exec_empty_selection \
-    cargo test --profile ci -p lance --lib test_exec_roundtrip_keeps_empty_fragment_selection
+run_test_step options_none test_options_roundtrip_basic \
+    cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_basic
+run_test_step options_nonempty_legacy test_options_roundtrip_with_fragments \
+    cargo test --profile ci -p lance --features substrait --lib test_options_roundtrip_with_fragments
+run_test_step exec_codec_none test_exec_to_proto_roundtrip \
+    cargo test --profile ci -p lance --features substrait --lib test_exec_to_proto_roundtrip
+run_test_step exec_empty_selection test_exec_roundtrip_keeps_empty_fragment_selection \
+    cargo test --profile ci -p lance --features substrait --lib test_exec_roundtrip_keeps_empty_fragment_selection
 run_step root_clippy \
     cargo clippy --profile ci --all --tests --benches -- -D warnings
 
