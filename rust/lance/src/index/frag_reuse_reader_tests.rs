@@ -4741,3 +4741,337 @@ async fn row_map_reads_follow_index_cache_capacity() {
     assert_eq!(block_requests, 1, "exactly the block read");
     assert!(block_bytes < small_bytes, "{block_bytes} vs {small_bytes}");
 }
+
+/// Which index kinds the engine's single deferred-remap capability predicate
+/// (`segment_supports_batch_remapping`) classifies as deferrable at this pin.
+/// Asserts current behavior, so a later reclassification of HNSW shows up here.
+#[tokio::test]
+async fn capability_predicate_classifies_hnsw_as_deferrable() {
+    use arrow_array::types::Float32Type;
+    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_index::vector::hnsw::builder::HnswBuildParams;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::sq::builder::SQBuildParams;
+
+    let reader = lance_datagen::gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(32.into()))
+        .into_reader_rows(RowCount::from(512), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, "memory://hnsw_capability", None)
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::with_ivf_hnsw_sq_params(
+        lance_linalg::distance::MetricType::L2,
+        IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        },
+        HnswBuildParams {
+            max_level: 4,
+            m: 8,
+            ef_construction: 32,
+            prefetch_distance: None,
+        },
+        SQBuildParams::default(),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("hnsw_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    let hnsw = indices.iter().find(|i| i.name == "hnsw_idx").unwrap();
+    let btree = indices.iter().find(|i| i.name == "id_idx").unwrap();
+
+    // A modern-format HNSW segment: the engine says it CAN defer, because
+    // `vector_supports_batch_remapping` tests only the index file version.
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, hnsw)
+            .await
+            .unwrap(),
+        Some(true),
+        "HNSW is deferrable at this pin"
+    );
+    // A BTree segment: deferrable through the scalar plugin capability.
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, btree)
+            .await
+            .unwrap(),
+        Some(true),
+        "BTree keeps its normal deferred behavior"
+    );
+    // Absent details is the fail-closed third state.
+    let mut opaque = hnsw.clone();
+    opaque.index_details = None;
+    assert_eq!(
+        super::segment_supports_batch_remapping(&dataset, &opaque)
+            .await
+            .unwrap(),
+        None,
+        "unreadable metadata is neither deferrable nor silently withdrawn"
+    );
+}
+
+// The commit check reads every segment of the name from its own index file,
+// never through the fragment reuse history: neither the new segment, which is
+// not in the manifest yet, nor a retained one the reader derives no coverage
+// for, which a query refuses, fails the commit.
+#[tokio::test]
+async fn raw_vector_commit_reads_staged_and_uncovered_segments() {
+    use crate::dataset::CommitBuilder;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::index::frag_reuse::open_row_id_remapping;
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(4.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    let params = crate::index::vector::VectorIndexParams::ivf_flat(
+        1,
+        lance_linalg::distance::DistanceType::L2,
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    let superseded = indices
+        .iter()
+        .find(|index| index.name == "vector_idx")
+        .cloned()
+        .unwrap();
+    // A sibling built directly over the destinations owns them, so the reader
+    // derives no coverage for the segment built before the rewrite.
+    let destination_ids = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<Vec<_>>();
+    let mut direct = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+        .name("worker_idx".into())
+        .fragments(destination_ids)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    direct.name = "vector_idx".into();
+    indices.push(direct);
+    persist_fixture(&mut dataset, indices).await;
+    let Err(err) = open_row_id_remapping(&dataset, &superseded, &NoOpMetricsCollector).await else {
+        panic!("a query must refuse a segment the reader derives no coverage for");
+    };
+    assert!(
+        matches!(err, lance_core::Error::NotSupported { .. })
+            && err.to_string().contains("query coverage is unavailable"),
+        "{err:?}"
+    );
+
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let appended = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .max()
+        .unwrap();
+    let mut staged = CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+        .name("worker_idx".into())
+        .fragments(vec![appended])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    staged.name = "vector_idx".into();
+    let staged_uuid = staged.uuid;
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![staged],
+            removed_indices: vec![],
+        },
+        None,
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(transaction)
+        .await
+        .unwrap();
+    let segments: Vec<_> = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "vector_idx")
+        .map(|index| index.uuid)
+        .collect();
+    assert_eq!(segments.len(), 3, "{segments:?}");
+    assert!(segments.contains(&staged_uuid) && segments.contains(&superseded.uuid));
+
+    // One search across the two segments the reader lists, the direct sibling
+    // and the new one, against an exact scan.
+    let query = arrow_array::Float32Array::from(vec![0.0f32; 4]);
+    let mut row_ids = Vec::new();
+    for use_index in [true, false] {
+        let mut scan = dataset.scan();
+        scan.with_row_id()
+            .nearest("vector", &query, 4)
+            .unwrap()
+            .use_index(use_index);
+        if use_index {
+            let plan = scan.explain_plan(true).await.unwrap();
+            assert!(plan.contains("deltas=2"), "{plan}");
+        }
+        let found = scan.try_into_batch().await.unwrap();
+        row_ids.push(
+            found[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+        );
+    }
+    let recall = row_ids[0].intersection(&row_ids[1]).count() as f32 / 4.0;
+    assert!(recall >= 0.5, "recall {recall}");
+}
+
+// A segment of an older format, like an index extension's, has no metadata
+// the check reads without opening it, so it is opened, on the identity plan:
+// under the tagged history the snapshot has no plan for a staged segment, and
+// a retained legacy one whose fragments a rewrite moved is one the history
+// cannot translate. Opened so, the two are still compared.
+#[rstest::rstest]
+#[case::same_metric(lance_linalg::distance::DistanceType::L2)]
+#[case::other_metric(lance_linalg::distance::DistanceType::Dot)]
+#[tokio::test]
+async fn raw_vector_commit_opens_legacy_segments_on_the_identity_plan(
+    #[case] staged_metric: lance_linalg::distance::DistanceType,
+) {
+    use crate::dataset::CommitBuilder;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::index::frag_reuse::{MissingCoverageReason, segment_coverage_reason};
+    use crate::index::vector::ivf::v2::tests::build_legacy_v1_segment;
+    use lance_linalg::distance::DistanceType;
+
+    // 256 rows: enough to train a legacy codebook.
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vector",
+            lance_datagen::array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
+        )
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(128))
+        .await
+        .unwrap();
+    let retained = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    persist_fixture(&mut dataset, vec![retained.clone()]).await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    assert_eq!(
+        segment_coverage_reason(&dataset, &retained).await.unwrap(),
+        Some(MissingCoverageReason::Unsupported)
+    );
+
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let appended = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .max()
+        .unwrap();
+    let staged = build_legacy_v1_segment(&dataset, staged_metric, vec![appended]).await;
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![staged.clone()],
+            removed_indices: vec![],
+        },
+        None,
+    );
+    let result = CommitBuilder::new(Arc::new(dataset))
+        .execute(transaction)
+        .await;
+    if staged_metric == DistanceType::L2 {
+        let dataset = result.unwrap();
+        let segments: Vec<_> = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "shared")
+            .map(|index| index.uuid)
+            .collect();
+        assert_eq!(segments, vec![retained.uuid, staged.uuid]);
+    } else {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Dot") && err.to_string().contains("L2"),
+            "{err}"
+        );
+    }
+}

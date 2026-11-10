@@ -625,19 +625,44 @@ impl Transaction {
                 let lineage =
                     crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
                         &current_indices,
-                        frag_reuse_ledger,
+                        frag_reuse_ledger.clone(),
                     )?;
-                let live: RoaringBitmap = manifest
-                    .fragments
-                    .iter()
-                    .filter_map(|fragment| u32::try_from(fragment.id).ok())
-                    .collect();
+                let live = Self::live_fragment_bitmap(manifest);
                 Self::withdraw_in_place_rewrites(
                     &mut prepared,
                     rewrites,
                     &manifest.schema,
                     &live,
                     lineage.as_ref(),
+                );
+            }
+            // A deferred compaction leaves every covering segment's retired
+            // provenance in place for the reader to translate through the
+            // history. A segment whose type cannot do that would be left
+            // addressing provenance it can never translate, so its coverage
+            // of this compaction's sources is withdrawn in this same commit;
+            // the commit layer, which can read the index details, decided
+            // which segments those are.
+            if let FragReuseUpdate::Rewrite(assembly) = &frag_reuse
+                && !assembly.undeferrable_segments.is_empty()
+            {
+                let lineage =
+                    crate::system_index::frag_reuse::lineage::TaggedLineage::from_indices_with_ledger(
+                        &current_indices,
+                        frag_reuse_ledger,
+                    )?;
+                let live = Self::live_fragment_bitmap(manifest);
+                let rewritten: RoaringBitmap = self
+                    .operation
+                    .rewritten_source_fragments()
+                    .filter_map(|id| u32::try_from(id).ok())
+                    .collect();
+                Self::withdraw_undeferrable_rewrite_coverage(
+                    &mut prepared,
+                    lineage.as_ref(),
+                    &live,
+                    &assembly.undeferrable_segments,
+                    &rewritten,
                 );
             }
         }
@@ -647,6 +672,15 @@ impl Transaction {
             prepared,
             frag_reuse,
         ))
+    }
+
+    /// The fragment ids `manifest` lists, as a bitmap.
+    fn live_fragment_bitmap(manifest: &Manifest) -> RoaringBitmap {
+        manifest
+            .fragments
+            .iter()
+            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .collect()
     }
 
     /// Create a new manifest from the current manifest and the transaction.
@@ -2239,6 +2273,31 @@ impl Transaction {
             _ => {}
         }
 
+        // Every schema change lands here: the Blob v2 promotion and the field
+        // metadata updates above, which can turn a nested field into a blob.
+        // An Overwrite defines a new table, so its schema is checked in full.
+        // Otherwise a field the parent schema already nested this way may stay,
+        // e.g. to be dropped.
+        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+            field.is_blob_v2()
+                || matches!(
+                    manifest.data_storage_format.lance_file_format(),
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                )
+        };
+        let already_nested: HashSet<i32> = match current_manifest {
+            Some(current) if !matches!(self.operation, Operation::Overwrite { .. }) => current
+                .schema
+                .nested_blob_fields()
+                .filter(|prior| unsupported(current, prior))
+                .map(|prior| prior.id)
+                .collect(),
+            _ => HashSet::new(),
+        };
+        manifest.schema.check_blob_nesting(|field| {
+            unsupported(&manifest, field) && !already_nested.contains(&field.id)
+        })?;
+
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
         }
@@ -3443,6 +3502,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: Some(7),
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();
@@ -3640,6 +3700,7 @@ mod tests {
                     entry: appended.clone(),
                     base_entry_version: None,
                     reordered_sources: RoaringBitmap::new(),
+                    undeferrable_segments: Vec::new(),
                 })),
             )
             .unwrap();

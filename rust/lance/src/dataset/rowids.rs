@@ -325,6 +325,35 @@ pub async fn row_addrs_to_row_ids(
     row_addrs_to_row_ids_impl(dataset, addrs, DeletedRowBehavior::Include).await
 }
 
+/// Resolve row ids to their current row addresses, in input order.
+///
+/// A row address is `(fragment_id << 32) | offset`. With stable row ids, ids
+/// that are unknown or deleted yield `None`. Without stable row ids, row ids
+/// are row addresses, so each id is returned unchanged.
+///
+/// ```
+/// # use lance::{Dataset, Result};
+/// # use lance::dataset::rowids::row_ids_to_row_addrs;
+/// # async fn test(dataset: &Dataset) -> Result<()> {
+/// let addrs = row_ids_to_row_addrs(dataset, &[3, 21]).await?;
+/// let fragment_ids: Vec<u64> = addrs.into_iter().flatten().map(|addr| addr >> 32).collect();
+/// # Ok(())
+/// # }
+/// ```
+pub async fn row_ids_to_row_addrs(dataset: &Dataset, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(index) = get_row_id_index(dataset).await? else {
+        return Ok(row_ids.iter().copied().map(Some).collect());
+    };
+    Ok(index
+        .get_many(row_ids)?
+        .into_iter()
+        .map(|addr| addr.map(u64::from))
+        .collect())
+}
+
 /// Resolve physical row addresses to stable row ids only for live physical slots.
 ///
 /// When stable row ids are enabled, missing fragments, out-of-range offsets,
@@ -912,6 +941,58 @@ mod test {
         let addrs = vec![addr(1, 2), None];
         let ids = row_addrs_to_row_ids(&plain, addrs.clone()).await.unwrap();
         assert_eq!(ids, addrs);
+    }
+
+    #[tokio::test]
+    async fn test_row_ids_to_row_addrs() {
+        let batch = sequence_batch(0..25);
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let write_params = WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 10,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+            .await
+            .unwrap();
+        // Rewriting row 3 gives it a new address in a new fragment but keeps its id.
+        UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 3")
+            .unwrap()
+            .set("id", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        dataset.delete("id = 21").await.unwrap();
+
+        let addr = |frag: u64, offset: u64| Some((frag << 32) | offset);
+        let addrs = row_ids_to_row_addrs(&dataset, &[12, 3, 21, 999, 12])
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec![addr(1, 2), addr(3, 0), None, None, addr(1, 2)]);
+        assert!(
+            row_ids_to_row_addrs(&dataset, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            row_addrs_to_row_ids(&dataset, addrs).await.unwrap(),
+            vec![Some(12), Some(3), None, None, Some(12)]
+        );
+
+        // Without stable row ids, ids are the addresses: input passes through
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let plain = Dataset::write(reader, "memory://", None).await.unwrap();
+        let ids = [(1u64 << 32) | 2, 999];
+        assert_eq!(
+            row_ids_to_row_addrs(&plain, &ids).await.unwrap(),
+            vec![Some(ids[0]), Some(ids[1])]
+        );
     }
 
     #[tokio::test]

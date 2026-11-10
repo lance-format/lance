@@ -921,6 +921,36 @@ public class Dataset implements Closeable {
   private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
+   * Resolve row IDs (from the {@code _rowid} column) to their current row addresses.
+   *
+   * <p>A row address is {@code (fragmentId << 32) | rowOffset}, so callers can tell which fragment
+   * holds each row without scanning. With stable row IDs, a row keeps its ID when compaction or an
+   * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
+   * is its row address, and each input is returned unchanged without checking that the row exists.
+   *
+   * @param rowIds the row IDs to resolve
+   * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
+   *     is unknown or its row was deleted
+   * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
+   *     row IDs are corrupt
+   */
+  public List<Long> getRowAddresses(List<Long> rowIds) {
+    Preconditions.checkArgument(rowIds != null, "rowIds cannot be null");
+    long[] addresses;
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      addresses = nativeGetRowAddresses(rowIds);
+    }
+    List<Long> result = new ArrayList<>(addresses.length);
+    for (long address : addresses) {
+      result.add(address == -1L ? null : address);
+    }
+    return result;
+  }
+
+  private native long[] nativeGetRowAddresses(List<Long> rowIds);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take

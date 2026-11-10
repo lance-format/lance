@@ -622,6 +622,37 @@ async fn test_fts_filter_vector_search() {
         .try_into_stream()
         .await;
     assert!(stream.is_err());
+
+    // Case 7: postfilter FTS filter with .limit(): the limit applies to the
+    // rows the FTS filter keeps. The five nearest rows to [298; 4] are ids
+    // 296..=300; 296..=298 hold "noop" text and are dropped by the filter. A
+    // limit pushed below the filter would only let 298 and one of the tied
+    // 297/299 reach it.
+    let query_vector = Float32Array::from(vec![298f32, 298f32, 298f32, 298f32]);
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(false)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[299, 300],
+    )
+    .await;
 }
 
 #[rstest]
