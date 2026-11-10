@@ -125,13 +125,14 @@ fn generate_table(
             proto_dir.join("table.proto"),
             proto_dir.join("transaction.proto"),
             proto_dir.join("rowids.proto"),
+            proto_dir.join("snapshot.proto"),
         ],
         &[&proto_dir],
     )?;
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance-table/src/pb"),
-        &["lance.table.rs"],
+        &["lance.table.rs", "lance.snapshot.rs"],
         check,
     )
 }
@@ -203,9 +204,11 @@ fn generate_lance(
     config.extern_path(".lance.index.pb", "::lance_index::pb");
     config.extern_path(".lance.datafusion", "::lance_datafusion::pb");
     config.enable_type_names();
+    config.bytes([".lance.dataset.retention"]);
     config.compile_protos(
         &[
             proto_dir.join("ann.proto"),
+            proto_dir.join("snapshot_retention.proto"),
             proto_dir.join("fts.proto"),
             proto_dir.join("cache_diagnostics.proto"),
         ],
@@ -214,7 +217,11 @@ fn generate_lance(
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance/src/pb"),
-        &["lance.pb.rs", "lance.cache.rs"],
+        &[
+            "lance.pb.rs",
+            "lance.cache.rs",
+            "lance.dataset.retention.rs",
+        ],
         check,
     )
 }
