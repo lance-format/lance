@@ -20,7 +20,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());
@@ -217,13 +220,6 @@ impl<'a> TransactionRebase<'a> {
                     staged_replay: false,
                 })
             }
-            Operation::AcquireLease { .. }
-            | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. } => Err(Error::not_supported(format!(
-                "{} cannot be rebased: retention lease operations are not wired into the \
-                 commit path yet",
-                transaction.operation.name()
-            ))),
             // An unrecognized operation cannot be rebased: we don't know what it touches.
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \

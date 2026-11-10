@@ -21,7 +21,9 @@ use std::sync::Arc;
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RetentionLease, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
-use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
+use crate::feature_flags::{
+    FLAG_RETENTION_LEASES, FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag,
+};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
 use lance_core::cache::LanceCache;
@@ -202,6 +204,19 @@ impl Manifest {
     /// Why the stored retention lease list is invalid, if it is.
     pub(crate) fn retention_lease_error(&self) -> Option<&str> {
         self.retention_lease_error.as_deref()
+    }
+
+    /// Replace the lease list with one the caller derived, setting writer
+    /// flag 20 exactly when it is nonempty. A list read with invalid records
+    /// is replaced whole, so its decode error no longer applies.
+    pub fn set_retention_leases(&mut self, leases: Vec<RetentionLease>) {
+        if leases.is_empty() {
+            self.writer_feature_flags &= !FLAG_RETENTION_LEASES;
+        } else {
+            self.writer_feature_flags |= FLAG_RETENTION_LEASES;
+        }
+        self.retention_leases = leases;
+        self.retention_lease_error = None;
     }
 
     /// Whether this table requires independently addressed Managed Blob support.
@@ -883,6 +898,10 @@ pub struct ManifestBuildConfig {
     pub auto_set_feature_flags: bool,
     /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
     pub timestamp_nanos: u128,
+    /// The time this commit attempt judges retention lease expiry against.
+    /// The caller reads it once per attempt, so every derivation in the
+    /// attempt agrees on which leases have expired.
+    pub now: DateTime<Utc>,
     /// Request the stable row id feature. The flag is also inherited from the
     /// previous manifest, so false does not turn it off for a dataset that has it.
     pub use_stable_row_ids: bool,
@@ -1395,9 +1414,7 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{
-        FLAG_NON_REUSABLE_FIELD_IDS, FLAG_RETENTION_LEASES, FLAG_USE_V2_FORMAT_DEPRECATED,
-    };
+    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;

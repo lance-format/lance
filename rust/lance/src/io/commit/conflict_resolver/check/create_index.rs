@@ -501,11 +501,13 @@ impl<'a> TransactionRebase<'a> {
                 Operation::Overwrite { .. } | Operation::Restore { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))

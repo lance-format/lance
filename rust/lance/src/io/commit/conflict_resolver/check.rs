@@ -11,10 +11,6 @@ impl<'a> TransactionRebase<'a> {
         // Either order: the claim was checked without the write's data.
         let ours = &self.transaction.operation;
         let theirs = &other_transaction.operation;
-        if let Some(lease_operation) = [ours, theirs].into_iter().find(|op| is_lease_operation(op))
-        {
-            return Err(lease_operations_not_wired(lease_operation));
-        }
         if (may_alter_nullability(ours) && supplies_values(theirs))
             || (supplies_values(ours) && may_alter_nullability(theirs))
         {
@@ -83,9 +79,16 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
+            // Lease operations do not conflict with concurrent commits: a retry
+            // re-derives the lease list against the new head.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. } => Err(lease_operations_not_wired(op)),
+            | Operation::ReleaseLease { .. } => match other_transaction.operation {
+                Operation::Unknown { .. } => {
+                    Err(self.incompatible_conflict_err(other_transaction, other_version))
+                }
+                _ => Ok(()),
+            },
             // An unrecognized operation cannot be checked: assume it conflicts.
             Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
@@ -191,11 +194,13 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -451,11 +456,13 @@ impl<'a> TransactionRebase<'a> {
                     other_transaction,
                     other_version,
                 ),
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => {
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -510,11 +517,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Update { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. } => Ok(()),
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -563,11 +572,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -732,11 +743,13 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::UpdateMemWalState { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => Err(self.incompatible_conflict_err(other_transaction, other_version)),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -875,11 +888,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -919,11 +934,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -953,11 +970,13 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -986,11 +1005,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
             | Operation::UpdateBases { .. } => Ok(()),
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1023,11 +1044,13 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
-            // An unrecognized operation may touch anything: assume it conflicts.
+            // A lease operation changes only the lease list, which every attempt
+            // re-derives from its predecessor.
             Operation::AcquireLease { .. }
             | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-            | Operation::Unknown { .. } => {
+            | Operation::ReleaseLease { .. } => Ok(()),
+            // An unrecognized operation may touch anything: assume it conflicts.
+            Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
         }
@@ -1089,11 +1112,13 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => {
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -1172,11 +1197,13 @@ impl<'a> TransactionRebase<'a> {
                 | Operation::Project { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
-                // An unrecognized operation may touch anything: assume it conflicts.
+                // A lease operation changes only the lease list, which every attempt
+                // re-derives from its predecessor.
                 Operation::AcquireLease { .. }
                 | Operation::RenewLease { .. }
-                | Operation::ReleaseLease { .. }
-                | Operation::Unknown { .. } => {
+                | Operation::ReleaseLease { .. } => Ok(()),
+                // An unrecognized operation may touch anything: assume it conflicts.
+                Operation::Unknown { .. } => {
                     Err(self.incompatible_conflict_err(other_transaction, other_version))
                 }
             }
@@ -1255,22 +1282,4 @@ impl<'a> TransactionRebase<'a> {
         }
         Ok(())
     }
-}
-
-fn is_lease_operation(operation: &Operation) -> bool {
-    matches!(
-        operation,
-        Operation::AcquireLease { .. }
-            | Operation::RenewLease { .. }
-            | Operation::ReleaseLease { .. }
-    )
-}
-
-// TODO(retention leases): replace with the directional rules in the
-// transaction specification once lease operations are committed.
-fn lease_operations_not_wired(operation: &Operation) -> Error {
-    Error::not_supported(format!(
-        "{} cannot be rebased: retention lease operations are not wired into the commit path yet",
-        operation.name()
-    ))
 }

@@ -4777,6 +4777,7 @@ impl ManifestWriteConfig {
         ManifestBuildConfig {
             auto_set_feature_flags: self.auto_set_feature_flags,
             timestamp_nanos: timestamp_to_nanos(self.timestamp),
+            now: utc_now(),
             use_stable_row_ids: self.use_stable_row_ids,
             use_legacy_format: self.use_legacy_format,
             storage_format: self.storage_format.clone(),
