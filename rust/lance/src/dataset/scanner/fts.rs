@@ -1688,7 +1688,7 @@ impl Scanner {
             .with_document_granularity(document_granularity);
         let flat_params = params.clone().with_phrase_slop(Some(query.slop));
 
-        let (phrase_plan, flat_phrase_plan) = match &index {
+        let (phrase_plan, flat_phrase_plan, shared_scorer) = match &index {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
@@ -1782,14 +1782,14 @@ impl Scanner {
                             &flat_query,
                             &flat_params,
                             FlatMatchFilter::BeforeScoring(filter_plan),
-                            shared_scorer,
+                            shared_scorer.clone(),
                         )
                         .await?,
                     )
                 } else {
                     None
                 };
-                (phrase_plan, flat_phrase_plan)
+                (phrase_plan, flat_phrase_plan, shared_scorer)
             }
             None => {
                 if target_fragments.is_empty() {
@@ -1808,11 +1808,16 @@ impl Scanner {
                         None,
                     )
                     .await?;
-                (None, Some(flat_phrase_plan))
+                (None, Some(flat_phrase_plan), None)
             }
         };
 
-        Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)
+        let plan = Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)?;
+        // Preserve the shared statistics boundary for replay and remote placement.
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Use global append-only corpus statistics independently of the selected candidates.
@@ -2038,7 +2043,7 @@ impl Scanner {
             return Ok(Arc::new(EmptyExec::new(output_schema)));
         }
 
-        let (match_plan, flat_match_plan) = match &index {
+        let (match_plan, flat_match_plan, shared_scorer) = match &index {
             Some(index) => {
                 let unindexed_fragments = self
                     .retain_target_fragments(self.dataset.unindexed_fragments(&index.name).await?);
@@ -2125,14 +2130,14 @@ impl Scanner {
                             query,
                             params,
                             FlatMatchFilter::BeforeScoring(filter_plan),
-                            shared_scorer,
+                            shared_scorer.clone(),
                         )
                         .await?,
                     )
                 } else {
                     None
                 };
-                (match_plan, flat_match_plan)
+                (match_plan, flat_match_plan, shared_scorer)
             }
             None => {
                 if target_fragments.is_empty() {
@@ -2152,11 +2157,16 @@ impl Scanner {
                         None,
                     )
                     .await?;
-                (None, Some(flat_match_plan))
+                (None, Some(flat_match_plan), None)
             }
         };
 
-        Self::combine_fts_leaf_plans(match_plan, flat_match_plan, params)
+        let plan = Self::combine_fts_leaf_plans(match_plan, flat_match_plan, params)?;
+        // Preserve the shared statistics boundary for replay and remote placement.
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     fn combine_fts_leaf_plans(
