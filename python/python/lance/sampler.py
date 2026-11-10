@@ -602,6 +602,8 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         The total number of processes in the distributed cluster.
     randomize : bool, default False
         Whether to randomize the order of batches for each epoch.
+        Sequential iteration retains only the current batch. Randomized iteration
+        also retains one start offset per batch.
     seed : int, default 0
         Random seed for reproducibility when randomize is enabled.
     batch_size : int, default 0
@@ -641,18 +643,17 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         start = self._rank * per_rank
         end = min(start + per_rank, self._total_num_rows)
 
-        batches = []
-        current = start
-        while current < end:
-            batch_end = min(current + self._batch_size, end)
-            batches.append(list(range(current, batch_end)))
-            current = batch_end
+        batch_starts: Union[range, List[int]] = (
+            range(start, end, self._batch_size) if start < end else range(0)
+        )
 
         if self._randomize:
+            batch_starts = list(batch_starts)
             random.seed(self._seed + self._epoch)
-            random.shuffle(batches)
+            random.shuffle(batch_starts)
 
-        yield from batches
+        for current in batch_starts:
+            yield list(range(current, min(current + self._batch_size, end)))
 
     @staticmethod
     def from_torch(
