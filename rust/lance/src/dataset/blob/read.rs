@@ -963,7 +963,9 @@ async fn collect_blob_selection_for_selection(
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     let files = match blob_version_from_descriptions(descriptions)? {
-        BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V1 => {
+            collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs).await
+        }
         BlobVersion::V2 => {
             collect_blob_v2_descriptor_files(
                 dataset,
@@ -1343,7 +1345,9 @@ mod tests {
         )
         .unwrap();
         let row_addrs = UInt64Array::from(vec![u64::MAX]);
-        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs).unwrap();
+        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_none());
     }
