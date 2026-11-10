@@ -3449,6 +3449,8 @@ fn phrase_search_tail(
             None => return Vec::new(),
         }
     }
+    // Constant per token; resolved once instead of once per matched document.
+    let query_weights: Vec<f32> = tokens.iter().map(|tok| scorer.query_weight(tok)).collect();
     // Drive the intersection from the rarest token to bound work.
     let smallest_idx = (0..per_token_chunks.len())
         .min_by_key(|&i| {
@@ -3497,10 +3499,10 @@ fn phrase_search_tail(
                 continue;
             }
             let dl = lookup_dl(snap, document_position).unwrap_or(1);
-            let score: f32 = tokens
+            let score: f32 = query_weights
                 .iter()
-                .enumerate()
-                .map(|(ti, tok)| scorer.query_weight(tok) * scorer.doc_weight(frequencies[ti], dl))
+                .zip(&frequencies)
+                .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
                 .sum();
             if let Some(document) = lookup_document(snap, document_position) {
                 results.push(FtsEntry {
@@ -4848,15 +4850,13 @@ impl Partition {
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
         let mut term_ids: Vec<u32> = Vec::with_capacity(tokens.len());
-        // Query weights are constant per token; resolve them once here so the
-        // doc loop below does not repeat each token's HashMap lookup and idf
-        // for every matched document.
-        let mut qws: Vec<f32> = Vec::with_capacity(tokens.len());
+        // Constant per token; resolved once instead of once per matched document.
+        let mut query_weights: Vec<f32> = Vec::with_capacity(tokens.len());
         for token in tokens {
             match self.term_id(token) {
                 Some(id) => {
                     term_ids.push(id);
-                    qws.push(scorer.query_weight(token));
+                    query_weights.push(scorer.query_weight(token));
                 }
                 // A phrase needs every token present in this partition.
                 None => return Vec::new(),
@@ -4891,7 +4891,7 @@ impl Partition {
             }
             if present && phrase_matches(&all_positions, query_groups, slop) {
                 let dl = self.docs.num_tokens(doc);
-                let score: f32 = qws
+                let score: f32 = query_weights
                     .iter()
                     .zip(&freqs)
                     .map(|(&qw, &f)| qw * scorer.doc_weight(f, dl))
@@ -7840,14 +7840,19 @@ mod tests {
         assert!(index.search_phrase("world hello", 0).is_empty());
     }
 
-    #[test]
-    fn test_phrase_partition_exact_bm25_scores() {
-        // Freeze into a single partition so Partition::search_phrase scores
-        // the matches (the tests above with default freeze thresholds hit the
-        // tail path). Docs differ in length and per-token frequency so a
-        // wrong weight/freq pairing would change the score.
+    /// Phrase scores are exact BM25 sums on both the partition and the tail
+    /// path. Docs differ in length and per-token frequency, so pairing a
+    /// token's weight with another token's frequency changes the score.
+    #[rstest]
+    #[case::partition(3, 1)]
+    #[case::tail(usize::MAX, 0)]
+    fn test_phrase_exact_bm25_scores(
+        #[case] freeze_threshold_rows: usize,
+        #[case] partitions: usize,
+    ) {
         let schema = create_test_schema();
-        let index = position_index(1, "description").with_freeze_threshold_rows(3);
+        let index =
+            position_index(1, "description").with_freeze_threshold_rows(freeze_threshold_rows);
         let batch = RecordBatch::try_new(
             schema,
             vec![
@@ -7864,11 +7869,7 @@ mod tests {
         .unwrap();
         index.insert(&batch, 0).unwrap();
         let st = index.state.load_full();
-        assert_eq!(
-            st.partitions.len(),
-            1,
-            "fixture must freeze into one partition"
-        );
+        assert_eq!(st.partitions.len(), partitions);
 
         let entries = index.search_phrase("alpha beta", 0);
         assert_eq!(rows(entries.clone()), vec![0, 1, 2]);
@@ -7880,8 +7881,8 @@ mod tests {
             5,
             HashMap::from([("alpha".to_string(), 4), ("beta".to_string(), 3)]),
         );
-        // Bit-exact: the phrase score must keep evaluating
-        // query_weight(token) * doc_weight(freq, doc_length) per token.
+        // Bit-exact: query_weight(token) * doc_weight(freq, doc_length),
+        // summed over the tokens.
         let expected = |fa: u32, fb: u32, dl: u32| {
             scorer.query_weight("alpha") * scorer.doc_weight(fa, dl)
                 + scorer.query_weight("beta") * scorer.doc_weight(fb, dl)
