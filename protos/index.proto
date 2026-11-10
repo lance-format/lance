@@ -231,13 +231,15 @@ message VectorIndexDetails {
    */
   map<string, string> runtime_hints = 9;
 
-  /*
-   * Content-derived identity of this segment's final IVF coarse-routing state.
-   * Readers may reuse routing only for identical, well-formed values. It is
-   * absent for legacy or unsupported routers. The current encoding is a
-   * 32-byte BLAKE3 digest. Its canonical input encoding and lifecycle are
-   * defined in docs/src/format/index/vector/index.md under
-   * "Coarse-routing fingerprint".
+  /* A 32-byte BLAKE3 fingerprint of the final IVF coarse-routing state:
+   * - Index distance metric.
+   * - Centroid scalar type and shape (count and dimension).
+   * - Centroid values in partition-ID order and coordinate order.
+   *
+   * Readers may reuse routing only for identical, well-formed fingerprints.
+   * Absent when no reliable fingerprint is available.
+   * See "Coarse-routing fingerprint" in
+   * docs/src/format/index/vector/index.md for the canonical encoding.
    */
   optional bytes coarse_quantizer_fingerprint = 10;
 }
