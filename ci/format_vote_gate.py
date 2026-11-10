@@ -5,8 +5,10 @@ changes (https://lance.org/community/voting/). The `format-change` label is
 applied by the path labeler (`.github/labeler-area.yml`); this script reads it
 and publishes the `format-spec-vote` commit status, which blocks merging until:
 
-  * 3 PMC members have approved the PR (excluding the author), counted only on
-    the head commit so new pushes invalidate stale approvals;
+  * 3 PMC members have approved the PR (excluding the author), counted on any
+    commit so a rebase or a typo fix doesn't send everyone back to re-vote;
+  * at least one of those approvals is on the head commit. That member is
+    vouching that nothing substantive changed since the earlier approvals;
   * no PMC member has an outstanding "Request changes" review (a veto); and
   * the 72-hour voting period has elapsed. The clock starts once the PR is both
     labeled and out of draft, and pauses over weekends.
@@ -56,9 +58,11 @@ def tally_reviews(reviews, head_sha, author, is_pmc):
     """Tally PMC votes from a PR's reviews.
 
     `reviews` is an ordered list of dicts with `login`, `state`, `commit_id`.
-    A member's stance is their most recent stance review. Approvals only count
-    on the head commit; earlier ones are stale. A "changes requested" review is
-    a veto regardless of commit. The PR author never counts.
+    A member's stance is their most recent stance review. Approvals count
+    whatever commit they were cast on; the ones on the head commit are returned
+    separately, because the gate requires at least one of those. A "changes
+    requested" review is a veto regardless of commit. The PR author never
+    counts.
     """
     latest = {}
     for review in reviews:
@@ -69,22 +73,27 @@ def tally_reviews(reviews, head_sha, author, is_pmc):
             continue
         latest[login.lower()] = review
 
-    approvals, stale_approvals, vetoes = [], [], []
+    approvals, head_approvals, vetoes = [], [], []
     for review in latest.values():
         if review["state"] == "APPROVED":
-            target = approvals if review["commit_id"] == head_sha else stale_approvals
-            target.append(review["login"])
+            approvals.append(review["login"])
+            if review["commit_id"] == head_sha:
+                head_approvals.append(review["login"])
         elif review["state"] == "CHANGES_REQUESTED":
             vetoes.append(review["login"])
-    return approvals, stale_approvals, vetoes
+    return approvals, head_approvals, vetoes
 
 
-def decide_verdict(veto_count, approval_count, period_elapsed, required):
+def decide_verdict(
+    veto_count, approval_count, head_approval_count, period_elapsed, required
+):
     """Return the blocking condition (if any), in priority order."""
     if veto_count > 0:
         return "veto"
     if approval_count < required:
         return "insufficient"
+    if head_approval_count == 0:
+        return "unconfirmed"
     if not period_elapsed:
         return "waiting_period"
     return "pass"
@@ -153,7 +162,9 @@ def _as_utc(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
-def _build_comment(headline, approval_cell, vetoes, period_cell, rerun_url):
+def _build_comment(
+    headline, approval_cell, head_approval_cell, vetoes, period_cell, rerun_url
+):
     return "\n".join(
         [
             COMMENT_MARKER,
@@ -162,17 +173,23 @@ def _build_comment(headline, approval_cell, vetoes, period_cell, rerun_url):
             "",
             "This PR modifies the Lance format specification, so it requires "
             f"**{REQUIRED_APPROVALS} binding +1 votes from PMC members** "
-            "(excluding the proposer) and a minimum "
-            f"**{PERIOD_HOURS}-hour** voting period, weekends excluded, before "
-            "it can merge. "
+            "(excluding the proposer), **at least one of them on the latest "
+            f"commit**, and a minimum **{PERIOD_HOURS}-hour** voting period, "
+            "weekends excluded, before it can merge. "
             "Vote by approving this PR (+1) or requesting changes (−1, a veto). "
             f"See the [voting process]({VOTING_URL}).",
+            "",
+            "Approvals carry over across pushes, so a rebase or a typo fix does "
+            "not send everyone back to re-vote. Whoever approves the latest "
+            "commit is vouching that nothing substantive has changed since the "
+            "earlier approvals; if something has, ask for fresh votes.",
             "",
             f"**Status: {headline}**",
             "",
             "| | |",
             "|---|---|",
-            f"| Approvals (this commit) | {approval_cell} |",
+            f"| Approvals | {approval_cell} |",
+            f"| Latest commit approved by | {head_approval_cell} |",
             f"| Vetoes | {_fmt_list(vetoes)} |",
             f"| Voting period | {period_cell} |",
             "",
@@ -286,7 +303,7 @@ class Gate:
             }
             for review in pr.get_reviews()
         ]
-        approvals, stale, vetoes = tally_reviews(
+        approvals, head_approvals, vetoes = tally_reviews(
             reviews, head_sha, pr.user.login, self.is_pmc
         )
 
@@ -299,7 +316,11 @@ class Gate:
         period_ends = weekday_deadline(opened_at or now, PERIOD_HOURS)
         period_elapsed = now >= period_ends
         verdict = decide_verdict(
-            len(vetoes), len(approvals), period_elapsed, REQUIRED_APPROVALS
+            len(vetoes),
+            len(approvals),
+            len(head_approvals),
+            period_elapsed,
+            REQUIRED_APPROVALS,
         )
 
         deadline = _fmt_deadline(period_ends)
@@ -308,10 +329,15 @@ class Gate:
             headline = f"❌ Blocked — vetoed by {_fmt_list(vetoes)}"
         elif verdict == "insufficient":
             state = "failure"
-            summary = (
-                f"{len(approvals)}/{REQUIRED_APPROVALS} PMC approvals on this commit."
-            )
+            summary = f"{len(approvals)}/{REQUIRED_APPROVALS} PMC approvals."
             headline = f"❌ Blocked — {len(approvals)} of {REQUIRED_APPROVALS} required approvals"
+        elif verdict == "unconfirmed":
+            state = "failure"
+            summary = f"{len(approvals)} PMC approvals, but none on the latest commit."
+            headline = (
+                f"❌ Blocked — {len(approvals)} approvals, but none on the latest "
+                "commit; one PMC member must approve it"
+            )
         elif verdict == "waiting_period":
             state, summary = "failure", f"Approved; voting period ends {deadline}."
             headline = (
@@ -329,14 +355,22 @@ class Gate:
         approval_cell = (
             f"{_fmt_list(approvals)} ({len(approvals)}/{REQUIRED_APPROVALS})"
         )
-        if stale:
-            approval_cell += f" — stale, re-approve needed: {_fmt_list(stale)}"
+        head_approval_cell = (
+            _fmt_list(head_approvals)
+            if head_approvals
+            else "none — one PMC member must approve the latest commit"
+        )
 
         self.set_status(head_sha, state, summary)
         self.upsert_comment(
             issue,
             _build_comment(
-                headline, approval_cell, vetoes, period_cell, self.rerun_url
+                headline,
+                approval_cell,
+                head_approval_cell,
+                vetoes,
+                period_cell,
+                self.rerun_url,
             ),
         )
         print(f"PR #{number}: {summary}")

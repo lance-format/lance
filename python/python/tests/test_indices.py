@@ -559,6 +559,50 @@ def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand
     assert reader.metadata().num_rows == SMALL_NUM_ROWS
 
 
+def test_vector_transform_mismatched_codebook(
+    tmpdir, small_rand_dataset, small_rand_ivf
+):
+    # The dimension comes from the column and the codebook from the caller, and
+    # the codebook is sliced with column-derived offsets.
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    codebook = np.random.default_rng(42).random(DIMENSION * 256 * 2).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
+    pq = PqModel(NUM_SUBVECTORS, codebook)
+
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
+    with pytest.raises(ValueError, match="PQ codebook has"):
+        builder.transform_vectors(
+            small_rand_ivf, pq, str(tmpdir / "transformed"), fragments=None
+        )
+
+
+def test_vector_transform_cosine(tmpdir, small_rand_dataset, small_rand_pq):
+    # A cosine IVF model used to hand Cosine to the PQ quantizer, which has no
+    # Cosine kernel and panicked on the first batch.
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(dtype)
+    ivf = IvfModel(pa.FixedSizeListArray.from_arrays(centroids, DIMENSION), "cosine")
+
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
+    uri = str(tmpdir / "transformed")
+    builder.transform_vectors(ivf, small_rand_pq, uri, fragments=None)
+
+    assert LanceFileReader(uri).metadata().num_rows == SMALL_NUM_ROWS
+
+
+def test_vector_transform_codebook_of_another_value_type(tmpdir, small_float32_dataset):
+    # The column is f32 and the codebook f16: the length check passed and
+    # quantization panicked reading the codebook as f32.
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(np.float32)
+    ivf = IvfModel(pa.FixedSizeListArray.from_arrays(centroids, DIMENSION), "l2")
+    codebook = np.random.default_rng(42).random(DIMENSION * 256).astype(np.float16)
+    pq = PqModel(NUM_SUBVECTORS, pa.FixedSizeListArray.from_arrays(codebook, DIMENSION))
+
+    builder = IndicesBuilder(small_float32_dataset, "vectors")
+    with pytest.raises(ValueError, match="PQ codebook value type"):
+        builder.transform_vectors(ivf, pq, str(tmpdir / "transformed"), fragments=None)
+
+
 @pytest.mark.cuda
 def test_vector_transform_with_precomputed_partitions(
     tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq

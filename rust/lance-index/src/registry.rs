@@ -2,19 +2,18 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use lance_core::{Error, Result};
 
-#[cfg(feature = "geo")]
-use crate::scalar::rtree::RTreeIndexPlugin;
 use crate::{
     pb, pbold,
     scalar::{
-        bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin, btree::BTreeIndexPlugin,
-        fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin, json::JsonIndexPlugin,
-        label_list::LabelListIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
+        BuiltinIndexType, bitmap::BitmapIndexPlugin, bloomfilter::BloomFilterIndexPlugin,
+        btree::BTreeIndexPlugin, fmindex::FMIndexPlugin, inverted::InvertedIndexPlugin,
+        json::JsonIndexPlugin, label_list::LabelListIndexPlugin,
+        minhash_lsh::MinHashLshIndexPlugin, ngram::NGramIndexPlugin, registry::ScalarIndexPlugin,
         zonemap::ZoneMapIndexPlugin,
     },
 };
@@ -22,6 +21,120 @@ use crate::{
 /// Scalar detail package emitted by Lance 0.36 before the messages moved back
 /// to `lance.table` for forward compatibility.
 const V036_SCALAR_DETAILS_PACKAGE: &str = "lance.index.pb";
+
+struct PluginRegistration {
+    name: String,
+    details_type_name: String,
+    install: fn(&mut IndexPluginRegistry),
+}
+
+#[derive(Default)]
+struct PluginRegistrations {
+    plugins: Vec<PluginRegistration>,
+    is_frozen: bool,
+}
+
+impl PluginRegistrations {
+    fn register<
+        DetailsType: prost::Message + prost::Name,
+        PluginType: ScalarIndexPlugin + Default + 'static,
+    >(
+        &mut self,
+        builtins: &IndexPluginRegistry,
+    ) -> Result<()> {
+        if self.is_frozen {
+            return Err(Error::invalid_input(
+                "scalar index plugins must be registered before the first plugin registry is built",
+            ));
+        }
+        let name = plugin_name_from_details_url(DetailsType::NAME);
+        let details_type_name = DetailsType::full_name().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(Error::invalid_input(
+                "scalar index plugin name must not be empty",
+            ));
+        }
+        // `lance` installs this plugin from `lance-geo`, so it is not a builtin here, yet the
+        // rest of Lance reads any details message of this name as the R-tree index.
+        if name == BuiltinIndexType::RTree.as_str() {
+            return Err(Error::invalid_input(format!(
+                "scalar index plugin name '{name}' is reserved for Lance's R-tree index"
+            )));
+        }
+        if builtins.plugins.contains_key(&name)
+            || builtins.details_type_names.contains(&details_type_name)
+            || self
+                .plugins
+                .iter()
+                .any(|plugin| plugin.name == name || plugin.details_type_name == details_type_name)
+        {
+            return Err(Error::invalid_input(format!(
+                "scalar index plugin '{name}' or details type '{}' is already registered",
+                DetailsType::full_name()
+            )));
+        }
+        self.plugins.push(PluginRegistration {
+            name,
+            details_type_name,
+            install: |registry| registry.add_plugin::<DetailsType, PluginType>(),
+        });
+        Ok(())
+    }
+
+    fn freeze(&mut self) -> Vec<fn(&mut IndexPluginRegistry)> {
+        self.is_frozen = true;
+        self.plugins.iter().map(|plugin| plugin.install).collect()
+    }
+}
+
+static PLUGIN_REGISTRATIONS: Mutex<PluginRegistrations> = Mutex::new(PluginRegistrations {
+    plugins: Vec::new(),
+    is_frozen: false,
+});
+
+/// Register a statically linked scalar index plugin before using any datasets.
+///
+/// The details message determines the creation name, as in
+/// [`IndexPluginRegistry::add_plugin`]. Every subsequently constructed default
+/// registry includes the plugin. Registrations are frozen when the first such
+/// registry is built; late registrations and name or details-type collisions
+/// return an error. Register each plugin once at process startup. The name
+/// `rtree` is reserved for Lance's R-tree index, whether or not the application
+/// links it.
+///
+/// A custom index must persist its details message in [`crate::scalar::CreatedIndex`]
+/// so another process can select the registered reader. This registers Rust
+/// implementations linked into the application, not dynamic libraries.
+///
+/// This is an unstable Rust extension interface: plugins must use the same
+/// Lance version as the application. Each process must register its plugins;
+/// registration is not persisted in the dataset. Parallel tests sharing a
+/// process should use a shared `std::sync::LazyLock` to register all plugins
+/// once, before any test constructs a default registry or uses a dataset.
+/// Racing registry construction either includes the registration or rejects it
+/// as late; it never silently omits a successful registration.
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_index::scalar::registry::ScalarIndexPlugin;
+/// # fn register<D, P>() -> Result<()>
+/// # where D: prost::Message + prost::Name,
+/// #       P: ScalarIndexPlugin + Default + 'static,
+/// # {
+/// lance_index::registry::register_scalar_index_plugin::<D, P>()?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn register_scalar_index_plugin<
+    DetailsType: prost::Message + prost::Name,
+    PluginType: ScalarIndexPlugin + Default + 'static,
+>() -> Result<()> {
+    let builtins = IndexPluginRegistry::with_builtin_plugins();
+    PLUGIN_REGISTRATIONS
+        .lock()
+        .map_err(|_| Error::internal("scalar index plugin registration lock poisoned"))?
+        .register::<DetailsType, PluginType>(&builtins)
+}
 
 /// Derive the scalar index plugin name from a details type URL.
 ///
@@ -94,8 +207,68 @@ impl IndexPluginRegistry {
             .insert(format!("{}.{}", package, DetailsType::NAME).to_ascii_lowercase());
     }
 
-    /// Create a registry with the default plugins
+    /// Create a registry with builtin and startup-registered plugins.
+    ///
+    /// The first call freezes [`register_scalar_index_plugin`]. Later calls
+    /// construct independent registries with the same registered plugin types.
+    ///
+    /// The R-tree plugin is not among the builtins: it lives in `lance-geo`, and
+    /// `lance` adds it to the registry its datasets use. Add it to a registry of
+    /// your own with [`Self::with_default_plugins_and`].
     pub fn with_default_plugins() -> Arc<Self> {
+        Self::with_default_plugins_and(|_| {})
+    }
+
+    /// Create a registry with the default plugins and the ones `install` adds.
+    ///
+    /// This composes plugins from crates that depend on this one, as `lance`
+    /// does for the R-tree plugin in `lance-geo`. Unlike
+    /// [`register_scalar_index_plugin`], it works after the first registry was
+    /// built and affects only the registry it returns. It freezes registration
+    /// just as [`Self::with_default_plugins`] does.
+    ///
+    /// `install` runs after the startup-registered plugins. Give what it adds a
+    /// name no other plugin uses: [`Self::add_plugin`] replaces a plugin of the
+    /// same name but leaves the details type of the old one registered.
+    ///
+    /// This takes a closure because the finished registry is shared through
+    /// [`ScalarIndexPlugin::attach_registry`]: plugins that wrap another index,
+    /// like the JSON index, need to see what `install` added.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_index::registry::IndexPluginRegistry;
+    /// # use lance_index::scalar::registry::ScalarIndexPlugin;
+    /// # fn build<D, P>() -> Arc<IndexPluginRegistry>
+    /// # where D: prost::Message + prost::Name,
+    /// #       P: ScalarIndexPlugin + Default + 'static,
+    /// # {
+    /// IndexPluginRegistry::with_default_plugins_and(|registry| {
+    ///     registry.add_plugin::<D, P>();
+    /// })
+    /// # }
+    /// ```
+    pub fn with_default_plugins_and(install: impl FnOnce(&mut Self)) -> Arc<Self> {
+        let mut registry = Self::with_builtin_plugins();
+        // Freeze atomically with registration, but run plugin constructors
+        // outside the lock so they cannot deadlock registration.
+        let installers = PLUGIN_REGISTRATIONS
+            .lock()
+            .expect("scalar index plugin registration lock poisoned")
+            .freeze();
+        for installer in installers {
+            installer(&mut registry);
+        }
+        install(&mut registry);
+
+        let registry = Arc::new(registry);
+        for plugin in registry.plugins.values() {
+            plugin.attach_registry(registry.clone());
+        }
+        registry
+    }
+
+    fn with_builtin_plugins() -> Self {
         let mut registry = Self {
             plugins: HashMap::new(),
             details_type_names: HashSet::new(),
@@ -109,8 +282,7 @@ impl IndexPluginRegistry {
         registry.add_plugin::<pbold::InvertedIndexDetails, InvertedIndexPlugin>();
         registry.add_plugin::<pb::JsonIndexDetails, JsonIndexPlugin>();
         registry.add_plugin::<pb::FmIndexDetails, FMIndexPlugin>();
-        #[cfg(feature = "geo")]
-        registry.add_plugin::<pb::RTreeIndexDetails, RTreeIndexPlugin>();
+        registry.add_plugin::<pb::MinHashLshIndexDetails, MinHashLshIndexPlugin>();
 
         // Lance 0.36 released these scalar detail messages in the index package.
         // Register only those historical identities, not arbitrary packages
@@ -122,11 +294,6 @@ impl IndexPluginRegistry {
         registry.add_details_type_alias::<pbold::NGramIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::ZoneMapIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
         registry.add_details_type_alias::<pbold::InvertedIndexDetails>(V036_SCALAR_DETAILS_PACKAGE);
-
-        let registry = Arc::new(registry);
-        for plugin in registry.plugins.values() {
-            plugin.attach_registry(registry.clone());
-        }
 
         registry
     }
@@ -155,9 +322,10 @@ impl IndexPluginRegistry {
             .get(&plugin_name)
             .map(|plugin| plugin.as_ref())
             .ok_or_else(|| {
-                let hint = if plugin_name == "rtree" {
-                    ". The 'rtree' index requires the `geo` feature. \
-                     Rebuild with `--features geo` to enable geospatial support"
+                let hint = if plugin_name == BuiltinIndexType::RTree.as_str() {
+                    ". The 'rtree' plugin lives in `lance-geo`: build `lance` with its `geo` \
+                     feature, or add `lance_geo::rtree::RTreeIndexPlugin` through \
+                     `IndexPluginRegistry::with_default_plugins_and` if you built this registry"
                 } else {
                     ""
                 };
@@ -179,7 +347,189 @@ impl IndexPluginRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
+    use arrow_schema::{DataType, Field};
+
     use super::*;
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ExampleIndexDetails {}
+
+    impl prost::Name for ExampleIndexDetails {
+        const NAME: &'static str = "ExampleIndexDetails";
+        const PACKAGE: &'static str = "example.index";
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ConflictingIndexDetails {}
+
+    impl prost::Name for ConflictingIndexDetails {
+        const NAME: &'static str = "EXAMPLEIndexDetails";
+        const PACKAGE: &'static str = "another.index";
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct ForeignRTreeIndexDetails {}
+
+    impl prost::Name for ForeignRTreeIndexDetails {
+        const NAME: &'static str = "RTREEIndexDetails";
+        const PACKAGE: &'static str = "another.index";
+    }
+
+    #[test]
+    fn test_external_registration_installs_name_and_details() {
+        let mut registrations = PluginRegistrations::default();
+        let mut registry = IndexPluginRegistry::with_builtin_plugins();
+        registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&registry)
+            .unwrap();
+        for install in registrations.freeze() {
+            install(&mut registry);
+        }
+        assert!(registry.get_plugin_by_name("EXAMPLE").is_ok());
+        let details = prost_types::Any::from_msg(&ExampleIndexDetails {}).unwrap();
+        assert!(registry.supports_details(&details));
+        assert!(registry.get_plugin_by_details(&details).is_ok());
+        assert!(registry.get_plugin_by_name("btree").is_ok());
+        assert!(!registry.supports_details(&prost_types::Any {
+            type_url: "/another.package.ExampleIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn test_external_registration_rejects_collisions() {
+        let mut registrations = PluginRegistrations::default();
+        let builtins = IndexPluginRegistry::with_builtin_plugins();
+        let err = registrations
+            .register::<pbold::ZoneMapIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+
+        registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap();
+        let err = registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+        let err = registrations
+            .register::<ConflictingIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("already registered"));
+
+        let err = registrations
+            .register::<pb::RTreeIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("reserved"));
+        let err = registrations
+            .register::<ForeignRTreeIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("reserved"));
+        assert_eq!(registrations.plugins.len(), 1);
+    }
+
+    #[test]
+    fn test_with_default_plugins_and_adds_to_that_registry_only() {
+        let registry = IndexPluginRegistry::with_default_plugins_and(|registry| {
+            registry.add_plugin::<ExampleIndexDetails, ZoneMapIndexPlugin>();
+        });
+        let details = prost_types::Any::from_msg(&ExampleIndexDetails {}).unwrap();
+        assert!(registry.get_plugin_by_name("example").is_ok());
+        assert!(registry.supports_details(&details));
+        assert!(registry.get_plugin_by_details(&details).is_ok());
+        assert!(registry.get_plugin_by_name("btree").is_ok());
+
+        let plain = IndexPluginRegistry::with_default_plugins();
+        let err = plain.get_plugin_by_name("example").unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("No scalar index plugin found"));
+        assert!(!plain.supports_details(&details));
+    }
+
+    #[test]
+    fn test_with_default_plugins_and_reaches_wrapping_plugins() {
+        let train_json_on_example = |registry: &IndexPluginRegistry| {
+            registry
+                .get_plugin_by_name("json")
+                .unwrap()
+                .basic_trainer()
+                .unwrap()
+                .new_training_request(
+                    r#"{"target_index_type": "example", "path": "x"}"#,
+                    &Field::new("value", DataType::LargeBinary, true),
+                )
+        };
+
+        let plain = IndexPluginRegistry::with_default_plugins();
+        let err = train_json_on_example(&plain).err().unwrap();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("No scalar index plugin found"));
+
+        let registry = IndexPluginRegistry::with_default_plugins_and(|registry| {
+            registry.add_plugin::<ExampleIndexDetails, ZoneMapIndexPlugin>();
+        });
+        assert!(train_json_on_example(&registry).is_ok());
+    }
+
+    #[test]
+    fn test_missing_rtree_plugin_names_both_ways_to_get_it() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let err = registry.get_plugin_by_name("RTREE").unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        let message = err.to_string();
+        for expected in ["`geo` feature", "with_default_plugins_and"] {
+            assert!(
+                message.contains(expected),
+                "expected {expected} in: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_registration_racing_freeze_is_included_or_rejected() {
+        let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
+        let barrier = Arc::new(Barrier::new(2));
+        let register = std::thread::spawn({
+            let registrations = registrations.clone();
+            let barrier = barrier.clone();
+            move || {
+                let builtins = IndexPluginRegistry::with_builtin_plugins();
+                barrier.wait();
+                registrations
+                    .lock()
+                    .unwrap()
+                    .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            }
+        });
+        barrier.wait();
+        let installers = registrations.lock().unwrap().freeze();
+        let result = register.join().unwrap();
+        assert_eq!(installers.len(), usize::from(result.is_ok()));
+        if let Err(err) = result {
+            assert!(matches!(err, Error::InvalidInput { .. }));
+            assert!(err.to_string().contains("before the first plugin registry"));
+        }
+    }
+
+    #[test]
+    fn test_external_registration_rejects_late_registration() {
+        let mut registrations = PluginRegistrations::default();
+        let builtins = IndexPluginRegistry::with_builtin_plugins();
+        assert!(registrations.freeze().is_empty());
+        let err = registrations
+            .register::<ExampleIndexDetails, ZoneMapIndexPlugin>(&builtins)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("before the first plugin registry"));
+        assert!(registrations.plugins.is_empty());
+    }
 
     #[test]
     fn test_display_type_from_url() {
@@ -212,6 +562,7 @@ mod tests {
             ("BLOOMFILTER", "BloomFilter"),
             ("FM", "Fm"),
             ("JSON", "Json"),
+            ("MINHASHLSH", "MinHashLsh"),
         ] {
             let plugin = registry.get_plugin_by_name(requested_name).unwrap();
             assert_eq!(plugin.name(), expected_name);

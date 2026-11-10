@@ -1,0 +1,2 @@
+LanceRead: uri=tmp/fts.lance/data, projection=[id, text], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=false, full_filter=contains(text, Utf8("train")), refine_filter=--
+  ScalarIndexQuery: query=[contains(text, Utf8("train"))]@text_ngram(NGram)

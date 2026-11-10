@@ -7,16 +7,18 @@ Tests for DirectoryNamespace implementation.
 This module tests the DirectoryNamespace class which provides a directory-based
 namespace implementation for organizing Lance tables and nested namespaces.
 
-These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
+These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir/tests/
 
 Additionally, tests are parameterized to run with both the native DirectoryNamespace
 and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import timedelta
 from threading import Lock
 from typing import Dict, Optional
 
@@ -84,6 +86,7 @@ from lance_namespace.errors import (
     TableBranchAlreadyExistsError,
     TableBranchNotFoundError,
     TableNotFoundError,
+    ThrottlingError,
 )
 
 
@@ -690,6 +693,16 @@ class TestPythonNamespaceErrorMapping:
         ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
         with pytest.raises(TableBranchNotFoundError, match="no such branch"):
             lance.dataset(namespace_client=ns, table_id=["t"])
+
+    def test_throttling_retry_after_survives_callback_round_trip(self):
+        exc = ThrottlingError("slow down")
+        exc.retry_after = timedelta(seconds=7)
+        ns = _RaisingNamespace(exc)
+
+        with pytest.raises(ThrottlingError) as exc_info:
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        assert exc_info.value.retry_after == timedelta(seconds=7)
 
     def test_foreign_code_attribute_not_trusted(self):
         # The foreign exception must surface as itself, not be reinterpreted
@@ -1469,6 +1482,8 @@ class TestDataManipulation:
         )
         response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
         assert response is not None
+        assert response.num_inserted_rows == 2
+        assert response.version == 2
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
@@ -1696,3 +1711,16 @@ class TestIndexOperations:
         assert len(list_response.indexes) == 1
         assert list_response.indexes[0].index_name == "vector_idx"
         assert list_response.indexes[0].columns == ["vector"]
+
+
+def test_import_lance_does_not_load_namespace_client():
+    # The generated REST client is expensive to import and only needed when a
+    # namespace is actually used, so `import lance` must not pull it in.
+    code = (
+        "import sys, lance; "
+        "assert 'lance_namespace' not in sys.modules, sorted(sys.modules); "
+        "assert 'lance.namespace' not in sys.modules; "
+        "lance.LanceNamespace; lance.DescribeTableRequest; "
+        "assert 'lance_namespace' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

@@ -93,6 +93,27 @@ First, multiple workers build segments in parallel:
    or Python `create_index_uncommitted(..., fragment_ids=...)`
 2. each worker writes one segment under `indices/<segment_uuid>/`
 
+### Worker Shuffle Memory
+
+Vector workers using the two-file IVF shuffler can set
+`LANCE_SHUFFLE_MAX_PRELOADED_OFFSETS_BYTES` to control the maximum allocated bytes
+retained for the shuffle offsets table. The default is `268435456` (256 MiB).
+Set it before starting the shuffle; reopened shuffle readers also use the setting.
+Values must be non-negative integers in bytes. `0` disables offset preloading;
+invalid values return an error.
+
+For example, allow up to 512 MiB per shuffle:
+
+```shell
+export LANCE_SHUFFLE_MAX_PRELOADED_OFFSETS_BYTES=536870912
+```
+
+When offsets fit, the reader can combine adjacent partitions into read windows.
+If the limit is exceeded or allocation fails, the reader uses offsets from disk
+and reads partitions individually. The limit applies to each shuffle, so memory
+use adds up across concurrent builds. It does not include decoded data, index
+construction, or other buffers, and it does not limit total process memory.
+
 ### Segment Merge
 
 Then the caller decides whether those existing segments should be committed as-is

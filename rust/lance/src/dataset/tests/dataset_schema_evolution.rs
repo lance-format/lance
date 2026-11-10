@@ -636,3 +636,281 @@ async fn test_scan_with_null_typed_struct_subfield_across_fragments() {
     let result = ds.scan().try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), 4);
 }
+
+/// Nested struct type whose fields are all nullable.
+fn st(fields: Vec<(&str, DataType)>) -> DataType {
+    DataType::Struct(
+        fields
+            .into_iter()
+            .map(|(name, dt)| ArrowField::new(name, dt, true))
+            .collect(),
+    )
+}
+
+fn li(dt: DataType) -> DataType {
+    DataType::List(Arc::new(ArrowField::new("item", dt, true)))
+}
+
+/// `dt` without the fields named `b`: the shape before the child is added.
+fn strip_b(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .filter(|f| f.name() != "b")
+                .map(|f| f.as_ref().clone().with_data_type(strip_b(f.data_type())))
+                .collect(),
+        ),
+        DataType::List(item) => li(strip_b(item.data_type())),
+        dt => dt.clone(),
+    }
+}
+
+/// Only the paths of `dt` that lead to a field named `b`: the partial type
+/// handed to `add_columns`.
+fn only_b(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Struct(fields) => {
+            let kept = fields
+                .iter()
+                .filter_map(|f| {
+                    if f.name() == "b" {
+                        Some(f.as_ref().clone())
+                    } else {
+                        only_b(f.data_type()).map(|dt| f.as_ref().clone().with_data_type(dt))
+                    }
+                })
+                .collect::<Vec<_>>();
+            (!kept.is_empty()).then(|| DataType::Struct(kept.into()))
+        }
+        DataType::List(item) => only_b(item.data_type()).map(li),
+        _ => None,
+    }
+}
+
+/// `n` deterministic values of `dt`, with every field named `b` all-null when
+/// `null_b`. Nested values mix null structs, null lists and empty lists.
+fn fill(dt: &DataType, n: usize, seed: usize, null_b: bool) -> ArrayRef {
+    match dt {
+        DataType::Int32 => Arc::new(Int32Array::from_iter_values(
+            (0..n).map(|i| (seed + i) as i32),
+        )),
+        DataType::Utf8 => Arc::new(StringArray::from_iter_values(
+            (0..n).map(|i| format!("v{}", seed + i)),
+        )),
+        DataType::Struct(fields) => Arc::new(StructArray::new(
+            fields.clone(),
+            fields
+                .iter()
+                .map(|f| {
+                    if null_b && f.name() == "b" {
+                        arrow_array::new_null_array(f.data_type(), n)
+                    } else {
+                        fill(f.data_type(), n, seed, null_b)
+                    }
+                })
+                .collect(),
+            Some((0..n).map(|i| (seed + i) % 4 != 2).collect()),
+        )),
+        DataType::List(item) => {
+            let valid = (0..n).map(|i| (seed + i) % 5 != 4).collect::<Vec<_>>();
+            let offsets = arrow_buffer::OffsetBuffer::from_lengths(
+                (0..n).map(|i| if valid[i] { (seed + i) % 3 } else { 0 }),
+            );
+            let len = *offsets.last().unwrap() as usize;
+            Arc::new(ListArray::new(
+                item.clone(),
+                offsets,
+                fill(item.data_type(), len, seed * 7, null_b),
+                Some(valid.into()),
+            ))
+        }
+        dt => unimplemented!("{dt}"),
+    }
+}
+
+/// Rows keyed `keys` of column `c: dt`; the row keyed 3 holds a null `c`.
+fn keyed_batch(keys: &[i32], dt: &DataType, seed: usize, null_b: bool) -> RecordBatch {
+    let columns = keys
+        .iter()
+        .map(|&k| {
+            if k == 3 {
+                arrow_array::new_null_array(dt, 1)
+            } else {
+                fill(dt, 1, seed + k as usize, null_b)
+            }
+        })
+        .collect::<Vec<_>>();
+    let c = arrow_select::concat::concat(&columns.iter().map(|c| c.as_ref()).collect::<Vec<_>>())
+        .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("k", DataType::Int32, true),
+        ArrowField::new("c", dt.clone(), true),
+    ]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(keys.to_vec())), c]).unwrap()
+}
+
+fn sort_by_k(batch: &RecordBatch) -> RecordBatch {
+    use lance_arrow::RecordBatchExt;
+    let k = batch.schema().index_of("k").unwrap();
+    batch.sort_by_column(k, None).unwrap()
+}
+
+/// Every read path a newly added nested child can take returns `expected`.
+async fn assert_reads(dataset: &Dataset, expected: &RecordBatch, new_leaf: &str, old_leaf: &str) {
+    use lance_arrow::RecordBatchExt;
+    let expected = sort_by_k(expected);
+    let project = |batch: &RecordBatch, schema: &lance_core::datatypes::Schema| {
+        batch.project_by_schema(&ArrowSchema::from(schema)).unwrap()
+    };
+
+    let scanned = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(sort_by_k(&scanned), expected, "scan");
+
+    let rows = (0..expected.num_rows() as u64).collect::<Vec<_>>();
+    let taken = dataset.take(&rows, dataset.schema().clone()).await.unwrap();
+    assert_eq!(sort_by_k(&taken), expected, "take");
+
+    let mut scan = dataset.scan();
+    scan.filter("c IS NOT NULL").unwrap();
+    let filtered = scan.try_into_batch().await.unwrap();
+    let keep = expected.column(1).logical_nulls().map_or_else(
+        || arrow_array::BooleanArray::from(vec![true; expected.num_rows()]),
+        |nulls| arrow_array::BooleanArray::new(nulls.inner().clone(), None),
+    );
+    let expected_filtered = arrow_select::filter::filter_record_batch(&expected, &keep).unwrap();
+    assert_eq!(sort_by_k(&filtered), expected_filtered, "filter on parent");
+
+    let mut scan = dataset.scan();
+    scan.filter("k = 1").unwrap();
+    let one = scan.try_into_batch().await.unwrap();
+    assert_eq!(one, expected.slice(1, 1), "filter on key");
+
+    for leaf in [new_leaf, old_leaf] {
+        let projection = dataset.schema().project(&["k", leaf]).unwrap();
+        let mut scan = dataset.scan();
+        scan.project_with_schema(&projection).unwrap();
+        let scanned = scan.try_into_batch().await.unwrap();
+        let want = project(&expected, &projection);
+        assert_eq!(sort_by_k(&scanned), want, "scan of {leaf}");
+
+        let taken = dataset.take(&rows, projection.clone()).await.unwrap();
+        assert_eq!(sort_by_k(&taken), want, "take of {leaf}");
+
+        let mut scan = dataset.scan();
+        scan.project_with_schema(&projection).unwrap();
+        scan.filter("c IS NOT NULL").unwrap();
+        // The scan also returns the leaf of `c` the filter read; compare the
+        // requested part.
+        let filtered = project(&scan.try_into_batch().await.unwrap(), &projection);
+        let want = project(&expected_filtered, &projection);
+        assert_eq!(sort_by_k(&filtered), want, "filtered scan of {leaf}");
+    }
+}
+
+/// A child added to a struct at any depth, under lists or not, reads back in
+/// existing rows (as null when added without data) and round-trips once written.
+#[rstest]
+#[case::struct_child(st(vec![("t", DataType::Int32), ("a", DataType::Int32), ("b", DataType::Utf8)]), "c.b", "c.a")]
+#[case::struct_in_struct(
+    st(vec![("t", DataType::Int32), ("in", st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))]),
+    "c.in.b",
+    "c.in.a"
+)]
+#[case::list_struct(li(st(vec![("t", DataType::Int32), ("a", DataType::Int32), ("b", DataType::Utf8)])), "c.item.b", "c.item.a")]
+#[case::list_struct_in_struct(
+    li(st(vec![("t", DataType::Int32), ("in", st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))])),
+    "c.item.in.b",
+    "c.item.in.a"
+)]
+#[case::list_struct_three_deep(
+    li(st(vec![("t", DataType::Int32), ("in", st(vec![("in2", st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))]))])),
+    "c.item.in.in2.b",
+    "c.item.in.in2.a"
+)]
+#[case::list_struct_string_leaves(
+    li(st(vec![("a", DataType::Utf8), ("in", st(vec![("s", DataType::Utf8), ("b", DataType::Utf8)]))])),
+    "c.item.in.b",
+    "c.item.in.s"
+)]
+#[case::list_list_struct(
+    li(li(st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))),
+    "c.item.item.b",
+    "c.item.item.a"
+)]
+#[case::struct_list_struct_in_struct(
+    st(vec![("t", DataType::Int32), ("s", li(st(vec![("in", st(vec![("a", DataType::Int32), ("b", DataType::Utf8)]))])))]),
+    "c.s.item.in.b",
+    "c.s.item.in.a"
+)]
+#[case::list_struct_list_struct(
+    li(st(vec![("t", DataType::Int32), ("x", li(st(vec![("a", DataType::Int32), ("b", DataType::Utf8)])))])),
+    "c.item.x.item.b",
+    "c.item.x.item.a"
+)]
+#[tokio::test]
+async fn test_add_nested_child_reads_null_then_round_trips(
+    #[case] full: DataType,
+    #[case] new_leaf: &str,
+    #[case] old_leaf: &str,
+    #[values(1, 2)] num_fragments: usize,
+    #[values(false, true)] with_data: bool,
+) {
+    let keys = [0, 1, 2, 3];
+    let original = keyed_batch(&keys, &strip_b(&full), 0, true);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(original.clone())], original.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: keys.len().div_ceil(num_fragments),
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), num_fragments);
+
+    let added = keyed_batch(&keys, &only_b(&full).unwrap(), 0, false)
+        .project(&[1])
+        .unwrap();
+    let transform = if with_data {
+        NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(added.clone())],
+            added.schema(),
+        )))
+    } else {
+        NewColumnTransform::AllNulls(added.schema())
+    };
+    dataset.add_columns(transform, None, None).await.unwrap();
+    let expected = keyed_batch(&keys, &full, 0, !with_data);
+    assert_eq!(
+        ArrowSchema::from(dataset.schema())
+            .field_with_name("c")
+            .unwrap()
+            .data_type(),
+        &full
+    );
+    assert_reads(&dataset, &expected, new_leaf, old_leaf).await;
+
+    // Update key 0 and insert key 10, both carrying the new child.
+    let source = keyed_batch(&[0, 10], &full, 100, false);
+    let mut merge =
+        crate::dataset::MergeInsertBuilder::try_new(Arc::new(dataset), vec!["k".into()]).unwrap();
+    merge
+        .when_matched(crate::dataset::WhenMatched::UpdateAll)
+        .when_not_matched(crate::dataset::WhenNotMatched::InsertAll);
+    let (dataset, _) = merge
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        ))
+        .await
+        .unwrap();
+    let kept = expected.slice(1, keys.len() - 1);
+    let expected =
+        arrow_select::concat::concat_batches(&expected.schema(), &[source, kept]).unwrap();
+    assert_reads(&dataset, &expected, new_leaf, old_leaf).await;
+}

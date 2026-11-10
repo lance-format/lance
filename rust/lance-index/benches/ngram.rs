@@ -8,7 +8,7 @@ use arrow_array::{RecordBatch, UInt64Array};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ID;
@@ -93,7 +93,7 @@ fn bench_ngram(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pbold::NGramIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(NGramIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
+        .block_on(NGramIndexPlugin.load_index(store, &details, 0, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {

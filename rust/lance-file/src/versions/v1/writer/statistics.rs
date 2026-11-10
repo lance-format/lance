@@ -1541,13 +1541,12 @@ mod tests {
             },
             // FixedSizeBinaryArray
             TestCase {
-                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                    Some(vec![0, 1].as_slice()),
-                    Some(vec![2, 3].as_slice()),
-                    Some(vec![4, 5].as_slice()),
-                    Some(vec![6, 7].as_slice()),
-                    Some(vec![8, 9].as_slice()),
-                ]))],
+                source_arrays: vec![Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        [[0u8, 1], [2, 3], [4, 5], [6, 7], [8, 9]].into_iter(),
+                    )
+                    .unwrap(),
+                )],
                 stats: StatisticsRow {
                     null_count: 0,
                     min_value: ScalarValue::FixedSizeBinary(2, Some(vec![0, 1])),
@@ -1555,9 +1554,10 @@ mod tests {
                 },
             },
             TestCase {
-                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                    min_binary_value.as_slice(),
-                ]))],
+                source_arrays: vec![Arc::new(
+                    FixedSizeBinaryArray::try_from_iter([min_binary_value.as_slice()].into_iter())
+                        .unwrap(),
+                )],
                 stats: StatisticsRow {
                     null_count: 0,
                     min_value: ScalarValue::FixedSizeBinary(
@@ -1571,9 +1571,12 @@ mod tests {
                 },
             },
             TestCase {
-                source_arrays: vec![Arc::new(FixedSizeBinaryArray::from(vec![
-                    &[0xFFu8; BINARY_PREFIX_LENGTH + 7],
-                ]))],
+                source_arrays: vec![Arc::new(
+                    FixedSizeBinaryArray::try_from_iter(
+                        [[0xFFu8; BINARY_PREFIX_LENGTH + 7]].into_iter(),
+                    )
+                    .unwrap(),
+                )],
                 stats: StatisticsRow {
                     null_count: 0,
                     min_value: ScalarValue::FixedSizeBinary(
