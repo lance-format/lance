@@ -154,7 +154,9 @@ def _async_lifecycle_scenario(scenario, start_method):
         dataset.close()
     elif scenario == "start_failure":
         dataset = AsyncDataset(lambda: [])
-        with pytest.raises((AttributeError, pickle.PicklingError), match="pickle"):
+        with pytest.raises(
+            (AttributeError, pickle.PicklingError), match="local object"
+        ):
             next(iter(dataset))
         assert not dataset.started
         dataset.close()
