@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
@@ -79,6 +79,13 @@ fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct VectorRefinement {
+    pub(super) column: String,
+    pub(super) key: ArrayRef,
+    pub(super) metric: MetricType,
+}
+
 impl Scanner {
     pub(super) async fn vector_search_source(
         &self,
@@ -98,7 +105,9 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self
+                        .fts(&filter_plan.expr_filter_plan, fts_query, fts_query.params())
+                        .await?;
                     if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
                         fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
                     }
@@ -140,6 +149,15 @@ impl Scanner {
             return Err(Error::invalid_input(
                 "Quantized refine factor cannot be zero".to_string(),
             ));
+        }
+
+        if let Some(refine) = &self.nearest_refine {
+            if self.is_batch_nearest {
+                return self.batch_per_query_vector_search(filter_plan, &q).await;
+            }
+            return self
+                .cross_column_vector_search(filter_plan, &q, refine)
+                .await;
         }
 
         // Sanity check
@@ -518,6 +536,49 @@ impl Scanner {
         }
     }
 
+    async fn cross_column_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+        refine: &VectorRefinement,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let factor = q
+            .refine_factor
+            .filter(|factor| *factor > 0)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "refine_column requires an explicit positive refine_factor".to_string(),
+                )
+            })?;
+        let mut coarse = q.clone();
+        coarse.k = q.k.checked_mul(factor as usize).ok_or_else(|| {
+            Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+        })?;
+        coarse.refine_factor = None;
+        // Bounds apply to the final distance space, not the coarse index.
+        coarse.lower_bound = None;
+        coarse.upper_bound = None;
+
+        let mut coarse_scanner = self.clone();
+        coarse_scanner.nearest_refine = None;
+        coarse_scanner.nearest = Some(coarse.clone());
+        // Merge indexed, appended, and updated rows before cross-column scoring.
+        let candidates = coarse_scanner.vector_search(filter_plan, &coarse).await?;
+        let projection = self
+            .dataset
+            .empty_projection()
+            .union_column(&refine.column, OnMissing::Error)?;
+        let candidates = self.take(candidates, projection)?;
+
+        let mut final_query = q.clone();
+        final_query.column = refine.column.clone();
+        final_query.key = refine.key.clone();
+        final_query.metric_type = Some(refine.metric);
+        final_query.refine_factor = None;
+        final_query.use_index = false;
+        self.flat_knn(candidates, &final_query).await
+    }
+
     /// Whether a batch (multi-query) vector search can use the shared-scan
     /// indexed fast path ([`new_knn_batch_exec`]) instead of running one indexed
     /// search per query vector.
@@ -717,6 +778,14 @@ impl Scanner {
             };
         }
 
+        self.batch_per_query_vector_search(filter_plan, q).await
+    }
+
+    async fn batch_per_query_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let query_dim = q.key.len() / self.nearest_query_count;
         let mut query_plans = Vec::with_capacity(self.nearest_query_count);
 
@@ -728,6 +797,12 @@ impl Scanner {
             single_scanner.nearest_query_count = 1;
             single_scanner.is_batch_nearest = false;
             single_scanner.nearest = Some(single_query.clone());
+            if let Some(refine) = &self.nearest_refine {
+                let refine_dim = refine.key.len() / self.nearest_query_count;
+                let mut single_refine = refine.clone();
+                single_refine.key = refine.key.slice(query_index * refine_dim, refine_dim);
+                single_scanner.nearest_refine = Some(single_refine);
+            }
 
             let single_plan = single_scanner
                 .vector_search(filter_plan, &single_query)
