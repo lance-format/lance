@@ -805,8 +805,13 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::between_representations(false)]
+    #[case::admission_boundary(true)]
     #[tokio::test]
-    async fn rejected_complete_view_keeps_repeated_batches_on_resident_fragments() {
+    async fn rejected_complete_view_keeps_repeated_batches_on_resident_fragments(
+        #[case] admission_boundary: bool,
+    ) {
         const ROWS: usize = 1024;
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
@@ -901,7 +906,15 @@ mod tests {
             fragment_bytes < full_bytes,
             "fixture must have a larger complete view"
         );
-        let dataset = cold_dataset(dataset, (fragment_bytes + full_bytes) / 2, 1 << 20);
+        let budget = if admission_boundary {
+            full_bytes
+                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+                + std::mem::size_of::<lance_core::cache::InternalCacheKey>()
+                - 1
+        } else {
+            (fragment_bytes + full_bytes) / 2
+        };
+        let dataset = cold_dataset(dataset, budget, 1 << 20);
         for _ in 0..4 {
             assert_eq!(
                 resolve_row_ids(&dataset, &ids, true)

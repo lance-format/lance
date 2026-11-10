@@ -107,9 +107,10 @@ impl RowIdIndexSize {
         Self {
             version: cached.version,
             e_tag: cached.e_tag.clone(),
-            // LanceCache charges the value and its Arc control block.
+            // Capacity includes the canonical key as well as the cached Arc.
             bytes: cached.deep_size_of()
-                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>(),
+                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+                + std::mem::size_of::<InternalCacheKey>(),
         }
     }
 
