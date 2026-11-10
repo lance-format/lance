@@ -614,15 +614,12 @@ be used in detached commits, and lease operations, Clone, and detached commits
 never release a lease by UUID.
 
 The [Retention Leases specification](retention_leases.md) defines acquisition,
-confirmation, expiration, transaction recording, and retention. Lease changes
-**must not bypass** existing data conflicts or writer-capability checks. Unknown operations retain their fail-closed conflict behavior.
-Config and metadata maps cannot mutate leases.
+confirmation, expiration, transaction recording, and retention.
 
 ### Directional conflict rules
 
 Lease operations may re-evaluate over known attached data and lease operations in
-the same table and branch. Fresh acquisition or a definitively lost attempt
-may rebase; uncertain acquisition recovery cannot resubmit. The successful
+the same table and branch. Acquisition may rebase and is idempotent by lease ID. The successful
 acquisition version fixes the leased version, and work begins only after confirmation.
 
 For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLease:
@@ -630,24 +627,21 @@ For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLe
 | Incoming operation | Required behavior |
 | --- | --- |
 | Append, Delete, Merge, ReserveFragments, Update, Project, UpdateConfig, DataReplacement, DataOverlay, UpdateMemWalState, UpdateBases, CreateIndex | Apply existing data/index conflict rules. Derive leases from the attempt's predecessor, remove expired records, release the lease matching the transaction UUID if listed, and preserve the rest. |
-| Rewrite | Recheck current lease requirements before committing. Missing required transitions require replanning, even if planning preceded acquisition. |
-| Restore, Overwrite | Use current leases and the sticky capability, apply expiration and UUID-matched release, and preserve surviving records. Never import historical membership. Existing data conflicts remain. |
-| Clone | Start the destination with no leases and preserve the inherited capability. Do not transfer lease mutations or ownership to the destination. |
-| AcquireLease | Recover a listed ID without changing it. Otherwise, a fresh or definitively lost attempt uses the new head and an unexpired request. Uncertain recovery stays read-only. |
+| Rewrite | If the rewrite replaces fragments a listed lease requires, it must record FRI transitions for them; otherwise it conflicts and must be replanned. |
+| Restore, Overwrite | Remove all leases. Existing data conflicts remain. |
+| Clone | Start the destination with no leases and no lease flag. Do not transfer lease mutations or ownership to the destination. |
+| AcquireLease | Return a listed ID without changing it. Otherwise, add the lease against the new head with an unexpired request. |
 | RenewLease | Recheck membership and expiration. Missing or expired is an error; an already satisfied request is a no-op; otherwise extend only `expires_at`. |
 | ReleaseLease | Remove the target ID; absent is a no-op. A concurrent renewal does not prevent explicit release. |
 
 Every retry **must recompute expiration** from its new predecessor. A winning
 renewal defeats an older removal decision; a winning removal prevents renewal
 from recreating the ID. No-op lease requests create no version, while real
-mutations use ordinary version counting. Release does not fence acquisition
-already in flight. Distinct IDs remain independent.
+mutations use ordinary version counting.
 
-Operations removing FRI history **must revalidate** the union of current lease
-and existing-consumer requirements using the
-[retention rules](retention_leases.md#retention-and-data-operations). Restore
-and Overwrite apply them to the resulting current history; discarded paths need
-not be reconstructed, but surviving leases retain their complete version window.
+FRI trimming **must revalidate** the union of the transitions listed leases and
+existing FRI consumers require, using the
+[retention rules](retention_leases.md#required-transitions).
 
 ## Conflict Resolution
 

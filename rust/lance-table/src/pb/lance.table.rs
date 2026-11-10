@@ -952,8 +952,8 @@ pub struct Manifest {
     /// * 1 << 16: paired with the reader bit for version 1 zone-level statistics
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
-    /// * 1 << 20: retention leases. Writer-only and sticky; maintenance must honor
-    ///    the current lease list. Reserved until the lease contract is implemented.
+    /// * 1 << 20: retention leases. Writer-only; set exactly when retention_leases
+    ///    is nonempty, and maintenance must honor the list. Reserved until the lease contract is implemented.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.
@@ -1059,10 +1059,10 @@ pub struct Manifest {
     pub max_clustering_id: u32,
     /// The authoritative lease list when this is the current attached manifest.
     /// Absent/empty means no listed leases. Order is insignificant; IDs must be
-    /// unique. A nonempty list requires writer bit 20. Once set, that bit remains
-    /// set even when this list becomes empty. Attached commits remove expired leases.
-    /// Restore/overwrite start from current leases, never a historical list;
-    /// new clones/branches start with an empty list. Detached manifests cannot own
+    /// unique. Writer bit 20 is set exactly when this list is nonempty. Attached
+    /// commits remove expired leases.
+    /// Restore and overwrite remove all leases; new clones and branches start
+    /// with an empty list. Detached manifests cannot own
     /// or mutate listed leases. No reader capability is required solely for leases.
     #[prost(message, repeated, tag = "27")]
     pub retention_leases: ::prost::alloc::vec::Vec<RetentionLease>,
