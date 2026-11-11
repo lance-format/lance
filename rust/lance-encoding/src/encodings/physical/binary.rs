@@ -149,15 +149,24 @@ fn chunk_offsets<N: OffsetSizeTrait>(
         .sum::<usize>();
 
     let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+    let mut rebased_scratch = [N::default(); 1025];
 
     for chunk in chunks_info {
         let base_offset = offsets[chunk.chunk_start_offset_in_orig_idx];
         let start_offset = N::from_usize(chunk.bytes_start_offset).unwrap();
-        for &offset in
-            &offsets[chunk.chunk_start_offset_in_orig_idx..=chunk.chunk_last_offset_in_orig_idx]
-        {
-            let rebased = offset - base_offset + start_offset;
-            output.extend_from_slice(rebased.to_byte_slice());
+        let src =
+            &offsets[chunk.chunk_start_offset_in_orig_idx..=chunk.chunk_last_offset_in_orig_idx];
+        if src.len() <= rebased_scratch.len() {
+            let dst = &mut rebased_scratch[..src.len()];
+            for (&offset, out_offset) in src.iter().zip(dst.iter_mut()) {
+                *out_offset = offset - base_offset + start_offset;
+            }
+            output.extend_from_slice(dst.to_byte_slice());
+        } else {
+            for &offset in src {
+                let rebased = offset - base_offset + start_offset;
+                output.extend_from_slice(rebased.to_byte_slice());
+            }
         }
 
         let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx]
