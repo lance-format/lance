@@ -23,9 +23,11 @@ pub enum LeaseChange {
         /// The lease an `AcquireLease` added or a `RenewLease` extended.
         lease: Option<RetentionLease>,
     },
-    /// A lease operation that requests nothing new, so no version is written:
-    /// re-acquiring a listed ID, renewing to a time not later than the current
-    /// expiry, or releasing an absent ID.
+    /// A lease operation whose derived list equals its predecessor's, so no
+    /// version is written: re-acquiring a listed ID, renewing to a time not
+    /// later than the current expiry, or releasing an absent ID, when no
+    /// listed lease has expired. If one has, the request writes a version so
+    /// that expired leases stop retaining history.
     NoOp {
         /// The listed record for the target ID; `None` for an absent release.
         stored: Option<RetentionLease>,
@@ -61,6 +63,17 @@ pub fn derive_retention_leases(
         .collect::<Vec<_>>();
     let position =
         |leases: &[RetentionLease], id: &Uuid| leases.iter().position(|lease| lease.id() == *id);
+    let pruned_expired = leases.len() != previous.len();
+    let unchanged = |leases: Vec<RetentionLease>, stored: Option<RetentionLease>| {
+        if pruned_expired {
+            LeaseChange::Updated {
+                leases,
+                lease: stored,
+            }
+        } else {
+            LeaseChange::NoOp { stored }
+        }
+    };
 
     match &transaction.operation {
         Operation::AcquireLease {
@@ -82,9 +95,8 @@ pub fn derive_retention_leases(
                 )));
             }
             if let Some(index) = position(&leases, lease_id) {
-                return Ok(LeaseChange::NoOp {
-                    stored: Some(leases[index].clone()),
-                });
+                let stored = Some(leases[index].clone());
+                return Ok(unchanged(leases, stored));
             }
             if *expires_at <= now {
                 return Err(Error::invalid_input(format!(
@@ -119,9 +131,8 @@ pub fn derive_retention_leases(
                 )));
             };
             if *expires_at <= leases[index].expires_at() {
-                return Ok(LeaseChange::NoOp {
-                    stored: Some(leases[index].clone()),
-                });
+                let stored = Some(leases[index].clone());
+                return Ok(unchanged(leases, stored));
             }
             leases[index] = leases[index].with_expires_at(*expires_at);
             let lease = Some(leases[index].clone());
@@ -135,7 +146,7 @@ pub fn derive_retention_leases(
                     lease: None,
                 })
             }
-            None => Ok(LeaseChange::NoOp { stored: None }),
+            None => Ok(unchanged(leases, None)),
         },
         Operation::Restore { .. } | Operation::Overwrite { .. } | Operation::Clone { .. } => {
             Ok(LeaseChange::Updated {
@@ -327,13 +338,31 @@ mod tests {
         );
     }
 
-    #[rstest::rstest]
-    #[case::absent(5)]
-    #[case::expired(1)]
-    fn test_release_of_unlisted_lease_is_noop(#[case] id: u128) {
+    #[test]
+    fn test_release_of_unlisted_lease_is_noop() {
         assert_eq!(
-            derive(&[lease(1, 2, NOW)], release(id)).unwrap(),
+            derive(&[lease(1, 2, 200)], release(5)).unwrap(),
             LeaseChange::NoOp { stored: None }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::release_expired_target(release(1), None)]
+    #[case::release_absent(release(5), None)]
+    #[case::reacquire(acquire(2, 90, 300), Some(lease(2, 3, 200)))]
+    #[case::renew_not_later(renew(2, 150), Some(lease(2, 3, 200)))]
+    fn test_unchanged_request_still_removes_expired_leases(
+        #[case] operation: Operation,
+        #[case] stored: Option<RetentionLease>,
+    ) {
+        // Writing a version here is what lets an expired lease stop retaining
+        // history without waiting for an unrelated commit.
+        assert_eq!(
+            derive(&[lease(1, 2, NOW), lease(2, 3, 200)], operation).unwrap(),
+            LeaseChange::Updated {
+                leases: vec![lease(2, 3, 200)],
+                lease: stored,
+            }
         );
     }
 
