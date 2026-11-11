@@ -6,7 +6,11 @@ import multiprocessing
 import os
 import pickle
 import signal
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 import lance
@@ -89,8 +93,13 @@ def _empty_dataset():
 
 
 class _FailureDataset(torch.utils.data.IterableDataset):
+    def __init__(self, failing=None):
+        self.failing = failing
+
     def __iter__(self):
         yield torch.tensor([17])
+        if self.failing is not None:
+            self.failing.set()
         raise ValueError("iteration exploded")
 
 
@@ -154,12 +163,59 @@ class _BlockedDataset(torch.utils.data.IterableDataset):
         yield 1
 
 
+class _CountedItem:
+    decoded = 0
+
+    def __init__(self, epoch, index):
+        self.epoch = epoch
+        self.index = index
+
+    def __setstate__(self, state):
+        type(self).decoded += 1
+        self.__dict__.update(state)
+
+
+class _StreamingEpochDataset(torch.utils.data.IterableDataset):
+    def __init__(self, first_epoch_rows, limit):
+        self.first_epoch_rows = first_epoch_rows
+        self.limit = limit
+        self.epoch = 0
+
+    def __iter__(self):
+        self.epoch += 1
+        index = 0
+        while self.limit is None or index < self.limit:
+            if self.epoch == 1:
+                self.first_epoch_rows.value += 1
+            yield _CountedItem(self.epoch, index)
+            index += 1
+
+
+class _CleanupDataset(torch.utils.data.IterableDataset):
+    def __init__(self, cache_path, ready, release, cleaned):
+        self.cache_path = Path(cache_path)
+        self.cache_path.mkdir()
+        self.ready = ready
+        self.release = release
+        self.cleaned = cleaned
+
+    def __iter__(self):
+        try:
+            self.ready.set()
+            self.release.wait()
+            yield 1
+        finally:
+            self.cache_path.rmdir()
+            self.cleaned.set()
+
+
 def _async_lifecycle_scenario(scenario, start_method):
     multiprocessing.set_start_method(start_method, force=True)
     # Exercise escalation without spending a production grace period per case.
-    async_module._SHUTDOWN_TIMEOUT_SECONDS = (
+    shutdown_timeout = (
         0.05 if scenario in ("blocked_user_code", "ignored_termination") else 0.5
     )
+    async_module._REAP_TIMEOUT_SECONDS = shutdown_timeout
     async_module._QUEUE_POLL_SECONDS = 0.01
     if scenario == "unused_context":
         with async_dataset(_creator_failure) as dataset:
@@ -246,10 +302,77 @@ def _async_lifecycle_scenario(scenario, start_method):
                 assert batches[1]["pid"] == worker_pid
                 assert torch.equal(batches[1]["tensor"], torch.tensor([1, 2]))
     elif scenario == "discard_failure":
-        with async_dataset(_FailureDataset, queue_size=1) as dataset:
-            assert torch.equal(next(iter(dataset)), torch.tensor([17]))
+        failing = multiprocessing.Event()
+        with async_dataset(partial(_FailureDataset, failing), queue_size=1) as dataset:
+            batches = iter(dataset)
+            assert torch.equal(next(batches), torch.tensor([17]))
+            assert failing.wait(5), "Worker never reached the failure"
+            batches.close()
             with pytest.raises(RuntimeError, match="ValueError: iteration exploded"):
                 next(iter(dataset))
+    elif scenario.startswith("cancel_epoch_"):
+        queue_size = int(scenario.rsplit("_", 1)[1])
+        limit = None if "endless" in scenario else 1_000_000
+        first_epoch_rows = multiprocessing.Value("q", 0, lock=False)
+        creator = partial(_StreamingEpochDataset, first_epoch_rows, limit)
+        with async_dataset(creator, queue_size=queue_size) as dataset:
+            first = next(iter(dataset))
+            assert (first.epoch, first.index) == (1, 0)
+            worker_pid = dataset.worker.pid
+            batches = iter(dataset)
+            second = next(batches)
+            assert (second.epoch, second.index) == (2, 0)
+            assert dataset.worker.pid == worker_pid
+            assert first_epoch_rows.value <= queue_size + 2
+            assert _CountedItem.decoded <= queue_size + 3
+            batches.close()
+    elif scenario.startswith("graceful_cleanup_"):
+        ready = multiprocessing.Event()
+        release = multiprocessing.Event()
+        cleaned = multiprocessing.Event()
+        join_started = Event()
+        expected_timeout = 5.0 if scenario.endswith("default") else 7.5
+        options = {} if scenario.endswith("default") else {"shutdown_timeout": 7.5}
+        with tempfile.TemporaryDirectory() as base:
+            cache_path = Path(base) / "worker-cache"
+            creator = partial(_CleanupDataset, cache_path, ready, release, cleaned)
+            with async_dataset(creator, queue_size=1, **options) as dataset:
+                dataset._start()
+                try:
+                    assert ready.wait(5), "Worker never began the read"
+                    assert cache_path.is_dir()
+                    native_join = dataset.worker.join
+                    exit_codes = []
+
+                    def join_worker(timeout):
+                        join_started.set()
+                        native_join(timeout=timeout)
+                        exit_codes.append(dataset.worker.exitcode)
+
+                    with (
+                        patch.object(
+                            dataset.worker, "join", side_effect=join_worker
+                        ) as join,
+                        patch.object(dataset.worker, "terminate") as terminate,
+                        patch.object(dataset.worker, "kill") as kill,
+                        ThreadPoolExecutor(max_workers=1) as executor,
+                    ):
+                        closed = executor.submit(dataset.close)
+                        assert join_started.wait(5), (
+                            "Close never began its grace period"
+                        )
+                        assert dataset.shutdown.value
+                        release.set()
+                        closed.result(timeout=10)
+                        assert join.call_count == 1
+                        assert join.call_args.kwargs == {"timeout": expected_timeout}
+                        terminate.assert_not_called()
+                        kill.assert_not_called()
+                    assert exit_codes == [0]
+                    assert cleaned.is_set()
+                    assert not cache_path.exists()
+                finally:
+                    release.set()
     elif scenario in ("partial_transfer", "large_transfer"):
         with async_dataset(_LargeItemDataset, queue_size=1) as dataset:
             if scenario == "partial_transfer":
@@ -280,7 +403,7 @@ def _async_lifecycle_scenario(scenario, start_method):
                 multiprocessing.Event(),
                 scenario == "ignored_termination",
             )
-        dataset = AsyncDataset(creator, queue_size=1)
+        dataset = AsyncDataset(creator, queue_size=1, shutdown_timeout=shutdown_timeout)
         try:
             dataset._start()
             assert ready.wait(5), "Worker never reached the blocking operation"
@@ -352,6 +475,12 @@ def _async_lifecycle_scenario(scenario, start_method):
             "peek_epoch",
             "overlapping_iterators",
             "discard_failure",
+            "cancel_epoch_endless_1",
+            "cancel_epoch_endless_4",
+            "cancel_epoch_large_1",
+            "cancel_epoch_large_4",
+            "graceful_cleanup_default",
+            "graceful_cleanup_custom",
             "repeated_close",
             "blocked_producer",
             "blocked_user_code",
@@ -371,6 +500,8 @@ def _async_lifecycle_scenario(scenario, start_method):
                 "nonleaf_after_item",
                 "peek_epoch",
                 "discard_failure",
+                "cancel_epoch_endless_1",
+                "graceful_cleanup_custom",
             )
         ]
         if "forkserver" in multiprocessing.get_all_start_methods()
@@ -400,3 +531,18 @@ def test_async_dataset_lifecycle(scenario, start_method):
             process.kill()
             process.join(timeout=5)
         process.close()
+
+
+@pytest.mark.parametrize("factory", [AsyncDataset, async_dataset])
+@pytest.mark.parametrize(
+    "shutdown_timeout", [-1.0, float("nan"), float("inf"), -float("inf")]
+)
+def test_async_dataset_invalid_shutdown_timeout(factory, shutdown_timeout):
+    with pytest.raises(
+        ValueError, match="shutdown_timeout must be finite and non-negative"
+    ):
+        if factory is AsyncDataset:
+            factory(_empty_dataset, shutdown_timeout=shutdown_timeout)
+        else:
+            with factory(_empty_dataset, shutdown_timeout=shutdown_timeout):
+                pass
