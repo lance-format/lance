@@ -607,8 +607,8 @@ pub(crate) fn bitpack_out_of_line_vec<T: ArrowNativeType + BitPackingUninit>(
 /// Depending on the encoding decision the final chunk may be fully packed (with padding)
 /// or stored as raw tail values. We infer the layout from the buffer length.
 ///
-/// A zero-width payload is empty, so only the allocation bounds `num_values`; a count too
-/// large to allocate returns an error.
+/// A zero-width payload holds at most a raw tail of fewer than 1024 values, so only the
+/// allocation bounds `num_values`; a count too large to allocate returns an error.
 pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     data: FixedWidthDataBlock,
     num_values: usize,
@@ -1425,8 +1425,8 @@ mod test {
         assert_eq!(decoded.data.borrow_to_typed_slice::<u16>().as_ref(), values);
     }
 
-    /// A zero-width payload is empty, so it does not bound the declared count. A count too
-    /// large to allocate is an error rather than a panic or an abort.
+    /// A zero-width payload holds at most a raw tail, so it does not bound the declared count.
+    /// A count too large to allocate is an error rather than a panic or an abort.
     #[rstest]
     #[case::u8(8)]
     #[case::u16(16)]
@@ -1437,8 +1437,9 @@ mod test {
     ) {
         let decompressor = OutOfLineBitpacking::new(0, uncompressed_bit_width);
         let word_bytes = uncompressed_bit_width / 8;
-        // Overflows usize bytes, exceeds isize::MAX bytes, and fits isize but not any address
-        // space (1 EiB), where `Vec::with_capacity` would abort the process.
+        // Overflows usize bytes (for 16-bit and wider words; for u8 it exceeds isize::MAX),
+        // exceeds isize::MAX bytes, and fits isize but not any address space (1 EiB), where
+        // `Vec::with_capacity` would abort the process.
         for num_values in [
             u64::MAX - 2048,
             isize::MAX as u64 / word_bytes + 1,
