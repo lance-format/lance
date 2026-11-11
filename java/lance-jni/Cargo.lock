@@ -4234,6 +4234,7 @@ dependencies = [
  "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
+ "lance-datafusion",
  "lance-datafusion-exec",
  "lance-encoding",
  "lance-file",

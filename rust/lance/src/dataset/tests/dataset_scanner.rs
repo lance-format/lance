@@ -29,6 +29,7 @@ use lance_datafusion::exec::execute_plan;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
     query::{FtsQuery, MatchQuery, Operator, PhraseQuery},
@@ -42,6 +43,7 @@ use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
 use crate::dataset::NewColumnTransform;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
 use crate::{Dataset, Error};
@@ -1518,11 +1520,13 @@ fn detection_batch(ids: std::ops::Range<i32>) -> RecordBatch {
     .unwrap()
 }
 
-/// Three fragments with a BTree on `width`, then a fourth the index does not
-/// cover.
-async fn detection_dataset() -> Dataset {
+/// Three fragments with a BTree on `width`, and with `element_index` a
+/// list-element index on `detections`, then a fourth fragment the indices do
+/// not cover.
+async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> Dataset {
     let params = WriteParams {
         max_rows_per_file: 500,
+        enable_stable_row_ids,
         ..Default::default()
     };
     let indexed = detection_batch(0..1500);
@@ -1544,6 +1548,19 @@ async fn detection_dataset() -> Dataset {
         )
         .await
         .unwrap();
+    if element_index {
+        dataset
+            .create_index(
+                &["detections"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["label", "confidence"]})),
+                false,
+            )
+            .await
+            .unwrap();
+    }
     dataset
         .append(
             RecordBatchIterator::new(vec![Ok(detection_batch(1500..DETECTION_ROWS))], schema),
@@ -1556,6 +1573,16 @@ async fn detection_dataset() -> Dataset {
 }
 
 async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+    scan_any_element_ids(dataset, filter, use_scalar_index, false).await
+}
+
+/// With `fast_search`, only the fragments the indices cover are read.
+async fn scan_any_element_ids(
+    dataset: &Dataset,
+    filter: &str,
+    use_scalar_index: bool,
+    fast_search: bool,
+) -> Vec<i32> {
     let mut scanner = dataset.scan();
     scanner
         .project(&["id"])
@@ -1563,62 +1590,108 @@ async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool
         .filter(filter)
         .unwrap()
         .use_scalar_index(use_scalar_index);
+    if fast_search {
+        scanner.fast_search();
+    }
     let batch = scanner.try_into_batch().await.unwrap();
     let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
     ids.sort_unstable();
     ids
 }
 
-#[rstest]
-#[case::same_element(
-    "any_element(detections, 'label = ''car'' AND confidence > 0.9')",
-    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true)
-)]
-#[case::inclusive_range(
-    "any_element(detections, 'label = ''car'' AND confidence >= 0.9')",
-    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 >= 0.9) == Some(true)
-)]
-#[case::in_list(
-    "any_element(detections, 'label IN (''truck'', ''carrot'') AND confidence > 0.95')",
-    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true)
-)]
-#[case::three_conditions(
-    "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')",
-    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9 && d.2 > 10000.0) == Some(true)
-)]
-#[case::negated(
-    "NOT any_element(detections, 'label = ''car'' AND confidence > 0.9')",
-    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(false)
-)]
-#[case::and_indexed_column(
-    "any_element(detections, 'label = ''car'' AND confidence > 0.9') AND width > 1920",
-    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true) && w > 1920
-)]
-#[case::or_indexed_column(
-    "any_element(detections, 'label = ''car'' AND confidence > 0.9') OR width = 1280",
-    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true) || w == 1280
-)]
-#[case::lambda(
-    "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
-    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true)
-)]
-#[case::lambda_alias_and_subscript(
-    "any_match(detections, (x) -> x['label'] IN ('truck', 'carrot') AND x.confidence > 0.95)",
-    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true)
-)]
-#[case::lambda_negated_and_indexed_column(
-    "NOT array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9) AND width > 1920",
-    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(false) && w > 1920
-)]
-#[tokio::test]
-async fn test_any_element_filter(#[case] filter: &str, #[case] keep: DetectionCheck) {
-    let dataset = detection_dataset().await;
-    let expected: Vec<i32> = (0..DETECTION_ROWS)
+/// The ids of the fixture rows `keep` selects.
+fn detection_ids(keep: impl Fn(i32, &Detections) -> bool) -> Vec<i32> {
+    (0..DETECTION_ROWS)
         .filter(|id| {
             let (width, detections) = detection_row(*id);
             keep(width, &detections)
         })
-        .collect();
+        .collect()
+}
+
+const CAR_ABOVE_09: &str = "any_element(detections, 'label = ''car'' AND confidence > 0.9')";
+
+fn is_car_above_09(detection: &Detection) -> bool {
+    detection.0 == "car" && detection.1 > 0.9
+}
+
+/// `exact`: whether a list-element index on `(label, confidence)` answers the
+/// filter without a recheck.
+#[rstest]
+#[case::same_element(
+    CAR_ABOVE_09,
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(true),
+    true
+)]
+#[case::inclusive_range(
+    "any_element(detections, 'label = ''car'' AND confidence >= 0.9')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 >= 0.9) == Some(true),
+    true
+)]
+#[case::upper_range(
+    "any_element(detections, 'label = ''car'' AND confidence < 0.2')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 < 0.2) == Some(true),
+    true
+)]
+#[case::between(
+    "any_element(detections, 'label = ''person'' AND confidence BETWEEN 0.25 AND 0.5')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "person" && (0.25..=0.5).contains(&d.1)) == Some(true),
+    true
+)]
+#[case::first_key_only(
+    "any_element(detections, 'label = ''carrot''')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "carrot") == Some(true),
+    true
+)]
+#[case::in_list(
+    "any_element(detections, 'label IN (''truck'', ''carrot'') AND confidence > 0.95')",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true),
+    true
+)]
+#[case::three_conditions(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')",
+    |_, d: &Detections| any_detection(d, |d| is_car_above_09(d) && d.2 > 10000.0) == Some(true),
+    false
+)]
+#[case::negated(
+    "NOT any_element(detections, 'label = ''car'' AND confidence > 0.9')",
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(false),
+    true
+)]
+#[case::and_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') AND width > 1920",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(true) && w > 1920,
+    true
+)]
+#[case::or_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') OR width = 1280",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(true) || w == 1280,
+    true
+)]
+#[case::lambda(
+    "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
+    |_, d: &Detections| any_detection(d, is_car_above_09) == Some(true),
+    true
+)]
+#[case::lambda_alias_and_subscript(
+    "any_match(detections, (x) -> x['label'] IN ('truck', 'carrot') AND x.confidence > 0.95)",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true),
+    true
+)]
+#[case::lambda_negated_and_indexed_column(
+    "NOT array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9) AND width > 1920",
+    |w, d: &Detections| any_detection(d, is_car_above_09) == Some(false) && w > 1920,
+    true
+)]
+#[tokio::test]
+async fn test_any_element_filter(
+    #[case] filter: &str,
+    #[case] keep: DetectionCheck,
+    #[case] exact: bool,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = detection_dataset(element_index, false).await;
+    let expected = detection_ids(keep);
     assert!(!expected.is_empty(), "`{filter}` should match some rows");
     for use_scalar_index in [true, false] {
         assert_eq!(
@@ -1631,22 +1704,144 @@ async fn test_any_element_filter(#[case] filter: &str, #[case] keep: DetectionCh
         dataset.count_rows(Some(filter.to_string())).await.unwrap(),
         expected.len()
     );
+    if element_index {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let plan = scanner.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("ListElement(detections"),
+            "`{filter}`: {plan}"
+        );
+        assert_eq!(!plan.contains("recheck"), exact, "`{filter}`: {plan}");
+    }
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_any_element_edge_rows() {
-    let dataset = detection_dataset().await;
-    let filter = "any_element(detections, 'label = ''car'' AND confidence > 0.9')";
-    let matched = any_element_ids(&dataset, filter, true).await;
+async fn test_any_element_edge_rows(#[values(false, true)] element_index: bool) {
+    let dataset = detection_dataset(element_index, false).await;
+    let matched = any_element_ids(&dataset, CAR_ABOVE_09, true).await;
     // Only row 2 has a car above 0.9 among the edge cases.
     for id in [0, 1, 3, 4, 5] {
-        assert!(!matched.contains(&id), "row {id} must not match `{filter}`");
+        assert!(
+            !matched.contains(&id),
+            "row {id} must not match `{CAR_ABOVE_09}`"
+        );
     }
     assert!(matched.contains(&2));
     // The empty list is FALSE, so NOT selects it; the null list is NULL, so
     // neither does.
-    let negated = any_element_ids(&dataset, &format!("NOT {filter}"), true).await;
+    let negated = any_element_ids(&dataset, &format!("NOT {CAR_ABOVE_09}"), true).await;
     assert!(negated.contains(&4) && !negated.contains(&5));
+}
+
+/// A predicate with no condition on the first key cannot seek the index, so
+/// `any_element` evaluates it on every row.
+#[tokio::test]
+async fn test_element_index_declines_without_first_key() {
+    let dataset = detection_dataset(true, false).await;
+    let filter = "any_element(detections, 'confidence > 0.95')";
+    assert_eq!(
+        any_element_ids(&dataset, filter, true).await,
+        detection_ids(|_, d| any_detection(d, |d| d.1 > 0.95) == Some(true))
+    );
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(!plan.contains("ListElement("), "{plan}");
+}
+
+/// With `fast_search` the unindexed fragment is skipped, until
+/// `optimize_indices` adds it to the index.
+#[tokio::test]
+async fn test_element_index_fast_search_and_update() {
+    let mut dataset = detection_dataset(true, false).await;
+    let expected = detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true));
+    let indexed_only = expected
+        .iter()
+        .copied()
+        .filter(|id| *id < 1500)
+        .collect::<Vec<_>>();
+    assert_ne!(indexed_only, expected, "the appended rows should match too");
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        indexed_only
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+    let negated = format!("NOT {CAR_ABOVE_09}");
+    assert_eq!(
+        scan_any_element_ids(&dataset, &negated, true, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(false))
+    );
+}
+
+/// After deletes and compaction, the index answers alone (`fast_search`) for
+/// the rewritten fragments: compaction remaps its row addresses, with or
+/// without stable row ids.
+#[rstest]
+#[tokio::test]
+async fn test_element_index_delete_and_compaction(
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let mut dataset = detection_dataset(true, enable_stable_row_ids).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let matching = detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true));
+    // Updating the index keeps the rows it already held, which are addresses
+    // even when the table has stable row ids.
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        matching
+    );
+    let deleted = matching.iter().copied().step_by(2).collect::<Vec<_>>();
+    let deleted_list = deleted
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    dataset
+        .delete(&format!(
+            "id IN ({deleted_list}) OR (id >= 100 AND id < 600)"
+        ))
+        .await
+        .unwrap();
+    let is_kept = |id: &i32| !deleted.contains(id) && !(100..600).contains(id);
+    let expected = matching.into_iter().filter(is_kept).collect::<Vec<_>>();
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+
+    let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        expected
+    );
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, false, false).await,
+        expected
+    );
+    let negated = format!("NOT {CAR_ABOVE_09}");
+    assert_eq!(
+        scan_any_element_ids(&dataset, &negated, true, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(false))
+            .into_iter()
+            .filter(|id| !(100..600).contains(id))
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A predicate that names a column outside the element, or calls a function
@@ -1656,8 +1851,12 @@ async fn test_any_element_edge_rows() {
 #[case::outside_column("any_element(detections, 'width > 1')", "width")]
 #[case::stable_function("any_element(detections, 'now() IS NOT NULL')", "calls now()")]
 #[tokio::test]
-async fn test_any_element_rejects_invalid_predicates(#[case] filter: &str, #[case] reason: &str) {
-    let dataset = detection_dataset().await;
+async fn test_any_element_rejects_invalid_predicates(
+    #[case] filter: &str,
+    #[case] reason: &str,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = detection_dataset(element_index, false).await;
     let mut scanner = dataset.scan();
     scanner.filter(filter).unwrap();
     let err = scanner.try_into_batch().await.unwrap_err();
@@ -1687,7 +1886,7 @@ async fn test_any_element_rejects_invalid_predicates(#[case] filter: &str, #[cas
 )]
 #[tokio::test]
 async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[case] reason: &str) {
-    let dataset = detection_dataset().await;
+    let dataset = detection_dataset(false, false).await;
     let mut scanner = dataset.scan();
     scanner.filter(filter).unwrap();
     let err = scanner.try_into_batch().await.unwrap_err();

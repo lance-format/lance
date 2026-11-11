@@ -22,6 +22,7 @@ use lance_index::{
         inverted::InvertedIndex,
         json,
         lance_format::LanceIndexStore,
+        list_element,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
         zonemap::ZoneMapIndexVersion,
@@ -1261,12 +1262,13 @@ async fn merge_scalar_indices<'a>(
                         .await?
                 }
                 _ => {
-                    // A JSON index over an address-domain target stores row
-                    // addresses, which a row-id filter would wrongly prune.
-                    let address_domain = reference_index
-                        .as_any()
-                        .downcast_ref::<json::JsonIndex>()
-                        .is_some_and(|index| index.results_are_row_addresses());
+                    // A JSON index over an address-domain target, and a
+                    // list-element index, store row addresses, which a row-id
+                    // filter would wrongly prune.
+                    let index = reference_index.as_any();
+                    let address_domain = reference_index.results_are_row_addresses()
+                        && (index.is::<json::JsonIndex>()
+                            || index.is::<list_element::ListElementIndex>());
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
