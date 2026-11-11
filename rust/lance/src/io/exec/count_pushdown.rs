@@ -148,6 +148,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     };
 
     let options = filtered_read.options();
+    // The index mask still contains entries invalidated by overlays. Replacing
+    // this read would bypass its stale-entry exclusion.
+    if options.overlay_block.is_some() {
+        return Ok(None);
+    }
     // We don't currently support count pushdown when the row selector
     // is a row stream.
     if filtered_read.row_stream_input().is_some() {
@@ -612,6 +617,60 @@ mod tests {
             !plan_contains_union(&plan),
             "no union expected when index covers every fragment, got: {}",
             displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn rule_skips_overlay_block() {
+        let fixture = make_fixture().await;
+        let mut scanner = fixture.dataset.scan();
+        scanner.filter("ordered < 25").unwrap();
+        let (plan, _) = run_count(&mut scanner).await;
+        let aggregate = plan.downcast_ref::<AggregateExec>().unwrap();
+        let mut index_input = None;
+        plan.apply(|node| {
+            if node.is::<ScalarIndexExec>() {
+                index_input = Some(node.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        assert!(index_input.is_some());
+
+        // Value 12 is a hit in fragment 1. The read must exclude it even when
+        // an aggregate is placed directly above it without a replay union.
+        let options = FilteredReadOptions::basic_full_read(&fixture.dataset).with_overlay_block(
+            RowAddrMask::from_block(RowAddrTreeMap::from_iter([u64::from(
+                RowAddress::new_from_parts(1, 2),
+            )])),
+        );
+        let read: Arc<dyn ExecutionPlan> = Arc::new(
+            FilteredReadExec::try_new(fixture.dataset.clone(), options, index_input).unwrap(),
+        );
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::default(),
+            aggregate.aggr_expr().to_vec(),
+            vec![None],
+            read.clone(),
+            read.schema(),
+        )
+        .unwrap();
+        assert!(try_rewrite(&aggregate).unwrap().is_none());
+        let batches = datafusion::physical_plan::collect(
+            Arc::new(aggregate),
+            Arc::new(datafusion::execution::TaskContext::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            24
         );
     }
 

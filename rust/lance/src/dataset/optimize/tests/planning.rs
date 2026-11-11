@@ -4,9 +4,44 @@
 //! Compaction tests for the planning contract area.
 
 use super::*;
+use std::collections::BTreeSet;
+
 use crate::dataset::optimize::planning::{
-    CandidateBin, CompactionCandidacy, FragmentMetrics, fragment_file_bytes,
+    CandidateBin, CompactionCandidacy, FragmentMetrics, HELD_BACK_SAMPLE_LIMIT, describe_held,
+    fragment_file_bytes, limit_tasks_to_source_budget,
 };
+
+/// The hold-back log names at most [`HELD_BACK_SAMPLE_LIMIT`] fragment ids,
+/// in ascending order, and summarizes the rest as a count.
+#[test]
+fn held_back_description_truncates_to_a_sample_and_a_count() {
+    assert_eq!(describe_held(&BTreeSet::new()), "fragment(s) ");
+    assert_eq!(describe_held(&BTreeSet::from([7])), "fragment(s) 7");
+    assert_eq!(
+        describe_held(&BTreeSet::from([3, 1, 2])),
+        "fragment(s) 1, 2, 3",
+        "ids are named in ascending order"
+    );
+
+    let at_limit = (0..HELD_BACK_SAMPLE_LIMIT as u64).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&at_limit),
+        "fragment(s) 0, 1, 2, 3, 4, 5, 6, 7"
+    );
+
+    let over_limit = (0..HELD_BACK_SAMPLE_LIMIT as u64 + 1).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&over_limit),
+        "fragment(s) 0, 1, 2, 3, 4, 5, 6, 7 and 1 more"
+    );
+
+    let wide = (100..1_100).collect::<BTreeSet<_>>();
+    assert_eq!(
+        describe_held(&wide),
+        "fragment(s) 100, 101, 102, 103, 104, 105, 106, 107 and 992 more",
+        "a wide index cannot produce an unbounded line"
+    );
+}
 
 #[rstest::rstest]
 #[case::below_default(Some(949), Some(1000), None, true)]
@@ -561,6 +596,35 @@ async fn grouped_compaction_replaces_only_the_selected_fragments() {
 
     // The non-adjacent remainder under a fragment budget: over budget is
     // not planned and nothing is written; within budget it compacts.
+    let mut missing_size = dataset.clone();
+    let manifest = Arc::make_mut(&mut missing_size.manifest);
+    Arc::make_mut(&mut manifest.fragments)[0].files[0].file_size_bytes = CachedFileSize::unknown();
+    let groups = vec![group(&[&after[0], &after[1]], &[("group", "b")])];
+
+    let soft_plan = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..options.clone()
+    })
+    .unwrap()
+    .plan_groups(&missing_size, groups.clone())
+    .await
+    .unwrap();
+    assert_eq!(soft_plan.tasks.len(), 1);
+    assert_eq!(soft_plan.tasks[0].fragments.len(), 2);
+
+    let hard_plan = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        ..options.clone()
+    })
+    .unwrap()
+    .plan_groups(&missing_size, groups)
+    .await
+    .unwrap();
+    assert!(hard_plan.tasks.is_empty(), "{:?}", hard_plan.tasks);
+
     let metrics = compact_files_with_planner(
         &mut dataset,
         None,
@@ -702,85 +766,87 @@ async fn grouped_compaction_applies_ordinary_candidacy_inside_the_group() {
     assert_eq!(after[1].physical_rows, Some(300));
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1_300);
 }
-/// An index this build cannot read holds back only the sources a group
-/// actually selects: a covered member that candidacy leaves alone does not
-/// stop the rest of its group; covered members that would be rewritten
-/// refuse the plan before anything is written; a covered member split off
-/// on its own at the index boundary is left out, not rewritten.
-#[tokio::test]
-async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only() {
+/// Three fragments of 100, 200 and 1,000 rows, in that order.
+async fn three_sizes(uri: &str) -> Dataset {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let mut dataset: Option<Dataset> = None;
+    for (start, rows) in [(0_i64, 100_i64), (100, 200), (300, 1_000)] {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+        )
+        .unwrap();
+        dataset = Some(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                uri,
+                Some(WriteParams {
+                    mode: if dataset.is_none() {
+                        WriteMode::Create
+                    } else {
+                        WriteMode::Append
+                    },
+                    max_rows_per_file: 1_000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    dataset.unwrap()
+}
+
+/// Replace a readable index on `column` with one of a type this build has no
+/// reader for, covering exactly `covered`.
+async fn plant_unreadable_index(dataset: &mut Dataset, column: &str, covered: &[u32]) {
     use crate::dataset::transaction::{Operation, Transaction};
     use lance_table::format::IndexMetadata;
 
-    async fn three_sizes(uri: &str) -> Dataset {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let mut dataset: Option<Dataset> = None;
-        for (start, rows) in [(0_i64, 100_i64), (100, 200), (300, 1_000)] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
-            )
-            .unwrap();
-            dataset = Some(
-                Dataset::write(
-                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
-                    uri,
-                    Some(WriteParams {
-                        mode: if dataset.is_none() {
-                            WriteMode::Create
-                        } else {
-                            WriteMode::Append
-                        },
-                        max_rows_per_file: 1_000,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap(),
-            );
-        }
-        dataset.unwrap()
-    }
+    dataset
+        .create_index(
+            &[column],
+            IndexType::BTree,
+            Some("a_idx".to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    let current = dataset.load_indices().await.unwrap();
+    let unknown = IndexMetadata {
+        index_details: Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
+            value: Vec::new(),
+        })),
+        fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
+        ..current[0].clone()
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![unknown],
+                    removed_indices: current.to_vec(),
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+}
 
-    // Replace a readable index with one of a type this build has no
-    // reader for, covering exactly `covered`.
-    async fn plant_unreadable_index(dataset: &mut Dataset, covered: &[u32]) {
-        dataset
-            .create_index(
-                &["a"],
-                IndexType::BTree,
-                Some("a_idx".to_string()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
-                false,
-            )
-            .await
-            .unwrap();
-        let current = dataset.load_indices().await.unwrap();
-        let unknown = IndexMetadata {
-            index_details: Some(Arc::new(prost_types::Any {
-                type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
-                value: Vec::new(),
-            })),
-            fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
-            ..current[0].clone()
-        };
-        dataset
-            .apply_commit(
-                Transaction::new(
-                    dataset.manifest.version,
-                    Operation::CreateIndex {
-                        new_indices: vec![unknown],
-                        removed_indices: current.to_vec(),
-                    },
-                    None,
-                ),
-                &Default::default(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
-    }
-
+/// A source covered by an index this build cannot read is held out of every
+/// task instead of refusing the plan: a covered member candidacy leaves alone
+/// never mattered, a covered member that would have been rewritten is simply
+/// left uncompacted, and the members on either side of the gap are not planned
+/// together. Stable row ids and deferred remapping hold nothing back: there an
+/// index's coverage is fixed up from manifest metadata alone.
+#[tokio::test]
+async fn grouped_compaction_holds_unreadable_coverage_back_from_its_group() {
     let planner = DefaultCompactionPlanner::new(CompactionOptions {
         target_rows_per_fragment: 1_000,
         ..Default::default()
@@ -792,7 +858,7 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[2]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2]).await;
     let plan = planner
         .plan_groups(
             &dataset,
@@ -814,16 +880,14 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
         vec![0, 1]
     );
 
-    // Covered members that would be rewritten: refused before anything is
-    // written. Both small members are covered so they stay one bin; a
-    // covered member on its own is split off at the index boundary and,
-    // being a lone neighbours-only fragment, is simply left out.
+    // Both members of the group are covered: the plan is empty rather than
+    // refused, and nothing is written.
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[0, 1]).await;
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
     let version = dataset.manifest.version;
-    let error = planner
+    let plan = planner
         .plan_groups(
             &dataset,
             vec![CompactionGroup {
@@ -833,16 +897,12 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
             }],
         )
         .await
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("fragment 0") && error.to_string().contains("a_idx"),
-        "{error}"
-    );
+        .unwrap();
+    assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
     assert_eq!(dataset.manifest.version, version);
 
-    // A covered task the source budget drops must not refuse the valid
-    // tasks kept before it: two groups of two small members each, the
-    // second group covered, a budget of two sources keeps only the first.
+    // The source budget drops the first group's task; the second group is
+    // fully covered and contributes nothing either way.
     let dir = TempStrDir::default();
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
@@ -861,7 +921,7 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
     .await
     .unwrap();
     let four = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[2, 3]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2, 3]).await;
     let groups = vec![
         CompactionGroup {
             fragments: four[..2].to_vec(),
@@ -893,14 +953,24 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
-    // Without the budget the covered group is selected, and refused.
-    let error = planner.plan_groups(&dataset, groups).await.unwrap_err();
-    assert!(error.to_string().contains("fragment 2"), "{error}");
+    // Without the budget the covered group is still held back, not refused.
+    let plan = planner.plan_groups(&dataset, groups).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 
+    // One of two small members is covered: the other is left alone rather
+    // than compacted on its own.
     let dir = TempStrDir::default();
     let mut dataset = three_sizes(&dir).await;
     let before = dataset.manifest.fragments.as_ref().clone();
-    plant_unreadable_index(&mut dataset, &[0]).await;
+    plant_unreadable_index(&mut dataset, "a", &[0]).await;
     let plan = planner
         .plan_groups(
             &dataset,
@@ -913,6 +983,672 @@ async fn grouped_compaction_checks_unreadable_coverage_on_selected_sources_only(
         .await
         .unwrap();
     assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
+
+    // Stable row ids hold nothing back: coverage is fixed up from manifest
+    // metadata alone, so the same coverage plans both small members.
+    let mut dataset = stable_row_id_dataset("memory://", 3).await;
+    let before = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "i", &[0, 1]).await;
+    let plan = planner
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: before[..2].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+
+    // Deferred remapping holds nothing back either: it remaps no index here.
+    let dir = TempStrDir::default();
+    let mut dataset = three_sizes(&dir).await;
+    let before = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        defer_index_remap: true,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![CompactionGroup {
+            fragments: before[..2].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+/// A group fully covered by an index this build cannot read does not stop an
+/// uncovered group: the plan holds exactly the uncovered group's task, and
+/// none of the covered group's fragments appear anywhere in it. The held-back
+/// index name and fragment ids go to the info log, which this test cannot
+/// observe without a log capture crate, so only the plan shape is asserted.
+#[tokio::test]
+async fn grouped_compaction_plans_an_uncovered_group_beside_a_covered_one() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..400))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let four = dataset.manifest.fragments.as_ref().clone();
+    // Group A is fragments 0 and 1, both covered; group B is 2 and 3.
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![
+            CompactionGroup {
+                fragments: four[..2].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+            CompactionGroup {
+                fragments: four[2..].to_vec(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert!(
+        !plan
+            .tasks
+            .iter()
+            .flat_map(|task| &task.fragments)
+            .any(|fragment| fragment.id == 0 || fragment.id == 1),
+        "{:?}",
+        plan.tasks
+    );
+}
+/// The uncovered group's plan actually executes and commits while the covered
+/// group is left exactly as it was: its fragments keep their ids and files, the
+/// index this build cannot read keeps its coverage, and every row of the table
+/// survives. A plan whose every source is held back writes nothing at all.
+#[tokio::test]
+async fn grouped_compaction_commit_leaves_the_held_back_group_untouched() {
+    async fn four_fragments(dir: &TempStrDir) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn values(dataset: &Dataset, predicate: Option<&str>) -> Vec<i64> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["a"]).unwrap();
+        if let Some(predicate) = predicate {
+            scanner.filter(predicate).unwrap();
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut values = batch
+            .column_by_name("a")
+            .unwrap()
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Group A is fragments 0 and 1, both covered; group B is 2 and 3.
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragments(&dir).await;
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1]).await;
+    let planted = load_all_indices(&Dataset::open(&dir).await.unwrap())
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    assert_eq!(planted.len(), 1);
+
+    let groups = vec![
+        CompactionGroup {
+            fragments: four[..2].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        },
+        CompactionGroup {
+            fragments: four[2..].to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        },
+    ];
+    let planned = Dataset::open(&dir).await.unwrap();
+    let plan = planner.plan_groups(&planned, groups).await.unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+
+    let mut results = Vec::new();
+    for task in plan.compaction_tasks() {
+        results.push(task.execute(&planned).await.unwrap());
+    }
+    let mut committer = Dataset::open(&dir).await.unwrap();
+    commit_compaction(
+        &mut committer,
+        results,
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &plan.options,
+    )
+    .await
+    .unwrap();
+
+    // The covered group's fragments are byte-for-byte what they were.
+    let after = committer.manifest.fragments.as_ref().clone();
+    assert_eq!(
+        after.iter().map(|f| f.id).collect::<Vec<_>>(),
+        vec![0, 1, 4]
+    );
+    assert_eq!(after[0], four[0], "the covered fragment 0 is untouched");
+    assert_eq!(after[1], four[1], "the covered fragment 1 is untouched");
+    assert_eq!(after[2].physical_rows, Some(200), "2 and 3 compacted");
+
+    // The index this build cannot read is still there, byte-for-byte the
+    // metadata that was planted: nothing of it had to be remapped.
+    let indices = load_all_indices(&committer).await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(
+        indices[0], planted[0],
+        "the unreadable index's metadata is untouched"
+    );
+
+    // Every row survives, and the uncovered group's own rows are exact.
+    assert_eq!(committer.count_rows(None).await.unwrap(), 400);
+    assert_eq!(values(&committer, None).await, (0..400).collect::<Vec<_>>());
+    assert_eq!(
+        values(&committer, Some("a >= 200")).await,
+        (200..400).collect::<Vec<_>>(),
+        "the rewritten group's rows are preserved exactly"
+    );
+
+    // Every source held back: no task, so nothing is rewritten and the commit
+    // of the empty plan leaves the manifest where it was.
+    let dir = TempStrDir::default();
+    let mut dataset = four_fragments(&dir).await;
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[0, 1, 2, 3]).await;
+    let planned = Dataset::open(&dir).await.unwrap();
+    let plan = planner
+        .plan_groups(
+            &planned,
+            vec![CompactionGroup {
+                fragments: four.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(plan.tasks.is_empty(), "{:?}", plan.tasks);
+
+    let mut committer = Dataset::open(&dir).await.unwrap();
+    let version = committer.manifest.version;
+    let metrics = commit_compaction(
+        &mut committer,
+        Vec::new(),
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &plan.options,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 0);
+    assert_eq!(metrics.fragments_added, 0);
+    assert_eq!(
+        committer.manifest.version, version,
+        "an empty plan commits nothing"
+    );
+    assert_eq!(committer.manifest.fragments.as_ref(), &four);
+    assert_eq!(committer.count_rows(None).await.unwrap(), 400);
+}
+/// Grouped planning leaves exactly the gap ordinary planning leaves at a
+/// source held back for unreadable index coverage. Ordinary planning folds
+/// that coverage into its own exclusions and terminates the current bin at
+/// one, so the candidates on either side are never planned together; the same
+/// group handed to `plan_groups`, with the same options, has to select the
+/// same sources.
+#[tokio::test]
+async fn grouped_planning_keeps_the_same_gap_at_a_held_back_source_as_ordinary_planning() {
+    /// A dataset of `sizes` fragments in order, one fragment per entry.
+    async fn fragments_of(dir: &TempStrDir, sizes: &[i64]) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut dataset: Option<Dataset> = None;
+        let mut start = 0_i64;
+        for rows in sizes {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+            )
+            .unwrap();
+            dataset = Some(
+                Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    dir,
+                    Some(WriteParams {
+                        mode: if dataset.is_none() {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        max_rows_per_file: 1_000,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            start += rows;
+        }
+        let dataset = dataset.unwrap();
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        assert_eq!(fragments.len(), sizes.len());
+        (dataset, fragments)
+    }
+
+    fn sources(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+        plan.tasks
+            .iter()
+            .map(|task| task.fragments.iter().map(|f| f.id).collect())
+            .collect()
+    }
+
+    // The one set of options both planners run under: the large middle
+    // fragment is over the target, so `candidacy_of` rejects it either way.
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    };
+
+    // Two small, one over-target and covered, two small. Both planners plan
+    // the two sides as separate tasks and leave the covered member alone.
+    let dir = TempStrDir::default();
+    let (mut dataset, five) = fragments_of(&dir, &[100, 100, 1_000, 100, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[2]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(
+        sources(&ordinary),
+        vec![vec![0, 1], vec![3, 4]],
+        "ordinary planning splits its bin at the excluded source"
+    );
+
+    let grouped = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: five.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sources(&grouped),
+        sources(&ordinary),
+        "grouped planning selects the same sources as ordinary planning"
+    );
+
+    // One small on each side of the covered member: the gap leaves each a
+    // lone fragment that would only gain from neighbours, which neither
+    // planner rewrites.
+    let dir = TempStrDir::default();
+    let (mut dataset, three) = fragments_of(&dir, &[100, 1_000, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert!(ordinary.tasks.is_empty(), "{:?}", ordinary.tasks);
+    let grouped = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: three.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(grouped.tasks.is_empty(), "{:?}", grouped.tasks);
+}
+/// Only a held-back source terminates a grouped run; an ordinary
+/// non-candidate does not. Ordinary planning ends its bin at every
+/// non-candidate, so an over-target fragment splits its plan too. Grouped
+/// planning skips that fragment and keeps the candidates around it in one
+/// task, because naming them in a group is an explicit request to compact
+/// them together; only coverage this build cannot remap overrides it.
+#[tokio::test]
+async fn grouped_planning_splits_at_a_held_back_source_but_not_at_an_over_target_one() {
+    /// A dataset of `sizes` fragments in order, one fragment per entry.
+    async fn fragments_of(dir: &TempStrDir, sizes: &[i64]) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut dataset: Option<Dataset> = None;
+        let mut start = 0_i64;
+        for rows in sizes {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + rows))],
+            )
+            .unwrap();
+            dataset = Some(
+                Dataset::write(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                    dir,
+                    Some(WriteParams {
+                        mode: if dataset.is_none() {
+                            WriteMode::Create
+                        } else {
+                            WriteMode::Append
+                        },
+                        max_rows_per_file: 1_000,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap(),
+            );
+            start += rows;
+        }
+        let dataset = dataset.unwrap();
+        let fragments = dataset.manifest.fragments.as_ref().clone();
+        assert_eq!(fragments.len(), sizes.len());
+        (dataset, fragments)
+    }
+
+    fn sources(plan: &CompactionPlan) -> Vec<Vec<u64>> {
+        plan.tasks
+            .iter()
+            .map(|task| task.fragments.iter().map(|f| f.id).collect())
+            .collect()
+    }
+
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    };
+
+    // Fragment 2 is over the target, so neither planner rewrites it, and it is
+    // not held back. Fragment 4 is small and covered, so it is held back.
+    let dir = TempStrDir::default();
+    let (mut dataset, six) = fragments_of(&dir, &[100, 100, 1_000, 100, 100, 100]).await;
+    plant_unreadable_index(&mut dataset, "a", &[4]).await;
+    let dataset = Dataset::open(&dir).await.unwrap();
+
+    let grouped = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups(
+            &dataset,
+            vec![CompactionGroup {
+                fragments: six.clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sources(&grouped),
+        vec![vec![0, 1, 3]],
+        "the over-target member 2 does not split the run, the held-back member 4 does, and \
+         fragment 5 is left alone past the split"
+    );
+
+    // The same layout through ordinary planning: its bin ends at the
+    // over-target member as well, so the run before it is a task of its own.
+    let ordinary = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(
+        sources(&ordinary),
+        vec![vec![0, 1]],
+        "ordinary planning splits at the over-target member too, leaving 3 alone between the \
+         two gaps"
+    );
+}
+/// A group that mixes covered and uncovered sources still plans the uncovered
+/// ones: the covered member is held back and the two uncovered members on one
+/// side of it compact together.
+#[tokio::test]
+async fn grouped_compaction_plans_the_uncovered_sources_of_a_mixed_group() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from_iter_values(0..400))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let four = dataset.manifest.fragments.as_ref().clone();
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+
+    let plan = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap()
+    .plan_groups(
+        &dataset,
+        vec![CompactionGroup {
+            fragments: four.clone(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }],
+    )
+    .await
+    .unwrap();
+
+    // Fragment 0 is left alone: the gap at 1 terminates its run, and a lone
+    // neighbours-only fragment is not rewritten.
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+}
+/// No metric of a held-back member is read: its data file is gone, so any
+/// measurement of it would fail the plan, and the manifest's cached counts are
+/// made untrustworthy so that every measured member really does open its file.
+#[tokio::test]
+async fn grouped_compaction_reads_no_metrics_for_a_held_back_source() {
+    /// Four fragments of 100 rows, with fragment 1's data file removed and the
+    /// writer version cleared so that the cached counts cannot be trusted and
+    /// measuring fragment 1 must fail.
+    async fn four_with_an_unreadable_second(dir: &TempStrDir) -> (Dataset, Vec<Fragment>) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..400))],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            dir,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let four = dataset.manifest.fragments.as_ref().clone();
+        (dataset, four)
+    }
+
+    /// Returns the path removed, so a caller can relate it to the fragment the
+    /// planner is expected to hold back.
+    fn sabotage(
+        dataset: &mut Dataset,
+        fragment: &Fragment,
+        dir: &TempStrDir,
+    ) -> std::path::PathBuf {
+        Arc::make_mut(&mut dataset.manifest).writer_version = None;
+        let path = std::path::Path::new(dir.as_ref())
+            .join("data")
+            .join(&fragment.files[0].path);
+        std::fs::remove_file(&path).unwrap();
+        path
+    }
+
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 1_000,
+        ..Default::default()
+    })
+    .unwrap();
+    let whole_group = |four: &[Fragment]| {
+        vec![CompactionGroup {
+            fragments: four.to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        }]
+    };
+
+    // The control: with no index holding it back, fragment 1 is measured and
+    // its missing file fails the plan. This is what makes the case below a
+    // proof that the held-back member is never measured.
+    let dir = TempStrDir::default();
+    let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
+    sabotage(&mut dataset, &four[1], &dir);
+    assert!(
+        planner
+            .plan_groups(&dataset, whole_group(&four))
+            .await
+            .is_err()
+    );
+
+    // The same unreadable fragment, now covered by an index this build cannot
+    // read: no metric of it is read, the plan succeeds, and the uncovered
+    // members on the far side of the gap it leaves still compact together.
+    let dir = TempStrDir::default();
+    let (mut dataset, four) = four_with_an_unreadable_second(&dir).await;
+    plant_unreadable_index(&mut dataset, "a", &[1]).await;
+    let mut dataset = Dataset::open(&dir).await.unwrap();
+    let held = dataset
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id == four[1].id)
+        .cloned()
+        .expect("the held-back fragment survives the index commit");
+    let removed = sabotage(&mut dataset, &held, &dir);
+    // The sabotage only proves anything if the index the reopened manifest
+    // carries is the unreadable one, and if the fragment whose file was
+    // removed is exactly the fragment that index's coverage holds back.
+    // `load_all_indices`, not `load_indices`: the latter drops exactly the
+    // unusable entry this case is about.
+    let indices = load_all_indices(&dataset).await.unwrap();
+    assert_eq!(indices.len(), 1, "{indices:?}");
+    assert!(
+        indices[0]
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("example.ForeignIndexDetails")),
+        "{indices:?}"
+    );
+    assert_eq!(
+        indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![four[1].id as u32]
+    );
+    assert_eq!(held.files[0].path, four[1].files[0].path);
+    assert!(removed.ends_with(&held.files[0].path), "{removed:?}");
+    let plan = planner
+        .plan_groups(&dataset, whole_group(&four))
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1, "{:?}", plan.tasks);
+    assert_eq!(
+        plan.tasks[0]
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
 }
 /// With stable row ids and deferred remapping, a non-adjacent group's
 /// moves are recorded in the fragment reuse index and every row keeps its
@@ -1544,6 +2280,10 @@ fn test_from_dataset_config() {
             "lance.compaction.max_source_bytes".to_string(),
             "1073741824".to_string(),
         ),
+        (
+            "lance.compaction.source_budget_mode".to_string(),
+            "soft".to_string(),
+        ),
     ]);
 
     let opts = CompactionOptions::from_dataset_config(&config).unwrap();
@@ -1563,23 +2303,25 @@ fn test_from_dataset_config() {
     assert_eq!(opts.max_source_fragments, Some(20));
     assert_eq!(opts.max_source_rows, Some(1_000_000));
     assert_eq!(opts.max_source_bytes, Some(1_073_741_824));
+    assert_eq!(opts.source_budget_mode, SourceBudgetMode::Soft);
 
     let mut serialized = serde_json::to_value(&opts).unwrap();
     assert_eq!(
         serde_json::from_value::<CompactionOptions>(serialized.clone()).unwrap(),
         opts
     );
-    // Older serialized options omit the byte threshold.
+    // Older serialized options omit newer defaults.
     serialized
         .as_object_mut()
         .unwrap()
         .remove("min_bytes_per_file");
-    assert_eq!(
-        serde_json::from_value::<CompactionOptions>(serialized)
-            .unwrap()
-            .min_bytes_per_file,
-        None
-    );
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("source_budget_mode");
+    let decoded = serde_json::from_value::<CompactionOptions>(serialized).unwrap();
+    assert_eq!(decoded.min_bytes_per_file, None);
+    assert_eq!(decoded.source_budget_mode, SourceBudgetMode::Hard);
 }
 #[test]
 fn test_from_dataset_config_empty() {
@@ -1707,6 +2449,17 @@ fn test_from_dataset_config_invalid_compaction_mode() {
     let result = CompactionOptions::from_dataset_config(&config);
     let err_msg = result.unwrap_err().to_string();
     assert!(err_msg.contains("invalid_mode"));
+}
+
+#[test]
+fn test_from_dataset_config_invalid_source_budget_mode() {
+    let config = HashMap::from([(
+        "lance.compaction.source_budget_mode".to_string(),
+        "invalid".to_string(),
+    )]);
+
+    let err = CompactionOptions::from_dataset_config(&config).unwrap_err();
+    assert!(err.to_string().contains("Invalid source budget mode"));
 }
 #[test]
 fn test_from_dataset_config_max_overlays_per_fragment() {
@@ -1905,6 +2658,223 @@ async fn test_max_source_rows() {
         .sum();
     assert_eq!(physical_rows, 300);
 }
+
+#[tokio::test]
+async fn test_soft_source_budget_admits_one_oversized_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+
+    // The first task contains three fragments and 250 live rows, and its
+    // source files are larger than one byte. In soft mode it is admitted
+    // so compaction can make progress, but the next task is not.
+    let opts = CompactionOptions {
+        target_rows_per_fragment: 250,
+        max_source_fragments: Some(1),
+        max_source_rows: Some(1),
+        max_source_bytes: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(opts)
+        .unwrap()
+        .plan_with_budget(&dataset)
+        .await
+        .unwrap();
+    let plan = result.plan;
+    let summary = result.source_budget;
+    assert_eq!(summary.selected_source_rows, 250);
+    assert_eq!(summary.selected_source_fragments, 3);
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 1));
+    assert!(summary.budget_exhausted());
+    assert_eq!(
+        summary.limiting_budgets,
+        vec![
+            SourceBudgetLimit::Fragments,
+            SourceBudgetLimit::Rows,
+            SourceBudgetLimit::Bytes
+        ]
+    );
+
+    assert_eq!(plan.num_tasks(), 1);
+    assert_eq!(plan.tasks()[0].fragments.len(), 3);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_missing_first_task_size() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    all_tasks[0].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let hard = CompactionOptions {
+        max_source_bytes: Some(1),
+        ..Default::default()
+    };
+    let err = limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+    assert!(err.to_string().contains("has no size recorded"));
+
+    let soft = CompactionOptions {
+        max_source_bytes: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.selected_source_bytes, None);
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Bytes]);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_keeps_prefix_before_unknown_later_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    assert!(
+        all_tasks[0].0.fragments[0].files[0]
+            .file_size_bytes
+            .get()
+            .is_some()
+    );
+    all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let hard = CompactionOptions {
+        max_source_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    let err = limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap_err();
+    assert!(err.to_string().contains("has no size recorded"));
+
+    let soft = CompactionOptions {
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Bytes]);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_stops_after_oversized_first_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 1);
+
+    let mut all_tasks = plan
+        .tasks
+        .into_iter()
+        .map(|task| (task, 0))
+        .collect::<Vec<_>>();
+    // The first task has known source sizes and exceeds the row budget.
+    // The second task's unknown size must not be inspected after soft mode
+    // admits the first task, because the plan must stop at that point.
+    assert!(
+        all_tasks[0].0.fragments[0].files[0]
+            .file_size_bytes
+            .get()
+            .is_some()
+    );
+    all_tasks[0].1 = 2;
+    all_tasks[1].0.fragments[0].files[0].file_size_bytes = CachedFileSize::unknown();
+
+    let soft = CompactionOptions {
+        max_source_rows: Some(1),
+        max_source_bytes: Some(u64::MAX),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+    let (selected, summary) =
+        limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(summary.selected_tasks, 1);
+    assert!(summary.budget_exhausted());
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.selected_source_rows, 2);
+    assert!(summary.selected_source_bytes.is_some_and(|bytes| bytes > 0));
+    assert_eq!(summary.next_task_source_bytes, None);
+    assert_eq!(summary.limiting_budgets, vec![SourceBudgetLimit::Rows]);
+}
+
+#[tokio::test]
+async fn test_soft_source_budget_uses_cumulative_totals_after_first_task() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let unbounded = CompactionOptions {
+        target_rows_per_fragment: 250,
+        ..Default::default()
+    };
+    let plan = plan_compaction(&dataset, &unbounded).await.unwrap();
+    assert!(plan.tasks.len() > 2);
+
+    // Each task's synthetic row count fits the budget independently. The
+    // first two fit cumulatively, but adding the third exceeds the total.
+    let all_tasks = plan
+        .tasks
+        .into_iter()
+        .take(3)
+        .map(|task| (task, 2))
+        .collect::<Vec<_>>();
+    let hard = CompactionOptions {
+        max_source_rows: Some(5),
+        ..Default::default()
+    };
+    let soft = CompactionOptions {
+        max_source_rows: Some(5),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    };
+
+    let hard_selected =
+        limit_tasks_to_source_budget(&hard, dataset.schema(), all_tasks.clone()).unwrap();
+    let soft_selected = limit_tasks_to_source_budget(&soft, dataset.schema(), all_tasks).unwrap();
+    assert_eq!(hard_selected.0.len(), 2);
+    assert_eq!(hard_selected.1.selected_source_rows, 4);
+    assert_eq!(hard_selected.1.next_task_source_rows, Some(2));
+    assert_eq!(
+        hard_selected.1.limiting_budgets,
+        vec![SourceBudgetLimit::Rows]
+    );
+    assert_eq!(soft_selected, hard_selected);
+}
+
 #[tokio::test]
 async fn test_max_source_bytes() {
     let test_dir = TempStrDir::default();
@@ -2157,4 +3127,366 @@ async fn byte_full_fragment_preserves_small_runs_on_both_sides() {
         plan.compaction_tasks()
             .all(|task| task.task.fragments.iter().all(|f| f.id != middle_id))
     );
+}
+
+#[tokio::test]
+async fn test_source_budget_progress_and_blocked_diagnostics() {
+    // Whole tasks fit the run cap and drain over separate atomic commits.
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(5), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_rows: Some(200),
+        ..Default::default()
+    };
+    let mut committed = 0;
+    loop {
+        let result = DefaultCompactionPlanner::new(options.clone())
+            .unwrap()
+            .plan_with_budget(&dataset)
+            .await
+            .unwrap();
+        assert!(result.source_budget.selected_source_rows <= 200);
+        assert!(!result.source_budget.is_blocked());
+        if result.plan.num_tasks() == 0 {
+            break;
+        }
+        assert_eq!(result.plan.options.target_rows_per_fragment, 100);
+        let mut results = Vec::new();
+        for task in result.plan.compaction_tasks() {
+            results.push(task.execute(&dataset).await.unwrap());
+        }
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        committed += 1;
+        assert!(committed <= 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 250);
+    }
+    assert_eq!(committed, 2);
+
+    // A task larger than the cap is held back whole, even when some of its
+    // source fragments fit. Report that boundary rather than a silent no-op.
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(3), FragmentRowCount(99))
+        .await
+        .unwrap();
+    let blocked = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_rows: Some(200),
+        ..options
+    })
+    .unwrap()
+    .plan_with_budget(&dataset)
+    .await
+    .unwrap();
+    assert_eq!(blocked.plan.num_tasks(), 0);
+    assert!(blocked.source_budget.is_blocked());
+    assert_eq!(
+        blocked.source_budget.limiting_budgets,
+        vec![SourceBudgetLimit::Rows]
+    );
+    assert_eq!(blocked.source_budget.next_task_source_rows, Some(297));
+    assert_eq!(blocked.source_budget.next_task_source_fragments, Some(3));
+}
+
+#[tokio::test]
+async fn test_source_budget_reports_remaining_work_and_live_rows() {
+    let test_dir = TempStrDir::default();
+    let dataset = dataset_with_ten_small_fragments(&test_dir).await;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 250,
+        max_source_rows: Some(270),
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .plan_with_budget(&dataset)
+        .await
+        .unwrap();
+    assert!(result.source_budget.budget_exhausted());
+    assert!(!result.source_budget.is_blocked());
+    assert_eq!(result.source_budget.selected_tasks, 1);
+    assert_eq!(result.source_budget.selected_source_rows, 250);
+    assert!(result.source_budget.candidate_tasks > 1);
+    assert_eq!(result.source_budget.next_task_source_rows, Some(300));
+    assert_eq!(result.source_budget.next_task_source_fragments, Some(3));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ByteBudgetCase {
+    Unset,
+    BelowFirstTask,
+    FirstTask,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BudgetPlanningPath {
+    Ordinary,
+    Grouped,
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_soft_budget_report_admits_first_task_in_both_planning_paths(
+    #[values(BudgetPlanningPath::Ordinary, BudgetPlanningPath::Grouped)] path: BudgetPlanningPath,
+    #[values(2, 4)] fragments: u32,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(fragments), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_rows: Some(99),
+        max_source_fragments: Some(1),
+        source_budget_mode: SourceBudgetMode::Soft,
+        ..Default::default()
+    })
+    .unwrap();
+    let result = match path {
+        BudgetPlanningPath::Ordinary => planner.plan_with_budget(&dataset).await,
+        BudgetPlanningPath::Grouped => {
+            let groups = dataset
+                .manifest
+                .fragments
+                .chunks(2)
+                .map(|fragments| CompactionGroup {
+                    fragments: fragments.to_vec(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                })
+                .collect();
+            planner.plan_groups_with_budget(&dataset, groups).await
+        }
+    }
+    .unwrap();
+    let summary = result.source_budget;
+    assert_eq!(result.plan.num_tasks(), 1);
+    assert_eq!(summary.candidate_tasks, fragments as usize / 2);
+    assert_eq!(summary.selected_tasks, 1);
+    assert_eq!(summary.selected_source_rows, 100);
+    assert_eq!(summary.selected_source_fragments, 2);
+    assert_eq!(summary.selected_source_bytes, None);
+    assert!(!summary.is_blocked());
+    assert_eq!(summary.budget_exhausted(), fragments == 4);
+    assert_eq!(
+        summary.next_task_source_rows,
+        (fragments == 4).then_some(100)
+    );
+    assert_eq!(
+        summary.next_task_source_fragments,
+        (fragments == 4).then_some(2)
+    );
+    assert_eq!(
+        summary.limiting_budgets,
+        if fragments == 4 {
+            vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows]
+        } else {
+            vec![]
+        }
+    );
+}
+
+#[rstest::rstest]
+#[case::rows(Some(99), None, ByteBudgetCase::Unset, vec![SourceBudgetLimit::Rows], 0)]
+#[case::fragments(None, Some(1), ByteBudgetCase::Unset, vec![SourceBudgetLimit::Fragments], 0)]
+#[case::bytes(None, None, ByteBudgetCase::BelowFirstTask, vec![SourceBudgetLimit::Bytes], 0)]
+#[case::all_limits(Some(99), Some(1), ByteBudgetCase::BelowFirstTask,
+    vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows, SourceBudgetLimit::Bytes], 0)]
+#[case::bytes_after_progress(None, None, ByteBudgetCase::FirstTask, vec![SourceBudgetLimit::Bytes], 1)]
+#[case::all_limits_after_progress(Some(100), Some(2), ByteBudgetCase::FirstTask,
+    vec![SourceBudgetLimit::Fragments, SourceBudgetLimit::Rows, SourceBudgetLimit::Bytes], 1)]
+#[case::unlimited(None, None, ByteBudgetCase::Unset, vec![], 2)]
+#[tokio::test]
+async fn test_source_budget_reports_limits_bytes_and_warning_context(
+    #[case] max_source_rows: Option<usize>,
+    #[case] max_source_fragments: Option<usize>,
+    #[case] byte_budget: ByteBudgetCase,
+    #[case] limiting_budgets: Vec<SourceBudgetLimit>,
+    #[case] selected_tasks: usize,
+    #[values(BudgetPlanningPath::Ordinary, BudgetPlanningPath::Grouped)] path: BudgetPlanningPath,
+) {
+    let dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(4), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        ..Default::default()
+    };
+    let unlimited = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan(&dataset)
+        .await
+        .unwrap();
+    assert_eq!(unlimited.num_tasks(), 2);
+    let task_bytes: Vec<u64> = unlimited
+        .tasks()
+        .iter()
+        .map(|task| {
+            task.fragments
+                .iter()
+                .flat_map(|fragment| &fragment.files)
+                .map(|file| file.file_size_bytes.get().unwrap().get())
+                .sum()
+        })
+        .collect();
+    assert!(task_bytes[0] > 1);
+    let options = CompactionOptions {
+        max_source_rows,
+        max_source_fragments,
+        max_source_bytes: match byte_budget {
+            ByteBudgetCase::Unset => None,
+            ByteBudgetCase::BelowFirstTask => Some(task_bytes[0] - 1),
+            ByteBudgetCase::FirstTask => Some(task_bytes[0]),
+        },
+        ..options
+    };
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let planner = DefaultCompactionPlanner::new(options.clone()).unwrap();
+    let result = match path {
+        BudgetPlanningPath::Ordinary => planner.plan_with_budget(&dataset).await,
+        BudgetPlanningPath::Grouped => {
+            let groups = dataset
+                .manifest
+                .fragments
+                .chunks(2)
+                .map(|fragments| CompactionGroup {
+                    fragments: fragments.to_vec(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                })
+                .collect();
+            planner.plan_groups_with_budget(&dataset, groups).await
+        }
+    }
+    .unwrap();
+    let summary = &result.source_budget;
+    assert_eq!(result.plan.num_tasks(), selected_tasks);
+    assert_eq!(summary.candidate_tasks, 2);
+    assert_eq!(summary.selected_tasks, selected_tasks);
+    assert_eq!(summary.selected_source_rows, selected_tasks * 100);
+    assert_eq!(summary.selected_source_fragments, selected_tasks * 2);
+    assert_eq!(
+        summary.selected_source_bytes,
+        options
+            .max_source_bytes
+            .map(|_| task_bytes[..selected_tasks].iter().sum())
+    );
+    assert_eq!(summary.limiting_budgets, limiting_budgets);
+    assert_eq!(summary.budget_exhausted(), selected_tasks < 2);
+    assert_eq!(summary.is_blocked(), selected_tasks == 0);
+    assert_eq!(
+        summary.next_task_source_rows,
+        (selected_tasks < 2).then_some(100)
+    );
+    assert_eq!(
+        summary.next_task_source_fragments,
+        (selected_tasks < 2).then_some(2)
+    );
+    assert_eq!(
+        summary.next_task_source_bytes,
+        options
+            .max_source_bytes
+            .and_then(|_| task_bytes.get(selected_tasks).copied())
+    );
+
+    let output = std::fs::read_to_string(logs.path()).unwrap();
+    if summary.is_blocked() {
+        for expected in [
+            "candidate_tasks=2".to_string(),
+            format!("max_source_rows={max_source_rows:?}"),
+            format!("max_source_fragments={max_source_fragments:?}"),
+            format!("max_source_bytes={:?}", options.max_source_bytes),
+            format!("limiting_budgets={limiting_budgets:?}"),
+            "first_task_source_rows=Some(100)".to_string(),
+            "first_task_source_fragments=Some(2)".to_string(),
+            format!(
+                "first_task_source_bytes={:?}",
+                summary.next_task_source_bytes
+            ),
+        ] {
+            assert!(output.contains(&expected), "missing {expected}: {output}");
+        }
+    } else {
+        assert!(
+            !output.contains("Compaction source budget cannot admit"),
+            "{output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_grouped_budget_report_preserves_fragment_cutoff_before_byte_validation() {
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount(4), FragmentRowCount(50))
+        .await
+        .unwrap();
+    let mut manifest = dataset.manifest.as_ref().clone();
+    let mut fragments = manifest.fragments.as_ref().clone();
+    fragments[2].files[0].file_size_bytes = Default::default();
+    manifest.fragments = Arc::new(fragments);
+    dataset.manifest = Arc::new(manifest);
+    let groups: Vec<_> = dataset
+        .manifest
+        .fragments
+        .chunks(2)
+        .map(|fragments| CompactionGroup {
+            fragments: fragments.to_vec(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        })
+        .collect();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 100,
+        max_source_fragments: Some(2),
+        max_source_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    let result = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .plan_groups_with_budget(&dataset, groups.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.plan.num_tasks(), 1);
+    assert_eq!(result.source_budget.candidate_tasks, 2);
+    assert_eq!(result.source_budget.selected_tasks, 1);
+    assert_eq!(result.source_budget.next_task_source_rows, Some(100));
+    assert_eq!(result.source_budget.next_task_source_fragments, Some(2));
+    assert_eq!(result.source_budget.next_task_source_bytes, None);
+    assert_eq!(
+        result.source_budget.limiting_budgets,
+        vec![SourceBudgetLimit::Fragments]
+    );
+    assert!(result.source_budget.budget_exhausted());
+
+    let error = DefaultCompactionPlanner::new(CompactionOptions {
+        max_source_fragments: None,
+        ..options
+    })
+    .unwrap()
+    .plan_groups_with_budget(&dataset, groups)
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("no size recorded"), "{error}");
 }

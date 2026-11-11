@@ -36,10 +36,12 @@ use rstest::rstest;
 
 use super::dataset_overlay_index_masking::commit_overlay;
 use crate::Dataset;
-use crate::dataset::WriteParams;
+use crate::dataset::{WriteMode, WriteParams};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::fts::{MatchQueryExec, PhraseQueryExec, SharedFtsScorerExec};
+use crate::io::exec::fts::{
+    FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorerExec,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -253,6 +255,134 @@ async fn build_segments(
         .await
         .unwrap();
     segments
+}
+
+#[rstest]
+#[tokio::test]
+async fn list_fts_corpus_owner(
+    #[values(Kind::Match, Kind::Phrase)] kind: Kind,
+    #[values(false, true)] is_stable: bool,
+    #[values(false, true)] filtered: bool,
+) {
+    let batch = |start| {
+        let mut text = ListBuilder::new(StringBuilder::new());
+        for row in [
+            Some(vec![Some("alpha beta"), Some("alpha")]),
+            Some(vec![None, Some("alpha beta")]),
+            Some(vec![Some("alpha x beta"), Some("other")]),
+            Some(vec![Some("alpha"), Some("beta")]),
+            Some(vec![]),
+            None,
+        ] {
+            if let Some(values) = row {
+                for value in values {
+                    text.values().append_option(value);
+                }
+                text.append(true);
+            } else {
+                text.append(false);
+            }
+        }
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(start..start + 6)) as ArrayRef,
+            ),
+            ("text", Arc::new(text.finish()) as ArrayRef),
+        ])
+        .unwrap()
+    };
+    let mut dataset = write(batch(0), is_stable).await;
+    let granularity = DocumentGranularity::ListElement;
+    build_segments(&mut dataset, granularity).await;
+    let residual = batch(6);
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(residual.clone())], residual.schema()),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let query = match kind {
+        Kind::Match => FtsQuery::Match(
+            MatchQuery::new("alpha beta".into())
+                .with_column(Some("text".into()))
+                .with_operator(Operator::And)
+                .with_document_granularity(granularity),
+        ),
+        Kind::Phrase => FtsQuery::Phrase(
+            PhraseQuery::new("alpha beta".into())
+                .with_column(Some("text".into()))
+                .with_document_granularity(granularity),
+        ),
+    };
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    if filtered {
+        scanner.filter("id % 3 != 1").unwrap().prefilter(true);
+    }
+    let plan = scanner.create_plan().await.unwrap();
+    let mut owners = Vec::new();
+    plan.apply(|node| {
+        if node.is::<SharedFtsScorerExec>() {
+            owners.push(node.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    assert_eq!(
+        owners.len(),
+        1,
+        "mixed list plan needs an explicit corpus owner"
+    );
+    let owner = owners[0].downcast_ref::<SharedFtsScorerExec>().unwrap();
+    let binding = owner.binding().unwrap();
+    let at_path = |path: &[usize]| {
+        let mut node = owner.children()[0].clone();
+        for &child in path {
+            node = node.children()[child].clone();
+        }
+        node
+    };
+    assert!(at_path(&binding.producer_path).is::<FlatMatchQueryExec>());
+    let consumer = at_path(&binding.consumer_path);
+    assert!(match kind {
+        Kind::Match => consumer.is::<MatchQueryExec>(),
+        Kind::Phrase => consumer.is::<PhraseQueryExec>(),
+    });
+
+    let expected: Vec<_> = (0..12)
+        .filter(|row| !filtered || row % 3 != 1)
+        .filter_map(|row| match row % 6 {
+            0 => Some((row_id(row, is_stable), vec![0])),
+            1 => Some((row_id(row, is_stable), vec![1])),
+            2 if matches!(kind, Kind::Match) => Some((row_id(row, is_stable), vec![0])),
+            _ => None,
+        })
+        .collect();
+    let first = results(plan.clone()).await;
+    assert_eq!(
+        first
+            .iter()
+            .map(|(row, doc, _)| (*row, doc.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    // Exercise scanner-created ownership and reconstructed ownership independently.
+    // Reusing either plan must not retain a consumed producer or stale scorer state.
+    let rebuilt = restore_plan(plan.clone());
+    for replay in [plan, rebuilt.clone(), rebuilt] {
+        assert_eq!(results(replay).await, first);
+    }
 }
 
 #[rstest]

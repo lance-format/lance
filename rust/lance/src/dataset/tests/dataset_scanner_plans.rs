@@ -21,6 +21,7 @@ use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datagen::{
     ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
 };
+use lance_file::reader::FileReaderOptions;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::SCORE_COL;
@@ -41,14 +42,15 @@ use rstest::rstest;
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, append_scalar_filter_test_data, assert_plan_equals,
-    assert_query_index_field, limit_offset_equivalency_test, make_scalar_filter_test_dataset,
+    assert_query_index_field, find_filtered_read, limit_offset_equivalency_test,
+    make_scalar_filter_test_dataset,
 };
 use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::{StageParams, VectorIndexParams};
 use crate::io::exec::Planner;
-use crate::io::exec::filtered_read::filter_read_columns;
+use crate::io::exec::filtered_read::{FilteredReadThreadingMode, filter_read_columns};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{Error, Result};
 
@@ -1875,8 +1877,9 @@ CoalesceBatchesExec: target_batch_size=8192
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
 MatchQuery: column=s, query=[hello]
-  LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+  PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+    LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1989,12 +1992,12 @@ MatchCorpus
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]
-          LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
             ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+            LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
         FlatMatchQuery: column=s, query=hello
           LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
-          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-            ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -2273,6 +2276,148 @@ async fn test_batch_fast_search_without_index_returns_empty_with_query_index() {
 
     assert_eq!(batch.num_rows(), 0);
     assert_query_index_field(&batch);
+}
+
+#[rstest]
+#[case::default(None, None, None, 16 * 1024 * 1024)]
+#[case::dataset(Some(1024), None, None, 1024)]
+#[case::reader(None, Some(2048), None, 2048)]
+#[case::reader_over_dataset(Some(1024), Some(2048), None, 2048)]
+#[case::scanner_over_reader(Some(1024), Some(2048), Some(4096), 4096)]
+#[case::larger_explicit(None, None, Some(64 * 1024 * 1024), 64 * 1024 * 1024)]
+#[tokio::test]
+async fn test_fts_tail_decode_byte_target(
+    #[case] dataset_bytes: Option<u64>,
+    #[case] reader_bytes: Option<u64>,
+    #[case] scanner_bytes: Option<u64>,
+    #[case] expected_bytes: u64,
+) {
+    let batch = arrow_array::record_batch!((
+        "text",
+        Utf8,
+        [
+            Some("needle"),
+            Some("other"),
+            None,
+            Some("needle needle"),
+            Some("needle filler"),
+            Some("unrelated")
+        ]
+    ))
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.slice(0, 3))], batch.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.slice(3, 3))], batch.schema()),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    let query = FullTextSearchQuery::new("needle".into())
+        .with_column("text".into())
+        .unwrap();
+    let expected = dataset
+        .scan()
+        .batch_size(1)
+        .full_text_search(query.clone())
+        .unwrap()
+        .project(&[ROW_ID, SCORE_COL])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+
+    dataset.file_reader_options = dataset_bytes.map(|batch_size_bytes| {
+        Arc::new(FileReaderOptions {
+            batch_size_bytes: Some(batch_size_bytes),
+            ..Default::default()
+        })
+    });
+    let ordinary = dataset.scan().create_plan().await.unwrap();
+    assert_eq!(
+        find_filtered_read(ordinary.as_ref())
+            .unwrap()
+            .options()
+            .file_reader_options
+            .as_ref()
+            .and_then(|opts| opts.batch_size_bytes),
+        dataset_bytes
+    );
+
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(query)
+        .unwrap()
+        .project(&[ROW_ID, SCORE_COL])
+        .unwrap();
+    scanner.batch_readahead(3).io_buffer_size(8192);
+    if let Some(batch_size_bytes) = reader_bytes {
+        scanner.with_file_reader_options(FileReaderOptions {
+            batch_size_bytes: Some(batch_size_bytes),
+            ..Default::default()
+        });
+    }
+    if let Some(batch_size_bytes) = scanner_bytes {
+        scanner.batch_size_bytes(batch_size_bytes);
+    }
+    let plan = scanner.create_plan().await.unwrap();
+    let options = find_filtered_read(plan.as_ref()).unwrap().options();
+    assert_eq!(
+        options
+            .file_reader_options
+            .as_ref()
+            .and_then(|opts| opts.batch_size_bytes),
+        Some(expected_bytes)
+    );
+    assert_eq!(options.io_buffer_size_bytes, Some(8192));
+    assert_eq!(
+        options.threading_mode,
+        FilteredReadThreadingMode::OnePartitionMultipleThreads(3)
+    );
+    let actual = scanner.try_into_batch().await.unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.num_rows(), 3);
+    if dataset_bytes.is_none() && reader_bytes.is_none() && scanner_bytes.is_none() {
+        // The internal text budget must not conflict with strict output batching.
+        let batches = scanner
+            .batch_size(2)
+            .strict_batch_size(true)
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(concat_batches(&actual.schema(), &batches).unwrap(), actual);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

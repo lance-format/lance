@@ -1819,10 +1819,11 @@ impl BatchDecodeStream {
                 // Real decode work happens inside into_batch, which can block the current
                 // thread for a long time. By spawning it as a new task, we allow Tokio's
                 // worker threads to keep making progress.
-                let (batch, _data_size) =
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??;
+                let (batch, _data_size) = lance_core::utils::tokio::spawn(async move {
+                    next_task.into_batch(emitted_batch_size_warning)
+                })
+                .await
+                .map_err(|err| Error::wrapped(err.into()))??;
                 Ok(batch)
             };
             // This should be true since batch size is u32
@@ -2306,9 +2307,11 @@ impl StructuralBatchDecodeStream {
             let has_variable_width = slf.has_variable_width;
             let task = async move {
                 let (batch, data_size) = if spawn_batch_decode_tasks {
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??
+                    lance_core::utils::tokio::spawn(async move {
+                        next_task.into_batch(emitted_batch_size_warning)
+                    })
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??
                 } else {
                     next_task.into_batch(emitted_batch_size_warning)?
                 };
@@ -2496,7 +2499,7 @@ pub struct SchedulerDecoderConfig {
 
 fn check_scheduler_on_drop(
     stream: BoxStream<'static, ReadBatchTask>,
-    scheduler_handle: tokio::task::JoinHandle<()>,
+    scheduler_handle: lance_core::utils::tokio::JoinHandle<()>,
 ) -> BoxStream<'static, ReadBatchTask> {
     // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
     // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
@@ -2711,7 +2714,7 @@ async fn create_scheduler_decoder(
         let scheduling = async move {
             decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io)
         };
-        let scheduler_handle = tokio::task::spawn(scheduling);
+        let scheduler_handle = lance_core::utils::tokio::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
     }
 }
