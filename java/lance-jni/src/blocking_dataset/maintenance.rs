@@ -404,11 +404,7 @@ fn inner_explain_expire_versions<'local>(
 ) -> Result<JObject<'local>> {
     let policy = extract_expire_versions_policy(env, &jpolicy)?;
 
-    let plan = {
-        let dataset =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_expire_versions(policy)
-    }?;
+    let plan = clone_dataset(env, &jdataset)?.explain_expire_versions(policy)?;
 
     expire_versions_plan_to_java(env, plan)
 }

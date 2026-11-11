@@ -249,7 +249,9 @@ public class DirectoryNamespaceTest {
             .tableId(tableId)
             .build()) {
       dataset.tags().create("v1", 1);
-      // One call per read entry point that releases the native dataset before its I/O.
+      // Exercise representative reads affected by the clone-before-I/O change. Their
+      // progress while the refresh is parked shows that they do not wait for it; it does
+      // not prove that every read entry point releases the native field guard.
       Map<String, Callable<Object>> reads = new LinkedHashMap<>();
       reads.put("countRows", dataset::countRows);
       reads.put("take", () -> countBatchRows(dataset.take(Arrays.asList(0L), Arrays.asList("id"))));
