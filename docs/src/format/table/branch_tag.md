@@ -65,6 +65,8 @@ Branch datasets are organized using the `tree/` directory at the dataset root:
             _indices/
                 {UUID}/
                     index.idx
+            _retention/
+                *.json
 ```
 
 Named branches store their version-specific files under `tree/{branch_name}/`, resembling the GitHub branch path convention.
@@ -130,68 +132,91 @@ Each tag file is a JSON file with the following fields:
 
 Cleanup can run at the same time as operations that publish a reference to an old version: tag
 creation and update, branch creation, and restore. To stop a reference from being published to a
-version that cleanup is deleting, cleanup records which versions it **expires** in two
-[table config](table_config.md) keys before it deletes anything:
-
-| Key                            | Value                                                                                  |
-|--------------------------------|----------------------------------------------------------------------------------------|
-| `lance.history.expired_before` | A decimal version number `F`.                                                          |
-| `lance.history.retained`       | Ascending, comma-separated decimal version numbers below `F` that cleanup keeps. Missing or empty means none. |
-
-A version `v` of a branch is **expired** when that branch's latest manifest has `v < F` and `v` is
-not listed in `lance.history.retained`. Retained versions are typically tagged versions, branch
-points, and versions kept by thinning retention rules.
+version that cleanup is deleting, cleanup records which versions it **expires** in a retention file
+before it deletes anything.
 
 Expiration affects only new references. Readers may still check out an expired version until cleanup
 deletes it, but tags, branches, and restores must not newly reference it.
 
-The keys are per branch and apply only to versions of that branch. A branch continues its parent's
-numbering (a branch created from version 50 starts at version 51), so values copied from the parent
-never match a version of the branch.
+### Retention Files
 
-The keys are table config rather than manifest fields so that writers that do not recognize them
-carry them forward unchanged. The protection is best-effort. A writer that does not implement this
-section may change or drop the keys, and missing or malformed values must be treated as expiring
-nothing. In those cases references and cleanup race as they would without these keys.
+Each branch keeps its retention files in a `_retention/` directory under its own root: the dataset
+root for the default branch, and `tree/{branch_name}/` for a named branch. Files are named
+`{n}.json`, where `n` is a positive decimal integer. The file with the largest `n` holds the
+branch's current rule:
+
+| JSON Key        | Type             | Description                                                                 |
+|-----------------|------------------|-----------------------------------------------------------------------------|
+| `expiredBefore` | number           | A version number `F`.                                                       |
+| `retained`      | array of numbers | Ascending version numbers below `F` that are not expired. May be empty.     |
+
+A version `v` of a branch is **expired** when the branch's current rule has `v < F` and `v` is not
+in `retained`. Retained versions are typically tagged versions, branch points, and versions kept by
+thinning retention rules.
+
+A branch continues its parent's numbering (a branch created from version 50 starts at version 51),
+and a new branch has no retention files.
+
+To write a rule, a writer reads the current file `{n}.json` and creates `{n+1}.json` with
+put-if-not-exists, the same operation that commits manifests. If `{n+1}.json` already exists, the
+writer reads it and tries again. A writer that finds no retention files creates `1.json`.
+
+Expiration is monotonic. A new rule must not lift the expiration of any version that its
+predecessor expires, so a writer always merges its rule `(F_own, R_own)` with the current rule
+`(F', R')`. The merged rule has `F = max(F_own, F')`, and lists as retained exactly the versions below
+`F` that neither rule expires: those with `v >= F_own` or `v` in `R_own`, and also `v >= F'` or
+`v` in `R'`. Implementations may offer an explicit override that writes any rule. Lifting expiration
+is safe only when no cleanup that read an earlier rule is still deleting.
+
+The protection is best-effort. Writers that do not implement this section ignore retention files
+and pins. A missing `_retention/` directory or a current file that cannot be parsed must be treated
+as expiring nothing. In those cases references and cleanup race as they would without this section.
+
+### Pins
+
+A pin is a short-lived reference that a restore holds while it commits. Pins are JSON files stored at
+`_refs/pins/{uuid}.json` in the dataset root:
+
+| JSON Key    | Type   | Optional | Description                                                              |
+|-------------|--------|----------|--------------------------------------------------------------------------|
+| `branch`    | string | Yes      | Branch name being pinned. `null` or absent indicates the default branch. |
+| `version`   | number |          | Version number being pinned within that branch.                          |
+| `createdAt` | string |          | RFC 3339 timestamp for when the pin was created.                         |
+
+Cleanup treats a pinned version like a tagged one. It may delete pins created more than 24 hours
+ago, which are left behind by restores that did not finish.
 
 ### Cleanup
 
 Before deleting any manifest, cleanup must:
 
 1. Determine the versions it will delete and the versions below `F` it will keep.
-2. Commit an [UpdateConfig](transaction.md#updateconfig) that sets both keys, with `F` greater than
-   every version it will delete. `F` must not be lower than the current value. If neither key would
-   change, the commit is skipped.
-3. After that commit succeeds, list tags and branches and keep every version they reference.
+2. Write a rule with `F` greater than every version it will delete, merged with the current rule as
+   described above. If the merged rule equals the current rule, the write is skipped.
+3. After the write succeeds, list tags, branches, and pins and keep every version they reference.
 4. Delete.
+5. Delete retention files other than the one with the largest `n`.
 
-A version kept in step 3 stays expired until a later cleanup lists it as retained. Committed
-keys remain valid if cleanup stops before deleting, and a later cleanup continues from them.
-
-If the commit conflicts with a concurrent commit that sets the keys, cleanup rebases onto the new
-values `(F', R')`. It writes `F = max(F_own, F')`, and lists as retained exactly the versions below
-`F` that neither rule expires: those with `v >= F_own` or `v` in `R_own`, and also `v >= F'` or
-`v` in `R'`.
+A version kept in step 3 stays expired. Written rules remain valid if cleanup stops before deleting,
+and a later cleanup continues from them.
 
 ### Publishing References
 
 Tag creation, tag update, and branch creation that target version `v` of branch `b` must write the
-reference first and then read the latest manifest of `b`. If `v` is expired there, the writer
-must remove the reference it wrote and fail. Implementations may offer an explicit option that skips
-this check.
+reference first and then read the current rule of `b`. If `v` is expired there, the writer must remove
+the reference it wrote and fail.
 
-Restore of version `v` must fail if `v` is expired in the manifest the restore commits on top of.
-This covers rules committed before the restore read the table; rules committed after it are caught
-by the conflict rules in [Restore Compatibility](transaction.md#restore-compatibility).
+Restore of version `v` of branch `b` must:
 
-### Writer Rules
+1. Write a pin for `v`.
+2. Read the current rule of `b`. If `v` is expired there, delete the pin and fail.
+3. Commit the restore.
+4. Delete the pin.
 
-- Only cleanup, including version expiration, sets these keys. Other UpdateConfig operations must not set or remove them.
-- Restore must carry the keys of the manifest it rebases onto, not those of the restored version.
-- Branch creation should not copy the keys into the new branch.
+Implementations may offer an explicit option that skips these checks.
 
 ### Guarantees
 
 When cleanup and the publishing writer both implement this section, a reference published while
 cleanup runs either keeps its version from deletion or is rejected. There is no guarantee when
-either side does not implement it, or when the keys were dropped or malformed.
+either side does not implement it, or when the current rule is missing or malformed.

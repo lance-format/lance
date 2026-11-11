@@ -15,7 +15,7 @@ are defined in the
 
 The dataset root is the location where the dataset was initially created.
 Every Lance dataset has exactly one dataset root, which serves as the primary storage location for the dataset's files.
-The dataset root contains the standard subdirectory structure (`data/`, `_blobs/`, `_versions/`, `_deletions/`, `_indices/`, `_refs/`, `tree/`) that organizes the dataset's files.
+The dataset root contains the standard subdirectory structure (`data/`, `_blobs/`, `_versions/`, `_deletions/`, `_indices/`, `_refs/`, `_retention/`, `tree/`) that organizes the dataset's files.
 
 ## Basic Layout
 
@@ -45,6 +45,10 @@ A Lance dataset in its basic form stores all files within the dataset root direc
             *.json        -- Tag metadata
         branches/
             *.json        -- Branch metadata
+        pins/
+            *.json        -- Restore pins (see History Retention)
+    _retention/
+        *.json            -- History retention rules (see History Retention)
     _bt/
         ...               -- Fragment tree objects (see Fragment Metadata Tree)
     tree/
