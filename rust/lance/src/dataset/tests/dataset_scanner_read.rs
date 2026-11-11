@@ -24,7 +24,7 @@ use futures::stream::StreamExt;
 use half::f16;
 use lance_arrow::SchemaExt;
 use lance_core::ROW_ID;
-use lance_core::cache::LanceCache;
+use lance_core::cache::{CacheSnapshotMode, LanceCache};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datagen::{
@@ -2257,11 +2257,46 @@ async fn test_ann_with_deletion(
             .await
             .unwrap();
 
+        let occupancy = dataset
+            .session()
+            .cache_diagnostics_by_type(CacheSnapshotMode::Refreshed)
+            .await
+            .index
+            .by_type
+            .unwrap()
+            .occupancy
+            .unwrap();
+        let row_id_entries: Vec<_> = occupancy
+            .types
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.type_name.as_str(),
+                    "CachedRowIdIndex" | "LatestRowIdIndex" | "RowIdIndexPart"
+                )
+            })
+            .map(|entry| (entry.type_name.as_str(), entry.num_entries))
+            .collect();
+        // The snapshot directory and reuse hint do not own the prepared graph;
+        // that allocation is cached and charged separately.
+        assert_eq!(
+            row_id_entries,
+            if stable_row_ids {
+                vec![
+                    ("CachedRowIdIndex", 1),
+                    ("LatestRowIdIndex", 1),
+                    ("RowIdIndexPart", 1),
+                ]
+            } else {
+                vec![]
+            }
+        );
         assert_eq!(
             dataset.index_cache_entry_count().await,
             // The vector index, its partitions and the segment ownership mask,
-            // plus versioned index metadata and the stable-row-id lookup.
-            6 + dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
+            // plus versioned index metadata and the separately checked row-ID entries.
+            6 + dataset.versions().await.unwrap().len()
+                + row_id_entries.iter().map(|(_, count)| count).sum::<u64>() as usize
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];
