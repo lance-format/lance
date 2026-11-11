@@ -108,10 +108,14 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::index_files_to_table;
+    use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::minhash_lsh::{BANDS_FILENAME, MinHashQuery, SIGNATURES_FILENAME};
-    use lance_index::scalar::{BuiltinIndexType, IndexStore, ScalarIndexParams, index_files_to_table};
+    use lance_index::scalar::{BuiltinIndexType, IndexStore, ScalarIndexParams};
+    use uuid::Uuid;
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::index::LanceIndexStoreExt;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::{CreateIndexBuilder, DatasetIndexExt};
