@@ -44,8 +44,11 @@ class BFloat16Array(pa.ExtensionArray):
 
         from ml_dtypes import bfloat16
 
-        buffer = self.storage.buffers()[1]
-        array = np.frombuffer(buffer, dtype=bfloat16)
+        storage = self.storage
+        buffer = storage.buffers()[1]
+        array = np.frombuffer(
+            buffer, dtype=bfloat16, count=len(storage), offset=storage.offset * 2
+        )
 
         return array
 
