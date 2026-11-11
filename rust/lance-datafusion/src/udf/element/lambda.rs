@@ -21,13 +21,14 @@
 //! Only this shape is accepted. The body may refer to the fields of the lambda
 //! parameter and nothing else, and any other lambda is an error.
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
 use arrow_schema::DataType;
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Expr as SQLExpr, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart, OneOrManyWithParens,
-    Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
+    AccessExpr, BinaryOperator, Expr as SQLExpr, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart,
+    OneOrManyWithParens, Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
     visit_expressions_mut,
 };
 use lance_core::{Error, Result};
@@ -49,6 +50,11 @@ pub fn rewrite_element_lambdas(
     filter: &mut SQLExpr,
     type_of: impl Fn(&SQLExpr) -> Result<DataType>,
 ) -> Result<()> {
+    // The visitors below recurse over the AST, and a filter such as
+    // `a AND b AND ...` parses as a chain as deep as its number of operands.
+    // Balance those chains first; `Planner::binary_expr` rebuilds the same
+    // chains balanced after parsing, so the result is unchanged.
+    let _ = VisitMut::visit(filter, &mut BalanceLogicalBinaryExprs);
     if let ControlFlow::Break(err) = VisitMut::visit(filter, &mut LambdaRewriter { type_of }) {
         return Err(err);
     }
@@ -66,6 +72,72 @@ pub fn rewrite_element_lambdas(
         ))),
         None => Ok(()),
     }
+}
+
+struct BalanceLogicalBinaryExprs;
+
+impl VisitorMut for BalanceLogicalBinaryExprs {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut SQLExpr) -> ControlFlow<()> {
+        balance_logical_binary_expr(expr);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Rebuild `expr`, when it is a chain of `AND` or `OR`, as a balanced tree.
+///
+/// Only one associative operator is regrouped: `(a AND b) AND c` becomes
+/// `a AND (b AND c)`, while `AND` and `OR` are never mixed.
+fn balance_logical_binary_expr(expr: &mut SQLExpr) {
+    let op = match expr {
+        SQLExpr::BinaryOp {
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            ..
+        } => op.clone(),
+        _ => return,
+    };
+    let placeholder = SQLExpr::value(Value::Null);
+    let SQLExpr::BinaryOp { left, right, .. } = std::mem::replace(expr, placeholder) else {
+        unreachable!("the expression was matched as a binary operation above")
+    };
+
+    let mut stack = vec![*right, *left];
+    let mut leaves = Vec::new();
+    while let Some(expr) = stack.pop() {
+        match expr {
+            SQLExpr::BinaryOp {
+                left,
+                op: child_op,
+                right,
+            } if child_op == op => {
+                stack.push(*right);
+                stack.push(*left);
+            }
+            leaf => leaves.push(leaf),
+        }
+    }
+
+    let mut exprs = VecDeque::from(leaves);
+    while exprs.len() > 1 {
+        let mut next = VecDeque::with_capacity(exprs.len().div_ceil(2));
+        while let Some(left) = exprs.pop_front() {
+            if let Some(right) = exprs.pop_front() {
+                next.push_back(SQLExpr::BinaryOp {
+                    left: Box::new(left),
+                    op: op.clone(),
+                    right: Box::new(right),
+                });
+            } else {
+                next.push_back(left);
+            }
+        }
+        exprs = next;
+    }
+
+    *expr = exprs
+        .pop_front()
+        .expect("a binary expression has at least two operands");
 }
 
 struct LambdaRewriter<F> {
