@@ -786,7 +786,7 @@ block is `128 * w` bytes, laid out by `w`:
 | --------- | ---------------------------------------------------------------------------------------------------- |
 | 0         | Empty. Every value is zero.                                                                          |
 | 1 to 64   | The low `k` bits of each value in the transposed layout, with `k = 32` when `w` is at most 32 and `k = 64` otherwise. |
-| 65 to 127 | A bit stream in which bit `b` is bit `b % 8` of byte `b / 8`. Value `i` occupies bits `i * w` to `(i + 1) * w - 1`. |
+| 65 to 127 | The low 64 bits of the 1024 values as little-endian 64-bit words, followed by the high `w - 64` bits of each value in the transposed layout with `k = 64` at width `w - 64`. |
 | 128       | The 1024 values as little-endian 16-byte integers.                                                   |
 
 The transposed layout packs 1024 `k`-bit values at width `w` (`0 < w <= k`) into `w * 1024 / k` little-endian `k`-bit
