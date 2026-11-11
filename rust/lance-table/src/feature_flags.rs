@@ -669,7 +669,7 @@ pub fn validate_non_reusable_field_id_flags(manifest: &Manifest) -> Result<()> {
 /// Refuse a lease list that writers must not carry forward: an invalid or
 /// duplicate record, or a list whose writer flag disagrees with it. Readers
 /// ignore the list, so this is checked only before writes.
-fn validate_retention_leases(manifest: &Manifest) -> Result<()> {
+pub fn validate_retention_leases(manifest: &Manifest) -> Result<()> {
     if let Some(error) = manifest.retention_lease_error() {
         return Err(Error::corrupt_file_named(
             "manifest",

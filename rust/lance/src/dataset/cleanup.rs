@@ -45,6 +45,7 @@ pub use retention::{CleanupRule, parse_cleanup_policy};
 
 use super::mem_wal::util::is_mem_wal_dir_name;
 use super::refs::{REFS_DIR, TagContents, normalize_branch};
+use super::version_retention::LeaseRetention;
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -439,6 +440,10 @@ struct CleanupTask<'a> {
     ignored_manifests: HashSet<Path>,
     track_removed_manifests: bool,
     include_referenced_branches: bool,
+    /// What the leases listed on the read version protect. A lease listed on a newer
+    /// version holds that version or a later one, which cleanup keeps anyway, so for
+    /// retaining versions the read version's list suffices.
+    leases: Option<LeaseRetention>,
 }
 
 /// Cache identity includes the cleanup owner's base IDs.
@@ -502,6 +507,12 @@ struct CleanupInspection {
     /// Set when an expired manifest was classified from the listing instead of read, so
     /// its commit time is unknown and the listing cutoff cannot be trusted.
     skipped_expired_manifest_read: bool,
+    /// Versions from the oldest leased one up to the read version whose manifest was read
+    /// and, after the leased version, records the transaction a holder rebases over.
+    confirmed_lease_history: HashSet<u64>,
+    /// The earliest `staged_files_since` among leases listed on the read version or any
+    /// newer one, so a lease acquired since the read still protects its staged output.
+    staged_files_since: Option<DateTime<Utc>>,
 }
 
 impl CleanupInspection {
@@ -921,6 +932,7 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
+            leases: None,
         })
     }
 
@@ -1047,6 +1059,8 @@ impl<'a> CleanupTask<'a> {
             );
         }
 
+        self.leases = LeaseRetention::from_leases(&self.dataset.manifest.retention_leases);
+
         // we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
 
@@ -1083,6 +1097,7 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
         let inspection = self.process_manifests(&tagged_versions, inspection).await?;
+        self.ensure_lease_history_confirmed(&inspection)?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -1183,6 +1198,37 @@ impl<'a> CleanupTask<'a> {
             .list_manifest_locations(base, object_store, false)
             .chain(detached)
             .boxed()
+    }
+
+    /// Refuse to clean up when a version a lease holder needs is missing.
+    ///
+    /// Without a version's manifest there is no way to tell which files it references, so
+    /// no deletion can be shown safe for it. The window is short-lived and a gap in it is
+    /// damage rather than a state a lease-aware writer produces, so failing the whole run
+    /// is preferred over guessing which deletions might still be safe.
+    fn ensure_lease_history_confirmed(&self, inspection: &CleanupInspection) -> Result<()> {
+        let Some(leases) = self.leases else {
+            return Ok(());
+        };
+        let unconfirmed: Vec<u64> = (leases.oldest_version..=self.read_version)
+            .filter(|version| !inspection.confirmed_lease_history.contains(version))
+            .collect();
+        if unconfirmed.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Cleanup {
+            message: format!(
+                "Cannot confirm the history that retention leases retain: {} version(s) from \
+                 the oldest leased version {} through {} are missing their manifest or \
+                 transaction file (first: {:?}). Nothing on this branch was deleted; cleanup \
+                 can proceed once those leases are released or expire and a commit removes \
+                 them.",
+                unconfirmed.len(),
+                leases.oldest_version,
+                self.read_version,
+                &unconfirmed[..unconfirmed.len().min(10)],
+            ),
+        })
     }
 
     async fn inspect_managed_blobs(
@@ -1353,10 +1399,14 @@ impl<'a> CleanupTask<'a> {
         // This is the whole cost on a table that has accumulated versions faster than it
         // cleaned them, where almost every manifest is expired. Retained branch roots
         // must also be read so all of their files join the working set.
+        let in_lease_window = self
+            .leases
+            .is_some_and(|leases| location.version >= leases.oldest_version);
         if self.policy.delete_unverified
             && self.retention_policy.is_none()
             && !tagged_versions.contains(&location.version)
             && !branch_versions.contains(&location.version)
+            && !in_lease_window
             && location.version < self.read_version
             && self.policy.proven_expired(location.version)
         {
@@ -1432,7 +1482,8 @@ impl<'a> CleanupTask<'a> {
             || is_latest
             || !(hard_expired || thinning_candidate.is_some())
             || is_tagged
-            || branch_versions.contains(&manifest.version);
+            || branch_versions.contains(&manifest.version)
+            || in_lease_window;
         if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
@@ -1442,6 +1493,22 @@ impl<'a> CleanupTask<'a> {
                 .await?;
         }
         let mut inspection = inspection.lock().unwrap();
+
+        if let Some(leases) = self.leases
+            && in_lease_window
+            && (manifest.version == leases.oldest_version || manifest.transaction_file.is_some())
+        {
+            inspection.confirmed_lease_history.insert(manifest.version);
+        }
+        if is_latest && let Some(leases) = LeaseRetention::from_leases(&manifest.retention_leases) {
+            inspection.staged_files_since = Some(
+                inspection
+                    .staged_files_since
+                    .map_or(leases.staged_files_since, |since| {
+                        since.min(leases.staged_files_since)
+                    }),
+            );
+        }
 
         // Track tagged old versions in case we want to return a `CleanupError` later.
         // Only track tagged when it is old.
@@ -1692,6 +1759,17 @@ impl<'a> CleanupTask<'a> {
         let candidate_file_limit = self.action.candidate_file_limit();
         let verification_threshold = utc_now()
             - TimeDelta::try_days(UNVERIFIED_THRESHOLD_DAYS).expect("TimeDelta::try_days");
+        // Files modified at or after this may belong to a write still in progress, and
+        // are deleted only when a manifest this run removes proves where they came from.
+        // A lease holder's staged output stays unreferenced until it publishes, however
+        // long that takes, so leases pull the threshold back even past `delete_unverified`.
+        let in_progress_since = [
+            (!self.policy.delete_unverified).then_some(verification_threshold),
+            inspection.staged_files_since,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
 
         // Build stream for a managed subtree
         let build_listing_stream = |dir: Path, unmodified_since| {
@@ -1712,8 +1790,8 @@ impl<'a> CleanupTask<'a> {
                 .try_filter_map(move |obj_meta| {
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
-                    let maybe_in_progress = !self.policy.delete_unverified
-                        && obj_meta.last_modified >= verification_threshold;
+                    let maybe_in_progress =
+                        in_progress_since.is_some_and(|since| obj_meta.last_modified >= since);
                     self.cleanup_file_if_not_referenced(obj_meta, maybe_in_progress, inspection_ref)
                 })
                 .boxed()
@@ -1816,8 +1894,8 @@ impl<'a> CleanupTask<'a> {
                     .object_store
                     .read_local_staging_files(&dir)
                     .try_filter_map(move |meta| {
-                        let can_remove = self.policy.delete_unverified
-                            || meta.last_modified < verification_threshold;
+                        let can_remove =
+                            in_progress_since.is_none_or(|since| meta.last_modified < since);
                         future::ready(Ok(can_remove.then_some(CleanupFile {
                             path: meta.location,
                             kind,
@@ -1997,7 +2075,7 @@ impl<'a> CleanupTask<'a> {
                             root.clone(),
                             retained_dirs,
                             verified_dirs,
-                            (!self.policy.delete_unverified).then_some(verification_threshold),
+                            in_progress_since,
                         )
                         .await
                     {
@@ -3371,6 +3449,8 @@ mod tests {
     mod auto_cleanup;
 
     mod branch_lineage;
+
+    mod retention_lease;
 
     #[rstest]
     #[case::zero(0)]
