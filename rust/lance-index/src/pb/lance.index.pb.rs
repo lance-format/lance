@@ -527,30 +527,37 @@ impl ::prost::Name for JsonIndexDetails {
 /// the feature is removed if its stabilization vote does not pass. Datasets
 /// that do not use the index are not affected either way.
 ///
-/// Every segment of one logical index carries the same `keys`, `key_types`
-/// and `key_encoding`.
+/// Every segment of one logical index carries the same `key_field_ids`,
+/// `key_types` and `key_encoding`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListElementIndexDetails {
-    /// The names of the element struct's fields that form the key, in key
-    /// order. Each names a direct child of the element struct, and no name
+    /// The key fields, in key order, as Lance field IDs (`file.Field.id`). Each
+    /// is a direct child of the element struct of the indexed column, and no ID
     /// appears twice. There is at least one.
-    #[prost(string, repeated, tag = "1")]
+    ///
+    /// A reader resolves each ID against the current schema and refers to the
+    /// field by its current name, so the index follows a rename. A reader must
+    /// not use the index when an ID is no longer a direct child of the element
+    /// struct, or when its field no longer has the type in `key_types`.
+    #[prost(int32, repeated, tag = "1")]
+    pub key_field_ids: ::prost::alloc::vec::Vec<i32>,
+    /// The names of the key fields when this segment was written, parallel to
+    /// `key_field_ids`. They are informational: a rename does not update them,
+    /// and a reader must not use them to find the key fields.
+    #[prost(string, repeated, tag = "2")]
     pub keys: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// The Lance logical type of each key field when the index was trained,
-    /// parallel to `keys` (for example "string" or "float"). A reader must not
-    /// use the index for a column whose key fields now have other types, because
-    /// the encoded keys would not compare correctly against encoded query
-    /// values.
-    #[prost(string, repeated, tag = "2")]
+    /// parallel to `key_field_ids` (for example "string" or "float").
+    #[prost(string, repeated, tag = "3")]
     pub key_types: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(enumeration = "ListElementKeyEncoding", tag = "3")]
+    #[prost(enumeration = "ListElementKeyEncoding", tag = "4")]
     pub key_encoding: i32,
     /// Details of the B-tree that stores the encoded keys.
-    #[prost(message, optional, tag = "4")]
+    #[prost(message, optional, tag = "5")]
     pub target_details: ::core::option::Option<::prost_types::Any>,
     /// The B-tree's own format version, the `index_version` it would have in
     /// `IndexMetadata` as a standalone index.
-    #[prost(uint32, tag = "5")]
+    #[prost(uint32, tag = "6")]
     pub target_index_version: u32,
 }
 impl ::prost::Name for ListElementIndexDetails {

@@ -35,12 +35,17 @@ byte strings in an ordinary [BTree](btree.md) over a `Binary` column, the
 `IndexMetadata.fields` holds the single `list<struct>` field the index is built
 on, which may be a `List` or a `LargeList` of a `Struct`.
 
-`keys` names the key fields, in key order. Each is the name of a direct child
-of the element struct. There is at least one key, and no name appears twice.
+`key_field_ids` identifies the key fields, in key order, by their field IDs
+(`file.Field.id`), following the [field-reference
+contract](../../table/schema.md#using-field-ids). Each is a direct child of the
+element struct, there is at least one key, and no ID appears twice. `keys` holds
+the names those fields had when the segment was written. The names are for
+display only: a rename does not update them, and a reader must not use them to
+find the key fields.
 
 `key_types` holds the [logical type](../../table/schema.md) of each key field
-when the index was trained, in the same order as `keys`. A key may have one of
-these logical types:
+when the index was trained, in the same order as `key_field_ids`. A key may
+have one of these logical types:
 
 | Logical types | Arrow types |
 |---|---|
@@ -53,10 +58,14 @@ these logical types:
 | `string`, `large_string` | Utf8 (or Utf8View), LargeUtf8 |
 | `binary`, `large_binary` | Binary (or BinaryView), LargeBinary |
 
-A reader must not use the index if any key field of the column no longer has
-the recorded logical type, since its encoded query values would not compare
-correctly with the stored keys. It must also not use the index if `keys` names
-a field the element struct no longer has.
+Before using the index, a reader resolves each ID in `key_field_ids` against
+the current schema. The field must exist, must be a direct child of the element
+struct of the column in `IndexMetadata.fields`, and must have the logical type
+recorded in `key_types`. The reader then refers to each key field by its
+current name, so the index follows a rename, including one that gives a key's
+old name to another field. If any key field fails these checks, because it was
+dropped, moved or changed type, the reader must not use the index and evaluates
+the filter on the data instead.
 
 `key_encoding` is `LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1`, the encoding
 defined in [Key Encoding](#key-encoding). A reader must not use an index whose
@@ -69,8 +78,9 @@ defined in [Key Encoding](#key-encoding). A reader must not use an index whose
 or greater, so the target stores row addresses. `IndexMetadata.index_version`
 holds the version of the list element index itself, which is 0.
 
-Every segment of one logical index has the same `keys`, `key_types` and
-`key_encoding`.
+Every segment of one logical index has the same `key_field_ids`, `key_types`
+and `key_encoding`. Their `keys` may differ, if they were written on either
+side of a rename.
 
 ## Storage Layout
 
@@ -109,10 +119,10 @@ Each element of the indexed column gives one row of the target's
 A row whose list is null has one row in `page_data.lance`, whose `values` is
 null. A row whose list is empty has none.
 
-To read the index, decode `ListElementIndexDetails`, check `keys`, `key_types`
-and `key_encoding` as above, and then read the target exactly as a standalone
-BTree, using `target_details` as its details and `target_index_version` as its
-version.
+To read the index, decode `ListElementIndexDetails`, resolve and check the key
+fields and `key_encoding` as above, and then read the target exactly as a
+standalone BTree, using `target_details` as its details and
+`target_index_version` as its version.
 
 ## Key Encoding
 
@@ -162,8 +172,9 @@ pattern `3F000000` of 0.5 with its sign bit inverted.
 The index accelerates the filter function
 `any_element(list_column, 'predicate')`, which is TRUE for a row when the
 predicate is TRUE on at least one element of its list, NULL when the list is
-null or no element matches but the predicate is NULL on some element, and FALSE
-otherwise. The predicate refers to the element's fields by name.
+null or no element makes it TRUE but it is UNKNOWN on some element, and FALSE
+otherwise. A null element makes every field UNKNOWN. The predicate refers to the
+element's fields by their current names.
 
 A reader may answer such a call from the index when its predicate is a
 conjunction that fixes the first key with `=`, `IN` or `IS NULL`. Further
@@ -174,12 +185,31 @@ range becomes one range of encoded tuples, searched in the target as a range of
 and whose next key lies in the range. The answer is the union of the row
 addresses found.
 
-The answer is exact when every conjunct is answered this way. Otherwise the
-index returns a superset of the matching rows, which the reader rechecks by
-evaluating the call on them.
+When some conjunct is not answered this way, for example a condition on a field
+that is not a key, the index returns a superset of the rows on which the call
+is TRUE, and the reader rechecks it by evaluating the call on them.
 
-The rows on which the call is NULL are the rows whose list is null, found as
-the null `values` of the target, and the rows with an element on which the
-predicate is NULL that no element makes TRUE. A reader finds the latter by
-searching the tuples in which some fixed or ranged key is null and every other
-one matches.
+`NOT any_element(...)` also needs the rows on which the call is NULL, since
+those must be excluded. They are the rows whose list is null, found as the null
+`values` of the target, and the rows with an element on which the predicate is
+UNKNOWN, unless another element of the row makes it TRUE. A conjunction is
+UNKNOWN on an element when no conjunct is FALSE and at least one is UNKNOWN.
+
+The index determines these rows exactly only when every conjunct is answered
+from the keys as above and is UNKNOWN exactly when its key is null: `=`, `IN`
+with non-null values, or a range with non-null bounds. `IS NULL` is never
+UNKNOWN. Under that condition, the predicate is UNKNOWN on an element exactly
+when a non-empty set of the keys that `=`, `IN` or the range constrain is null
+and every other constrained key matches. With k such keys there are up to
+2^k − 1 such sets, each crossed with the `IN` values of the keys it leaves
+non-null; each combination is one range of encoded tuples, with a null in the
+positions of the set. A reader may stop enumerating combinations past a limit
+of its choosing.
+
+Otherwise the index does not determine the NULL rows. That is the case when a
+conjunct is not answered from the keys, when a conjunct holds a NULL literal
+(`label IN ('car', NULL)` is UNKNOWN for `dog`, although `label` is not null),
+when it uses `IS NOT NULL`, `IS [NOT] TRUE`, `IS [NOT] FALSE`,
+`IS [NOT] UNKNOWN` or `IS [NOT] DISTINCT FROM`, or when the reader stopped
+enumerating. A reader must then not answer `NOT any_element(...)` from the
+index; it evaluates the call on the data instead.
