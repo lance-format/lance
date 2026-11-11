@@ -48,6 +48,10 @@ use dataset::merge_insert::MergeInsertBuilder;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
+use dataset::optimize_indices::{
+    PyIndexSegmentResult, PyOptimizeIndexMerge, PyOptimizeIndexTask, PyOptimizeIndices,
+    PyOptimizeIndicesPlan,
+};
 use dataset::write::write_dataset;
 use env_logger::{Builder, Env};
 use file::{
@@ -107,6 +111,7 @@ pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 pub use scanner::serialize_row_addrs;
+use transaction::PyInsertedRowsFilter;
 
 use crate::blob::{
     PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
@@ -309,6 +314,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<PyOptimizeIndices>()?;
+    m.add_class::<PyOptimizeIndicesPlan>()?;
+    m.add_class::<PyOptimizeIndexTask>()?;
+    m.add_class::<PyOptimizeIndexMerge>()?;
+    m.add_class::<PyIndexSegmentResult>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<object_store::PyObjectStoreProvider>()?;
@@ -319,6 +329,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<bitmap::PyBitmap>()?;
     m.add_class::<bitmap::PyBitmapIter>()?;
+    m.add_class::<PyInsertedRowsFilter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;

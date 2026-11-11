@@ -1,0 +1,412 @@
+{
+  "manifest_sha256": "133297bdb605ed30d5fbf7f0aa5ae7b4b81d97ad7dd7611252d4363e55500abd",
+  "input_sha256": {
+    "dino-1.npz": "02e5c8cfcc7b0fc4cc6a7637bac8379a07660396c9e3075843493caab0843228",
+    "dino-10.npz": "f5c0489f34a6f3bfaf9957c0c546731aaa69f463b2abf4869091f509091debff",
+    "dino-100.npz": "05bd90657fe6ef4ac85bbb2976aca639aa9467707b6fd5f8313dbdcf65160b6a",
+    "dino-1000.npz": "1b41fdd77d0f6443168909b813a36a811e3a846994a3318e581a5962a1c6a622",
+    "laion-1.npz": "1f8473a27015723c5f00b5ec7c67644771c843ecd23828d4cf25fc724d021509",
+    "laion-10.npz": "903f99ec658c0dbc8ac48fb0470bf6d16c473e34254a3ef5a135f2f486222a13",
+    "laion-100.npz": "3b4b5fec731dad3a946acbd3b49bc66a221887a7c97bc2bc425c780006541307",
+    "laion-1000.npz": "c08b5ae7ef6cf904681f050e496255e078e203d1e3c4a1a6e5e7325767691c7c",
+    "fineweb-1.npz": "a150babfc47f0bc521a840d2e83da909ca5fc10b4951e64d5950e44fa31a4a55",
+    "fineweb-10.npz": "737b85caf3657019f275cd9d57de50145c19e0d2278eed368c3999fbda20ade0",
+    "fineweb-100.npz": "2a9e3f95229ef2d676706228bf0058c1a13d69f619f3e2f35e15317c5ac1d69c",
+    "fineweb-1000.npz": "16f69c204f5c6579464d248f787a2501b198d1dc400b60d7d7e3fdf83e990b93",
+    "wiki-cohere-35m-1.npz": "57feb91b72e1e4473f2a89da88395ce589f11b918c81343625f6bdfd6dd856ed",
+    "wiki-cohere-35m-10.npz": "6457e6823af8b3bc4ef20cfc3b0af680e9fc9fde8a0bee981ccd8eb76741d0e9",
+    "wiki-cohere-35m-100.npz": "06b7768482bb42f33c8ca5c63524ded430355108972c521e5e76939f92a3af95",
+    "dpr-wikipedia-single-nq-1.npz": "b951138442623a653f0f4f77a04bd558bbb1f9f09e8703955d521dd1b1d98d4a",
+    "dpr-wikipedia-single-nq-10.npz": "4b5beab87a8cfa1a2e4c1bf3401bd9f837a99465df01955cb9e23a9b152d7e62",
+    "dpr-wikipedia-single-nq-100.npz": "90f99dc23aa355eb7b01fdc2005aaf65022fef9387b5475934444a62807abfc9"
+  },
+  "evaluation_used": false,
+  "scale_step": 0.001,
+  "profiles": {
+    "cosine": [
+      {
+        "effort": 0.1,
+        "target": 0.8,
+        "calibration_target": 0.81,
+        "scale": 0.278,
+        "calibration": [
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.81005859375,
+            "mean_partitions": 4.13427734375,
+            "p95_partitions": 14.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.8804687500000001,
+            "mean_partitions": 7.130859375,
+            "p95_partitions": 22.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.860302734375,
+            "mean_partitions": 11.451171875,
+            "p95_partitions": 30.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.8846767578125001,
+            "mean_partitions": 26.8837890625,
+            "p95_partitions": 69.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.83447265625,
+            "mean_partitions": 6.716796875,
+            "p95_partitions": 14.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.8525390625,
+            "mean_partitions": 11.2138671875,
+            "p95_partitions": 22.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.8550585937499999,
+            "mean_partitions": 19.1630859375,
+            "p95_partitions": 30.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.872296875,
+            "mean_partitions": 43.75341796875,
+            "p95_partitions": 69.0
+          }
+        ]
+      },
+      {
+        "effort": 0.25,
+        "target": 0.9,
+        "calibration_target": 0.91,
+        "scale": 0.563,
+        "calibration": [
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.9208984375,
+            "mean_partitions": 8.07958984375,
+            "p95_partitions": 29.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.9429199218750001,
+            "mean_partitions": 13.6630859375,
+            "p95_partitions": 44.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.9353271484375,
+            "mean_partitions": 22.7392578125,
+            "p95_partitions": 60.0
+          },
+          {
+            "corpus": "laion",
+            "metric": "cosine",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.94426806640625,
+            "mean_partitions": 54.1826171875,
+            "p95_partitions": 140.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.91015625,
+            "mean_partitions": 13.35205078125,
+            "p95_partitions": 29.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.914794921875,
+            "mean_partitions": 22.07373046875,
+            "p95_partitions": 44.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.917392578125,
+            "mean_partitions": 38.2236328125,
+            "p95_partitions": 60.0
+          },
+          {
+            "corpus": "fineweb",
+            "metric": "cosine",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.9289340820312499,
+            "mean_partitions": 88.4453125,
+            "p95_partitions": 140.0
+          }
+        ]
+      }
+    ],
+    "dot": [
+      {
+        "effort": 0.1,
+        "target": 0.8,
+        "calibration_target": 0.81,
+        "scale": 0.161,
+        "calibration": [
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 1,
+            "queries": 2500,
+            "mean_routing_recall": 0.8672,
+            "mean_partitions": 18.9948,
+            "p95_partitions": 19.0
+          },
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 10,
+            "queries": 2500,
+            "mean_routing_recall": 0.8484400000000002,
+            "mean_partitions": 43.0676,
+            "p95_partitions": 70.0
+          },
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 100,
+            "queries": 2500,
+            "mean_routing_recall": 0.841144,
+            "mean_partitions": 71.748,
+            "p95_partitions": 124.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 1,
+            "queries": 1805,
+            "mean_routing_recall": 0.817174515235457,
+            "mean_partitions": 16.177839335180057,
+            "p95_partitions": 19.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 10,
+            "queries": 1805,
+            "mean_routing_recall": 0.8129085872576178,
+            "mean_partitions": 24.0,
+            "p95_partitions": 24.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 100,
+            "queries": 1805,
+            "mean_routing_recall": 0.811257617728532,
+            "mean_partitions": 33.0,
+            "p95_partitions": 33.0
+          }
+        ]
+      },
+      {
+        "effort": 0.25,
+        "target": 0.9,
+        "calibration_target": 0.91,
+        "scale": 0.441,
+        "calibration": [
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 1,
+            "queries": 2500,
+            "mean_routing_recall": 0.9288,
+            "mean_partitions": 49.986,
+            "p95_partitions": 50.0
+          },
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 10,
+            "queries": 2500,
+            "mean_routing_recall": 0.91964,
+            "mean_partitions": 116.8012,
+            "p95_partitions": 191.0
+          },
+          {
+            "corpus": "wiki-cohere-35m",
+            "metric": "dot",
+            "k": 100,
+            "queries": 2500,
+            "mean_routing_recall": 0.9190599999999999,
+            "mean_partitions": 195.5324,
+            "p95_partitions": 339.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 1,
+            "queries": 1805,
+            "mean_routing_recall": 0.910803324099723,
+            "mean_partitions": 42.46537396121884,
+            "p95_partitions": 50.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 10,
+            "queries": 1805,
+            "mean_routing_recall": 0.9107479224376732,
+            "mean_partitions": 64.0,
+            "p95_partitions": 64.0
+          },
+          {
+            "corpus": "dpr-wikipedia-single-nq",
+            "metric": "dot",
+            "k": 100,
+            "queries": 1805,
+            "mean_routing_recall": 0.9105318559556786,
+            "mean_partitions": 89.0,
+            "p95_partitions": 89.0
+          }
+        ]
+      }
+    ],
+    "l2": [
+      {
+        "effort": 0.1,
+        "target": 0.8,
+        "calibration_target": 0.81,
+        "scale": 0.286,
+        "calibration": [
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.8193359375,
+            "mean_partitions": 3.2900390625,
+            "p95_partitions": 6.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.8119140625000001,
+            "mean_partitions": 4.00732421875,
+            "p95_partitions": 7.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.834033203125,
+            "mean_partitions": 6.7314453125,
+            "p95_partitions": 11.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.8579365234375,
+            "mean_partitions": 15.36279296875,
+            "p95_partitions": 27.0
+          }
+        ]
+      },
+      {
+        "effort": 0.25,
+        "target": 0.9,
+        "calibration_target": 0.91,
+        "scale": 0.601,
+        "calibration": [
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 1,
+            "queries": 2048,
+            "mean_routing_recall": 0.91650390625,
+            "mean_partitions": 6.48486328125,
+            "p95_partitions": 12.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 10,
+            "queries": 2048,
+            "mean_routing_recall": 0.911474609375,
+            "mean_partitions": 8.1767578125,
+            "p95_partitions": 15.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 100,
+            "queries": 2048,
+            "mean_routing_recall": 0.9141064453125001,
+            "mean_partitions": 13.3203125,
+            "p95_partitions": 23.0
+          },
+          {
+            "corpus": "dino",
+            "metric": "l2",
+            "k": 1000,
+            "queries": 2048,
+            "mean_routing_recall": 0.92877294921875,
+            "mean_partitions": 31.48193359375,
+            "p95_partitions": 56.0
+          }
+        ]
+      }
+    ]
+  },
+  "input_correction": {
+    "original_frozen_sha256": "c6d8f3058d53c7bc0ccb7ca1ca815758c78fb22d9a38a10ea1fa0d0dfce99f82",
+    "reason": "Exclude 256 FineWeb reserve queries from evaluation; only original test queries are held out.",
+    "calibration_arrays_equal": true,
+    "scales_unchanged": true,
+    "evaluation_used_for_selection": false
+  }
+}

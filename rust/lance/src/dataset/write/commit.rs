@@ -611,6 +611,16 @@ impl<'a> CommitBuilder<'a> {
                         branch: manifest.branch.clone(),
                     },
                 );
+                let branch_identifier = if let Some(dataset) = dest.dataset() {
+                    dataset.ensure_branch_exists().await?;
+                    dataset.branch_identifier.clone()
+                } else {
+                    Arc::new(
+                        refs.branches()
+                            .get_identifier(manifest.branch.as_deref())
+                            .await?,
+                    )
+                };
 
                 Ok(Dataset {
                     object_store,
@@ -621,6 +631,7 @@ impl<'a> CommitBuilder<'a> {
                     session,
                     commit_handler,
                     refs,
+                    branch_identifier,
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,

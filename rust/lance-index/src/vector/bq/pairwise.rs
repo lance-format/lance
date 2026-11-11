@@ -40,6 +40,7 @@ const CODE_NORM: &str = "__pairwise_rq_code_norm";
 const CENTER_DOT: &str = "__pairwise_rq_center_dot";
 
 /// Partition-local RQ code scoring.
+#[derive(Debug)]
 pub struct RQPairScorer {
     dim: usize,
     bits: u8,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::block_on;
 use crate::error::Result;
 use crate::ffi::JNIEnvExt;
@@ -258,9 +258,8 @@ fn inner_list_tags<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let mut tags: Vec<_> = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_tags()?.into_iter().collect()
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_tags()?.into_iter().collect()
     };
     tags.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
@@ -411,9 +410,8 @@ fn inner_get_version_by_tag(
     jtag_name: JString,
 ) -> Result<u64> {
     let tag = { jtag_name.extract(env)? };
-    let dataset_guard =
-        { unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }? };
-    dataset_guard.get_version(tag.as_str())
+    let dataset = clone_dataset(env, &java_dataset)?;
+    dataset.get_version(tag.as_str())
 }
 
 //////////////////////////////
@@ -430,9 +428,8 @@ fn inner_list_branches<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let mut branches: Vec<_> = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_branches()?.into_iter().collect()
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_branches()?.into_iter().collect()
     };
     branches.sort_unstable_by(|(left_name, _), (right_name, _)| left_name.cmp(right_name));
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;

@@ -1,12 +1,5 @@
 {% extends "base.html" %}
 
-{#- Resolve the first concrete page inside a nested navigation section. -#}
-{%- macro track_first_url(item) -%}
-  {%- set found = namespace(matched=false, url=item.url) -%}
-  {{- find_first_page(item, found) -}}
-  {{- found.url -}}
-{%- endmacro -%}
-
 {#- Render leaf links and collapsible nested subsections inside a group. -#}
 {%- macro sidenav_item(item) -%}
   {%- if item.is_section %}
@@ -40,22 +33,34 @@
 {%- endmacro -%}
 
 {%- macro render_section_groups(children, root_label=none) -%}
-  {%- set direct = namespace(items=[], used_root=false) -%}
+  {%- set shape = namespace(seen_section=false, leaf_after_section=false) -%}
   {%- for item in children %}
     {%- if item.is_section %}
-      {%- if direct.items %}
-        {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
-        {%- set direct.items = [] -%}
-        {%- set direct.used_root = true -%}
-      {%- endif %}
-      {{ sidenav_group(item.children, item.title) }}
-      {%- set direct.used_root = true -%}
-    {%- else %}
-      {%- set direct.items = direct.items + [item] -%}
+      {%- set shape.seen_section = true -%}
+    {%- elif shape.seen_section %}
+      {%- set shape.leaf_after_section = true -%}
     {%- endif %}
   {%- endfor %}
-  {%- if direct.items %}
-    {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+  {%- if shape.leaf_after_section %}
+    {{ sidenav_group(children, root_label) }}
+  {%- else %}
+    {%- set direct = namespace(items=[], used_root=false) -%}
+    {%- for item in children %}
+      {%- if item.is_section %}
+        {%- if direct.items %}
+          {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+          {%- set direct.items = [] -%}
+          {%- set direct.used_root = true -%}
+        {%- endif %}
+        {{ sidenav_group(item.children, item.title) }}
+        {%- set direct.used_root = true -%}
+      {%- else %}
+        {%- set direct.items = direct.items + [item] -%}
+      {%- endif %}
+    {%- endfor %}
+    {%- if direct.items %}
+      {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+    {%- endif %}
   {%- endif %}
 {%- endmacro -%}
 
@@ -70,50 +75,7 @@
     </button>
     <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
       {%- if active_section.item and active_section.item.is_section %}
-        {%- set tracks = namespace(has_direct_page=false, has_link_or_nested=false, count=0, active=none) -%}
-        {%- for child in active_section.item.children -%}
-          {%- if child.is_page -%}
-            {%- set tracks.has_direct_page = true -%}
-          {%- else -%}
-            {%- set tracks.count = tracks.count + 1 -%}
-            {%- if child.is_link -%}
-              {%- set tracks.has_link_or_nested = true -%}
-            {%- elif child.is_section -%}
-              {%- for sub in child.children -%}
-                {%- if sub.is_section -%}
-                  {%- set tracks.has_link_or_nested = true -%}
-                {%- endif -%}
-              {%- endfor -%}
-            {%- endif -%}
-            {%- if child.active -%}
-              {%- set tracks.active = child -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {%- if not tracks.has_direct_page and tracks.count >= 2 and tracks.has_link_or_nested %}
-          <div class="ld-sidenav__group ld-sidenav__group--tracks">
-            <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title | e }}</div>
-            <div class="ld-sidenav__tracks" role="navigation" aria-label="{{ active_section.item.title | e }} tracks">
-              {%- for track in active_section.item.children %}
-              {%- if track.is_link %}
-              <a class="ld-sidenav__track" href="{{ track.url | e }}" target="_blank" rel="noopener">
-                <span>{{ track.title | e }}</span>
-                <span class="ext">↗</span>
-              </a>
-              {%- else %}
-              <a class="ld-sidenav__track{% if track.active %} active{% endif %}" href="{{ track_first_url(track) | url }}">
-                <span>{{ track.title | e }}</span>
-              </a>
-              {%- endif %}
-              {%- endfor %}
-            </div>
-          </div>
-          {%- if tracks.active and tracks.active.children %}
-            {{ render_section_groups(tracks.active.children) }}
-          {%- endif %}
-        {%- else %}
-          {{ render_section_groups(active_section.item.children, active_section.item.title) }}
-        {%- endif %}
+        {{ render_section_groups(active_section.item.children, active_section.item.title) }}
       {%- elif active_section.item %}
       <div class="ld-sidenav__group">
         <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title | e }}</div>
