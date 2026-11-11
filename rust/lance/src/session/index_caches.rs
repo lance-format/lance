@@ -15,6 +15,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_select::RowAddrMask;
 use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
 use uuid::Uuid;
@@ -402,6 +403,32 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 
     fn schema() -> CacheKeySchema {
         CacheKeySchema::new("lance.index.scalar-details-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
+/// Complete persisted tokenizer parameters, independent of row remapping.
+#[derive(Debug)]
+pub(crate) struct InvertedIndexParamsKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for InvertedIndexParamsKey<'_> {
+    type ValueType = InvertedIndexParams;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("inverted_params/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "InvertedIndexParams"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.inverted-params-key", 1)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {

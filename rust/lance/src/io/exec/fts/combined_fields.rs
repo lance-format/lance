@@ -15,7 +15,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::stream::{self};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
@@ -451,52 +451,67 @@ pub(super) async fn open_combined_fields_scan(
                     .map(Arc::from)
             }
         };
-        // Tokenizer metadata belongs to the field, including when this shard
-        // has no indexed rows. Validate before pruning so a flat-only shard need
-        // not open an unrelated segment just to borrow its tokenizer.
         if let Some(segments) = &segments {
             load_segment_details(dataset, column, segments).await?;
-            // Manifest details omit the document tokenizer (including explicit
-            // overrides). Read complete parameters without opening partitions;
-            // schema inference would lose valid JSON tokenizers on text fields.
-            for segment in segments.iter() {
-                let params = load_segment_params(dataset, segment).await?;
-                if let Some((reference, expected)) = &tokenizer_params {
-                    if !expected.same_tokenization(&params) {
-                        return Err(DataFusionError::Execution(format!(
-                            "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
-                        )));
-                    }
-                } else {
-                    tokenizer_params = Some((column, params));
-                }
-            }
         }
-        let segments = segments.map(|segments| {
-            let Some(scope) = statistics_fragments else {
-                return segments;
-            };
-            let selected: Vec<_> = segments
-                .iter()
-                .filter(|segment| {
-                    segment
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_none_or(|coverage| !coverage.is_disjoint(scope))
-                })
-                .cloned()
-                .collect();
-            Arc::from(selected)
+        let in_statistics_domain = |segment: &IndexMetadata| {
+            statistics_fragments.is_none_or(|scope| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|coverage| !coverage.is_disjoint(scope))
+            })
+        };
+        let selected = segments.as_ref().map(|segments| {
+            if statistics_fragments.is_none() {
+                return segments.clone();
+            }
+            Arc::from(
+                segments
+                    .iter()
+                    .filter(|segment| in_statistics_domain(segment))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         });
-        let indices = match segments {
-            Some(segments) => {
+        let indices = match selected {
+            Some(selected) => {
                 let indices =
-                    open_fts_segments(dataset, column, &segments, &metrics.index_metrics).await?;
-                all_segments.extend(segments.iter().cloned());
+                    open_fts_segments(dataset, column, &selected, &metrics.index_metrics).await?;
+                all_segments.extend(selected.iter().cloned());
                 indices
             }
             None => Vec::new(),
         };
+
+        // Opened indices already contain the complete persisted parameters,
+        // including explicit document tokenizers absent from manifest details.
+        // Reopening their metadata adds an extra cold read per segment.
+        let selected_params = stream::iter(indices.iter().map(|index| Ok(index.params().clone())));
+        // Omitted segments still participate in configuration validation. Read
+        // only their parameters, without partitions, and bound concurrent I/O.
+        let mut omitted_params = Vec::new();
+        if let Some(segments) = &segments {
+            for segment in segments.iter() {
+                if !in_statistics_domain(segment) {
+                    omitted_params.push(load_segment_params(dataset, segment));
+                }
+            }
+        }
+        let omitted_params =
+            stream::iter(omitted_params).buffered(dataset.object_store.io_parallelism());
+        let mut field_params = selected_params.chain(omitted_params);
+        while let Some(params) = field_params.try_next().await? {
+            if let Some((reference, expected)) = &tokenizer_params {
+                if !expected.same_tokenization(&params) {
+                    return Err(DataFusionError::Execution(format!(
+                        "combined_fields requires every target column to share the same tokenizer/index configuration; column '{column}' differs from column '{reference}'"
+                    )));
+                }
+            } else {
+                tokenizer_params = Some((column, params));
+            }
+        }
         if statistics_fragments.is_some() && indices.iter().any(|index| index.is_legacy()) {
             return Err(DataFusionError::Plan(
                 "BM25F fragment statistics require modern DocId-keyed indices".into(),
@@ -775,10 +790,11 @@ mod tests {
     #[case::explicit_json_on_text("json", "json", false)]
     #[case::incompatible_document_tokenizer("json", "text", false)]
     #[tokio::test]
-    async fn flat_shard_uses_metadata_without_opening_unrelated_indices(
+    async fn combined_fields_preserves_document_tokenizers(
         #[case] title_tokenizer: &str,
         #[case] body_tokenizer: &str,
         #[case] incompatible_analyzer: bool,
+        #[values(None, Some(0), Some(1))] fragment: Option<u32>,
     ) {
         let batch = arrow_array::record_batch!(
             ("title", Utf8, [r#"{"title":"Alpha"}"#]),
@@ -815,12 +831,12 @@ mod tests {
         };
         let query = CombinedFieldsQuery::try_new(terms.into(), vec!["title".into(), "body".into()])
             .unwrap();
-        let scope = roaring::RoaringBitmap::from_iter([1]);
+        let scope = fragment.map(|fragment| roaring::RoaringBitmap::from_iter([fragment]));
         let metrics = FtsIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
         let scan = open_combined_fields_scan(
             &dataset,
             &query,
-            Some(&scope),
+            scope.as_ref(),
             CombinedFieldsIndexRequirement::AtLeastOneColumn,
             &[],
             &OnceLock::new(),
@@ -833,11 +849,90 @@ mod tests {
             assert!(error.to_string().contains("share the same tokenizer"));
         } else {
             let scan = scan.unwrap();
-            assert!(scan.segments.is_empty());
-            assert!(scan.columns.iter().all(|column| column.indices.is_empty()));
+            let indexed = fragment != Some(1);
+            assert_eq!(scan.segments.len(), if indexed { 2 } else { 0 });
+            assert!(
+                scan.columns
+                    .iter()
+                    .all(|column| column.indices.len() == usize::from(indexed))
+            );
             assert_eq!(scan.tokens.len(), 2);
             assert_eq!(scan.tokens.get_token(0), expected_tokens[0]);
             assert_eq!(scan.tokens.get_token(1), expected_tokens[1]);
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn combined_fields_validates_omitted_field_tokenizer(
+        #[values("json", "text")] body_tokenizer: &str,
+        #[values(0, 1)] fragment: u32,
+    ) {
+        let batch = arrow_array::record_batch!(
+            (
+                "title",
+                Utf8,
+                [r#"{"title":"Alpha"}"#, r#"{"title":"Alpha"}"#]
+            ),
+            ("body", Utf8, [r#"{"title":"beta"}"#, r#"{"title":"beta"}"#])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: false,
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for (column, tokenizer, covered) in [("title", "json", 0), ("body", body_tokenizer, 1)] {
+            let params = InvertedIndexParams::default().lance_tokenizer(tokenizer.to_string());
+            let name = format!("{column}_idx");
+            let segment = dataset
+                .create_index_builder(&[column], IndexType::Inverted, &params)
+                .name(name.clone())
+                .fragments(vec![covered])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments(&name, column, vec![segment])
+                .await
+                .unwrap();
+        }
+        let query = CombinedFieldsQuery::try_new(
+            "title,str,ALPHA beta".into(),
+            vec!["title".into(), "body".into()],
+        )
+        .unwrap();
+        let scope = roaring::RoaringBitmap::from_iter([fragment]);
+        let metrics = FtsIndexMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let scan = open_combined_fields_scan(
+            &dataset,
+            &query,
+            Some(&scope),
+            CombinedFieldsIndexRequirement::AtLeastOneColumn,
+            &[],
+            &OnceLock::new(),
+            &metrics,
+        )
+        .await;
+        if body_tokenizer == "json" {
+            let scan = scan.unwrap();
+            assert_eq!(scan.segments.len(), 1);
+            assert_eq!(scan.columns[fragment as usize].indices.len(), 1);
+            assert!(scan.columns[1 - fragment as usize].indices.is_empty());
+            assert_eq!(scan.tokens.len(), 2);
+            assert_eq!(scan.tokens.get_token(0), "title,str,alpha");
+            assert_eq!(scan.tokens.get_token(1), "title,str,beta");
+        } else {
+            let error = scan.err().unwrap();
+            assert!(matches!(&error, DataFusionError::Execution(_)));
+            assert!(error.to_string().contains("share the same tokenizer"));
         }
     }
 

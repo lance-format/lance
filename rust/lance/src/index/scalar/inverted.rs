@@ -36,6 +36,7 @@ use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
+    session::index_caches::InvertedIndexParamsKey,
 };
 
 #[derive(Debug, Clone)]
@@ -1240,13 +1241,122 @@ pub async fn load_segment_params(
     dataset: &Dataset,
     segment: &IndexMetadata,
 ) -> Result<InvertedIndexParams> {
-    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
-    InvertedIndex::load_params(&store).await
+    // The dataset cache namespaces immutable index UUIDs by dataset URI. Params
+    // do not depend on query candidates or FRI translations, and replacements
+    // receive a new UUID. The existing cache budget accounts for decoded values.
+    let params = dataset
+        .index_cache
+        .get_or_insert_with_key(
+            InvertedIndexParamsKey {
+                uuid: &segment.uuid,
+            },
+            || async {
+                let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+                InvertedIndex::load_params(&store).await
+            },
+        )
+        .await?;
+    Ok(params.as_ref().clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::RecordBatchIterator;
+    use lance_io::object_store::ObjectStoreRegistry;
+
+    use crate::dataset::WriteParams;
+    use crate::session::Session;
+
+    #[rstest::rstest]
+    #[case::disabled(0)]
+    #[case::oversized(1024)]
+    #[case::enabled(1024 * 1024)]
+    #[tokio::test]
+    async fn segment_params_cache_respects_budget_and_index_replacement(
+        #[case] cache_bytes: usize,
+    ) {
+        let batch =
+            arrow_array::record_batch!(("text", Utf8, [r#"{"title":"alpha beta"}"#])).unwrap();
+        let session = Arc::new(Session::new(
+            cache_bytes,
+            0,
+            Arc::new(ObjectStoreRegistry::default()),
+        ));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                session: Some(session),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let json_params = InvertedIndexParams::default()
+            .lance_tokenizer("json".into())
+            .custom_stop_words(Some(vec!["x".repeat(2048)]));
+        dataset
+            .create_index(
+                &["text"],
+                lance_index::IndexType::Inverted,
+                None,
+                &json_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let old_segment = dataset.load_indices().await.unwrap()[0].clone();
+        let old_snapshot = dataset.clone();
+        dataset.index_cache.clear().await;
+
+        let before = dataset.object_store.io_stats_snapshot().read_iops;
+        let first = load_segment_params(&dataset, &old_segment).await.unwrap();
+        let after_first = dataset.object_store.io_stats_snapshot().read_iops;
+        assert!(after_first > before);
+        assert!(first.same_tokenization(&json_params));
+        let repeated = load_segment_params(&dataset, &old_segment).await.unwrap();
+        assert_eq!(first, repeated);
+        let after_repeat = dataset.object_store.io_stats_snapshot().read_iops;
+        if cache_bytes <= 1024 {
+            assert!(after_repeat > after_first);
+        } else {
+            assert_eq!(after_repeat, after_first);
+        }
+
+        dataset.index_cache.clear().await;
+        let before_reload = dataset.object_store.io_stats_snapshot().read_iops;
+        assert_eq!(
+            load_segment_params(&dataset, &old_segment).await.unwrap(),
+            first
+        );
+        assert!(dataset.object_store.io_stats_snapshot().read_iops > before_reload);
+
+        // Replacing the index changes its tokenizer but must not invalidate the
+        // immutable old snapshot or reuse its cached parameters for the new one.
+        let text_params = InvertedIndexParams::default().lance_tokenizer("text".into());
+        dataset
+            .create_index(
+                &["text"],
+                lance_index::IndexType::Inverted,
+                None,
+                &text_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let new_segment = dataset.load_indices().await.unwrap()[0].clone();
+        assert_ne!(old_segment.uuid, new_segment.uuid);
+        let replacement = load_segment_params(&dataset, &new_segment).await.unwrap();
+        assert!(replacement.same_tokenization(&text_params));
+        assert!(!replacement.same_tokenization(&first));
+        assert_eq!(
+            load_segment_params(&old_snapshot, &old_segment)
+                .await
+                .unwrap(),
+            first
+        );
+    }
 
     /// A covered FTS index (`fields=[tags, id]`, `id` carried) must still be
     /// recognized by `indexed_fts_document_granularities`: matching on
