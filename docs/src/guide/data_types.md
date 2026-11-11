@@ -359,6 +359,206 @@ table = pa.Table.from_pydict({
 ds = lance.write_dataset(table, "./with_maps.lance", data_storage_version="2.2")
 ```
 
+### Standard Variant arrays (Rust)
+
+Current-format dataset writers accept the canonical `arrow.parquet.variant`
+extension type, including arrays already shredded by Arrow's
+`parquet-variant-compute` kernels. Lance preserves the extension metadata and
+stores the struct's children as columns. Nested `BinaryView` and `Utf8View`
+arrays are stored and returned as `Binary` and `Utf8` arrays.
+
+For example, using a version of `parquet-variant-compute` compatible with Lance's
+Arrow dependencies:
+
+```rust
+use std::sync::Arc;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+use parquet_variant_compute::{json_to_variant, shred_variant, unshred_variant, VariantArray};
+
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"id":42,"extra":"retained in residual data"}"#,
+        r#"{"id":"a different type"}"#,
+    ]));
+    let variant = json_to_variant(&json)?;
+    let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+    let shredded = shred_variant(&variant, &target)?;
+    let schema = Arc::new(Schema::new(vec![shredded.field("event")]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(shredded.into_inner())])?;
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        None,
+    ).await?;
+
+    let batch = dataset.scan().try_into_batch().await?;
+    let stored = VariantArray::try_new(batch["event"].as_ref())?;
+    let reconstructed = unshred_variant(&stored)?;
+    assert_eq!(reconstructed.len(), 2);
+    Ok(())
+}
+```
+
+The physical layout for this example is:
+
+```text
+event (arrow.parquet.variant)
+|-- metadata: binary
+|-- value: binary (residual data)
+`-- typed_value: struct
+    `-- id: struct
+        |-- value: binary (values that do not fit int64)
+        `-- typed_value: int64
+```
+
+A projection such as `event.typed_value.id.typed_value` reads the typed child
+column, but it does not include values left in the residual data. Use the Arrow
+Variant kernels on the full Variant array when reconstruction or path extraction
+needs those values. Keep the same physical shredding schema across batches and
+appends. This interoperability does not automatically select fields to shred,
+or rewrite existing data. The optional query functions below provide logical
+access with residual fallback. Existing
+[JSON columns](json.md) continue to use their separate JSONB representation.
+
+### Explicit Variant shredding on write (Rust)
+
+Enable Lance's optional `variant` Cargo feature to use
+`InsertBuilder::with_variant_shredding(column, as_type)`. Pass an unshredded
+`arrow.parquet.variant` column and the desired Arrow value type. A struct selects
+object fields; `List` and `LargeList` select array element types. Supported leaf
+types are Boolean, signed integers, Float32/Float64, and binary/string types,
+including their large and view variants. Call the method once for each top-level
+Variant column to transform.
+
+```rust
+use std::sync::Arc;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance::dataset::{InsertBuilder, WriteMode, WriteParams};
+use parquet_variant_compute::json_to_variant;
+
+async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"id":42,"extra":"preserved"}"#,
+        r#"{"id":1.5}"#,
+    ]));
+    let variant = json_to_variant(&json)?;
+    let schema = Arc::new(Schema::new(vec![variant.field("event")]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(variant.into_inner())])?;
+    let target = DataType::Struct(vec![Field::new("id", DataType::Int64, true)].into());
+
+    let dataset = InsertBuilder::new("memory://")
+        .with_variant_shredding("event", target.clone())
+        .execute_stream(RecordBatchIterator::new([Ok(batch.clone())], schema.clone()))
+        .await?;
+    let dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams { mode: WriteMode::Append, ..Default::default() })
+        .with_variant_shredding("event", target)
+        .execute_stream(RecordBatchIterator::new([Ok(batch)], schema))
+        .await?;
+    assert_eq!(dataset.count_rows(None).await?, 4);
+    Ok(())
+}
+```
+
+Shredding runs one batch at a time and also works with the builder's batch and
+uncommitted write methods. The declared layout is fixed across all batches and
+appends; incompatible append layouts, duplicate column selections, unsupported
+target types, and already-shredded inputs are rejected. Write already-shredded
+arrays directly without this option. This API uses the current V2 writer.
+
+The API preserves values without coercion. In the example, `42` is stored in
+`event.typed_value.id.typed_value`, while the row containing `1.5` stays in the
+root residual `event.value`. If any selected value cannot fit without coercion,
+the entire row remains in residual storage, including other selected fields in
+that row. Integer widths may change when the value fits; floating-point values
+must match the requested width. SQL null, Variant null, missing fields, and
+unselected object fields are preserved. Raw typed-child projections therefore
+still require residual fallback for complete query results.
+
+Decimal, temporal, UUID, and fixed-size/list-view targets are not yet exposed by
+this API. Automatic field selection and layout evolution are separate
+capabilities; this option neither infers a layout nor rewrites existing data.
+
+### Variant queries (Rust)
+
+With the `variant` Cargo feature, dataset SQL, scanner filters, and computed
+projections support the following functions on `arrow.parquet.variant` columns:
+
+| Function | Result |
+| --- | --- |
+| `variant_get(event, 'user.id')` | An unshredded standard Variant, preserving the value's type |
+| `variant_get_int(event, 'user.id')` | Int64 using Arrow Variant's safe conversion rules |
+| `variant_get_float(event, 'price')` | Float64 using Arrow Variant's safe conversion rules |
+| `variant_get_string(event, 'user.name')` | Utf8 using Arrow Variant's safe conversion rules |
+| `variant_get_bool(event, 'active')` | Boolean using Arrow Variant's safe conversion rules |
+| `variant_to_json(event)` | JSON text reconstructed from typed and residual values |
+
+Paths must be non-null constant strings. They use Arrow Variant path syntax:
+`user.name`, `items[0]`, or `user['first.name']`; the empty string selects the
+whole value. Wildcards and recursive descent are not supported. Paths are
+relative: use `user.name` without a JSONPath `$` prefix.
+
+```rust
+use lance::Dataset;
+
+async fn example(dataset: &Dataset) -> lance::Result<()> {
+    let result = dataset.scan()
+        .filter("variant_get_float(event, 'price') > 10")?
+        .project_with_transform(&[
+            ("name", "variant_get_string(event, 'user.name')"),
+            ("document", "variant_to_json(event)"),
+        ])?
+        .try_into_batch().await?;
+    Ok(())
+}
+```
+
+Missing paths, out-of-bounds array indices, and SQL null inputs return SQL null.
+`variant_get` preserves an explicit Variant null as a valid Variant value;
+`variant_to_json` renders it as the string `"null"`. The typed getters return SQL
+null for Variant null and failed conversions. They perform conversions, unlike the
+lossless write API: for example, `variant_get_int` can truncate a fractional
+number or convert a Boolean to 0/1; a numeric string returns SQL null. Use
+`variant_get` to preserve the original type and value. `variant_to_json` follows Arrow's JSON serialization rules; it is not
+a lossless interchange format for every non-JSON Variant type.
+
+The initial query implementation reconstructs each batch before extracting a
+path, so it includes residual values at any ancestor level. It reads the full
+Variant column and does **not** yet push paths into physical child projections
+or use indices on shredded fields. This establishes equivalent results for
+shredded and unshredded layouts; it does not promise faster queries.
+
+### When shredding helps
+
+Lance already converts JSON columns to binary JSONB, avoiding repeated JSON text
+parsing. Shredding's additional opportunity is to read just the relevant typed
+columns, apply columnar operations, and compress homogeneous values efficiently.
+This is most useful for repeated filters, projections, and aggregations over a
+small subset of a wide document. Complete path queries must also account for
+residual values before they can safely exploit those independent columns.
+
+Writing incurs extra extraction work. Whole-document reads require reconstruction,
+and mixed types can leave many rows in residual storage. Storage savings and
+query speedups depend on field selection, residual frequency, and the workload.
+The current reconstruction-based query path can be slower than JSONB.
+
+A reproducible field-projection benchmark compares JSONB, unshredded Variant,
+and shredded Variant with 0% and 10% whole-row fallback:
+
+```bash
+cargo bench -p lance --bench variant --features variant --profile release-with-debug
+```
+
+It checks that all cases return the same values. A separate direct typed-child
+case is included only for the zero-fallback fixture: it illustrates the potential
+of column projection, not the performance of a complete residual-aware query.
+This measures unindexed in-memory scans, not object-storage latency. Existing
+JSONB path indices can already accelerate selective lookups; this benchmark
+does not compare indexed queries.
+
 ## Data Type Mapping for Integrations
 
 When integrating Lance with other systems (like Apache Flink, Spark, or Presto), the following type mappings apply:

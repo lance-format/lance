@@ -12,8 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [package.metadata.docs.rs]
-# Publish the feature-gated metrics catalogue; keep cloud backends off.
-features = ["metrics"]
+# Publish the metrics catalogue and Variant write API; keep cloud backends off.
+features = ["metrics", "variant"]
 no-default-features = true
 
 [package.metadata.cargo-machete]
@@ -91,6 +91,8 @@ log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 permutation = { version = "0.4.0" }
+parquet-variant = { workspace = true, optional = true }
+parquet-variant-compute = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 tracing.workspace = true
 humantime = { workspace = true }
@@ -140,6 +142,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
+parquet-variant-compute = { workspace = true }
 reqwest = { workspace = true, features = ["rustls"] }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
@@ -156,6 +159,8 @@ name = "memory_metrics"
 required-features = ["metrics"]
 
 [features]
+# Explicit lossless Variant shredding on insert and Variant SQL functions.
+variant = ["dep:parquet-variant", "dep:parquet-variant-compute", "lance-datafusion/variant"]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
 backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
@@ -382,6 +387,11 @@ harness = false
 [[bench]]
 name = "cleanup"
 harness = false
+
+[[bench]]
+name = "variant"
+harness = false
+required-features = ["variant"]
 
 [lints]
 workspace = true

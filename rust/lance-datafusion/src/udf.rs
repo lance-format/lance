@@ -20,6 +20,9 @@ pub use lance_datafusion_exec::udf::{CONTAINS_TOKENS_UDF, json};
 #[cfg(feature = "geo")]
 mod geo;
 
+#[cfg(feature = "variant")]
+mod variant;
+
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(CONTAINS_TOKENS_UDF.clone());
@@ -34,6 +37,8 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(json::json_get_bool_udf());
     ctx.register_udf(json::json_array_contains_udf());
     ctx.register_udf(json::json_array_length_udf());
+    #[cfg(feature = "variant")]
+    variant::register_functions(ctx);
     // GEO functions
     #[cfg(feature = "geo")]
     {
