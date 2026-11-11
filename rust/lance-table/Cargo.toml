@@ -59,17 +59,10 @@ rstest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-mock.workspace = true
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [features]
 dynamodb = ["dep:aws-sdk-dynamodb", "dep:aws-credential-types", "lance-io/aws"]
-protoc = ["dep:protobuf-src"]
-
-[package.metadata.docs.rs]
-# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
-features = ["protoc"]
+# Retained for compatibility; protobuf sources are now checked in.
+protoc = []
 
 [[bench]]
 name = "row_id_index"

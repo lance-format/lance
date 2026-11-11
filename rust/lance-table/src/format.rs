@@ -22,7 +22,10 @@ pub use clustering::{
     refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
 };
 pub use fragment::*;
-pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
+pub use index::{
+    IndexFile, IndexMetadata, index_details_are_row_addrs, index_metadata_codec,
+    list_index_files_with_sizes,
+};
 
 pub(crate) use manifest::pb_manifest_without_fragments;
 pub use manifest::{
@@ -53,7 +56,7 @@ pub mod pb {
     #![allow(improper_ctypes)]
     #![allow(clippy::upper_case_acronyms)]
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+    include!("pb/lance.table.rs");
 }
 
 /// These version/magic values are written at the end of manifest files (e.g. versions/1.version)
