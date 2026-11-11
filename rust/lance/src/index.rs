@@ -18,10 +18,12 @@ mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
+mod frag_reuse_v0_cache;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 mod lifecycle;
 pub(crate) mod loading;
 pub mod mem_wal;
+pub(crate) mod memory_progress;
 pub mod optimize;
 pub mod prefilter;
 mod prewarm;
@@ -33,8 +35,11 @@ pub(crate) mod segment;
 pub(crate) mod segment_coverage;
 mod statistics;
 pub mod vector;
+pub(crate) mod visibility;
 
-pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+pub use crate::index::api::{
+    DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment,
+};
 pub use crate::index::loading::DatasetIndexInternalExt;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};

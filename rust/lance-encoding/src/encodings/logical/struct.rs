@@ -268,7 +268,7 @@ impl StructuralStructDecoder {
     ) -> Result<Box<dyn StructuralFieldDecoder>> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() || field.is_blob() {
+                if field.is_packed_struct() || field.is_blob() || fields.is_empty() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Ok(Box::new(decoder))

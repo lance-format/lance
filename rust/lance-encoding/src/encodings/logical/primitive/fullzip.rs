@@ -10,13 +10,17 @@
 //! This requires transparent compression and is most suitable for
 //! large data types.
 
+use std::sync::Arc;
+
 use crate::{
     data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     format::metadata::CompressiveEncoding,
 };
 
 use arrow_buffer::BooleanBuffer;
+use futures::{FutureExt, future::BoxFuture};
 use lance_core::Result;
+use lance_core::utils::tokio::spawn_cpu;
 
 /// Per-value compression must either:
 ///
@@ -66,5 +70,24 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
         _validity: Option<&BooleanBuffer>,
     ) -> Result<(PerValueDataBlock, CompressiveEncoding)> {
         self.compress(data)
+    }
+
+    /// Asynchronous counterpart of [`Self::compress_with_validity`].
+    ///
+    /// The default implementation runs the existing synchronous compressor on
+    /// the CPU pool. Implementations that can fan out internally may override
+    /// this method, but must keep the synchronous method above available for
+    /// callers that do not have an async context.
+    #[doc(hidden)]
+    fn compress_with_validity_async(
+        self: Arc<Self>,
+        data: DataBlock,
+        validity: Option<BooleanBuffer>,
+    ) -> BoxFuture<'static, Result<(PerValueDataBlock, CompressiveEncoding)>>
+    where
+        Self: 'static,
+    {
+        async move { spawn_cpu(move || self.compress_with_validity(data, validity.as_ref())).await }
+            .boxed()
     }
 }

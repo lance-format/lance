@@ -318,6 +318,12 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
+        } else if !index_is_usable(idx) {
+            log::warn!(
+                "Index {} has unsupported field dependencies {:?}, ignoring it",
+                idx.name,
+                idx.dependency_fields(),
+            );
         }
     }
 }
@@ -904,7 +910,9 @@ impl Dataset {
         let index_dir = self.indice_files_dir(index_meta)?;
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
-        let file_cache = self.index_cache.for_index(uuid, None);
+        // Physical file keys also let shallow clones share immutable columns.
+        // Translated partitions remain scoped to the dataset and FRI below.
+        let file_cache = self.session.index_cache.with_key_prefix("ivf-file");
         let resident_columns_handle = Some(ResidentColumns::shared(&aux_file_key(
             &object_store,
             &index_dir,
@@ -1047,7 +1055,7 @@ impl Dataset {
                 let idx = vector::open_vector_index_v2(
                     Arc::new(self.clone()),
                     column,
-                    uuid,
+                    index_meta,
                     reader,
                     frag_reuse_index,
                 )
@@ -1056,30 +1064,9 @@ impl Dataset {
             }
 
             (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
-                    object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&object_store),
-                );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &self.metadata_cache.file_metadata_cache(&index_file),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let index_metadata = reader
-                    .schema()
-                    .metadata
-                    .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
-                let index_metadata: lance_index::IndexMetadata =
-                    serde_json::from_str(index_metadata)?;
+                let index_metadata = self
+                    .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+                    .await?;
 
                 // Resolve the column name and field
                 let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
@@ -1200,6 +1187,21 @@ impl Dataset {
                         }
                     },
 
+                    "IVF_HNSW_RQ" => {
+                        let ivf = IVFIndex::<HNSW, RabitQuantizer>::try_new(
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            remapping,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                            open_context,
+                        )
+                        .await?;
+                        Ok(wrap_ivf(ivf))
+                    }
+
                     "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
                             object_store.clone(),
@@ -1262,6 +1264,40 @@ impl Dataset {
                 .await;
         }
         Ok(index)
+    }
+
+    /// The index metadata in the schema of a vector index file of the
+    /// current format, `(0, 3)` or `(2, _)`: the type the file opens as and
+    /// its distance type, both read before any centroid or quantizer.
+    pub(crate) async fn read_vector_index_metadata(
+        &self,
+        object_store: &Arc<lance_io::object_store::ObjectStore>,
+        index_file: &object_store::path::Path,
+        file_sizes: &HashMap<String, u64>,
+    ) -> Result<lance_index::IndexMetadata> {
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(object_store),
+        );
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file = scheduler.open_file(index_file, &cached_size).await?;
+        let reader = lance_file::reader::FileReader::try_open(
+            file,
+            None,
+            Default::default(),
+            &self.metadata_cache.file_metadata_cache(index_file),
+            FileReaderOptions::default(),
+        )
+        .await?;
+        let index_metadata = reader
+            .schema()
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or(Error::index("Index Metadata not found".to_owned()))?;
+        Ok(serde_json::from_str(index_metadata)?)
     }
 }
 
