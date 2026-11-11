@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub(crate) mod clustering;
 mod encoded_fragments;
 mod fragment;
+pub mod history_retention;
 mod index;
 pub mod key_existence;
 mod manifest;
