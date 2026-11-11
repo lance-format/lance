@@ -3830,12 +3830,35 @@ impl Dataset {
     /// 'target_path': the uri string to clone the dataset into.
     /// 'version': the version cloned from, could be a version number or tag.
     /// 'store_params': the object store params to use for the new dataset.
+    ///
+    /// The returned handle retains the source's store parameters for shared files.
+    /// When reopening a clone across stores, supply the source parameters with
+    /// [`DatasetBuilder::with_base_store_params`].
     pub async fn shallow_clone(
         &mut self,
         target_path: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
+        let store_params = match store_params {
+            Some(params) => params,
+            None => {
+                let mut params = self.store_params.as_deref().cloned().unwrap_or_default();
+                // Inherit the custom store, but not its source dataset location.
+                #[allow(deprecated)]
+                if let Some((_, location)) = params.object_store.as_mut() {
+                    *location = lance_io::object_store::uri_to_url(target_path)?;
+                }
+                params
+            }
+        };
+        let (target_store, _) = ObjectStore::from_uri_and_params(
+            self.session.store_registry(),
+            target_path,
+            &store_params,
+        )
+        .await?;
+
         // Prevent cloning into an existing target dataset (parity with
         // `deep_clone`) before anything is written there: a tagged clone
         // stages its relocated FRI details in the target's `_indices/`
@@ -3843,12 +3866,13 @@ impl Dataset {
         // dataset. The check goes through the same store and commit handler
         // the commit below writes through. Only a definitive "no dataset
         // here" permits the clone; see `ensure_clone_target_absent`.
+        // CommitBuilder extracts its path from the URI when given an explicit store.
         let target_base =
             ObjectStore::extract_path_from_uri(self.session.store_registry(), target_path)?;
         Self::ensure_clone_target_absent(
             self.commit_handler.as_ref(),
             &target_base,
-            &self.object_store,
+            &target_store,
             target_path,
         )
         .await?;
@@ -3859,19 +3883,37 @@ impl Dataset {
             is_shallow: true,
             ref_name,
             ref_version: version_number,
-            ref_path: source_location.uri,
+            ref_path: source_location.uri.clone(),
             branch_name: None,
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
         let builder = CommitBuilder::new(WriteDestination::Uri(target_path))
-            .with_store_params(
-                store_params.unwrap_or(self.store_params.as_deref().cloned().unwrap_or_default()),
-            )
-            .with_object_store(Arc::new(self.object_store.as_ref().clone()))
+            .with_store_params(store_params)
+            .with_object_store(target_store)
+            .with_source_store(self.object_store.clone())
+            .with_session(self.session.clone())
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+        let mut cloned = builder.execute(transaction).await?;
+        // Destination credentials must not replace the bindings for shared
+        // source files, including bases inherited through earlier shallow clones.
+        cloned.base_store_params = Some(Arc::new(
+            cloned
+                .manifest
+                .base_paths
+                .values()
+                .map(|base| {
+                    let params = if base.path == source_location.uri {
+                        self.store_params_for_base(None)
+                    } else {
+                        self.store_params_for_base(Some(base))
+                    };
+                    (base.path.clone(), params)
+                })
+                .collect(),
+        ));
+        Ok(cloned)
     }
 
     /// Deep clone the target version into a new dataset at target_path.

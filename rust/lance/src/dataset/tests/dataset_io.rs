@@ -73,7 +73,7 @@ use lance_io::object_store::{
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::MetricType;
-use lance_table::io::commit::write_manifest_file_to_path;
+use lance_table::io::commit::{ConditionalPutCommitHandler, write_manifest_file_to_path};
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use object_store::{
@@ -2873,6 +2873,164 @@ async fn test_deep_clone_cross_store(
     assert_eq!(cloned_indices.len(), 1);
     assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
     assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
+}
+
+#[rstest]
+#[case::empty_target(false, false)]
+#[case::target_path_exists_only_in_source(true, false)]
+#[case::target_path_exists_only_in_target(false, true)]
+#[tokio::test]
+async fn test_shallow_clone_cross_store(
+    #[case] source_has_target: bool,
+    #[case] target_has_target: bool,
+) {
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///source";
+    let target_uri = "memory:///target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.fragments().len(), 2);
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    for (store, has_target) in [
+        (&source_store, source_has_target),
+        (&target_store, target_has_target),
+    ] {
+        if has_target {
+            Dataset::write(
+                data(),
+                target_uri,
+                Some(WriteParams {
+                    store_params: Some(store_params(store.clone(), target_uri)),
+                    commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let source_before = source_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let target_before = target_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let result = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store.clone(), target_uri)),
+        )
+        .await;
+
+    assert_eq!(
+        source_store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        source_before,
+        "cloning must not write anything to the source store"
+    );
+    if target_has_target {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::DatasetAlreadyExists { .. }));
+        assert!(error.to_string().contains(target_uri));
+        assert_eq!(
+            target_store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            target_before,
+            "rejecting an existing target must leave it unchanged"
+        );
+        return;
+    }
+
+    let cloned = result.unwrap();
+    assert_eq!(cloned.uri(), target_uri);
+    assert_eq!(cloned.version().version, 1);
+    target_store
+        .head(&cloned.manifest_location.path)
+        .await
+        .unwrap();
+    assert!(cloned.read_transaction().await.unwrap().is_some());
+    assert_eq!(
+        count_files(&cloned.object_store, &cloned.base, "data").await,
+        0
+    );
+    let base_id = first_base_id(&cloned);
+    assert_eq!(cloned.manifest().base_paths[&base_id].path, source_uri);
+    assert_eq!(cloned.scan().try_into_batch().await.unwrap(), expected);
+
+    // Omitting target params must keep supporting the source's custom store.
+    let inherited = source
+        .shallow_clone("memory:///same-store", source.version().version, None)
+        .await
+        .unwrap();
+    assert!(
+        inherited
+            .manifest_location
+            .path
+            .as_ref()
+            .starts_with("same-store/_versions/")
+    );
+    assert_eq!(inherited.scan().try_into_batch().await.unwrap(), expected);
+
+    let mut reopened = DatasetBuilder::from_uri(target_uri)
+        .with_read_params(ReadParams {
+            store_options: Some(store_params(target_store, target_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        })
+        .with_base_store_params(source_uri, store_params(source_store, source_uri))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+
+    let chained_uri = "memory:///chained";
+    let chained = reopened
+        .shallow_clone(
+            chained_uri,
+            reopened.version().version,
+            Some(store_params(
+                Arc::new(object_store::memory::InMemory::new()),
+                chained_uri,
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chained.scan().try_into_batch().await.unwrap(), expected);
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
