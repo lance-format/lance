@@ -4,7 +4,7 @@
 use crate::{
     Error, Result,
     dataset::{
-        Dataset,
+        Dataset, LeaseOptions,
         transaction::{Operation, TransactionBuilder},
     },
     index::{
@@ -94,6 +94,7 @@ pub struct CreateIndexBuilder<'a> {
     /// The parameters come from an existing index, so settings refused for a new
     /// index (see [`InvertedIndexParams::validate_for_creation`]) are accepted.
     is_copy_of_existing: bool,
+    retention_lease: Option<LeaseOptions>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -118,6 +119,7 @@ impl<'a> CreateIndexBuilder<'a> {
             memory_operation: Some(ObservedOperation::CreateIndex),
             transaction_properties: None,
             is_copy_of_existing: false,
+            retention_lease: None,
         }
     }
 
@@ -205,6 +207,11 @@ impl<'a> CreateIndexBuilder<'a> {
     /// (e.g., job_id for tracking completed index jobs).
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(Arc::new(properties));
+        self
+    }
+
+    pub fn retention_lease(mut self, options: LeaseOptions) -> Self {
+        self.retention_lease = Some(options);
         self
     }
 
@@ -1188,6 +1195,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod retention_lease;
     mod staged_tagged;
 
     use super::*;

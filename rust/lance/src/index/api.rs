@@ -14,6 +14,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::dataset::RetentionLease;
 use crate::{Error, Result};
 
 /// Statistics for one physical index segment, collected at a dataset read version.
@@ -528,6 +529,14 @@ pub trait DatasetIndexExt {
         index_name: &str,
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
+    ) -> Result<()>;
+
+    async fn commit_existing_index_segments_for_lease(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+        lease: &RetentionLease,
     ) -> Result<()>;
 
     async fn read_index_partition(

@@ -25,6 +25,7 @@ use roaring::RoaringBitmap;
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::dataset::RetentionLease;
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use crate::index::append;
@@ -847,6 +848,17 @@ impl DatasetIndexExt for Dataset {
             merged_segment.dataset_version = merged_dataset_version;
         }
         Ok(merged_segment)
+    }
+
+    async fn commit_existing_index_segments_for_lease(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+        _lease: &RetentionLease,
+    ) -> Result<()> {
+        self.commit_existing_index_segments(index_name, column, segments)
+            .await
     }
 
     async fn commit_existing_index_segments(
