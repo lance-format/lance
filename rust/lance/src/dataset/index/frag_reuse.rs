@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub(crate) mod leases;
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -22,6 +24,13 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::system_index::frag_reuse::leases::{
+    LeaseRequirement, RecordLineage, requires_legacy_version,
+};
+pub(crate) use leases::{
+    ensure_rewrite_records_lease_transitions, lease_requirement, leased_fragments,
+    oldest_leased_version,
+};
 use log::warn;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -155,10 +164,20 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
 
     let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+    // No retry re-derives a v0 trim, and none needs to: a lease acquired
+    // concurrently leases a version newer than every reuse version stamped
+    // here, and a concurrent rewrite that records one replaces the entry, so
+    // this trim conflicts with it.
+    let oldest_leased = oldest_leased_version(dataset);
 
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
+        if requires_legacy_version(oldest_leased, version.dataset_version) {
+            fragment_bitmaps.extend(version.new_frag_bitmap());
+            retained_versions.push(version.clone());
+            continue;
+        }
         let check_results = indices
             .iter()
             .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
@@ -220,7 +239,13 @@ async fn cleanup_stable_row_id_history(
     indices: &[IndexMetadata],
 ) -> Result<()> {
     let details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-    let trimmed = trimmable_versions(&details.versions, indices);
+    let oldest_leased = oldest_leased_version(dataset);
+    let first_leased = details
+        .versions
+        .iter()
+        .position(|version| requires_legacy_version(oldest_leased, version.dataset_version))
+        .unwrap_or(details.versions.len());
+    let trimmed = trimmable_versions(&details.versions, indices).min(first_leased);
     if trimmed == 0 {
         return Ok(());
     }
@@ -758,7 +783,11 @@ fn is_transition_needed(
 /// downstream consumer of its destinations, so those records must survive
 /// too. Legacy versions retain at whole-version granularity (their groups
 /// stand or fall together, as in v0).
-fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata]) -> Vec<bool> {
+fn compute_tagged_retention(
+    elements: &[TrimElement],
+    indices: &[IndexMetadata],
+    lease_requirement: Option<&LeaseRequirement>,
+) -> Vec<bool> {
     // The v0 predicate's disjointness rule is scoped to the legacy chain, as
     // in v0: an index touching only tagged-transition fragments holds nothing
     // a legacy version remaps.
@@ -796,6 +825,10 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
 
     let mut retained = vec![false; elements.len()];
     for (position, element) in elements.iter().enumerate() {
+        if lease_requirement.is_some_and(|required| required.requires_record(position)) {
+            retained[position] = true;
+            continue;
+        }
         match &element.record {
             TrimRecord::LegacyVersion(version) => {
                 let check_results = indices
@@ -928,7 +961,24 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
         ));
     }
     let elements = split_trim_elements(&content)?;
-    let retained = compute_tagged_retention(&elements, &indices);
+    // Read from the manifest this derivation runs against, which on a retry
+    // is the attempt's predecessor: leases acquired concurrently count too.
+    let lease_requirement = if dataset.manifest.retention_leases.is_empty() {
+        None
+    } else {
+        let records: Vec<RecordLineage> = elements
+            .iter()
+            .map(|element| match &element.record {
+                TrimRecord::LegacyVersion(version) => RecordLineage::from(version),
+                TrimRecord::Transition(transition) => RecordLineage::from(transition),
+            })
+            .collect();
+        Some(LeaseRequirement::compute(
+            &Box::pin(leased_fragments(dataset)).await,
+            &records,
+        ))
+    };
+    let retained = compute_tagged_retention(&elements, &indices, lease_requirement.as_ref());
 
     if retained.iter().all(|kept| *kept) {
         return Ok(TaggedTrimOutcome::NothingToTrim);
@@ -1566,7 +1616,7 @@ pub(crate) mod tests {
         fn transition_retention_rules() {
             let elements = vec![transition_element(&[1, 2], &[5, 6])];
             let retain =
-                |indices: &[IndexMetadata]| compute_tagged_retention(&elements, indices)[0];
+                |indices: &[IndexMetadata]| compute_tagged_retention(&elements, indices, None)[0];
 
             // B1: a disjoint index does not block the trim.
             assert!(!retain(&[named_index("a_idx", 1, &[3, 4])]));
@@ -1610,17 +1660,17 @@ pub(crate) mod tests {
             ];
             // Enters at the head: both hops retained.
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[1])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[1])], None),
                 vec![true, true]
             );
             // Enters mid-chain: only the downstream hop retained.
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[2])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 1, &[2])], None),
                 vec![false, true]
             );
             // Fully retired: both trim together.
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 2, &[3])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 2, &[3])], None),
                 vec![false, false]
             );
         }
@@ -1636,13 +1686,13 @@ pub(crate) mod tests {
             // A stale index over the legacy sources pins the version (exact
             // v0 predicate) and, transitively, the downstream transition.
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])], None),
                 vec![true, true]
             );
             // Caught up past the legacy version and rebuilt onto the final
             // fragments: everything trims.
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 11, &[3])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 11, &[3])], None),
                 vec![false, false]
             );
 
@@ -1655,7 +1705,7 @@ pub(crate) mod tests {
                 transition_element(&[6], &[7]),
             ];
             assert_eq!(
-                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])]),
+                compute_tagged_retention(&elements, &[named_index("a_idx", 5, &[1])], None),
                 vec![true, true]
             );
         }
@@ -2448,13 +2498,17 @@ pub(crate) mod tests {
             let mut unusable_taker = named_index("a_idx", 2, &[5, 6]);
             unusable_taker.index_details = unusable_details();
             assert_eq!(
-                compute_tagged_retention(&elements, &[pinner.clone(), unusable_taker]),
+                compute_tagged_retention(&elements, &[pinner.clone(), unusable_taker], None),
                 vec![true],
                 "an unusable segment's bitmap must not stand in as direct coverage"
             );
             // The same takeover by a usable segment releases the transition.
             assert_eq!(
-                compute_tagged_retention(&elements, &[pinner, named_index("a_idx", 2, &[5, 6])]),
+                compute_tagged_retention(
+                    &elements,
+                    &[pinner, named_index("a_idx", 2, &[5, 6])],
+                    None
+                ),
                 vec![false]
             );
         }
@@ -2791,6 +2845,269 @@ pub(crate) mod tests {
                     assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
                     assert_eq!(indexed, vec![value]);
                 }
+            }
+        }
+
+        /// Retention leases: what trim and compaction must keep for a lease
+        /// holder until it publishes.
+        mod leases {
+            use super::*;
+            use crate::dataset::LeaseOptions;
+            use crate::dataset::index::DatasetIndexRemapperOptions;
+            use crate::dataset::optimize::{commit_compaction, plan_compaction};
+            use crate::index::CreateIndexBuilder;
+            use lance_table::system_index::frag_reuse::leases::{
+                LeaseRequirement, LeasedFragments, RecordLineage,
+            };
+            use mock_instant::thread_local::MockClock;
+            use std::time::Duration;
+
+            /// Fragments 0 and 1, four rows each, `i` counting from 0.
+            async fn two_fragments() -> Dataset {
+                MockClock::set_system_time(Duration::from_secs(1_000));
+                let batch = lance_datagen::gen_batch()
+                    .col("i", lance_datagen::array::step::<Int32Type>())
+                    .into_batch_rows(lance_datagen::RowCount::from(8))
+                    .unwrap();
+                crate::dataset::InsertBuilder::new("memory://")
+                    .with_params(&WriteParams {
+                        max_rows_per_file: 4,
+                        ..Default::default()
+                    })
+                    .execute(vec![batch])
+                    .await
+                    .unwrap()
+            }
+
+            async fn transition_sources(dataset: &Dataset) -> Vec<Vec<u64>> {
+                let entry = fri_entry(dataset).await.unwrap();
+                decode_frag_reuse_ledger(dataset, &entry)
+                    .await
+                    .unwrap()
+                    .transitions()
+                    .iter()
+                    .map(|transition| transition.sources().iter().map(|d| d.id).collect())
+                    .collect()
+            }
+
+            async fn reuse_stamps(dataset: &Dataset) -> Vec<u64> {
+                let entry = fri_entry(dataset).await.unwrap();
+                load_frag_reuse_index_details(dataset, &entry)
+                    .await
+                    .unwrap()
+                    .versions
+                    .iter()
+                    .map(|version| version.dataset_version)
+                    .collect()
+            }
+
+            #[test]
+            fn lease_retains_transitions_indices_released() {
+                let elements = vec![
+                    transition_element(&[1], &[2]),
+                    transition_element(&[2], &[3]),
+                    transition_element(&[4], &[5]),
+                ];
+                // Rebuilt over every output: no index needs any transition.
+                let indices = [named_index("a_idx", 2, &[3, 5])];
+                assert_eq!(
+                    compute_tagged_retention(&elements, &indices, None),
+                    vec![false, false, false]
+                );
+                let records = [
+                    RecordLineage::transition([1], [2]),
+                    RecordLineage::transition([2], [3]),
+                    RecordLineage::transition([4], [5]),
+                ];
+                let leased = LeasedFragments::Known([1].into_iter().collect());
+                let required = LeaseRequirement::compute(&leased, &records);
+                assert_eq!(
+                    compute_tagged_retention(&elements, &indices, Some(&required)),
+                    vec![true, true, false]
+                );
+            }
+
+            /// A lease taken before any index exists makes a compaction that
+            /// does not defer remapping record its moves in a new tagged
+            /// history. Trim keeps them until the holder publishes an index
+            /// built at the leased version, which then answers through the
+            /// history; once the index is rebuilt, trim removes them.
+            #[tokio::test]
+            #[serial_test::serial(frag_reuse_maintenance)]
+            async fn lease_transitions_kept_until_publication() {
+                let dataset = two_fragments().await;
+                let (lease, mut dataset) = dataset
+                    .acquire_retention_lease(LeaseOptions::default())
+                    .await
+                    .unwrap();
+                compact_files(&mut dataset, CompactionOptions::default(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(dataset.fragments().len(), 1);
+                let entry = fri_entry(&dataset).await.unwrap();
+                assert_eq!(entry.index_version, 1);
+                let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+                assert_eq!(dataset.manifest.reader_feature_flags & flag, flag);
+                assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+                assert_eq!(transition_sources(&dataset).await, vec![vec![0, 1]]);
+
+                // No index needs the transition, but the lease does.
+                let version = dataset.manifest.version;
+                cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+                assert_eq!(dataset.manifest.version, version);
+                assert_eq!(fri_entry(&dataset).await.unwrap().uuid, entry.uuid);
+
+                let mut worker = dataset.checkout_lease(&lease).await.unwrap();
+                let params = ScalarIndexParams::default();
+                let index =
+                    CreateIndexBuilder::new(&mut worker, &["i"], IndexType::Scalar, &params)
+                        .name("i_idx".into())
+                        .execute_uncommitted()
+                        .await
+                        .unwrap();
+                let publication = crate::dataset::transaction::TransactionBuilder::for_lease(
+                    &lease,
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                )
+                .build();
+                let mut dataset = CommitBuilder::new(Arc::new(dataset))
+                    .execute(publication)
+                    .await
+                    .unwrap();
+                assert!(dataset.retention_leases().is_empty());
+                assert_eq!(
+                    covered_fragments(&dataset, "i_idx").await,
+                    *dataset.fragment_bitmap.as_ref()
+                );
+                for predicate in ["i = 6", "i >= 3"] {
+                    let plan = dataset
+                        .scan()
+                        .filter(predicate)
+                        .unwrap()
+                        .use_scalar_index(true)
+                        .explain_plan(false)
+                        .await
+                        .unwrap();
+                    assert!(plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+                    assert_eq!(
+                        filtered_values(&dataset, predicate, true).await,
+                        filtered_values(&dataset, predicate, false).await
+                    );
+                }
+                assert_eq!(filtered_values(&dataset, "i = 6", true).await, vec![6]);
+
+                // The published index still translates through the
+                // transition; rebuilt over the output, it no longer does.
+                cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+                assert!(fri_entry(&dataset).await.is_some());
+                dataset
+                    .create_index(
+                        &["i"],
+                        IndexType::Scalar,
+                        Some("i_idx".into()),
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+                assert!(fri_entry(&dataset).await.is_none());
+            }
+
+            /// A lease acquired after the compaction was planned, which then
+            /// recorded nothing, makes the commit a retryable conflict; the
+            /// replanned compaction records the transition.
+            #[tokio::test]
+            #[serial_test::serial(frag_reuse_maintenance)]
+            async fn compaction_replans_after_concurrent_lease() {
+                let mut dataset = two_fragments().await;
+                let options = CompactionOptions::default();
+                let plan = plan_compaction(&dataset, &options).await.unwrap();
+                let mut results = Vec::new();
+                for task in plan.compaction_tasks() {
+                    results.push(task.execute(&dataset).await.unwrap());
+                }
+                dataset
+                    .acquire_retention_lease(LeaseOptions::default())
+                    .await
+                    .unwrap();
+                let error = commit_compaction(
+                    &mut dataset,
+                    results,
+                    Arc::new(DatasetIndexRemapperOptions::default()),
+                    &options,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("retention lease"), "{error}");
+
+                dataset.checkout_latest().await.unwrap();
+                compact_files(&mut dataset, options, None).await.unwrap();
+                assert_eq!(transition_sources(&dataset).await, vec![vec![0, 1]]);
+            }
+
+            /// On a legacy-only history, trim keeps the reuse versions
+            /// stamped at or after the leased version even once every index
+            /// has caught up, and drops the older ones. The compaction under
+            /// the lease touches no indexed fragment, so only the lease makes
+            /// it record its move.
+            #[tokio::test]
+            #[serial_test::serial(frag_reuse_maintenance)]
+            async fn v0_trim_keeps_versions_stamped_after_lease() {
+                let mut dataset = two_fragments().await;
+                let params = ScalarIndexParams::default();
+                dataset
+                    .create_index(
+                        &["i"],
+                        IndexType::Scalar,
+                        Some("i_idx".into()),
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                let deferred = CompactionOptions {
+                    defer_index_remap: true,
+                    ..Default::default()
+                };
+                compact_files(&mut dataset, deferred, None).await.unwrap();
+                assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 0);
+                // Two unindexed fragments, which compaction merges apart
+                // from the indexed one.
+                let dataset = append_rows(dataset, 100, 4).await;
+                let dataset = append_rows(dataset, 200, 4).await;
+                let (lease, mut dataset) = dataset
+                    .acquire_retention_lease(LeaseOptions::default())
+                    .await
+                    .unwrap();
+                compact_files(&mut dataset, CompactionOptions::default(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 0);
+                let recorded = reuse_stamps(&dataset).await;
+                assert_eq!(recorded.len(), 2);
+                assert!(recorded[0] < lease.version(), "{recorded:?}");
+                assert!(recorded[1] >= lease.version(), "{recorded:?}");
+
+                dataset
+                    .create_index(
+                        &["i"],
+                        IndexType::Scalar,
+                        Some("i_idx".into()),
+                        &params,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+                assert_eq!(reuse_stamps(&dataset).await, vec![recorded[1]]);
             }
         }
     }

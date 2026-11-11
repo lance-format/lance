@@ -2071,7 +2071,6 @@ fn test_lease_operations_never_conflict() {
         current_live: None,
         current_schema: None,
         read_fragments: None,
-        read_version_fragments: None,
         read_schema: None,
         reuse: Default::default(),
         staged_replay: false,

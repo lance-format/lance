@@ -30,6 +30,10 @@ use crate::{Dataset, Error};
 /// conflicts in either direction, and the retry re-derives the lease list
 /// from the new head.
 ///
+/// The fixture's lease retains every fragment, so the rewrite records its move
+/// in the fragment reuse index, as compaction does under a lease. That defers
+/// index remapping, so a rewrite and an index build no longer conflict.
+///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
 /// A row landing here also opts that pair into the invariant battery, so a cell
@@ -51,8 +55,8 @@ project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  L
 project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  L  L
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  L  L  L
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  L  L  L
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  L  X  X  L  L  L  L
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  L  R  X  X  L  L  L  L
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L
 restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  L  L
 update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X  L  L  L

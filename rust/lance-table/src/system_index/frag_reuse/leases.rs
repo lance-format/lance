@@ -66,7 +66,8 @@ impl RecordLineage {
         }
     }
 
-    fn sources(&self) -> impl Iterator<Item = u64> + '_ {
+    /// Every group's source fragment ids.
+    pub fn sources(&self) -> impl Iterator<Item = u64> + '_ {
         self.groups
             .iter()
             .flat_map(|(sources, _)| sources.iter().copied())

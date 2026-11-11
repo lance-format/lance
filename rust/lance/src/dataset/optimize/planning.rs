@@ -832,6 +832,20 @@ impl DefaultCompactionPlanner {
 }
 
 impl DefaultCompactionPlanner {
+    /// This planner with `defer_index_remap` set, when `dataset` lists
+    /// retention leases and it is not set already. Leases require compaction
+    /// to record fragment reuse transitions, which only the deferred path
+    /// does; indices then catch up through the fragment reuse index.
+    fn deferring_under_leases(&self, dataset: &Dataset) -> Option<Self> {
+        (!self.options.defer_index_remap && !dataset.manifest.retention_leases.is_empty()).then(
+            || {
+                let mut planner = self.clone();
+                planner.options.defer_index_remap = true;
+                planner
+            },
+        )
+    }
+
     /// Why one fragment is a compaction candidate, if it is: the same rule for
     /// ordinary planning and for caller-chosen groups.
     pub(super) fn candidacy_of(
@@ -956,6 +970,9 @@ impl DefaultCompactionPlanner {
         dataset: &Dataset,
         groups: Vec<CompactionGroup>,
     ) -> Result<CompactionPlanningResult> {
+        if let Some(planner) = self.deferring_under_leases(dataset) {
+            return Box::pin(planner.plan_groups_with_budget(dataset, groups)).await;
+        }
         let write_version = self.options.write_version(dataset);
         versions::validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),
@@ -1383,6 +1400,9 @@ impl DefaultCompactionPlanner {
     /// # Ok(()) }
     /// ```
     pub async fn plan_with_budget(&self, dataset: &Dataset) -> Result<CompactionPlanningResult> {
+        if let Some(planner) = self.deferring_under_leases(dataset) {
+            return Box::pin(planner.plan_with_budget(dataset)).await;
+        }
         let write_version = self.options.write_version(dataset);
         versions::validate_write_version(
             dataset.manifest.data_storage_format.lance_file_format(),

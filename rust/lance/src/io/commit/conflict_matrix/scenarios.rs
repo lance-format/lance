@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::ROW_ADDR;
 use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
+use lance_index::frag_reuse::{FragDigest, FragReuseGroup};
 use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
@@ -673,6 +674,46 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
         )
         .await?;
     }
+    // The fixture's lease retains every fragment, so the rewrite records its
+    // move as compaction does under a lease. Compaction reserves the output
+    // ids in a commit of its own first; ids well above any a concurrent
+    // scenario allocates stand in for that reservation.
+    let first_id = u64::from(dataset.manifest.max_fragment_id.unwrap_or(0)) + 100;
+    for (fragment, id) in fragments.iter_mut().zip(first_id..) {
+        fragment.id = id;
+    }
+    let changed_row_addrs = crate::dataset::optimize::execution::live_source_row_addrs(
+        dataset.as_ref(),
+        std::slice::from_ref(&old),
+    )
+    .await?;
+    let mut serialized = Vec::with_capacity(changed_row_addrs.serialized_size());
+    changed_row_addrs.serialize_into(&mut serialized)?;
+    let digest = |fragment: &Fragment| FragDigest {
+        id: fragment.id,
+        physical_rows: fragment.physical_rows.unwrap_or(0),
+        num_deleted_rows: fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion| deletion.num_deleted_rows)
+            .unwrap_or(0),
+    };
+    let group = FragReuseGroup {
+        changed_row_addrs: serialized,
+        old_frags: vec![digest(&old)],
+        new_frags: fragments.iter().map(digest).collect(),
+    };
+    let new_bitmap = fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let frag_reuse_index = crate::index::frag_reuse::build_new_frag_reuse_index(
+        &mut dataset.as_ref().clone(),
+        vec![group],
+        new_bitmap,
+        dataset.manifest.version,
+    )
+    .await?;
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::Rewrite {
@@ -681,7 +722,7 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
                 new_fragments: fragments,
             }],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
+            frag_reuse_index: Some(frag_reuse_index),
         },
     )))
 }

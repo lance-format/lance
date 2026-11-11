@@ -1967,6 +1967,13 @@ pub(crate) async fn commit_transaction(
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+        Box::pin(
+            crate::dataset::index::frag_reuse::ensure_rewrite_records_lease_transitions(
+                &dataset,
+                &transaction,
+            ),
+        )
+        .await?;
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);
 

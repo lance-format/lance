@@ -22,6 +22,7 @@ use super::planning::{
 use super::remapping::{self, IndexRemapperOptions};
 use crate::Dataset;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::index::frag_reuse::lease_requirement;
 use crate::dataset::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -136,6 +137,25 @@ pub async fn commit_compaction(
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
+
+    // Listed retention leases require this compaction to record the
+    // transitions they need, which only the deferred path does. Tasks that
+    // recorded no row addresses cannot; the commit then refuses the rewrite
+    // if a lease requires its fragments, and the caller replans.
+    let deferred_by_leases;
+    let options = if !options.defer_index_remap
+        && !dataset.manifest.retention_leases.is_empty()
+        && completed_tasks.iter().all(|task| task.row_addrs.is_some())
+    {
+        // Boxed: the options are large and held across every await below.
+        deferred_by_leases = Box::new(CompactionOptions {
+            defer_index_remap: true,
+            ..options.clone()
+        });
+        &*deferred_by_leases
+    } else {
+        options
+    };
 
     // A tagged FRI history stores row translation in the manifest entry and
     // depends on index bitmaps keeping their retired provenance, so a
@@ -262,6 +282,12 @@ pub async fn commit_compaction(
     // past this rewrite (a bare rewrite of a covered fragment preempts it).
     // Trim reclaims such records once every index is disjoint from the chain
     // or postdates the rewrite.
+    let lease_requirement = if records_row_addrs {
+        Box::pin(lease_requirement(dataset)).await?
+    } else {
+        None
+    };
+    let mut any_group_lease_required = false;
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -339,6 +365,11 @@ pub async fn commit_compaction(
                 }
             }
         } else if records_row_addrs {
+            if lease_requirement.as_ref().is_some_and(|required| {
+                required.requires_sources(old_fragments.iter().map(|fragment| fragment.id))
+            }) {
+                any_group_lease_required = true;
+            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -467,11 +498,17 @@ pub async fn commit_compaction(
         // extending it in place. A table that never was tagged has neither
         // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
+        //
+        // A table with no entry at all starts a tagged history when a lease
+        // requires the record (the retention lease specification's rule),
+        // except with stable row ids, which never carry one.
         let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-            &dataset.manifest,
-            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
-        );
+        let existing_entry = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+        let tagged_at_commit =
+            lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+                &dataset.manifest,
+                existing_entry,
+            ) || (any_group_lease_required && existing_entry.is_none() && !uses_stable_row_ids);
         if tagged_at_commit {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values; on a tagged table the
