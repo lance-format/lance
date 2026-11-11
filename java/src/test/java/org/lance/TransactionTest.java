@@ -360,6 +360,39 @@ public class TransactionTest {
     }
   }
 
+  @Test
+  public void testLeaseKeeper(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("lease_keeper").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        RetentionLease lease =
+            dataset.acquireRetentionLease(
+                LeaseOptions.builder().ttl(Duration.ofMinutes(10)).build());
+        try (Dataset leased = dataset.checkoutLease(lease)) {
+          LeaseKeeper closed;
+          try (LeaseKeeper keeper = LeaseKeeper.start(leased, lease)) {
+            assertEquals(lease, keeper.getLease());
+            assertTrue(keeper.getStatus().isHeld());
+            assertEquals(Optional.empty(), keeper.getStatus().getLostReason());
+            closed = keeper;
+          }
+          assertEquals(lease, closed.getLease());
+          assertThrows(IllegalStateException.class, closed::release);
+          try (Dataset latest = dataset.checkoutVersion(dataset.latestVersion())) {
+            assertEquals(Collections.singletonList(lease), latest.getRetentionLeases());
+          }
+
+          LeaseKeeper.start(leased, lease).release();
+          try (Dataset latest = dataset.checkoutVersion(dataset.latestVersion())) {
+            assertTrue(latest.getRetentionLeases().isEmpty());
+          }
+        }
+      }
+    }
+  }
+
   private static Operation operationAt(Dataset dataset, long version) {
     try (Dataset snapshot = dataset.checkoutVersion(version);
         Transaction transaction = snapshot.readTransaction().orElseThrow()) {

@@ -1414,7 +1414,8 @@ public class Dataset implements Closeable {
               options.isTrain(),
               options.getFragmentIds(),
               options.getIndexUUID(),
-              options.getPreprocessedData().map(ArrowArrayStream::memoryAddress));
+              options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
+              options.getRetentionLease().orElse(null));
         }
         return nativeCreateIndexWithProgress(
             options.getColumns(),
@@ -1426,6 +1427,7 @@ public class Dataset implements Closeable {
             options.getFragmentIds(),
             options.getIndexUUID(),
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
+            options.getRetentionLease().orElse(null),
             new ContextIndexBuildProgress(this, progress));
       } finally {
         if (commits) {
@@ -1458,7 +1460,8 @@ public class Dataset implements Closeable {
       boolean train,
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
-      Optional<Long> arrowStreamMemoryAddress);
+      Optional<Long> arrowStreamMemoryAddress,
+      LeaseOptions retentionLease);
 
   private native Index nativeCreateIndexWithProgress(
       List<String> columns,
@@ -1470,6 +1473,7 @@ public class Dataset implements Closeable {
       Optional<List<Integer>> fragments,
       Optional<String> indexUUID,
       Optional<Long> arrowStreamMemoryAddress,
+      LeaseOptions retentionLease,
       IndexBuildProgress progress);
 
   /**
@@ -1571,6 +1575,40 @@ public class Dataset implements Closeable {
    */
   public List<Index> commitExistingIndexSegments(
       String indexName, String column, List<Index> segments) {
+    return commitExistingIndexSegmentsInternal(indexName, column, segments, null);
+  }
+
+  /**
+   * Publish existing physical index segments built under {@code lease} as a logical index.
+   *
+   * <p>The segments must have been built on the leased version (see {@link #checkoutLease}). They
+   * are validated against it and rebased over every commit since, such as compactions the lease let
+   * run during the build, and the commit releases the lease. Fails if any segment's files are
+   * missing.
+   *
+   * <pre>{@code
+   * RetentionLease lease = dataset.acquireRetentionLease(LeaseOptions.builder().build());
+   * List<Index> segments;
+   * try (Dataset leased = dataset.checkoutLease(lease)) {
+   *   segments = buildSegmentsOnWorkers(leased);
+   * }
+   * dataset.commitExistingIndexSegments("value_idx", "value", segments, lease);
+   * }</pre>
+   *
+   * @param indexName logical index name
+   * @param column indexed column name
+   * @param segments physical segment metadata to publish
+   * @param lease the lease the segments were built under
+   * @return committed manifest metadata
+   */
+  public List<Index> commitExistingIndexSegments(
+      String indexName, String column, List<Index> segments, RetentionLease lease) {
+    Preconditions.checkNotNull(lease, "lease cannot be null");
+    return commitExistingIndexSegmentsInternal(indexName, column, segments, lease);
+  }
+
+  private List<Index> commitExistingIndexSegmentsInternal(
+      String indexName, String column, List<Index> segments, RetentionLease lease) {
     Preconditions.checkArgument(
         indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
     Preconditions.checkArgument(
@@ -1579,12 +1617,12 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(!segments.isEmpty(), "segments cannot be empty");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCommitExistingIndexSegments(indexName, column, segments);
+      return nativeCommitExistingIndexSegments(indexName, column, segments, lease);
     }
   }
 
   private native List<Index> nativeCommitExistingIndexSegments(
-      String indexName, String column, List<Index> segments);
+      String indexName, String column, List<Index> segments, RetentionLease lease);
 
   /**
    * Count the number of rows in the dataset.

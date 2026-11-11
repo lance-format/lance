@@ -4,16 +4,19 @@
 use std::time::Duration;
 
 use jni::JNIEnv;
-use jni::objects::{JObject, JString, JValue};
-use lance::dataset::{LeaseOptions, RetentionLease};
+use jni::objects::{JClass, JObject, JString, JValue};
+use lance::dataset::{LeaseKeeper, LeaseOptions, LeaseStatus, RetentionLease};
 use lance_table::format::pb;
 
 use super::{BlockingDataset, NATIVE_DATASET};
-use crate::block_on;
 use crate::error::{Error, Result};
+use crate::ffi::JNIEnvExt;
 use crate::traits::{FromJObjectWithEnv, FromJString, IntoJava, export_vec};
+use crate::{RT, block_on};
 
 const RETENTION_LEASE_CLASS: &str = "org/lance/RetentionLease";
+const LEASE_KEEPER_CLASS: &str = "org/lance/LeaseKeeper";
+const NATIVE_LEASE_KEEPER: &str = "nativeLeaseKeeperHandle";
 
 impl IntoJava for &RetentionLease {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -124,6 +127,24 @@ fn ttl_from_java(env: &mut JNIEnv<'_>, ttl: &JObject) -> Result<Duration> {
             "retention lease ttl must be positive, got {seconds}s {nanos}ns"
         ))),
     }
+}
+
+/// Reads an `org.lance.LeaseOptions`, or `None` if it is null.
+pub(crate) fn lease_options_from_java(
+    env: &mut JNIEnv<'_>,
+    options: &JObject,
+) -> Result<Option<LeaseOptions>> {
+    if options.is_null() {
+        return Ok(None);
+    }
+    let mut lease_options = LeaseOptions::default();
+    if let Some(ttl) =
+        env.get_optional_from_method(options, "getTtl", |env, ttl| ttl_from_java(env, &ttl))?
+    {
+        lease_options.ttl = ttl;
+    }
+    lease_options.label = env.get_optional_string_from_method(options, "getLabel")?;
+    Ok(Some(lease_options))
 }
 
 #[unsafe(no_mangle)]
@@ -254,4 +275,106 @@ fn inner_get_retention_leases<'local>(
         dataset_guard.inner.retention_leases().to_vec()
     };
     export_vec(env, &leases)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_LeaseKeeper_nativeStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass,
+    java_dataset: JObject,
+    lease: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_start_lease_keeper(&mut env, java_dataset, lease))
+}
+
+fn inner_start_lease_keeper<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    lease: JObject,
+) -> Result<JObject<'local>> {
+    let lease: RetentionLease = lease.extract_object(env)?;
+    let dataset = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.clone()
+    };
+    // `LeaseKeeper::start` spawns its renewal task on the current runtime.
+    let keeper = {
+        let _runtime = RT.enter();
+        LeaseKeeper::start(&dataset, lease)
+    };
+    let java_keeper = env.new_object(LEASE_KEEPER_CLASS, "()V", &[])?;
+    unsafe { env.set_rust_field(&java_keeper, NATIVE_LEASE_KEEPER, keeper) }?;
+    Ok(java_keeper)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_LeaseKeeper_nativeGetLease<'local>(
+    mut env: JNIEnv<'local>,
+    java_keeper: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_keeper_lease(&mut env, java_keeper))
+}
+
+fn inner_get_keeper_lease<'local>(
+    env: &mut JNIEnv<'local>,
+    java_keeper: JObject,
+) -> Result<JObject<'local>> {
+    let lease = {
+        let keeper =
+            unsafe { env.get_rust_field::<_, _, LeaseKeeper>(java_keeper, NATIVE_LEASE_KEEPER) }?;
+        keeper.lease()
+    };
+    lease.into_java(env)
+}
+
+/// Returns the reason the lease was lost, or null while it is held.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_LeaseKeeper_nativeGetLostReason<'local>(
+    mut env: JNIEnv<'local>,
+    java_keeper: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_lost_reason(&mut env, java_keeper))
+}
+
+fn inner_get_lost_reason<'local>(
+    env: &mut JNIEnv<'local>,
+    java_keeper: JObject,
+) -> Result<JObject<'local>> {
+    let status = {
+        let keeper =
+            unsafe { env.get_rust_field::<_, _, LeaseKeeper>(java_keeper, NATIVE_LEASE_KEEPER) }?;
+        keeper.status()
+    };
+    match status {
+        LeaseStatus::Held => Ok(JObject::null()),
+        LeaseStatus::Lost { reason } => Ok(env.new_string(reason)?.into()),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_LeaseKeeper_nativeRelease(
+    mut env: JNIEnv,
+    java_keeper: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_release_lease_keeper(&mut env, java_keeper))
+}
+
+fn inner_release_lease_keeper(env: &mut JNIEnv, java_keeper: JObject) -> Result<()> {
+    let keeper: LeaseKeeper = unsafe { env.take_rust_field(java_keeper, NATIVE_LEASE_KEEPER) }?;
+    block_on(keeper.release())?;
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_LeaseKeeper_nativeClose(
+    mut env: JNIEnv,
+    java_keeper: JObject,
+) {
+    ok_or_throw_without_return!(env, inner_close_lease_keeper(&mut env, java_keeper))
+}
+
+fn inner_close_lease_keeper(env: &mut JNIEnv, java_keeper: JObject) -> Result<()> {
+    let _: LeaseKeeper = unsafe { env.take_rust_field(java_keeper, NATIVE_LEASE_KEEPER) }?;
+    Ok(())
 }

@@ -15,7 +15,9 @@ package org.lance.index;
 
 import org.lance.Dataset;
 import org.lance.Fragment;
+import org.lance.LeaseOptions;
 import org.lance.LockManager;
+import org.lance.RetentionLease;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
 import org.lance.index.scalar.FmIndexParams;
@@ -773,6 +775,75 @@ public class ScalarIndexTest {
             10,
             dataset.countIndexedRows(
                 indexName, "name >= 'Person 3' AND name < 'Person 8'", Optional.empty()));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateIndexUnderRetentionLease(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("index_under_lease").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build();
+        LeaseOptions leaseOptions = LeaseOptions.builder().label("reindex").build();
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.createIndex(
+                    IndexOptions.builder(
+                            Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                        .withFragmentIds(Collections.singletonList(0))
+                        .withRetentionLease(leaseOptions)
+                        .build()));
+
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                .withIndexName("name_idx")
+                .withRetentionLease(leaseOptions)
+                .build());
+        long leaseVersion = 4;
+        assertEquals(leaseVersion + 1, dataset.version());
+        assertTrue(dataset.getRetentionLeases().isEmpty());
+        assertTrue(dataset.listIndexes().contains("name_idx"));
+      }
+    }
+  }
+
+  @Test
+  public void testCommitIndexSegmentsForRetentionLease(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("segments_under_lease").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        RetentionLease lease = dataset.acquireRetentionLease(LeaseOptions.builder().build());
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build();
+        List<Index> segments = new ArrayList<>();
+        try (Dataset leased = dataset.checkoutLease(lease)) {
+          for (Fragment fragment : leased.getFragments()) {
+            segments.add(
+                leased.createIndex(
+                    IndexOptions.builder(
+                            Collections.singletonList("name"), IndexType.BTREE, indexParams)
+                        .withIndexName("name_idx")
+                        .withFragmentIds(Collections.singletonList(fragment.getId()))
+                        .build()));
+          }
+        }
+
+        List<Index> committed =
+            dataset.commitExistingIndexSegments("name_idx", "name", segments, lease);
+        assertEquals(2, committed.size());
+        assertEquals(lease.getVersion() + 1, dataset.version());
+        assertTrue(dataset.getRetentionLeases().isEmpty());
       }
     }
   }

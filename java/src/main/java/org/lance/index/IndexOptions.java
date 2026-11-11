@@ -13,6 +13,8 @@
  */
 package org.lance.index;
 
+import org.lance.LeaseOptions;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.util.Preconditions;
 
@@ -30,6 +32,7 @@ public class IndexOptions {
   private final IndexType indexType;
   private final IndexParams indexParams;
   private final ArrowArrayStream preprocessedData;
+  private final LeaseOptions retentionLease;
 
   private IndexOptions(
       String indexName,
@@ -40,7 +43,8 @@ public class IndexOptions {
       boolean train,
       List<Integer> fragmentIds,
       String indexUUID,
-      ArrowArrayStream preprocessedData) {
+      ArrowArrayStream preprocessedData,
+      LeaseOptions retentionLease) {
     this.replace = replace;
     this.train = train;
     this.fragmentIds = fragmentIds;
@@ -50,6 +54,7 @@ public class IndexOptions {
     this.indexType = indexType;
     this.indexParams = indexParams;
     this.preprocessedData = preprocessedData;
+    this.retentionLease = retentionLease;
   }
 
   public Optional<String> getIndexUUID() {
@@ -88,6 +93,10 @@ public class IndexOptions {
     return Optional.ofNullable(preprocessedData);
   }
 
+  public Optional<LeaseOptions> getRetentionLease() {
+    return Optional.ofNullable(retentionLease);
+  }
+
   public static Builder builder(
       List<String> columns, IndexType indexType, IndexParams indexParams) {
     return new Builder(columns, indexType, indexParams);
@@ -101,6 +110,7 @@ public class IndexOptions {
     private String indexUUID = null;
     private String indexName = null;
     private ArrowArrayStream preprocessedData = null;
+    private LeaseOptions retentionLease = null;
     private final List<String> columns;
     private final IndexType indexType;
     private final IndexParams indexParams;
@@ -178,6 +188,30 @@ public class IndexOptions {
       return this;
     }
 
+    /**
+     * Build under a retention lease, so that compaction and cleanup can run while a long build is
+     * in progress.
+     *
+     * <p>The build acquires the lease first, builds on the version it leases (the latest version at
+     * the time), renews it while building, and publishes the index for the lease. If the build
+     * fails, the lease is released and the dataset is left at its original version. Only applies to
+     * builds that commit: combining it with {@link #withFragmentIds} or {@link
+     * #withPreprocessedData} for a BTree index fails with {@link IllegalArgumentException}.
+     *
+     * <pre>{@code
+     * dataset.createIndex(
+     *     IndexOptions.builder(columns, IndexType.BTREE, params)
+     *         .withRetentionLease(LeaseOptions.builder().label("reindex").build())
+     *         .build());
+     * }</pre>
+     *
+     * @param retentionLease how to acquire the lease
+     */
+    public Builder withRetentionLease(LeaseOptions retentionLease) {
+      this.retentionLease = retentionLease;
+      return this;
+    }
+
     public IndexOptions build() {
       return new IndexOptions(
           indexName,
@@ -188,7 +222,8 @@ public class IndexOptions {
           train,
           fragmentIds,
           indexUUID,
-          preprocessedData);
+          preprocessedData,
+          retentionLease);
     }
   }
 }
