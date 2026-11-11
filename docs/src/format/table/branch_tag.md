@@ -183,8 +183,10 @@ A pin is a short-lived reference that a restore writes before it commits. Pins a
 | `version`   | number |          | Version number being pinned within that branch.                          |
 | `createdAt` | string |          | RFC 3339 timestamp for when the pin was created.                         |
 
-Cleanup treats a pinned version like a tagged one. A pin is **stale** once it was created more than
-24 hours ago. Cleanup ignores stale pins and may delete them.
+Cleanup treats a pinned version like a tagged one. A pin is **stale** for a cleanup if it was
+created more than 24 hours before that cleanup began. Cleanup ignores pins that are stale for it and
+may delete them. Age is measured from the start of the cleanup, not from the current time, so a pin
+cannot become stale partway through a long cleanup.
 
 ### Cleanup
 
@@ -215,9 +217,11 @@ Restore of version `v` of branch `b` must:
 2. Read the current rule of `b`. If `v` is expired there, delete the pin and fail.
 3. Commit the restore within 24 hours of writing the pin.
 
-The restore must not delete its pin after committing. A cleanup that planned before the commit does
-not see the restored version, so until the pin is stale it is what keeps that cleanup from deleting
-the restored files. By then any later cleanup plans with the restored version in view.
+The restore must not delete its pin after committing. A cleanup that began before the commit does
+not see the restored version, and the pin is not stale for it, so the pin keeps that cleanup from
+deleting the restored files however long it runs. A cleanup for which the pin is stale began more
+than 24 hours after the pin was written, so after the commit, and plans with the restored version in
+view.
 
 Implementations may offer an explicit option that skips these checks.
 
