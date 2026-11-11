@@ -100,14 +100,16 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
-    use lance_index::scalar::minhash_lsh::MinHashQuery;
-    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_index::scalar::minhash_lsh::{BANDS_FILENAME, MinHashQuery, SIGNATURES_FILENAME};
+    use lance_index::scalar::{BuiltinIndexType, IndexStore, ScalarIndexParams, index_files_to_table};
 
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -474,5 +476,115 @@ mod tests {
             !neighbors.contains(&2),
             "deleted row must stay gone: {neighbors:?}"
         );
+    }
+
+    /// MinHash LSH is experimental and has no compatibility path (see
+    /// AGENTS.md): `rebuild_from` always writes the current
+    /// (row-address-domain) layout, so merging a segment persisted before
+    /// that move would carry its stored row ids into a file the next load
+    /// unconditionally reads as row addresses, corrupting every one of them
+    /// on a stable-row-id dataset. Build one by hand -- the only way a real
+    /// segment this old would still exist -- and check the merge is refused
+    /// instead.
+    #[tokio::test]
+    async fn test_merge_rejects_legacy_row_id_domain_segment() {
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch(0..6))], schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["text"],
+            IndexType::MinHashLsh,
+            &params(),
+        )
+        .name(INDEX_NAME.into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+        // Rewrite the freshly trained segment's files as a pre-migration
+        // (row-id domain) layout: rename `_rowaddr` to `_rowid`, convert each
+        // stored address into the dataset's logical row id, and stamp file
+        // version 0.
+        let source = LanceIndexStore::from_dataset_for_existing(&dataset, &segment)
+            .await
+            .unwrap();
+        let legacy_uuid = Uuid::new_v4();
+        let legacy = LanceIndexStore::from_dataset_for_new(&dataset, &legacy_uuid).unwrap();
+        let mut files = Vec::new();
+        for name in [BANDS_FILENAME, SIGNATURES_FILENAME] {
+            let reader = source.open_index_file(name).await.unwrap();
+            let batch = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+            let mut metadata = reader.schema().metadata.clone();
+            metadata.insert("minhash_lsh_index_version".into(), "0".into());
+            let old_schema = batch.schema();
+            let fields = old_schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == lance_core::ROW_ADDR {
+                        Arc::new(field.as_ref().clone().with_name(lance_core::ROW_ID))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(fields));
+            let mut columns = batch.columns().to_vec();
+            if name == SIGNATURES_FILENAME {
+                let ids = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
+                columns[0] = Arc::new(UInt64Array::from_iter_values(
+                    ids.values()
+                        .iter()
+                        .map(|address| (address >> 32) * 2 + (address & 0xffff_ffff)),
+                ));
+            }
+            let mut writer = legacy.new_index_file(name, schema.clone()).await.unwrap();
+            writer
+                .write_record_batch(RecordBatch::try_new(schema, columns).unwrap())
+                .await
+                .unwrap();
+            if name == BANDS_FILENAME {
+                let key = "minhash_lsh_page_table_buffer";
+                let buffer = reader
+                    .read_global_buffer(metadata[key].parse().unwrap())
+                    .await
+                    .unwrap();
+                let id = writer.add_global_buffer(buffer).await.unwrap();
+                metadata.insert(key.into(), id.to_string());
+            }
+            files.push(writer.finish_with_metadata(metadata).await.unwrap());
+        }
+        segment.uuid = legacy_uuid;
+        segment.index_version = 0;
+        segment.files = Some(index_files_to_table(files));
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![segment])
+            .await
+            .unwrap();
+
+        // The legacy segment is still readable on its own.
+        let before = search_ids(&dataset, 2, 6).await;
+        assert!(before.contains(&2), "before merge: {before:?}");
+
+        // But merging it must be refused outright, not silently corrupt it.
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(err.to_string().contains("cannot be merged"), "{err}");
+
+        // The dataset is untouched: the legacy segment still answers correctly.
+        assert_eq!(search_ids(&dataset, 2, 6).await, before);
     }
 }

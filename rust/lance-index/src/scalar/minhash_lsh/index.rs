@@ -1783,6 +1783,19 @@ pub async fn merge_minhash_indices(
                 first.params, index.params
             )));
         }
+        // MinHash LSH is an experimental format with no compatibility path
+        // (see AGENTS.md): `rebuild_from` always writes the current
+        // (row-address-domain) layout, regardless of a source's own domain.
+        // Merging a segment persisted before that move would carry its
+        // stored row ids into a file the next load unconditionally reads as
+        // row addresses, silently corrupting every id it holds.
+        if !index.results_are_row_addresses() {
+            return Err(Error::invalid_input(
+                "MinHash LSH segments persisted before the row-address-domain format change \
+                 cannot be merged; rebuild the index with replace=true instead"
+                    .to_string(),
+            ));
+        }
     }
     let total_docs: u64 = sources.iter().map(|(index, _)| index.num_docs as u64).sum();
     if total_docs > u32::MAX as u64 + 1 {
