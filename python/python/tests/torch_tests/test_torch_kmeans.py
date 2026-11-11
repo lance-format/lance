@@ -56,3 +56,16 @@ def test_torch_kmeans_nans(tmp_path: Path):
             assert part_ids[1] == -1
         else:
             assert part_ids[idx] != -1
+
+
+def test_kmeans_random_init_is_seeded():
+    data = torch.arange(64 * 4, dtype=torch.float32).reshape(64, 4)
+
+    def init(seed):
+        kmeans = KMeans(16, seed=seed, device="cpu")
+        kmeans._random_init(data)
+        return kmeans.centroids
+
+    first, second = init(7), init(7)
+    assert torch.equal(first, second)
+    assert not torch.equal(first, init(8))
