@@ -5132,8 +5132,10 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             doc_field,
         ]));
-        let doc_values: Vec<String> =
-            ids.clone().map(|i| format!(r#"{{"x":"word{i}"}}"#)).collect();
+        let doc_values: Vec<String> = ids
+            .clone()
+            .map(|i| format!(r#"{{"x":"word{i}"}}"#))
+            .collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![

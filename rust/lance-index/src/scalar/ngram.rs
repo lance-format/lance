@@ -2599,7 +2599,7 @@ mod tests {
         let values = (0..4096).map(|i| format!("{i:03x}")).collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatch::try_new(
             schema.clone(),
@@ -2628,7 +2628,7 @@ mod tests {
             .unwrap();
 
         let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-        let index = NGramIndex::load(store, None, &cache).await.unwrap();
+        let index = NGramIndex::load(store, None, &cache, true).await.unwrap();
         let num_lists = index.tokens.len();
         assert_eq!(num_lists, values.len());
 
@@ -2671,9 +2671,14 @@ mod tests {
             deleted: HashSet::from([4]),
         };
         let cache = LanceCache::with_capacity(1024 * 1024);
-        let index = NGramIndex::load(stored_index.store.clone(), Some(Arc::new(remapper)), &cache)
-            .await
-            .unwrap();
+        let index = NGramIndex::load(
+            stored_index.store.clone(),
+            Some(Arc::new(remapper)),
+            &cache,
+            true,
+        )
+        .await
+        .unwrap();
 
         index.prewarm().await.unwrap();
 

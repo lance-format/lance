@@ -503,16 +503,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut segment = CreateIndexBuilder::new(
-            &mut dataset,
-            &["text"],
-            IndexType::MinHashLsh,
-            &params(),
-        )
-        .name(INDEX_NAME.into())
-        .execute_uncommitted()
-        .await
-        .unwrap();
+        let mut segment =
+            CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::MinHashLsh, &params())
+                .name(INDEX_NAME.into())
+                .execute_uncommitted()
+                .await
+                .unwrap();
 
         // Rewrite the freshly trained segment's files as a pre-migration
         // (row-id domain) layout: rename `_rowaddr` to `_rowid`, convert each
