@@ -953,6 +953,10 @@ mod tests {
             // Verify single-chunk split & unsplit byte-for-byte against scalar reference
             if num_values > 0 && num_values <= encoder.max_chunk_size() {
                 let mut expected_split = vec![0u8; total_bytes];
+                // SAFETY: `input` and `expected_split` both contain `num_values * width` bytes.
+                // Each call passes the matching `num_values`, so `split_scalar_range` reads those
+                // values and writes every byte of the corresponding `WIDTH` interleaved output in
+                // bounds; the inactive width processes zero values.
                 unsafe {
                     split_scalar_range::<4>(
                         input.as_ptr(),
