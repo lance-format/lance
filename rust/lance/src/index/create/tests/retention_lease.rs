@@ -107,6 +107,22 @@ async fn test_failed_leased_build_releases_the_lease() {
     assert_eq!(dataset.version().version, 1);
 }
 
+#[tokio::test]
+async fn test_uncommitted_build_refuses_a_retention_lease() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = four_fragments(test_dir.as_str()).await;
+    let params = btree_params();
+
+    let error = CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+        .retention_lease(LeaseOptions::default())
+        .execute_uncommitted()
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("retention_lease"), "{error}");
+    assert_eq!(listed_leases(&dataset).await, vec![]);
+}
+
 /// Stage one B-tree segment per fragment of `leased`, as distributed workers
 /// would.
 async fn stage_segments(leased: &mut Dataset) -> Vec<IndexMetadata> {
