@@ -26,7 +26,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::dataset::RetentionLease;
-use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
+use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
 use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use crate::index::append;
 use crate::index::create::CreateIndexBuilder;
@@ -241,7 +241,323 @@ pub(super) async fn build_index_metadata_from_segments(
     Ok(new_indices)
 }
 
+/// Refuse to publish an index whose files are gone. A lease keeps staged
+/// files from cleanup only within its clock-skew margin, so a commit made for
+/// a lease checks rather than publishing an index that cannot be opened.
+pub async fn ensure_index_files_exist(dataset: &Dataset, indices: &[IndexMetadata]) -> Result<()> {
+    for index in indices {
+        let Some(files) = &index.files else {
+            continue;
+        };
+        let index_dir = dataset.indices_dir().join(index.uuid.to_string());
+        if files.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: index segment {} of '{}' has no files under {index_dir}; \
+                 they may have been removed by cleanup, so rebuild the segment",
+                index.uuid, index.name
+            )));
+        }
+        let paths = files
+            .iter()
+            .map(|file| index_dir.clone().join(file.path.as_str()))
+            .collect::<Vec<_>>();
+        let exists = futures::stream::iter(paths.clone().into_iter().map(|path| {
+            let object_store = dataset.object_store.clone();
+            async move { object_store.exists(&path).await }
+        }))
+        .buffered(dataset.object_store.io_parallelism())
+        .try_collect::<Vec<_>>()
+        .await?;
+        let missing = paths
+            .iter()
+            .zip(exists)
+            .filter_map(|(path, exists)| (!exists).then_some(path))
+            .collect::<Vec<_>>();
+        if let Some(path) = missing.first() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: index segment {} of '{}' is missing {path}; it may have \
+                 been removed by cleanup, so rebuild the segment",
+                index.uuid, index.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Dataset {
+    async fn commit_index_segments(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+        lease: Option<&RetentionLease>,
+    ) -> Result<()> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::index(format!(
+                "CreateIndex: column '{column}' does not exist"
+            )));
+        };
+
+        let segments = segments
+            .into_iter()
+            .map(IntoIndexSegment::into_index_segment)
+            .collect::<Result<Vec<_>>>()?;
+        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
+        if segments.first().is_some_and(|segment| {
+            segment
+                .index_details()
+                .type_url
+                .ends_with("NGramIndexDetails")
+        }) {
+            let has_retired_coverage = segments
+                .iter()
+                .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
+            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+            let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
+                segments.iter().any(|segment| {
+                    append::fragment_reuse_affects_segment(
+                        frag_reuse_index,
+                        segment.fragment_bitmap(),
+                        segment.dataset_version(),
+                    )
+                })
+            });
+            if has_retired_coverage || requires_rebuild {
+                return Err(Error::invalid_input(
+                    "CreateIndex: NGram segments built before compaction must be rebuilt or merged \
+                     with merge_existing_index_segments before commit"
+                        .to_string(),
+                ));
+            }
+        }
+        // On a tagged table the segments are first validated against this
+        // snapshot (`replay_staged_segments`): a rewrite since their build
+        // keeps their provenance translating, an in-place column rewrite
+        // withdraws the affected coverage, a rewrite they cannot be carried
+        // across says to rebuild. The commit then reads from this snapshot,
+        // and the commit loop carries the segments across anything newer
+        // through the same rules.
+        let segments = replay_staged_segments(
+            self,
+            segments
+                .into_iter()
+                .map(|segment| segment.into_metadata(index_name))
+                .collect(),
+        )
+        .await?
+        .into_iter()
+        .map(IntoIndexSegment::into_index_segment)
+        .collect::<Result<Vec<_>>>()?;
+        let new_indices =
+            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
+        validate_segment_metadata(index_name, &new_indices)?;
+        validate_segment_index_details(index_name, &new_indices)?;
+
+        let incoming_type_url = new_indices[0]
+            .index_details
+            .as_ref()
+            .map(|details| details.type_url.clone());
+        let mut incoming_fragments = RoaringBitmap::new();
+        for segment in &new_indices {
+            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
+                incoming_fragments |= fragment_bitmap.clone();
+            }
+        }
+
+        let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
+        if existing_named_indices.iter().any(|idx| {
+            // Field order is part of a plugin scope's identity. Covered
+            // single-column indices still compare only their keyed prefix.
+            idx.keyed_fields() != new_indices[0].keyed_fields()
+        }) {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
+            // Legacy metadata may omit index details. Its type cannot be proven
+            // compatible, so only a full replacement is safe.
+            let Some(existing_details) = idx.index_details.as_ref() else {
+                return Some("<unknown>".to_owned());
+            };
+            let existing_type_url = existing_details.type_url.as_str();
+            (Some(existing_type_url) != incoming_type_url.as_deref())
+                .then(|| existing_type_url.to_owned())
+        });
+        let missing_fragments = &dataset_fragments - &incoming_fragments;
+        if let Some(existing_type_url) = &existing_different_type_url
+            && !missing_fragments.is_empty()
+        {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: cannot change index '{}' from type '{}' to type '{}' with partial fragment coverage; incoming segments are missing current fragments {:?}",
+                index_name,
+                existing_type_url,
+                incoming_type_url.as_deref().unwrap_or("<missing>"),
+                missing_fragments.iter().collect::<Vec<_>>()
+            )));
+        }
+
+        let is_index_type_change = existing_different_type_url.is_some();
+        let existing_snapshot = existing_named_indices.clone();
+        // What a retained sibling has to agree with. Every incoming segment
+        // already carries the same pair: `build_index_metadata_from_segments`
+        // compares them against each other before this point.
+        let expected_fields = new_indices[0].fields.clone();
+        let expected_covering_fields = new_indices[0].covering_fields.clone();
+        let removed_indices = existing_named_indices
+            .into_iter()
+            .map(|idx| -> Result<Option<IndexMetadata>> {
+                // A logical index cannot combine segment types. Full current-fragment
+                // coverage was verified above, so a type change replaces every segment.
+                if is_index_type_change {
+                    return Ok(Some(idx));
+                }
+
+                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
+                else {
+                    if incoming_fragments != dataset_fragments {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
+                            idx.uuid, index_name
+                        )));
+                    }
+                    return Ok(Some(idx));
+                };
+
+                // A zero-fragment segment can be used to create an index while
+                // deferring the actual build. Such a segment is disjoint from every
+                // other segment but should still be removed.
+                if existing_fragments.is_empty() {
+                    return Ok(Some(idx));
+                }
+
+                if existing_fragments.is_disjoint(&incoming_fragments) {
+                    // Retained, so its declaration outlives this commit and has
+                    // to match what is being written: `IndexDescriptionImpl::try_new`
+                    // requires `fields` to be identical across the segments of one
+                    // logical index. Nothing above catches a disagreement, because
+                    // `keyed_fields` is the prefix left after the carried ones -- a
+                    // segment carrying columns keys on exactly what a plain one
+                    // keys on, and both pass the keyed-field guard.
+                    if idx.fields != expected_fields
+                        || idx.covering_fields != expected_covering_fields
+                    {
+                        return Err(Error::invalid_input(format!(
+                            "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
+                             but retained segment {} declares fields {:?} and covering_fields {:?}; \
+                             a logical index cannot mix declarations - rebuild every segment in one commit",
+                            index_name,
+                            expected_fields,
+                            expected_covering_fields,
+                            idx.uuid,
+                            idx.fields,
+                            idx.covering_fields
+                        )));
+                    }
+                    return Ok(None);
+                }
+
+                let uncovered = existing_fragments - &incoming_fragments;
+                if !uncovered.is_empty() {
+                    return Err(Error::invalid_input(format!(
+                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
+                        index_name,
+                        uncovered.iter().collect::<Vec<_>>(),
+                        idx.uuid
+                    )));
+                }
+
+                Ok(Some(idx))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        // Segments that stay together must be compatible under the plugin's
+        // rules (for example identical hash parameters). Segments this commit
+        // removes are not consulted, so a full rebuild may change parameters.
+        let retained_indices: Vec<IndexMetadata> = existing_snapshot
+            .into_iter()
+            .filter(|idx| {
+                !removed_indices
+                    .iter()
+                    .any(|removed| removed.uuid == idx.uuid)
+            })
+            .collect();
+        validate_segment_params_compatible(&retained_indices, &new_indices)?;
+
+        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+        if segment_has_inverted_details(&new_indices[0]) {
+            // Apply the merge/query semantic contract only to segments that will
+            // coexist, so a full rebuild can change the analyzer settings.
+            let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
+            scalar::inverted::load_segment_details(self, column, &segments).await?;
+        }
+
+        // The query planner ranks coexisting vector segments under one contract.
+        // Validate after replacement selection so a full rebuild may change it.
+        let vector_segment_count = coexisting_indices
+            .clone()
+            .filter(|segment| segment_has_vector_details(segment))
+            .count();
+        if vector_segment_count > 1 {
+            // Only the query contract is compared, never a row: a staged
+            // segment is not in the manifest, so it opens on an identity plan,
+            // and a retained one opens for maintenance so that a segment the
+            // tagged reader excludes from the listing still takes part.
+            let mut vector_indices = Vec::with_capacity(vector_segment_count);
+            for segment in coexisting_indices {
+                let staged_plan = new_indices
+                    .iter()
+                    .any(|staged| staged.uuid == segment.uuid)
+                    .then_some(&frag_reuse::SegmentRemappingPlan::Identity);
+                let index = self
+                    .open_vector_index_from_metadata_with_plan(
+                        column,
+                        segment,
+                        staged_plan,
+                        frag_reuse::OpenPurpose::Maintenance,
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+                vector_indices.push(index);
+            }
+            vector::ivf::validate_vector_query_compatibility(
+                &vector_indices,
+                &format!("CreateIndex: index '{index_name}'"),
+            )
+            .map_err(|error| Error::invalid_input(error.to_string()))?;
+        }
+
+        if lease.is_some() {
+            ensure_index_files_exist(self, &new_indices).await?;
+        }
+        let transaction = match lease {
+            Some(lease) => TransactionBuilder::for_lease(
+                lease,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            )
+            .build(),
+            None => Transaction::new(
+                self.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+                None,
+            ),
+        };
+
+        self.apply_commit(transaction, &Default::default(), &Default::default())
+            .await?;
+
+        Ok(())
+    }
+
     /// Whether an otherwise empty commit would record a new MemWAL catch-up
     /// position.
     ///
@@ -850,274 +1166,30 @@ impl DatasetIndexExt for Dataset {
         Ok(merged_segment)
     }
 
-    async fn commit_existing_index_segments_for_lease(
-        &mut self,
-        index_name: &str,
-        column: &str,
-        segments: Vec<impl IntoIndexSegment + Send>,
-        _lease: &RetentionLease,
-    ) -> Result<()> {
-        self.commit_existing_index_segments(index_name, column, segments)
-            .await
-    }
-
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
     ) -> Result<()> {
-        let Some(field) = self.schema().field(column) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column}' does not exist"
-            )));
-        };
+        self.commit_index_segments(index_name, column, segments, None)
+            .await
+    }
 
-        let segments = segments
-            .into_iter()
-            .map(IntoIndexSegment::into_index_segment)
-            .collect::<Result<Vec<_>>>()?;
-        let dataset_fragments = self.fragment_bitmap.as_ref().clone();
-        if segments.first().is_some_and(|segment| {
-            segment
-                .index_details()
-                .type_url
-                .ends_with("NGramIndexDetails")
-        }) {
-            let has_retired_coverage = segments
-                .iter()
-                .any(|segment| !(segment.fragment_bitmap() - &dataset_fragments).is_empty());
-            let frag_reuse_index = self.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-            let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
-                segments.iter().any(|segment| {
-                    append::fragment_reuse_affects_segment(
-                        frag_reuse_index,
-                        segment.fragment_bitmap(),
-                        segment.dataset_version(),
-                    )
-                })
-            });
-            if has_retired_coverage || requires_rebuild {
-                return Err(Error::invalid_input(
-                    "CreateIndex: NGram segments built before compaction must be rebuilt or merged \
-                     with merge_existing_index_segments before commit"
-                        .to_string(),
-                ));
-            }
+    async fn commit_existing_index_segments_for_lease(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+        lease: &RetentionLease,
+    ) -> Result<()> {
+        // Validating against the leased version lets the commit rebase the
+        // segments over everything committed since they were built.
+        if self.manifest.version != lease.version() {
+            *self = self.checkout_lease(lease).await?;
         }
-        // On a tagged table the segments are first validated against this
-        // snapshot (`replay_staged_segments`): a rewrite since their build
-        // keeps their provenance translating, an in-place column rewrite
-        // withdraws the affected coverage, a rewrite they cannot be carried
-        // across says to rebuild. The commit then reads from this snapshot,
-        // and the commit loop carries the segments across anything newer
-        // through the same rules.
-        let segments = replay_staged_segments(
-            self,
-            segments
-                .into_iter()
-                .map(|segment| segment.into_metadata(index_name))
-                .collect(),
-        )
-        .await?
-        .into_iter()
-        .map(IntoIndexSegment::into_index_segment)
-        .collect::<Result<Vec<_>>>()?;
-        let new_indices =
-            build_index_metadata_from_segments(self, index_name, field.id, segments).await?;
-        validate_segment_metadata(index_name, &new_indices)?;
-        validate_segment_index_details(index_name, &new_indices)?;
-
-        let incoming_type_url = new_indices[0]
-            .index_details
-            .as_ref()
-            .map(|details| details.type_url.clone());
-        let mut incoming_fragments = RoaringBitmap::new();
-        for segment in &new_indices {
-            if let Some(fragment_bitmap) = &segment.fragment_bitmap {
-                incoming_fragments |= fragment_bitmap.clone();
-            }
-        }
-
-        let existing_named_indices = load_all_indices_by_name(self, index_name).await?;
-        if existing_named_indices.iter().any(|idx| {
-            // Field order is part of a plugin scope's identity. Covered
-            // single-column indices still compare only their keyed prefix.
-            idx.keyed_fields() != new_indices[0].keyed_fields()
-        }) {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        let existing_different_type_url = existing_named_indices.iter().find_map(|idx| {
-            // Legacy metadata may omit index details. Its type cannot be proven
-            // compatible, so only a full replacement is safe.
-            let Some(existing_details) = idx.index_details.as_ref() else {
-                return Some("<unknown>".to_owned());
-            };
-            let existing_type_url = existing_details.type_url.as_str();
-            (Some(existing_type_url) != incoming_type_url.as_deref())
-                .then(|| existing_type_url.to_owned())
-        });
-        let missing_fragments = &dataset_fragments - &incoming_fragments;
-        if let Some(existing_type_url) = &existing_different_type_url
-            && !missing_fragments.is_empty()
-        {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: cannot change index '{}' from type '{}' to type '{}' with partial fragment coverage; incoming segments are missing current fragments {:?}",
-                index_name,
-                existing_type_url,
-                incoming_type_url.as_deref().unwrap_or("<missing>"),
-                missing_fragments.iter().collect::<Vec<_>>()
-            )));
-        }
-
-        let is_index_type_change = existing_different_type_url.is_some();
-        let existing_snapshot = existing_named_indices.clone();
-        // What a retained sibling has to agree with. Every incoming segment
-        // already carries the same pair: `build_index_metadata_from_segments`
-        // compares them against each other before this point.
-        let expected_fields = new_indices[0].fields.clone();
-        let expected_covering_fields = new_indices[0].covering_fields.clone();
-        let removed_indices = existing_named_indices
-            .into_iter()
-            .map(|idx| -> Result<Option<IndexMetadata>> {
-                // A logical index cannot combine segment types. Full current-fragment
-                // coverage was verified above, so a type change replaces every segment.
-                if is_index_type_change {
-                    return Ok(Some(idx));
-                }
-
-                let Some(existing_fragments) = idx.effective_fragment_bitmap(&dataset_fragments)
-                else {
-                    if incoming_fragments != dataset_fragments {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: cannot replace legacy index segment {} for '{}' with partial fragment coverage; rebuild all fragments in one commit",
-                            idx.uuid, index_name
-                        )));
-                    }
-                    return Ok(Some(idx));
-                };
-
-                // A zero-fragment segment can be used to create an index while
-                // deferring the actual build. Such a segment is disjoint from every
-                // other segment but should still be removed.
-                if existing_fragments.is_empty() {
-                    return Ok(Some(idx));
-                }
-
-                if existing_fragments.is_disjoint(&incoming_fragments) {
-                    // Retained, so its declaration outlives this commit and has
-                    // to match what is being written: `IndexDescriptionImpl::try_new`
-                    // requires `fields` to be identical across the segments of one
-                    // logical index. Nothing above catches a disagreement, because
-                    // `keyed_fields` is the prefix left after the carried ones -- a
-                    // segment carrying columns keys on exactly what a plain one
-                    // keys on, and both pass the keyed-field guard.
-                    if idx.fields != expected_fields
-                        || idx.covering_fields != expected_covering_fields
-                    {
-                        return Err(Error::invalid_input(format!(
-                            "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
-                             but retained segment {} declares fields {:?} and covering_fields {:?}; \
-                             a logical index cannot mix declarations - rebuild every segment in one commit",
-                            index_name,
-                            expected_fields,
-                            expected_covering_fields,
-                            idx.uuid,
-                            idx.fields,
-                            idx.covering_fields
-                        )));
-                    }
-                    return Ok(None);
-                }
-
-                let uncovered = existing_fragments - &incoming_fragments;
-                if !uncovered.is_empty() {
-                    return Err(Error::invalid_input(format!(
-                        "CreateIndex: incoming segments for '{}' would orphan fragments {:?} from existing segment {}",
-                        index_name,
-                        uncovered.iter().collect::<Vec<_>>(),
-                        idx.uuid
-                    )));
-                }
-
-                Ok(Some(idx))
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        // Segments that stay together must be compatible under the plugin's
-        // rules (for example identical hash parameters). Segments this commit
-        // removes are not consulted, so a full rebuild may change parameters.
-        let retained_indices: Vec<IndexMetadata> = existing_snapshot
-            .into_iter()
-            .filter(|idx| {
-                !removed_indices
-                    .iter()
-                    .any(|removed| removed.uuid == idx.uuid)
-            })
-            .collect();
-        validate_segment_params_compatible(&retained_indices, &new_indices)?;
-
-        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
-        if segment_has_inverted_details(&new_indices[0]) {
-            // Apply the merge/query semantic contract only to segments that will
-            // coexist, so a full rebuild can change the analyzer settings.
-            let segments = coexisting_indices.clone().cloned().collect::<Vec<_>>();
-            scalar::inverted::load_segment_details(self, column, &segments).await?;
-        }
-
-        // The query planner ranks coexisting vector segments under one contract.
-        // Validate after replacement selection so a full rebuild may change it.
-        let vector_segment_count = coexisting_indices
-            .clone()
-            .filter(|segment| segment_has_vector_details(segment))
-            .count();
-        if vector_segment_count > 1 {
-            // Only the query contract is compared, never a row: a staged
-            // segment is not in the manifest, so it opens on an identity plan,
-            // and a retained one opens for maintenance so that a segment the
-            // tagged reader excludes from the listing still takes part.
-            let mut vector_indices = Vec::with_capacity(vector_segment_count);
-            for segment in coexisting_indices {
-                let staged_plan = new_indices
-                    .iter()
-                    .any(|staged| staged.uuid == segment.uuid)
-                    .then_some(&frag_reuse::SegmentRemappingPlan::Identity);
-                let index = self
-                    .open_vector_index_from_metadata_with_plan(
-                        column,
-                        segment,
-                        staged_plan,
-                        frag_reuse::OpenPurpose::Maintenance,
-                        &NoOpMetricsCollector,
-                    )
-                    .await?;
-                vector_indices.push(index);
-            }
-            vector::ivf::validate_vector_query_compatibility(
-                &vector_indices,
-                &format!("CreateIndex: index '{index_name}'"),
-            )
-            .map_err(|error| Error::invalid_input(error.to_string()))?;
-        }
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-            None,
-        );
-
-        self.apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
-
-        Ok(())
+        self.commit_index_segments(index_name, column, segments, Some(lease))
+            .await
     }
 
     async fn load_scalar_index<'a, 'b>(
