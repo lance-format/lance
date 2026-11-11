@@ -32,6 +32,9 @@ pub struct AddDataFile {
 impl AddDataFile {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
+        if self.data_change {
+            state.reject_data_change_to_rearranged(fragment_id, "AddDataFile")?;
+        }
         let resolved = self
             .field_ids
             .iter()
@@ -135,6 +138,9 @@ impl AddDataFile {
         fragment.files.push(file);
         for field_id in bound_fields.iter() {
             state.note_rebind(fragment_id, *field_id, self.data_change)?;
+        }
+        if self.data_change {
+            state.note_data_change(fragment_id);
         }
         Ok(())
     }

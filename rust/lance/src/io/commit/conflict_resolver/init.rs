@@ -354,13 +354,18 @@ impl<'a> TransactionRebase<'a> {
         // A missing transaction may have changed a source fragment or inserted
         // the same keys without touching any shared fragment. Neither conflict
         // check can establish safety across a gap.
+        //
+        // An action set is checked by comparing footprints, which needs every
+        // transaction in the window: replay re-validates only what still
+        // exists, not that a read, key, or definition it depends on is
+        // unchanged. Nearly every action set depends on one, so refuse them all.
         if !self.modified_fragment_ids.is_empty()
             || matches!(
                 &self.transaction.operation,
                 Operation::Update {
                     inserted_rows_filter: Some(_),
                     ..
-                }
+                } | Operation::CompositeOperation(_)
             )
         {
             return Err(Error::retryable_commit_conflict_source(
