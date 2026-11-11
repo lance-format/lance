@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use object_store::path::Path;
 
@@ -236,6 +240,7 @@ pub(in crate::dataset) async fn collect_blob_v2_descriptor_files(
         )));
     }
     let mut locator = BlobLocator::new(dataset, blob_field_id);
+    locator.prefetch_external_sizes(descriptions).await?;
     let mut files = Vec::with_capacity(row_addrs.len());
     for (selection_index, row_addr) in row_addrs.iter().enumerate() {
         let file = match StoredBlob::parse(descriptions, selection_index)? {
@@ -270,6 +275,9 @@ pub(super) struct BlobLocator<'a> {
     base_roots: HashMap<u32, Path>,
     stores: HashMap<u32, Arc<ObjectStore>>,
     sources: HashMap<BlobSourceKey, Arc<BlobSource>>,
+    /// Object lengths of External blobs, keyed by `(base_id, uri)`, for
+    /// descriptors that were written without a size.
+    external_sizes: HashMap<(u32, String), u64>,
 }
 
 impl<'a> BlobLocator<'a> {
@@ -281,12 +289,74 @@ impl<'a> BlobLocator<'a> {
             base_roots: HashMap::new(),
             stores: HashMap::new(),
             sources: HashMap::new(),
+            external_sizes: HashMap::new(),
         }
+    }
+
+    /// Look up the lengths of all External blobs in `descriptions` that were
+    /// written without a size, so that [`Self::locate`] does not have to.
+    ///
+    /// Each distinct object is requested once, with up to the store's I/O
+    /// parallelism in flight.
+    pub(super) async fn prefetch_external_sizes(
+        &mut self,
+        descriptions: &StructArray,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for idx in 0..descriptions.len() {
+            let Some(StoredBlob::External {
+                base_id,
+                uri,
+                size: 0,
+                ..
+            }) = StoredBlob::parse(descriptions, idx)?
+            else {
+                continue;
+            };
+            let key = (base_id, uri.to_string());
+            if self.external_sizes.contains_key(&key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            let (store, path) = self.external_target(base_id, uri).await?;
+            pending.push((key, store, path));
+        }
+        let sizes: Vec<_> = stream::iter(pending)
+            .map(|(key, store, path)| async move {
+                let size = store.size(&path).await?;
+                Ok::<_, Error>((key, size))
+            })
+            .buffer_unordered(self.dataset.object_store.io_parallelism())
+            .try_collect()
+            .await?;
+        self.external_sizes.extend(sizes);
+        Ok(())
+    }
+
+    async fn external_target(
+        &mut self,
+        base_id: u32,
+        uri: &str,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        if base_id == 0 {
+            let registry = self.dataset.session.store_registry();
+            let params = self
+                .dataset
+                .store_params
+                .as_ref()
+                .map(|p| Arc::new((**p).clone()))
+                .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+            return ObjectStore::from_uri_and_params(registry, uri, &params).await;
+        }
+        let root = self.base_root(Some(base_id))?;
+        let store = self.store(Some(base_id)).await?;
+        Ok((store, join_base_and_relative_path(&root, uri)?))
     }
 
     /// Resolve `blob`, stored at `row_addr`, to a lazy handle on its payload.
     ///
-    /// External blobs with an unknown size issue a request for the object length.
+    /// External blobs with an unknown size issue a request for the object
+    /// length unless [`Self::prefetch_external_sizes`] already resolved it.
     pub(super) async fn locate(
         &mut self,
         blob: &StoredBlob<'_>,
@@ -315,24 +385,15 @@ impl<'a> BlobLocator<'a> {
                 position,
                 size,
             } => {
-                let (store, path) = if base_id == 0 {
-                    let registry = self.dataset.session.store_registry();
-                    let params = self
-                        .dataset
-                        .store_params
-                        .as_ref()
-                        .map(|p| Arc::new((**p).clone()))
-                        .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
-                    ObjectStore::from_uri_and_params(registry, uri, &params).await?
-                } else {
-                    let root = self.base_root(Some(base_id))?;
-                    let store = self.store(Some(base_id)).await?;
-                    (store, join_base_and_relative_path(&root, uri)?)
-                };
+                let (store, path) = self.external_target(base_id, uri).await?;
                 let size = if size > 0 {
                     size
+                } else if let Some(size) = self.external_sizes.get(&(base_id, uri.to_string())) {
+                    *size
                 } else {
-                    store.size(&path).await?
+                    let size = store.size(&path).await?;
+                    self.external_sizes.insert((base_id, uri.to_string()), size);
+                    size
                 };
                 Ok(self.file(store, &path, position, size, BlobKind::External, Some(uri)))
             }
