@@ -65,7 +65,7 @@ use lance_table::{
     feature_flags::{
         ensure_can_read_manifest, ensure_can_write_manifest, validate_auto_cleanup_config,
     },
-    format::{BasePath, IndexMetadata, Manifest, is_detached_version},
+    format::{BasePath, Fragment, IndexMetadata, Manifest, is_detached_version},
     io::{
         commit::{ManifestLocation, ManifestNamingScheme, read_version_hint},
         deletion::deletion_file_path,
@@ -489,6 +489,8 @@ struct CleanupInspection {
     /// entry uuid so each is decoded at most once; the flag records whether
     /// some retained (working-set) manifest carries the entry.
     frag_reuse_entries: HashMap<uuid::Uuid, (IndexMetadata, bool)>,
+    /// The `frag_reuse_entries` some attached manifest carries.
+    attached_frag_reuse_entries: HashSet<uuid::Uuid>,
     /// Set when a branch manifest's FRI history could not be interpreted:
     /// `_fri/` garbage collection is skipped for the run rather than risking
     /// row maps the branch references invisibly.
@@ -528,6 +530,122 @@ impl CleanupInspection {
             (Some(retained), Some(deleted)) if deleted > retained => None,
             (retained, _) => retained,
         }
+    }
+}
+
+/// Whether `error` reading the manifest at `location` under `base` means a
+/// detached version was removed after it was listed. Nothing removes a detached
+/// manifest at its canonical path but its owner, and a detached version without
+/// one cannot be checked out, so none of its files need keeping.
+fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: &Error) -> bool {
+    is_detached_version(location.version)
+        && location.path == ManifestNamingScheme::V2.manifest_path(base, location.version)
+        && error.is_not_found()
+}
+
+async fn read_manifest_and_indexes(
+    object_store: &ObjectStore,
+    location: &ManifestLocation,
+) -> Result<(Manifest, Vec<IndexMetadata>)> {
+    let manifest = read_manifest(object_store, &location.path, location.size).await?;
+    ensure_can_read_manifest(&manifest)?;
+    ensure_can_write_manifest(&manifest)?;
+    let indexes = read_manifest_indexes(object_store, location, &manifest).await?;
+    Ok((manifest, indexes))
+}
+
+/// Reads the manifest listed at `location` under `base` and its index section,
+/// returning the location actually read. A detached version's staging copy is
+/// deleted once the commit is finalized, after it is copied to the canonical path,
+/// so a staging copy that is gone when read is retried at the canonical path.
+async fn read_listed_manifest(
+    object_store: &ObjectStore,
+    location: ManifestLocation,
+    base: &Path,
+) -> (ManifestLocation, Result<(Manifest, Vec<IndexMetadata>)>) {
+    let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
+    match read_manifest_and_indexes(object_store, &location).await {
+        Err(error)
+            if is_detached_version(location.version)
+                && location.path != canonical
+                && error.is_not_found() =>
+        {
+            let location = ManifestLocation {
+                path: canonical,
+                size: None,
+                e_tag: None,
+                ..location
+            };
+            let read = read_manifest_and_indexes(object_store, &location).await;
+            (location, read)
+        }
+        read => (location, read),
+    }
+}
+
+/// The data files of a fragment that hold its blob descriptors: every data file
+/// holding a blob field, `None` for one in another base.
+struct BlobDescriptorFiles {
+    data: Vec<Option<Path>>,
+}
+
+impl BlobDescriptorFiles {
+    fn new(dataset: &Dataset, fragment: &Fragment, blob_field_ids: &[i32]) -> Self {
+        let data = fragment
+            .files
+            .iter()
+            .filter(|file| file.fields.iter().any(|id| blob_field_ids.contains(id)))
+            .map(|file| {
+                file.base_id
+                    .is_none()
+                    .then(|| dataset.data_dir().join(file.path.as_str()))
+            })
+            .collect();
+        Self { data }
+    }
+
+    /// Whether the descriptors are gone: every data file holding a blob field is
+    /// missing. A file in another base counts as present. A missing deletion file
+    /// does not count, since the data files still hold the descriptors.
+    async fn removed(&self, store: &ObjectStore) -> Result<bool> {
+        if self.data.is_empty() {
+            return Ok(false);
+        }
+        for path in &self.data {
+            match path {
+                Some(path) if !store.exists(path).await? => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// A file missing from the managed blob scan of a detached version. Removing the
+/// version's manifest drops the version and lets cleanup run. Reported as an IO
+/// error; `is_not_found()` still sees the missing file through its source.
+#[derive(Debug)]
+struct DetachedBlobScanError {
+    version: u64,
+    fragment_id: usize,
+    manifest: Path,
+    source: Error,
+}
+
+impl std::fmt::Display for DetachedBlobScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot read the managed blobs of fragment {} of detached version {}: {}. \
+             Remove {} if the version is no longer needed",
+            self.fragment_id, self.version, self.source, self.manifest
+        )
+    }
+}
+
+impl std::error::Error for DetachedBlobScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -988,9 +1106,7 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<CleanupInspection> {
         let branch_versions = inspection.branch_referenced_versions.clone();
         let inspection = Mutex::new(inspection);
-        self.dataset
-            .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+        self.manifest_locations(&self.dataset.base)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(
@@ -1020,6 +1136,53 @@ impl<'a> CleanupTask<'a> {
             )
             .await?;
         Ok(inspection.into_inner().unwrap())
+    }
+
+    /// The manifests under `base`, detached ones included. A detached version is
+    /// outside the version history, so it never expires, but whoever committed it
+    /// can still check it out.
+    fn manifest_locations<'b>(
+        &'b self,
+        base: &'b Path,
+    ) -> stream::BoxStream<'b, Result<ManifestLocation>> {
+        let commit_handler = &self.dataset.commit_handler;
+        let object_store = &self.dataset.object_store;
+        // A staging copy of a detached manifest shares its name prefix and is deleted
+        // once the commit is finalized. It is the version's manifest only while the
+        // commit handler names it, as when the copy to the canonical path failed.
+        // If the handler no longer names a listed copy, the version may have been
+        // finalized after the listing passed its canonical path, so that path is
+        // read if it exists.
+        let detached = commit_handler
+            .list_detached_manifest_locations(base, object_store)
+            .try_filter_map(move |location| async move {
+                let canonical = ManifestNamingScheme::V2.manifest_path(base, location.version);
+                if location.path == canonical
+                    || commit_handler
+                        .is_manifest_path_authoritative(
+                            base,
+                            location.version,
+                            &location.path,
+                            object_store.inner.as_ref(),
+                        )
+                        .await?
+                {
+                    return Ok(Some(location));
+                }
+                Ok(object_store
+                    .exists(&canonical)
+                    .await?
+                    .then_some(ManifestLocation {
+                        path: canonical,
+                        size: None,
+                        e_tag: None,
+                        ..location
+                    }))
+            });
+        commit_handler
+            .list_manifest_locations(base, object_store, false)
+            .chain(detached)
+            .boxed()
     }
 
     async fn inspect_managed_blobs(
@@ -1053,6 +1216,12 @@ impl<'a> CleanupTask<'a> {
             .collect::<Vec<_>>();
         bases.sort_unstable();
         let owner_base_ids = self.parent_base_ids(&dataset.manifest);
+        // Earlier releases removed files that only detached versions referenced. When
+        // every data file holding a detached fragment's blob fields is gone, this
+        // version stops protecting that fragment's managed blobs; any other missing
+        // file fails cleanup naming the version.
+        let detached_manifest = is_detached_version(dataset.manifest.version)
+            .then(|| dataset.manifest_location().path.clone());
         stream::iter(dataset.get_fragments())
             .map(|fragment| {
                 let key = ManagedScanKey {
@@ -1074,6 +1243,13 @@ impl<'a> CleanupTask<'a> {
                     .or_default()
                     .clone();
                 let scan_owner_base_ids = owner_base_ids.clone();
+                let descriptor_files = detached_manifest
+                    .is_some()
+                    .then(|| BlobDescriptorFiles::new(dataset, &fragment.metadata, &field_ids));
+                let detached_manifest = detached_manifest.clone();
+                let version = dataset.manifest.version;
+                let fragment_id = fragment.id();
+                let store = dataset.object_store.clone();
                 async move {
                     let scanned = cell
                         .get_or_try_init(|| async {
@@ -1122,12 +1298,36 @@ impl<'a> CleanupTask<'a> {
                             }
                             Ok::<_, Error>(found)
                         })
-                        .await;
+                        .await
+                        .copied();
                     match scanned {
-                        Ok(has_paths) => Ok(*has_paths),
+                        Ok(has_paths) => Ok(has_paths),
                         // An expired descriptor can disappear during concurrent cleanup.
                         // Leave failed cells uninitialized so subsequent scans can retry.
                         Err(error) if !retained && error.is_not_found() => Ok(false),
+                        Err(error) if error.is_not_found() => {
+                            match (descriptor_files, detached_manifest) {
+                                (Some(files), _) if files.removed(&store).await? => {
+                                    warn!(
+                                        version,
+                                        fragment_id,
+                                        error = %error,
+                                        "Not protecting the managed blobs of a detached version's \
+                                         fragment whose blob data files are gone"
+                                    );
+                                    Ok(false)
+                                }
+                                (_, Some(manifest)) => {
+                                    Err(Error::io_source(Box::new(DetachedBlobScanError {
+                                        version,
+                                        fragment_id,
+                                        manifest,
+                                        source: error,
+                                    })))
+                                }
+                                _ => Err(error),
+                            }
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -1186,18 +1386,18 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest_and_indexes = async {
-            let manifest =
-                read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
-            ensure_can_read_manifest(&manifest)?;
-            ensure_can_write_manifest(&manifest)?;
-            let indexes =
-                read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
-            Ok::<_, Error>((manifest, indexes))
-        }
-        .await;
+        let (location, manifest_and_indexes) =
+            read_listed_manifest(&self.dataset.object_store, location, &self.dataset.base).await;
         let (manifest, indexes) = match manifest_and_indexes {
             Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if is_removed_detached_version(&location, &self.dataset.base, &error) => {
+                debug!(
+                    manifest_version = location.version,
+                    manifest_path = %location.path,
+                    "Skipping detached manifest removed after it was listed"
+                );
+                return Ok(());
+            }
             Err(error) if location.version < self.read_version && error.is_not_found() => {
                 // Another cleanup may remove an old manifest after this cleanup lists it.
                 // The current manifest is never safe to skip because it anchors our snapshot.
@@ -1221,11 +1421,14 @@ impl<'a> CleanupTask<'a> {
         };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
-        // version.  These are either in-progress or newly added since we started.
+        // version.  These are either in-progress or newly added since we started. Detached
+        // versions never expire.
+        let is_detached = is_detached_version(manifest.version);
         let is_latest = self.read_version <= manifest.version;
         let (hard_expired, thinning_candidate) = self.cleanup_candidates(&manifest);
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = retain_bucket_survivor
+        let in_working_set = is_detached
+            || retain_bucket_survivor
             || is_latest
             || !(hard_expired || thinning_candidate.is_some())
             || is_tagged
@@ -1286,9 +1489,13 @@ impl<'a> CleanupTask<'a> {
                 inspection.old_manifests.remove(&location.path);
                 inspection.retired_records.remove(&manifest.version);
             }
-            match inspection.earliest_retained_manifest_time {
-                Some(ts) if commit_ts >= ts => {}
-                _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
+            // Detached versions do not move the retained-manifest cutoff; their own
+            // files are referenced either way.
+            if !is_detached {
+                match inspection.earliest_retained_manifest_time {
+                    Some(ts) if commit_ts >= ts => {}
+                    _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
+                }
             }
         }
         Ok(())
@@ -1348,6 +1555,9 @@ impl<'a> CleanupTask<'a> {
                     .entry(index.uuid)
                     .or_insert_with(|| (index.clone(), false));
                 entry.1 |= in_working_set;
+                if !is_detached_version(manifest.version) {
+                    inspection.attached_frag_reuse_entries.insert(index.uuid);
+                }
             }
         }
         Ok(())
@@ -1411,6 +1621,20 @@ impl<'a> CleanupTask<'a> {
                         &mut inspection.verified_files
                     };
                     target.frag_reuse_map_ids.extend(map_ids);
+                }
+                // Earlier releases removed files that only detached versions referenced.
+                // A detached version cannot read an entry whose content is gone, so its
+                // row maps need no protection from it.
+                Err(error)
+                    if error.is_not_found()
+                        && !inspection.attached_frag_reuse_entries.contains(uuid) =>
+                {
+                    warn!(
+                        entry_uuid = %uuid,
+                        error = %error,
+                        "Skipping a fragment reuse index entry of detached versions whose \
+                         content is missing"
+                    );
                 }
                 Err(error) => {
                     warn!(
@@ -2277,9 +2501,7 @@ impl<'a> CleanupTask<'a> {
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
             let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
-            self.dataset
-                .commit_handler
-                .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
+            self.manifest_locations(&branch_location.path)
                 .try_filter(|location| {
                     future::ready(!removed_branch_manifests.contains(&location.path))
                 })
@@ -2437,10 +2659,22 @@ impl<'a> CleanupTask<'a> {
         referenced_version: u64,
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
-        let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
-        ensure_can_read_manifest(&manifest)?;
-        ensure_can_write_manifest(&manifest)?;
+        // Read the index section before a checkout, which may finalize a detached
+        // version and delete the staging copy this location names.
+        let (location, manifest_and_indexes) =
+            read_listed_manifest(&self.dataset.object_store, location, branch_root).await;
+        let (manifest, indexes) = match manifest_and_indexes {
+            Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if is_removed_detached_version(&location, branch_root, &error) => {
+                debug!(
+                    manifest_version = location.version,
+                    manifest_path = %location.path,
+                    "Skipping branch detached manifest removed after it was listed"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let managed_referenced = if manifest.has_managed_blobs() {
             let snapshot = self
                 .dataset
@@ -2451,8 +2685,6 @@ impl<'a> CleanupTask<'a> {
         } else {
             false
         };
-        let indexes =
-            read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
         let parent_base_ids = self.parent_base_ids(&manifest);
 
         // Resolve tagged FRI references into the parent before taking the
@@ -2475,6 +2707,14 @@ impl<'a> CleanupTask<'a> {
                     .await
                 {
                     Ok(map_ids) => branch_parent_map_ids.extend(map_ids),
+                    Err(error) if is_detached_version(manifest.version) && error.is_not_found() => {
+                        warn!(
+                            entry_uuid = %index.uuid,
+                            error = %error,
+                            "Skipping a fragment reuse index entry of a branch's detached \
+                             version whose content is missing"
+                        );
+                    }
                     Err(error) => {
                         warn!(
                             entry_uuid = %index.uuid,
@@ -3121,6 +3361,9 @@ mod tests {
 
     mod branch_source;
 
+    mod detached;
+    use detached::commit_detached_delete;
+
     mod retention;
 
     mod concurrency;
@@ -3638,6 +3881,7 @@ mod tests {
     #[case::unprotected(None)]
     #[case::tag(Some("tag"))]
     #[case::branch(Some("branch"))]
+    #[case::detached(Some("detached"))]
     #[tokio::test]
     async fn managed_cleanup_preserves_protected_rows(
         #[case] protection: Option<&str>,
@@ -3674,6 +3918,10 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            Some("detached") => {
+                let version = commit_detached_delete(&Arc::new(dataset.clone()), "id = 1").await;
+                Some(dataset.checkout_version(version).await.unwrap())
+            }
             _ => None,
         };
         dataset.delete("id = 0").await.unwrap();
@@ -6176,19 +6424,38 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_old_replaced_segment_keeps_still_referenced_segments() {
+        // Real segments: a commit reads the index files of the vector segments
+        // that share a name.
+        async fn build_segment(dataset: &mut Dataset, name: &str, fragment: u32) -> IndexMetadata {
+            dataset
+                .create_index_builder(
+                    &["indexable"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, MetricType::L2),
+                )
+                .name(name.to_string())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+
         let fixture = MockDatasetFixture::try_new().unwrap();
         fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
 
         let mut dataset = fixture.open().await.unwrap();
-        let field_id = dataset.schema().field("indexable").unwrap().id;
+        let fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect::<Vec<_>>();
 
-        let seg_a = Uuid::new_v4();
-        let seg_b = Uuid::new_v4();
-        write_dummy_index_artifact(&dataset, seg_a).await.unwrap();
-        write_dummy_index_artifact(&dataset, seg_b).await.unwrap();
-
-        let index_a = dummy_index_metadata(&dataset, field_id, seg_a, [0_u32]);
-        let index_b = dummy_index_metadata(&dataset, field_id, seg_b, [1_u32]);
+        let index_a = build_segment(&mut dataset, "some_index", fragments[0]).await;
+        let index_b = build_segment(&mut dataset, "some_index", fragments[1]).await;
+        let seg_a = index_a.uuid;
+        let seg_b = index_b.uuid;
         let initial_tx = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
@@ -6204,9 +6471,10 @@ mod tests {
 
         MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
 
-        let seg_c = Uuid::new_v4();
-        write_dummy_index_artifact(&dataset, seg_c).await.unwrap();
-        let index_c = dummy_index_metadata(&dataset, field_id, seg_c, [2_u32]);
+        // A build may not take the name of an existing index.
+        let mut index_c = build_segment(&mut dataset, "worker_idx", fragments[2]).await;
+        index_c.name = "some_index".to_string();
+        let seg_c = index_c.uuid;
         let replace_tx = Transaction::new(
             dataset.manifest.version,
             Operation::CreateIndex {
@@ -6225,7 +6493,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(removed.index_files_removed, 2);
+        assert_eq!(
+            removed.index_files_removed,
+            index_a.files.as_ref().unwrap().len() as u64
+        );
         assert!(!fixture.local_index_dir(seg_a).exists());
         assert!(
             !dataset
@@ -7456,6 +7727,16 @@ mod tests {
     struct IdentifiedStore {
         rows: Mutex<HashMap<u64, (String, u64, String)>>,
         next_identity: std::sync::atomic::AtomicU64,
+        /// Whether `list_versions` reports that the store cannot list its records,
+        /// so the manifests are listed from the object store.
+        is_unlisted: bool,
+        /// A version whose first lookup moves its record off the recorded copy, as
+        /// finalizing the commit does: the copy is copied to the given canonical
+        /// path, the record is repointed and the copy is deleted.
+        finalize_on_lookup: Mutex<Option<(u64, Arc<ObjectStore>, Path)>>,
+        /// Whether that lookup answers with the record as it was before the move,
+        /// as when the version is finalized between the lookup and the read.
+        answers_before_finalizing: bool,
     }
 
     #[async_trait::async_trait]
@@ -7474,13 +7755,34 @@ mod tests {
             _base_uri: &str,
             version: u64,
         ) -> Result<ManifestLocation> {
-            let row = self
-                .rows
-                .lock()
-                .unwrap()
-                .get(&version)
-                .cloned()
-                .ok_or_else(|| Error::not_found(format!("@{version}")))?;
+            let finalize = {
+                let mut finalize = self.finalize_on_lookup.lock().unwrap();
+                finalize
+                    .as_ref()
+                    .is_some_and(|(pending, _, _)| *pending == version)
+                    .then(|| finalize.take())
+                    .flatten()
+            };
+            let row = || {
+                self.rows
+                    .lock()
+                    .unwrap()
+                    .get(&version)
+                    .cloned()
+                    .ok_or_else(|| Error::not_found(format!("@{version}")))
+            };
+            let before = row()?;
+            if let Some((_, object_store, canonical)) = finalize {
+                let staging = Path::parse(&before.0).unwrap();
+                object_store.copy(&staging, &canonical).await?;
+                self.rows.lock().unwrap().get_mut(&version).unwrap().0 = canonical.to_string();
+                object_store.delete(&staging).await?;
+            }
+            let row = if self.answers_before_finalizing {
+                before
+            } else {
+                row()?
+            };
             Ok(ManifestLocation {
                 version,
                 path: Path::parse(&row.0).unwrap(),
@@ -7498,6 +7800,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
+                .filter(|(version, _)| !is_detached_version(**version))
                 .max_by_key(|(version, _)| **version)
                 .map(|(version, row)| (*version, row.0.clone())))
         }
@@ -7571,6 +7874,9 @@ mod tests {
             base_uri: &str,
             since: Option<u64>,
         ) -> Result<Option<Vec<ManifestLocation>>> {
+            if self.is_unlisted {
+                return Ok(None);
+            }
             let versions: Vec<u64> = self.rows.lock().unwrap().keys().copied().collect();
             let mut locations = Vec::new();
             for version in versions {
@@ -8232,7 +8538,7 @@ mod tests {
                     type_url: "/lance.table.FragmentReuseIndexDetails".into(),
                     value: reader_tests::field(1, &unknown_content),
                 })),
-                ..entry
+                ..entry.clone()
             };
             let mut inspection = CleanupInspection::default();
             inspection
@@ -8242,6 +8548,25 @@ mod tests {
                 !task.resolve_frag_reuse_map_ids(&mut inspection).await,
                 "an unknown envelope record must disable _fri collection"
             );
+
+            // An entry whose content an earlier release removed is skipped when
+            // only detached versions carry it, and still disables `_fri`
+            // collection when an attached version does.
+            dataset.object_store.delete(&details_path).await.unwrap();
+            for attached in [false, true] {
+                let mut inspection = CleanupInspection::default();
+                inspection
+                    .frag_reuse_entries
+                    .insert(uuid, (entry.clone(), true));
+                if attached {
+                    inspection.attached_frag_reuse_entries.insert(uuid);
+                }
+                assert_eq!(
+                    task.resolve_frag_reuse_map_ids(&mut inspection).await,
+                    !attached
+                );
+                assert!(inspection.referenced_files.frag_reuse_map_ids.is_empty());
+            }
         }
 
         /// E: the full lifecycle, asserting every stage. A stable-partition

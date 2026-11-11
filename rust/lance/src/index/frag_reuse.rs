@@ -3,6 +3,9 @@
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_v0_cache::{
+    V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
+};
 use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
@@ -40,7 +43,11 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
     /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    V0 {
+        remapper: Arc<dyn RowIdRemapper>,
+        /// See [`v0_segment_cache_id`].
+        cache_id: Option<Uuid>,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -55,7 +62,10 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { cache_id, .. } => f
+                .debug_struct("V0")
+                .field("cache_id", cache_id)
+                .finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { remapper, .. } => {
                 f.debug_tuple("V1Translate").field(remapper).finish()
@@ -97,15 +107,15 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the history, by its
-/// [`v0_cache_identity`], identify cached content. Under a tagged history the
+/// handed to the plugin's load path), so only then does the history, by
+/// [`v0_segment_cache_id`], identify cached content. Under a tagged history the
 /// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
 /// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((_, ResolvedRemapping::V0 { cache_id, .. })) => cache_id.as_ref(),
         _ => None,
     }
 }
@@ -671,12 +681,24 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                v0_cache_identity(dataset, fri),
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
+        let Some(legacy) = dataset.open_frag_reuse_index(metrics).await? else {
+            return Ok(None);
+        };
+        let history = v0_cache_identity(dataset, fri);
+        let digests = dataset
+            .index_cache
+            .get_or_insert_with_key(V0HistoryDigestsKey { history: &history }, || async {
+                Ok(V0HistoryDigests::new(&legacy.details))
+            })
+            .await?;
+        let cache_id = v0_segment_cache_id(history, &legacy.details, &digests, index);
+        return Ok(Some((
+            history,
+            ResolvedRemapping::V0 {
+                remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                cache_id,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(
@@ -4012,12 +4034,11 @@ mod tests {
         assert_eq!(dataset.latest_version_id().await.unwrap(), version);
     }
 
-    /// Round 5 item 4: deferred compaction of fragments no index covers and
-    /// no lineage reaches commits a plain rewrite on a tagged table -- no
-    /// new transition, the entry untouched -- instead of growing the history
-    /// with records no reader ever has to translate.
+    /// Deferred compaction of fragments no index covers and no lineage reaches
+    /// still appends a transition on a tagged table (an index build in flight
+    /// may cover them), and trim releases it since no committed index needs it.
     #[tokio::test]
-    async fn uncovered_deferred_compaction_commits_plain_rewrite() {
+    async fn uncovered_deferred_compaction_appends_a_trimmable_transition() {
         let mut dataset = reader_tests::fixture().await;
         reserve_fragments(&mut dataset, 20).await;
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
@@ -4092,20 +4113,34 @@ mod tests {
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
 
-        // The entry is byte-for-byte the one from before the compaction.
         let stored = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap();
         let entry = stored_fri(&stored);
-        assert_eq!(entry.uuid, entry_before.uuid);
+        assert_ne!(entry.uuid, entry_before.uuid);
         let ledger = decode_entry(&dataset, &entry).await;
-        assert_eq!(ledger.transitions().len(), 1);
+        assert_eq!(ledger.transitions().len(), 2);
         assert_eq!(sorted_values(&dataset).await, before);
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
         assert_eq!(
             filtered_values(&dataset, "i >= 100").await,
             (100..104).collect::<Vec<_>>()
         );
+
+        // Trim releases the uncovered transition and keeps the covered one.
+        let ledger_before = decode_entry(&dataset, &entry_before).await;
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        let trimmed = decode_entry(&dataset, &stored_fri(&stored)).await;
+        assert_eq!(
+            format!("{:?}", trimmed.transitions()),
+            format!("{:?}", ledger_before.transitions())
+        );
+        assert_eq!(sorted_values(&dataset).await, before);
     }
 
     /// Round 5 item 7: detached commits skip the rebase pipeline, so nothing
