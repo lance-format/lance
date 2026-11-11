@@ -13,9 +13,10 @@ use super::{
 };
 use crate::{
     decoder::{
-        DecodedArray, DrainLimit, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
-        ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
-        StructuralFieldScheduler, StructuralSchedulingJob,
+        ColumnContext, DecodeColumnError, DecodedArray, DrainLimit, FilterExpression,
+        LoadedPageShard, NextDecodeTask, PageEncoding, ScheduledScanLine, SchedulerContext,
+        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+        StructuralSchedulingJob,
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
@@ -239,6 +240,10 @@ pub struct StructuralStructDecoder {
     // The root decoder is slightly different because it cannot have nulls
     is_root: bool,
     nullable: bool,
+    // Column context for top-level fields, if known.
+    column_contexts: Option<Arc<[ColumnContext]>>,
+    // Rows drained so far, used to report the batch offset for root decodes.
+    rows_drained: u64,
 }
 
 impl StructuralStructDecoder {
@@ -259,7 +264,15 @@ impl StructuralStructDecoder {
             child_fields: fields,
             is_root,
             nullable: !is_root && nullable,
+            column_contexts: None,
+            rows_drained: 0,
         })
+    }
+
+    /// Attach top-level column context so decode errors name the failing column.
+    pub fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
+        self.column_contexts = Some(contexts.into());
+        self
     }
 
     fn field_to_decoder(
@@ -377,9 +390,13 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
             .iter_mut()
             .map(|child| child.drain(num_rows))
             .collect::<Result<Vec<_>>>()?;
+        let offset = self.is_root.then_some(self.rows_drained);
+        self.rows_drained += num_rows;
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            column_contexts: self.column_contexts.clone(),
+            offset,
             is_root: self.is_root,
             num_rows,
         }))
@@ -412,6 +429,8 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    column_contexts: Option<Arc<[ColumnContext]>>,
+    offset: Option<u64>,
     is_root: bool,
     num_rows: u64,
 }
@@ -426,10 +445,26 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             });
         }
 
+        let contexts = self.column_contexts;
+        let offset = self.offset;
         let arrays = self
             .children
             .into_iter()
-            .map(|task| task.decode())
+            .enumerate()
+            .map(|(index, task)| {
+                task.decode().map_err(|source| {
+                    match contexts.as_ref().and_then(|contexts| contexts.get(index)) {
+                        Some(context) => DecodeColumnError {
+                            field_name: context.name.clone(),
+                            field_id: context.id,
+                            offset,
+                            source,
+                        }
+                        .into(),
+                        None => source,
+                    }
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
         let mut repdefs = Vec::with_capacity(arrays.len());

@@ -10,8 +10,8 @@ use std::{
 use crate::{
     data::concat_decoded_arrays,
     decoder::{
-        DecodeArrayTask, DrainLimit, FilterExpression, MessageType, NextDecodeTask, PriorityRange,
-        ScheduledScanLine, SchedulerContext,
+        ColumnContext, DecodeArrayTask, DecodeColumnError, DrainLimit, FilterExpression,
+        MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
     },
     decoder::{DecoderReady, FieldScheduler, LogicalPageDecoder, SchedulingJob},
 };
@@ -491,6 +491,10 @@ pub struct SimpleStructDecoder {
     child_fields: Fields,
     data_type: DataType,
     num_rows: u64,
+    // Column context for top-level fields, if known.
+    column_contexts: Option<Arc<[ColumnContext]>>,
+    // Rows drained so far, used to report the batch offset for root decodes.
+    rows_drained: u64,
 }
 
 impl SimpleStructDecoder {
@@ -505,7 +509,15 @@ impl SimpleStructDecoder {
             child_fields,
             data_type,
             num_rows,
+            column_contexts: None,
+            rows_drained: 0,
         }
+    }
+
+    /// Attach top-level column context so decode errors name the failing column.
+    pub fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
+        self.column_contexts = Some(contexts.into());
+        self
     }
 
     async fn do_wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
@@ -572,10 +584,14 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             .collect::<Result<Vec<_>>>()?;
         let num_rows = child_tasks[0].num_rows;
         debug_assert!(child_tasks.iter().all(|task| task.num_rows == num_rows));
+        let offset = self.column_contexts.is_some().then_some(self.rows_drained);
+        self.rows_drained += num_rows;
         Ok(NextDecodeTask {
             task: Box::new(SimpleStructDecodeTask {
                 children: child_tasks,
                 child_fields: self.child_fields.clone(),
+                column_contexts: self.column_contexts.clone(),
+                offset,
             }),
             num_rows,
         })
@@ -659,14 +675,32 @@ impl CompositeDecodeTask {
 struct SimpleStructDecodeTask {
     children: Vec<CompositeDecodeTask>,
     child_fields: Fields,
+    column_contexts: Option<Arc<[ColumnContext]>>,
+    offset: Option<u64>,
 }
 
 impl DecodeArrayTask for SimpleStructDecodeTask {
     fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+        let contexts = self.column_contexts;
+        let offset = self.offset;
         let child_arrays = self
             .children
             .into_iter()
-            .map(|child| child.decode())
+            .enumerate()
+            .map(|(index, child)| {
+                child.decode().map_err(|source| {
+                    match contexts.as_ref().and_then(|contexts| contexts.get(index)) {
+                        Some(context) => DecodeColumnError {
+                            field_name: context.name.clone(),
+                            field_id: context.id,
+                            offset,
+                            source,
+                        }
+                        .into(),
+                        None => source,
+                    }
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         // data_size is only tracked in the v2.1 structural decode path; the v2.0 array
         // v2.0 path does not need it so we return 0.
