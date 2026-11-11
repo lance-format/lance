@@ -44,6 +44,12 @@ const SUPPORTED_FORM: &str =
 /// Rewrite every `array_any_match(list, x -> predicate)` in a parsed filter to
 /// `any_element(list, 'predicate')`, and reject any other lambda.
 ///
+/// Before visiting, each chain of one logical operator (`AND` or `OR`) is
+/// regrouped into a balanced tree. The visitors below recurse over the AST,
+/// and `a AND b AND ...` parses as a chain as deep as its operand count, so
+/// balancing bounds that recursion. Only one operator is regrouped at a time,
+/// which leaves the filter's meaning unchanged.
+///
 /// `type_of` returns the data type of an argument, to check that it is a
 /// `list<struct>`.
 pub fn rewrite_element_lambdas(
@@ -90,16 +96,24 @@ impl VisitorMut for BalanceLogicalBinaryExprs {
 /// Only one associative operator is regrouped: `(a AND b) AND c` becomes
 /// `a AND (b AND c)`, while `AND` and `OR` are never mixed.
 fn balance_logical_binary_expr(expr: &mut SQLExpr) {
-    let op = match expr {
-        SQLExpr::BinaryOp {
-            op: op @ (BinaryOperator::And | BinaryOperator::Or),
-            ..
-        } => op.clone(),
-        _ => return,
+    let SQLExpr::BinaryOp { op, .. } = expr else {
+        return;
     };
+    if !matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+        return;
+    }
+
     let placeholder = SQLExpr::value(Value::Null);
-    let SQLExpr::BinaryOp { left, right, .. } = std::mem::replace(expr, placeholder) else {
-        unreachable!("the expression was matched as a binary operation above")
+    let (left, op, right) = match std::mem::replace(expr, placeholder) {
+        SQLExpr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => (left, op, right),
+        other => {
+            *expr = other;
+            return;
+        }
     };
 
     let mut stack = vec![*right, *left];
@@ -135,9 +149,10 @@ fn balance_logical_binary_expr(expr: &mut SQLExpr) {
         exprs = next;
     }
 
-    *expr = exprs
-        .pop_front()
-        .expect("a binary expression has at least two operands");
+    debug_assert_eq!(exprs.len(), 1, "balancing keeps one expression");
+    if let Some(balanced) = exprs.pop_front() {
+        *expr = balanced;
+    }
 }
 
 struct LambdaRewriter<F> {
