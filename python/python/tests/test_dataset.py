@@ -9397,6 +9397,59 @@ def test_retention_lease_pickle_roundtrip(tmp_path: Path):
         )
 
 
+def test_retention_lease_managed_index_build(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": [1, 2, 3, 4]}), tmp_path / "leased", max_rows_per_file=2
+    )
+    options = lance.LeaseOptions(label="reindex")
+    with pytest.raises(ValueError, match="fragment_ids"):
+        dataset.create_scalar_index(
+            "a", "BTREE", fragment_ids=[0], retention_lease=options
+        )
+
+    dataset.create_scalar_index("a", "BTREE", retention_lease=options)
+    lease_version = 2
+    assert dataset.version == lease_version + 1
+    assert dataset.retention_leases() == []
+    assert [index.name for index in dataset.describe_indices()] == ["a_idx"]
+
+
+def test_retention_lease_commit_index_segments(tmp_path: Path):
+    uri = tmp_path / "leased"
+    dataset = lance.write_dataset(
+        pa.table({"a": [1, 2, 3, 4]}), uri, max_rows_per_file=2
+    )
+    lease, leased = dataset.acquire_retention_lease()
+    segments = [
+        leased.create_index_uncommitted(
+            "a", "BTREE", fragment_ids=[fragment.fragment_id]
+        )
+        for fragment in leased.get_fragments()
+    ]
+    lance.write_dataset(pa.table({"a": [5]}), uri, mode="append")
+
+    dataset.commit_existing_index_segments("a_idx", "a", segments, lease=lease)
+    assert dataset.version == 4
+    assert dataset.retention_leases() == []
+    assert [index.name for index in dataset.describe_indices()] == ["a_idx"]
+
+
+def test_lease_keeper(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"a": [1]}), tmp_path / "leased")
+    lease, leased = dataset.acquire_retention_lease(ttl=timedelta(minutes=10))
+    with lance.LeaseKeeper(leased, lease) as keeper:
+        assert keeper.lease == lease
+        assert keeper.lost_reason is None
+    dataset.checkout_latest()
+    assert dataset.retention_leases() == [lease]
+    with pytest.raises(ValueError, match="already stopped"):
+        keeper.release()
+
+    lance.LeaseKeeper(leased, lease).release()
+    dataset.checkout_latest()
+    assert dataset.retention_leases() == []
+
+
 def test_read_transaction_properties(tmp_path):
     """Test retrieving properties from transactions at different versions."""
     # Create schema and data for the dataset

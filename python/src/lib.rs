@@ -52,7 +52,7 @@ use dataset::optimize_indices::{
     PyIndexSegmentResult, PyOptimizeIndexMerge, PyOptimizeIndexTask, PyOptimizeIndices,
     PyOptimizeIndicesPlan,
 };
-use dataset::retention_lease::PyRetentionLease;
+use dataset::retention_lease::{PyLeaseKeeper, PyRetentionLease};
 use dataset::write::write_dataset;
 use env_logger::{Builder, Env};
 use file::{
@@ -277,6 +277,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<PyRetentionLease>()?;
+    m.add_class::<PyLeaseKeeper>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<OverlayWriter>()?;
     m.add_class::<FragmentAddColumnsCleanup>()?;

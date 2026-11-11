@@ -106,7 +106,7 @@ use self::cleanup::{
 use self::commit::PyCommitLock;
 use self::delta::DatasetDeltaBuilder;
 use self::io_stats::IoStats;
-use self::retention_lease::PyRetentionLease;
+use self::retention_lease::{PyRetentionLease, extract_lease_options};
 use self::sql::SqlQueryBuilder;
 use self::write::{PyWriteDest, transforms_from_python};
 
@@ -2377,7 +2377,7 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None))]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, train = None, storage_options = None, kwargs = None, retention_lease = None))]
     #[allow(clippy::too_many_arguments)]
     fn create_index(
         &mut self,
@@ -2388,6 +2388,7 @@ impl Dataset {
         train: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
+        retention_lease: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyLance<IndexMetadata>> {
         let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
         let index_type = index_type.to_uppercase();
@@ -2632,6 +2633,15 @@ impl Dataset {
         if let Some(progress_handler) = progress_handler.as_ref() {
             builder = builder.progress(progress_handler.progress.clone());
         }
+        if let Some(retention_lease) = retention_lease {
+            if has_fragment_ids {
+                return Err(PyValueError::new_err(
+                    "retention_lease applies only to builds that publish the index, \
+                     not to fragment-level builds (fragment_ids)",
+                ));
+            }
+            builder = builder.retention_lease(extract_lease_options(retention_lease)?);
+        }
 
         use std::future::IntoFuture;
 
@@ -2667,18 +2677,31 @@ impl Dataset {
         Ok(PyLance(merged))
     }
 
+    #[pyo3(signature = (index_name, column, segments, lease = None))]
     fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
         column: &str,
         segments: &Bound<'_, PyAny>,
+        lease: Option<PyRef<'_, PyRetentionLease>>,
     ) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let segments = extract_index_segments(segments)?;
-        rt().block_on(
-            None,
-            new_self.commit_existing_index_segments(index_name, column, segments),
-        )?
+        match lease {
+            Some(lease) => rt().block_on(
+                None,
+                new_self.commit_existing_index_segments_for_lease(
+                    index_name,
+                    column,
+                    segments,
+                    &lease.inner,
+                ),
+            )?,
+            None => rt().block_on(
+                None,
+                new_self.commit_existing_index_segments(index_name, column, segments),
+            )?,
+        }
         .infer_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
