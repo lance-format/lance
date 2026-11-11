@@ -27,6 +27,8 @@ from lance_namespace import (
     AlterTransactionRequest,
     AlterTransactionResponse,
     AnalyzeTableQueryPlanRequest,
+    BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse,
     CountTableRowsRequest,
     CountTableRowsResponse,
     CreateMaterializedViewRequest,
@@ -41,6 +43,8 @@ from lance_namespace import (
     CreateTableResponse,
     CreateTableTagRequest,
     CreateTableTagResponse,
+    CreateTableVersionRequest,
+    CreateTableVersionResponse,
     DeclareTableRequest,
     DeclareTableResponse,
     DeleteFromTableRequest,
@@ -57,6 +61,8 @@ from lance_namespace import (
     DescribeTableIndexStatsResponse,
     DescribeTableRequest,
     DescribeTableResponse,
+    DescribeTableVersionRequest,
+    DescribeTableVersionResponse,
     DescribeTransactionRequest,
     DescribeTransactionResponse,
     DropNamespaceRequest,
@@ -473,61 +479,69 @@ class DirectoryNamespace(LanceNamespace):
         response_dict = self._inner.list_table_versions(request.model_dump())
         return ListTableVersionsResponse.from_dict(response_dict)
 
-    def create_table_version(self, request: dict) -> dict:
+    def create_table_version(
+        self, request: CreateTableVersionRequest
+    ) -> CreateTableVersionResponse:
         """Create a table version (for external manifest store integration).
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - version: int - Version number to create
-            - manifest_path: str - Path to staging manifest
-            - manifest_size: int (optional) - Size in bytes
-            - e_tag: str (optional) - ETag for optimistic concurrency
+        request : CreateTableVersionRequest or dict
+            Request with the table id, the version number to create, the path
+            to the staging manifest, and optionally its size and ETag
 
         Returns
         -------
-        dict
-            Response dictionary with optional transaction_id
+        CreateTableVersionResponse
+            Response with the created version and optional transaction id
         """
-        return self._inner.create_table_version(request)
+        response_dict = self._inner.create_table_version(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return CreateTableVersionResponse.from_dict(response_dict)
 
-    def describe_table_version(self, request: dict) -> dict:
+    def describe_table_version(
+        self, request: DescribeTableVersionRequest
+    ) -> DescribeTableVersionResponse:
         """Describe a specific table version.
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - version: int (optional) - Version to describe (None = latest)
+        request : DescribeTableVersionRequest or dict
+            Request with the table id and optionally the version to describe
+            (latest when omitted)
 
         Returns
         -------
-        dict
-            Response dictionary with version info:
-            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        DescribeTableVersionResponse
+            Response whose ``version`` holds the version number, manifest path,
+            manifest size, ETag and timestamp
         """
-        return self._inner.describe_table_version(request)
+        response_dict = self._inner.describe_table_version(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return DescribeTableVersionResponse.from_dict(response_dict)
 
-    def batch_delete_table_versions(self, request: dict) -> dict:
+    def batch_delete_table_versions(
+        self, request: BatchDeleteTableVersionsRequest
+    ) -> BatchDeleteTableVersionsResponse:
         """Delete multiple table versions in a single request.
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - versions: List[int] - List of version numbers to delete
+        request : BatchDeleteTableVersionsRequest or dict
+            Request with the table id and the version ranges to delete
 
         Returns
         -------
-        dict
-            Response dictionary with:
-            - deleted_versions: List[int] - List of successfully deleted versions
+        BatchDeleteTableVersionsResponse
+            Response with the number of deleted versions and optional
+            transaction id
         """
-        return self._inner.batch_delete_table_versions(request)
+        response_dict = self._inner.batch_delete_table_versions(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return BatchDeleteTableVersionsResponse.from_dict(response_dict)
 
     # Data manipulation operations
 
@@ -1072,61 +1086,69 @@ class RestNamespace(LanceNamespace):
         response_dict = self._inner.list_table_versions(request.model_dump())
         return ListTableVersionsResponse.from_dict(response_dict)
 
-    def create_table_version(self, request: dict) -> dict:
+    def create_table_version(
+        self, request: CreateTableVersionRequest
+    ) -> CreateTableVersionResponse:
         """Create a table version (for external manifest store integration).
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - version: int - Version number to create
-            - manifest_path: str - Path to staging manifest
-            - manifest_size: int (optional) - Size in bytes
-            - e_tag: str (optional) - ETag for optimistic concurrency
+        request : CreateTableVersionRequest or dict
+            Request with the table id, the version number to create, the path
+            to the staging manifest, and optionally its size and ETag
 
         Returns
         -------
-        dict
-            Response dictionary with optional transaction_id
+        CreateTableVersionResponse
+            Response with the created version and optional transaction id
         """
-        return self._inner.create_table_version(request)
+        response_dict = self._inner.create_table_version(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return CreateTableVersionResponse.from_dict(response_dict)
 
-    def describe_table_version(self, request: dict) -> dict:
+    def describe_table_version(
+        self, request: DescribeTableVersionRequest
+    ) -> DescribeTableVersionResponse:
         """Describe a specific table version.
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - version: int (optional) - Version to describe (None = latest)
+        request : DescribeTableVersionRequest or dict
+            Request with the table id and optionally the version to describe
+            (latest when omitted)
 
         Returns
         -------
-        dict
-            Response dictionary with version info:
-            - version: dict with version, manifest_path, manifest_size, e_tag, timestamp
+        DescribeTableVersionResponse
+            Response whose ``version`` holds the version number, manifest path,
+            manifest size, ETag and timestamp
         """
-        return self._inner.describe_table_version(request)
+        response_dict = self._inner.describe_table_version(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return DescribeTableVersionResponse.from_dict(response_dict)
 
-    def batch_delete_table_versions(self, request: dict) -> dict:
+    def batch_delete_table_versions(
+        self, request: BatchDeleteTableVersionsRequest
+    ) -> BatchDeleteTableVersionsResponse:
         """Delete multiple table versions in a single request.
 
         Parameters
         ----------
-        request : dict
-            Request dictionary with keys:
-            - id: List[str] - Table identifier
-            - versions: List[int] - List of version numbers to delete
+        request : BatchDeleteTableVersionsRequest or dict
+            Request with the table id and the version ranges to delete
 
         Returns
         -------
-        dict
-            Response dictionary with:
-            - deleted_versions: List[int] - List of successfully deleted versions
+        BatchDeleteTableVersionsResponse
+            Response with the number of deleted versions and optional
+            transaction id
         """
-        return self._inner.batch_delete_table_versions(request)
+        response_dict = self._inner.batch_delete_table_versions(
+            request.model_dump() if hasattr(request, "model_dump") else request
+        )
+        return BatchDeleteTableVersionsResponse.from_dict(response_dict)
 
     # Data manipulation operations
 

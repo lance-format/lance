@@ -14,6 +14,8 @@ and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import posixpath
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,8 @@ import pyarrow as pa
 import pytest
 from lance.namespace import LanceNamespace
 from lance_namespace import (
+    BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse,
     CountTableRowsRequest,
     CountTableRowsResponse,
     CreateNamespaceRequest,
@@ -88,6 +92,7 @@ from lance_namespace.errors import (
     TableNotFoundError,
     ThrottlingError,
 )
+from lance_namespace_urllib3_client import VersionRange
 
 
 class CustomNamespace(LanceNamespace):
@@ -167,6 +172,11 @@ class CustomNamespace(LanceNamespace):
         self, request: CreateTableVersionRequest
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
+
+    def batch_delete_table_versions(
+        self, request: BatchDeleteTableVersionsRequest
+    ) -> BatchDeleteTableVersionsResponse:
+        return self._inner.batch_delete_table_versions(request)
 
     def create_table_branch(
         self, request: CreateTableBranchRequest
@@ -1570,9 +1580,53 @@ class TestTableVersions:
         describe_req = DescribeTableVersionRequest(
             id=["workspace", "test_table"], version=1
         )
-        response = temp_ns_client.describe_table_version(describe_req.model_dump())
-        assert response is not None
-        assert response.get("version") is not None
+        response = temp_ns_client.describe_table_version(describe_req)
+        assert isinstance(response, DescribeTableVersionResponse)
+        assert response.version.version == 1
+
+    @pytest.mark.parametrize(
+        "use_custom", [False, True], ids=["DirectoryNS", "CustomNS"]
+    )
+    def test_create_and_batch_delete_table_versions(self, tmp_path, use_custom):
+        """Version methods take and return the LanceNamespace models."""
+        ns_client = _wrap_if_custom(connect("dir", {"root": str(tmp_path)}), use_custom)
+        ns_client.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+        table_id = ["workspace", "test_table"]
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        # A plain dict request is still accepted.
+        v1 = ns_client.describe_table_version({"id": table_id, "version": 1}).version
+
+        # Stage a copy of the v1 manifest, as a writer would, and publish it as v2.
+        manifest_name = posixpath.basename(v1.manifest_path)
+        (local_v1,) = [
+            path
+            for path in tmp_path.glob(f"*/_versions/{manifest_name}")
+            if path.parent.parent.name != "__manifest"
+        ]
+        shutil.copy(local_v1, local_v1.with_name("staging.manifest"))
+        staging_path = posixpath.join(
+            posixpath.dirname(v1.manifest_path), "staging.manifest"
+        )
+        created = ns_client.create_table_version(
+            CreateTableVersionRequest(
+                id=table_id, version=2, manifest_path=staging_path
+            )
+        )
+        assert isinstance(created, CreateTableVersionResponse)
+        assert created.version.version == 2
+
+        deleted = ns_client.batch_delete_table_versions(
+            BatchDeleteTableVersionsRequest(
+                id=table_id, ranges=[VersionRange(start_version=1, end_version=2)]
+            )
+        )
+        assert isinstance(deleted, BatchDeleteTableVersionsResponse)
+        assert deleted.deleted_count == 1
+
+        listed = ns_client.list_table_versions(ListTableVersionsRequest(id=table_id))
+        assert [v.version for v in listed.versions] == [2]
 
     def test_multiple_versions_via_insert(self, temp_ns_client):
         """Test that inserts create new versions."""

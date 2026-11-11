@@ -28,6 +28,8 @@ from lance_namespace import (
     DeregisterTableRequest,
     DescribeNamespaceRequest,
     DescribeTableRequest,
+    DescribeTableVersionRequest,
+    DescribeTableVersionResponse,
     DropNamespaceRequest,
     DropTableRequest,
     ListNamespacesRequest,
@@ -222,6 +224,20 @@ class TestDescribeTable:
 
         error_msg = str(exc_info.value).lower()
         assert "not found" in error_msg or "does not exist" in error_msg
+
+    def test_describe_table_version(self, rest_namespace):
+        """Test describing a table version with the request model."""
+        rest_namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+        table_id = ["workspace", "test_table"]
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        rest_namespace.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        response = rest_namespace.describe_table_version(
+            DescribeTableVersionRequest(id=table_id, version=1)
+        )
+
+        assert isinstance(response, DescribeTableVersionResponse)
+        assert response.version.version == 1
 
 
 class TestTableOperations:
