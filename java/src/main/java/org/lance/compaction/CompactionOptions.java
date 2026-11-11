@@ -42,6 +42,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> targetRowsPerFragment;
   private Optional<Long> maxRowsPerGroup;
   private Optional<Long> maxBytesPerFile;
+  private Optional<Long> minBytesPerFile;
   private Optional<Boolean> materializeDeletions;
   private Optional<Float> materializeDeletionsThreshold;
   private Optional<Long> numThreads;
@@ -54,11 +55,13 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceBytes;
   private List<Long> excludedFragmentIds;
   private Optional<DataStorageVersion> dataStorageVersion;
+  private Optional<SourceBudgetMode> sourceBudgetMode;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
+      Optional<Long> minBytesPerFile,
       Optional<Boolean> materializeDeletions,
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
@@ -70,10 +73,12 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion) {
+      Optional<String> dataStorageVersion,
+      Optional<SourceBudgetMode> sourceBudgetMode) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
+    this.minBytesPerFile = minBytesPerFile;
     this.materializeDeletions = materializeDeletions;
     this.materializeDeletionsThreshold = materializeDeletionsThreshold;
     this.numThreads = numThreads;
@@ -86,6 +91,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = maxSourceBytes;
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
     this.dataStorageVersion = dataStorageVersion.map(DataStorageVersion::fromRustString);
+    this.sourceBudgetMode = sourceBudgetMode;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -117,6 +123,11 @@ public class CompactionOptions implements Serializable {
     return excludedFragmentIds;
   }
 
+  /** Returns the source budget mode as its string value for the native layer. */
+  public Optional<String> getSourceBudgetMode() {
+    return sourceBudgetMode.map(SourceBudgetMode::getValue);
+  }
+
   /** Returns the version selector as its string value for the native layer. */
   public Optional<String> getDataStorageVersion() {
     return dataStorageVersion.map(DataStorageVersion::toRustString);
@@ -136,6 +147,11 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getMaxBytesPerFile() {
     return maxBytesPerFile;
+  }
+
+  /** Returns the optional file-size threshold in bytes for small-file compaction. */
+  public Optional<Long> getMinBytesPerFile() {
+    return minBytesPerFile;
   }
 
   public Optional<Long> getMaxRowsPerGroup() {
@@ -160,6 +176,7 @@ public class CompactionOptions implements Serializable {
         .add("targetRowsPerFragment", targetRowsPerFragment.orElse(null))
         .add("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
         .add("maxBytesPerFile", maxBytesPerFile.orElse(null))
+        .add("minBytesPerFile", minBytesPerFile.orElse(null))
         .add("materializeDeletions", materializeDeletions.orElse(null))
         .add("materializeDeletionsThreshold", materializeDeletionsThreshold.orElse(null))
         .add("numThreads", numThreads.orElse(null))
@@ -172,6 +189,7 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .add("excludedFragmentIds", excludedFragmentIds)
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
+        .add("sourceBudgetMode", sourceBudgetMode.orElse(null))
         .toString();
   }
 
@@ -191,6 +209,8 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceBytes.orElse(null));
     output.writeObject(excludedFragmentIds);
     output.writeObject(getDataStorageVersion().orElse(null));
+    output.writeObject(minBytesPerFile.orElse(null));
+    output.writeObject(sourceBudgetMode.map(SourceBudgetMode::getValue).orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -218,6 +238,8 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = readTrailingLong(input);
     this.excludedFragmentIds = readTrailingLongList(input);
     this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
+    this.minBytesPerFile = readTrailingLong(input);
+    this.sourceBudgetMode = readTrailingSourceBudgetMode(input);
   }
 
   /**
@@ -263,11 +285,26 @@ public class CompactionOptions implements Serializable {
     }
   }
 
+  private static Optional<SourceBudgetMode> readTrailingSourceBudgetMode(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    Optional<String> value = readTrailingString(input);
+    if (value.isEmpty()) {
+      return Optional.empty();
+    }
+    for (SourceBudgetMode mode : SourceBudgetMode.values()) {
+      if (mode.getValue().equals(value.get())) {
+        return Optional.of(mode);
+      }
+    }
+    return Optional.empty();
+  }
+
   /** Builder for CompactionOptions. */
   public static class Builder {
     private Optional<Long> targetRowsPerFragment = Optional.empty();
     private Optional<Long> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
+    private Optional<Long> minBytesPerFile = Optional.empty();
     private Optional<Boolean> materializeDeletions = Optional.empty();
     private Optional<Float> materializeDeletionsThreshold = Optional.empty();
     private Optional<Long> numThreads = Optional.empty();
@@ -280,6 +317,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceBytes = Optional.empty();
     private List<Long> excludedFragmentIds = Collections.emptyList();
     private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
+    private Optional<SourceBudgetMode> sourceBudgetMode = Optional.empty();
 
     private Builder() {}
 
@@ -293,8 +331,26 @@ public class CompactionOptions implements Serializable {
       return this;
     }
 
+    /**
+     * Maximum bytes per output file. Defaults to the dataset config value, or the <a
+     * href="https://docs.rs/lance/latest/lance/dataset/write/struct.WriteParams.html#structfield.max_bytes_per_file">writer's
+     * default</a>.
+     */
     public Builder withMaxBytesPerFile(long maxBytesPerFile) {
       this.maxBytesPerFile = Optional.of(maxBytesPerFile);
+      return this;
+    }
+
+    /**
+     * Files at or above this size are excluded from small-file compaction. Defaults to the dataset
+     * config value, or 95% of {@link #withMaxBytesPerFile(long) maxBytesPerFile}. Must be greater
+     * than zero and no greater than that limit. Files needing cleanup may still be compacted.
+     *
+     * <p>Example: {@code CompactionOptions.builder().withMinBytesPerFile(512L * 1024 *
+     * 1024).build()}.
+     */
+    public Builder withMinBytesPerFile(long minBytesPerFile) {
+      this.minBytesPerFile = Optional.of(minBytesPerFile);
       return this;
     }
 
@@ -383,6 +439,20 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Sets how planning applies all configured max-source budgets to cumulative totals across the
+     * tasks selected for one plan. {@link SourceBudgetMode#HARD} rejects a task when adding it
+     * would exceed a cumulative budget. {@link SourceBudgetMode#SOFT} always admits the first task;
+     * if it exceeds a budget the plan stops there, otherwise later tasks use the same cumulative
+     * checks as hard mode. If a byte budget is configured but the first task has a source file
+     * without a recorded size, soft mode admits that task and stops; hard mode reports an error.
+     */
+    public Builder withSourceBudgetMode(SourceBudgetMode sourceBudgetMode) {
+      this.sourceBudgetMode =
+          Optional.of(Objects.requireNonNull(sourceBudgetMode, "sourceBudgetMode"));
+      return this;
+    }
+
+    /**
      * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
      * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
      * and unknown IDs are ignored.
@@ -420,6 +490,7 @@ public class CompactionOptions implements Serializable {
           targetRowsPerFragment,
           maxRowsPerGroup,
           maxBytesPerFile,
+          minBytesPerFile,
           materializeDeletions,
           materializeDeletionsThreshold,
           numThreads,
@@ -431,7 +502,8 @@ public class CompactionOptions implements Serializable {
           maxSourceRows,
           maxSourceBytes,
           excludedFragmentIds,
-          dataStorageVersion.map(DataStorageVersion::toRustString));
+          dataStorageVersion.map(DataStorageVersion::toRustString),
+          sourceBudgetMode);
     }
   }
 }

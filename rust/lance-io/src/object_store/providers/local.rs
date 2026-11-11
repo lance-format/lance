@@ -28,6 +28,19 @@ struct FileSystemDirOperations {
 #[cfg(any(windows, test))]
 #[async_trait::async_trait]
 impl LocalDirOperations for FileSystemDirOperations {
+    fn directory_to_filesystem(&self, path: &Path) -> Result<std::path::PathBuf> {
+        // This maps directory prefixes, which may themselves end in '#<digits>'.
+        // A valid placeholder filename bypasses LocalFileSystem's file-name guard
+        // while retaining its rooted path and Windows filename conversions.
+        let placeholder = self
+            .local_file_system
+            .path_to_filesystem(&path.clone().join("__lance_directory__"))?;
+        placeholder
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| Error::io(format!("Cannot resolve local directory prefix {path}")))
+    }
+
     async fn remove_dir_all(&self, path: &Path) -> Result<()> {
         let local_path = self.local_file_system.path_to_filesystem(path)?;
         let object_store_path = path.to_string();
@@ -279,6 +292,34 @@ mod tests {
             .unwrap();
 
         assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
+
+    #[tokio::test]
+    async fn test_rooted_staging_listing_uses_local_root() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(dataset.join("nested#1")).unwrap();
+        write(dataset.join("nested#1/file#1"), "staging").unwrap();
+        let store = rooted_local_store(&root);
+        let mut files = store.read_local_staging_files(&Path::from("dataset"));
+        let file = futures::TryStreamExt::try_next(&mut files)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file.location,
+            Path::parse("dataset/nested#1/file#1").unwrap()
+        );
+        assert_eq!(file.size, 7);
+        store.delete(&file.location).await.unwrap();
+        assert!(!dataset.join("nested#1/file#1").exists());
+        assert!(
+            futures::TryStreamExt::try_next(&mut files)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

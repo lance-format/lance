@@ -143,19 +143,34 @@ fn install_atfork() {}
 /// own type. This hands tokio a single non-generic future type instead, so that
 /// machinery is instantiated once for the whole program. The future and its
 /// output share one extra allocation.
+///
+/// The returned handle mirrors [`tokio::task::JoinHandle`]: awaiting it yields
+/// the task's output or a [`tokio::task::JoinError`], and it offers the same
+/// `abort`/`abort_handle`/`is_finished` controls.
+///
+/// ```
+/// # use lance_core::utils::tokio::spawn;
+/// # async fn example() -> Result<(), tokio::task::JoinError> {
+/// let output = spawn(async { 42 }).await?;
+/// assert_eq!(output, 42);
+/// # Ok(())
+/// # }
+/// ```
 #[track_caller]
 pub fn spawn<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> JoinHandle<T> {
     let task = Arc::new(SpawnedTask {
         stage: UnsafeCell::new(Stage::Running(future)),
     });
     JoinHandle {
-        handle: spawn_erased(ErasedTask(task.clone())),
+        handle: spawn_erased_task(ErasedTask(task.clone())),
         task,
     }
 }
 
+/// Keep tokio's generic `spawn` instantiated for one concrete future type, in
+/// this one place, instead of at every `spawn` call site.
 #[track_caller]
-fn spawn_erased(task: ErasedTask) -> tokio::task::JoinHandle<()> {
+fn spawn_erased_task(task: ErasedTask) -> tokio::task::JoinHandle<()> {
     tokio::spawn(task)
 }
 
@@ -194,8 +209,9 @@ impl<T> Future for JoinHandle<T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.handle.poll_unpin(cx).map_ok(|()| {
-            // SAFETY: the task completed successfully, so tokio has already
-            // dropped its `ErasedTask` and nothing else touches the stage.
+            // SAFETY: `Ok` means tokio dropped the `ErasedTask` before it
+            // reported completion (see `SpawnedTask`), so this is the only
+            // remaining access to the stage.
             unsafe { self.task.take_output() }
                 .expect("spawned task completed without storing its output")
         })
@@ -207,9 +223,14 @@ impl<T> Future for JoinHandle<T> {
 /// The stage is shared between the task and its [`JoinHandle`] without locks.
 /// Access is sequenced by the task lifecycle rather than synchronized: while the
 /// task is alive, only tokio touches the stage, through the task's exclusive
-/// `ErasedTask` (polled or dropped by one thread at a time). Tokio drops the
-/// `ErasedTask` before it reports completion, and the handle reads the stage
-/// only after a successful completion.
+/// `ErasedTask` (polled or dropped by one thread at a time).
+///
+/// The handle reads the stage only after its [`tokio::task::JoinHandle`] resolved
+/// with `Ok`, and tokio drops the future before it reports that: the poll that
+/// returns `Ready` drops the `ErasedTask`, the task then transitions to complete
+/// with a release store, and the handle reads the output only after an acquire
+/// load of that state. So both the poll that wrote the stage and the drop that
+/// may touch it again happen before `take_output`.
 struct SpawnedTask<F: Future> {
     stage: UnsafeCell<Stage<F, F::Output>>,
 }
@@ -358,20 +379,23 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    // Propagate the current span into the task
-    let span = Span::current();
-    let handle = global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        func()
+    // The closure and its output share one allocation, and only the non-generic
+    // `spawn_erased` touches tokio, so tokio's blocking-task machinery (task
+    // cell, harness, vtable, drop glue) is instantiated once rather than once
+    // per closure type in every calling crate.
+    let task = Arc::new(CpuTask {
+        func: UnsafeCell::new(Some(func)),
+        output: UnsafeCell::new(None),
     });
-    // Awaited through the join handle, not a result channel: a panic in `func`
-    // arrives as a `JoinError` still carrying its payload, so resuming it
-    // re-raises the original panic in the caller. Reporting the closure's
-    // outcome over a channel instead loses that -- the sender drops unsent and
-    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
-    // `RecvError`, pointing here rather than at the fault.
-    handle.map(|res| match res {
-        Ok(result) => result,
+    spawn_erased(task.clone()).map(move |res| match res {
+        // SAFETY: the join handle resolved, so `run` has returned on the CPU
+        // thread and tokio's task-completion handoff orders its write to
+        // `output` before this read. Nothing else touches `output`.
+        Ok(()) => unsafe { (*task.output.get()).take() }
+            .expect("spawn_cpu task completed without storing its output"),
+        // Awaited through the join handle, not a result channel: a panic in
+        // `func` arrives as a `JoinError` still carrying its payload, so
+        // resuming it re-raises the original panic in the caller.
         Err(join_error) => match join_error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             // The CPU runtime outlives every caller, so its tasks are not
@@ -381,9 +405,68 @@ pub fn spawn_cpu<
     })
 }
 
+/// A closure and the slot for its output, shared between the caller and the
+/// CPU thread without locks. Access is sequenced by the task lifecycle rather
+/// than synchronized per field: `func` is only touched by `run`, and `output`
+/// is written by `run` and read by the caller only after the task completes.
+struct CpuTask<F, T> {
+    func: UnsafeCell<Option<F>>,
+    output: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: the fields are never accessed concurrently (see `CpuTask`), so
+// sharing across threads only requires the contents to be `Send`.
+unsafe impl<F: Send, T: Send> Sync for CpuTask<F, T> {}
+
+trait RunOnce: Send + Sync {
+    /// # Safety
+    ///
+    /// Must be called at most once, and `output` must not be read until it
+    /// returns.
+    unsafe fn run(&self);
+}
+
+impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
+    unsafe fn run(&self) {
+        // SAFETY: upheld by the caller of `run`; see `RunOnce::run`.
+        let func = unsafe { (*self.func.get()).take() }.expect("spawn_cpu task runs once");
+        let output = func();
+        unsafe { *self.output.get() = Some(output) };
+    }
+}
+
+fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
+    // Propagate the current span into the task
+    let span = Span::current();
+    global_cpu_runtime().spawn_blocking(move || {
+        let _span_guard = span.enter();
+        // SAFETY: tokio runs a blocking task exactly once, and the caller in
+        // `spawn_cpu` reads `output` only after this task's join handle resolves.
+        unsafe { task.run() };
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The successful path must hand back the closure's own output.
+    ///
+    /// The output travels through an erased, type-independent task, so this
+    /// pins the typed contract: the caller receives the exact value the
+    /// closure returned, moved out of the task rather than re-created.
+    #[tokio::test]
+    async fn spawn_cpu_returns_the_closure_output() {
+        let result = spawn_cpu(|| -> std::result::Result<(u32, String), std::io::Error> {
+            Ok((7, String::from("done")))
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("the closure succeeded"),
+            (7, "done".to_string())
+        );
+    }
 
     /// A panic in the closure must reach the caller intact.
     ///
@@ -416,6 +499,19 @@ mod tests {
     #[tokio::test]
     async fn spawn_returns_the_future_output() {
         let output = spawn(async { String::from("done") }).await.unwrap();
+        assert_eq!(output, "done");
+    }
+
+    /// The stage has to survive across polls: a future that is pending first
+    /// and ready later still hands back its output.
+    #[tokio::test]
+    async fn spawn_returns_the_output_after_a_pending_poll() {
+        let output = spawn(async {
+            tokio::task::yield_now().await;
+            String::from("done")
+        })
+        .await
+        .unwrap();
         assert_eq!(output, "done");
     }
 
