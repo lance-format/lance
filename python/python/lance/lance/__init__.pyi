@@ -81,6 +81,21 @@ from .optimize import (
     CompactionTask as CompactionTask,
 )
 from .optimize import (
+    IndexSegmentResult as IndexSegmentResult,
+)
+from .optimize import (
+    OptimizeIndexMerge as OptimizeIndexMerge,
+)
+from .optimize import (
+    OptimizeIndexTask as OptimizeIndexTask,
+)
+from .optimize import (
+    OptimizeIndices as OptimizeIndices,
+)
+from .optimize import (
+    OptimizeIndicesPlan as OptimizeIndicesPlan,
+)
+from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
@@ -113,6 +128,21 @@ class FtsToken:
     position: int
     def __repr__(self) -> str: ...
 
+class InsertedRowsFilter:
+    @property
+    def field_ids(self) -> List[int]: ...
+    @property
+    def kind(self) -> Literal["exact", "bloom"]: ...
+    @property
+    def payload(self) -> bytes: ...
+    @property
+    def number_of_items(self) -> Optional[int]: ...
+    @property
+    def probability(self) -> Optional[float]: ...
+    def might_contain(
+        self, values: Union[pa.Array, pa.RecordBatch, pa.Table]
+    ) -> List[bool]: ...
+
 def tokenize(
     query: str,
     *,
@@ -135,7 +165,9 @@ def tokenize(
 ) -> List[FtsToken]:
     """Tokenize an FTS query without an index.
 
-    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    ``max_token_length`` is an exclusive limit in UTF-8 bytes, not characters.
+    Tokens of this length or longer are removed. It defaults to 40; pass
+    ``None`` to disable the limit.
     """
     ...
 
@@ -380,6 +412,20 @@ class _Session:
         ...
     def size_bytes(self) -> int: ...
     def index_cache_size_bytes(self) -> int: ...
+    def cache_diagnostics(
+        self, refresh: bool = False, by_type: bool = False
+    ) -> Dict[str, Dict[str, Any]]:
+        """Inspect lifetime activity and backend accounting for both caches.
+
+        The top-level keys are ``index`` and ``metadata``. Each value contains
+        ``activity``, ``backend``, and ``utilization``. Unsupported backend
+        measurements, unknown capacities, and utilization for zero capacity are
+        represented by ``None``. Setting ``refresh`` requests backend maintenance
+        before sampling. Setting ``by_type`` scans resident entries and adds a
+        ``by_type`` dictionary with bounded activity and approximate occupancy.
+        Either option may be more expensive.
+        """
+        ...
 
 class LanceBlobFile:
     def close(self): ...
@@ -538,6 +584,7 @@ class _Dataset:
         data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
+    def column_layout_stats(self) -> List[Dict[str, Any]]: ...
     def versions(self) -> List[Version]: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
@@ -760,8 +807,19 @@ class _MergeInsertBuilder:
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
     def execute_batches(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_dataset(self, source: _Dataset) -> ExecuteResult: ...
+    def analyze_plan_dataset(self, source: _Dataset) -> str: ...
+    def execute_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> ExecuteResult: ...
+    def analyze_plan_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> str: ...
     def execute_uncommitted(
         self, new_data: pa.RecordBatchReader
+    ) -> tuple[Transaction, ExecuteResult]: ...
+    def execute_uncommitted_dataset(
+        self, source: _Dataset
     ) -> tuple[Transaction, ExecuteResult]: ...
     def execute_uncommitted_batches(
         self, new_data: pa.RecordBatchReader
@@ -842,6 +900,12 @@ class _Fragment:
         read_columns: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
+    def update_columns_from_stream(
+        self,
+        reader: pa.RecordBatchReader,
+        batch_size: Optional[int] = None,
+        with_offsets: bool = False,
+    ) -> Tuple[FragmentMetadata, List[int], Optional[bytes]]: ...
     def write_overlay(self, columns: List[str]) -> _OverlayWriter: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
     def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...

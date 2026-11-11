@@ -10,6 +10,8 @@ mod read;
 mod refs;
 mod schema;
 
+pub(crate) use index::optimize_options_from_java;
+
 use jni::JNIEnv;
 use jni::objects::JObject;
 use lance::dataset::Dataset;

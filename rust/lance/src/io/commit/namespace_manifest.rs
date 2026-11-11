@@ -284,6 +284,7 @@ mod tests {
             store_with(|| {
                 NamespaceError::Throttling {
                     message: "slow down".to_string(),
+                    retry_after: None,
                 }
                 .into()
             }),

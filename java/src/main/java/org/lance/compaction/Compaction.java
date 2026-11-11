@@ -39,6 +39,7 @@ public class Compaction {
           compactionOptions.getTargetRowsPerFragment(),
           compactionOptions.getMaxRowsPerGroup(),
           compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMinBytesPerFile(),
           compactionOptions.getMaterializeDeletions(),
           compactionOptions.getMaterializeDeletionsThreshold(),
           compactionOptions.getNumThreads(),
@@ -50,7 +51,8 @@ public class Compaction {
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
           compactionOptions.getExcludedFragmentIds(),
-          compactionOptions.getDataStorageVersion());
+          compactionOptions.getDataStorageVersion(),
+          compactionOptions.getSourceBudgetMode());
     }
   }
 
@@ -144,6 +146,7 @@ public class Compaction {
       Optional<Long> targetRowsPerFragment,
       Optional<Long> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile,
+      Optional<Long> minBytesPerFile,
       Optional<Boolean> materializeDeletions,
       Optional<Float> materializeDeletionsThreshold,
       Optional<Long> numThreads,
@@ -155,5 +158,6 @@ public class Compaction {
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion);
+      Optional<String> dataStorageVersion,
+      Optional<String> sourceBudgetMode);
 }
