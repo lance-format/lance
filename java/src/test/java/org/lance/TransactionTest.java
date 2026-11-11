@@ -21,6 +21,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.memwal.CompactedSsTable;
 import org.lance.memwal.InitializeMemWalParams;
+import org.lance.operation.AcquireLease;
 import org.lance.operation.Append;
 import org.lance.operation.Clone;
 import org.lance.operation.CreateIndex;
@@ -30,6 +31,8 @@ import org.lance.operation.Delete;
 import org.lance.operation.KeyExistenceFilter;
 import org.lance.operation.Operation;
 import org.lance.operation.Overwrite;
+import org.lance.operation.ReleaseLease;
+import org.lance.operation.RenewLease;
 import org.lance.operation.ReserveFragments;
 import org.lance.operation.Restore;
 import org.lance.operation.Rewrite;
@@ -339,12 +342,28 @@ public class TransactionTest {
         try (Dataset latest = dataset.checkoutVersion(dataset.latestVersion())) {
           assertTrue(latest.getRetentionLeases().isEmpty());
         }
+        AcquireLease acquired = (AcquireLease) operationAt(dataset, 2);
+        assertEquals(lease.getId(), acquired.getLeaseId());
+        assertEquals(lease.getCreatedAt(), acquired.getCreatedAt());
+        assertEquals(lease.getExpiresAt(), acquired.getExpiresAt());
+        assertTrue(acquired.getLabel().isEmpty());
+        RenewLease renewal = (RenewLease) operationAt(dataset, 3);
+        assertEquals(lease.getId(), renewal.getLeaseId());
+        assertEquals(renewed.getExpiresAt(), renewal.getExpiresAt());
+        assertEquals(lease.getId(), ((ReleaseLease) operationAt(dataset, 4)).getLeaseId());
         IllegalArgumentException error =
             assertThrows(
                 IllegalArgumentException.class,
                 () -> dataset.renewRetentionLease(lease, Duration.ofHours(1)));
         assertTrue(error.getMessage().contains("it is not listed"), error.getMessage());
       }
+    }
+  }
+
+  private static Operation operationAt(Dataset dataset, long version) {
+    try (Dataset snapshot = dataset.checkoutVersion(version);
+        Transaction transaction = snapshot.readTransaction().orElseThrow()) {
+      return transaction.operation();
     }
   }
 

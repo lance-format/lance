@@ -80,8 +80,8 @@ public class LeaseOptions {
     }
 
     /**
-     * Set human-readable context stored with the lease. It has no retention meaning; an empty
-     * label is stored as no label.
+     * Set human-readable context stored with the lease. It has no retention meaning; an empty label
+     * is stored as no label.
      *
      * @param label the label
      * @return this builder

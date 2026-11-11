@@ -84,7 +84,7 @@ impl FromJObjectWithEnv<RetentionLease> for JObject<'_> {
     }
 }
 
-fn instant_to_java<'a>(
+pub(crate) fn instant_to_java<'a>(
     env: &mut JNIEnv<'a>,
     timestamp: chrono::DateTime<chrono::Utc>,
 ) -> Result<JObject<'a>> {

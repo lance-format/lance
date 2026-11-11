@@ -1290,8 +1290,8 @@ public class Dataset implements Closeable {
   private native RetentionLease nativeRenewRetentionLease(RetentionLease lease, Duration ttl);
 
   /**
-   * Release {@code lease}, ending its retention without publishing a result. Releasing a lease
-   * that is no longer listed changes nothing.
+   * Release {@code lease}, ending its retention without publishing a result. Releasing a lease that
+   * is no longer listed changes nothing.
    *
    * @param lease the lease to release
    */
