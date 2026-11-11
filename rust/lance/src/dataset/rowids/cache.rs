@@ -336,7 +336,8 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<C
     // A complete previous view already has global routing. Prefer its shared
     // groups over remerging the fragment units that remain in the part cache.
     let mut cached = if previous.is_none()
-        && let Some(promotion) = super::resolve::promote_fragments(dataset, with_deletions).await?
+        && let Some(promotion) =
+            super::resolve::promote_fragments(dataset, with_deletions, &[]).await?
     {
         let super::resolve::FragmentPromotion {
             index,
@@ -366,6 +367,7 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<C
     } else {
         build(dataset, with_deletions, previous.as_deref()).await?
     };
+    retained.extend(cached.parts.iter().cloned());
     let (part_keys, parts) =
         super::parts::prepare(dataset, &cached.index, &cached.fragments, &retained).await?;
     cached.parts = parts;
@@ -489,6 +491,34 @@ pub(super) async fn build(
         Ok::<_, Error>((reused, changed))
     })
     .await?;
+    if reused.is_none()
+        && previous.is_some()
+        && let Some(promotion) =
+            super::resolve::promote_fragments(dataset, with_deletions, &changed).await?
+    {
+        tracing::debug!(
+            event = "row_id_index_build",
+            total_fragments = promotion.fragments.len(),
+            retained_fragments = promotion.fragments.len() - promotion.loaded_fragments,
+            loaded_fragments = promotion.loaded_fragments,
+            prepared_fragments = promotion.loaded_fragments,
+            "recomposed resident fragments after complete-view reuse was unavailable"
+        );
+        return Ok(CachedRowIdIndex {
+            version: dataset.manifest.version,
+            e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
+                Error::internal("cached row id index requires a manifest generation token")
+            })?,
+            index: Arc::new(promotion.index),
+            fragments: Arc::new(promotion.fragments),
+            parts: promotion
+                .units
+                .into_iter()
+                .flat_map(|(_, unit)| unit.parts.clone())
+                .collect(),
+            part_keys: Vec::new(),
+        });
+    }
     let has_reused_index = reused.is_some();
     let changed_fragments = changed.len();
     let index = if let Some(index) = reused {
@@ -1159,7 +1189,24 @@ pub(super) mod tests {
             &[7, 9, 7, 40]
         );
         assert_eq!(index.get(999).unwrap(), None);
+        drop(index);
+        drop(old_index);
         dataset.delete("i = 7").await.unwrap();
+        let fragment = dataset
+            .manifest
+            .fragments
+            .iter()
+            .find(|fragment| fragment.deletion_file.is_some())
+            .unwrap();
+        let reads_before = dataset.object_store.io_stats_snapshot();
+        let sequence = Arc::new(read_row_id_sequence(&dataset, fragment).await.unwrap());
+        let source = load_source(&dataset, fragment, sequence, true)
+            .await
+            .unwrap();
+        drop(source);
+        let changed_source_bytes =
+            dataset.object_store.io_stats_snapshot().read_bytes - reads_before.read_bytes;
+        let reads_before = dataset.object_store.io_stats_snapshot();
         assert!(
             get_row_id_index(&dataset)
                 .await
@@ -1169,7 +1216,20 @@ pub(super) mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(old_index.get(9).unwrap().is_some());
+        assert!(
+            dataset.object_store.io_stats_snapshot().read_bytes - reads_before.read_bytes
+                <= changed_source_bytes,
+            "a changed deletion must reuse resident fragments instead of rereading the complete merged source group"
+        );
+        assert!(
+            get_row_id_index(&old)
+                .await
+                .unwrap()
+                .unwrap()
+                .get(9)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

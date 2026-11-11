@@ -3,6 +3,7 @@
 
 //! Resolve requested IDs while preserving complete-index lookup semantics.
 
+use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -11,7 +12,7 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::{Fragment, RowIdMeta};
-use lance_table::rowids::{RowIdIndex, RowIdIndexPart, RowIdIndexView};
+use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, RowIdIndexPart, RowIdIndexView};
 
 use crate::session::index_caches::{
     LatestRowIdIndexKey, PreparedRowIdFragmentKey, PreparedRowIdPartKey, RowIdFragmentSpanKey,
@@ -446,7 +447,14 @@ pub(super) struct FragmentPromotion {
 pub(super) async fn promote_fragments(
     dataset: &Dataset,
     with_deletions: bool,
+    prepared_sources: &[FragmentRowIdIndex],
 ) -> Result<Option<FragmentPromotion>> {
+    // A previous complete-view reuse attempt may already have loaded changed
+    // sources using this snapshot's effective deletion policy.
+    let prepared_sources: HashMap<_, _> = prepared_sources
+        .iter()
+        .map(|source| (source.fragment_id, source))
+        .collect();
     let mut candidates = Vec::with_capacity(dataset.manifest.fragments.len());
     let mut spans = Vec::with_capacity(dataset.manifest.fragments.len());
     let mut spans_known = true;
@@ -554,8 +562,22 @@ pub(super) async fn promote_fragments(
             );
             let mut loads = Vec::with_capacity(missing.len());
             for (i, needs_deletions) in missing {
+                let prepared = prepared_sources
+                    .get(&(dataset.manifest.fragments[i].id as u32))
+                    .copied();
                 loads.push(async move {
                     let fragment = &dataset.manifest.fragments[i];
+                    if let Some(source) = prepared {
+                        return Ok::<_, Error>((
+                            i,
+                            source.row_id_sequence.row_id_range(),
+                            FragmentRowIdIndex {
+                                fragment_id: source.fragment_id,
+                                row_id_sequence: source.row_id_sequence.clone(),
+                                deletion_vector: source.deletion_vector.clone(),
+                            },
+                        ));
+                    }
                     let sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
                     let span = sequence.row_id_range();
                     dataset
@@ -583,7 +605,30 @@ pub(super) async fn promote_fragments(
             let index = if sources.is_empty() {
                 Some(combined)
             } else {
-                spawn_cpu(move || combined.try_reuse_fragments(&retained, &sources)).await?
+                let resident: Vec<_> = units
+                    .iter()
+                    .filter_map(|(_, unit)| unit.index.clone())
+                    .collect();
+                spawn_cpu(move || {
+                    if let Some(index) = combined.try_reuse_fragments(&retained, &sources)? {
+                        return Ok(Some(index));
+                    }
+                    // Changed deletions cannot be appended to an existing
+                    // merged source group. Prepare only the changed sources,
+                    // then use the bounded prepared-index composition path.
+                    // Release the tentative combined output before allocating
+                    // another union; the original resident parts remain alive.
+                    drop(combined);
+                    let prepared = sources
+                        .iter()
+                        .map(|source| RowIdIndex::new(std::slice::from_ref(source)))
+                        .collect::<Result<Vec<_>>>()?;
+                    let mut inputs = Vec::with_capacity(resident.len() + prepared.len());
+                    inputs.extend(resident.iter().map(Arc::as_ref));
+                    inputs.extend(prepared.iter());
+                    RowIdIndex::try_combine(&inputs)
+                })
+                .await?
             };
             if index.is_none() {
                 tracing::debug!(
