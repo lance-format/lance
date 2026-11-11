@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Debug,
     io::Cursor,
     ops::Range,
@@ -33,7 +33,7 @@ use prost::Message;
 use lance_core::{
     Error, Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
-    datatypes::{Field, Schema},
+    datatypes::{BLOB_V2_DESC_LANCE_FIELD, Field, Schema},
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
@@ -589,6 +589,79 @@ pub(crate) fn verify_uniform_lengths(field_lengths: &[(&str, u64)]) -> Result<u6
     )))
 }
 
+fn descriptor_child_matches(field: &Field, expected: &Field) -> bool {
+    field.id == -1
+        && field.parent_id == -1
+        && field.name == expected.name
+        && field.logical_type == expected.logical_type
+        && field.children.is_empty()
+}
+
+/// A Blob v2 descriptor struct whose children were split off by the footer
+/// reconstruction. Legacy Blob v1 columns are stored as plain binary fields,
+/// so the struct type check keeps them from receiving Blob v2 children.
+fn is_childless_blob_v2_descriptor(field: &Field) -> bool {
+    field.is_blob()
+        && field.children.is_empty()
+        && field.logical_type == BLOB_V2_DESC_LANCE_FIELD.logical_type
+}
+
+fn attach_blob_descriptor_children(
+    fields: &mut [Field],
+    descriptor_children: &mut VecDeque<Vec<Field>>,
+) {
+    for field in fields {
+        if is_childless_blob_v2_descriptor(field) {
+            if let Some(children) = descriptor_children.pop_front() {
+                field.children = children;
+            }
+        } else {
+            attach_blob_descriptor_children(&mut field.children, descriptor_children);
+        }
+    }
+}
+
+/// Blob descriptor children historically use anonymous field IDs in the file
+/// descriptor. Reconstruct their tree shape before applying ordinary schema
+/// projection rules. This interprets the existing footer representation and
+/// does not add persisted metadata or alter the file grammar.
+///
+/// The function is idempotent: a schema whose Blob fields already have
+/// children is returned unchanged.
+pub(crate) fn normalize_blob_footer_schema(schema: &Schema) -> Schema {
+    let expected = &BLOB_V2_DESC_LANCE_FIELD.children;
+    let missing_descriptor_count = schema
+        .fields_pre_order()
+        .filter(|field| is_childless_blob_v2_descriptor(field))
+        .count();
+    if missing_descriptor_count == 0 {
+        return schema.clone();
+    }
+    let mut normalized = schema.clone();
+    let mut descriptor_children = VecDeque::new();
+    let mut field_index = 0;
+    while descriptor_children.len() < missing_descriptor_count
+        && field_index + expected.len() <= normalized.fields.len()
+    {
+        if normalized.fields[field_index..field_index + expected.len()]
+            .iter()
+            .zip(expected)
+            .all(|(field, expected)| descriptor_child_matches(field, expected))
+        {
+            descriptor_children.push_back(
+                normalized
+                    .fields
+                    .drain(field_index..field_index + expected.len())
+                    .collect(),
+            );
+        } else {
+            field_index += 1;
+        }
+    }
+    attach_blob_descriptor_children(&mut normalized.fields, &mut descriptor_children);
+    normalized
+}
+
 impl FileReader {
     pub(crate) fn base_projection(&self) -> &ReaderProjection {
         &self.core.base_projection
@@ -1087,6 +1160,9 @@ impl FileReader {
             metadata: pb_schema.metadata,
         };
         let schema = Schema::try_from(fields_with_meta)?;
+        // Blob v2 descriptor children are persisted with anonymous field ids
+        // and would otherwise be rebuilt as orphan top-level fields.
+        let schema = normalize_blob_footer_schema(&schema);
         Ok((num_rows, schema))
     }
 
@@ -5747,6 +5823,170 @@ mod tests {
             error.to_string().contains("beyond the file size"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Writes a v2.2 file with one Blob v2 column (in the prepared writer
+    /// layout) and, optionally, a legacy Blob v1 column and an ordinary `id`
+    /// column in front of it.
+    async fn write_blob_v2_raw_file(fs: &FsFixture, has_legacy_blob: bool, has_id: bool) {
+        use arrow_array::{
+            ArrayRef, LargeBinaryArray, StringArray, StructArray, UInt8Array, UInt32Array,
+            UInt64Array,
+        };
+
+        let blob_fields = Fields::from(vec![
+            Field::new("kind", DataType::UInt8, true),
+            Field::new("data", DataType::LargeBinary, true),
+            Field::new("uri", DataType::Utf8, true),
+            Field::new("blob_id", DataType::UInt32, true),
+            Field::new("blob_size", DataType::UInt64, true),
+            Field::new("position", DataType::UInt64, true),
+        ]);
+        let blob = StructArray::try_new(
+            blob_fields.clone(),
+            vec![
+                Arc::new(UInt8Array::from(vec![0, 0, 0])),
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(b"first".as_ref()),
+                    None,
+                    Some(b"".as_ref()),
+                ])),
+                Arc::new(StringArray::from(vec![None::<&str>, None, None])),
+                Arc::new(UInt32Array::from(vec![0, 0, 0])),
+                Arc::new(UInt64Array::from(vec![0, 0, 0])),
+                Arc::new(UInt64Array::from(vec![0, 0, 0])),
+            ],
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let blob_field =
+            Field::new("blob", DataType::Struct(blob_fields), true).with_metadata(HashMap::from([
+                (
+                    lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                    lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+                ),
+            ]));
+        let mut fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        if has_legacy_blob {
+            fields.push(
+                Field::new("legacy", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                    BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+            );
+            columns.push(Arc::new(LargeBinaryArray::from(vec![
+                Some(b"legacy".as_ref()),
+                Some(b"".as_ref()),
+                None,
+            ])));
+        }
+        if has_id {
+            fields.push(Field::new("id", DataType::Int32, false));
+            columns.push(Arc::new(Int32Array::from(vec![1, 2, 3])));
+        }
+        fields.push(blob_field);
+        columns.push(Arc::new(blob));
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        let schema = batch.schema();
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            fs,
+            ConcreteFileVersion::V2_2,
+            FileWriterOptions::default(),
+        )
+        .await;
+    }
+
+    #[rstest]
+    #[case::blob_only(false, false)]
+    #[case::with_ordinary_column(false, true)]
+    #[case::with_legacy_blob(true, false)]
+    #[tokio::test]
+    async fn test_raw_reader_reads_blob_v2_descriptor_children(
+        #[case] has_legacy_blob: bool,
+        #[case] has_id: bool,
+    ) {
+        let fs = FsFixture::default();
+        write_blob_v2_raw_file(&fs, has_legacy_blob, has_id).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // The anonymous descriptor children must stay under the Blob field
+        // instead of being promoted to top-level fields.
+        let schema = reader.schema();
+        let expected_top_level = 1 + usize::from(has_legacy_blob) + usize::from(has_id);
+        assert_eq!(schema.fields.len(), expected_top_level, "{schema:?}");
+        if has_legacy_blob {
+            // Legacy Blob v1 columns have no descriptor children to restore.
+            assert!(schema.field("legacy").unwrap().children.is_empty());
+        }
+        let blob = schema.field("blob").unwrap();
+        assert!(blob.is_blob_v2());
+        assert_eq!(
+            blob.children.len(),
+            lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD
+                .children
+                .len()
+        );
+
+        let batches = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), expected_top_level);
+        let descriptor = batch.column_by_name("blob").unwrap().as_struct();
+        assert_eq!(descriptor.num_columns(), blob.children.len());
+        assert_eq!(descriptor.null_count(), 1);
+        assert!(descriptor.is_null(1));
+
+        // An explicit projection of the Blob column must decode its
+        // descriptor children too.
+        let projection = versions::reader_projection_from_column_names(
+            ConcreteFileVersion::V2_2,
+            schema,
+            &["blob"],
+        )
+        .unwrap();
+        let projected = reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let projected = concat_batches(&projected[0].schema(), &projected).unwrap();
+        assert_eq!(projected.num_columns(), 1);
+        assert_eq!(projected["blob"].to_data(), descriptor.to_data());
     }
 
     #[test]
