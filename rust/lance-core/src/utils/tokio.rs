@@ -256,6 +256,24 @@ fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
 
+    /// The successful path must hand back the closure's own output.
+    ///
+    /// The output travels through an erased, type-independent task, so this
+    /// pins the typed contract: the caller receives the exact value the
+    /// closure returned, moved out of the task rather than re-created.
+    #[tokio::test]
+    async fn spawn_cpu_returns_the_closure_output() {
+        let result = spawn_cpu(|| -> std::result::Result<(u32, String), std::io::Error> {
+            Ok((7, String::from("done")))
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("the closure succeeded"),
+            (7, "done".to_string())
+        );
+    }
+
     /// A panic in the closure must reach the caller intact.
     ///
     /// Reporting the closure's outcome over a channel loses it: the sender
