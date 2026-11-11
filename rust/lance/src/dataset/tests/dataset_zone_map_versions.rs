@@ -287,8 +287,11 @@ fn only_segment(indices: &[IndexMetadata]) -> &IndexMetadata {
 /// contract; appending and optimizing rebuilds its single segment as a
 /// version 1 segment covering every fragment, rather than updating the
 /// version 0 file in place.
+#[rstest::rstest]
+#[case::unbounded(None)]
+#[case::bounded(Some(1))]
 #[tokio::test]
-async fn test_v8_zonemap_segment_is_rebuilt_as_version_1() {
+async fn test_v8_zonemap_segment_is_rebuilt_as_version_1(#[case] task_limit: Option<u64>) {
     let test_dir = copy_test_data_to_tmp("v8.0.0/decimal_zonemap").unwrap();
     let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
@@ -313,10 +316,29 @@ async fn test_v8_zonemap_segment_is_rebuilt_as_version_1() {
         .append(RecordBatchIterator::new([Ok(batch)], arrow_schema), None)
         .await
         .unwrap();
-    dataset
-        .optimize_indices(&OptimizeOptions::default())
+    let options = OptimizeOptions::default().max_rows_per_task(task_limit);
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
         .await
         .unwrap();
+    if task_limit.is_some() {
+        assert!(plan.tasks.len() > 1, "v0 rebuild is distributed");
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.old_segments.is_empty() && task.fragments.len() == 1)
+        );
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .flat_map(|task| task.fragments.iter().copied())
+                .collect::<RoaringBitmap>(),
+            *dataset.fragment_bitmap
+        );
+    } else {
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].old_segments.len(), 1);
+    }
+    dataset.optimize_indices(&options).await.unwrap();
 
     let after = raw_manifest_indices(&dataset).await;
     assert_eq!(after.len(), 1, "{after:?}");
@@ -648,5 +670,33 @@ async fn test_staged_version_1_intermediates_merge_beside_version_0_coverage() {
     assert_eq!(
         assert_query_agrees(&reopened, "val IS NULL", true).await,
         [6, 13]
+    );
+    // Optimize can upgrade mixed inputs by distributing the rebuild, even
+    // without appended data. Only freshly built v1 outputs enter the merger.
+    let options = OptimizeOptions::merge(2).max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &options)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 4);
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.old_segments.is_empty() && task.fragments.len() == 1)
+    );
+    dataset.optimize_indices(&options).await.unwrap();
+    let upgraded = raw_manifest_indices(&dataset).await;
+    assert_eq!(upgraded.len(), 1);
+    assert_eq!(upgraded[0].index_version, 1);
+    assert_eq!(
+        upgraded[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.fragment_bitmap.as_ref()
+    );
+    assert_eq!(
+        assert_query_agrees(&dataset, "val IS NULL", true).await,
+        [6, 13]
+    );
+    assert_eq!(
+        assert_query_agrees(&dataset, "val = 30.0", true).await,
+        [12]
     );
 }
