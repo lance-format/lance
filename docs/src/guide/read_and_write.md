@@ -687,7 +687,9 @@ of the keys, then one range on the next key. When the predicate has conditions
 the index cannot answer, such as one on a field that is not a key, the rows the
 index finds are rechecked with `any_element` itself, so the index never changes
 the result. Keys may be booleans, integers, floats, dates, timestamps, strings
-or binaries.
+or binaries. The index follows its key fields through renames. If a key field
+is dropped or changes type, queries stop using the index and scan instead; drop
+and recreate it.
 
 !!! warning "Experimental"
 

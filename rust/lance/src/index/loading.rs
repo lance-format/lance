@@ -53,7 +53,7 @@ use crate::index::api::DatasetIndexExt;
 use crate::index::frag_reuse::{self, load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_frag_reuse;
 use crate::index::mem_wal::open_mem_wal_index;
-use crate::index::scalar::{self, IndexDetails, fetch_index_details};
+use crate::index::scalar::{self, IndexDetails, fetch_index_details, list_element};
 use crate::index::segment::{
     index_is_usable, index_type_is_known, segment_has_vector_details, unsupported_index_version,
 };
@@ -672,9 +672,36 @@ impl Dataset {
                 field.name.clone()
             };
 
-            let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
+            let mut index_details =
+                IndexDetails(fetch_index_details(self, &field_path, index).await?);
             if index_details.is_vector() {
                 continue;
+            }
+            // A list-element index finds its key fields by ID; plan with the
+            // names they have now, or not at all if one is gone or changed.
+            if list_element::is_list_element(&index_details.0) {
+                match list_element::bind_key_fields(field, &index_details.0) {
+                    Ok(Some(bound)) => index_details = IndexDetails(Arc::new(bound)),
+                    Ok(None) => {
+                        log::warn!(
+                            "Skipping index '{}' on column '{}': a key field was dropped or \
+                             changed type since it was built. Queries on this column will \
+                             fall back to a full scan; drop and recreate the index.",
+                            index.name,
+                            field_path,
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Skipping index '{}' on column '{}': {err}. Queries on this column \
+                             will fall back to a full scan.",
+                            index.name,
+                            field_path,
+                        );
+                        continue;
+                    }
+                }
             }
 
             let plugin = match index_details.get_plugin() {

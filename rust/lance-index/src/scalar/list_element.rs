@@ -37,11 +37,16 @@
 //! # Nulls
 //!
 //! `any_element` is NULL for a NULL list, and for a list with no matching
-//! element but some element on which the predicate is NULL. Those rows matter
-//! only under `NOT`, and the index reports them exactly when asked to track
-//! nulls: a NULL list is stored as a NULL key, and an element on which the
-//! predicate is NULL is found by seeks with NULL in the constrained key
-//! positions. A NULL element is stored as NULL in every key.
+//! element but some element on which the predicate is UNKNOWN: no conjunct is
+//! FALSE and at least one is UNKNOWN. Those rows matter only under `NOT`, and
+//! the index reports them when asked to track nulls. A NULL list is stored as a
+//! NULL key. When every conjunct is a key condition that is UNKNOWN exactly
+//! when its key is NULL, the predicate is UNKNOWN on an element exactly when a
+//! non-empty set of the constrained keys is NULL and the rest match, so one
+//! seek per such combination finds those elements. A NULL element is stored
+//! as NULL in every key. Otherwise (a residual conjunct, a NULL literal, a
+//! null-sensitive test, or too many combinations) the answer is not exact, so
+//! the scan rechecks and `NOT` falls back to evaluating `any_element`.
 //!
 //! # Maintenance
 //!
@@ -125,8 +130,14 @@ pub struct ListElementIndexParams {
 /// The key fields of one index and their Arrow row encoding.
 #[derive(Debug, Clone, PartialEq)]
 struct KeyCodec {
-    /// Key names and types, all nullable.
+    /// Key names and types, all nullable. The names are the ones the column
+    /// has now: Lance resolves `field_ids` to them before handing the details
+    /// to the plugin.
     fields: Fields,
+    /// The Lance field IDs of the keys, parallel to `fields`. Empty in a
+    /// segment the plugin has just trained, until Lance records them from its
+    /// schema (the plugin only sees Arrow fields, which carry no IDs).
+    field_ids: Vec<i32>,
 }
 
 /// One seek: values of the leading keys (NULL included), then optionally a
@@ -201,6 +212,7 @@ impl KeyCodec {
                 .zip(types)
                 .map(|(name, data_type)| Field::new(name, data_type.clone(), true))
                 .collect(),
+            field_ids: Vec::new(),
         })
     }
 
@@ -228,7 +240,26 @@ impl KeyCodec {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::try_new(&details.keys, &types)
+        if !details.key_field_ids.is_empty() && details.key_field_ids.len() != details.keys.len() {
+            return Err(Error::corrupt_file_named(
+                "ListElementIndexDetails",
+                format!(
+                    "list-element index has {} key field IDs for {} keys",
+                    details.key_field_ids.len(),
+                    details.keys.len()
+                ),
+            ));
+        }
+        Ok(Self {
+            field_ids: details.key_field_ids.clone(),
+            ..Self::try_new(&details.keys, &types)?
+        })
+    }
+
+    /// Whether Lance has recorded the key fields' IDs, which a query needs to
+    /// be sure the keys are still the fields the index encoded.
+    fn has_field_ids(&self) -> bool {
+        self.field_ids.len() == self.fields.len()
     }
 
     fn names(&self) -> Vec<String> {
@@ -374,9 +405,11 @@ impl KeyCodec {
         self.ranges_of(&slots, false)
     }
 
-    /// Byte ranges of the keys on which `query`'s conjunction is NULL: each
-    /// constrained key matches or is NULL, and at least one is NULL. `IS NULL`
-    /// on a key is never NULL.
+    /// Byte ranges of the keys on which `query`'s conjunction is UNKNOWN: a
+    /// non-empty set of the constrained keys is NULL and every other one
+    /// matches. `IS NULL` on a key is never UNKNOWN, so it only matches NULL.
+    /// Holds when every conjunct has plain NULL semantics (see
+    /// [`has_plain_null_semantics`]).
     fn null_ranges(&self, query: &TupleQuery) -> Result<Vec<BinaryRange>> {
         self.ranges_of(&self.null_slots(query)?, true)
     }
@@ -700,9 +733,14 @@ impl AnyQuery for ListElementQuery {
     }
 }
 
-/// Whether a planned conjunct is NULL exactly when one of its keys is NULL,
-/// which is what [`KeyCodec::null_ranges`] assumes. `IS NOT NULL` and a NULL
-/// literal (`x = 1 OR NULL`) break that.
+/// Whether a planned conjunct is UNKNOWN exactly when its key is NULL.
+///
+/// [`KeyCodec::null_ranges`] relies on this for every conjunct: the predicate
+/// is then UNKNOWN on an element exactly when a non-empty set of the
+/// constrained keys is NULL and every other one matches. A NULL literal breaks
+/// it (`label IN ('car', NULL)` is UNKNOWN for `'dog'`; the tuple planner keeps
+/// only the non-null values), and so do `IS NOT NULL`, the
+/// `IS [NOT] TRUE/FALSE/UNKNOWN` tests and `IS [NOT] DISTINCT FROM`.
 fn has_plain_null_semantics(conjunct: &Expr) -> bool {
     !conjunct
         .exists(|e| {
@@ -723,19 +761,26 @@ fn has_plain_null_semantics(conjunct: &Expr) -> bool {
 
 /// Plan an `any_element` predicate (parsed over the element's fields) against
 /// the index keys. `None` when no conjunct fixes the first key.
+///
+/// The answer is exact only when both the TRUE rows and the NULL rows are:
+/// every conjunct is a key condition the seeks express, each is UNKNOWN exactly
+/// when its key is NULL, and the NULL seeks stay within [`MAX_NULL_SEEKS`]. One
+/// flag covers both, because the recheck it controls is also what makes
+/// `NOT any_element(...)` fall back to a scan; an inexact NULL set must never
+/// reach `NOT` as an exact answer.
 fn plan_predicate(predicate: &Expr, codec: &KeyCodec, call: Expr) -> Option<ListElementQuery> {
     let conjuncts = split_conjunction(predicate)
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
     let plan = plan_tuple_predicate(&conjuncts, &codec.fields)?;
-    let mut exact = plan.key_residual.is_empty()
-        && plan.row_residual.is_empty()
-        && plan.consumed.iter().all(|c| has_plain_null_semantics(c));
+    // A residual conjunct may be UNKNOWN on an element whose keys all match.
+    let is_fully_planned = plan.key_residual.is_empty() && plan.row_residual.is_empty();
+    let nulls_follow_keys = plan.consumed.iter().all(|c| has_plain_null_semantics(c));
     let tuple = plan.query;
-    if exact && codec.null_seek_count(&tuple).ok()? > MAX_NULL_SEEKS {
-        exact = false;
-    }
+    let exact = is_fully_planned
+        && nulls_follow_keys
+        && codec.null_seek_count(&tuple).ok()? <= MAX_NULL_SEEKS;
     Some(ListElementQuery { tuple, exact, call })
 }
 
@@ -855,6 +900,12 @@ impl DeepSizeOf for ListElementIndex {
 }
 
 impl ListElementIndex {
+    /// The names this index reads its keys by, in key order: the names the
+    /// key fields had when the index was opened.
+    pub fn key_names(&self) -> Vec<String> {
+        self.codec.names()
+    }
+
     fn wrap_target(&self, target: CreatedIndex) -> Result<CreatedIndex> {
         wrap_target(&self.codec, target)
     }
@@ -896,6 +947,7 @@ impl ListElementIndex {
 
 fn wrap_target(codec: &KeyCodec, target: CreatedIndex) -> Result<CreatedIndex> {
     let details = ListElementIndexDetails {
+        key_field_ids: codec.field_ids.clone(),
         keys: codec.names(),
         key_types: codec.logical_types()?,
         key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
@@ -1209,6 +1261,11 @@ impl ScalarIndexPlugin for ListElementIndexPlugin {
     ) -> Option<Box<dyn ScalarQueryParser>> {
         let details = decode_details(index_details).ok()?;
         let codec = KeyCodec::from_details(&details).ok()?;
+        // Without the key fields' IDs, the names could belong to other fields
+        // after a rename.
+        if !codec.has_field_ids() {
+            return None;
+        }
         Some(Box::new(ListElementQueryParser { index_name, codec }))
     }
 
@@ -1247,6 +1304,7 @@ impl ScalarIndexPlugin for ListElementIndexPlugin {
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
         let details = decode_details(details)?;
         Ok(serde_json::json!({
+            "key_field_ids": details.key_field_ids,
             "keys": details.keys,
             "key_types": details.key_types,
             "key_encoding": ListElementKeyEncoding::try_from(details.key_encoding)
@@ -1270,13 +1328,17 @@ impl ScalarIndexPlugin for ListElementIndexPlugin {
         let first = decode_details(first)?;
         for segment in segments {
             let segment = decode_details(segment)?;
-            if (&segment.keys, &segment.key_types, segment.key_encoding)
-                != (&first.keys, &first.key_types, first.key_encoding)
+            // Names may differ after a rename; the field IDs identify the keys.
+            if (
+                &segment.key_field_ids,
+                &segment.key_types,
+                segment.key_encoding,
+            ) != (&first.key_field_ids, &first.key_types, first.key_encoding)
             {
                 return Err(Error::invalid_input(format!(
-                    "list-element index segments must share their keys: one has keys {:?} \
-                     with types {:?}, another {:?} with types {:?}",
-                    first.keys, first.key_types, segment.keys, segment.key_types
+                    "list-element index segments must share their keys: one has key fields \
+                     {:?} with types {:?}, another {:?} with types {:?}",
+                    first.key_field_ids, first.key_types, segment.key_field_ids, segment.key_types
                 )));
             }
         }
@@ -1384,6 +1446,7 @@ mod tests {
             Some(vec![Some((None, Some(0.99)))]),           // 9 null label
             Some(vec![car(0.95), car(0.97)]),               // 10 two matches
             Some(vec![car(0.5)]),                           // 11
+            Some(vec![Some((None, None))]),                 // 12 both keys null
         ]
     }
 
@@ -1517,7 +1580,7 @@ mod tests {
                 true,
             ),
             ("label = 'person' AND confidence > 0.9", &[0], true),
-            ("label IS NULL", &[4, 5, 9], true),
+            ("label IS NULL", &[4, 5, 9, 12], true),
             // A non-key condition: candidates, recheck.
             (
                 "label = 'car' AND confidence > 0.9 AND area > 0",
@@ -1544,11 +1607,12 @@ mod tests {
         assert!(exact);
         assert_eq!(t, vec![1, 4, 10]);
         // 3 null list, 5 null element, 6 car with null confidence, 9 null label
-        // with a high confidence; row 4 is TRUE despite its null element.
-        assert_eq!(n, vec![3, 5, 6, 9]);
+        // with a high confidence, 12 both keys null (every conjunct UNKNOWN);
+        // row 4 is TRUE despite its null element.
+        assert_eq!(n, vec![3, 5, 6, 9, 12]);
         let query = parse(&q("label = 'car'")).unwrap();
         let (_, n, _) = search(index.as_ref(), &query, true).await;
-        assert_eq!(n, vec![3, 5, 9]);
+        assert_eq!(n, vec![3, 5, 9, 12]);
     }
 
     #[test]
@@ -1568,15 +1632,23 @@ mod tests {
             .optimize_expr(planner.parse_filter("detections IS NULL").unwrap())
             .unwrap();
         assert!(!matches!(expr, Expr::ScalarFunction(_)));
-        // IS NOT NULL keeps the TRUE rows exact but not the NULL rows.
-        let query = parse(&q("label = 'car' AND confidence IS NOT NULL")).unwrap();
-        assert!(!query.is_exact());
+        // Shapes whose NULL rows do not follow the keys: not exact, so the
+        // scan rechecks and NOT falls back to the scan.
+        for pred in [
+            "label = 'car' AND confidence IS NOT NULL",
+            "label IN ('car', NULL)",
+            "label = 'car' AND confidence > 0.9 AND area > 0",
+        ] {
+            let query = parse(&q(pred)).unwrap_or_else(|| panic!("{pred} not planned"));
+            assert!(!query.is_exact(), "{pred}: {query:?}");
+        }
     }
 
     #[test]
     fn test_details_round_trip() {
         let codec = codec();
         let details = ListElementIndexDetails {
+            key_field_ids: vec![2, 3],
             keys: codec.names(),
             key_types: codec.logical_types().unwrap(),
             key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
@@ -1584,7 +1656,14 @@ mod tests {
             target_index_version: 0,
         };
         assert_eq!(details.key_types, vec!["string", "float"]);
-        assert_eq!(KeyCodec::from_details(&details).unwrap(), codec);
+        let decoded = KeyCodec::from_details(&details).unwrap();
+        assert_eq!(decoded.fields, codec.fields);
+        assert_eq!(decoded.field_ids, vec![2, 3]);
+        assert!(decoded.has_field_ids());
+        assert!(
+            !codec.has_field_ids(),
+            "a freshly trained codec has no IDs yet"
+        );
         assert_eq!(prefix_successor(&[1, 2, 255]), Some(vec![1, 3]));
         assert_eq!(prefix_successor(&[255, 255]), None);
 
@@ -1595,6 +1674,13 @@ mod tests {
         let err = KeyCodec::from_details(&unspecified).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
 
+        let missing_id = ListElementIndexDetails {
+            key_field_ids: vec![2],
+            ..details.clone()
+        };
+        let err = KeyCodec::from_details(&missing_id).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+
         let not_a_key = ListElementIndexDetails {
             key_types: vec!["string".to_string(), "list".to_string()],
             ..details
@@ -1602,6 +1688,34 @@ mod tests {
         let err = KeyCodec::from_details(&not_a_key).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("'list'"), "{err}");
+    }
+
+    /// A segment whose key field IDs Lance has not recorded cannot plan
+    /// queries: its names alone may point at other fields after a rename.
+    #[test]
+    fn test_query_parser_needs_field_ids() {
+        let details = |key_field_ids: Vec<i32>| {
+            prost_types::Any::from_msg(&ListElementIndexDetails {
+                key_field_ids,
+                keys: vec!["label".to_string()],
+                key_types: vec!["string".to_string()],
+                key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
+                target_details: None,
+                target_index_version: 0,
+            })
+            .unwrap()
+        };
+        let plugin = ListElementIndexPlugin;
+        assert!(
+            plugin
+                .new_query_parser("idx".to_string(), &details(vec![]))
+                .is_none()
+        );
+        assert!(
+            plugin
+                .new_query_parser("idx".to_string(), &details(vec![2]))
+                .is_some()
+        );
     }
 
     /// The bytes the format specification gives as its example.
@@ -1672,8 +1786,9 @@ mod tests {
 
     #[test]
     fn test_segments_must_share_keys() {
-        let details = |keys: &[&str], key_types: &[&str]| {
+        let details = |ids: &[i32], keys: &[&str], key_types: &[&str]| {
             prost_types::Any::from_msg(&ListElementIndexDetails {
+                key_field_ids: ids.to_vec(),
                 keys: keys.iter().map(|k| k.to_string()).collect(),
                 key_types: key_types.iter().map(|t| t.to_string()).collect(),
                 key_encoding: ListElementKeyEncoding::ArrowRowV1.into(),
@@ -1682,17 +1797,22 @@ mod tests {
             })
             .unwrap()
         };
-        let label_confidence = details(&["label", "confidence"], &["string", "float"]);
-        let label = details(&["label"], &["string"]);
-        let label_double = details(&["label", "confidence"], &["string", "double"]);
+        let label_confidence = details(&[2, 3], &["label", "confidence"], &["string", "float"]);
+        // The same fields after a rename.
+        let renamed = details(&[2, 3], &["class", "score"], &["string", "float"]);
+        let label = details(&[2], &["label"], &["string"]);
+        let other_field = details(&[4, 3], &["label", "confidence"], &["string", "float"]);
+        let label_double = details(&[2, 3], &["label", "confidence"], &["string", "double"]);
         let plugin = ListElementIndexPlugin;
-        plugin
-            .validate_new_segments_against_existing(&[&label_confidence], &[&label_confidence])
-            .unwrap();
+        for same in [&label_confidence, &renamed] {
+            plugin
+                .validate_new_segments_against_existing(&[&label_confidence], &[same])
+                .unwrap();
+        }
         plugin
             .validate_new_segments_against_existing(&[], &[&label])
             .unwrap();
-        for other in [&label, &label_double] {
+        for other in [&label, &other_field, &label_double] {
             let err = plugin
                 .validate_new_segments_against_existing(&[&label_confidence], &[other])
                 .unwrap_err();

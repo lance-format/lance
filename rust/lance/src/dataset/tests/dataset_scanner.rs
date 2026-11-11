@@ -42,10 +42,10 @@ use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
-use crate::dataset::NewColumnTransform;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::{DatasetRecordBatchStream, QueryFilter};
 use crate::dataset::write::WriteParams;
+use crate::dataset::{ColumnAlteration, NewColumnTransform};
 use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -1841,6 +1841,392 @@ async fn test_element_index_delete_and_compaction(
             .into_iter()
             .filter(|id| !(100..600).contains(id))
             .collect::<Vec<_>>()
+    );
+}
+
+/// The `detections` column of `detection_batch(ids)` with its element fields
+/// named `names` in place, values unmoved.
+fn detections_named(ids: std::ops::Range<i32>, names: [&str; 3]) -> RecordBatch {
+    let batch = detection_batch(ids);
+    let list = batch["detections"].as_list::<i32>();
+    let elements = list.values().as_struct();
+    let fields = elements
+        .fields()
+        .iter()
+        .zip(names)
+        .map(|(field, name)| field.as_ref().clone().with_name(name))
+        .collect::<Fields>();
+    let elements = StructArray::try_new(
+        fields.clone(),
+        elements.columns().to_vec(),
+        elements.nulls().cloned(),
+    )
+    .unwrap();
+    let item = Arc::new(ArrowField::new("item", DataType::Struct(fields), true));
+    let detections = ListArray::try_new(
+        item.clone(),
+        list.offsets().clone(),
+        Arc::new(elements),
+        list.nulls().cloned(),
+    )
+    .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("width", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            batch["id"].clone(),
+            batch["width"].clone(),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap()
+}
+
+async fn explain(dataset: &Dataset, filter: &str) -> String {
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    scanner.explain_plan(true).await.unwrap()
+}
+
+/// The index follows its key fields by ID. Swapping the names of `confidence`
+/// (a key) and `area` (not a key), both floats, must not let `confidence`
+/// conditions use the index; `area` conditions now do. An update after the swap,
+/// through an index opened before it, reads the key from its new name.
+#[tokio::test]
+async fn test_element_index_follows_renamed_key_fields() {
+    let mut dataset = detection_dataset(true, false).await;
+    // Open the index before the renames, so it is cached under the old names.
+    assert_eq!(
+        any_element_ids(&dataset, CAR_ABOVE_09, true).await,
+        detection_ids(|_, d| any_detection(d, is_car_above_09) == Some(true))
+    );
+    for (from, to) in [
+        ("confidence", "tmp"),
+        ("area", "confidence"),
+        ("tmp", "area"),
+    ] {
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new(format!("detections.item.{from}")).rename(to.to_string())
+            ])
+            .await
+            .unwrap();
+    }
+    let batch = detections_named(
+        DETECTION_ROWS..DETECTION_ROWS + 400,
+        ["label", "area", "confidence"],
+    );
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    // Every row keeps the generated confidence in the field now named `area`
+    // and the generated area in the one now named `confidence`.
+    let all_ids = |keep: &dyn Fn(&Detections) -> bool| {
+        (0..DETECTION_ROWS + 400)
+            .filter(|id| keep(&detection_row(*id).1))
+            .collect::<Vec<_>>()
+    };
+    let key_filter = "any_element(detections, 'label = ''car'' AND area > 0.9')";
+    let expected = all_ids(&|d| any_detection(d, is_car_above_09) == Some(true));
+    for (use_scalar_index, fast_search) in [(true, false), (true, true), (false, false)] {
+        assert_eq!(
+            scan_any_element_ids(&dataset, key_filter, use_scalar_index, fast_search).await,
+            expected,
+            "index: {use_scalar_index}, fast_search: {fast_search}"
+        );
+    }
+    let plan = explain(&dataset, key_filter).await;
+    assert!(
+        plan.contains("ListElement(detections") && !plan.contains("recheck"),
+        "{plan}"
+    );
+
+    let non_key_filter = "any_element(detections, 'label = ''car'' AND confidence > 15000')";
+    let expected = all_ids(&|d| any_detection(d, |d| d.0 == "car" && d.2 > 15000.0) == Some(true));
+    assert!(!expected.is_empty());
+    for use_scalar_index in [true, false] {
+        assert_eq!(
+            any_element_ids(&dataset, non_key_filter, use_scalar_index).await,
+            expected,
+            "index: {use_scalar_index}"
+        );
+    }
+    let plan = explain(&dataset, non_key_filter).await;
+    assert!(plan.contains("recheck"), "{plan}");
+}
+
+/// Dropping a key field leaves the index in place but unusable: queries scan,
+/// and optimizing skips it.
+#[tokio::test]
+async fn test_element_index_dropped_key_field() {
+    let mut dataset = detection_dataset(true, false).await;
+    dataset
+        .drop_columns(&["detections.item.confidence"])
+        .await
+        .unwrap();
+    let filter = "any_element(detections, 'label = ''carrot''')";
+    let expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+    assert!(!explain(&dataset, filter).await.contains("ListElement("));
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+}
+
+/// label, confidence, area, each possibly NULL.
+type NullableDetection = (Option<&'static str>, Option<f32>, Option<f32>);
+
+/// Elements on which three-valued predicates are UNKNOWN in different ways,
+/// one list per row, repeated over two fragments.
+fn null_detection_rows() -> Vec<Option<Vec<Option<NullableDetection>>>> {
+    let det = |l, c, a| Some((l, c, a));
+    let base = vec![
+        Some(vec![det(None, None, Some(200.0))]),
+        Some(vec![det(Some("dog"), Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("car"), Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("dog"), None, Some(200.0))]),
+        Some(vec![det(None, Some(0.5), Some(200.0))]),
+        Some(vec![det(None, Some(0.95), Some(200.0))]),
+        Some(vec![det(Some("car"), None, Some(200.0))]),
+        Some(vec![]),
+        None,
+        Some(vec![
+            det(None, None, Some(200.0)),
+            det(Some("car"), Some(0.95), Some(200.0)),
+        ]),
+        Some(vec![det(Some("cat"), Some(0.95), Some(200.0)), None]),
+        Some(vec![det(Some("car"), Some(0.95), None)]),
+        Some(vec![det(Some("car"), Some(0.95), Some(50.0))]),
+    ];
+    let mut rows = base.clone();
+    rows.extend(base);
+    rows
+}
+
+async fn null_detection_dataset(element_index: bool) -> Dataset {
+    let rows = null_detection_rows();
+    let fields = Fields::from(vec![
+        ArrowField::new("label", DataType::Utf8, true),
+        ArrowField::new("confidence", DataType::Float32, true),
+        ArrowField::new("area", DataType::Float32, true),
+    ]);
+    let (mut labels, mut confidences, mut areas, mut is_valid) = (vec![], vec![], vec![], vec![]);
+    let (mut lengths, mut is_list_valid) = (vec![], vec![]);
+    for row in &rows {
+        is_list_valid.push(row.is_some());
+        let row = row.clone().unwrap_or_default();
+        lengths.push(row.len());
+        for detection in row {
+            is_valid.push(detection.is_some());
+            let (label, confidence, area) =
+                detection.unwrap_or((Some("car"), Some(0.99), Some(999.0)));
+            labels.push(label);
+            confidences.push(confidence);
+            areas.push(area);
+        }
+    }
+    let elements = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(StringArray::from(labels)) as ArrayRef,
+            Arc::new(Float32Array::from(confidences)),
+            Arc::new(Float32Array::from(areas)),
+        ],
+        Some(NullBuffer::from(is_valid)),
+    )
+    .unwrap();
+    let item = Arc::new(ArrowField::new("item", DataType::Struct(fields), true));
+    let detections = ListArray::try_new(
+        item.clone(),
+        OffsetBuffer::from_lengths(lengths),
+        Arc::new(elements),
+        Some(NullBuffer::from(is_list_valid)),
+    )
+    .unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..rows.len() as i32)),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        max_rows_per_file: rows.len() / 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(params),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    if element_index {
+        dataset
+            .create_index(
+                &["detections"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::new("listelement".to_string())
+                    .with_params(&serde_json::json!({"keys": ["label", "confidence"]})),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+/// SQL three-valued AND.
+fn and3(conditions: &[Option<bool>]) -> Option<bool> {
+    if conditions.contains(&Some(false)) {
+        Some(false)
+    } else if conditions.contains(&None) {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+fn eq3<T: PartialEq>(value: Option<T>, wanted: T) -> Option<bool> {
+    value.map(|value| value == wanted)
+}
+
+fn gt3(value: Option<f32>, bound: f32) -> Option<bool> {
+    value.map(|value| value > bound)
+}
+
+/// SQL three-valued `any_element`: NULL for a NULL list; TRUE if an element is
+/// TRUE; otherwise NULL if one is UNKNOWN (a NULL element is); otherwise FALSE.
+fn any3(
+    list: &Option<Vec<Option<NullableDetection>>>,
+    predicate: &dyn Fn(&NullableDetection) -> Option<bool>,
+) -> Option<bool> {
+    let list = list.as_ref()?;
+    let results = list
+        .iter()
+        .map(|element| element.as_ref().and_then(predicate))
+        .collect::<Vec<_>>();
+    if results.contains(&Some(true)) {
+        Some(true)
+    } else if results.contains(&None) {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// `exact`: whether the index answers the predicate, NULL rows included,
+/// without a recheck. When it cannot, `NOT` must not take its answer as exact.
+#[rstest]
+#[case::two_null_keys(
+    "label = ''car'' AND confidence > 0.9",
+    |d: &NullableDetection| and3(&[eq3(d.0, "car"), gt3(d.1, 0.9)]),
+    true
+)]
+#[case::null_in_list(
+    "label IN (''car'', NULL)",
+    |d: &NullableDetection| match d.0 {
+        Some("car") => Some(true),
+        _ => None,
+    },
+    false
+)]
+#[case::residual_conjunct(
+    "label = ''car'' AND confidence > 0.9 AND area > 100",
+    |d: &NullableDetection| and3(&[eq3(d.0, "car"), gt3(d.1, 0.9), gt3(d.2, 100.0)]),
+    false
+)]
+#[tokio::test]
+async fn test_any_element_three_valued_not(
+    #[case] predicate: &str,
+    #[case] element: fn(&NullableDetection) -> Option<bool>,
+    #[case] exact: bool,
+    #[values(false, true)] element_index: bool,
+) {
+    let dataset = null_detection_dataset(element_index).await;
+    let rows = null_detection_rows();
+    let call = format!("any_element(detections, '{predicate}')");
+    for (filter, keep) in [
+        (call.clone(), Some(true)),
+        (format!("NOT {call}"), Some(false)),
+    ] {
+        let expected = (0..rows.len() as i32)
+            .filter(|id| any3(&rows[*id as usize], &element) == keep)
+            .collect::<Vec<_>>();
+        assert!(!expected.is_empty(), "`{filter}` should match some rows");
+        for use_scalar_index in [true, false] {
+            assert_eq!(
+                any_element_ids(&dataset, &filter, use_scalar_index).await,
+                expected,
+                "`{filter}`, index: {use_scalar_index}"
+            );
+        }
+        assert_eq!(
+            dataset.count_rows(Some(filter.clone())).await.unwrap(),
+            expected.len(),
+            "count_rows(`{filter}`)"
+        );
+    }
+    if element_index {
+        let plan = explain(&dataset, &call).await;
+        assert!(plan.contains("ListElement(detections"), "{plan}");
+        assert_eq!(!plan.contains("recheck"), exact, "{plan}");
+    }
+}
+
+/// An overlay replaces a car list with a carrot list after the index was
+/// built. Optimizing must drop the old posting, whatever the row-id domain.
+#[rstest]
+#[tokio::test]
+async fn test_element_index_overlay_optimize(#[values(false, true)] enable_stable_row_ids: bool) {
+    let mut dataset = detection_dataset(true, enable_stable_row_ids).await;
+    let field_id = dataset.schema().field("detections").unwrap().id;
+    let filter = "any_element(detections, 'label = ''car''')";
+    assert!(any_element_ids(&dataset, filter, true).await.contains(&500));
+    // Row 500 is offset 0 of fragment 1; row 3's list holds only a carrot.
+    dataset = super::dataset_overlay_index_masking::commit_overlay(
+        dataset,
+        "det_overlay",
+        1,
+        &[field_id],
+        lance_table::format::overlay::OverlayCoverage::dense(roaring::RoaringBitmap::from_iter([
+            0,
+        ])),
+        vec![detection_batch(3..4)["detections"].clone()],
+    )
+    .await;
+    let expected = any_element_ids(&dataset, filter, false).await;
+    assert!(!expected.contains(&500));
+    assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(any_element_ids(&dataset, filter, false).await, expected);
+    assert_eq!(
+        any_element_ids(&dataset, filter, true).await,
+        expected,
+        "a stale car posting survived optimize"
     );
 }
 
