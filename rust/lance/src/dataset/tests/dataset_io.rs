@@ -1103,8 +1103,11 @@ async fn test_base_files_share_one_scheduler_per_scan() {
     );
 }
 
+#[rstest]
+#[case::dataset_defaults(false)]
+#[case::source_bindings(true)]
 #[tokio::test]
-async fn test_base_object_store_cache_invalidation() {
+async fn test_base_object_store_cache_invalidation(#[case] has_source_bindings: bool) {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
     let extra_dir = tempfile::tempdir().unwrap();
@@ -1112,7 +1115,17 @@ async fn test_base_object_store_cache_invalidation() {
     let clone_uri = file_object_store_uri(clone_dir.path());
 
     let mut source = write_multi_fragment_source(&source_uri).await;
-    let mut cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    // Reopening without runtime source bindings exercises dataset-level fallback params.
+    let mut cloned = if has_source_bindings {
+        cloned
+    } else {
+        DatasetBuilder::from_uri(&clone_uri)
+            .with_session(cloned.session.clone())
+            .load()
+            .await
+            .unwrap()
+    };
     let base_id = first_base_id(&cloned);
     let store = cloned.object_store(Some(base_id)).await.unwrap();
 
@@ -1123,10 +1136,25 @@ async fn test_base_object_store_cache_invalidation() {
             ..Default::default()
         }),
     );
+    let attempts_before = registry_attempts(&rebound);
     let rebound_store = rebound.object_store(Some(base_id)).await.unwrap();
-    assert!(
-        !Arc::ptr_eq(&store, &rebound_store),
-        "changed store params must not serve the previously cached base store"
+    assert_eq!(
+        registry_attempts(&rebound) - attempts_before,
+        1,
+        "changed store params must invalidate the dataset's base store cache"
+    );
+    assert_eq!(
+        Arc::ptr_eq(&store, &rebound_store),
+        has_source_bindings,
+        "explicit source bindings must take precedence over changed dataset defaults"
+    );
+    assert_eq!(
+        rebound_store.block_size(),
+        if has_source_bindings {
+            store.block_size()
+        } else {
+            32 * 1024
+        }
     );
 
     cloned.delete("id = 0").await.unwrap();
