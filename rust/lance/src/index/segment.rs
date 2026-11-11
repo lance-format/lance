@@ -123,16 +123,16 @@ pub(crate) fn validate_segment_index_details(
     Ok(())
 }
 
-/// Whether optimize can fold several segments of this kind into one without
-/// rescanning the table: the kinds the single-process optimize merges rather
-/// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
-/// Inverted (`InvertedIndex::merge_segments`).
+/// Whether bounded optimize can merge several segments of this kind without
+/// rescanning the table. LabelList's pure segment merge is supported even though
+/// its ordinary append path cannot merge several old segments with a new stream.
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
         || segment_has_ngram_details(segment)
         || segment_has_inverted_details(segment)
+        || segment_has_label_list_details(segment)
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.
