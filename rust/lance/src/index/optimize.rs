@@ -35,7 +35,10 @@
 //! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
 //! segments within a physical-row budget, leaving unindexed fragments alone.
 //! Shared models merge directly; differing models are re-encoded in tasks under
-//! the newest selected model, then merged into one output. All selected coverage
+//! the newest selected model, then merged into one output. A segment selection
+//! ([`OptimizeOptions::consolidate_selected`]) instead trains a model on its own
+//! rows when the models differ, and may pack its output into several segments
+//! of at most `max_rows_per_segment` live rows. All selected coverage
 //! must be present before committing. A caller may retry the same results on a
 //! refreshed dataset after a concurrent append or delete; a changed source owner
 //! or restored source rows require replanning. Tagged fragment reuse is not
@@ -73,8 +76,11 @@ mod consolidate;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use chrono::Utc;
 use futures::FutureExt;
+use itertools::Itertools;
+use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
@@ -83,13 +89,21 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::DatasetIndexExt;
 use super::append::{
     append_vector_segment, expects_definition_only, fragment_reuse_affects_segments,
     index_field_path, is_definition_only_segment, merge_indices_with_unindexed_frags,
     partition_dormant_vector_segments, select_segments_to_merge, tagged_segment_coverage,
 };
 use super::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
-use super::vector::details::vector_params_from_details;
+use super::loading::{DatasetIndexInternalExt, load_all_indices};
+use super::scalar;
+use super::segment::{
+    index_is_usable, index_type_is_known, retain_committed_inverted_files,
+    segment_has_inverted_details, segment_has_merge_primitive, segment_has_vector_details,
+    unsupported_index_version, validate_segment_metadata,
+};
+use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
     IVFIndex as LegacyIvfIndex, VectorSegmentCompatibility, optimize_vector_indices,
     select_steady_state_rebalance, vector_segment_compatibility,
@@ -97,14 +111,184 @@ use super::vector::ivf::{
 use super::vector::{
     LogicalVectorIndex, VectorIndexParams, build_vector_model_segment, fresh_vector_segment_params,
 };
-use super::{
-    DatasetIndexExt, DatasetIndexInternalExt, load_all_indices, optimizable_indices,
-    retain_committed_inverted_files, segment_has_inverted_details, segment_has_merge_primitive,
-    segment_has_vector_details, validate_segment_metadata, vector_index_details,
-};
 use crate::dataset::Dataset;
 use crate::dataset::transaction::{Operation, TransactionBuilder};
 use crate::{Error, Result};
+
+/// The indices an optimize pass may rewrite: each entry is one index name
+/// with all of its segments, in name order.
+///
+/// An index this build cannot rewrite is skipped with a warning: an index type
+/// it does not recognize, a segment newer than it reads, a covered index, an
+/// externally maintained index, or a scalar index with nothing to do. A covered
+/// or externally maintained index named in `index_names` is refused instead.
+pub(crate) fn optimizable_indices<'a>(
+    dataset: &Dataset,
+    indices: &'a [IndexMetadata],
+    options: &OptimizeOptions,
+) -> Result<Vec<(String, Vec<&'a IndexMetadata>)>> {
+    let indices_to_optimize = options
+        .index_names
+        .as_ref()
+        .map(|names| names.iter().collect::<HashSet<_>>());
+    let name_to_indices = indices
+        .iter()
+        .filter(|idx| {
+            indices_to_optimize
+                .as_ref()
+                .is_none_or(|names| names.contains(&idx.name))
+                && !is_system_index(idx)
+        })
+        .map(|idx| (idx.name.clone(), idx))
+        .into_group_map();
+
+    let mut optimizable = Vec::with_capacity(name_to_indices.len());
+    for (name, deltas) in name_to_indices {
+        if let Some(index) = deltas.iter().find(|idx| !index_type_is_known(idx)) {
+            let type_url = index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.as_str())
+                .unwrap_or("<legacy>");
+            log::warn!(
+                "Skipping optimization of index '{}' because this build does not recognize index type '{}'",
+                index.name,
+                type_url
+            );
+            continue;
+        }
+
+        if let Some(index) = deltas.iter().find(|index| {
+            index.index_details.as_ref().is_some_and(|details| {
+                scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                    .get_plugin_by_details(details)
+                    .is_ok_and(|plugin| !plugin.supports_optimization())
+            })
+        }) {
+            if options.index_names.is_some() {
+                return Err(Error::not_supported(format!(
+                    "Index '{}' is maintained externally and does not support optimize_indices",
+                    index.name
+                )));
+            }
+            continue;
+        }
+
+        // Optimizing a covered index would republish its declaration on a
+        // segment rebuilt without the carried values: `scan_vector_fragments`
+        // projects the keyed field and `_rowid` only, and the scalar merges
+        // reconstruct value plus row id.
+        //
+        // What decides is the caller's intent, not whether this group is
+        // stale. An unfiltered `optimize_indices()` is a table-wide
+        // maintenance request, and erroring aborts the loop before the
+        // replacements accumulated for the other groups are committed -- so
+        // one index this build cannot rebuild would leave every other index
+        // on the table stale. Skip it with a warning instead.
+        //
+        // A caller that listed this index in `index_names` asked for it
+        // specifically, so refuse out loud. The loop is already filtered by
+        // that list, so reaching here with it set means this group was named.
+        if let Some(covered) = deltas
+            .iter()
+            .find(|index| !index.covering_fields.is_empty())
+        {
+            if options.index_names.is_none() {
+                log::warn!(
+                    "Skipping index '{}': it declares covering fields {:?}, \
+                     which no index builder writes or preserves yet.",
+                    covered.name,
+                    covered.covering_fields,
+                );
+                continue;
+            }
+            return Err(Error::index(format!(
+                "Optimizing index '{}' is not supported: it declares \
+                 covering fields {:?}, which no index builder writes or \
+                 preserves yet",
+                covered.name, covered.covering_fields,
+            )));
+        }
+
+        // Optimizing a name means replacing its segments with one that
+        // covers their union, which this build cannot compute when it
+        // cannot read one of them: the merged segment would overlap the
+        // segment left behind, and `Dataset::validate` calls that
+        // corruption. Leave the whole name to a build that can read it.
+        if let Some(max_supported_version) =
+            deltas.iter().find_map(|idx| unsupported_index_version(idx))
+        {
+            log::warn!(
+                "Index {} has a segment newer than version {}, which this build cannot read; \
+                 skipping its optimization",
+                name,
+                max_supported_version,
+            );
+            continue;
+        }
+        if let Some(index) = deltas.iter().find(|index| !index_is_usable(index)) {
+            log::warn!(
+                "Index {} has a segment with unsupported field dependencies {:?}; \
+                 skipping its optimization",
+                name,
+                index.dependency_fields(),
+            );
+            continue;
+        }
+        // Scalar indices have no rebalance concept, so skip them entirely
+        // when every fragment is already covered and the caller hasn't
+        // asked for retrain or an explicit delta merge. Vector indices
+        // fall through and use a rebalance-aware no-op check inside
+        // merge_indices_with_unindexed_frags.
+        if !options.retrain
+            && options.num_indices_to_merge.is_none_or(|n| n == 0)
+            && index_group_is_scalar(dataset, &deltas)
+            && index_group_has_no_unindexed(dataset, &deltas)
+        {
+            continue;
+        }
+        optimizable.push((name, deltas));
+    }
+    optimizable.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(optimizable)
+}
+
+fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let Some(field_id) = deltas.first().and_then(|d| d.fields.first()) else {
+        return false;
+    };
+    match dataset.schema().field_by_id(*field_id) {
+        Some(field) => !is_vector_field(field.data_type()),
+        None => false,
+    }
+}
+
+fn index_group_has_no_unindexed(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
+    let mut indexed = RoaringBitmap::new();
+    for idx in deltas {
+        if let Some(bitmap) = idx.fragment_bitmap.as_ref() {
+            indexed |= bitmap;
+        } else {
+            // Pre-0.8 indices have no fragment bitmap; treat as needing optimize.
+            return false;
+        }
+    }
+    dataset
+        .fragments()
+        .iter()
+        .all(|frag| indexed.contains(frag.id as u32))
+}
+
+fn is_vector_field(data_type: DataType) -> bool {
+    match data_type {
+        DataType::FixedSizeList(_, _) => true,
+        DataType::List(inner) => {
+            // A list of fixed-size lists is a multivector field.
+            matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        }
+        _ => false,
+    }
+}
 
 /// A plan to optimize the indices of a dataset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -416,7 +600,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
-        if options.max_rows_to_consolidate.is_some() {
+        if consolidate::is_consolidation(options) {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
             continue;
         }
@@ -745,27 +929,56 @@ async fn plan_split_rebuild(
             "the column has too few rows to train the index",
         );
     }
+    let reference = train_model_segment(
+        dataset,
+        field_path,
+        last,
+        &params,
+        None,
+        options.progress.clone(),
+    )
+    .await?;
+    Ok(Some(SplitInputs {
+        reference,
+        fragments: dataset.fragments().as_ref().clone(),
+        absorbed: Vec::new(),
+        replaces: segments.iter().map(|segment| segment.uuid).collect(),
+    }))
+}
+
+/// Train a model for `segment`'s index, from `fragment_ids` or the whole
+/// table, and describe it as a segment outside the manifest that build tasks
+/// encode against.
+async fn train_model_segment(
+    dataset: &Dataset,
+    field_path: &str,
+    segment: &IndexMetadata,
+    params: &VectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<IndexMetadata> {
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let built = build_vector_model_segment(
         dataset,
         field_path,
-        name,
+        &segment.name,
         uuid,
-        &params,
+        params,
         frag_reuse_index,
-        options.progress.clone(),
+        fragment_ids,
+        progress,
     )
     .await?;
-    let reference = IndexMetadata {
+    Ok(IndexMetadata {
         uuid,
-        name: name.to_string(),
-        fields: last.fields.clone(),
+        name: segment.name.clone(),
+        fields: segment.fields.clone(),
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
         index_details: Some(Arc::new(vector_index_details(
-            &params,
+            params,
             built.target_partition_size,
         ))),
         index_version: params.index_type().version(),
@@ -774,13 +987,7 @@ async fn plan_split_rebuild(
         files: Some(built.files),
         clustering_id: None,
         metadata: Default::default(),
-    };
-    Ok(Some(SplitInputs {
-        reference,
-        fragments: dataset.fragments().as_ref().clone(),
-        absorbed: Vec::new(),
-        replaces: segments.iter().map(|segment| segment.uuid).collect(),
-    }))
+    })
 }
 
 /// Drop the candidates a split merge cannot absorb. A segment with no live
@@ -1156,10 +1363,11 @@ async fn merge_vector_segments(
                 .filter_map(|metadata| metadata.fragment_bitmap.clone())
                 .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap),
         ),
-        index_details: last
-            .index_details
-            .clone()
-            .or_else(|| Some(Arc::new(super::vector_index_details_default()))),
+        index_details: last.index_details.clone().or_else(|| {
+            Some(Arc::new(
+                super::vector::details::vector_index_details_default(),
+            ))
+        }),
         index_version: last.index_version,
         created_at: Some(Utc::now()),
         base_id: None,
@@ -1221,7 +1429,7 @@ pub async fn commit_optimize_indices(
     }
     let planned = dataset_at_version(dataset, read_version).await?;
     let mut results = results;
-    let read_version = if options.max_rows_to_consolidate.is_some() {
+    let read_version = if consolidate::is_consolidation(options) {
         consolidate::validate_commit(dataset, &planned, &mut results).await?;
         if results.is_empty() {
             return Ok(());
@@ -1230,7 +1438,7 @@ pub async fn commit_optimize_indices(
     } else {
         read_version
     };
-    let committed_segments = if options.max_rows_to_consolidate.is_some() {
+    let committed_segments = if consolidate::is_consolidation(options) {
         load_all_indices(dataset).await?
     } else {
         load_all_indices(&planned).await?
@@ -1321,7 +1529,9 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
-    use lance_index::vector::{ivf::IvfBuildParams, pq::PQBuildParams};
+    use lance_index::vector::{
+        bq::RQBuildParams, hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, pq::PQBuildParams,
+    };
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
 
@@ -1605,11 +1815,23 @@ mod tests {
         assert_eq!(indexed_rows(&dataset, &segments).await, 1250);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_vector_retrain() {
+    async fn test_vector_retrain(#[values(false, true)] hnsw_rq: bool) {
         let test_dir = TempStrDir::default();
         let mut dataset = write_dataset(&test_dir, 1000, 500).await;
-        create_vector_index(&mut dataset).await;
+        if hnsw_rq {
+            let (ivf, hnsw) = (IvfBuildParams::new(2), HnswBuildParams::default());
+            let rq = RQBuildParams::default();
+            let params = VectorIndexParams::with_ivf_hnsw_rq_params(MetricType::L2, ivf, hnsw, rq);
+            let name = Some(VECTOR_INDEX.to_string());
+            dataset
+                .create_index(&["vector"], IndexType::Vector, name, &params, true)
+                .await
+                .unwrap();
+        } else {
+            create_vector_index(&mut dataset).await;
+        }
         let original = segments(&dataset, VECTOR_INDEX).await[0].uuid;
         append(&mut dataset, 500, 250).await; // fragments 2, 3
 
@@ -1624,6 +1846,10 @@ mod tests {
         let model = &plan.tasks[0].reference;
         assert_ne!(model.uuid, original);
         assert_eq!(model.fragment_bitmap, Some(RoaringBitmap::new()));
+        // The model segment carries the trained model only: no rows, no graphs.
+        let opened =
+            dataset.open_vector_index_from_metadata("vector", model, &NoOpMetricsCollector);
+        assert_eq!(opened.await.unwrap().num_rows(), 0);
         assert!(
             plan.tasks
                 .iter()

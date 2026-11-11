@@ -793,6 +793,53 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         }
     }
 
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        let BinaryMiniBlockLayout::Legacy { bits_per_offset } = &self.layout else {
+            // Generic offsets are stored in a separate, possibly compressed buffer. Without
+            // decoding that buffer there is no reliable value-range bound.
+            return None;
+        };
+        let bits_per_offset = *bits_per_offset;
+        if chunk_buffers.len() != 1 || !matches!(bits_per_offset, 32 | 64) {
+            return None;
+        }
+
+        let data = &chunk_buffers[0];
+        let bytes_per_offset = usize::from(bits_per_offset / 8);
+        if !data.len().is_multiple_of(bytes_per_offset) {
+            return None;
+        }
+        let start = usize::try_from(offset_in_chunk).ok()?;
+        let end = start.checked_add(usize::try_from(num_rows).ok()?)?;
+        let needed = end.checked_add(1)?.checked_mul(bytes_per_offset)?;
+        if data.len() < needed {
+            return None;
+        }
+
+        let data_bytes = match bits_per_offset {
+            32 => {
+                let offsets = data.borrow_to_typed_slice::<u32>();
+                let offsets = offsets.as_ref();
+                u64::from(offsets.get(end)?.checked_sub(*offsets.get(start)?)?)
+            }
+            64 => {
+                let offsets = data.borrow_to_typed_slice::<u64>();
+                let offsets = offsets.as_ref();
+                offsets.get(end)?.checked_sub(*offsets.get(start)?)?
+            }
+            _ => return None,
+        };
+        let offset_bytes = u64::try_from(end.checked_sub(start)?.checked_add(1)?)
+            .ok()?
+            .checked_mul(bytes_per_offset as u64)?;
+        data_bytes.checked_add(offset_bytes)
+    }
+
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure
@@ -1047,6 +1094,15 @@ pub struct VariableDecoder {}
 impl VariablePerValueDecompressor for VariableDecoder {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
+    }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
+        u64::try_from(data.len()).ok()
     }
 }
 
@@ -1558,7 +1614,6 @@ mod tests {
         structural_encoding: &str,
         #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
         #[values(
-            TestEncoding::Array,
             TestEncoding::StructuralU16,
             TestEncoding::StructuralU32,
             TestEncoding::StructuralSparse
@@ -1575,6 +1630,19 @@ mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(field_metadata);
         check_basic_random_case(field, encoding, page_size, use_slicing).await;
+    }
+
+    /// The 2.0 array encoding ignores the structural encoding metadata, so it
+    /// is not crossed with it.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_binary_array_encoding(
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, TestEncoding::Array, page_size, use_slicing).await;
     }
 
     #[rstest]
@@ -1663,7 +1731,6 @@ mod tests {
         #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
         structural_encoding: &str,
         #[values(
-            TestEncoding::Array,
             TestEncoding::StructuralU16,
             TestEncoding::StructuralU32,
             TestEncoding::StructuralSparse
@@ -1678,6 +1745,27 @@ mod tests {
             structural_encoding.into(),
         );
         let field = Field::new("", DataType::Utf8, true).with_metadata(field_metadata);
+        check_small_strings(field, encoding, page_size, use_slicing).await;
+    }
+
+    /// The 2.0 array encoding ignores the structural encoding metadata, so it
+    /// is not crossed with it.
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_small_strings_array_encoding(
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let field = Field::new("", DataType::Utf8, true);
+        check_small_strings(field, TestEncoding::Array, page_size, use_slicing).await;
+    }
+
+    async fn check_small_strings(
+        field: Field,
+        encoding: TestEncoding,
+        page_size: u64,
+        use_slicing: bool,
+    ) {
         check_round_trip_encoding_generated(
             field,
             Box::new(FnArrayGeneratorProvider::new(move || {
@@ -2107,6 +2195,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("decreases"), "{err}");
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[chunk_u32(&[16, 8], &[])], 0, 1),
+            None
+        );
 
         // The first offset points inside the offset table, which would alias
         // the serialized offsets into the value bytes.
@@ -2129,6 +2221,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("multiple"), "{err}");
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[LanceBuffer::from(vec![0u8; 10])], 0, 1),
+            None
+        );
 
         // 64-bit offsets take the same validation path.
         fn chunk_u64(offsets: &[u64], values: &[u8]) -> LanceBuffer {

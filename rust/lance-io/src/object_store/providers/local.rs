@@ -28,6 +28,19 @@ struct FileSystemDirOperations {
 #[cfg(any(windows, test))]
 #[async_trait::async_trait]
 impl LocalDirOperations for FileSystemDirOperations {
+    fn directory_to_filesystem(&self, path: &Path) -> Result<std::path::PathBuf> {
+        // This maps directory prefixes, which may themselves end in '#<digits>'.
+        // A valid placeholder filename bypasses LocalFileSystem's file-name guard
+        // while retaining its rooted path and Windows filename conversions.
+        let placeholder = self
+            .local_file_system
+            .path_to_filesystem(&path.clone().join("__lance_directory__"))?;
+        placeholder
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .ok_or_else(|| Error::io(format!("Cannot resolve local directory prefix {path}")))
+    }
+
     async fn remove_dir_all(&self, path: &Path) -> Result<()> {
         let local_path = self.local_file_system.path_to_filesystem(path)?;
         let object_store_path = path.to_string();
@@ -39,6 +52,11 @@ impl LocalDirOperations for FileSystemDirOperations {
         })
         .await
         .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))?
+    }
+
+    async fn canonicalize(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
+        let local_path = self.local_file_system.path_to_filesystem(path)?;
+        crate::object_store::canonicalize_local_io_result(tokio::fs::canonicalize(local_path).await)
     }
 }
 
@@ -138,6 +156,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -252,6 +271,7 @@ mod tests {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count: 0,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: "file$rooted-test".to_owned(),
             paginated_lister: None,
@@ -272,6 +292,81 @@ mod tests {
             .unwrap();
 
         assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
+
+    #[tokio::test]
+    async fn test_rooted_staging_listing_uses_local_root() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(dataset.join("nested#1")).unwrap();
+        write(dataset.join("nested#1/file#1"), "staging").unwrap();
+        let store = rooted_local_store(&root);
+        let mut files = store.read_local_staging_files(&Path::from("dataset"));
+        let file = futures::TryStreamExt::try_next(&mut files)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            file.location,
+            Path::parse("dataset/nested#1/file#1").unwrap()
+        );
+        assert_eq!(file.size, 7);
+        store.delete(&file.location).await.unwrap();
+        assert!(!dataset.join("nested#1/file#1").exists());
+        assert!(
+            futures::TryStreamExt::try_next(&mut files)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rooted_canonicalize_uses_local_root() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(&dataset).unwrap();
+        let store = rooted_local_store(&root);
+
+        let canonical = store
+            .canonicalize_local_path(&Path::from("dataset"))
+            .await
+            .unwrap()
+            .expect("rooted local paths should canonicalize");
+
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(&dataset).unwrap(),
+            "canonicalization must use the store's filesystem root"
+        );
+        assert!(!store.has_direct_local_paths());
+        #[cfg(unix)]
+        {
+            symlink(&dataset, root.join("alias")).unwrap();
+            assert_eq!(
+                store
+                    .canonicalize_local_path(&Path::from("alias"))
+                    .await
+                    .unwrap(),
+                Some(canonical)
+            );
+        }
+        assert!(
+            store
+                .canonicalize_local_path(&Path::from("missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ObjectStore::memory()
+                .canonicalize_local_path(&Path::from("dataset"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

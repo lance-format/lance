@@ -23,7 +23,9 @@ use self::plan::{
     plan_blob_read_plans, plan_disjoint_blob_reads,
 };
 use super::file::{BlobFile, BlobSource};
-use super::locate::{blob_version_from_descriptions, collect_blob_files_v1, collect_blob_files_v2};
+use super::locate::{
+    blob_version_from_descriptions, collect_blob_files_v1, collect_blob_v2_descriptor_files,
+};
 use crate::dataset::take::{MissingRowPolicy, TakeBuilder};
 use crate::dataset::{Dataset, ProjectionRequest};
 use lance_core::datatypes::{BlobVersion, parse_field_path};
@@ -961,9 +963,17 @@ async fn collect_blob_selection_for_selection(
     let row_addrs = description_and_addr.column(1).as_primitive::<UInt64Type>();
 
     let files = match blob_version_from_descriptions(descriptions)? {
-        BlobVersion::V1 => collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs),
+        BlobVersion::V1 => {
+            collect_blob_files_v1(dataset, blob_field_id, descriptions, row_addrs).await
+        }
         BlobVersion::V2 => {
-            collect_blob_files_v2(dataset, blob_field_id, descriptions, row_addrs).await
+            collect_blob_v2_descriptor_files(
+                dataset,
+                blob_field_id,
+                descriptions,
+                row_addrs.values(),
+            )
+            .await
         }
     }?;
     if files.len() != row_addrs.len() {
@@ -1335,9 +1345,117 @@ mod tests {
         )
         .unwrap();
         let row_addrs = UInt64Array::from(vec![u64::MAX]);
-        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs).unwrap();
+        let files = collect_blob_files_v1(&dataset, u32::MAX, &descriptions, &row_addrs)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_none());
+    }
+
+    #[tokio::test]
+    async fn test_blob_v1_files_read_source_base_after_shallow_clone() {
+        let source_dir = TempStrDir::default();
+        let clone_dir = TempStrDir::default();
+        let expected = b"known independent legacy clone payload\x00\xff";
+        let blob_metadata = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("blob", DataType::LargeBinary, true).with_metadata(blob_metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![0, 1, 2])),
+                Arc::new(LargeBinaryArray::from_iter([
+                    Some(b"".as_slice()),
+                    None,
+                    Some(expected.as_slice()),
+                ])),
+            ],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &source_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut source = Dataset::open(source_dir.as_ref()).await.unwrap();
+        assert_eq!(source.get_fragments().len(), 3);
+        let source_blobs = Arc::new(source.clone())
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            source_blobs[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert!(source_blobs[1].is_none());
+        assert!(
+            source_blobs[2]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        source
+            .shallow_clone(clone_dir.as_ref(), source.version_id(), None)
+            .await
+            .unwrap();
+        let cloned = Arc::new(Dataset::open(clone_dir.as_ref()).await.unwrap());
+        assert_eq!(cloned.get_fragments().len(), 3);
+        let data_file = cloned.get_fragments()[0].metadata.files[0].clone();
+        assert!(
+            data_file.base_id.is_some(),
+            "shallow clone data file must reference the source base"
+        );
+        assert!(
+            !std::path::Path::new(clone_dir.as_ref())
+                .join("data")
+                .join(&data_file.path)
+                .exists(),
+            "shallow clone publication must not copy the legacy blob data file"
+        );
+
+        let cloned_blobs = cloned
+            .take_blobs_by_indices(&[2, 1, 0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            cloned_blobs[0]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+        assert!(cloned_blobs[1].is_none());
+        assert!(
+            cloned_blobs[2]
+                .as_ref()
+                .unwrap()
+                .read()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

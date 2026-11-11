@@ -213,6 +213,10 @@ impl FsstPerValueDecompressor {
 }
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
         let compressed_variable_data = self
@@ -235,7 +239,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -245,6 +249,8 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                     &mut decompress_offset_buf,
                 )
                 .map_err(map_fsst_error)?;
+                // The values become the batch's buffer, so release the unused 8x headroom
+                decompress_bytes_buf.shrink_to_fit();
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -266,7 +272,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -276,6 +282,8 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                     &mut decompress_offset_buf,
                 )
                 .map_err(map_fsst_error)?;
+                // The values become the batch's buffer, so release the unused 8x headroom
+                decompress_bytes_buf.shrink_to_fit();
 
                 // Ensure the offsets array is trimmed to exactly num_values + 1 elements
                 decompress_offset_buf.truncate((num_values + 1) as usize);
@@ -293,6 +301,19 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 compressed_variable_data.bits_per_offset,
             ),
         }
+    }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        offsets_bytes: &[u8],
+        bits_per_offset: u8,
+    ) -> Option<u64> {
+        let fsst_compressed_size =
+            self.inner_decompressor
+                .decompressed_size(data, offsets_bytes, bits_per_offset)?;
+        // The vendored FSST decoder expands each compressed value by at most 8x.
+        fsst_compressed_size.checked_mul(8)
     }
 }
 
@@ -319,6 +340,17 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         self.inner_decompressor.num_buffers()
     }
 
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        self.inner_decompressor
+            .decoded_bytes_from_chunk(chunk_buffers, offset_in_chunk, num_rows)?
+            .checked_mul(8)
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding
@@ -336,7 +368,7 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -360,7 +392,7 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
-                let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let mut decompress_bytes_buf = Vec::with_capacity(bytes.len() * 8);
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,

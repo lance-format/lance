@@ -1,0 +1,4616 @@
+{
+  "manifest_sha256": "b514799657cd512d7ad6814e668f2032a5375d51ccd42a2517f3fe4161acb13f",
+  "input_sha256": {
+    "dino/k-1.npz": "c76c4c35144d10d467c941e9e2fac1a8b39dfe91cfd5c52942aec03f518e26d1",
+    "dino/k-2.npz": "a11fd65b28e3290fd7a3ad8c3b5e760f792f5d35554c6d6cad0f0729f4d94fc8",
+    "dino/k-5.npz": "e0d940a9e0837378d48aea1b8c805274236543b0faf19bda646249df1051081d",
+    "dino/k-10.npz": "7d26961657ac488c5e3ab0bd5f36a608f05d4ef4335d6fbd5557421ba92db223",
+    "dino/k-11.npz": "0f8cfb470f0840711c999ce8c2568e9c8fc0b457ccf5cd92497fb9a9cc7e136a",
+    "dino/k-20.npz": "1623db72df75a0178a620609d23a15e2f574b352143a686a6a00a313fa2a28c0",
+    "dino/k-50.npz": "30a895abe3b51697c70c3e3a1c84de16fbc4fbd5b1dd2e1e6f1d4923e2348e33",
+    "dino/k-100.npz": "4c156e14a57a8f0013e7b7019c9c9b869bac4445cac503a4d366efa56667d606",
+    "dino/k-101.npz": "31bcec7acde58013893867cd2c9d1f88d17bdcb72b4e36cce9be933439aea2f4",
+    "dino/k-150.npz": "6e97db3b93a482dfcd4c02222db080d9c0ae4f4210735d253dee735a21829307",
+    "dino/k-200.npz": "2a8b45f7e957b89b27b305412e0999ebe133e3bd3507ed8fc6dd4a77a3aaa54f",
+    "dino/k-201.npz": "bd8df3b845a30218259c3dff73ce7c88b923d8af5d077654463a2bcf1ed4b9d5",
+    "dino/k-300.npz": "7be0ab9bc88b0b09c7396f31bde5342d536ad32d94f0ef990a37da5595bdf86b",
+    "dino/k-500.npz": "9d9b8d64cd1f5fffd8ead79e81642a648e0bead542f89f459d860fb175040076",
+    "dino/k-501.npz": "ae487514c93892bfa403e492ca5d720327858be5c95d08a685333d3cf8dd6f80",
+    "dino/k-750.npz": "190646ca18c110d1946d828ac49d1e1ae79a06a6b0d799b0ca7412b5fea3422e",
+    "dino/k-1000.npz": "7657952032df899e08e95ef96136841e450803a35faba0e61fffb3b631acce9a",
+    "dino/k-1001.npz": "95b3544a9104e959b3fadff6831082b4d03fccba220a5cff01951ff78f3cae90",
+    "dino/k-1500.npz": "156d2405a439c764ab54244cff883bd20c6882910013c5af41db0f03dde4016a",
+    "dino/k-2000.npz": "8dfb01f6cbfa4547c4f813eeac4dca7438ea00f05e81145495ef03c13eb4ac8b",
+    "dino/k-3000.npz": "28ca9e3ce078ae0749cea69b9a98e8ac1f00c87d2499c18b9e0c15c00ed0d77a",
+    "dino/k-5000.npz": "8a5d90e32da86d8d0f9e5bd7f11c17a9fb955ea7ddf4b97c322961dde4a6cff2",
+    "dino/k-7500.npz": "ebfaab2e62a28e2ebadb19d70c27f6974d29d9679c07f4250eb46880549b1ad6",
+    "dino/k-10000.npz": "367bef561cb1016f6a0d567475e51872fe20c7998ae5745161e76becb08807f8",
+    "dino/k-10001.npz": "bf4f136af51b0d160161c4cc0da8713aa574dc04c01d0b86619db3ac4e16cdf5",
+    "dino/k-15000.npz": "10a45125ca4547f42919680f1e5f4786e85a9a77de3d3cbc4f93a4168cd1dfff",
+    "dino/k-20000.npz": "a6abe2108ba08738e2a44ec2b44b486de7e5e7b2e97ffa923dfaba585a24bfd1",
+    "dino/k-30000.npz": "408d5ba08431c582aa02032adcb7217751e932da1d744321a70dad1b02c06290",
+    "dino/k-50000.npz": "f22d0f79905f0b30a5c39ad15717e2d3c7979c9c27c4789158d9488f51b96416",
+    "dino/k-75000.npz": "25d9162f2a49c89bcfe4d2097832028d500ed95b65d4b5b9483ef03557380681",
+    "dino/k-100000.npz": "e0d72ca42eeeb26fd4eee6c8b13ef5d13dfca672ed6771ad97a4b2bd778b2294",
+    "dpr-wikipedia-single-nq/k-1.npz": "f55ac9c9f21fd5c2fc00a7dc3921b14dfe3b0318895d335ede2f8a297c397fce",
+    "dpr-wikipedia-single-nq/k-2.npz": "75ec957c717753ce535fcaf9afc96944ea4a04da3fa86318f45a4c785aab295f",
+    "dpr-wikipedia-single-nq/k-5.npz": "f25f7ebeae896e7f379f5fab463087f08ea924541a8885be32d4c89b93ff7617",
+    "dpr-wikipedia-single-nq/k-10.npz": "44ff4a33d325012c9b649c72b77ed58eeff43182c2ad1dbc6a72f867e330f823",
+    "dpr-wikipedia-single-nq/k-11.npz": "65b2d1ffffa5e103d2057e93a02e158f247650031716f5062aab24ecdf9533a1",
+    "dpr-wikipedia-single-nq/k-20.npz": "728e3ea5c2aeda5fcee854362d4a19dd6b242a79b39103682148c3c8503ebad5",
+    "dpr-wikipedia-single-nq/k-50.npz": "a34975f448d4bc97f6da510f93d070dffbec585090eb55c640e3cf0c6039891b",
+    "dpr-wikipedia-single-nq/k-100.npz": "13beae393bbd796d6a1e114c26b58f4b3cb79d11a83433e4a81cb1e48b8b6d68",
+    "dpr-wikipedia-single-nq/k-101.npz": "421086e9fe0771ec0bf6da07c9c4edaeccf2cc177f44b8772626acc744d930eb",
+    "dpr-wikipedia-single-nq/k-150.npz": "36feb5b85c7dc828472b09bfede819d679dd337c98c22499b9545669ed5132f0",
+    "dpr-wikipedia-single-nq/k-200.npz": "a1de5dc02cea946c86a03abd3b339d5514ac001e6ac31d95b1148cdf02875bab",
+    "dpr-wikipedia-single-nq/k-201.npz": "a5c6c478c1d2d51b25a7508d073084e89a362591c3a7c47449ebc8e534f1a893",
+    "dpr-wikipedia-single-nq/k-300.npz": "ea819cccce87b1bc8ecea48d8e6a7f586ae54bd4fe9a503d168a6c07551072c7",
+    "dpr-wikipedia-single-nq/k-500.npz": "2ba97d7180d632d052d78c6686c74d6a079872d90ca02a60faf22dbc3a5f214b",
+    "dpr-wikipedia-single-nq/k-501.npz": "f7280e5972e06c6ad7379d27ba1a7e4878bbfa2c988975cbbf6b71b33eb86434",
+    "dpr-wikipedia-single-nq/k-750.npz": "6befacc7b5c259bb6409ea4ad11a03edd4c492b1779aaa8f17d39085f687e07d",
+    "dpr-wikipedia-single-nq/k-1000.npz": "c44865dc086a5c640e69cae5f846893d96e10f318aa2e81abb84d68cbc60a295",
+    "dpr-wikipedia-single-nq/k-1001.npz": "6014ede9dcf5ee309d39e26bae582d120ce7213004c45c93ee2798f411d24ecc",
+    "dpr-wikipedia-single-nq/k-1500.npz": "e520bfbee07ed70350f6efabd7f75f3ee058a9c98e84dbc67cc8054aa9250cbd",
+    "dpr-wikipedia-single-nq/k-2000.npz": "d2d9a84dc312ce9e1bddc316b35808174fcfc35fe1fb9469e956a8bd6ef265a7",
+    "dpr-wikipedia-single-nq/k-3000.npz": "7856e89e11a673a57e3f3208e9f6519d1e3e406b47d179bf8c9ac41eac2384e3",
+    "dpr-wikipedia-single-nq/k-5000.npz": "b1e8a23eea3d6dbebe65c16b8fff58b1e355c2a36ebb62cb1bfcd12881f4e34d",
+    "dpr-wikipedia-single-nq/k-7500.npz": "52106af90863dc40c3daa86f843a2dcf48dca932da9d55424f67818e88127e87",
+    "dpr-wikipedia-single-nq/k-10000.npz": "66374d136c7d0db2d1147c33c0a948bcebc9ee1a54405a39797767a569d7d7c4",
+    "dpr-wikipedia-single-nq/k-10001.npz": "90987d05c39b8f1b7d4f3d5cdf880f4e0bd01600f875c3320b236e4b2e75f0bc",
+    "dpr-wikipedia-single-nq/k-15000.npz": "a66970c48bcb4283a9d40d2a482259446e2cb127b1ea8e124300e6e4cd3820aa",
+    "dpr-wikipedia-single-nq/k-20000.npz": "5c6120729ccb4d013e528753e9670622d400fce3c165ba7d501451e0db60946f",
+    "dpr-wikipedia-single-nq/k-30000.npz": "2715b5ed21e4e919f6130de258fe4b1b5216115fc3df54aa40846dc8bdbbd85c",
+    "dpr-wikipedia-single-nq/k-50000.npz": "391c67221368408728f0e79cd50aab0c2f27aa81ffc5f95836ff6ce68aa915c3",
+    "dpr-wikipedia-single-nq/k-75000.npz": "82220ff059bcd97980876b998368816b50ff4a2f06a1467516a2cc14056f6ac3",
+    "dpr-wikipedia-single-nq/k-100000.npz": "4944e8d8064e74736eed21febbe868c463726530a985a3a9848d403557dd0a21",
+    "fineweb/k-1.npz": "6d49b0ed54b7199418d811d740edde0fcf44131eda1f6368ac95cf165e7841f7",
+    "fineweb/k-2.npz": "824feb9f098bb0c3d280dced94937c72f6d2f5905e0f267f136cc79254980824",
+    "fineweb/k-5.npz": "0541b63b5daa4fab6589f1c2563567a50fe9cd2a2bd00ab38625e8e141389baa",
+    "fineweb/k-10.npz": "3c873449e4721236f75c77927e4f1f536423c1892d7d16da0f82d150fccd72d4",
+    "fineweb/k-11.npz": "edb17dd370cf01cc5e211b75ea1c9bd344608394caa098302b3b2ccdd83a20b6",
+    "fineweb/k-20.npz": "5b91e7a8c80ec835b19dc52a35c1b888d548417468cda36867fe1eb2d0a40e77",
+    "fineweb/k-50.npz": "e5f875065337d780ebd203ae01064769ca935f4f69f2a9070ffe87573139762f",
+    "fineweb/k-100.npz": "678cfc313627ba30bf41d63d6746b39f7445b8a1a805ef8dd7eccf5397474e5e",
+    "fineweb/k-101.npz": "9cca43667421ec042b45d9c2b4dfa5d3f0fa59173f8e53513e91259c80551942",
+    "fineweb/k-150.npz": "651e88ee88b5a806817d64640308b9f1483281ad4614bc98cde5cf7b5a4dcbbf",
+    "fineweb/k-200.npz": "7c3b77a44e2bece4182985cacfc59e5bec80e6242230a0af218da97fc41420ef",
+    "fineweb/k-201.npz": "2dc46449f2cc0aeb7a7e9871a4d0f66391cb002667220ba714a2ed65a3c84699",
+    "fineweb/k-300.npz": "b95cc0126a4ebacad5e36acd4e966c5f054624938a434891b9fb5fdd58de87d2",
+    "fineweb/k-500.npz": "bfb4b4932a33f32945fd5bd3b171968c7fd431884efda91e255c66f82fe29b3c",
+    "fineweb/k-501.npz": "873df51af5d6c08bfaeee7462f33a84c49388023fbddc70e24c9ac5c2b0bf895",
+    "fineweb/k-750.npz": "6bb328e9ad78a50ff160767795ba0e9309241f4fbc612c096c1e473908e2fa00",
+    "fineweb/k-1000.npz": "0acb0787ba67391b73c09c2e5ad96e7c783a73a9ab6c88179d7587eadb4e27cb",
+    "fineweb/k-1001.npz": "c1ca10fec68fd954e189e0af77d20f51e9ce480ad8efbc2ad3c40337f06bc9bb",
+    "fineweb/k-1500.npz": "4ea36599fe510b65d0b29b8160447157eb96cf0916fe0e62baf279dbb91fc705",
+    "fineweb/k-2000.npz": "d99d4e1cebb9c773843866ed872ce3beed635c9d288d8231c0f9f3fef6586bcc",
+    "fineweb/k-3000.npz": "a99943e0427306993799bd6a71557ba49b2474f762cf9cbbf936cec1be827e50",
+    "fineweb/k-5000.npz": "cbf34ab977229bba809e9cb6ca9c9f12a1cd175d7c2f0cfee87e5fbcebf615cb",
+    "fineweb/k-7500.npz": "1f9c9e37e04449ed2631b3cf6fb8178c2482c8e03fb9b5767b67ec7be14bfe2c",
+    "fineweb/k-10000.npz": "076c30e820fb4b26b548d3a06f6bd452e3cff70fec7b3bb618ee5277ad42d7d2",
+    "fineweb/k-10001.npz": "28f61ba5a7df6d3fb8536e1eec6ed06f8366e81983dcb2d75107f891f5fc0ff6",
+    "fineweb/k-15000.npz": "d26fd3dce6a78e5c64b75587454e153d45f006933d8c4d305bf3195fe353fce6",
+    "fineweb/k-20000.npz": "cd3742f51420e58905895c37b0c37a5783a000fedc274f2e08493b739eaf8a9a",
+    "fineweb/k-30000.npz": "c2daf0f72ca183b82c10a3067bae30b6ac802d4bf7627715c4fc21dc2c5b4349",
+    "fineweb/k-50000.npz": "92872e31a79e5e0fb46cda741a10298a4705dbdf34d7ab09adf50cb011ed1efb",
+    "fineweb/k-75000.npz": "d8d40c77d2473960400cfffd877636062ed599edb1360a10326d7ebd440444b3",
+    "fineweb/k-100000.npz": "dc755c6faeee38d56166985776d02048e1dc3aa1183fd8aff2113b59d0379395",
+    "laion/k-1.npz": "a4cd570cbd104f4092164cf7bef36fa8bf06084d8ecb25c646b90c1f7f874e4e",
+    "laion/k-2.npz": "40937140a08b108f19336027b69e792e3c564768922057272e0880b3facc2c50",
+    "laion/k-5.npz": "d909d1a1313c5fd981e37937c87ab82b8051314b1577d31161ed263606c2c475",
+    "laion/k-10.npz": "99dc4eafc3ec09f939cab206973b2c62a665439707804aeffb8772a51a6fa96a",
+    "laion/k-11.npz": "669c9eafaf081312ccfe733936dd1a1aa997bfc222ec6518f874a14d2ccd05c1",
+    "laion/k-20.npz": "a49f718af4b95c3e498c474769f665ba81f5e224dd6e2c5bda705e35055936b9",
+    "laion/k-50.npz": "a3277bed93b2f809f490fb14cdda54d83250e8aa2e837542ded12466d8aa2424",
+    "laion/k-100.npz": "ae696e288e5d86bd06480faee7bb95b116e1d2717eb2c2f6428de1e1e0abb3e1",
+    "laion/k-101.npz": "2be86674e6e0ba72938925901a07445595c291839a2b46b33d5e4da9bb522c6d",
+    "laion/k-150.npz": "4a96779bf5d349482d1bb2e2dec4111e1e15cf64ebfa04d485ae7059aaeea8f7",
+    "laion/k-200.npz": "c6bb0e6035fab255e586dc93eb472e13f5b19b2cdf1cd5c3ec9a9c36dcfa6ba2",
+    "laion/k-201.npz": "624f2cd907f4f4c6078aff6804a48fd2c3a296513dffea05751996dec7e24f9b",
+    "laion/k-300.npz": "7ec89eb991abadc4c71bd5af4d98bcd072a7e666d561d404545a05b47c46f6e6",
+    "laion/k-500.npz": "bd5863ae41786d71ff28055cd29bcef7d0f032822ebf67327d7edf4240a46a3a",
+    "laion/k-501.npz": "e4ae4881d66886ed6dc413cebf25b2e3d42f4b23b0671aebd8507cf18a01c109",
+    "laion/k-750.npz": "52f0d7613f661409059eed8165efef23a68d9337ff1fa57b22289071d15e4366",
+    "laion/k-1000.npz": "afd642d6fadabf8c65c7ff7edc83775f1c5d1a4e62ee46d057409736944c0c0e",
+    "laion/k-1001.npz": "1a41d29602fd1cd881ce4ae27f370248c1a9905d860af43a2dd01a5453db5443",
+    "laion/k-1500.npz": "9cad1439a41fb038be6cab15a28cd7c8411cb472eda7fd75dcfcc91fcf45928e",
+    "laion/k-2000.npz": "a244fc66ef95ad9223abbb46c61d73df9abd5d5733342a7a73bc48dd4d476d60",
+    "laion/k-3000.npz": "795eb56e1b9e847495fefed6aea521687d9c953305d3cd9dc66bc85c2e4ac0c4",
+    "laion/k-5000.npz": "3abbb66a726198592f777fa777a647fea0a5726c023fcb46bd2baa162a9b9c11",
+    "laion/k-7500.npz": "746467bf8c9f49d62a3da36610433975562931363d3ad85a4f9e3e770048e760",
+    "laion/k-10000.npz": "82b5558965e269c342f30d5248b3cb079c3fa209eff185c05c3659a4a4baae82",
+    "laion/k-10001.npz": "d1bed5e791eea9342eb1569ad99e2054d1be6fedb056a53d022d9e95b95b1dbd",
+    "laion/k-15000.npz": "9c7fd78cb454ef9bc8a446e46b6c44fd81f7d0529514acfca22dac217c6602b9",
+    "laion/k-20000.npz": "30c5c87c1170ae46485142a50f0450c916c3ac5415093f0855cb6f0449733a11",
+    "laion/k-30000.npz": "449d900c7f8dfe25cd7be9227489aa21db05393fc984cd7b92a2e10fc7f095f6",
+    "laion/k-50000.npz": "528e549b0190e5e2d80248c52de27ac2ef0c5e3d864039a85529673f48cb7343",
+    "laion/k-75000.npz": "94f91349fb56aaec71d3b95b5a1b2a57479f53dfae45ee75bda295f1e8b967a0",
+    "laion/k-100000.npz": "8925117c420cc94b94db923a44f55a3970542fcffa3601218f31defc488d1683",
+    "wiki-cohere-35m/k-1.npz": "cfd0b503c5d78c2db0e21656d1d74362b49c888bfb9c115e6cd1a1a48ba5fc6b",
+    "wiki-cohere-35m/k-2.npz": "797edd53e148e9582da02591be3ca6380f5bebda79d4dcd86eafb361ad7b6702",
+    "wiki-cohere-35m/k-5.npz": "bc95f681b59ca6a22d67ea656defe9add8b44cafe4e30dd83fda86cee7c4edc8",
+    "wiki-cohere-35m/k-10.npz": "e925062932a107876083baae330682b8eb7bb5169fde64afbbe416398a4b7b88",
+    "wiki-cohere-35m/k-11.npz": "9ee4bcdef089f9065ff1ed82d5b9b398674c81fe18c4cde2e480aa1ed313d32e",
+    "wiki-cohere-35m/k-20.npz": "5f517dbf4193ad748e7c8355d2da50747aa91fb9b36877ec9bcb5cb43370d7ba",
+    "wiki-cohere-35m/k-50.npz": "9ddd2fb955fa4ddfb7756203d6b0834e32f8464ae416530fa55e8dbf1f93f5d1",
+    "wiki-cohere-35m/k-100.npz": "034e4149370264741fbf66971da4b5cdae63f55d78436f95260f3a7236b2fef9",
+    "wiki-cohere-35m/k-101.npz": "c1982561478e528f477f231aea4585af65c65dba209e5bf4b0ee0633fe7ce1a4",
+    "wiki-cohere-35m/k-150.npz": "e32292316a7933890b65492ea2cbe05a943a7b10841e3d98d2289647af084dde",
+    "wiki-cohere-35m/k-200.npz": "dfa4d9300176bbcb8aeff70b315b49f1014b026744fada9475e47e63398dcd1f",
+    "wiki-cohere-35m/k-201.npz": "cba8223290783adfbb9bd3256b065bf776a059abe13d8bcaf02fbbbb8f0728a4",
+    "wiki-cohere-35m/k-300.npz": "ed9908be83372412c2e35b86d42aa71c6c08a204b9549971fa2de5d0e63d732c",
+    "wiki-cohere-35m/k-500.npz": "8598358daddf54d737d9e33d829dd4fb1d486c778522181422df3d1671ff87bd",
+    "wiki-cohere-35m/k-501.npz": "9ceec3ea5ccc60f6845cf80725e5ab8b79d055f1ccee802efcb90f364326e9b8",
+    "wiki-cohere-35m/k-750.npz": "160939168fd3ed847abaccc1ca7c054729f0838ca736294d1b491a6b9326e162",
+    "wiki-cohere-35m/k-1000.npz": "f313e10618c3948d0dd2ddc1b2b4f5b7e8c441820084b387e7f6a7b82921a54e",
+    "wiki-cohere-35m/k-1001.npz": "f2e9f98376e515625a4c69b123db5d403b1d427731727c62c9684848460765ab",
+    "wiki-cohere-35m/k-1500.npz": "fb71b2eebd7724e97117a466b0b8c5b00b29aeeede4095bcc65da3446d621505",
+    "wiki-cohere-35m/k-2000.npz": "f3f3e93d93c74757e175f6733eb856bede30e8bb9a9234886ecabfef650c59b2",
+    "wiki-cohere-35m/k-3000.npz": "38b4aa1b2d68d1d7fe586d285d911d9117e1a6760034360a5ab71e1625dd8533",
+    "wiki-cohere-35m/k-5000.npz": "3fe6dec5185354d49841490b52d3b277b01a42c6d2071b60b505fb32fd16b129",
+    "wiki-cohere-35m/k-7500.npz": "0efc404478e15d9ed0bed6d7bb520867e2ee591916b75b17c9cebeaf6fe7f3ea",
+    "wiki-cohere-35m/k-10000.npz": "aeab2056cbfc15292148e41674f99fb21abe83db0dc7956789b85425e495d48b",
+    "wiki-cohere-35m/k-10001.npz": "9cbdef0ef7aba9714d8cefdad96094a096b9d886e1b6419303038f3b53805a0e",
+    "wiki-cohere-35m/k-15000.npz": "fe9765755fd1a7b0e9ceec9372730334b285b5a006ca8d62fa0f650e3c7b18b2",
+    "wiki-cohere-35m/k-20000.npz": "1438afee0add4a76e54feaf541885cc06ad3f8435a4bc71ae07598b4a55ec380",
+    "wiki-cohere-35m/k-30000.npz": "06c390061df584b40c917d56e7e0cbb265b3b3278e9dcc574a0bb914239b982a",
+    "wiki-cohere-35m/k-50000.npz": "8da00ade550310018c88aa162721754899152ce6fa39d2dbef172e9c775a5ae3",
+    "wiki-cohere-35m/k-75000.npz": "86bf791e8c1d4be184fb0fe0a3f7c1f21d65c7e9f7987cac0aaa77ee812dc570",
+    "wiki-cohere-35m/k-100000.npz": "9ea67038c5ecff610fd2109b1de0f359235f54c331c023dab8f1bea708a7a521"
+  },
+  "evaluation_used": false,
+  "scale_step": 0.001,
+  "mandatory_k_anchors": [
+    1,
+    2,
+    10,
+    11,
+    100,
+    101,
+    200,
+    201,
+    500,
+    501,
+    1000,
+    1001,
+    2000,
+    5000,
+    10000,
+    10001,
+    20000,
+    50000,
+    100000
+  ],
+  "interpolation_max_probe_overhead": 1.05,
+  "profiles": {
+    "cosine": {
+      "1": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.278,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.83447265625,
+              "mean_partitions": 6.716796875,
+              "p95_partitions": 14.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.81005859375,
+              "mean_partitions": 4.13427734375,
+              "p95_partitions": 14.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.563,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.91015625,
+              "mean_partitions": 13.35205078125,
+              "p95_partitions": 29.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.9208984375,
+              "mean_partitions": 8.07958984375,
+              "p95_partitions": 29.0
+            }
+          ]
+        }
+      ],
+      "2": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.143,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.811767578125,
+              "mean_partitions": 6.1845703125,
+              "p95_partitions": 12.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.825927734375,
+              "mean_partitions": 4.0693359375,
+              "p95_partitions": 12.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.383,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.910400390625,
+              "mean_partitions": 15.22119140625,
+              "p95_partitions": 30.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.937255859375,
+              "mean_partitions": 9.62939453125,
+              "p95_partitions": 30.0
+            }
+          ]
+        }
+      ],
+      "5": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.174,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.8109375000000001,
+              "mean_partitions": 7.18798828125,
+              "p95_partitions": 14.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.8291015625,
+              "mean_partitions": 4.61572265625,
+              "p95_partitions": 14.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.442,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.91025390625,
+              "mean_partitions": 17.49560546875,
+              "p95_partitions": 35.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.9348632812500001,
+              "mean_partitions": 10.81982421875,
+              "p95_partitions": 35.0
+            }
+          ]
+        }
+      ],
+      "10": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.201,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.81123046875,
+              "mean_partitions": 8.2099609375,
+              "p95_partitions": 16.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.830078125,
+              "mean_partitions": 5.17138671875,
+              "p95_partitions": 16.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.53,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100097656250001,
+              "mean_partitions": 20.73486328125,
+              "p95_partitions": 41.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.939697265625,
+              "mean_partitions": 12.94775390625,
+              "p95_partitions": 41.0
+            }
+          ]
+        }
+      ],
+      "11": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.133,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.8229314630681817,
+              "mean_partitions": 9.5634765625,
+              "p95_partitions": 15.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.8115234375,
+              "mean_partitions": 5.740234375,
+              "p95_partitions": 15.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.308,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.9103338068181818,
+              "mean_partitions": 21.17236328125,
+              "p95_partitions": 33.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.9303977272727273,
+              "mean_partitions": 12.83349609375,
+              "p95_partitions": 33.0
+            }
+          ]
+        }
+      ],
+      "20": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.143,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.8222167968749999,
+              "mean_partitions": 10.31396484375,
+              "p95_partitions": 16.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.8407470703125,
+              "mean_partitions": 6.421875,
+              "p95_partitions": 16.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.352,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100341796875,
+              "mean_partitions": 24.2216796875,
+              "p95_partitions": 38.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.9298828125,
+              "mean_partitions": 14.525390625,
+              "p95_partitions": 38.0
+            }
+          ]
+        }
+      ],
+      "50": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.161,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.8132421875000001,
+              "mean_partitions": 11.5068359375,
+              "p95_partitions": 18.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.824990234375,
+              "mean_partitions": 7.0859375,
+              "p95_partitions": 18.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.429,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100390625,
+              "mean_partitions": 29.38232421875,
+              "p95_partitions": 46.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.93060546875,
+              "mean_partitions": 17.7275390625,
+              "p95_partitions": 46.0
+            }
+          ]
+        }
+      ],
+      "100": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.189,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.8130126953125001,
+              "mean_partitions": 13.3955078125,
+              "p95_partitions": 21.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.8194287109375,
+              "mean_partitions": 8.14794921875,
+              "p95_partitions": 21.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.501,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.910390625,
+              "mean_partitions": 34.4072265625,
+              "p95_partitions": 54.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.92875,
+              "mean_partitions": 20.60546875,
+              "p95_partitions": 54.0
+            }
+          ]
+        }
+      ],
+      "101": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.129,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.8102906482054456,
+              "mean_partitions": 13.1982421875,
+              "p95_partitions": 21.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.8316541615099011,
+              "mean_partitions": 8.20556640625,
+              "p95_partitions": 21.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.348,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100112159653465,
+              "mean_partitions": 34.4306640625,
+              "p95_partitions": 55.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.9329024211014851,
+              "mean_partitions": 21.09423828125,
+              "p95_partitions": 55.0
+            }
+          ]
+        }
+      ],
+      "150": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.143,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.8106803385416667,
+              "mean_partitions": 14.4833984375,
+              "p95_partitions": 23.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.8273763020833333,
+              "mean_partitions": 8.92578125,
+              "p95_partitions": 23.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.388,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100130208333332,
+              "mean_partitions": 38.11767578125,
+              "p95_partitions": 61.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.9299055989583334,
+              "mean_partitions": 23.095703125,
+              "p95_partitions": 61.0
+            }
+          ]
+        }
+      ],
+      "200": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.154,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.81008544921875,
+              "mean_partitions": 15.61376953125,
+              "p95_partitions": 25.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.82358642578125,
+              "mean_partitions": 9.5185546875,
+              "p95_partitions": 25.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.412,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100097656249999,
+              "mean_partitions": 40.634765625,
+              "p95_partitions": 65.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.9287109375,
+              "mean_partitions": 24.78857421875,
+              "p95_partitions": 65.0
+            }
+          ]
+        }
+      ],
+      "201": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.118,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.8101897737873134,
+              "mean_partitions": 15.15478515625,
+              "p95_partitions": 23.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.8346864311256219,
+              "mean_partitions": 9.67578125,
+              "p95_partitions": 23.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.322,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.9103675956156716,
+              "mean_partitions": 40.51953125,
+              "p95_partitions": 62.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.9328819768345771,
+              "mean_partitions": 25.53369140625,
+              "p95_partitions": 62.0
+            }
+          ]
+        }
+      ],
+      "300": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.136,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.8126660156250001,
+              "mean_partitions": 17.546875,
+              "p95_partitions": 27.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.8303564453125001,
+              "mean_partitions": 10.93359375,
+              "p95_partitions": 27.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.36,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102441406249999,
+              "mean_partitions": 45.541015625,
+              "p95_partitions": 70.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.9306949869791666,
+              "mean_partitions": 28.572265625,
+              "p95_partitions": 70.0
+            }
+          ]
+        }
+      ],
+      "500": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.156,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.8100361328125001,
+              "mean_partitions": 19.74853515625,
+              "p95_partitions": 30.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.8288466796874999,
+              "mean_partitions": 12.52685546875,
+              "p95_partitions": 30.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.422,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102255859375,
+              "mean_partitions": 53.19384765625,
+              "p95_partitions": 82.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.92803515625,
+              "mean_partitions": 33.0302734375,
+              "p95_partitions": 82.0
+            }
+          ]
+        }
+      ],
+      "501": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.126,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.8110263847305389,
+              "mean_partitions": 20.3125,
+              "p95_partitions": 32.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.8277049416791418,
+              "mean_partitions": 12.62939453125,
+              "p95_partitions": 32.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.342,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.910052940993014,
+              "mean_partitions": 53.7705078125,
+              "p95_partitions": 85.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.9265872551771457,
+              "mean_partitions": 32.9111328125,
+              "p95_partitions": 85.0
+            }
+          ]
+        }
+      ],
+      "750": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.146,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.8107500000000001,
+              "mean_partitions": 23.35107421875,
+              "p95_partitions": 37.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.8185345052083334,
+              "mean_partitions": 14.21337890625,
+              "p95_partitions": 37.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.388,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102044270833334,
+              "mean_partitions": 61.2587890625,
+              "p95_partitions": 97.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.9258802083333333,
+              "mean_partitions": 37.58203125,
+              "p95_partitions": 97.0
+            }
+          ]
+        }
+      ],
+      "1000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.161,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.81030810546875,
+              "mean_partitions": 25.4833984375,
+              "p95_partitions": 40.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8209296875000001,
+              "mean_partitions": 15.74560546875,
+              "p95_partitions": 40.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.432,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.91039599609375,
+              "mean_partitions": 68.08984375,
+              "p95_partitions": 108.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9244306640625,
+              "mean_partitions": 41.55126953125,
+              "p95_partitions": 108.0
+            }
+          ]
+        }
+      ],
+      "1001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.066,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8102312726336164,
+              "mean_partitions": 23.85546875,
+              "p95_partitions": 30.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8344077797202797,
+              "mean_partitions": 15.85888671875,
+              "p95_partitions": 30.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.184,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100606424825175,
+              "mean_partitions": 65.94482421875,
+              "p95_partitions": 83.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.933643992726024,
+              "mean_partitions": 44.0322265625,
+              "p95_partitions": 83.0
+            }
+          ]
+        }
+      ],
+      "2000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.088,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8123046875,
+              "mean_partitions": 31.85546875,
+              "p95_partitions": 40.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8335290527343749,
+              "mean_partitions": 21.40673828125,
+              "p95_partitions": 40.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.24,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.91026318359375,
+              "mean_partitions": 85.67626953125,
+              "p95_partitions": 108.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9304113769531249,
+              "mean_partitions": 56.81103515625,
+              "p95_partitions": 108.0
+            }
+          ]
+        }
+      ],
+      "5000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.135,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.81168876953125,
+              "mean_partitions": 48.52685546875,
+              "p95_partitions": 61.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.825270703125,
+              "mean_partitions": 32.51318359375,
+              "p95_partitions": 61.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.352,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.91039580078125,
+              "mean_partitions": 125.40576171875,
+              "p95_partitions": 158.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9249571289062499,
+              "mean_partitions": 83.3056640625,
+              "p95_partitions": 158.0
+            }
+          ]
+        }
+      ],
+      "10000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.193,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.811228076171875,
+              "mean_partitions": 69.13818359375,
+              "p95_partitions": 87.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.812525146484375,
+              "mean_partitions": 46.17626953125,
+              "p95_partitions": 87.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.481,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.910117919921875,
+              "mean_partitions": 171.43994140625,
+              "p95_partitions": 216.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9165640625,
+              "mean_partitions": 114.0205078125,
+              "p95_partitions": 216.0
+            }
+          ]
+        }
+      ],
+      "10001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.082,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8110452626612339,
+              "mean_partitions": 66.361328125,
+              "p95_partitions": 79.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8561179038346165,
+              "mean_partitions": 62.8505859375,
+              "p95_partitions": 79.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.209,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100041167758224,
+              "mean_partitions": 168.66796875,
+              "p95_partitions": 201.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.938363341400235,
+              "mean_partitions": 159.71435546875,
+              "p95_partitions": 201.0
+            }
+          ]
+        }
+      ],
+      "20000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.118,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8105882568359375,
+              "mean_partitions": 95.7001953125,
+              "p95_partitions": 114.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8468150146484374,
+              "mean_partitions": 90.65478515625,
+              "p95_partitions": 114.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.286,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102095214843751,
+              "mean_partitions": 230.4580078125,
+              "p95_partitions": 274.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.933076708984375,
+              "mean_partitions": 218.36376953125,
+              "p95_partitions": 274.0
+            }
+          ]
+        }
+      ],
+      "50000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.198,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.810459453125,
+              "mean_partitions": 159.78955078125,
+              "p95_partitions": 190.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8284904296875,
+              "mean_partitions": 151.4111328125,
+              "p95_partitions": 190.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.437,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102575390625001,
+              "mean_partitions": 351.5888671875,
+              "p95_partitions": 419.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.923081962890625,
+              "mean_partitions": 332.86083984375,
+              "p95_partitions": 419.0
+            }
+          ]
+        }
+      ],
+      "75000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.25,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.810090859375,
+              "mean_partitions": 201.36376953125,
+              "p95_partitions": 240.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8176663346354166,
+              "mean_partitions": 190.6435546875,
+              "p95_partitions": 240.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.526,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102020052083333,
+              "mean_partitions": 423.2431640625,
+              "p95_partitions": 504.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9161624153645833,
+              "mean_partitions": 400.810546875,
+              "p95_partitions": 504.0
+            }
+          ]
+        }
+      ],
+      "100000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.297,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.811000517578125,
+              "mean_partitions": 239.3369140625,
+              "p95_partitions": 285.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8107156884765625,
+              "mean_partitions": 226.6689453125,
+              "p95_partitions": 285.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.601,
+          "calibration": [
+            {
+              "corpus": "fineweb",
+              "metric": "cosine",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9101998876953126,
+              "mean_partitions": 483.3154296875,
+              "p95_partitions": 576.0
+            },
+            {
+              "corpus": "laion",
+              "metric": "cosine",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9108469433593749,
+              "mean_partitions": 457.5595703125,
+              "p95_partitions": 576.0
+            }
+          ]
+        }
+      ]
+    },
+    "dot": {
+      "1": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.179,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1,
+              "queries": 1805,
+              "mean_routing_recall": 0.8160664819944599,
+              "mean_partitions": 17.8792243767313,
+              "p95_partitions": 21.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1,
+              "queries": 2500,
+              "mean_routing_recall": 0.8792,
+              "mean_partitions": 20.994,
+              "p95_partitions": 21.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.465,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1,
+              "queries": 1805,
+              "mean_routing_recall": 0.9113573407202216,
+              "mean_partitions": 45.05041551246537,
+              "p95_partitions": 53.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1,
+              "queries": 2500,
+              "mean_routing_recall": 0.9344,
+              "mean_partitions": 52.9852,
+              "p95_partitions": 53.0
+            }
+          ]
+        }
+      ],
+      "2": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.139,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 2,
+              "queries": 1805,
+              "mean_routing_recall": 0.8193905817174515,
+              "mean_partitions": 21.0,
+              "p95_partitions": 21.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 2,
+              "queries": 2500,
+              "mean_routing_recall": 0.8892,
+              "mean_partitions": 37.466,
+              "p95_partitions": 61.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.341,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 2,
+              "queries": 1805,
+              "mean_routing_recall": 0.910803324099723,
+              "mean_partitions": 50.0,
+              "p95_partitions": 50.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 2,
+              "queries": 2500,
+              "mean_routing_recall": 0.939,
+              "mean_partitions": 90.6412,
+              "p95_partitions": 148.0
+            }
+          ]
+        }
+      ],
+      "5": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.16,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 5,
+              "queries": 1805,
+              "mean_routing_recall": 0.8119667590027702,
+              "mean_partitions": 24.0,
+              "p95_partitions": 24.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 5,
+              "queries": 2500,
+              "mean_routing_recall": 0.86984,
+              "mean_partitions": 42.9704,
+              "p95_partitions": 70.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.417,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 5,
+              "queries": 1805,
+              "mean_routing_recall": 0.9101385041551248,
+              "mean_partitions": 61.0,
+              "p95_partitions": 61.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 5,
+              "queries": 2500,
+              "mean_routing_recall": 0.9314399999999999,
+              "mean_partitions": 110.742,
+              "p95_partitions": 181.0
+            }
+          ]
+        }
+      ],
+      "10": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.181,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10,
+              "queries": 1805,
+              "mean_routing_recall": 0.8111357340720221,
+              "mean_partitions": 27.0,
+              "p95_partitions": 27.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10,
+              "queries": 2500,
+              "mean_routing_recall": 0.8593200000000001,
+              "mean_partitions": 48.4824,
+              "p95_partitions": 79.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.473,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10,
+              "queries": 1805,
+              "mean_routing_recall": 0.9102493074792244,
+              "mean_partitions": 69.0,
+              "p95_partitions": 69.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10,
+              "queries": 2500,
+              "mean_routing_recall": 0.9239200000000001,
+              "mean_partitions": 125.4404,
+              "p95_partitions": 205.0
+            }
+          ]
+        }
+      ],
+      "11": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.136,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 11,
+              "queries": 1805,
+              "mean_routing_recall": 0.8143540669856459,
+              "mean_partitions": 28.0,
+              "p95_partitions": 28.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 11,
+              "queries": 2500,
+              "mean_routing_recall": 0.8721090909090908,
+              "mean_partitions": 60.7436,
+              "p95_partitions": 105.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.356,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 11,
+              "queries": 1805,
+              "mean_routing_recall": 0.910853689247041,
+              "mean_partitions": 72.0,
+              "p95_partitions": 72.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 11,
+              "queries": 2500,
+              "mean_routing_recall": 0.9340363636363636,
+              "mean_partitions": 158.0264,
+              "p95_partitions": 274.0
+            }
+          ]
+        }
+      ],
+      "20": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.14,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 20,
+              "queries": 1805,
+              "mean_routing_recall": 0.8118005540166204,
+              "mean_partitions": 29.0,
+              "p95_partitions": 29.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 20,
+              "queries": 2500,
+              "mean_routing_recall": 0.8617,
+              "mean_partitions": 62.5544,
+              "p95_partitions": 108.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.381,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 20,
+              "queries": 1805,
+              "mean_routing_recall": 0.9103047091412743,
+              "mean_partitions": 77.0,
+              "p95_partitions": 77.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 20,
+              "queries": 2500,
+              "mean_routing_recall": 0.93,
+              "mean_partitions": 169.0376,
+              "p95_partitions": 293.0
+            }
+          ]
+        }
+      ],
+      "50": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.161,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 50,
+              "queries": 1805,
+              "mean_routing_recall": 0.8109473684210526,
+              "mean_partitions": 33.0,
+              "p95_partitions": 33.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 50,
+              "queries": 2500,
+              "mean_routing_recall": 0.8542639999999999,
+              "mean_partitions": 71.7464,
+              "p95_partitions": 124.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.436,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 50,
+              "queries": 1805,
+              "mean_routing_recall": 0.9101052631578948,
+              "mean_partitions": 88.0,
+              "p95_partitions": 88.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 50,
+              "queries": 2500,
+              "mean_routing_recall": 0.925464,
+              "mean_partitions": 193.294,
+              "p95_partitions": 335.0
+            }
+          ]
+        }
+      ],
+      "100": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.176,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 100,
+              "queries": 1805,
+              "mean_routing_recall": 0.8102326869806095,
+              "mean_partitions": 36.0,
+              "p95_partitions": 36.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 100,
+              "queries": 2500,
+              "mean_routing_recall": 0.848776,
+              "mean_partitions": 78.5048,
+              "p95_partitions": 136.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.481,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 100,
+              "queries": 1805,
+              "mean_routing_recall": 0.9104598337950138,
+              "mean_partitions": 97.0,
+              "p95_partitions": 97.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 100,
+              "queries": 2500,
+              "mean_routing_recall": 0.924148,
+              "mean_partitions": 213.3048,
+              "p95_partitions": 370.0
+            }
+          ]
+        }
+      ],
+      "101": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.166,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 101,
+              "queries": 1805,
+              "mean_routing_recall": 0.810038122925866,
+              "mean_partitions": 36.0,
+              "p95_partitions": 36.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 101,
+              "queries": 2500,
+              "mean_routing_recall": 0.8591920792079207,
+              "mean_partitions": 88.8484,
+              "p95_partitions": 139.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.455,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 101,
+              "queries": 1805,
+              "mean_routing_recall": 0.9104248374976002,
+              "mean_partitions": 97.0,
+              "p95_partitions": 97.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 101,
+              "queries": 2500,
+              "mean_routing_recall": 0.9310099009900988,
+              "mean_partitions": 242.424,
+              "p95_partitions": 380.0
+            }
+          ]
+        }
+      ],
+      "150": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.176,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 150,
+              "queries": 1805,
+              "mean_routing_recall": 0.8107072945521699,
+              "mean_partitions": 38.0,
+              "p95_partitions": 38.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 150,
+              "queries": 2500,
+              "mean_routing_recall": 0.8572746666666666,
+              "mean_partitions": 94.0232,
+              "p95_partitions": 147.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.484,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 150,
+              "queries": 1805,
+              "mean_routing_recall": 0.910437673130194,
+              "mean_partitions": 103.0,
+              "p95_partitions": 103.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 150,
+              "queries": 2500,
+              "mean_routing_recall": 0.930168,
+              "mean_partitions": 257.7508,
+              "p95_partitions": 404.0
+            }
+          ]
+        }
+      ],
+      "200": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.185,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 200,
+              "queries": 1805,
+              "mean_routing_recall": 0.8109473684210525,
+              "mean_partitions": 40.0,
+              "p95_partitions": 40.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 200,
+              "queries": 2500,
+              "mean_routing_recall": 0.85695,
+              "mean_partitions": 98.9936,
+              "p95_partitions": 155.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.503,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 200,
+              "queries": 1805,
+              "mean_routing_recall": 0.9105706371191136,
+              "mean_partitions": 107.0,
+              "p95_partitions": 107.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 200,
+              "queries": 2500,
+              "mean_routing_recall": 0.9297059999999999,
+              "mean_partitions": 267.5628,
+              "p95_partitions": 419.0
+            }
+          ]
+        }
+      ],
+      "201": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.16,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 201,
+              "queries": 1805,
+              "mean_routing_recall": 0.8108295089648709,
+              "mean_partitions": 40.0,
+              "p95_partitions": 40.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 201,
+              "queries": 2500,
+              "mean_routing_recall": 0.8575502487562189,
+              "mean_partitions": 100.1776,
+              "p95_partitions": 156.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.435,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 201,
+              "queries": 1805,
+              "mean_routing_recall": 0.9104863494163531,
+              "mean_partitions": 107.0,
+              "p95_partitions": 107.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 201,
+              "queries": 2500,
+              "mean_routing_recall": 0.9300935323383084,
+              "mean_partitions": 271.2288,
+              "p95_partitions": 423.0
+            }
+          ]
+        }
+      ],
+      "300": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.173,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 300,
+              "queries": 1805,
+              "mean_routing_recall": 0.8124746075715606,
+              "mean_partitions": 43.0,
+              "p95_partitions": 43.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 300,
+              "queries": 2500,
+              "mean_routing_recall": 0.8569413333333333,
+              "mean_partitions": 108.024,
+              "p95_partitions": 168.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.468,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 300,
+              "queries": 1805,
+              "mean_routing_recall": 0.9107516158818098,
+              "mean_partitions": 115.0,
+              "p95_partitions": 115.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 300,
+              "queries": 2500,
+              "mean_routing_recall": 0.93004,
+              "mean_partitions": 291.7272,
+              "p95_partitions": 455.0
+            }
+          ]
+        }
+      ],
+      "500": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.189,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 500,
+              "queries": 1805,
+              "mean_routing_recall": 0.8123745152354569,
+              "mean_partitions": 47.0,
+              "p95_partitions": 47.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 500,
+              "queries": 2500,
+              "mean_routing_recall": 0.8540592,
+              "mean_partitions": 118.1572,
+              "p95_partitions": 184.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.509,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 500,
+              "queries": 1805,
+              "mean_routing_recall": 0.9106925207756232,
+              "mean_partitions": 125.0,
+              "p95_partitions": 125.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 500,
+              "queries": 2500,
+              "mean_routing_recall": 0.9288304000000001,
+              "mean_partitions": 317.3024,
+              "p95_partitions": 495.0
+            }
+          ]
+        }
+      ],
+      "501": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.165,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 501,
+              "queries": 1805,
+              "mean_routing_recall": 0.8123022652755432,
+              "mean_partitions": 47.0,
+              "p95_partitions": 47.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 501,
+              "queries": 2500,
+              "mean_routing_recall": 0.85408622754491,
+              "mean_partitions": 118.4252,
+              "p95_partitions": 181.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.445,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 501,
+              "queries": 1805,
+              "mean_routing_recall": 0.9106628847568022,
+              "mean_partitions": 125.0,
+              "p95_partitions": 125.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 501,
+              "queries": 2500,
+              "mean_routing_recall": 0.9287576846307386,
+              "mean_partitions": 317.8648,
+              "p95_partitions": 486.0
+            }
+          ]
+        }
+      ],
+      "750": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.18,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 750,
+              "queries": 1805,
+              "mean_routing_recall": 0.8121351800554016,
+              "mean_partitions": 51.0,
+              "p95_partitions": 51.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 750,
+              "queries": 2500,
+              "mean_routing_recall": 0.8525029333333334,
+              "mean_partitions": 128.9456,
+              "p95_partitions": 197.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.477,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 750,
+              "queries": 1805,
+              "mean_routing_recall": 0.910575807940905,
+              "mean_partitions": 134.0,
+              "p95_partitions": 134.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 750,
+              "queries": 2500,
+              "mean_routing_recall": 0.9279386666666667,
+              "mean_partitions": 340.7384,
+              "p95_partitions": 521.0
+            }
+          ]
+        }
+      ],
+      "1000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.19,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8114315789473684,
+              "mean_partitions": 54.0,
+              "p95_partitions": 54.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8505763999999999,
+              "mean_partitions": 136.152,
+              "p95_partitions": 208.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.506,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1000,
+              "queries": 1805,
+              "mean_routing_recall": 0.9104315789473685,
+              "mean_partitions": 142.0,
+              "p95_partitions": 142.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9275768,
+              "mean_partitions": 361.5244,
+              "p95_partitions": 553.0
+            }
+          ]
+        }
+      ],
+      "1001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.103,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1001,
+              "queries": 1805,
+              "mean_routing_recall": 0.8114024479675449,
+              "mean_partitions": 54.0,
+              "p95_partitions": 54.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1001,
+              "queries": 2500,
+              "mean_routing_recall": 0.8453926073926074,
+              "mean_partitions": 129.5604,
+              "p95_partitions": 188.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.273,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 1001,
+              "queries": 1805,
+              "mean_routing_recall": 0.9104170068158988,
+              "mean_partitions": 142.0,
+              "p95_partitions": 142.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 1001,
+              "queries": 2500,
+              "mean_routing_recall": 0.9237142857142857,
+              "mean_partitions": 342.7092,
+              "p95_partitions": 498.0
+            }
+          ]
+        }
+      ],
+      "2000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.122,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 2000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8110285318559557,
+              "mean_partitions": 64.0,
+              "p95_partitions": 64.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 2000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8417176,
+              "mean_partitions": 153.5512,
+              "p95_partitions": 223.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.32,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 2000,
+              "queries": 1805,
+              "mean_routing_recall": 0.910070083102493,
+              "mean_partitions": 166.0,
+              "p95_partitions": 166.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 2000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9225958000000001,
+              "mean_partitions": 401.6696,
+              "p95_partitions": 584.0
+            }
+          ]
+        }
+      ],
+      "5000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.163,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 5000,
+              "queries": 1805,
+              "mean_routing_recall": 0.810827700831025,
+              "mean_partitions": 85.0,
+              "p95_partitions": 85.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 5000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8390415999999999,
+              "mean_partitions": 205.0016,
+              "p95_partitions": 298.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.414,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 5000,
+              "queries": 1805,
+              "mean_routing_recall": 0.910278781163435,
+              "mean_partitions": 215.0,
+              "p95_partitions": 215.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 5000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9219627199999999,
+              "mean_partitions": 519.834,
+              "p95_partitions": 756.0
+            }
+          ]
+        }
+      ],
+      "10000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.211,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8101830470914128,
+              "mean_partitions": 110.0,
+              "p95_partitions": 110.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8385227999999999,
+              "mean_partitions": 265.0208,
+              "p95_partitions": 385.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.525,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10000,
+              "queries": 1805,
+              "mean_routing_recall": 0.910270083102493,
+              "mean_partitions": 272.0,
+              "p95_partitions": 272.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10000,
+              "queries": 2500,
+              "mean_routing_recall": 0.92299764,
+              "mean_partitions": 658.7516,
+              "p95_partitions": 958.0
+            }
+          ]
+        }
+      ],
+      "10001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.097,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10001,
+              "queries": 1805,
+              "mean_routing_recall": 0.8113251832711467,
+              "mean_partitions": 110.3224376731302,
+              "p95_partitions": 181.79999999999995
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10001,
+              "queries": 2500,
+              "mean_routing_recall": 0.832880511948805,
+              "mean_partitions": 246.0,
+              "p95_partitions": 246.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.229,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 10001,
+              "queries": 1805,
+              "mean_routing_recall": 0.9103256433359432,
+              "mean_partitions": 260.7174515235457,
+              "p95_partitions": 427.79999999999995
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 10001,
+              "queries": 2500,
+              "mean_routing_recall": 0.9114653734626535,
+              "mean_partitions": 579.0,
+              "p95_partitions": 579.0
+            }
+          ]
+        }
+      ],
+      "20000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.13,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 20000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8110696121883656,
+              "mean_partitions": 148.2842105263158,
+              "p95_partitions": 243.0
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 20000,
+              "queries": 2500,
+              "mean_routing_recall": 0.83530404,
+              "mean_partitions": 329.0,
+              "p95_partitions": 329.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.298,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 20000,
+              "queries": 1805,
+              "mean_routing_recall": 0.9102135734072022,
+              "mean_partitions": 338.58005540166204,
+              "p95_partitions": 556.5999999999999
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 20000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9137231599999999,
+              "mean_partitions": 754.0,
+              "p95_partitions": 754.0
+            }
+          ]
+        }
+      ],
+      "50000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.202,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 50000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8104766426592799,
+              "mean_partitions": 229.5213296398892,
+              "p95_partitions": 377.79999999999995
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 50000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8411896239999999,
+              "mean_partitions": 511.0,
+              "p95_partitions": 511.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.434,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 50000,
+              "queries": 1805,
+              "mean_routing_recall": 0.9101767977839336,
+              "mean_partitions": 492.76897506925206,
+              "p95_partitions": 810.5999999999999
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 50000,
+              "queries": 2500,
+              "mean_routing_recall": 0.91718772,
+              "mean_partitions": 1098.0,
+              "p95_partitions": 1098.0
+            }
+          ]
+        }
+      ],
+      "75000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.248,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 75000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8101524506001846,
+              "mean_partitions": 282.1578947368421,
+              "p95_partitions": 463.5999999999999
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 75000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8439608693333334,
+              "mean_partitions": 627.0,
+              "p95_partitions": 627.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.517,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 75000,
+              "queries": 1805,
+              "mean_routing_recall": 0.9101873979686058,
+              "mean_partitions": 587.1495844875346,
+              "p95_partitions": 965.3999999999999
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 75000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9189872106666666,
+              "mean_partitions": 1307.0,
+              "p95_partitions": 1307.0
+            }
+          ]
+        }
+      ],
+      "100000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.289,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 100000,
+              "queries": 1805,
+              "mean_routing_recall": 0.8105049418282549,
+              "mean_partitions": 328.4249307479224,
+              "p95_partitions": 539.8
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 100000,
+              "queries": 2500,
+              "mean_routing_recall": 0.8465932639999999,
+              "mean_partitions": 731.0,
+              "p95_partitions": 731.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.584,
+          "calibration": [
+            {
+              "corpus": "dpr-wikipedia-single-nq",
+              "metric": "dot",
+              "k": 100000,
+              "queries": 1805,
+              "mean_routing_recall": 0.9100123878116344,
+              "mean_partitions": 663.4886426592798,
+              "p95_partitions": 1090.3999999999999
+            },
+            {
+              "corpus": "wiki-cohere-35m",
+              "metric": "dot",
+              "k": 100000,
+              "queries": 2500,
+              "mean_routing_recall": 0.9202446120000001,
+              "mean_partitions": 1477.0,
+              "p95_partitions": 1477.0
+            }
+          ]
+        }
+      ]
+    },
+    "l2": {
+      "1": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.264,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.810546875,
+              "mean_partitions": 3.18017578125,
+              "p95_partitions": 6.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.601,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1,
+              "queries": 2048,
+              "mean_routing_recall": 0.91650390625,
+              "mean_partitions": 6.48486328125,
+              "p95_partitions": 12.0
+            }
+          ]
+        }
+      ],
+      "2": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.209,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.81396484375,
+              "mean_partitions": 3.38330078125,
+              "p95_partitions": 6.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.501,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 2,
+              "queries": 2048,
+              "mean_routing_recall": 0.92333984375,
+              "mean_partitions": 7.302734375,
+              "p95_partitions": 13.0
+            }
+          ]
+        }
+      ],
+      "5": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.251,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.8177734375000001,
+              "mean_partitions": 3.85546875,
+              "p95_partitions": 7.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.501,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 5,
+              "queries": 2048,
+              "mean_routing_recall": 0.9117187500000001,
+              "mean_partitions": 7.302734375,
+              "p95_partitions": 13.0
+            }
+          ]
+        }
+      ],
+      "10": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.286,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.8119140625000001,
+              "mean_partitions": 4.00732421875,
+              "p95_partitions": 7.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.591,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100585937500001,
+              "mean_partitions": 8.12646484375,
+              "p95_partitions": 15.0
+            }
+          ]
+        }
+      ],
+      "11": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.182,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.8349609374999999,
+              "mean_partitions": 4.53173828125,
+              "p95_partitions": 7.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.364,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 11,
+              "queries": 2048,
+              "mean_routing_recall": 0.9125976562499999,
+              "mean_partitions": 8.474609375,
+              "p95_partitions": 14.0
+            }
+          ]
+        }
+      ],
+      "20": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.182,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.8182128906249999,
+              "mean_partitions": 4.53173828125,
+              "p95_partitions": 7.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.395,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 20,
+              "queries": 2048,
+              "mean_routing_recall": 0.9106689453125001,
+              "mean_partitions": 9.224609375,
+              "p95_partitions": 16.0
+            }
+          ]
+        }
+      ],
+      "50": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.211,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.814267578125,
+              "mean_partitions": 5.25927734375,
+              "p95_partitions": 9.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.474,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 50,
+              "queries": 2048,
+              "mean_routing_recall": 0.9108203125000001,
+              "mean_partitions": 10.9921875,
+              "p95_partitions": 19.0
+            }
+          ]
+        }
+      ],
+      "100": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.264,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.8139208984375,
+              "mean_partitions": 6.1416015625,
+              "p95_partitions": 11.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.553,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 100,
+              "queries": 2048,
+              "mean_routing_recall": 0.91005859375,
+              "mean_partitions": 12.73974609375,
+              "p95_partitions": 22.0
+            }
+          ]
+        }
+      ],
+      "101": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.179,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.8119730430074257,
+              "mean_partitions": 6.1396484375,
+              "p95_partitions": 11.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.401,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 101,
+              "queries": 2048,
+              "mean_routing_recall": 0.9118773205445545,
+              "mean_partitions": 13.2373046875,
+              "p95_partitions": 23.0
+            }
+          ]
+        }
+      ],
+      "150": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.201,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.825224609375,
+              "mean_partitions": 7.06689453125,
+              "p95_partitions": 12.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.449,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 150,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100455729166667,
+              "mean_partitions": 14.50341796875,
+              "p95_partitions": 26.0
+            }
+          ]
+        }
+      ],
+      "200": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.201,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.81501220703125,
+              "mean_partitions": 7.06689453125,
+              "p95_partitions": 12.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.471,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 200,
+              "queries": 2048,
+              "mean_routing_recall": 0.9103173828125,
+              "mean_partitions": 15.40966796875,
+              "p95_partitions": 27.0
+            }
+          ]
+        }
+      ],
+      "201": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.161,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.8111371851679104,
+              "mean_partitions": 7.11181640625,
+              "p95_partitions": 14.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.364,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 201,
+              "queries": 2048,
+              "mean_routing_recall": 0.910127098880597,
+              "mean_partitions": 15.5576171875,
+              "p95_partitions": 30.0
+            }
+          ]
+        }
+      ],
+      "300": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.182,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.8192073567708333,
+              "mean_partitions": 8.10546875,
+              "p95_partitions": 15.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.41,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 300,
+              "queries": 2048,
+              "mean_routing_recall": 0.9107096354166666,
+              "mean_partitions": 17.46728515625,
+              "p95_partitions": 34.0
+            }
+          ]
+        }
+      ],
+      "500": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.209,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.8100615234375,
+              "mean_partitions": 8.84375,
+              "p95_partitions": 17.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.484,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 500,
+              "queries": 2048,
+              "mean_routing_recall": 0.9100029296875001,
+              "mean_partitions": 20.154296875,
+              "p95_partitions": 40.0
+            }
+          ]
+        }
+      ],
+      "501": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.162,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.8109698571606786,
+              "mean_partitions": 8.88134765625,
+              "p95_partitions": 16.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.38,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 501,
+              "queries": 2048,
+              "mean_routing_recall": 0.9120158121257486,
+              "mean_partitions": 20.412109375,
+              "p95_partitions": 36.0
+            }
+          ]
+        }
+      ],
+      "750": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.176,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.8102278645833334,
+              "mean_partitions": 9.82470703125,
+              "p95_partitions": 17.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.431,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 750,
+              "queries": 2048,
+              "mean_routing_recall": 0.910796875,
+              "mean_partitions": 22.8681640625,
+              "p95_partitions": 41.0
+            }
+          ]
+        }
+      ],
+      "1000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.207,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.81934619140625,
+              "mean_partitions": 11.517578125,
+              "p95_partitions": 20.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.483,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9117998046875,
+              "mean_partitions": 25.5830078125,
+              "p95_partitions": 45.0
+            }
+          ]
+        }
+      ],
+      "1001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.068,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8104195609078422,
+              "mean_partitions": 10.78564453125,
+              "p95_partitions": 17.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.164,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 1001,
+              "queries": 2048,
+              "mean_routing_recall": 0.9120001092657343,
+              "mean_partitions": 25.64306640625,
+              "p95_partitions": 40.0
+            }
+          ]
+        }
+      ],
+      "2000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.092,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.817154052734375,
+              "mean_partitions": 14.53369140625,
+              "p95_partitions": 22.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.215,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 2000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9116020507812499,
+              "mean_partitions": 33.30712890625,
+              "p95_partitions": 52.0
+            }
+          ]
+        }
+      ],
+      "5000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.143,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8162451171875,
+              "mean_partitions": 22.50634765625,
+              "p95_partitions": 35.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.331,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 5000,
+              "queries": 2048,
+              "mean_routing_recall": 0.91003349609375,
+              "mean_partitions": 50.45751953125,
+              "p95_partitions": 79.0
+            }
+          ]
+        }
+      ],
+      "10000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.212,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8101240234375,
+              "mean_partitions": 32.39892578125,
+              "p95_partitions": 51.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.488,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10000,
+              "queries": 2048,
+              "mean_routing_recall": 0.91002080078125,
+              "mean_partitions": 74.16748046875,
+              "p95_partitions": 117.0
+            }
+          ]
+        }
+      ],
+      "10001": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.057,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.8125767013142436,
+              "mean_partitions": 31.85791015625,
+              "p95_partitions": 41.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.137,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 10001,
+              "queries": 2048,
+              "mean_routing_recall": 0.9107357330673183,
+              "mean_partitions": 75.49658203125,
+              "p95_partitions": 97.0
+            }
+          ]
+        }
+      ],
+      "20000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.089,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.810218408203125,
+              "mean_partitions": 49.3125,
+              "p95_partitions": 63.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.206,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 20000,
+              "queries": 2048,
+              "mean_routing_recall": 0.910196435546875,
+              "mean_partitions": 113.39404296875,
+              "p95_partitions": 146.0
+            }
+          ]
+        }
+      ],
+      "50000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.172,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.810428486328125,
+              "mean_partitions": 94.61865234375,
+              "p95_partitions": 122.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.373,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 50000,
+              "queries": 2048,
+              "mean_routing_recall": 0.910059072265625,
+              "mean_partitions": 204.375,
+              "p95_partitions": 263.0
+            }
+          ]
+        }
+      ],
+      "75000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.232,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.81021900390625,
+              "mean_partitions": 127.50390625,
+              "p95_partitions": 164.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.482,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 75000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9101419921875,
+              "mean_partitions": 264.40185546875,
+              "p95_partitions": 340.0
+            }
+          ]
+        }
+      ],
+      "100000": [
+        {
+          "effort": 0.1,
+          "target": 0.8,
+          "calibration_target": 0.81,
+          "scale": 0.288,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.8106755029296875,
+              "mean_partitions": 158.046875,
+              "p95_partitions": 203.0
+            }
+          ]
+        },
+        {
+          "effort": 0.25,
+          "target": 0.9,
+          "calibration_target": 0.91,
+          "scale": 0.579,
+          "calibration": [
+            {
+              "corpus": "dino",
+              "metric": "l2",
+              "k": 100000,
+              "queries": 2048,
+              "mean_routing_recall": 0.9102219970703125,
+              "mean_partitions": 317.42333984375,
+              "p95_partitions": 408.0
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "k_anchors": [
+    1,
+    2,
+    5,
+    10,
+    11,
+    20,
+    50,
+    100,
+    101,
+    150,
+    200,
+    201,
+    300,
+    500,
+    501,
+    750,
+    1000,
+    1001,
+    2000,
+    5000,
+    10000,
+    10001,
+    20000,
+    50000,
+    75000,
+    100000
+  ],
+  "interpolation_checks": [
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.8103580729166667,
+      "mean_partitions": 12.58740234375,
+      "p95_partitions": 20.0,
+      "effort": 0.1,
+      "scale": 0.08113784607326312,
+      "pointwise_scale": 0.081,
+      "probe_overhead": 1.0008541367395272
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9103121744791667,
+      "mean_partitions": 29.2841796875,
+      "p95_partitions": 46.0,
+      "effort": 0.25,
+      "scale": 0.19211523545781453,
+      "pointwise_scale": 0.19,
+      "probe_overhead": 1.0018207633842813
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.81310546875,
+      "mean_partitions": 17.12255859375,
+      "p95_partitions": 27.0,
+      "effort": 0.1,
+      "scale": 0.11182766598834687,
+      "pointwise_scale": 0.108,
+      "probe_overhead": 1.0246318373071528
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9114930013020833,
+      "mean_partitions": 39.67919921875,
+      "p95_partitions": 62.0,
+      "effort": 0.25,
+      "scale": 0.26023137091681203,
+      "pointwise_scale": 0.256,
+      "probe_overhead": 1.0107086888385861
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.8122805989583333,
+      "mean_partitions": 27.51904296875,
+      "p95_partitions": 43.0,
+      "effort": 0.1,
+      "scale": 0.1800381417786784,
+      "pointwise_scale": 0.174,
+      "probe_overhead": 1.0175125024824423
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9102893229166666,
+      "mean_partitions": 63.03515625,
+      "p95_partitions": 99.0,
+      "effort": 0.25,
+      "scale": 0.4153822086556397,
+      "pointwise_scale": 0.412,
+      "probe_overhead": 1.001473942252494
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.81233876953125,
+      "mean_partitions": 41.24267578125,
+      "p95_partitions": 53.0,
+      "effort": 0.1,
+      "scale": 0.07397115059728693,
+      "pointwise_scale": 0.074,
+      "probe_overhead": 0.9999881609168186
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9110246744791667,
+      "mean_partitions": 95.6376953125,
+      "p95_partitions": 123.0,
+      "effort": 0.25,
+      "scale": 0.17391382557748936,
+      "pointwise_scale": 0.172,
+      "probe_overhead": 1.010770000877288
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.8108383626302083,
+      "mean_partitions": 65.75830078125,
+      "p95_partitions": 84.0,
+      "effort": 0.1,
+      "scale": 0.11912647294952579,
+      "pointwise_scale": 0.119,
+      "probe_overhead": 1.0001559575795385
+    },
+    {
+      "corpus": "dino",
+      "metric": "l2",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9105661783854166,
+      "mean_partitions": 147.28662109375,
+      "p95_partitions": 189.0,
+      "effort": 0.25,
+      "scale": 0.26789459475861616,
+      "pointwise_scale": 0.268,
+      "probe_overhead": 0.9999734792856646
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 1500,
+      "queries": 1805,
+      "mean_routing_recall": 0.8105141274238228,
+      "mean_partitions": 59.0,
+      "p95_partitions": 59.0,
+      "effort": 0.1,
+      "scale": 0.11371064612768288,
+      "pointwise_scale": 0.113,
+      "probe_overhead": 1.0
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 1500,
+      "queries": 1805,
+      "mean_routing_recall": 0.9102803324099723,
+      "mean_partitions": 155.0,
+      "p95_partitions": 155.0,
+      "effort": 0.25,
+      "scale": 0.29955481320343325,
+      "pointwise_scale": 0.298,
+      "probe_overhead": 1.0
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 3000,
+      "queries": 1805,
+      "mean_routing_recall": 0.8108530009233611,
+      "mean_partitions": 72.0,
+      "p95_partitions": 72.0,
+      "effort": 0.1,
+      "scale": 0.1386881987100961,
+      "pointwise_scale": 0.138,
+      "probe_overhead": 1.0
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 3000,
+      "queries": 1805,
+      "mean_routing_recall": 0.9109316712834717,
+      "mean_partitions": 186.0,
+      "p95_partitions": 186.0,
+      "effort": 0.25,
+      "scale": 0.35862829570567284,
+      "pointwise_scale": 0.354,
+      "probe_overhead": 1.0108695652173914
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 7500,
+      "queries": 1805,
+      "mean_routing_recall": 0.8114065373961219,
+      "mean_partitions": 99.0,
+      "p95_partitions": 99.0,
+      "effort": 0.1,
+      "scale": 0.18956532016279468,
+      "pointwise_scale": 0.19,
+      "probe_overhead": 1.0
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 7500,
+      "queries": 1805,
+      "mean_routing_recall": 0.9103368421052631,
+      "mean_partitions": 246.0,
+      "p95_partitions": 246.0,
+      "effort": 0.25,
+      "scale": 0.4757123931101236,
+      "pointwise_scale": 0.474,
+      "probe_overhead": 1.0
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 15000,
+      "queries": 1805,
+      "mean_routing_recall": 0.8119487719298244,
+      "mean_partitions": 131.42105263157896,
+      "p95_partitions": 215.79999999999995,
+      "effort": 0.1,
+      "scale": 0.11512105119185571,
+      "pointwise_scale": 0.114,
+      "probe_overhead": 1.009090599715839
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 15000,
+      "queries": 1805,
+      "mean_routing_recall": 0.9105575253924285,
+      "mean_partitions": 303.66260387811633,
+      "p95_partitions": 499.5999999999999,
+      "effort": 0.25,
+      "scale": 0.2671388801095317,
+      "pointwise_scale": 0.266,
+      "probe_overhead": 1.0039416879289471
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 30000,
+      "queries": 1805,
+      "mean_routing_recall": 0.8115593167128347,
+      "mean_partitions": 179.8781163434903,
+      "p95_partitions": 295.79999999999995,
+      "effort": 0.1,
+      "scale": 0.15799478388751084,
+      "pointwise_scale": 0.157,
+      "probe_overhead": 1.0063446702600167
+    },
+    {
+      "corpus": "dpr-wikipedia-single-nq",
+      "metric": "dot",
+      "k": 30000,
+      "queries": 1805,
+      "mean_routing_recall": 0.910646352723915,
+      "mean_partitions": 400.22105263157897,
+      "p95_partitions": 657.5999999999999,
+      "effort": 0.25,
+      "scale": 0.35193780698176474,
+      "pointwise_scale": 0.35,
+      "probe_overhead": 1.0056267287713492
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.8115992838541666,
+      "mean_partitions": 27.98828125,
+      "p95_partitions": 35.0,
+      "effort": 0.1,
+      "scale": 0.07808246781652255,
+      "pointwise_scale": 0.077,
+      "probe_overhead": 1.002325703394128
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9108212890624999,
+      "mean_partitions": 77.00439453125,
+      "p95_partitions": 97.0,
+      "effort": 0.25,
+      "scale": 0.21490646780158673,
+      "pointwise_scale": 0.213,
+      "probe_overhead": 1.0097837709778008
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.81251220703125,
+      "mean_partitions": 38.24853515625,
+      "p95_partitions": 48.0,
+      "effort": 0.1,
+      "scale": 0.10634647334026061,
+      "pointwise_scale": 0.106,
+      "probe_overhead": 1.0005875815908132
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9109720052083334,
+      "mean_partitions": 101.56689453125,
+      "p95_partitions": 128.0,
+      "effort": 0.25,
+      "scale": 0.28432435877425094,
+      "pointwise_scale": 0.282,
+      "probe_overhead": 1.0076051521272629
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.811624609375,
+      "mean_partitions": 59.6044921875,
+      "p95_partitions": 75.0,
+      "effort": 0.1,
+      "scale": 0.16639248926522496,
+      "pointwise_scale": 0.164,
+      "probe_overhead": 1.0131383468755966
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9101389322916666,
+      "mean_partitions": 150.0419921875,
+      "p95_partitions": 189.0,
+      "effort": 0.25,
+      "scale": 0.4225372388726383,
+      "pointwise_scale": 0.421,
+      "probe_overhead": 1.0006154407239407
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.8106160481770833,
+      "mean_partitions": 81.8544921875,
+      "p95_partitions": 98.0,
+      "effort": 0.1,
+      "scale": 0.10145380271289578,
+      "pointwise_scale": 0.101,
+      "probe_overhead": 1.0035919970306157
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9102343424479167,
+      "mean_partitions": 202.36572265625,
+      "p95_partitions": 241.0,
+      "effort": 0.25,
+      "scale": 0.25108546501387285,
+      "pointwise_scale": 0.251,
+      "probe_overhead": 1.000016890343067
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.8106590006510417,
+      "mean_partitions": 119.8095703125,
+      "p95_partitions": 143.0,
+      "effort": 0.1,
+      "scale": 0.14837138487403823,
+      "pointwise_scale": 0.148,
+      "probe_overhead": 1.0023734726642128
+    },
+    {
+      "corpus": "fineweb",
+      "metric": "cosine",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9103263671874999,
+      "mean_partitions": 277.630859375,
+      "p95_partitions": 331.0,
+      "effort": 0.25,
+      "scale": 0.3450153338111046,
+      "pointwise_scale": 0.345,
+      "probe_overhead": 1.0000052762559688
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.8361331380208333,
+      "mean_partitions": 18.931640625,
+      "p95_partitions": 35.0,
+      "effort": 0.1,
+      "scale": 0.07808246781652255,
+      "pointwise_scale": 0.077,
+      "probe_overhead": 1.0032084454564272
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 1500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9323167317708333,
+      "mean_partitions": 51.2529296875,
+      "p95_partitions": 97.0,
+      "effort": 0.25,
+      "scale": 0.21490646780158673,
+      "pointwise_scale": 0.213,
+      "probe_overhead": 1.007805824124125
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.8305755208333333,
+      "mean_partitions": 25.71484375,
+      "p95_partitions": 48.0,
+      "effort": 0.1,
+      "scale": 0.10634647334026061,
+      "pointwise_scale": 0.106,
+      "probe_overhead": 1.0008361839604714
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 3000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9290584309895833,
+      "mean_partitions": 67.47119140625,
+      "p95_partitions": 128.0,
+      "effort": 0.25,
+      "scale": 0.28432435877425094,
+      "pointwise_scale": 0.282,
+      "probe_overhead": 1.006196752348358
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.8176682291666666,
+      "mean_partitions": 39.7705078125,
+      "p95_partitions": 75.0,
+      "effort": 0.1,
+      "scale": 0.16639248926522496,
+      "pointwise_scale": 0.164,
+      "probe_overhead": 1.010909632498045
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 7500,
+      "queries": 2048,
+      "mean_routing_recall": 0.9201140624999999,
+      "mean_partitions": 99.6005859375,
+      "p95_partitions": 189.0,
+      "effort": 0.25,
+      "scale": 0.4225372388726383,
+      "pointwise_scale": 0.421,
+      "probe_overhead": 1.0009421463271013
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.8512738932291667,
+      "mean_partitions": 77.36376953125,
+      "p95_partitions": 98.0,
+      "effort": 0.1,
+      "scale": 0.10145380271289578,
+      "pointwise_scale": 0.101,
+      "probe_overhead": 1.001270222446916
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 15000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9357427734375,
+      "mean_partitions": 191.6455078125,
+      "p95_partitions": 241.0,
+      "effort": 0.25,
+      "scale": 0.25108546501387285,
+      "pointwise_scale": 0.251,
+      "probe_overhead": 1.000012739340357
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.839271875,
+      "mean_partitions": 113.38232421875,
+      "p95_partitions": 143.0,
+      "effort": 0.1,
+      "scale": 0.14837138487403823,
+      "pointwise_scale": 0.148,
+      "probe_overhead": 1.000857729043826
+    },
+    {
+      "corpus": "laion",
+      "metric": "cosine",
+      "k": 30000,
+      "queries": 2048,
+      "mean_routing_recall": 0.9294201985677084,
+      "mean_partitions": 262.8076171875,
+      "p95_partitions": 331.0,
+      "effort": 0.25,
+      "scale": 0.3450153338111046,
+      "pointwise_scale": 0.345,
+      "probe_overhead": 1.0000018579452241
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 1500,
+      "queries": 2500,
+      "mean_routing_recall": 0.8434573333333334,
+      "mean_partitions": 143.05,
+      "p95_partitions": 208.0,
+      "effort": 0.1,
+      "scale": 0.11371064612768288,
+      "pointwise_scale": 0.113,
+      "probe_overhead": 1.0049400478268566
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 1500,
+      "queries": 2500,
+      "mean_routing_recall": 0.9232671999999998,
+      "mean_partitions": 376.0716,
+      "p95_partitions": 547.0,
+      "effort": 0.25,
+      "scale": 0.29955481320343325,
+      "pointwise_scale": 0.298,
+      "probe_overhead": 1.004930705049136
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 3000,
+      "queries": 2500,
+      "mean_routing_recall": 0.8408616000000002,
+      "mean_partitions": 174.1828,
+      "p95_partitions": 253.0,
+      "effort": 0.1,
+      "scale": 0.1386881987100961,
+      "pointwise_scale": 0.138,
+      "probe_overhead": 1.0040326671401034
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 3000,
+      "queries": 2500,
+      "mean_routing_recall": 0.9226630666666668,
+      "mean_partitions": 450.3264,
+      "p95_partitions": 655.0,
+      "effort": 0.25,
+      "scale": 0.35862829570567284,
+      "pointwise_scale": 0.354,
+      "probe_overhead": 1.0133485030414424
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 7500,
+      "queries": 2500,
+      "mean_routing_recall": 0.8390689066666666,
+      "mean_partitions": 238.1904,
+      "p95_partitions": 346.0,
+      "effort": 0.1,
+      "scale": 0.18956532016279468,
+      "pointwise_scale": 0.19,
+      "probe_overhead": 0.9975792441545867
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 7500,
+      "queries": 2500,
+      "mean_routing_recall": 0.9226452266666667,
+      "mean_partitions": 596.8184,
+      "p95_partitions": 868.0,
+      "effort": 0.25,
+      "scale": 0.4757123931101236,
+      "pointwise_scale": 0.474,
+      "probe_overhead": 1.0032267673089943
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 15000,
+      "queries": 2500,
+      "mean_routing_recall": 0.8346304,
+      "mean_partitions": 292.0,
+      "p95_partitions": 292.0,
+      "effort": 0.1,
+      "scale": 0.11512105119185571,
+      "pointwise_scale": 0.114,
+      "probe_overhead": 1.0103806228373702
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 15000,
+      "queries": 2500,
+      "mean_routing_recall": 0.9130061866666667,
+      "mean_partitions": 676.0,
+      "p95_partitions": 676.0,
+      "effort": 0.25,
+      "scale": 0.2671388801095317,
+      "pointwise_scale": 0.266,
+      "probe_overhead": 1.0044576523031203
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 30000,
+      "queries": 2500,
+      "mean_routing_recall": 0.8385870533333335,
+      "mean_partitions": 400.0,
+      "p95_partitions": 400.0,
+      "effort": 0.1,
+      "scale": 0.15799478388751084,
+      "pointwise_scale": 0.157,
+      "probe_overhead": 1.0075566750629723
+    },
+    {
+      "corpus": "wiki-cohere-35m",
+      "metric": "dot",
+      "k": 30000,
+      "queries": 2500,
+      "mean_routing_recall": 0.91536388,
+      "mean_partitions": 890.0,
+      "p95_partitions": 890.0,
+      "effort": 0.25,
+      "scale": 0.35193780698176474,
+      "pointwise_scale": 0.35,
+      "probe_overhead": 1.0056497175141244
+    }
+  ]
+}

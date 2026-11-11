@@ -287,12 +287,16 @@ impl NormalizedStructuralPlan {
             );
         }
 
-        let total_len = self.layers.last().map_or(0, RawRepDef::num_values)
-            + self
-                .layers
-                .iter()
-                .map(RawRepDef::num_specials)
-                .sum::<usize>();
+        // Fixed-size-list readers schedule in expanded row units. Enclosing
+        // null/empty-list markers occupy those units too, even without values.
+        let mut specials = 0;
+        for layer in &self.layers {
+            match layer {
+                RawRepDef::Fsl(fsl) => specials *= fsl.dimension,
+                _ => specials += layer.num_specials(),
+            }
+        }
+        let total_len = self.layers.last().map_or(0, RawRepDef::num_values) + specials;
         let max_rep = self.layers.iter().map(RawRepDef::max_rep).sum::<u16>();
         let max_def = self.layers.iter().map(RawRepDef::max_def).sum::<u16>();
         let bits_per_rep = if max_rep > 0 {
@@ -870,62 +874,29 @@ impl SerializerContext {
 
     fn multiply_levels(&mut self, multiplier: usize) {
         let old_len = self.current_len;
-        // All non-special values will be broadcasted by the multiplier.  Special values are copied as-is.
-        self.current_len =
-            (self.current_len - self.current_num_specials) * multiplier + self.current_num_specials;
-
-        if self.rep_levels.is_empty() && self.def_levels.is_empty() {
-            // All valid with no rep/def levels, nothing to do
-            return;
-        } else if self.rep_levels.is_empty() {
-            assert!(self.def_levels.len() >= self.current_len);
-            // No rep levels, just multiply the def levels
-            let mut def_read_itr = self.def_levels.iter().copied();
-            let mut def_write_itr = self.spare_def.iter_mut();
-            for _ in 0..old_len {
-                let mut def = def_read_itr.next().unwrap();
-                while def > SPECIAL_THRESHOLD {
-                    *def_write_itr.next().unwrap() = def;
-                    def = def_read_itr.next().unwrap();
-                }
-                for _ in 0..multiplier {
-                    *def_write_itr.next().unwrap() = def;
-                }
+        self.current_len *= multiplier;
+        self.current_num_specials *= multiplier;
+        // Preserve the same expanded row coordinates for data and structural
+        // markers. Skipping markers here both under-allocates the level buffers
+        // and makes nullable List<FSL<...>> pages disagree with their row count.
+        if !self.rep_levels.is_empty() {
+            for (source, target) in self.rep_levels[..old_len]
+                .iter()
+                .zip(self.spare_rep[..self.current_len].chunks_exact_mut(multiplier))
+            {
+                target.fill(*source);
             }
-        } else if self.def_levels.is_empty() {
-            assert!(self.rep_levels.len() >= self.current_len);
-            // No def levels, just multiply the rep levels
-            let mut rep_read_itr = self.rep_levels.iter().copied();
-            let mut rep_write_itr = self.spare_rep.iter_mut();
-            for _ in 0..old_len {
-                let rep = rep_read_itr.next().unwrap();
-                for _ in 0..multiplier {
-                    *rep_write_itr.next().unwrap() = rep;
-                }
-            }
-        } else {
-            assert!(self.rep_levels.len() >= self.current_len);
-            assert!(self.def_levels.len() >= self.current_len);
-            let mut rep_read_itr = self.rep_levels.iter().copied();
-            let mut def_read_itr = self.def_levels.iter().copied();
-            let mut rep_write_itr = self.spare_rep.iter_mut();
-            let mut def_write_itr = self.spare_def.iter_mut();
-            for _ in 0..old_len {
-                let mut def = def_read_itr.next().unwrap();
-                while def > SPECIAL_THRESHOLD {
-                    *def_write_itr.next().unwrap() = def;
-                    *rep_write_itr.next().unwrap() = rep_read_itr.next().unwrap();
-                    def = def_read_itr.next().unwrap();
-                }
-                let rep = rep_read_itr.next().unwrap();
-                for _ in 0..multiplier {
-                    *def_write_itr.next().unwrap() = def;
-                    *rep_write_itr.next().unwrap() = rep;
-                }
-            }
+            std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
         }
-        std::mem::swap(&mut self.def_levels, &mut self.spare_def);
-        std::mem::swap(&mut self.rep_levels, &mut self.spare_rep);
+        if !self.def_levels.is_empty() {
+            for (source, target) in self.def_levels[..old_len]
+                .iter()
+                .zip(self.spare_def[..self.current_len].chunks_exact_mut(multiplier))
+            {
+                target.fill(*source);
+            }
+            std::mem::swap(&mut self.def_levels, &mut self.spare_def);
+        }
     }
 
     fn record_validity_buf(&mut self, validity: &Option<BooleanBuffer>) {
@@ -1608,7 +1579,7 @@ pub struct RepDefUnraveler {
     // Current layer index, 0 means inner-most layer and it counts up from there.  Used to index
     // into special_defs
     current_layer: usize,
-    // Number of items in the inner-most layer (needed if the definition levels are not present)
+    // Number of items in the current layer (needed if the definition levels are not present)
     num_items: u64,
 }
 
@@ -1777,6 +1748,7 @@ impl RepDefUnraveler {
         // Or, to think about it another way, if every unraveler adds the starting 0 and the trailing
         // length then we have N + unravelers.len() values instead of N + 1.
         offsets.pop();
+        let offsets_len_before = offsets.len();
 
         let to_offset = |val: usize| {
             T::from_usize(val)
@@ -1836,6 +1808,8 @@ impl RepDefUnraveler {
                     read_idx += 1;
                 }
             }
+            // The layer above sees one item per list, not one per leaf value
+            self.num_items = (offsets.len() - offsets_len_before) as u64;
             offsets.push(to_offset(curlen)?);
             rep_levels.truncate(write_idx);
             def_levels.truncate(write_idx);
@@ -1860,6 +1834,7 @@ impl RepDefUnraveler {
                 }
             }
             let num_new_lists = offsets.len() - old_offsets_len;
+            self.num_items = num_new_lists as u64;
             offsets.push(to_offset(curlen)?);
             // Truncate to the number of lists THIS unraveler produced (write_idx),
             // not `offsets.len() - 1` — the latter includes offsets contributed by
@@ -1948,22 +1923,34 @@ impl RepDefUnraveler {
         if let Some(sparse) = self.sparse.as_mut() {
             return sparse.decimate(dimension);
         }
-        if self.rep_levels.is_some() {
-            // If we need to support this then I think we need to walk through the rep def levels to find
-            // the spots at which we keep.  E.g. if we have:
-            //  rep: 1 0 0 1 0 1 0 0 0 1 0 0
-            //  def: 1 1 1 0 1 0 1 1 0 1 1 0
-            //  dimension: 2
-            //
-            // The output should be:
-            //  rep: 1 0 0 1 0 0 0
-            //  def: 1 1 1 0 1 1 0
-            //
-            // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
-            return Err(Error::not_supported(
-                "Reading a column that combines a fixed-size-list with a list-like layer is not yet supported: the fixed-size-list layer cannot decimate repetition levels",
-            ));
+        if let Some(rep_levels) = &mut self.rep_levels {
+            if !rep_levels.len().is_multiple_of(dimension)
+                || self
+                    .def_levels
+                    .as_ref()
+                    .is_some_and(|defs| defs.len() != rep_levels.len())
+            {
+                return Err(Error::invalid_input(
+                    "Incomplete fixed-size-list structural group",
+                ));
+            }
+            // Both visible slots and enclosing null/empty markers are expanded
+            // by the writer. Keep their coordinates in lockstep when collapsing.
+            let len = rep_levels.len() / dimension;
+            for write in 0..len {
+                rep_levels[write] = rep_levels[write * dimension];
+                if let Some(defs) = &mut self.def_levels {
+                    defs[write] = defs[write * dimension];
+                }
+            }
+            rep_levels.truncate(len);
+            if let Some(defs) = &mut self.def_levels {
+                defs.truncate(len);
+            }
+            self.num_items /= dimension as u64;
+            return Ok(());
         }
+        self.num_items /= dimension as u64;
         let Some(def_levels) = self.def_levels.as_mut() else {
             return Ok(());
         };
@@ -2318,7 +2305,11 @@ impl NilaryControlWordIterator {
 
 /// Helper function to get a bit mask of the given width
 fn get_mask(width: u16) -> u16 {
-    (1 << width) - 1
+    if width >= u16::BITS as u16 {
+        u16::MAX
+    } else {
+        (1 << width) - 1
+    }
 }
 
 // We're really going out of our way to avoid boxing here but this will be called on a per-value basis
@@ -2866,8 +2857,8 @@ mod tests {
         SparseValiditySet,
     };
     use crate::repdef::{
-        CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
-        max_visible_level,
+        CompositeRepDefUnraveler, ControlWordParser, DefinitionInterpretation, RepDefUnraveler,
+        SerializedRepDefs, max_visible_level,
     };
 
     use super::RepDefBuilder;
@@ -2900,6 +2891,16 @@ mod tests {
         #[case] expected: u16,
     ) {
         assert_eq!(max_visible_level(def_meaning), expected);
+    }
+
+    #[test]
+    fn control_word_parser_handles_16_bit_levels() {
+        let parser = ControlWordParser::new(16, 16);
+        let mut rep = Vec::new();
+        let mut def = Vec::new();
+        parser.parse(&[0xff; 4], &mut rep, &mut def);
+        assert_eq!(rep, vec![u16::MAX]);
+        assert_eq!(def, vec![u16::MAX]);
     }
 
     fn validity(values: &[bool]) -> NullBuffer {
@@ -3164,11 +3165,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repdef_fsl_over_list_is_not_supported() {
-        // A fixed-size-list whose child contains a list serializes repetition levels, and
-        // decimating those through the fixed-size dimension is not implemented.  The write
-        // side accepts such a column, so the read side has to report it instead of hitting
-        // the todo!() this used to end in (which panicked inside a decode task).
+    fn test_repdef_fsl_over_list() {
         //
         // Layers as the writer emits them for FSL<Struct<List<Int32>>>: the fixed-size-list
         // layer, then the struct layer, then the list offsets, then the leaf validity.
@@ -3189,19 +3186,55 @@ mod tests {
             5,
         )]);
 
-        // Consume the inner layers in the order the decoder does, so the fixed-size-list
-        // layer is the one that fails
+        // Consume inner layers in decoder order, retaining one marker per FSL.
         unraveler.unravel_validity(5).unwrap();
         unraveler.unravel_offsets::<i32>().unwrap();
         unraveler.unravel_validity(4).unwrap();
 
-        let err = unraveler.unravel_fsl_validity(2, 2).unwrap_err();
-        assert!(matches!(err, lance_core::Error::NotSupported { .. }));
-        assert!(
-            err.to_string()
-                .contains("cannot decimate repetition levels"),
-            "unexpected error: {}",
-            err
+        let validity = unraveler.unravel_fsl_validity(2, 2).unwrap();
+        assert!(validity.is_none_or(|validity| validity.len() == 2 && validity.null_count() == 0));
+    }
+
+    #[rstest::rstest]
+    fn test_repdef_list_fsl_nested_list(#[values(1, 2, 3)] dimension: usize) {
+        let mut inner_offsets = vec![0_i32];
+        let mut inner_validity = Vec::new();
+        for slot in 0..3 * dimension {
+            let valid = slot / dimension != 1;
+            inner_validity.push(valid);
+            let count = if valid && slot % 2 == 0 { 2 } else { 0 };
+            inner_offsets.push(inner_offsets.last().unwrap() + count);
+        }
+        let leaf_count = *inner_offsets.last().unwrap() as usize;
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 0, 0, 1, 3]),
+            Some(validity(&[false, true, true, true])),
+        );
+        builder.add_fsl(Some(validity(&[true, false, true])), dimension, 3);
+        builder.add_no_null(3 * dimension);
+        builder.add_offsets(offsets_32(&inner_offsets), Some(validity(&inner_validity)));
+        builder.add_no_null(leaf_count);
+        let encoded = RepDefBuilder::serialize(vec![builder]);
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            encoded.repetition_levels.map(|v| v.as_ref().to_vec()),
+            encoded.definition_levels.map(|v| v.as_ref().to_vec()),
+            encoded.def_meaning.into(),
+            leaf_count as u64,
+        )]);
+        unraveler.unravel_validity(leaf_count).unwrap();
+        unraveler.unravel_offsets::<i32>().unwrap();
+        unraveler.unravel_validity(3 * dimension).unwrap();
+        let fsl = unraveler
+            .unravel_fsl_validity(3, dimension)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fsl.iter().collect::<Vec<_>>(), vec![true, false, true]);
+        let (offsets, nulls) = unraveler.unravel_offsets::<i32>().unwrap();
+        assert_eq!(offsets.as_ref(), &[0, 0, 0, 1, 3]);
+        assert_eq!(
+            nulls.unwrap().iter().collect::<Vec<_>>(),
+            vec![false, true, true, true]
         );
     }
 
@@ -3384,33 +3417,6 @@ mod tests {
             *single_rep, *multi_rep,
             "multi-batch nested-list rep levels must equal single-batch"
         );
-    }
-
-    #[test]
-    fn test_only_empty_lists() {
-        let mut builder = RepDefBuilder::default();
-        builder.add_offsets(offsets_32(&[0, 4, 4, 4, 6]), None);
-        builder.add_no_null(6);
-
-        let repdefs = RepDefBuilder::serialize(vec![builder]);
-
-        let rep = repdefs.repetition_levels.unwrap();
-        let def = repdefs.definition_levels.unwrap();
-
-        assert_eq!([1, 0, 0, 0, 1, 1, 1, 0], *rep);
-        assert_eq!([0, 0, 0, 0, 1, 1, 0, 0], *def);
-
-        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
-            Some(rep.as_ref().to_vec()),
-            Some(def.as_ref().to_vec()),
-            repdefs.def_meaning.into(),
-            8,
-        )]);
-
-        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
-        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
-        assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
-        assert_eq!(val, None);
     }
 
     #[test]

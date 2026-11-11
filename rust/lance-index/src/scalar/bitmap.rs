@@ -30,7 +30,7 @@ use lance_core::{
     Error, ROW_ADDR, Result,
     cache::{
         CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-        KeyBuilder, LanceCache, WeakLanceCache,
+        CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
     },
     error::LanceOptionExt,
     utils::tokio::get_num_compute_intensive_cpus,
@@ -996,6 +996,7 @@ impl Index for BitmapIndex {
                 })?;
                 let cache_key = BitmapKey::try_new(row_offset)?;
                 self.index_cache
+                    .with_load_origin(CacheLoadOrigin::Warm)
                     .insert_with_key(&cache_key, Arc::new(bitmap))
                     .await;
             }
@@ -2666,6 +2667,10 @@ impl BasicTrainer for BitmapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BitmapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -4703,6 +4708,14 @@ mod tests {
                 to_keep.contains(RowAddress::from(row_addr).fragment_id())
             }
             Some(OldIndexDataFilter::RowIds(valid)) => valid.contains(row_addr),
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            }) => {
+                to_keep.contains(RowAddress::from(row_addr).fragment_id())
+                    && !deleted_rows.contains(row_addr)
+            }
             None => true,
         }
     }
@@ -4738,7 +4751,7 @@ mod tests {
                 let rows = (0..rng.random_range(1..=8))
                     .map(|_| rand_row(&mut rng))
                     .collect::<Vec<_>>();
-                filters.push(match rng.random_range(0..4) {
+                filters.push(match rng.random_range(0..5) {
                     0 => None,
                     1 => Some(OldIndexDataFilter::Fragments {
                         // The bitmap merge reads only `to_keep`.
@@ -4751,6 +4764,15 @@ mod tests {
                             .map(|(_, row_addr)| *row_addr)
                             .collect(),
                     )),
+                    3 => Some(OldIndexDataFilter::RowAddresses {
+                        to_keep: (0..FRAGMENTS).filter(|_| rng.random_bool(0.6)).collect(),
+                        to_remove: RoaringBitmap::new(),
+                        deleted_rows: rows
+                            .iter()
+                            .filter(|_| rng.random_bool(0.4))
+                            .map(|(_, row_addr)| *row_addr)
+                            .collect(),
+                    }),
                     _ => Some(OldIndexDataFilter::Fragments {
                         to_keep: RoaringBitmap::new(),
                         to_remove: RoaringBitmap::new(),
