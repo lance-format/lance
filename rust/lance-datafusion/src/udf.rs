@@ -21,6 +21,8 @@ mod element;
 #[cfg(feature = "geo")]
 mod geo;
 
+pub(crate) use element::rewrite_element_lambdas;
+
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udf(CONTAINS_TOKENS_UDF.clone());

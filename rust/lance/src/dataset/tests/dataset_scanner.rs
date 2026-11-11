@@ -1598,6 +1598,18 @@ async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool
     "any_element(detections, 'label = ''car'' AND confidence > 0.9') OR width = 1280",
     |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true) || w == 1280
 )]
+#[case::lambda(
+    "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true)
+)]
+#[case::lambda_alias_and_subscript(
+    "any_match(detections, (x) -> x['label'] IN ('truck', 'carrot') AND x.confidence > 0.95)",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true)
+)]
+#[case::lambda_negated_and_indexed_column(
+    "NOT array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9) AND width > 1920",
+    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(false) && w > 1920
+)]
 #[tokio::test]
 async fn test_any_element_filter(#[case] filter: &str, #[case] keep: DetectionCheck) {
     let dataset = detection_dataset().await;
@@ -1655,6 +1667,32 @@ async fn test_any_element_rejects_invalid_predicates(#[case] filter: &str, #[cas
         message.contains("any_element") && message.contains(reason),
         "{message}"
     );
+    let err = dataset
+        .count_rows(Some(filter.to_string()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(reason), "{err}");
+}
+
+/// A lambda filter that `any_element` cannot express is rejected when the
+/// filter is parsed, with a message that says why.
+#[rstest]
+#[case::outside_column(
+    "array_any_match(detections, d -> d.label = 'car' AND width > 1)",
+    "`width` is outside the element"
+)]
+#[case::other_lambda_function(
+    "cardinality(array_filter(detections, d -> d.confidence > 0.5)) > 0",
+    "only accept lambdas as array_any_match"
+)]
+#[tokio::test]
+async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[case] reason: &str) {
+    let dataset = detection_dataset().await;
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap();
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    assert!(err.to_string().contains(reason), "{err}");
     let err = dataset
         .count_rows(Some(filter.to_string()))
         .await

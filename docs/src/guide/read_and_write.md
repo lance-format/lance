@@ -658,6 +658,17 @@ The result follows SQL three-valued logic: NULL for a null list, TRUE if the
 predicate is TRUE on some element, otherwise NULL if it is NULL on some element,
 otherwise FALSE. An empty list is FALSE.
 
+The same filter can be written as a lambda, which needs no quoting:
+
+```sql
+array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)
+```
+
+Lance rewrites it to the `any_element` call above, so the two behave the same.
+`any_match` is an alias, and fields can also be written `d['label']`. The lambda
+has one parameter, and its body may only refer to that parameter's fields.
+Other lambdas, such as in `array_filter`, are not supported in filters.
+
 ### Random read
 
 One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.
