@@ -56,6 +56,10 @@ use lance_core::{Error, Result};
 
 use crate::planner::Planner;
 
+mod lambda;
+
+pub use lambda::rewrite_element_lambdas;
+
 const ANY_ELEMENT: &str = "any_element";
 
 /// Compiled predicates kept per process; the cache is cleared when it is full.
@@ -514,6 +518,34 @@ mod tests {
         );
     }
 
+    /// The lambda form plans to the same `any_element` call, so it gets the
+    /// same answers, literal handling and Substrait encoding.
+    #[rstest]
+    #[case::same_element(
+        "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)",
+        Q1
+    )]
+    #[case::inclusive_float_bound(
+        "array_any_match(detections, d -> d.label = 'car' AND d.confidence >= 0.9)",
+        "any_element(detections, 'label = ''car'' AND confidence >= 0.9')"
+    )]
+    #[case::alias_and_null_test(
+        "any_match(detections, (x) -> x.confidence IS NULL)",
+        "any_element(detections, 'confidence IS NULL')"
+    )]
+    #[case::negated_with_row_column(
+        "NOT array_any_match(detections, d -> d['label'] IN ('person', 'truck')) AND width > 1920",
+        "NOT any_element(detections, '`label` IN (''person'', ''truck'')') AND width > 1920"
+    )]
+    fn test_lambda_form_is_any_element(#[case] lambda: &str, #[case] call: &str) {
+        let planner = Planner::new(schema(false));
+        assert_eq!(
+            planner.parse_filter(lambda).unwrap(),
+            planner.parse_filter(call).unwrap()
+        );
+        assert_eq!(eval(lambda, false), eval(call, false));
+    }
+
     #[test]
     fn test_predicate_forms() {
         // >=, IN, BETWEEN, IS NULL and OR inside the element predicate.
@@ -603,6 +635,10 @@ mod tests {
         assert_eq!(
             eval("any_element(detections, 'details.label IS NULL')"),
             BooleanArray::from(vec![T, T, F, F])
+        );
+        assert_eq!(
+            eval("array_any_match(detections, d -> d.details.label = 'car')"),
+            BooleanArray::from(vec![N, N, T, F])
         );
     }
 
