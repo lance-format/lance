@@ -17,6 +17,7 @@ nav:
     - Object Store Configuration: object_store.md
     - Performance Guide: performance.md
     - Observability: observability.md
+    - Retention Leases: retention_leases.md
     - Update Join Strategies: update_join.md
   - Advanced and Distributed:
     - Distributed Write: distributed_write.md
