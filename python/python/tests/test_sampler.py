@@ -227,6 +227,27 @@ def test_set_epoch_reshuffles(tmp_path: Path, sampler_cls):
     assert epoch1 != epoch2, "Different epochs should produce different orders"
 
 
+@pytest.mark.parametrize("world_size", [3, 4])
+def test_sharded_batch_sampler_filter_small_batches(tmp_path: Path, world_size):
+    # One scan batch per fragment, each smaller than the world size, so ranks
+    # regularly have to skip a whole batch.
+    ds = lance.write_dataset(
+        pa.table({"id": range(10)}), tmp_path / "data.lance", max_rows_per_file=2
+    )
+    seen = []
+    for rank in range(world_size):
+        sampler = ShardedBatchSampler(rank=rank, world_size=world_size)
+        batches = sampler(ds, columns=["id"], filter="id >= 0", batch_size=2)
+        seen.append([i for b in batches for i in b["id"].to_pylist()])
+    assert seen == [list(range(rank, 10, world_size)) for rank in range(world_size)]
+
+
+def test_sharded_batch_sampler_filter_no_match(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": range(10)}), tmp_path / "data.lance")
+    sampler = ShardedBatchSampler(rank=0, world_size=2)
+    assert list(sampler(ds, columns=["id"], filter="id > 100")) == []
+
+
 def test_edge_cases():
     """Validate handling of partial batches and data boundaries."""
 
