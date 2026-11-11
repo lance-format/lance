@@ -280,10 +280,20 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
             }
             RowAddrSelection::Partial(offsets) => {
                 let deletion_vector = file_fragment.get_deletion_vector().await?;
+                // A deletion does not compact the row id sequence; the deleted row keeps
+                // its slot (the deletion vector tracks it separately). So a physical offset
+                // is a direct index into the sequence, regardless of any deletions below it.
+                // A stale offset that points at a deleted row has no live counterpart and is
+                // not part of any answer, so it contributes no id to the block/take set.
+                let is_live = |offset: &u32| {
+                    !deletion_vector
+                        .as_ref()
+                        .is_some_and(|dv| dv.contains(*offset))
+                };
                 // A selected offset with no sequence entry points past the fragment's rows.
                 // Silently dropping it would let a stale index result escape masking, so
                 // treat the mismatch as corruption.
-                if let Some(max_offset) = offsets.max()
+                if let Some(max_offset) = offsets.iter().rev().find(is_live)
                     && u64::from(max_offset) >= sequence.len()
                 {
                     return Err(Error::internal(format!(
@@ -292,20 +302,8 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                         sequence.len()
                     )));
                 }
-                // A deletion does not compact the row id sequence; the deleted row keeps
-                // its slot (the deletion vector tracks it separately). So a physical offset
-                // is a direct index into the sequence, regardless of any deletions below it.
-                // A stale offset that points at a deleted row has no live counterpart and is
-                // not part of any answer, so it contributes no id to the block/take set.
                 // The bitmap yields offsets in order, so one pass over the sequence maps them.
-                let live_offsets = offsets
-                    .iter()
-                    .filter(|offset| {
-                        !deletion_vector
-                            .as_ref()
-                            .is_some_and(|dv| dv.contains(*offset))
-                    })
-                    .map(|offset| offset as usize);
+                let live_offsets = offsets.iter().filter(is_live).map(|offset| offset as usize);
                 for id in sequence.select(live_offsets) {
                     row_ids.insert(id);
                 }
