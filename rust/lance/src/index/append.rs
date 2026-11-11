@@ -2318,6 +2318,8 @@ mod tests {
     use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{Dimension, RowCount, array};
     use lance_file::version::LanceFileVersion;
+    use lance_index::pb::JsonIndexDetails;
+    use lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::{
@@ -5117,6 +5119,32 @@ mod tests {
         (schema, batch)
     }
 
+    /// Like [`json_btree_schema_and_batch`], but with string values: NGram
+    /// (unlike BTree) can only index a textual JSON value.
+    fn json_ngram_schema_and_batch(ids: std::ops::Range<i32>) -> (Arc<Schema>, RecordBatch) {
+        let doc_field = Field::new("doc", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            doc_field,
+        ]));
+        let doc_values: Vec<String> =
+            ids.clone().map(|i| format!(r#"{{"x":"word{i}"}}"#)).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids)),
+                Arc::new(StringArray::from(doc_values)),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
     fn json_wrapped_params(target_index_type: &str) -> ScalarIndexParams {
         ScalarIndexParams {
             index_type: "json".to_string(),
@@ -5204,6 +5232,85 @@ mod tests {
             dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
             1,
             "optimize should merge into a single segment, not fail or leave extras"
+        );
+    }
+
+    /// A JSON-wrapped NGram target now has the same row-id/row-address domain
+    /// split as BTree: `legacy_target_index_version` and
+    /// `wraps_row_addr_domain_target` must recognize NGram (and RTree) too,
+    /// or a pre-migration JSON-wrapped-NGram segment is never folded into an
+    /// `optimize_indices` rebuild on a stable-row-id dataset -- it survives
+    /// alongside a freshly scanned address-domain segment, and the mismatched
+    /// domains make the commit fail.
+    #[tokio::test]
+    async fn test_json_wrapped_ngram_optimize_folds_legacy_segment_with_stable_row_ids() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let (schema, batch) = json_ngram_schema_and_batch(0..10);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = json_wrapped_params("ngram");
+        let segment = dataset
+            .create_index_builder(&["doc"], IndexType::Scalar, &params)
+            .name("doc_idx".to_string())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        // Relabel it as a pre-migration segment: an old build recorded no
+        // `target_index_version` (the field did not exist yet) and stamped
+        // the wrapper itself at its row-id-domain version -- exactly as
+        // `JSON_ROW_ID_DOMAIN_VERSION` still does today for a dataset
+        // without stable row ids (see `relabel_as_row_id_domain`).
+        let mut details =
+            JsonIndexDetails::decode(segment.index_details.as_ref().unwrap().value.as_slice())
+                .unwrap();
+        details.target_index_version = None;
+        let legacy_segment = IndexMetadata {
+            index_version: JSON_ROW_ID_DOMAIN_VERSION as i32,
+            index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+            ..segment
+        };
+        dataset
+            .commit_existing_index_segments("doc_idx", "doc", vec![legacy_segment])
+            .await
+            .unwrap();
+
+        // Append and let optimize fold the legacy segment into a fresh,
+        // address-domain rebuild instead of leaving it stranded.
+        let (_, more) = json_ngram_schema_and_batch(10..20);
+        let appended = RecordBatchIterator::new(vec![Ok(more)], schema);
+        let mut dataset = Dataset::write(
+            appended,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("doc_idx").await.unwrap().len(),
+            1,
+            "optimize must fold the pre-migration segment into the rebuild, not leave it \
+             stranded alongside a fresh address-domain one"
         );
     }
 
