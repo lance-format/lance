@@ -1283,8 +1283,13 @@ mod tests {
         assert_eq!(rows[5], (5, Some(-6), Some(500)));
     }
 
-    fn nested_array_with_validity(a: Vec<i32>, b: Vec<i32>, nulls: Option<NullBuffer>) -> ArrayRef {
-        let field = |name| Arc::new(ArrowField::new(name, DataType::Int32, true));
+    fn nested_array_with_validity(
+        a: Vec<i32>,
+        b: Vec<i32>,
+        nulls: Option<NullBuffer>,
+        children_nullable: bool,
+    ) -> ArrayRef {
+        let field = |name| Arc::new(ArrowField::new(name, DataType::Int32, children_nullable));
         Arc::new(StructArray::new(
             vec![field("a"), field("b")].into(),
             vec![
@@ -1296,7 +1301,7 @@ mod tests {
     }
 
     fn nested_array(a: Vec<i32>, b: Vec<i32>) -> ArrayRef {
-        nested_array_with_validity(a, b, None)
+        nested_array_with_validity(a, b, None, true)
     }
 
     /// One four-row fragment of `val` = 0..4 and `nested: struct<a: i32, b: i32>`
@@ -1305,11 +1310,12 @@ mod tests {
     /// `nested` is non-nullable because these tests do not exercise struct
     /// validity replacement.
     async fn nested_dataset() -> (TempDir, Arc<Dataset>) {
-        nested_dataset_with_nullable_struct(false, None).await
+        nested_dataset_with_nullable_struct(false, true, None).await
     }
 
     async fn nested_dataset_with_nullable_struct(
         nullable: bool,
+        children_nullable: bool,
         data_storage_version: Option<LanceFileVersion>,
     ) -> (TempDir, Arc<Dataset>) {
         let test_dir = tempdir().unwrap();
@@ -1322,6 +1328,7 @@ mod tests {
                     (0..4).collect(),
                     (0..4).map(|v| v * 10).collect(),
                     nullable.then(|| NullBuffer::from(vec![false, true, true, true])),
+                    children_nullable,
                 ),
                 nullable,
             ),
@@ -1350,7 +1357,8 @@ mod tests {
     #[case::v2_3(LanceFileVersion::V2_3)]
     #[tokio::test]
     async fn test_nullable_struct_validity_is_replaced(#[case] version: LanceFileVersion) {
-        let (_test_dir, dataset) = nested_dataset_with_nullable_struct(true, Some(version)).await;
+        let (_test_dir, dataset) =
+            nested_dataset_with_nullable_struct(true, true, Some(version)).await;
         let nested_id = field_id(&dataset, "nested");
         let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
         writer
@@ -1363,6 +1371,7 @@ mod tests {
                         vec![-7, -8],
                         vec![-70, -80],
                         Some(NullBuffer::from(vec![true, false])),
+                        true,
                     ),
                 )],
             ))
@@ -1384,6 +1393,65 @@ mod tests {
         let a = nested.column(0).as_primitive::<Int32Type>();
         let b = nested.column(1).as_primitive::<Int32Type>();
         assert_eq!((a.value(0), b.value(0)), (-7, -70));
+    }
+
+    /// A struct's validity replacement must also hold when its children are
+    /// required: the null struct cell the overlay supplies has to mask the merged
+    /// child values before the struct is rebuilt, or arrow rejects the array
+    /// ("Found unmasked nulls for non-nullable StructArray field").
+    #[rstest]
+    #[case::v2_1(LanceFileVersion::V2_1)]
+    #[case::v2_2(LanceFileVersion::V2_2)]
+    #[case::v2_3(LanceFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_nullable_struct_validity_is_replaced_over_required_children(
+        #[case] version: LanceFileVersion,
+    ) {
+        let (_test_dir, dataset) =
+            nested_dataset_with_nullable_struct(true, false, Some(version)).await;
+        let nested_id = field_id(&dataset, "nested");
+        let mut writer = open_writer_on(&dataset, 0, &[nested_id]).await;
+        // Row 0 (struct null in the base) is filled in; row 1 (valid in the base)
+        // is nulled. Children carry values under the null struct cell, which is
+        // valid Arrow: the null parent masks them.
+        writer
+            .write_batch(&batch(
+                0,
+                &[0, 1],
+                vec![(
+                    "nested",
+                    nested_array_with_validity(
+                        vec![-7, -8],
+                        vec![-70, -80],
+                        Some(NullBuffer::from(vec![true, false])),
+                        false,
+                    ),
+                )],
+            ))
+            .await
+            .unwrap();
+        let dataset = commit(dataset, writer.finish().await.unwrap().unwrap()).await;
+
+        let batch = dataset
+            .scan()
+            .project(&["nested"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let nested = batch["nested"].as_struct();
+        assert!(nested.is_valid(0));
+        assert!(nested.is_null(1));
+        assert!(nested.is_valid(2));
+        assert!(nested.is_valid(3));
+        let a = nested.column(0).as_primitive::<Int32Type>();
+        let b = nested.column(1).as_primitive::<Int32Type>();
+        assert_eq!((a.value(0), b.value(0)), (-7, -70));
+        // The null struct cell masks its children, so their merged values read as
+        // null there; the rows the overlay leaves alone keep the base values.
+        assert!(a.is_null(1));
+        assert!(b.is_null(1));
+        assert_eq!((a.value(2), b.value(2)), (2, 20));
     }
 
     #[tokio::test]
