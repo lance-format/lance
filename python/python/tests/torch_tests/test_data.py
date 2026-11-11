@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import shutil
+import weakref
 from itertools import chain
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance._dataset.cache import CachedDataset
 from lance.sampler import ShardedBatchSampler, ShardedFragmentSampler
 
 torch = pytest.importorskip("torch")
@@ -101,6 +103,58 @@ def iter_over_dataset(tmp_path):
         total_rows += batch["vec"].shape[0]
         assert batch["vec"].shape[1] == 32
     assert total_rows == 4096
+
+
+@pytest.mark.parametrize("cache_location", ["temporary", "directory"])
+def test_interrupted_cache_fill_restarts(tmp_path, cache_location):
+    source = tmp_path / "source.lance"
+    lance.write_dataset(pa.table({"id": range(20)}), source, max_rows_per_file=5)
+    cache_base = tmp_path / "cache"
+    cache_base.mkdir()
+    cache = True if cache_location == "temporary" else str(cache_base)
+    dataset = LanceDataset(str(source), batch_size=1, cache=cache)
+    try:
+        batches = iter(dataset)
+        assert next(batches).item() == 0
+        partial = weakref.ref(dataset.cached_ds)
+        partial_path = Path(dataset.cached_ds.cache_dir.name)
+        batches.close()
+        assert not dataset.cached_ds.finished_origin_stream
+        assert dataset.cached_ds.cache_dir is None
+        assert not partial_path.exists()
+
+        assert [batch.item() for batch in dataset] == list(range(20))
+        assert partial() is None
+        completed = dataset.cached_ds
+        assert completed.finished_origin_stream
+        shutil.rmtree(source)
+        batches = iter(dataset)
+        assert next(batches).item() == 0
+        batches.close()
+        assert dataset.cached_ds is completed
+        assert [batch.item() for batch in dataset] == list(range(20))
+        assert dataset.cached_ds is completed
+    finally:
+        if dataset.cached_ds is not None:
+            dataset.cached_ds.close()
+    assert list(cache_base.iterdir()) == []
+
+
+def test_empty_cache_replays():
+    class EmptyStream:
+        def __init__(self):
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(())
+
+    stream = EmptyStream()
+    with CachedDataset(stream) as dataset:
+        assert list(dataset) == []
+        assert dataset.finished_origin_stream
+        assert list(dataset) == []
+    assert stream.iterations == 1
 
 
 def test_iter_filter(tmp_path):
@@ -406,7 +460,9 @@ def test_bf16_to_tensor_zero_copy_without_nulls():
 
 def test_bf16_to_tensor_clones_when_nulls_present():
     """Null replacement requires a writable tensor, so the Arrow buffer is cloned."""
-    arr = lance.arrow.bfloat16_array([1.0, None, 3.0])
+    from lance.arrow import bfloat16_array
+
+    arr = bfloat16_array([1.0, None, 3.0])
 
     tensor = _bf16_to_tensor(arr)
 

@@ -5,6 +5,7 @@ import contextlib
 import multiprocessing
 import os
 import pickle
+import shutil
 import signal
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -373,6 +374,36 @@ def _async_lifecycle_scenario(scenario, start_method):
                     assert not cache_path.exists()
                 finally:
                     release.set()
+    elif scenario.startswith("cached_"):
+        from lance.torch.data import LanceDataset
+
+        with tempfile.TemporaryDirectory() as base:
+            source = Path(base) / "source.lance"
+            lance.write_dataset(
+                pa.table({"id": range(100)}), source, max_rows_per_file=20
+            )
+            cache_base = Path(base) / "cache"
+            cache_base.mkdir()
+            cache = str(cache_base) if scenario.endswith("path") else True
+            creator = partial(LanceDataset, str(source), batch_size=1, cache=cache)
+            with async_dataset(creator, queue_size=1) as dataset:
+                if scenario == "cached_replay_peek":
+                    assert [batch.item() for batch in dataset] == list(range(100))
+                    shutil.rmtree(source)
+                worker_pid = None
+                for _ in range(3):
+                    assert next(iter(dataset)).item() == 0
+                    if worker_pid is None:
+                        worker_pid = dataset.worker.pid
+                    assert dataset.worker.pid == worker_pid
+                assert [batch.item() for batch in dataset] == list(range(100))
+                if source.exists():
+                    shutil.rmtree(source)
+                assert [batch.item() for batch in dataset] == list(range(100))
+                assert dataset.worker.pid == worker_pid
+                if scenario.endswith("path"):
+                    assert len(list(cache_base.iterdir())) == 1
+            assert list(cache_base.iterdir()) == []
     elif scenario in ("partial_transfer", "large_transfer"):
         with async_dataset(_LargeItemDataset, queue_size=1) as dataset:
             if scenario == "partial_transfer":
@@ -481,6 +512,9 @@ def _async_lifecycle_scenario(scenario, start_method):
             "cancel_epoch_large_4",
             "graceful_cleanup_default",
             "graceful_cleanup_custom",
+            "cached_first_peek",
+            "cached_first_peek_path",
+            "cached_replay_peek",
             "repeated_close",
             "blocked_producer",
             "blocked_user_code",
@@ -502,6 +536,7 @@ def _async_lifecycle_scenario(scenario, start_method):
                 "discard_failure",
                 "cancel_epoch_endless_1",
                 "graceful_cleanup_custom",
+                "cached_first_peek_path",
             )
         ]
         if "forkserver" in multiprocessing.get_all_start_methods()
