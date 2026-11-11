@@ -509,8 +509,10 @@ struct CleanupInspection {
     /// its commit time is unknown and the listing cutoff cannot be trusted.
     skipped_expired_manifest_read: bool,
     /// Versions from the oldest leased one up to the read version whose manifest was read
-    /// and, after the leased version, records the transaction a holder rebases over.
-    confirmed_lease_history: HashSet<u64>,
+    /// and, after the leased version, records the transaction a holder rebases over. Maps
+    /// each to the path of that transaction file, which must still exist; `None` for the
+    /// leased version itself, which no holder rebases over.
+    lease_history: HashMap<u64, Option<Path>>,
     /// The earliest `staged_files_since` among leases listed on the read version or any
     /// newer one, so a lease acquired since the read still protects its staged output.
     staged_files_since: Option<DateTime<Utc>>,
@@ -1099,7 +1101,7 @@ impl<'a> CleanupTask<'a> {
                 .await?
         };
         let inspection = self.process_manifests(&tagged_versions, inspection).await?;
-        self.ensure_lease_history_confirmed(&inspection)?;
+        self.ensure_lease_history_confirmed(&inspection).await?;
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -1208,13 +1210,28 @@ impl<'a> CleanupTask<'a> {
     /// no deletion can be shown safe for it. The window is short-lived and a gap in it is
     /// damage rather than a state a lease-aware writer produces, so failing the whole run
     /// is preferred over guessing which deletions might still be safe.
-    fn ensure_lease_history_confirmed(&self, inspection: &CleanupInspection) -> Result<()> {
+    /// Transaction files are checked with one request each: the window spans only the
+    /// versions committed since the oldest lease, and the check must finish before any
+    /// deletion starts, so the listing that drives deletion cannot serve.
+    async fn ensure_lease_history_confirmed(&self, inspection: &CleanupInspection) -> Result<()> {
         let Some(leases) = self.lease_retention else {
             return Ok(());
         };
-        let unconfirmed: Vec<u64> = (leases.oldest_version..=self.read_version)
-            .filter(|version| !inspection.confirmed_lease_history.contains(version))
-            .collect();
+        let object_store = &self.dataset.object_store;
+        let mut unconfirmed: Vec<u64> = stream::iter(leases.oldest_version..=self.read_version)
+            .map(|version| async move {
+                let confirmed = match inspection.lease_history.get(&version) {
+                    None => false,
+                    Some(None) => true,
+                    Some(Some(transaction_path)) => object_store.exists(transaction_path).await?,
+                };
+                Ok::<_, Error>((!confirmed).then_some(version))
+            })
+            .buffer_unordered(object_store.io_parallelism())
+            .try_filter_map(|version| future::ready(Ok(version)))
+            .try_collect()
+            .await?;
+        unconfirmed.sort_unstable();
         if unconfirmed.is_empty() {
             return Ok(());
         }
@@ -1498,9 +1515,18 @@ impl<'a> CleanupTask<'a> {
 
         if let Some(leases) = self.lease_retention
             && in_lease_window
-            && (manifest.version == leases.oldest_version || manifest.transaction_file.is_some())
         {
-            inspection.confirmed_lease_history.insert(manifest.version);
+            let transaction_path = manifest
+                .transaction_file
+                .as_deref()
+                .map(|file| self.dataset.base.child(TRANSACTIONS_DIR).child(file));
+            if manifest.version == leases.oldest_version {
+                inspection.lease_history.insert(manifest.version, None);
+            } else if let Some(path) = transaction_path {
+                inspection
+                    .lease_history
+                    .insert(manifest.version, Some(path));
+            }
         }
         if is_latest && let Some(leases) = LeaseRetention::from_leases(manifest.retention_leases())
         {
