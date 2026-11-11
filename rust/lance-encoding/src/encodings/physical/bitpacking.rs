@@ -116,32 +116,25 @@ impl InlineBitpacking {
             .as_any()
             .downcast_ref::<PrimitiveArray<UInt64Type>>()
             .unwrap();
+        let bit_widths_slice = bit_widths_array.values().as_ref();
+        let num_chunks = bit_widths_slice.len();
+        debug_assert!(num_chunks > 0);
+        let word_shift = data.bits_per_value.trailing_zeros();
 
-        let (packed_chunk_sizes, total_size) = bit_widths_array
-            .values()
+        let total_size: usize = bit_widths_slice
             .iter()
-            .map(|&bit_width| {
-                let chunk_size = ((1024 * bit_width) / data.bits_per_value) as usize;
-                (chunk_size, chunk_size + 1)
-            })
-            .fold(
-                (Vec::with_capacity(bit_widths_array.len()), 0),
-                |(mut sizes, total), (size, inc)| {
-                    sizes.push(size);
-                    (sizes, total + inc)
-                },
-            );
+            .map(|&bit_width| (((bit_width as usize) << LOG_ELEMS_PER_CHUNK) >> word_shift) + 1)
+            .sum();
 
         let mut output: Vec<T> = Vec::with_capacity(total_size);
-        let mut chunks = Vec::with_capacity(bit_widths_array.len());
+        let mut chunks = Vec::with_capacity(num_chunks);
+        let has_tail = !data.num_values.is_multiple_of(ELEMS_PER_CHUNK);
+        let num_full_chunks = if has_tail { num_chunks - 1 } else { num_chunks };
 
-        for (i, packed_chunk_size) in packed_chunk_sizes
-            .iter()
-            .enumerate()
-            .take(bit_widths_array.len() - 1)
-        {
+        for (i, &bw) in bit_widths_slice[..num_full_chunks].iter().enumerate() {
             let start_elem = i * ELEMS_PER_CHUNK as usize;
-            let bit_width = bit_widths_array.value(i) as usize;
+            let bit_width = bw as usize;
+            let packed_chunk_size = (bit_width << LOG_ELEMS_PER_CHUNK) >> word_shift;
             output.push(T::from_usize(bit_width).unwrap());
             let output_len = output.len();
             // SAFETY: `chunk_data` picks `T` from `data.bits_per_value`, so `packed_chunk_size` is
@@ -152,46 +145,43 @@ impl InlineBitpacking {
                 BitPackingUninit::unchecked_pack_uninit(
                     bit_width,
                     &data_buffer[start_elem..][..ELEMS_PER_CHUNK as usize],
-                    &mut output.spare_capacity_mut()[..*packed_chunk_size],
+                    &mut output.spare_capacity_mut()[..packed_chunk_size],
                 );
-                output.set_len(output_len + *packed_chunk_size);
+                output.set_len(output_len + packed_chunk_size);
             }
             chunks.push(MiniBlockChunk {
-                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u32],
-                log_num_values: LOG_ELEMS_PER_CHUNK,
+                buffer_sizes: vec![((1 + packed_chunk_size) * std::mem::size_of::<T>()) as u32],
+                log_num_values: if i + 1 == num_chunks {
+                    0
+                } else {
+                    LOG_ELEMS_PER_CHUNK
+                },
             });
         }
 
-        // Handle the last chunk
-        let last_chunk_elem_num = if data.num_values.is_multiple_of(ELEMS_PER_CHUNK) {
-            ELEMS_PER_CHUNK
-        } else {
-            data.num_values % ELEMS_PER_CHUNK
-        };
-        let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
-        last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
-            &data_buffer[data.num_values as usize - last_chunk_elem_num as usize..],
-        );
-        let bit_width = bit_widths_array.value(bit_widths_array.len() - 1) as usize;
-        output.push(T::from_usize(bit_width).unwrap());
-        let output_len = output.len();
-        let packed_chunk_size = packed_chunk_sizes[bit_widths_array.len() - 1];
-        // SAFETY: as for the full chunks above; `last_chunk` is padded to 1024 values.
-        unsafe {
-            BitPackingUninit::unchecked_pack_uninit(
-                bit_width,
-                &last_chunk,
-                &mut output.spare_capacity_mut()[..packed_chunk_size],
-            );
-            output.set_len(output_len + packed_chunk_size);
+        if has_tail {
+            let last_chunk_elem_num = (data.num_values % ELEMS_PER_CHUNK) as usize;
+            let mut last_chunk = [T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+            last_chunk[..last_chunk_elem_num]
+                .copy_from_slice(&data_buffer[data.num_values as usize - last_chunk_elem_num..]);
+            let bit_width = bit_widths_slice[num_chunks - 1] as usize;
+            let packed_chunk_size = (bit_width << LOG_ELEMS_PER_CHUNK) >> word_shift;
+            output.push(T::from_usize(bit_width).unwrap());
+            let output_len = output.len();
+            // SAFETY: as for the full chunks above; `last_chunk` is padded to 1024 values.
+            unsafe {
+                BitPackingUninit::unchecked_pack_uninit(
+                    bit_width,
+                    &last_chunk,
+                    &mut output.spare_capacity_mut()[..packed_chunk_size],
+                );
+                output.set_len(output_len + packed_chunk_size);
+            }
+            chunks.push(MiniBlockChunk {
+                buffer_sizes: vec![((1 + packed_chunk_size) * std::mem::size_of::<T>()) as u32],
+                log_num_values: 0,
+            });
         }
-        chunks.push(MiniBlockChunk {
-            buffer_sizes: vec![
-                ((1 + packed_chunk_sizes[bit_widths_array.len() - 1]) * std::mem::size_of::<T>())
-                    as u32,
-            ],
-            log_num_values: 0,
-        });
 
         MiniBlockCompressed {
             data: vec![LanceBuffer::reinterpret_vec(output)],
@@ -580,7 +570,7 @@ pub(crate) fn bitpack_out_of_line_vec<T: ArrowNativeType + BitPackingUninit>(
 
     if padding_cost < tail_pack_savings {
         // Padding buys us more than it costs: pad to 1024 values and pack them as a normal chunk.
-        let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
+        let mut last_chunk = [T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
         last_chunk[..remaining_items].copy_from_slice(&data_buffer[last_chunk_start..]);
         let start = output.len();
         // SAFETY: as for the complete chunks above; `last_chunk` is padded to 1024 values.
@@ -626,9 +616,12 @@ pub(crate) fn unpack_out_of_line<T: ArrowNativeType + BitPackingUninit>(
     let expected_new_len = expected_full_words + tail_values;
     let tail_is_raw = tail_values > 0 && compressed_words.len() == expected_new_len;
 
-    let extra_tail_capacity = ELEMS_PER_CHUNK as usize;
-    let mut decompressed: Vec<T> =
-        Vec::with_capacity(num_values.saturating_add(extra_tail_capacity));
+    let capacity = if tail_values > 0 && !tail_is_raw {
+        (num_whole_chunks + 1) * ELEMS_PER_CHUNK as usize
+    } else {
+        num_values
+    };
+    let mut decompressed: Vec<T> = Vec::with_capacity(capacity);
 
     for chunk_idx in 0..num_whole_chunks {
         let input_start = chunk_idx * words_per_chunk;
