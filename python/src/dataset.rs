@@ -44,7 +44,7 @@ use lance::dataset::scanner::{
 };
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ColumnAlteration, ProjectionRequest, validate_dataset_root_for_drop};
-use lance::dataset::{CommitBuilder, NewColumnTransform, WriteDestination};
+use lance::dataset::{CommitBuilder, LeaseOptions, NewColumnTransform, WriteDestination};
 use lance::dataset::{
     Dataset as LanceDataset, DeleteBuilder, ReadParams, UpdateBuilder, Version, VersionRef,
     fragment::FileFragment as LanceFileFragment,
@@ -106,6 +106,7 @@ use self::cleanup::{
 use self::commit::PyCommitLock;
 use self::delta::DatasetDeltaBuilder;
 use self::io_stats::IoStats;
+use self::retention_lease::PyRetentionLease;
 use self::sql::SqlQueryBuilder;
 use self::write::{PyWriteDest, transforms_from_python};
 
@@ -119,6 +120,7 @@ pub(crate) mod merge_insert;
 pub mod optimize;
 pub mod optimize_indices;
 mod replayable;
+pub(crate) mod retention_lease;
 pub(crate) mod sql;
 pub mod stats;
 pub(crate) mod write;
@@ -1931,6 +1933,65 @@ impl Dataset {
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(())
+    }
+
+    #[pyo3(signature = (ttl, label = None))]
+    fn acquire_retention_lease(
+        &self,
+        py: Python<'_>,
+        ttl: std::time::Duration,
+        label: Option<String>,
+    ) -> PyResult<(PyRetentionLease, Self)> {
+        let options = LeaseOptions { ttl, label };
+        let (lease, leased) = rt()
+            .block_on(Some(py), self.ds.acquire_retention_lease(options))?
+            .infer_error()?;
+        Ok((
+            lease.into(),
+            Self {
+                uri: leased.uri().to_string(),
+                ds: Arc::new(leased),
+            },
+        ))
+    }
+
+    fn checkout_lease(&self, py: Python<'_>, lease: PyRef<'_, PyRetentionLease>) -> PyResult<Self> {
+        let leased = rt()
+            .block_on(Some(py), self.ds.checkout_lease(&lease.inner))?
+            .infer_error()?;
+        Ok(Self {
+            uri: leased.uri().to_string(),
+            ds: Arc::new(leased),
+        })
+    }
+
+    fn renew_retention_lease(
+        &self,
+        py: Python<'_>,
+        lease: PyRef<'_, PyRetentionLease>,
+        ttl: std::time::Duration,
+    ) -> PyResult<PyRetentionLease> {
+        rt().block_on(Some(py), self.ds.renew_retention_lease(&lease.inner, ttl))?
+            .infer_error()
+            .map(PyRetentionLease::from)
+    }
+
+    fn release_retention_lease(
+        &self,
+        py: Python<'_>,
+        lease: PyRef<'_, PyRetentionLease>,
+    ) -> PyResult<()> {
+        rt().block_on(Some(py), self.ds.release_retention_lease(&lease.inner))?
+            .infer_error()
+    }
+
+    fn retention_leases(&self) -> Vec<PyRetentionLease> {
+        self.ds
+            .retention_leases()
+            .iter()
+            .cloned()
+            .map(PyRetentionLease::from)
+            .collect()
     }
 
     /// Truncate the dataset by deleting all rows. The schema is preserved and a new version is created.
