@@ -495,8 +495,8 @@ fn encode_page_f32(
     max_chunk: usize,
     raw_size: usize,
 ) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
-    let words = data.data.borrow_to_typed_slice::<u32>();
-    let Some(params) = select_params_f32(words.as_ref()) else {
+    let words = data.data.borrow_to_typed_view::<u32>();
+    let Some(params) = select_params_f32(&words) else {
         return Ok(None);
     };
 
@@ -507,7 +507,7 @@ fn encode_page_f32(
     let mut chunks = Vec::new();
     let mut compressed_size = 0usize;
 
-    for chunk in words.as_ref().chunks(max_chunk) {
+    for chunk in words.chunks(max_chunk) {
         let Some(encoded) = encode_chunk_f32(chunk, params)? else {
             return Ok(None);
         };
@@ -520,6 +520,9 @@ fn encode_page_f32(
         let exc_bytes = encoded.exception_bits.len();
         buf0.extend(encoded.packed_offsets);
         buf1.extend_from_slice(&encoded.header);
+        #[cfg(target_endian = "little")]
+        buf2.extend_from_slice(bytemuck::cast_slice(&encoded.exception_positions));
+        #[cfg(not(target_endian = "little"))]
         for pos in encoded.exception_positions {
             buf2.extend_from_slice(&pos.to_le_bytes());
         }
@@ -564,9 +567,9 @@ fn encode_page_f64(
     max_chunk: usize,
     raw_size: usize,
 ) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
-    let words = data.data.borrow_to_typed_slice::<u64>();
-    let Some(params) = select_params_f64(words.as_ref()) else {
-        return encode_page_f64_rd(words.as_ref(), max_chunk, raw_size);
+    let words = data.data.borrow_to_typed_view::<u64>();
+    let Some(params) = select_params_f64(&words) else {
+        return encode_page_f64_rd(&words, max_chunk, raw_size);
     };
 
     let mut buf0: Vec<u64> = Vec::new();
@@ -576,12 +579,12 @@ fn encode_page_f64(
     let mut chunks = Vec::new();
     let mut compressed_size = 0usize;
 
-    for chunk in words.as_ref().chunks(max_chunk) {
+    for chunk in words.chunks(max_chunk) {
         let Some(encoded) = encode_chunk_f64(chunk, params)? else {
-            return encode_page_f64_rd(words.as_ref(), max_chunk, raw_size);
+            return encode_page_f64_rd(&words, max_chunk, raw_size);
         };
         if encoded.total_bytes() > MAX_MINIBLOCK_BYTES as usize {
-            return encode_page_f64_rd(words.as_ref(), max_chunk, raw_size);
+            return encode_page_f64_rd(&words, max_chunk, raw_size);
         }
         let delta_bytes = encoded.packed_offsets.len() * 8;
         let header_bytes = encoded.header.len();
@@ -589,6 +592,9 @@ fn encode_page_f64(
         let exc_bytes = encoded.exception_bits.len();
         buf0.extend(encoded.packed_offsets);
         buf1.extend_from_slice(&encoded.header);
+        #[cfg(target_endian = "little")]
+        buf2.extend_from_slice(bytemuck::cast_slice(&encoded.exception_positions));
+        #[cfg(not(target_endian = "little"))]
         for pos in encoded.exception_positions {
             buf2.extend_from_slice(&pos.to_le_bytes());
         }
@@ -611,7 +617,7 @@ fn encode_page_f64(
     }
 
     if compressed_size >= raw_size {
-        return encode_page_f64_rd(words.as_ref(), max_chunk, raw_size);
+        return encode_page_f64_rd(&words, max_chunk, raw_size);
     }
     Ok(Some((
         MiniBlockCompressed {
@@ -831,7 +837,7 @@ fn backfill_exceptions<T: Copy>(encoded: &mut [T], exception_positions: &[u16]) 
 /// FOR-vs-Delta decision stays identical to packing both.
 #[cfg(feature = "bitpacking")]
 fn pack_chunk_f32(
-    encoded: Vec<i32>,
+    mut encoded: Vec<i32>,
     params: AlpParams,
     exception_positions: Vec<u16>,
     exception_bits: Vec<u8>,
@@ -879,11 +885,11 @@ fn pack_chunk_f32(
     };
 
     if for_len <= delta_len {
-        let offsets = encoded
-            .iter()
-            .map(|&v| v.wrapping_sub(min) as u32)
-            .collect();
-        let Some(packed) = pack_offsets_u32(offsets, for_width as usize) else {
+        // Transform `encoded` in place into unsigned FOR offsets (same 32-bit bit pattern).
+        for v in &mut encoded {
+            *v = v.wrapping_sub(min);
+        }
+        let Some(packed) = pack_i32_as_u32(encoded, for_width as usize) else {
             return Ok(None);
         };
         let mut header = Vec::with_capacity(8);
@@ -899,12 +905,13 @@ fn pack_chunk_f32(
             exception_bits,
         }))
     } else {
+        let first = encoded[0];
         let width = delta_bit_width as usize;
-        let offsets = encoded
-            .windows(2)
-            .map(|pair| (pair[1] as i128 - pair[0] as i128 - delta_min) as u32)
-            .collect();
-        let Some(packed) = pack_offsets_u32(offsets, width) else {
+        for i in 0..n - 1 {
+            encoded[i] = ((encoded[i + 1] as i128 - encoded[i] as i128 - delta_min) as u32) as i32;
+        }
+        encoded.truncate(n - 1);
+        let Some(packed) = pack_i32_as_u32(encoded, width) else {
             return Ok(None);
         };
         let mut header = Vec::with_capacity(12);
@@ -912,7 +919,7 @@ fn pack_chunk_f32(
         header.push(params.e);
         header.push(params.f);
         header.push(delta_bit_width);
-        header.extend_from_slice(&encoded[0].to_le_bytes());
+        header.extend_from_slice(&first.to_le_bytes());
         header.extend_from_slice(&(delta_min as i32).to_le_bytes());
         Ok(Some(EncodedChunk32 {
             packed_offsets: packed,
@@ -926,7 +933,7 @@ fn pack_chunk_f32(
 /// Pack the cheaper of the FOR and Delta offset streams.
 #[cfg(feature = "bitpacking")]
 fn pack_chunk_f64(
-    encoded: Vec<i64>,
+    mut encoded: Vec<i64>,
     params: AlpParams,
     exception_positions: Vec<u16>,
     exception_bits: Vec<u8>,
@@ -973,11 +980,11 @@ fn pack_chunk_f64(
     };
 
     if for_len <= delta_len {
-        let offsets = encoded
-            .iter()
-            .map(|&v| (v as i128 - min as i128) as u64)
-            .collect();
-        let Some(packed) = pack_offsets_u64(offsets, for_width as usize) else {
+        let min_u64 = min as u64;
+        for v in &mut encoded {
+            *v = (*v as u64).wrapping_sub(min_u64) as i64;
+        }
+        let Some(packed) = pack_i64_as_u64(encoded, for_width as usize) else {
             return Ok(None);
         };
         let mut header = Vec::with_capacity(12);
@@ -993,12 +1000,13 @@ fn pack_chunk_f64(
             exception_bits,
         }))
     } else {
+        let first = encoded[0];
         let width = delta_bit_width as usize;
-        let offsets = encoded
-            .windows(2)
-            .map(|pair| (pair[1] as i128 - pair[0] as i128 - delta_min) as u64)
-            .collect();
-        let Some(packed) = pack_offsets_u64(offsets, width) else {
+        for i in 0..n - 1 {
+            encoded[i] = ((encoded[i + 1] as i128 - encoded[i] as i128 - delta_min) as u64) as i64;
+        }
+        encoded.truncate(n - 1);
+        let Some(packed) = pack_i64_as_u64(encoded, width) else {
             return Ok(None);
         };
         let mut header = Vec::with_capacity(20);
@@ -1006,7 +1014,7 @@ fn pack_chunk_f64(
         header.push(params.e);
         header.push(params.f);
         header.push(delta_bit_width);
-        header.extend_from_slice(&encoded[0].to_le_bytes());
+        header.extend_from_slice(&first.to_le_bytes());
         header.extend_from_slice(&(delta_min as i64).to_le_bytes());
         Ok(Some(EncodedChunk64 {
             packed_offsets: packed,
@@ -1111,13 +1119,30 @@ fn encode_chunk_f64_rd(words: &[u64]) -> Option<EncodedRdChunk64> {
         return None;
     }
 
-    let mut best: Option<(u8, u8, Vec<u64>)> = None; // (d, index bits, sorted dict)
+    // Sort `words` once: for unsigned u64, `a <= b => (a >> d) <= (b >> d)` for every
+    // shift `d`, so each `RD_SWEEP` width can count distinct prefixes in a linear pass
+    // with zero heap allocations instead of sorting and deduplicating 17 times.
+    let mut stack_sorted = [0u64; 1024];
+    let mut heap_sorted: Vec<u64>;
+    let sorted: &mut [u64] = if n <= stack_sorted.len() {
+        stack_sorted[..n].copy_from_slice(words);
+        &mut stack_sorted[..n]
+    } else {
+        heap_sorted = words.to_vec();
+        heap_sorted.as_mut_slice()
+    };
+    sorted.sort_unstable();
+
+    let mut best: Option<(u8, u8, usize)> = None; // (d, index_bits, dict_len)
     let mut best_cost = usize::MAX;
     for &d in &RD_SWEEP {
-        let mut lefts: Vec<u64> = words.iter().map(|w| w >> d).collect();
-        lefts.sort_unstable();
-        lefts.dedup();
-        let dict_len = lefts.len();
+        let mut dict_len = 1usize;
+        let mut prev = sorted[0] >> d;
+        for &w in &sorted[1..] {
+            let cur = w >> d;
+            dict_len += usize::from(cur != prev);
+            prev = cur;
+        }
         let index_bits = bits_required_u128(dict_len as u128 - 1);
         let right_bytes = out_of_line_bytes(n, d as usize, 64);
         let index_bytes = if index_bits == 0 {
@@ -1128,30 +1153,78 @@ fn encode_chunk_f64_rd(words: &[u64]) -> Option<EncodedRdChunk64> {
         let cost = right_bytes + index_bytes + dict_len * 8 + 8;
         if cost < raw_bytes && cost <= MAX_MINIBLOCK_BYTES as usize && cost < best_cost {
             best_cost = cost;
-            best = Some((d, index_bits, lefts));
+            best = Some((d, index_bits, dict_len));
         }
     }
 
-    let (d, index_bits, dict) = best?;
+    let (d, index_bits, dict_len) = best?;
     let mask = (1u64 << d) - 1;
-    let right_values: Vec<u64> = words.iter().map(|w| w & mask).collect();
-    let right = pack_offsets_u64(right_values, d as usize)?;
+    let high_mask = !mask;
+
+    // Build the sorted dictionary (`(w >> d) << d == w & high_mask`) in one pass over `sorted`.
+    let mut dict = Vec::with_capacity(dict_len);
+    let mut prev_high = sorted[0] & high_mask;
+    dict.push(prev_high);
+    for &w in &sorted[1..] {
+        let cur_high = w & high_mask;
+        if cur_high != prev_high {
+            dict.push(cur_high);
+            prev_high = cur_high;
+        }
+    }
+    debug_assert_eq!(dict.len(), dict_len);
+
+    let mut scratch: Vec<u64> = words.iter().map(|&w| w & mask).collect();
+    let right = pack_offsets_u64(std::mem::take(&mut scratch), d as usize)?;
 
     let indices: Vec<u64> = if index_bits == 0 {
         Vec::new()
-    } else {
-        let mut position = std::collections::HashMap::with_capacity(dict.len());
-        for (i, &left) in dict.iter().enumerate() {
-            position.insert(left, i as u64);
+    } else if dict_len <= 1024 {
+        // Open-addressed stack hash table (load factor <= 0.5 since `dict_len <= 1024`
+        // for 8 KiB chunks), avoiding `HashMap` heap allocation and SipHash per value.
+        const EMPTY: u16 = u16::MAX;
+        const HASH_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut slots = [EMPTY; 2048];
+        for (i, &high) in dict.iter().enumerate() {
+            let mut slot = (((high >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
+            while slots[slot] != EMPTY {
+                slot = (slot + 1) & 2047;
+            }
+            slots[slot] = i as u16;
         }
-        let index_values: Vec<u64> = words.iter().map(|&w| position[&(w >> d)]).collect();
+        let mut index_values = Vec::with_capacity(n);
+        for &w in words {
+            let high = w & high_mask;
+            let mut slot = (((w >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
+            let idx = loop {
+                let candidate = slots[slot] as usize;
+                if dict[candidate] == high {
+                    break candidate as u64;
+                }
+                slot = (slot + 1) & 2047;
+            };
+            index_values.push(idx);
+        }
+        pack_offsets_u64(index_values, index_bits as usize)?
+    } else {
+        let index_values: Vec<u64> = words
+            .iter()
+            .map(|&w| dict.binary_search(&(w & high_mask)).unwrap() as u64)
+            .collect();
         pack_offsets_u64(index_values, index_bits as usize)?
     };
 
-    let mut dict_bytes = Vec::with_capacity(dict.len() * 8);
-    for left in &dict {
-        dict_bytes.extend_from_slice(&(left << d).to_le_bytes());
-    }
+    #[cfg(target_endian = "little")]
+    let dict_bytes = bytemuck::cast_slice::<u64, u8>(&dict).to_vec();
+    #[cfg(not(target_endian = "little"))]
+    let dict_bytes = {
+        let mut bytes = Vec::with_capacity(dict.len() * 8);
+        for &high in &dict {
+            bytes.extend_from_slice(&high.to_le_bytes());
+        }
+        bytes
+    };
+
     let mut header = Vec::with_capacity(8);
     header.push(MODE_RD);
     header.push(d);
@@ -1198,7 +1271,7 @@ fn out_of_line_bytes(num_items: usize, bit_width: usize, bits_per_value: usize) 
 }
 
 #[cfg(feature = "bitpacking")]
-fn pack_offsets_u32(offsets: Vec<u32>, bit_width: usize) -> Option<Vec<u32>> {
+fn pack_i32_as_u32(offsets: Vec<i32>, bit_width: usize) -> Option<Vec<u32>> {
     if offsets.is_empty() || bit_width >= 32 {
         return None;
     }
@@ -1210,6 +1283,21 @@ fn pack_offsets_u32(offsets: Vec<u32>, bit_width: usize) -> Option<Vec<u32>> {
         block_info: BlockInfo::new(),
     };
     Some(bitpack_out_of_line_vec::<u32>(block, bit_width))
+}
+
+#[cfg(feature = "bitpacking")]
+fn pack_i64_as_u64(offsets: Vec<i64>, bit_width: usize) -> Option<Vec<u64>> {
+    if offsets.is_empty() || bit_width >= 64 {
+        return None;
+    }
+    let num_values = offsets.len() as u64;
+    let block = FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec(offsets),
+        bits_per_value: 64,
+        num_values,
+        block_info: BlockInfo::new(),
+    };
+    Some(bitpack_out_of_line_vec::<u64>(block, bit_width))
 }
 
 #[cfg(feature = "bitpacking")]
@@ -1526,7 +1614,7 @@ impl AlpMiniBlockDecompressor {
         };
         let offsets_buf = offsets_block
             .as_ref()
-            .map(|b| b.data.borrow_to_typed_slice::<u32>());
+            .map(|b| b.data.borrow_to_typed_view::<u32>());
         let offsets: &[u32] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
@@ -1578,7 +1666,7 @@ impl AlpMiniBlockDecompressor {
         };
         let offsets_buf = offsets_block
             .as_ref()
-            .map(|b| b.data.borrow_to_typed_slice::<u64>());
+            .map(|b| b.data.borrow_to_typed_view::<u64>());
         let offsets: &[u64] = offsets_buf.as_deref().unwrap_or(&[]);
 
         if delta {
@@ -1620,63 +1708,76 @@ impl AlpMiniBlockDecompressor {
             )));
         }
 
-        let unpack = |buffer: LanceBuffer, count: usize, width: usize| -> Result<Vec<u64>> {
-            if count == 0 {
-                return Ok(Vec::new());
-            }
-            let block = FixedWidthDataBlock {
-                data: buffer,
-                bits_per_value: 64,
-                num_values: count as u64,
-                block_info: BlockInfo::new(),
-            };
-            Ok(unpack_out_of_line::<u64>(block, count, width)
-                .data
-                .borrow_to_typed_slice::<u64>()
-                .as_ref()
-                .to_vec())
-        };
-
-        let rights = unpack(packed, n, header.d as usize)?;
-        let indices = if header.index_bits == 0 {
+        let mut out: Vec<u64> = if n == 0 {
             Vec::new()
         } else {
-            unpack(index_buffer, n, header.index_bits as usize)?
+            let rights_block = unpack_out_of_line::<u64>(
+                FixedWidthDataBlock {
+                    data: packed,
+                    bits_per_value: 64,
+                    num_values: n as u64,
+                    block_info: BlockInfo::new(),
+                },
+                n,
+                header.d as usize,
+            );
+            rights_block
+                .data
+                .into_buffer()
+                .into_vec::<u64>()
+                .unwrap_or_else(|buf| {
+                    LanceBuffer::from(buf)
+                        .borrow_to_typed_view::<u64>()
+                        .to_vec()
+                })
         };
 
-        let dict_words = dict_buffer_entries(&dict_buffer, header.dict_len);
-        let mut out = Vec::with_capacity(n);
+        let dict_view = dict_buffer.borrow_to_typed_view::<u64>();
+        let dict_words = &dict_view[..header.dict_len];
         if header.index_bits == 0 {
+            #[cfg(target_endian = "little")]
             let single = dict_words[0];
-            out.extend(rights.iter().map(|&r| single | r));
-        } else {
-            for (&idx, &right) in indices.iter().zip(rights.iter()) {
-                let dict = match dict_words.get(idx as usize) {
-                    Some(v) => *v,
-                    None => {
-                        return Err(Error::invalid_input("ALP-RD index out of bounds"));
-                    }
+            #[cfg(not(target_endian = "little"))]
+            let single = u64::from_le(dict_words[0]);
+            for right in &mut out {
+                *right |= single;
+            }
+        } else if n > 0 {
+            let indices_block = unpack_out_of_line::<u64>(
+                FixedWidthDataBlock {
+                    data: index_buffer,
+                    bits_per_value: 64,
+                    num_values: n as u64,
+                    block_info: BlockInfo::new(),
+                },
+                n,
+                header.index_bits as usize,
+            );
+            let indices = indices_block.data.borrow_to_typed_view::<u64>();
+            for (right, &idx) in out.iter_mut().zip(indices.iter()) {
+                let Some(&raw_dict) = dict_words.get(idx as usize) else {
+                    return Err(Error::invalid_input("ALP-RD index out of bounds"));
                 };
-                out.push(dict | right);
+                #[cfg(target_endian = "little")]
+                let dict = raw_dict;
+                #[cfg(not(target_endian = "little"))]
+                let dict = u64::from_le(raw_dict);
+                *right |= dict;
             }
         }
 
-        let mut bytes = Vec::with_capacity(n * 8);
-        for w in out {
-            bytes.extend_from_slice(&w.to_le_bytes());
+        #[cfg(not(target_endian = "little"))]
+        for w in &mut out {
+            *w = w.to_le();
         }
+
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(bytes),
+            data: LanceBuffer::reinterpret_vec(out),
             bits_per_value: 64,
             num_values: n as u64,
             block_info: BlockInfo::new(),
         }))
     }
-}
-
-fn dict_buffer_entries(dict_buffer: &LanceBuffer, dict_len: usize) -> Vec<u64> {
-    let words = dict_buffer.borrow_to_typed_slice::<u64>();
-    words.as_ref()[..dict_len].to_vec()
 }
 
 fn apply_exceptions(
@@ -2212,6 +2313,44 @@ mod tests {
         assert_eq!(compressed.data.len(), 4);
         assert!(matches!(
             encoding.compression.as_ref().unwrap(),
+            metadata::compressive_encoding::Compression::Alp(_)
+        ));
+    }
+
+    #[test]
+    fn test_alp_rd_single_and_multi_prefix_round_trip() {
+        // 1) Single shared high prefix (`index_bits == 0`).
+        let mut state = 0x517c_c1b7_2722_0a95_u64;
+        let single_prefix: Vec<f64> = (0..2048)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let bits = (0x3FF0_u64 << 48) | (state & ((1u64 << 48) - 1));
+                f64::from_bits(bits)
+            })
+            .collect();
+        let enc1 = round_trip_f64(&single_prefix);
+        assert!(matches!(
+            enc1.compression.as_ref().unwrap(),
+            metadata::compressive_encoding::Compression::Alp(_)
+        ));
+
+        // 2) 128 distinct 20-bit prefixes with random 44-bit suffixes to stress
+        //    the single-sort RD_SWEEP + stack open-addressed dictionary table.
+        let multi_prefix: Vec<f64> = (0..2048)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let prefix = 0x0003_FE00_u64.wrapping_add((i % 128) as u64);
+                let bits = (prefix << 44) | (state & ((1u64 << 44) - 1));
+                f64::from_bits(bits)
+            })
+            .collect();
+        let enc2 = round_trip_f64(&multi_prefix);
+        assert!(matches!(
+            enc2.compression.as_ref().unwrap(),
             metadata::compressive_encoding::Compression::Alp(_)
         ));
     }

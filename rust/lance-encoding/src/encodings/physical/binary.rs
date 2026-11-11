@@ -10,6 +10,7 @@
 //! is needed in the encoding description.
 
 use arrow_array::OffsetSizeTrait;
+use arrow_buffer::ToByteSlice;
 use byteorder::{ByteOrder, LittleEndian};
 use prost::Message;
 
@@ -150,17 +151,14 @@ fn chunk_offsets<N: OffsetSizeTrait>(
     let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
 
     for chunk in chunks_info {
-        let this_chunk_offsets: Vec<N> = offsets
-            [chunk.chunk_start_offset_in_orig_idx..=chunk.chunk_last_offset_in_orig_idx]
-            .iter()
-            .map(|offset| {
-                *offset - offsets[chunk.chunk_start_offset_in_orig_idx]
-                    + N::from_usize(chunk.bytes_start_offset).unwrap()
-            })
-            .collect();
-
-        let this_chunk_offsets = LanceBuffer::reinterpret_vec(this_chunk_offsets);
-        output.extend_from_slice(&this_chunk_offsets);
+        let base_offset = offsets[chunk.chunk_start_offset_in_orig_idx];
+        let start_offset = N::from_usize(chunk.bytes_start_offset).unwrap();
+        for &offset in
+            &offsets[chunk.chunk_start_offset_in_orig_idx..=chunk.chunk_last_offset_in_orig_idx]
+        {
+            let rebased = offset - base_offset + start_offset;
+            output.extend_from_slice(rebased.to_byte_slice());
+        }
 
         let start_in_orig = offsets[chunk.chunk_start_offset_in_orig_idx]
             .to_usize()
@@ -346,8 +344,18 @@ fn build_generic_chunks<N: OffsetSizeTrait>(
     codec: &SequenceBlockCodec,
 ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
     let bytes_per_offset = (data.bits_per_offset / 8) as usize;
-    let mut offset_data = Vec::new();
+    let mut offset_data = if codec.has_payload() {
+        Vec::with_capacity(
+            (data.num_values as usize)
+                .saturating_add(ranges.len())
+                .saturating_mul(bytes_per_offset),
+        )
+    } else {
+        Vec::new()
+    };
+    let mut contiguous_range: Option<std::ops::Range<usize>> = None;
     let mut value_data = Vec::new();
+    let mut is_contiguous = true;
     let mut chunks = Vec::with_capacity(ranges.len());
     let mut actual_encoding = None;
 
@@ -399,7 +407,22 @@ fn build_generic_chunks<N: OffsetSizeTrait>(
                 Error::invalid_input("Variable value payload exceeds u32::MAX bytes")
             })?,
         );
-        value_data.extend_from_slice(value_bytes);
+        if is_contiguous {
+            match &mut contiguous_range {
+                None => contiguous_range = Some(value_range),
+                Some(prev) if prev.end == value_range.start => prev.end = value_range.end,
+                Some(prev) => {
+                    is_contiguous = false;
+                    let prev_slice = &data.data[prev.clone()];
+                    value_data.reserve(prev_slice.len() + value_bytes.len());
+                    value_data.extend_from_slice(prev_slice);
+                    value_data.extend_from_slice(value_bytes);
+                    contiguous_range = None;
+                }
+            }
+        } else {
+            value_data.extend_from_slice(value_bytes);
+        }
         let num_values = range.end_offset_index - range.start_offset_index;
         chunks.push(MiniBlockChunk {
             log_num_values: if index + 1 == ranges.len() {
@@ -415,7 +438,12 @@ fn build_generic_chunks<N: OffsetSizeTrait>(
     if codec.has_payload() {
         buffers.push(LanceBuffer::from(offset_data));
     }
-    buffers.push(LanceBuffer::from(value_data));
+    let values_buffer = if let Some(range) = contiguous_range {
+        data.data.slice_with_length(range.start, range.len())
+    } else {
+        LanceBuffer::from(value_data)
+    };
+    buffers.push(values_buffer);
     let offsets_encoding = actual_encoding.ok_or_else(|| {
         Error::internal("Variable-width page did not contain an offset chunk".to_string())
     })?;
@@ -2355,5 +2383,35 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("too small"), "{err}");
+    }
+
+    #[test]
+    fn test_binary_miniblock_shares_contiguous_value_buffer() {
+        use crate::data::{BlockInfo, DataBlock, VariableWidthBlock};
+        use crate::encodings::logical::primitive::miniblock::{
+            MiniBlockCompressionContext, MiniBlockCompressor,
+        };
+
+        let num_values = 512usize;
+        let payload: Vec<u8> = (0..(num_values * 32)).map(|i| (i % 251) as u8).collect();
+        let offsets: Vec<i32> = (0..=num_values).map(|i| (i * 32) as i32).collect();
+        let data_buf = LanceBuffer::from(payload);
+        let orig_ptr = data_buf.as_ptr();
+        let block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: data_buf,
+            bits_per_offset: 32,
+            offsets: LanceBuffer::reinterpret_vec(offsets),
+            num_values: num_values as u64,
+            block_info: BlockInfo::new(),
+        });
+
+        let encoder = super::BinaryMiniBlockEncoder::with_generic_offsets(
+            Some(4096),
+            crate::compression_config::CompressionFieldParams::default(),
+        );
+        let ctx = MiniBlockCompressionContext::new(0, true, true);
+        let (compressed, _) = encoder.compress(ctx, block).unwrap();
+        assert!(compressed.chunks.len() > 1);
+        assert_eq!(compressed.data.last().unwrap().as_ptr(), orig_ptr);
     }
 }
