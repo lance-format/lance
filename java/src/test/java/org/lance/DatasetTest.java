@@ -590,6 +590,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
