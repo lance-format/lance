@@ -3697,6 +3697,126 @@ async fn test_branch() {
     assert!(branches.is_empty());
 }
 
+/// Delays every read under `_versions/` and records how many are in flight at once.
+#[derive(Debug, Default)]
+struct ManifestReadProbe {
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl lance_io::object_store::WrappingObjectStore for ManifestReadProbe {
+    fn wrap(&self, _prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore> {
+        Arc::new(ManifestReadProbeStore {
+            inner: original,
+            in_flight: self.in_flight.clone(),
+            peak_in_flight: self.peak_in_flight.clone(),
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct ManifestReadProbeStore {
+    inner: Arc<dyn OSObjectStore>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Display for ManifestReadProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ManifestReadProbeStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for ManifestReadProbeStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        if !path.as_ref().contains("_versions/") {
+            return self.inner.get_opts(path, options).await;
+        }
+        let in_flight = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        self.peak_in_flight
+            .fetch_max(in_flight, AtomicOrdering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let result = self.inner.get_opts(path, options).await;
+        self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test]
+async fn test_versions_reads_manifests_concurrently() {
+    const VERSIONS: i32 = 12;
+
+    let mut dataset = Dataset::write(id_rows(0, 1), "memory://", None)
+        .await
+        .unwrap();
+    for i in 1..VERSIONS {
+        dataset.append(id_rows(i, 1), None).await.unwrap();
+    }
+
+    let probe = Arc::new(ManifestReadProbe::default());
+    let dataset = dataset.with_object_store_wrappers(vec![
+        probe.clone() as Arc<dyn lance_io::object_store::WrappingObjectStore>
+    ]);
+    let versions = dataset.versions().await.unwrap();
+
+    let ids: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    assert_eq!(ids, (1..=VERSIONS as u64).collect::<Vec<_>>());
+    assert!(
+        probe.peak_in_flight.load(AtomicOrdering::SeqCst) > 1,
+        "manifests were read one at a time"
+    );
+}
+
 fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
     gen_batch()
         .col("id", array::step_custom::<Int32Type>(start, 1))

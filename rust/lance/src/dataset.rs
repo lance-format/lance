@@ -3098,17 +3098,15 @@ impl Dataset {
         let mut versions: Vec<Version> = self
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
+            .map_ok(|location| async move {
                 let manifest_size = location.size;
-                match read_manifest(&self.object_store, &location.path, manifest_size).await {
-                    Ok(manifest) => {
-                        let mut version = Version::from(&manifest);
-                        version.manifest_size = manifest_size;
-                        Ok(Some(version))
-                    }
-                    Err(e) => Err(e),
-                }
+                let manifest =
+                    read_manifest(&self.object_store, &location.path, manifest_size).await?;
+                let mut version = Version::from(&manifest);
+                version.manifest_size = manifest_size;
+                Ok(version)
             })
+            .try_buffer_unordered(self.object_store.io_parallelism())
             .try_collect()
             .await?;
 
