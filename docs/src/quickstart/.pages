@@ -1,14 +1,10 @@
 nav:
-  - Overview: index.md
-  - Database:
-    - LanceDB: lancedb.md
-  - Language SDKs:
-    - Python (PyLance):
-      - Getting Started: pylance.md
-      - Versioning: versioning.md
-      - Vector Search: vector-search.md
-      - Full-Text Search: full-text-search.md
-    - Rust: rust.md
-    - Java: java.md
-  - Query & Compute Engines:
-    - Apache Spark: spark.md
+  - LanceDB: index.md
+  - Apache Spark: spark.md
+  - PyLance:
+    - Getting Started: pylance.md
+    - Versioning: versioning.md
+    - Vector Search: vector-search.md
+    - Full-Text Search: full-text-search.md
+  - Rust: rust.md
+  - Java: java.md

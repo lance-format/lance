@@ -5,7 +5,7 @@ use super::super::IVFIndex;
 use super::native_resident_tests::open_with_session;
 use super::native_storage_tests::*;
 use super::*;
-use crate::index::vector::ivf::v2::rabit_scan::RabitCacheLayout;
+use crate::index::vector::ivf::v2::rabit_scan::{RabitCacheLayout, RabitScanScope};
 use crate::session::Session;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
@@ -447,9 +447,10 @@ async fn test_rabit_raw_cache_survives_fragment_reuse(
         } else {
             crate::session::ResidentColumnsSetting::Off
         })
-        .with_rabit_scan_factory(Arc::new(SurvivorScanFactory {
-            index: ExIndex::Compact,
-        }));
+        .with_rabit_scan_factory(Arc::new(NativeScanFactory::Survivors(
+            ExIndex::Compact,
+            RabitScanScope::Query,
+        )));
     let mut dataset = open_with_session(dir.as_str(), session).await;
     let original = dataset
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
@@ -668,16 +669,19 @@ async fn test_rabit_raw_cache_survives_fragment_reuse(
 #[case::compaction(false)]
 #[case::stable_partition(true)]
 #[tokio::test]
-async fn test_survivor_scoring_through_fragment_reuse(
+async fn test_native_strategy_scoring_through_fragment_reuse(
     #[case] tagged: bool,
-    #[values(ExIndex::Identity, ExIndex::Compact)] index: ExIndex,
+    #[values(
+        NativeScanFactory::Whole(RabitCacheLayout::Planes),
+        NativeScanFactory::Survivors(ExIndex::Identity, RabitScanScope::Query),
+        NativeScanFactory::Survivors(ExIndex::Compact, RabitScanScope::Query)
+    )]
+    factory: NativeScanFactory,
     #[values(false, true)] filtered: bool,
     #[values(ApproxMode::Normal, ApproxMode::Accurate)] mode: ApproxMode,
 ) {
     let dir = TempStrDir::default();
-    let session = Arc::new(
-        Session::default().with_rabit_scan_factory(Arc::new(SurvivorScanFactory { index })),
-    );
+    let session = Arc::new(Session::default().with_rabit_scan_factory(Arc::new(factory)));
     let (mut dataset, batch) = native_fixture(dir.as_str()).await;
     let uuid = dataset.load_indices().await.unwrap()[0].uuid;
     // Search for a deleted row: admitting its stale entry into the heap would
@@ -772,6 +776,9 @@ async fn test_survivor_scoring_through_fragment_reuse(
         .await
         .unwrap();
     for k in [8, 256] {
+        if k == 256 {
+            lazy.prewarm().await.unwrap();
+        }
         let mut query = lazy_test_query(key.clone(), k, 4);
         query.approx_mode = mode;
         let expected = search_global(&ordinary, &query, filter.clone())
@@ -813,23 +820,31 @@ async fn test_survivor_scoring_through_fragment_reuse(
     }
 }
 
-#[derive(Debug, Clone)]
-struct SurvivorScanFactory {
-    index: ExIndex,
+#[derive(Debug, Clone, Copy)]
+enum NativeScanFactory {
+    Whole(RabitCacheLayout),
+    Survivors(ExIndex, RabitScanScope),
 }
 
-impl super::super::rabit_scan::RabitScanFactory for SurvivorScanFactory {
+impl super::super::rabit_scan::RabitScanFactory for NativeScanFactory {
     fn create(
         &self,
         _file: &IndexFileKey,
         _origin: OriginLatencyClass,
     ) -> Result<Arc<dyn super::super::rabit_scan::RabitScan>> {
-        Ok(Arc::new(self.clone()))
+        Ok(Arc::new(*self))
     }
 }
 
 #[async_trait]
-impl super::super::rabit_scan::RabitScan for SurvivorScanFactory {
+impl super::super::rabit_scan::RabitScan for NativeScanFactory {
+    fn cache_layout(&self) -> RabitCacheLayout {
+        match self {
+            Self::Whole(layout) => *layout,
+            Self::Survivors(_, _) => RabitCacheLayout::Planes,
+        }
+    }
+
     async fn search(
         &self,
         context: Arc<super::super::rabit_scan::RabitScanContext>,
@@ -839,63 +854,171 @@ impl super::super::rabit_scan::RabitScan for SurvivorScanFactory {
             std::collections::BinaryHeap::new();
         for probe in context.probes.clone() {
             let partition = context.partitions.value(probe) as usize;
-            let sign = context
-                .prepare_sign_partition(partition, context.centroid_distances.value(probe))
-                .await?
-                .expect("fixture supports native sign preparation");
-            let mut survivors = Vec::new();
-            let mut counts = StagePruneCounts::default();
-            select_full_survivors(
-                &sign.stage.lower_bounds,
-                sign.accept.as_deref(),
-                context.query.upper_bound,
-                heap.peek()
-                    .filter(|_| {
-                        heap.len()
-                            >= context.query.k * context.query.refine_factor.unwrap_or(1) as usize
-                    })
-                    .map(|node| node.dist.0),
-                &mut survivors,
-                &mut counts,
-            );
-            let gathered = match self.index {
-                ExIndex::Identity => GatheredRabitEx::Native {
-                    batch: context
-                        .storage()
-                        .load_plane(partition, 1, context.cache(), context.metrics.io_stats())
-                        .await?,
-                    index: self.index,
-                    source: None,
-                    origin_row_reads: 0,
-                },
-                ExIndex::Compact => {
-                    context
-                        .storage()
-                        .gather_rabit_ex_rows(
+            match self {
+                Self::Whole(_) => {
+                    let prepared = context
+                        .prepare_partition(partition, context.centroid_distances.value(probe))
+                        .await?;
+                    context.score_partition(prepared, &mut heap)?;
+                }
+                Self::Survivors(index, scope) => {
+                    let sign = context
+                        .prepare_sign_partition_with_scope(
                             partition,
-                            &survivors,
-                            GatherPlan {
-                                planes: [PlaneSource::Sparse; 2],
-                                origin_whole: [false; 2],
-                            },
-                            None,
-                            context.cache(),
-                            context.metrics.io_stats(),
+                            context.centroid_distances.value(probe),
+                            *scope,
                         )
                         .await?
+                        .expect("fixture supports native sign preparation");
+                    let mut survivors = Vec::new();
+                    let mut counts = StagePruneCounts::default();
+                    select_full_survivors(
+                        &sign.stage.lower_bounds,
+                        sign.accept.as_deref(),
+                        context.query.upper_bound,
+                        heap.peek()
+                            .filter(|_| {
+                                heap.len()
+                                    >= context.query.k
+                                        * context.query.refine_factor.unwrap_or(1) as usize
+                            })
+                            .map(|node| node.dist.0),
+                        &mut survivors,
+                        &mut counts,
+                    );
+                    let gathered = match index {
+                        ExIndex::Identity => GatheredRabitEx::Native {
+                            batch: context
+                                .storage()
+                                .load_plane(
+                                    partition,
+                                    1,
+                                    context.cache(),
+                                    context.metrics.io_stats(),
+                                )
+                                .await?,
+                            index: *index,
+                            source: None,
+                            origin_row_reads: 0,
+                        },
+                        ExIndex::Compact => {
+                            context
+                                .storage()
+                                .gather_rabit_ex_rows(
+                                    partition,
+                                    &survivors,
+                                    GatherPlan {
+                                        planes: [PlaneSource::Sparse; 2],
+                                        origin_whole: [false; 2],
+                                    },
+                                    None,
+                                    context.cache(),
+                                    context.metrics.io_stats(),
+                                )
+                                .await?
+                        }
+                    };
+                    context.score_rabit_survivors(
+                        &sign,
+                        &survivors,
+                        counts,
+                        &gathered,
+                        &mut heap,
+                        |_| {},
+                    )?;
                 }
-            };
-            context.score_rabit_survivors(
-                &sign,
-                &survivors,
-                counts,
-                &gathered,
-                &mut heap,
-                |_| {},
-            )?;
+            }
         }
         Ok(Some(context.finish(heap)?))
     }
+}
+
+#[rstest]
+#[case::partition(RabitCacheLayout::Partition)]
+#[case::planes(RabitCacheLayout::Planes)]
+#[tokio::test]
+async fn test_whole_scoring_reuses_selected_prewarm(#[case] layout: RabitCacheLayout) {
+    struct IoMetrics(lance_io::scheduler::IoStats);
+    impl lance_index::metrics::MetricsCollector for IoMetrics {
+        fn record_parts_loaded(&self, _: usize) {}
+        fn record_index_loads(&self, _: usize) {}
+        fn record_comparisons(&self, _: usize) {}
+        fn io_stats(&self) -> Option<lance_io::scheduler::IoStats> {
+            Some(self.0.clone())
+        }
+    }
+    let dir = TempStrDir::default();
+    let (dataset, batch) = native_fixture(dir.as_str()).await;
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 8, 4);
+    let ordinary = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let expected = search_global(&ordinary, &query, Arc::new(NoFilter))
+        .await
+        .unwrap();
+    let truth =
+        super::ground_truth(&dataset, "vector", query.key.as_ref(), 8, DistanceType::L2).await;
+    let configured = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(Arc::new(NativeScanFactory::Whole(layout))),
+    )
+    .await;
+    let index = configured
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(
+        lazy_index(&index).uses_rabit_plane_cache(),
+        layout == RabitCacheLayout::Planes
+    );
+    index.prewarm().await.unwrap();
+    let (partitions, distances) = index.find_partitions(&query).unwrap();
+    let io = lance_io::scheduler::IoStats::new();
+    for &partition in partitions.values() {
+        lazy_index(&index)
+            .load_query_partition(partition as usize, &IoMetrics(io.clone()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        io.snapshot().bytes_read,
+        0,
+        "ordinary reader consumes prewarmed cache"
+    );
+    let actual = index
+        .search_partitions(
+            query,
+            Arc::new(partitions),
+            Arc::new(distances),
+            0,
+            4,
+            Arc::new(NoFilter),
+            None,
+            Arc::new(IoMetrics(io.clone())),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        io.snapshot().bytes_read,
+        0,
+        "whole scoring consumes prewarmed cache"
+    );
+    assert_eq!(actual.len(), 1);
+    assert_eq!(result_bits(&actual[0]), result_bits(&expected));
+    assert!(
+        result_bits(&actual[0])
+            .0
+            .iter()
+            .filter(|id| truth.contains(id))
+            .count()
+            >= 4,
+        "recall must be >= 0.5"
+    );
 }
 
 #[rstest]
@@ -903,10 +1026,15 @@ impl super::super::rabit_scan::RabitScan for SurvivorScanFactory {
 #[case::unit_refinement(Some(1), 8)]
 #[case::oversampled(Some(3), 24)]
 #[tokio::test]
-async fn test_survivor_scoring_preserves_refinement_candidates(
+async fn test_native_strategy_scoring_preserves_refinement_candidates(
     #[case] refine_factor: Option<u32>,
     #[case] candidate_count: usize,
-    #[values(ExIndex::Identity, ExIndex::Compact)] index: ExIndex,
+    #[values(
+        NativeScanFactory::Whole(RabitCacheLayout::Planes),
+        NativeScanFactory::Survivors(ExIndex::Identity, RabitScanScope::Query),
+        NativeScanFactory::Survivors(ExIndex::Compact, RabitScanScope::Query)
+    )]
+    factory: NativeScanFactory,
 ) {
     let dir = TempStrDir::default();
     let (dataset, batch) = native_fixture(dir.as_str()).await;
@@ -923,7 +1051,7 @@ async fn test_survivor_scoring_preserves_refinement_candidates(
     assert_eq!(expected.num_rows(), candidate_count);
     let configured = open_with_session(
         dir.as_str(),
-        Session::default().with_rabit_scan_factory(Arc::new(SurvivorScanFactory { index })),
+        Session::default().with_rabit_scan_factory(Arc::new(factory)),
     )
     .await;
     let strategy = configured
@@ -1027,9 +1155,11 @@ async fn test_rabit_scan_factory_rebinds_from_current_session(
         behavior: TestScanBehavior::Full,
         cache_layout,
     });
+    assert!(session().rabit_scan_factory().is_none());
+    let configured = session().with_rabit_scan_factory(original.clone());
     let installed = open_with_session(
         dir.as_str(),
-        session().with_rabit_scan_factory(original.clone()),
+        session().with_rabit_scan_factory(configured.rabit_scan_factory().unwrap()),
     )
     .await;
     let mut expected = None;
@@ -1126,4 +1256,178 @@ async fn test_rabit_scan_factory_rebinds_from_current_session(
         }
         TestScanBehavior::OpenError => unreachable!(),
     }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_partition_survivors_preserve_native_batches(
+    #[values(false, true)] filtered: bool,
+    #[values(false, true)] compact: bool,
+    #[values(false, true)] tied: bool,
+    #[values(ExIndex::Identity, ExIndex::Compact)] ex_index: ExIndex,
+) {
+    let dir = TempStrDir::default();
+    let (mut dataset, mut batch) = native_fixture(dir.as_str()).await;
+    if tied {
+        let offsets = UInt32Array::from((0..256).map(|i| i % 4).collect::<Vec<u32>>());
+        batch = RecordBatch::try_new(
+            batch.schema(),
+            vec![
+                arrow::compute::take(&batch["vector"], &offsets, None).unwrap(),
+                batch["i"].clone(),
+            ],
+        )
+        .unwrap();
+        dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 64,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = VectorIndexParams::with_ivf_rq_params(
+            DistanceType::L2,
+            IvfBuildParams::try_with_centroids(
+                4,
+                Arc::new(batch["vector"].as_fixed_size_list().slice(0, 4)),
+            )
+            .unwrap(),
+            RQBuildParams::new(7),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+    }
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    if compact {
+        dataset.delete("i % 17 = 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let ordinary = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let configured = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(Arc::new(NativeScanFactory::Survivors(
+            ex_index,
+            RabitScanScope::Partition,
+        ))),
+    )
+    .await;
+    let strategy = configured
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let predicate = if filtered { "i % 3 = 0" } else { "true" };
+    let live = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let filter: Arc<dyn PreFilter> = if filtered {
+        let mask = Arc::new(RowAddrMask::AllowList(
+            live[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect(),
+        ));
+        Arc::new(DatasetPreFilter::new_with_filter_future(
+            Arc::new(dataset.clone()),
+            &dataset.load_indices().await.unwrap(),
+            Some(async move { Ok(mask) }.boxed()),
+        ))
+    } else {
+        Arc::new(DatasetPreFilter::new(
+            Arc::new(dataset.clone()),
+            &dataset.load_indices().await.unwrap(),
+            None,
+        ))
+    };
+    let mut query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 5, 4);
+    query.refine_factor = Some(3);
+    let (partitions, distances) = ordinary.find_partitions(&query).unwrap();
+    let partitions = Arc::new(partitions);
+    let distances = Arc::new(distances);
+    let mut found = Vec::new();
+    for rank in 0..partitions.len() {
+        let mut partition_query = query.clone();
+        partition_query.dist_q_c = distances.value(rank);
+        let expected = ordinary
+            .search_in_partition(
+                partitions.value(rank) as usize,
+                &partition_query,
+                filter.clone(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let actual = strategy
+            .clone()
+            .search_partitions(
+                query.clone(),
+                partitions.clone(),
+                distances.clone(),
+                rank,
+                rank + 1,
+                filter.clone(),
+                None,
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(
+            result_bits(&actual[0]),
+            result_bits(&expected),
+            "rank={rank}, filtered={filtered}, compact={compact}, tied={tied}"
+        );
+        assert!(actual[0].num_rows() <= 15);
+        found.extend(result_bits(&actual[0]).0);
+    }
+    let truth = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .nearest("vector", query.key.as_ref(), 5)
+        .unwrap()
+        .prefilter(true)
+        .use_index(false)
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert!(
+        truth[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .filter(|id| found.contains(id))
+            .count()
+            >= 3,
+        "recall must be >= 0.5"
+    );
 }

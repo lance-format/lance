@@ -20,10 +20,11 @@ use itertools::Itertools;
 #[cfg(feature = "bitpacking")]
 use lance_bitpacking::BitPackingUninit;
 use lance_core::Result;
-use lance_core::cache::{Context, DeepSizeOf};
+use lance_core::cache::{Context, DeepSizeOf, LanceCache};
 use lance_core::error::Error;
 use lance_core::utils::bit::pad_bytes;
 
+use super::structure::{StructuralMetadataIo, StructuralProjection};
 use crate::EncodingsIo;
 use crate::buffer::LanceBuffer;
 use crate::compression::{BlockDecompressor, DecompressionStrategy, MiniBlockDecompressor};
@@ -36,6 +37,8 @@ use crate::encodings::physical::bitpacking::InlineBitpacking;
 use crate::format::metadata::compressive_encoding::Compression;
 use crate::format::{EncodingUtils, metadata};
 use crate::repdef::{DefinitionInterpretation, LevelBuffer, RepDefUnraveler, max_visible_level};
+
+mod structure;
 
 use super::chunk_index::{
     ItemCounts, MiniBlockChunkIndex, PrefixSums, RowMapping, parse_nested_rep,
@@ -70,6 +73,7 @@ struct MiniBlockChunkSections {
 /// the decoding of the block. (TODO: test this theory)
 #[derive(Debug)]
 struct DecodeMiniBlockTask {
+    structural_projection: Option<StructuralProjection>,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -723,9 +727,14 @@ impl DecodeMiniBlockTask {
             num_levels,
         )?;
 
-        let values = self
-            .value_decompressor
-            .decompress(value_buffers, items_in_chunk)?;
+        let values = if self.structural_projection.is_some() {
+            DataBlock::AllNull(crate::data::AllNullDataBlock {
+                num_values: items_in_chunk,
+            })
+        } else {
+            self.value_decompressor
+                .decompress(value_buffers, items_in_chunk)?
+        };
 
         let rep = rep
             .map(|rep| {
@@ -767,6 +776,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         #[cfg(feature = "bitpacking")]
         if self.rep_decompressor.is_none()
+            && self.structural_projection.is_none()
             && self.def_decompressor.is_none()
             && self.dictionary_data.is_none()
             && self.num_buffers == 1
@@ -866,6 +876,11 @@ impl DecodePageTask for DecodeMiniBlockTask {
         }
 
         let mut data = data_builder.finish();
+        if let Some(projection) = &self.structural_projection {
+            // Slice and concatenate structural item counts before constructing
+            // one type-correct placeholder array for the requested batch.
+            data = projection.placeholder_values(data.num_values())?;
+        }
 
         let unraveler =
             RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone(), data.num_values());
@@ -897,6 +912,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 /// [`PrimitiveStructuralEncoder`]: crate::encodings::logical::primitive::PrimitiveStructuralEncoder
 #[derive(Debug)]
 struct MiniBlockDecoder {
+    structural_projection: Option<StructuralProjection>,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -920,6 +936,11 @@ impl StructuralPageDecoder for MiniBlockDecoder {
     }
 
     fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if self.structural_projection.is_some() {
+            return Err(Error::not_supported(
+                "Byte planning is unavailable for structural list reads",
+            ));
+        }
         if num_rows == 0 {
             return Ok(0);
         }
@@ -1101,6 +1122,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         let max_visible_level = max_visible_level(&self.def_meaning);
 
         Ok(Box::new(DecodeMiniBlockTask {
+            structural_projection: self.structural_projection.clone(),
             instructions: drain_instructions,
             def_decompressor: self.def_decompressor.clone(),
             rep_decompressor: self.rep_decompressor.clone(),
@@ -1181,6 +1203,8 @@ impl CachedPageData for MiniBlockCacheableState {
 /// `ChunkDrainInstructions`.
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
+    pub(super) structural_projection: Option<StructuralProjection>,
+    structural_cache: Option<Arc<LanceCache>>,
     // These come from the protobuf
     pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
@@ -1240,7 +1264,15 @@ impl MiniBlockScheduler {
                 .into();
             let dictionary_data_alignment = match dictionary_encoding.compression.as_ref().unwrap()
             {
-                Compression::Variable(_) => 4,
+                // The header is two offsets wide, so this aligns the offsets too
+                Compression::Variable(variable) => match variable
+                    .offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.compression.as_ref())
+                {
+                    Some(Compression::Flat(offsets)) if offsets.bits_per_value == 64 => 8,
+                    _ => 4,
+                },
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
                 Compression::FixedSizeList(_) => 1,
@@ -1274,6 +1306,8 @@ impl MiniBlockScheduler {
 
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
+            structural_projection: None,
+            structural_cache: None,
             rep_decompressor,
             def_decompressor,
             value_decompressor: value_decompressor.into(),
@@ -1872,16 +1906,23 @@ fn build_chunk_index(
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
+    fn set_cache(&mut self, cache: Arc<LanceCache>) {
+        self.structural_cache = self.structural_projection.is_some().then_some(cache);
+    }
     fn init_layout(&self) -> Result<PageInitialization> {
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
         let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
-        let dictionary_range = self.dictionary.as_ref().map(|dictionary| {
-            dictionary.dictionary_buf_position_and_size.0
-                ..dictionary.dictionary_buf_position_and_size.0
-                    + dictionary.dictionary_buf_position_and_size.1
-        });
+        let dictionary_range = self
+            .dictionary
+            .as_ref()
+            .filter(|_| self.structural_projection.is_none())
+            .map(|dictionary| {
+                dictionary.dictionary_buf_position_and_size.0
+                    ..dictionary.dictionary_buf_position_and_size.0
+                        + dictionary.dictionary_buf_position_and_size.1
+            });
         let repetition_index_range = if self.repetition_index_depth > 0 {
             let (rep_index_pos, rep_index_size) =
                 self.buffer_offsets_and_sizes.last().ok_or_else(|| {
@@ -1936,6 +1977,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                         dictionary.num_dictionary_items,
                     )?))
                 }
+                (_, None) if self.structural_projection.is_some() => None,
                 (None, None) => None,
                 _ => {
                     return Err(Error::internal(
@@ -1995,7 +2037,20 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+        let loaded_chunk_data = if self.structural_projection.is_some() {
+            structure::read_chunks(
+                StructuralMetadataIo::wrap(io.clone(), self.structural_cache.clone()),
+                chunk_ranges,
+                self.num_buffers,
+                self.rep_decompressor.is_some(),
+                self.def_decompressor.is_some(),
+                self.has_large_chunk,
+                self.priority,
+            )
+        } else {
+            io.submit_request(chunk_ranges, self.priority)
+        };
+        let structural_projection = self.structural_projection.clone();
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -2015,6 +2070,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }
 
             Ok(Box::new(MiniBlockDecoder {
+                structural_projection,
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
@@ -2043,6 +2099,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
+    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use bytes::Bytes;
     #[cfg(feature = "bitpacking")]
     use lance_bitpacking::BitPacking;
@@ -2050,7 +2107,9 @@ mod tests {
     use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::{DefaultDecompressionStrategy, MiniBlockDecompressor};
+    use crate::compression::{
+        BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
+    };
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use crate::decoder::{DecodePageTask, StructuralPageDecoder};
     use crate::encodings::logical::primitive::chunk_index::{
@@ -2058,6 +2117,7 @@ mod tests {
     };
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
+    use crate::encodings::physical::binary::VariableEncoder;
     #[cfg(feature = "bitpacking")]
     use crate::encodings::physical::bitpacking::InlineBitpacking;
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
@@ -2105,6 +2165,7 @@ mod tests {
         chunk_data.resize(chunk_data.len() + expected_size as usize, 7);
 
         let task = DecodeMiniBlockTask {
+            structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: Arc::new(FixedWidthMiniBlockDecompressor),
@@ -2184,6 +2245,7 @@ mod tests {
         let values: Vec<&[u8]> = vec![b"aa", b"bb", b"ccc", b"d", b"eeeee"];
         let chunk_data = miniblock_chunk(&binary_value_buffer(&values));
         let mut decoder = MiniBlockDecoder {
+            structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
@@ -2225,6 +2287,7 @@ mod tests {
             block_info: BlockInfo::new(),
         }));
         let decoder = MiniBlockDecoder {
+            structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
@@ -2304,6 +2367,7 @@ mod tests {
             )
         };
         let make_task = |decompressor: Arc<dyn MiniBlockDecompressor>| DecodeMiniBlockTask {
+            structural_projection: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: decompressor,
@@ -3331,6 +3395,65 @@ mod tests {
         assert_eq!(dictionary.dictionary_data_alignment, 1);
     }
 
+    #[rstest]
+    #[case::utf8(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 4, false)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 8, true)]
+    fn test_miniblock_variable_dictionary_offsets_aligned(
+        #[case] values: ArrayRef,
+        #[case] offset_alignment: usize,
+        #[case] copied: bool,
+    ) {
+        let (payload, dictionary_encoding) = VariableEncoder::default()
+            .compress(DataBlock::from_array(values))
+            .unwrap();
+        let payload = payload.unwrap();
+        let layout = metadata::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(EncodingUtils::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: 3,
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: 3,
+            has_large_chunk: false,
+        };
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &[(0, 0), (0, 0), (0, 0)],
+            /*priority=*/ 0,
+            /*items_in_page=*/ 3,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+        let dictionary = scheduler.dictionary.unwrap();
+
+        // A read can return the dictionary 4 bytes past an 8-byte boundary
+        let mut padded = vec![0_u8; payload.len() + 8];
+        let start = (12 - padded.as_ptr() as usize % 8) % 8;
+        padded[start..start + payload.len()].copy_from_slice(&payload);
+        let bytes = Bytes::from(padded).slice(start..start + payload.len());
+        assert_eq!(bytes.as_ptr() as usize % 8, 4);
+        let header_len = 2 * offset_alignment;
+        let offsets_in_place = bytes.as_ptr().wrapping_add(header_len);
+
+        let decoded = dictionary
+            .dictionary_decompressor
+            .decompress(
+                Some(LanceBuffer::from_bytes(
+                    bytes,
+                    dictionary.dictionary_data_alignment,
+                )),
+                3,
+            )
+            .unwrap();
+
+        let offsets = &decoded.as_variable_width_ref().unwrap().offsets;
+        assert_eq!(offsets.as_ptr().align_offset(offset_alignment), 0);
+        assert_eq!(offsets.as_ptr() != offsets_in_place, copied);
+    }
+
     #[test]
     fn miniblock_levels_use_one_count_for_mixed_codecs() {
         let actual_num_levels = usize::from(u16::MAX) + 8;
@@ -3462,6 +3585,7 @@ mod tests {
                 bytes.resize(bytes.len().div_ceil(8) * 8, 0);
             }
             let task = DecodeMiniBlockTask {
+                structural_projection: None,
                 rep_decompressor: Some(codec.clone()),
                 def_decompressor: Some(codec),
                 value_decompressor: Arc::new(ValueDecompressor::from_flat(&metadata::Flat {

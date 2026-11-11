@@ -227,14 +227,21 @@ else
     warn_missing_repo "Lance Namespace Impls docs" "$namespace_impls_repo/docs/src"
 fi
 
+integration_entries=(
+)
+
+while IFS= read -r line; do
+    integration_entries+=("$line")
+done < <(sed -n '2,$p' "$docs_src/integrations/.pages")
+
 if copy_duckdb_docs "$duckdb_repo/docs" "$docs_src/integrations/duckdb"; then
-    :
+    integration_entries+=("  - DuckDB: duckdb")
 else
     warn_missing_repo "Lance DuckDB docs" "$duckdb_repo/docs"
 fi
 
 if copy_docs_dir "$huggingface_repo/docs/src" "$docs_src/integrations/huggingface"; then
-    :
+    integration_entries+=("  - Huggingface: huggingface")
 else
     warn_missing_repo "Lance HuggingFace docs" "$huggingface_repo/docs/src"
 fi
@@ -249,66 +256,41 @@ if path.exists():
     text = path.read_text()
     path.write_text(text.replace('https://lance.org/format/table/index/scalar/fts/#tokenizers', 'https://lance.org/format/index/scalar/fts/#tokenizers'))
 PY
+    integration_entries+=("  - Apache Spark: spark")
 else
     warn_missing_repo "Lance Spark docs" "$spark_repo/docs/src"
 fi
 
 if copy_docs_dir "$ray_repo/docs/src" "$docs_src/integrations/ray"; then
-    :
+    integration_entries+=("  - Ray: ray")
 else
     warn_missing_repo "Lance Ray docs" "$ray_repo/docs/src"
 fi
 
 if copy_docs_dir "$trino_repo/docs/src" "$docs_src/integrations/trino"; then
-    :
+    integration_entries+=("  - Trino: trino")
 else
     warn_missing_repo "Lance Trino docs" "$trino_repo/docs/src"
 fi
 
-has_context_docs=false
 if copy_docs_dir "$context_repo/docs/src" "$docs_src/integrations/context"; then
-    has_context_docs=true
+    integration_entries+=("  - Lance Context: context")
 else
     warn_missing_repo "Lance Context docs" "$context_repo/docs/src"
 fi
 
-has_flink_docs=false
 if copy_docs_dir "$flink_repo/docs/src" "$docs_src/integrations/flink"; then
-    has_flink_docs=true
+    integration_entries+=("  - Apache Flink: flink")
 else
     warn_missing_repo "Lance Flink docs" "$flink_repo/docs/src"
 fi
 
 {
-    cat <<'EOF'
-nav:
-  - Overview: index.md
-  - Database:
-    - LanceDB: https://docs.lancedb.com/
-  - Language SDKs:
-    - Python (PyLance): https://lance-format.github.io/lance-python-doc
-    - Rust (docs.rs): https://docs.rs/lance/latest/lance
-    - Java (Javadoc): https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html
-  - Query & Compute Engines:
-    - Apache Spark: spark
-    - DuckDB: duckdb
-    - Trino: trino
-    - Apache DataFusion: datafusion.md
-    - Ray: ray
-EOF
-    if [ "$has_flink_docs" = true ]; then
-        echo "    - Apache Flink: flink"
-    fi
-    cat <<'EOF'
-    - PostgreSQL: https://github.com/lance-format/pglance
-  - ML & AI Ecosystem:
-    - PyTorch: pytorch.md
-    - Hugging Face: huggingface
-    - TensorFlow: tensorflow.md
-EOF
-    if [ "$has_context_docs" = true ]; then
-        echo "    - Lance Context: context"
-    fi
+    echo "nav:"
+    for entry in "${integration_entries[@]}"; do
+        [ -n "$entry" ] || continue
+        echo "$entry"
+    done
 } > "$docs_src/integrations/.pages"
 
 mkdir -p "$docs_src/community/project-specific/lance"

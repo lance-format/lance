@@ -39,6 +39,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+lance-io = { workspace = true, features = ["test-util"] }
 lance-datagen.workspace = true
 lance-testing.workspace = true
 criterion.workspace = true
@@ -49,16 +50,9 @@ rand.workspace = true
 test-log.workspace = true
 libc.workspace = true
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [features]
-protoc = ["dep:protobuf-src"]
-
-[package.metadata.docs.rs]
-# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
-features = ["protoc"]
+# Retained for compatibility; protobuf sources are now checked in.
+protoc = []
 
 [[bench]]
 name = "reader"

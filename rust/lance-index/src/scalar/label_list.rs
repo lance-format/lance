@@ -1536,7 +1536,7 @@ mod tests {
     // Every LabelList build or update now sorts through DataFusion with spilling
     // enabled. Most tests below get that from the default, process-cached
     // session, whose pool `LANCE_MEM_POOL_SIZE` governs, and so share that
-    // resource group -- see the same pattern in btree.rs, json.rs and rtree.rs.
+    // resource group -- see the same pattern in btree.rs and json.rs.
     // The spill-forcing test below passes an explicit `mem_pool_size` for the
     // spilling half, but its baseline build goes through the default session
     // like everything else, so it joins the group too.
