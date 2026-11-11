@@ -27,25 +27,27 @@ use crate::Result;
 /// from the store's, so the margin only has to absorb skew between those clocks, not a
 /// stalled writer: the holder writes after it acquires. An hour is far beyond the skew of
 /// any synchronized clock and costs nothing but a short delay in reclaiming garbage.
-pub const LEASE_CLOCK_SKEW_MARGIN: TimeDelta = TimeDelta::hours(1);
+pub(crate) const LEASE_CLOCK_SKEW_MARGIN: TimeDelta = TimeDelta::hours(1);
 
 /// What the retention leases listed on a branch's latest version protect.
 ///
 /// Expired leases still listed count: cleanup never judges expiry, a commit removes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LeaseRetention {
+pub(crate) struct LeaseRetention {
     /// The oldest leased version. It and every later version must survive.
-    pub oldest_version: u64,
+    pub(crate) oldest_version: u64,
     /// Unreferenced files last modified at or after this may be a holder's staged output.
-    pub staged_files_since: DateTime<Utc>,
+    pub(crate) staged_files_since: DateTime<Utc>,
 }
 
 impl LeaseRetention {
     /// Read the leases listed on the latest version of `dataset`'s branch.
     ///
     /// The latest version's list is the authoritative one; a handle checked out at an
-    /// older version may not list a lease acquired since.
-    pub async fn resolve(dataset: &Dataset) -> Result<Option<Self>> {
+    /// older version may not list a lease acquired since. Cleanup reads its read
+    /// version's list instead; see the `lease_retention` field of its task for why that
+    /// suffices there.
+    pub(crate) async fn resolve(dataset: &Dataset) -> Result<Option<Self>> {
         // Expiry promises not to read manifests, so skip the read whenever the handle
         // already holds the latest one.
         let latest = if dataset.latest_version_id().await? == dataset.manifest.version {
@@ -55,10 +57,10 @@ impl LeaseRetention {
         };
         // A list that failed to decode must not read as "no leases".
         validate_retention_leases(&latest)?;
-        Ok(Self::from_leases(&latest.retention_leases))
+        Ok(Self::from_leases(latest.retention_leases()))
     }
 
-    pub fn from_leases(leases: &[RetentionLease]) -> Option<Self> {
+    pub(crate) fn from_leases(leases: &[RetentionLease]) -> Option<Self> {
         let oldest_version = leases.iter().map(RetentionLease::version).min()?;
         let oldest_created_at = leases.iter().map(RetentionLease::created_at).min()?;
         Some(Self {

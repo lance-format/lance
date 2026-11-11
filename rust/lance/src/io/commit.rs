@@ -1641,7 +1641,8 @@ pub(crate) async fn commit_detached_transaction(
 /// An operation that carries rows' lineage over from existing fragments needs
 /// their sequences at build time, and the build cannot read the ones spilled to
 /// data files; they are read here, per attempt, so a rebase onto a newer
-/// manifest sees that manifest's fragments.
+/// manifest sees that manifest's fragments. The lease clock
+/// ([`ManifestBuildConfig::now`]) is likewise read per attempt.
 async fn build_config_for_attempt(
     dataset: &Dataset,
     transaction: &Transaction,

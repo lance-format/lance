@@ -116,6 +116,30 @@ async fn records_stable_row_id_moves(
     Ok(true)
 }
 
+/// `options` with `defer_index_remap` set, when listed retention leases need
+/// this compaction to record its transitions and the tasks allow it.
+///
+/// This covers plans made before a lease was acquired; see
+/// `DefaultCompactionPlanner::deferring_under_leases` for the other layers. Tasks
+/// that recorded no row addresses cannot be deferred; the commit then refuses the
+/// rewrite if a lease requires its fragments, and the caller replans. Boxed
+/// because the options are large and held across every await of the commit.
+fn deferred_by_leases(
+    dataset: &Dataset,
+    completed_tasks: &[RewriteResult],
+    options: &CompactionOptions,
+) -> Option<Box<CompactionOptions>> {
+    (!options.defer_index_remap
+        && !dataset.manifest.retention_leases().is_empty()
+        && completed_tasks.iter().all(|task| task.row_addrs.is_some()))
+    .then(|| {
+        Box::new(CompactionOptions {
+            defer_index_remap: true,
+            ..options.clone()
+        })
+    })
+}
+
 /// Commit the results of file compaction.
 ///
 /// It is not required that all tasks are passed to this method. If some failed,
@@ -138,24 +162,8 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    // Listed retention leases require this compaction to record the
-    // transitions they need, which only the deferred path does. Tasks that
-    // recorded no row addresses cannot; the commit then refuses the rewrite
-    // if a lease requires its fragments, and the caller replans.
-    let deferred_by_leases;
-    let options = if !options.defer_index_remap
-        && !dataset.manifest.retention_leases.is_empty()
-        && completed_tasks.iter().all(|task| task.row_addrs.is_some())
-    {
-        // Boxed: the options are large and held across every await below.
-        deferred_by_leases = Box::new(CompactionOptions {
-            defer_index_remap: true,
-            ..options.clone()
-        });
-        &*deferred_by_leases
-    } else {
-        options
-    };
+    let deferred_by_leases = deferred_by_leases(dataset, &completed_tasks, options);
+    let options = deferred_by_leases.as_deref().unwrap_or(options);
 
     // A tagged FRI history stores row translation in the manifest entry and
     // depends on index bitmaps keeping their retired provenance, so a

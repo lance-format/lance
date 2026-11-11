@@ -963,7 +963,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     let elements = split_trim_elements(&content)?;
     // Read from the manifest this derivation runs against, which on a retry
     // is the attempt's predecessor: leases acquired concurrently count too.
-    let lease_requirement = if dataset.manifest.retention_leases.is_empty() {
+    let lease_requirement = if dataset.manifest.retention_leases().is_empty() {
         None
     } else {
         let records: Vec<RecordLineage> = elements

@@ -318,9 +318,9 @@ impl fmt::Display for LanceToolManifest {
             f,
             2,
             "retention_leases",
-            &self.manifest.retention_leases.len().to_string(),
+            &self.manifest.retention_leases().len().to_string(),
         )?;
-        for lease in &self.manifest.retention_leases {
+        for lease in self.manifest.retention_leases() {
             writeln!(
                 f,
                 "    - id: {}, version: {}, created_at: {}, expires_at: {}, label: {}",

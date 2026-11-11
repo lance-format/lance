@@ -247,14 +247,14 @@ async fn dataset_scans(after: &Dataset, context: &str) {
     );
 }
 
-/// Writer flag 20 must be set exactly when the lease list is nonempty, so
+/// `FLAG_RETENTION_LEASES` must be set exactly when the lease list is nonempty, so
 /// writers without lease support are fenced only while leases exist.
 fn lease_flag_matches_list(after: &Dataset, context: &str) {
     let flagged = after.manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0;
     assert_eq!(
         flagged,
         !after.retention_leases().is_empty(),
-        "{context}: writer flag 20 is {flagged} but the manifest lists {} leases",
+        "{context}: FLAG_RETENTION_LEASES is {flagged} but the manifest lists {} leases",
         after.retention_leases().len(),
     );
 }

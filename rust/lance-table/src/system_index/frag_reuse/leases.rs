@@ -131,19 +131,21 @@ pub enum LeasedFragments {
 /// destinations.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LeaseRequirement {
-    records: Vec<bool>,
+    /// Indexed by position in the records passed to [`Self::compute`].
+    required_records: Vec<bool>,
     /// The leased fragments plus every destination reached from them. `None`
     /// when every fragment is required.
-    fragments: Option<RoaringBitmap>,
+    required_fragments: Option<RoaringBitmap>,
 }
 
 impl LeaseRequirement {
-    /// Evaluate `leased` against a history's records, in any order.
+    /// Evaluate `leased` against a history's records, in any order. Callers
+    /// must query [`Self::requires_record`] with positions in that same slice.
     pub fn compute(leased: &LeasedFragments, records: &[RecordLineage]) -> Self {
         let LeasedFragments::Known(leased) = leased else {
             return Self {
-                records: vec![true; records.len()],
-                fragments: None,
+                required_records: vec![true; records.len()],
+                required_fragments: None,
             };
         };
         let mut consumers: HashMap<u64, Vec<usize>> = HashMap::new();
@@ -176,20 +178,23 @@ impl LeaseRequirement {
             }
         }
         Self {
-            records: selected,
-            fragments: Some(fragments),
+            required_records: selected,
+            required_fragments: Some(fragments),
         }
     }
 
     /// Whether the record at `position` in the evaluated history is required.
     pub fn requires_record(&self, position: usize) -> bool {
-        self.records.get(position).copied().unwrap_or(false)
+        self.required_records
+            .get(position)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Whether a rewrite consuming `sources` must record a transition for
     /// them: some source is a leased fragment or reached from one.
     pub fn requires_sources(&self, sources: impl IntoIterator<Item = u64>) -> bool {
-        match &self.fragments {
+        match &self.required_fragments {
             None => true,
             Some(fragments) => sources
                 .into_iter()

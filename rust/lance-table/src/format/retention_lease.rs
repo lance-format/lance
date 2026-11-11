@@ -22,6 +22,24 @@ use crate::format::pb;
 /// A lease can only be obtained by acquiring one or by deserializing one
 /// (serde or protobuf), which lets the holder ship it to distributed workers.
 /// Deserialization validates the record.
+///
+/// ```
+/// # use lance_table::format::RetentionLease;
+/// let json = r#"{
+///     "id": "8c4f3f53-4a3e-4c55-9f5e-1d6a0a2b7c11",
+///     "version": 10,
+///     "created_at": "2026-01-01T00:00:00Z",
+///     "expires_at": "2026-01-01T00:30:00Z",
+///     "label": "index build"
+/// }"#;
+/// let lease: RetentionLease = serde_json::from_str(json).unwrap();
+/// assert_eq!(lease.version(), 10);
+/// let shipped = serde_json::to_string(&lease).unwrap();
+/// assert_eq!(serde_json::from_str::<RetentionLease>(&shipped).unwrap(), lease);
+///
+/// let invalid = json.replace("00:30:00", "00:00:00");
+/// assert!(serde_json::from_str::<RetentionLease>(&invalid).is_err());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 #[serde(try_from = "RetentionLeaseFields")]
 pub struct RetentionLease {
@@ -93,10 +111,16 @@ impl RetentionLease {
         self.version
     }
 
+    /// When the lease was acquired, by the acquirer's clock. Cleanup keeps
+    /// unreferenced files modified since shortly before this, since they may
+    /// be the holder's staged output.
     pub fn created_at(&self) -> DateTime<Utc> {
         self.created_at
     }
 
+    /// When the lease expires, by the clock of the acquirer or last renewer.
+    /// An expired lease still retains history until a later commit removes
+    /// it from the list.
     pub fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }

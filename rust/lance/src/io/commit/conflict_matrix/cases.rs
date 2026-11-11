@@ -32,7 +32,7 @@ use crate::{Dataset, Error};
 ///
 /// The fixture's lease retains every fragment, so the rewrite records its move
 /// in the fragment reuse index, as compaction does under a lease. That defers
-/// index remapping, so a rewrite and an index build no longer conflict.
+/// index remapping, so a rewrite and an index build do not conflict.
 ///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.

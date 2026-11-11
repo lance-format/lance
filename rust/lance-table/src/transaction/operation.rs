@@ -270,20 +270,28 @@ pub enum Operation {
         lease_id: Uuid,
         /// Fixed before the first attempt and preserved across retries.
         created_at: DateTime<Utc>,
-        /// Must be later than `created_at` and in the future at each attempt.
+        /// An absolute time, not a TTL. Must be later than `created_at` and in
+        /// the future at each attempt.
         expires_at: DateTime<Utc>,
+        /// Human-readable context, such as the job holding the lease. It has
+        /// no retention meaning.
         label: Option<String>,
     },
 
     /// Extend `expires_at` of a listed, unexpired lease. A requested time not
     /// later than the current one is a no-op.
     RenewLease {
+        /// The ID of the lease to renew.
         lease_id: Uuid,
+        /// The new absolute expiry, not a TTL.
         expires_at: DateTime<Utc>,
     },
 
     /// Remove a lease. An absent lease is a no-op.
-    ReleaseLease { lease_id: Uuid },
+    ReleaseLease {
+        /// The ID of the lease to release.
+        lease_id: Uuid,
+    },
 
     /// An operation written by a newer version of Lance that this version does
     /// not recognize. It can be read but never re-encoded or committed, and it

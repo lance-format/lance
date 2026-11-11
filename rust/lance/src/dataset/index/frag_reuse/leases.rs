@@ -25,7 +25,7 @@ use crate::index::loading::load_all_indices;
 pub fn oldest_leased_version(dataset: &Dataset) -> Option<u64> {
     dataset
         .manifest
-        .retention_leases
+        .retention_leases()
         .iter()
         .map(|lease| lease.version())
         .min()
@@ -41,7 +41,7 @@ pub fn oldest_leased_version(dataset: &Dataset) -> Option<u64> {
 pub async fn leased_fragments(dataset: &Dataset) -> LeasedFragments {
     let versions: BTreeSet<u64> = dataset
         .manifest
-        .retention_leases
+        .retention_leases()
         .iter()
         .map(|lease| lease.version())
         .collect();
@@ -104,7 +104,7 @@ pub async fn record_lineages(
 /// What `dataset`'s listed leases require of its current fragment reuse
 /// history, or `None` when no lease is listed.
 pub async fn lease_requirement(dataset: &Dataset) -> Result<Option<LeaseRequirement>> {
-    if dataset.manifest.retention_leases.is_empty() {
+    if dataset.manifest.retention_leases().is_empty() {
         return Ok(None);
     }
     let leased = leased_fragments(dataset).await;

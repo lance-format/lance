@@ -188,7 +188,7 @@ impl Dataset {
     /// # }
     /// ```
     pub fn retention_leases(&self) -> &[RetentionLease] {
-        &self.manifest.retention_leases
+        self.manifest.retention_leases()
     }
 
     /// Commit a lease operation on the latest version of this branch and

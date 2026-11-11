@@ -442,8 +442,9 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
     /// What the leases listed on the read version protect. A lease listed on a newer
     /// version holds that version or a later one, which cleanup keeps anyway, so for
-    /// retaining versions the read version's list suffices.
-    leases: Option<LeaseRetention>,
+    /// retaining versions the read version's list suffices. Staged files are judged
+    /// by the latest manifest's list instead, since a newer lease may have staged them.
+    lease_retention: Option<LeaseRetention>,
 }
 
 /// Cache identity includes the cleanup owner's base IDs.
@@ -932,7 +933,7 @@ impl<'a> CleanupTask<'a> {
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
-            leases: None,
+            lease_retention: None,
         })
     }
 
@@ -1059,7 +1060,8 @@ impl<'a> CleanupTask<'a> {
             );
         }
 
-        self.leases = LeaseRetention::from_leases(&self.dataset.manifest.retention_leases);
+        self.lease_retention =
+            LeaseRetention::from_leases(self.dataset.manifest.retention_leases());
 
         // we process all manifest files in parallel to figure
         // out which files are referenced by valid manifests
@@ -1207,7 +1209,7 @@ impl<'a> CleanupTask<'a> {
     /// damage rather than a state a lease-aware writer produces, so failing the whole run
     /// is preferred over guessing which deletions might still be safe.
     fn ensure_lease_history_confirmed(&self, inspection: &CleanupInspection) -> Result<()> {
-        let Some(leases) = self.leases else {
+        let Some(leases) = self.lease_retention else {
             return Ok(());
         };
         let unconfirmed: Vec<u64> = (leases.oldest_version..=self.read_version)
@@ -1400,7 +1402,7 @@ impl<'a> CleanupTask<'a> {
         // cleaned them, where almost every manifest is expired. Retained branch roots
         // must also be read so all of their files join the working set.
         let in_lease_window = self
-            .leases
+            .lease_retention
             .is_some_and(|leases| location.version >= leases.oldest_version);
         if self.policy.delete_unverified
             && self.retention_policy.is_none()
@@ -1494,13 +1496,14 @@ impl<'a> CleanupTask<'a> {
         }
         let mut inspection = inspection.lock().unwrap();
 
-        if let Some(leases) = self.leases
+        if let Some(leases) = self.lease_retention
             && in_lease_window
             && (manifest.version == leases.oldest_version || manifest.transaction_file.is_some())
         {
             inspection.confirmed_lease_history.insert(manifest.version);
         }
-        if is_latest && let Some(leases) = LeaseRetention::from_leases(&manifest.retention_leases) {
+        if is_latest && let Some(leases) = LeaseRetention::from_leases(manifest.retention_leases())
+        {
             inspection.staged_files_since = Some(
                 inspection
                     .staged_files_since

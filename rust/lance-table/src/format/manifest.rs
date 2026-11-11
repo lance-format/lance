@@ -124,9 +124,10 @@ pub struct Manifest {
     /// decreases, including after definition removal or restore.
     pub max_clustering_id: u32,
 
-    /// Listed retention leases, including expired ones that no commit has
-    /// removed yet. Only the current manifest's list is authoritative.
-    pub retention_leases: Vec<RetentionLease>,
+    /// Listed retention leases. Private outside this crate so that every
+    /// change goes through [`Self::set_retention_leases`], which keeps
+    /// [`FLAG_RETENTION_LEASES`] in sync.
+    pub(crate) retention_leases: Vec<RetentionLease>,
 
     /// Why the stored lease list is invalid, if it is. Readers ignore the
     /// list, so decoding keeps the valid records and only writers reject it.
@@ -206,8 +207,14 @@ impl Manifest {
         self.retention_lease_error.as_deref()
     }
 
-    /// Replace the lease list with one the caller derived, setting writer
-    /// flag 20 exactly when it is nonempty. A list read with invalid records
+    /// Listed retention leases, including expired ones that no commit has
+    /// removed yet. Only the current manifest's list is authoritative.
+    pub fn retention_leases(&self) -> &[RetentionLease] {
+        &self.retention_leases
+    }
+
+    /// Replace the lease list with one the caller derived, setting
+    /// [`FLAG_RETENTION_LEASES`] exactly when it is nonempty. A list read with invalid records
     /// is replaced whole, so its decode error no longer applies.
     pub fn set_retention_leases(&mut self, leases: Vec<RetentionLease>) {
         if leases.is_empty() {
@@ -900,7 +907,10 @@ pub struct ManifestBuildConfig {
     pub timestamp_nanos: u128,
     /// The time this commit attempt judges retention lease expiry against.
     /// The caller reads it once per attempt, so every derivation in the
-    /// attempt agrees on which leases have expired.
+    /// attempt agrees on which leases have expired. It is the real clock even
+    /// when `timestamp_nanos` is overridden: a caller-chosen manifest
+    /// timestamp, such as one replayed from another table, must not decide
+    /// which leases have expired.
     pub now: DateTime<Utc>,
     /// Request the stable row id feature. The flag is also inherited from the
     /// previous manifest, so false does not turn it off for a dataset that has it.

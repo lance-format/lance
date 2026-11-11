@@ -15,23 +15,15 @@ use crate::transaction::{Operation, Transaction};
 /// The outcome of [`derive_retention_leases`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseChange {
-    /// The commit writes `leases` as the new list, which may equal the
-    /// predecessor's. Removing expired leases alone is not a reason to write
-    /// a version; that is the caller's decision.
-    Updated {
-        leases: Vec<RetentionLease>,
-        /// The lease an `AcquireLease` added or a `RenewLease` extended.
-        lease: Option<RetentionLease>,
-    },
-    /// A lease operation whose derived list equals its predecessor's, so no
+    /// The commit writes this list, which may equal the predecessor's when
+    /// the operation is not a lease request.
+    Write(Vec<RetentionLease>),
+    /// A lease request whose derived list equals its predecessor's, so no
     /// version is written: re-acquiring a listed ID, renewing to a time not
     /// later than the current expiry, or releasing an absent ID, when no
     /// listed lease has expired. If one has, the request writes a version so
     /// that expired leases stop retaining history.
-    NoOp {
-        /// The listed record for the target ID; `None` for an absent release.
-        stored: Option<RetentionLease>,
-    },
+    Unchanged,
 }
 
 /// Derive the lease list a commit attempt writes.
@@ -49,6 +41,11 @@ pub enum LeaseChange {
 ///
 /// Detached commits neither carry nor change leases; callers must not derive
 /// a list for them.
+///
+/// Manifests built from another manifest than the predecessor clear their
+/// list themselves before any feature check, so a historical list neither
+/// carries over nor gates the commit: the restore target read while building
+/// a `Restore`, the clone source in `lance::io::commit`, and detached commits.
 pub fn derive_retention_leases(
     previous: &[RetentionLease],
     transaction: &Transaction,
@@ -64,14 +61,11 @@ pub fn derive_retention_leases(
     let position =
         |leases: &[RetentionLease], id: &Uuid| leases.iter().position(|lease| lease.id() == *id);
     let pruned_expired = leases.len() != previous.len();
-    let unchanged = |leases: Vec<RetentionLease>, stored: Option<RetentionLease>| {
+    let unchanged = |leases: Vec<RetentionLease>| {
         if pruned_expired {
-            LeaseChange::Updated {
-                leases,
-                lease: stored,
-            }
+            LeaseChange::Write(leases)
         } else {
-            LeaseChange::NoOp { stored }
+            LeaseChange::Unchanged
         }
     };
 
@@ -94,9 +88,8 @@ pub fn derive_retention_leases(
                      created_at {created_at}"
                 )));
             }
-            if let Some(index) = position(&leases, lease_id) {
-                let stored = Some(leases[index].clone());
-                return Ok(unchanged(leases, stored));
+            if position(&leases, lease_id).is_some() {
+                return Ok(unchanged(leases));
             }
             if *expires_at <= now {
                 return Err(Error::invalid_input(format!(
@@ -111,11 +104,8 @@ pub fn derive_retention_leases(
                 *expires_at,
                 label.clone(),
             )?;
-            leases.push(lease.clone());
-            Ok(LeaseChange::Updated {
-                leases,
-                lease: Some(lease),
-            })
+            leases.push(lease);
+            Ok(LeaseChange::Write(leases))
         }
         Operation::RenewLease {
             lease_id,
@@ -131,28 +121,20 @@ pub fn derive_retention_leases(
                 )));
             };
             if *expires_at <= leases[index].expires_at() {
-                let stored = Some(leases[index].clone());
-                return Ok(unchanged(leases, stored));
+                return Ok(unchanged(leases));
             }
             leases[index] = leases[index].with_expires_at(*expires_at);
-            let lease = Some(leases[index].clone());
-            Ok(LeaseChange::Updated { leases, lease })
+            Ok(LeaseChange::Write(leases))
         }
         Operation::ReleaseLease { lease_id } => match position(&leases, lease_id) {
             Some(index) => {
                 leases.remove(index);
-                Ok(LeaseChange::Updated {
-                    leases,
-                    lease: None,
-                })
+                Ok(LeaseChange::Write(leases))
             }
-            None => Ok(unchanged(leases, None)),
+            None => Ok(unchanged(leases)),
         },
         Operation::Restore { .. } | Operation::Overwrite { .. } | Operation::Clone { .. } => {
-            Ok(LeaseChange::Updated {
-                leases: Vec::new(),
-                lease: None,
-            })
+            Ok(LeaseChange::Write(Vec::new()))
         }
         Operation::Unknown { .. } => Err(Error::not_supported(format!(
             "Transaction {} has an operation this version of Lance does not recognize, \
@@ -177,10 +159,7 @@ pub fn derive_retention_leases(
             if let Ok(publication) = Uuid::parse_str(&transaction.uuid) {
                 leases.retain(|lease| lease.id() != publication);
             }
-            Ok(LeaseChange::Updated {
-                leases,
-                lease: None,
-            })
+            Ok(LeaseChange::Write(leases))
         }
     }
 }
@@ -232,13 +211,6 @@ mod tests {
         derive_retention_leases(previous, &transaction(99, operation), NEW_VERSION, at(NOW))
     }
 
-    fn updated(leases: Vec<RetentionLease>) -> LeaseChange {
-        LeaseChange::Updated {
-            leases,
-            lease: None,
-        }
-    }
-
     #[test]
     fn test_acquire_adds_lease_on_new_version() {
         let previous = vec![lease(1, 2, 200)];
@@ -252,32 +224,26 @@ mod tests {
         .unwrap();
         assert_eq!(
             derive(&previous, acquire(5, 90, 300)).unwrap(),
-            LeaseChange::Updated {
-                leases: vec![lease(1, 2, 200), expected.clone()],
-                lease: Some(expected),
-            }
+            LeaseChange::Write(vec![lease(1, 2, 200), expected])
         );
     }
 
     #[test]
-    fn test_acquire_of_listed_id_returns_stored_record() {
-        let stored = lease(5, 2, 200);
+    fn test_acquire_of_listed_id_is_unchanged() {
         assert_eq!(
-            derive(std::slice::from_ref(&stored), acquire(5, 90, 300)).unwrap(),
-            LeaseChange::NoOp {
-                stored: Some(stored)
-            }
+            derive(&[lease(5, 2, 200)], acquire(5, 90, 300)).unwrap(),
+            LeaseChange::Unchanged
         );
     }
 
     #[test]
     fn test_acquire_of_expired_id_adds_fresh_lease() {
         let change = derive(&[lease(5, 2, NOW)], acquire(5, 90, 300)).unwrap();
-        let LeaseChange::Updated { leases, lease } = change else {
-            panic!("expected Updated, got {change:?}");
+        let LeaseChange::Write(leases) = change else {
+            panic!("expected Write, got {change:?}");
         };
         assert_eq!(leases.len(), 1);
-        assert_eq!(lease.unwrap().version(), NEW_VERSION);
+        assert_eq!(leases[0].version(), NEW_VERSION);
     }
 
     #[rstest::rstest]
@@ -310,23 +276,17 @@ mod tests {
         let renewed = lease(1, 2, 200).with_expires_at(at(500));
         assert_eq!(
             derive(&[lease(1, 2, 200), lease(2, 3, 200)], renew(1, 500)).unwrap(),
-            LeaseChange::Updated {
-                leases: vec![renewed.clone(), lease(2, 3, 200)],
-                lease: Some(renewed),
-            }
+            LeaseChange::Write(vec![renewed, lease(2, 3, 200)])
         );
     }
 
     #[rstest::rstest]
     #[case::earlier(150)]
     #[case::equal(200)]
-    fn test_renew_to_not_later_time_is_noop(#[case] expires_at: i64) {
-        let stored = lease(1, 2, 200);
+    fn test_renew_to_not_later_time_is_unchanged(#[case] expires_at: i64) {
         assert_eq!(
-            derive(std::slice::from_ref(&stored), renew(1, expires_at)).unwrap(),
-            LeaseChange::NoOp {
-                stored: Some(stored)
-            }
+            derive(&[lease(1, 2, 200)], renew(1, expires_at)).unwrap(),
+            LeaseChange::Unchanged
         );
     }
 
@@ -334,35 +294,29 @@ mod tests {
     fn test_release_removes_listed_lease() {
         assert_eq!(
             derive(&[lease(1, 2, 200), lease(2, 3, 200)], release(1)).unwrap(),
-            updated(vec![lease(2, 3, 200)])
+            LeaseChange::Write(vec![lease(2, 3, 200)])
         );
     }
 
     #[test]
-    fn test_release_of_unlisted_lease_is_noop() {
+    fn test_release_of_unlisted_lease_is_unchanged() {
         assert_eq!(
             derive(&[lease(1, 2, 200)], release(5)).unwrap(),
-            LeaseChange::NoOp { stored: None }
+            LeaseChange::Unchanged
         );
     }
 
     #[rstest::rstest]
-    #[case::release_expired_target(release(1), None)]
-    #[case::release_absent(release(5), None)]
-    #[case::reacquire(acquire(2, 90, 300), Some(lease(2, 3, 200)))]
-    #[case::renew_not_later(renew(2, 150), Some(lease(2, 3, 200)))]
-    fn test_unchanged_request_still_removes_expired_leases(
-        #[case] operation: Operation,
-        #[case] stored: Option<RetentionLease>,
-    ) {
+    #[case::release_expired_target(release(1))]
+    #[case::release_absent(release(5))]
+    #[case::reacquire(acquire(2, 90, 300))]
+    #[case::renew_not_later(renew(2, 150))]
+    fn test_unchanged_request_still_removes_expired_leases(#[case] operation: Operation) {
         // Writing a version here is what lets an expired lease stop retaining
         // history without waiting for an unrelated commit.
         assert_eq!(
             derive(&[lease(1, 2, NOW), lease(2, 3, 200)], operation).unwrap(),
-            LeaseChange::Updated {
-                leases: vec![lease(2, 3, 200)],
-                lease: stored,
-            }
+            LeaseChange::Write(vec![lease(2, 3, 200)])
         );
     }
 
@@ -381,7 +335,7 @@ mod tests {
             at(NOW),
         )
         .unwrap();
-        assert_eq!(change, updated(expected));
+        assert_eq!(change, LeaseChange::Write(expected));
     }
 
     #[test]
@@ -391,7 +345,7 @@ mod tests {
         assert_eq!(publication.read_version, 2);
         let change =
             derive_retention_leases(&[leased], &publication, NEW_VERSION, at(NOW)).unwrap();
-        assert_eq!(change, updated(vec![]));
+        assert_eq!(change, LeaseChange::Write(vec![]));
     }
 
     #[test]
@@ -401,7 +355,7 @@ mod tests {
         let previous = [lease(1, 2, 200)];
         let change =
             derive_retention_leases(&previous, &transaction, NEW_VERSION, at(NOW)).unwrap();
-        assert_eq!(change, updated(previous.to_vec()));
+        assert_eq!(change, LeaseChange::Write(previous.to_vec()));
     }
 
     #[rstest::rstest]
@@ -413,8 +367,8 @@ mod tests {
         let change =
             derive_retention_leases(&previous, &transaction(1, operation), NEW_VERSION, at(NOW))
                 .unwrap();
-        let LeaseChange::Updated { leases, .. } = change else {
-            panic!("expected Updated, got {change:?}");
+        let LeaseChange::Write(leases) = change else {
+            panic!("expected Write, got {change:?}");
         };
         assert!(leases.iter().any(|lease| lease.id() == Uuid::from_u128(1)));
     }
@@ -439,7 +393,7 @@ mod tests {
         let change =
             derive_retention_leases(&previous, &transaction(1, operation), NEW_VERSION, at(NOW))
                 .unwrap();
-        assert_eq!(change, updated(vec![]));
+        assert_eq!(change, LeaseChange::Write(vec![]));
     }
 
     #[test]

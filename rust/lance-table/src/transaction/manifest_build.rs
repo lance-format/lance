@@ -255,7 +255,8 @@ impl Transaction {
             .await?;
         let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         // A restore removes all leases. The target's own list is historical,
-        // so it neither carries over nor gates the restore.
+        // so it neither carries over nor gates the restore (see
+        // `derive_retention_leases` for the other sites that clear the list).
         manifest.set_retention_leases(Vec::new());
         // This read bypasses Dataset's feature gates. Refuse unsupported target
         // manifests before apply_feature_flags can clear their unknown bits and
@@ -981,8 +982,8 @@ impl Transaction {
             new_version,
             config.now,
         )? {
-            LeaseChange::Updated { leases, .. } => leases,
-            LeaseChange::NoOp { .. } => return Ok(ManifestBuild::Unchanged),
+            LeaseChange::Write(leases) => leases,
+            LeaseChange::Unchanged => return Ok(ManifestBuild::Unchanged),
         };
 
         match &self.operation {

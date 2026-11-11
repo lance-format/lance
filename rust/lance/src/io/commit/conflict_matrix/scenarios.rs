@@ -846,7 +846,7 @@ async fn write_value_file(
 ///
 /// Version 1 holds `a`/`b`; versions 2 and 3 add `c` and `d`. Version 4
 /// acquires a retention lease, so every case runs with a listed lease and
-/// writer flag 20, and the lease scenarios have one to renew and release.
+/// `FLAG_RETENTION_LEASES`, and the lease scenarios have one to renew and release.
 /// Cases stage against the last, which gives `restore` a version to fall back
 /// to.
 pub(super) async fn fixture() -> Arc<Dataset> {

@@ -836,8 +836,13 @@ impl DefaultCompactionPlanner {
     /// retention leases and it is not set already. Leases require compaction
     /// to record fragment reuse transitions, which only the deferred path
     /// does; indices then catch up through the fragment reuse index.
+    ///
+    /// Three layers force deferral, one per way a compaction can be driven:
+    /// this planner, so distributed workers executing its plan record row
+    /// addresses; `compact_files_with_planner`, for custom planners; and
+    /// `commit_compaction`, for plans made before a lease was acquired.
     fn deferring_under_leases(&self, dataset: &Dataset) -> Option<Self> {
-        (!self.options.defer_index_remap && !dataset.manifest.retention_leases.is_empty()).then(
+        (!self.options.defer_index_remap && !dataset.manifest.retention_leases().is_empty()).then(
             || {
                 let mut planner = self.clone();
                 planner.options.defer_index_remap = true;
