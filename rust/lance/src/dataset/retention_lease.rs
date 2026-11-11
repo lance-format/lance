@@ -459,6 +459,152 @@ mod tests {
         assert_eq!(head.retention_leases(), std::slice::from_ref(&lease));
     }
 
+    /// Commit `operation` read at `read`'s version, so it rebases over every
+    /// version committed since.
+    async fn commit_from(read: &Dataset, operation: Operation) -> Result<Dataset> {
+        let transaction = TransactionBuilder::new(read.version().version, operation).build();
+        CommitBuilder::new(Arc::new(read.clone()))
+            .execute(transaction)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_renewal_committed_first_outlives_concurrent_expiry_check() {
+        MockClock::set_system_time(Duration::from_secs(1_000));
+        let dataset = create_dataset("memory://").await;
+        let options = LeaseOptions {
+            ttl: MINUTE,
+            ..Default::default()
+        };
+        let (lease, mut stale) = dataset.acquire_retention_lease(options).await.unwrap();
+
+        MockClock::set_system_time(Duration::from_secs(1_030));
+        let renewed = dataset
+            .renew_retention_lease(&lease, 10 * MINUTE)
+            .await
+            .unwrap();
+
+        // Past the expiry `stale` lists, but before the renewed one: the
+        // retry derives from the renewal, not from its read version.
+        MockClock::set_system_time(Duration::from_secs(1_000) + 2 * MINUTE);
+        stale.append(rows(), None).await.unwrap();
+        assert_eq!(stale.version().version, 4);
+        assert_eq!(stale.retention_leases(), std::slice::from_ref(&renewed));
+        assert!(has_lease_flag(&stale));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_retried_after_same_id_acquired_returns_stored_lease() {
+        MockClock::set_system_time(Duration::from_secs(1_000));
+        let dataset = create_dataset("memory://").await;
+        let lease_id = Uuid::new_v4();
+        let acquire = |label: &str| Operation::AcquireLease {
+            lease_id,
+            created_at: utc_now(),
+            expires_at: utc_now() + chrono::Duration::minutes(10),
+            label: Some(label.to_string()),
+        };
+        let first = commit_from(&dataset, acquire("first")).await.unwrap();
+        let stored = first.retention_leases().to_vec();
+
+        MockClock::set_system_time(Duration::from_secs(1_030));
+        let retried = commit_from(&dataset, acquire("retried")).await.unwrap();
+        assert_eq!(retried.version().version, 2);
+        assert_eq!(retried.retention_leases(), stored.as_slice());
+        assert_eq!(stored[0].label(), Some("first"));
+    }
+
+    enum LeaseEnd {
+        Released,
+        ExpiredAndRemoved,
+        ExpiredButListed,
+    }
+
+    #[rstest::rstest]
+    #[case::released(LeaseEnd::Released, "it is not listed")]
+    #[case::expired_and_removed(LeaseEnd::ExpiredAndRemoved, "it is not listed")]
+    #[case::expired_but_listed(LeaseEnd::ExpiredButListed, "it expired at")]
+    #[tokio::test]
+    async fn test_renew_retried_after_lease_ended_errors(
+        #[case] end: LeaseEnd,
+        #[case] message: &str,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(1_000));
+        let dataset = create_dataset("memory://").await;
+        let options = LeaseOptions {
+            ttl: MINUTE,
+            ..Default::default()
+        };
+        let (lease, stale) = dataset.acquire_retention_lease(options).await.unwrap();
+        let mut concurrent = stale.clone();
+        match end {
+            LeaseEnd::Released => dataset.release_retention_lease(&lease).await.unwrap(),
+            LeaseEnd::ExpiredAndRemoved => {
+                MockClock::set_system_time(Duration::from_secs(1_000) + MINUTE);
+                concurrent.append(rows(), None).await.unwrap();
+            }
+            LeaseEnd::ExpiredButListed => {
+                concurrent.append(rows(), None).await.unwrap();
+                MockClock::set_system_time(Duration::from_secs(1_000) + MINUTE);
+            }
+        }
+
+        let renew = Operation::RenewLease {
+            lease_id: lease.id(),
+            expires_at: utc_now() + chrono::Duration::minutes(10),
+        };
+        let error = commit_from(&stale, renew).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
+        assert_eq!(latest(&dataset).await.version().version, 3);
+    }
+
+    #[tokio::test]
+    async fn test_publication_retried_after_release_proceeds() {
+        MockClock::set_system_time(Duration::from_secs(1_000));
+        let dataset = create_dataset("memory://").await;
+        let (lease, worker) = dataset
+            .acquire_retention_lease(LeaseOptions::default())
+            .await
+            .unwrap();
+        dataset.release_retention_lease(&lease).await.unwrap();
+
+        let publication =
+            TransactionBuilder::for_lease(&lease, Operation::ReserveFragments { num_fragments: 1 })
+                .build();
+        let published = CommitBuilder::new(Arc::new(worker))
+            .execute(publication)
+            .await
+            .unwrap();
+        assert_eq!(published.version().version, 4);
+        assert!(published.retention_leases().is_empty());
+        assert!(!has_lease_flag(&published));
+    }
+
+    #[tokio::test]
+    async fn test_release_retried_after_publication_writes_no_version() {
+        MockClock::set_system_time(Duration::from_secs(1_000));
+        let dataset = create_dataset("memory://").await;
+        let (lease, worker) = dataset
+            .acquire_retention_lease(LeaseOptions::default())
+            .await
+            .unwrap();
+        let publication =
+            TransactionBuilder::for_lease(&lease, Operation::ReserveFragments { num_fragments: 1 })
+                .build();
+        CommitBuilder::new(Arc::new(worker.clone()))
+            .execute(publication)
+            .await
+            .unwrap();
+
+        let release = Operation::ReleaseLease {
+            lease_id: lease.id(),
+        };
+        let head = commit_from(&worker, release).await.unwrap();
+        assert_eq!(head.version().version, 3);
+        assert!(head.retention_leases().is_empty());
+    }
+
     #[rstest::rstest]
     #[case::zero(Duration::ZERO)]
     #[case::overflow(Duration::MAX)]

@@ -1954,3 +1954,145 @@ async fn test_conflicts_data_replacement() {
         }
     }
 }
+
+/// A lease operation and any other known operation rebase over each other in
+/// either order: the lease list is re-derived from each attempt's
+/// predecessor, so neither the lease nor the data checks have anything to
+/// reject. An unknown operation still conflicts with a lease operation.
+#[test]
+fn test_lease_operations_never_conflict() {
+    let fragment0 = Fragment::new(0);
+    let lease_id = Uuid::new_v4();
+    let at = |seconds| chrono::DateTime::from_timestamp(seconds, 0).unwrap();
+    let lease_operations = [
+        Operation::AcquireLease {
+            lease_id,
+            created_at: at(0),
+            expires_at: at(60),
+            label: None,
+        },
+        Operation::RenewLease {
+            lease_id,
+            expires_at: at(120),
+        },
+        Operation::ReleaseLease { lease_id },
+    ];
+    let schema = lance_core::datatypes::Schema::default();
+    let other_operations = [
+        Operation::Append {
+            fragments: vec![fragment0.clone()],
+        },
+        Operation::Delete {
+            updated_fragments: vec![fragment0.clone()],
+            deleted_fragment_ids: vec![1],
+            predicate: "x > 2".to_string(),
+        },
+        Operation::Overwrite {
+            fragments: vec![fragment0.clone()],
+            schema: schema.clone(),
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+        Operation::CreateIndex {
+            new_indices: vec![],
+            removed_indices: vec![],
+        },
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![fragment0.clone()],
+                new_fragments: vec![Fragment::new(1)],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                0,
+                DataFile::new_legacy_from_fields("path", vec![0], None),
+            )],
+        },
+        Operation::DataOverlay { groups: vec![] },
+        Operation::Merge {
+            fragments: vec![fragment0.clone()],
+            schema: schema.clone(),
+            preserves_nullability: false,
+        },
+        Operation::Restore { version: 1 },
+        Operation::ReserveFragments { num_fragments: 1 },
+        Operation::Update {
+            removed_fragment_ids: vec![1],
+            updated_fragments: vec![fragment0.clone()],
+            new_fragments: vec![Fragment::new(2)],
+            fields_modified: vec![0],
+            mem_wal_dir_id: None,
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        },
+        Operation::Project {
+            schema,
+            preserves_nullability: false,
+        },
+        create_update_config_for_test(
+            Some(HashMap::from([("key".to_string(), "value".to_string())])),
+            None,
+            Some(HashMap::from([("key".to_string(), "value".to_string())])),
+            None,
+        ),
+        Operation::UpdateMemWalState {
+            compacted_sstables: vec![],
+            dir_id: "dir".to_string(),
+        },
+        Operation::Clone {
+            is_shallow: true,
+            ref_name: None,
+            ref_version: 1,
+            ref_path: "memory://source".to_string(),
+            branch_name: None,
+        },
+        Operation::UpdateBases { new_bases: vec![] },
+    ];
+    let unknown = Transaction::try_from(lance_table::format::pb::Transaction {
+        uuid: "unknown".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    let rebase_of = |operation: &Operation| TransactionRebase {
+        transaction: Transaction::new(0, operation.clone(), None),
+        initial_fragments: HashMap::new(),
+        modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
+        affected_rows: None,
+        frag_reuse_base: None,
+        conflicting_mem_wal_compacted_sstables: Vec::new(),
+        current_lineage: None,
+        untagged_reuse: None,
+        current_live: None,
+        current_schema: None,
+        read_fragments: None,
+        read_version_fragments: None,
+        read_schema: None,
+        reuse: Default::default(),
+        staged_replay: false,
+    };
+
+    for lease in &lease_operations {
+        let lease_transaction = Transaction::new(0, lease.clone(), None);
+        for other in other_operations.iter().chain(&lease_operations) {
+            let other_transaction = Transaction::new(0, other.clone(), None);
+            if let Err(error) = rebase_of(lease).check_txn(&other_transaction, 1) {
+                panic!("{} over {}: {error}", lease.name(), other.name());
+            }
+            if let Err(error) = rebase_of(other).check_txn(&lease_transaction, 1) {
+                panic!("{} over {}: {error}", other.name(), lease.name());
+            }
+        }
+        let error = rebase_of(lease).check_txn(&unknown, 1).unwrap_err();
+        assert!(
+            matches!(error, Error::IncompatibleTransaction { .. }),
+            "{} over an unknown operation: {error}",
+            lease.name()
+        );
+    }
+}

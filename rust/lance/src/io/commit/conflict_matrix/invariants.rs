@@ -24,6 +24,7 @@
 
 use std::collections::HashSet;
 
+use lance_table::feature_flags::FLAG_RETENTION_LEASES;
 use lance_table::format::Fragment;
 
 use super::scenarios::{Scenario, row_counts};
@@ -45,6 +46,8 @@ pub(super) async fn check_all(before: &Dataset, after: &Dataset, ours: Scenario,
     }
     manifest_round_trips(after, context);
     dataset_scans(after, context).await;
+    lease_flag_matches_list(after, context);
+    leases_carry_over(before, after, ours, context);
 }
 
 /// Delegate to [`Dataset::validate`], the production integrity check.
@@ -238,4 +241,86 @@ async fn dataset_scans(after: &Dataset, context: &str) {
         "{context}: scan returned {} rows but the manifest accounts for {expected}",
         batch.num_rows(),
     );
+}
+
+/// Writer flag 20 must be set exactly when the lease list is nonempty, so
+/// writers without lease support are fenced only while leases exist.
+fn lease_flag_matches_list(after: &Dataset, context: &str) {
+    let flagged = after.manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0;
+    assert_eq!(
+        flagged,
+        !after.retention_leases().is_empty(),
+        "{context}: writer flag 20 is {flagged} but the manifest lists {} leases",
+        after.retention_leases().len(),
+    );
+}
+
+/// The lease list a commit writes is its predecessor's with only its own lease
+/// change applied. The matrix never moves the clock, so nothing expires.
+///
+/// Restore and overwrite remove every lease. Otherwise a listed lease survives
+/// unless `ours` released it, keeping its version and creation time, and only
+/// a renewal may push its expiry later. A lease absent from the predecessor can
+/// only be one `ours` acquired, on the version its commit created.
+fn leases_carry_over(before: &Dataset, after: &Dataset, ours: Scenario, context: &str) {
+    let leases = after.retention_leases();
+    let ids = leases
+        .iter()
+        .map(|lease| lease.id())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        ids.len(),
+        leases.len(),
+        "{context}: duplicate lease IDs in {leases:?}"
+    );
+    if ours.replaces_state() {
+        assert!(
+            leases.is_empty(),
+            "{context}: {} kept leases {leases:?}",
+            ours.name()
+        );
+        return;
+    }
+    for previous in before.retention_leases() {
+        let Some(lease) = leases.iter().find(|lease| lease.id() == previous.id()) else {
+            assert_eq!(
+                ours,
+                Scenario::ReleaseLease,
+                "{context}: lease {} was dropped by {}",
+                previous.id(),
+                ours.name(),
+            );
+            continue;
+        };
+        assert_eq!(lease.version(), previous.version(), "{context}");
+        assert_eq!(lease.created_at(), previous.created_at(), "{context}");
+        if ours == Scenario::RenewLease {
+            assert!(
+                lease.expires_at() >= previous.expires_at(),
+                "{context}: renewing lease {} moved its expiry earlier",
+                lease.id(),
+            );
+        } else {
+            assert_eq!(lease.expires_at(), previous.expires_at(), "{context}");
+        }
+    }
+    let previous_ids = before
+        .retention_leases()
+        .iter()
+        .map(|lease| lease.id())
+        .collect::<HashSet<_>>();
+    for lease in leases.iter().filter(|l| !previous_ids.contains(&l.id())) {
+        assert_eq!(
+            ours,
+            Scenario::AcquireLease,
+            "{context}: lease {} appeared under {}",
+            lease.id(),
+            ours.name(),
+        );
+        assert_eq!(
+            lease.version(),
+            after.manifest.version,
+            "{context}: an acquired lease must retain the version its commit created",
+        );
+    }
 }
