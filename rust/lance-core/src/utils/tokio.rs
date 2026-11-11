@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::Ordering;
-use std::sync::{LazyLock, atomic};
+use std::sync::{Arc, LazyLock, atomic};
 use std::time::Duration;
 
 use futures::{Future, FutureExt};
@@ -184,20 +185,23 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    // Propagate the current span into the task
-    let span = Span::current();
-    let handle = global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        func()
+    // The closure and its output share one allocation, and only the non-generic
+    // `spawn_erased` touches tokio, so tokio's blocking-task machinery (task
+    // cell, harness, vtable, drop glue) is instantiated once rather than once
+    // per closure type in every calling crate.
+    let task = Arc::new(CpuTask {
+        func: UnsafeCell::new(Some(func)),
+        output: UnsafeCell::new(None),
     });
-    // Awaited through the join handle, not a result channel: a panic in `func`
-    // arrives as a `JoinError` still carrying its payload, so resuming it
-    // re-raises the original panic in the caller. Reporting the closure's
-    // outcome over a channel instead loses that -- the sender drops unsent and
-    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
-    // `RecvError`, pointing here rather than at the fault.
-    handle.map(|res| match res {
-        Ok(result) => result,
+    spawn_erased(task.clone()).map(move |res| match res {
+        // SAFETY: the join handle resolved, so `run` has returned on the CPU
+        // thread and tokio's task-completion handoff orders its write to
+        // `output` before this read. Nothing else touches `output`.
+        Ok(()) => unsafe { (*task.output.get()).take() }
+            .expect("spawn_cpu task completed without storing its output"),
+        // Awaited through the join handle, not a result channel: a panic in
+        // `func` arrives as a `JoinError` still carrying its payload, so
+        // resuming it re-raises the original panic in the caller.
         Err(join_error) => match join_error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             // The CPU runtime outlives every caller, so its tasks are not
@@ -207,9 +211,68 @@ pub fn spawn_cpu<
     })
 }
 
+/// A closure and the slot for its output, shared between the caller and the
+/// CPU thread without locks. Access is sequenced by the task lifecycle rather
+/// than synchronized per field: `func` is only touched by `run`, and `output`
+/// is written by `run` and read by the caller only after the task completes.
+struct CpuTask<F, T> {
+    func: UnsafeCell<Option<F>>,
+    output: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: the fields are never accessed concurrently (see `CpuTask`), so
+// sharing across threads only requires the contents to be `Send`.
+unsafe impl<F: Send, T: Send> Sync for CpuTask<F, T> {}
+
+trait RunOnce: Send + Sync {
+    /// # Safety
+    ///
+    /// Must be called at most once, and `output` must not be read until it
+    /// returns.
+    unsafe fn run(&self);
+}
+
+impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
+    unsafe fn run(&self) {
+        // SAFETY: upheld by the caller of `run`; see `RunOnce::run`.
+        let func = unsafe { (*self.func.get()).take() }.expect("spawn_cpu task runs once");
+        let output = func();
+        unsafe { *self.output.get() = Some(output) };
+    }
+}
+
+fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
+    // Propagate the current span into the task
+    let span = Span::current();
+    global_cpu_runtime().spawn_blocking(move || {
+        let _span_guard = span.enter();
+        // SAFETY: tokio runs a blocking task exactly once, and the caller in
+        // `spawn_cpu` reads `output` only after this task's join handle resolves.
+        unsafe { task.run() };
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The successful path must hand back the closure's own output.
+    ///
+    /// The output travels through an erased, type-independent task, so this
+    /// pins the typed contract: the caller receives the exact value the
+    /// closure returned, moved out of the task rather than re-created.
+    #[tokio::test]
+    async fn spawn_cpu_returns_the_closure_output() {
+        let result = spawn_cpu(|| -> std::result::Result<(u32, String), std::io::Error> {
+            Ok((7, String::from("done")))
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("the closure succeeded"),
+            (7, "done".to_string())
+        );
+    }
 
     /// A panic in the closure must reach the caller intact.
     ///
