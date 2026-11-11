@@ -5,9 +5,12 @@
 //!
 //! See the [Retention Leases specification](https://lance.org/format/table/retention_leases/).
 
+mod keeper;
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+pub use keeper::{LeaseKeeper, LeaseStatus};
 pub use lance_table::format::RetentionLease;
 use uuid::Uuid;
 
