@@ -207,41 +207,31 @@ and read any metadata the footer references outside the hinted range.
 
 ## Deletion Files
 
-Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting
-data files. Each fragment can have at most one deletion file per version. Files
-live under `_deletions/` in the dataset root named by `base_id` (or the current
-dataset root when `base_id` is unset).
+Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.
+Each fragment can have at most one deletion file per version. Files live under the dataset
+root selected by `base_id` (or the current dataset root when `base_id` is unset).
 
-A deletion vector's location is determined by `DeletionFile.inline` and
-`DeletionFile.path` (which cannot both be set):
+A deletion vector can be stored in three ways, and `path` and `inline` cannot both be set.
 
-* **Inline (`inline` is set):** The vector is stored directly in the manifest
-  as a Roaring bitmap, with no file in `_deletions/`.
-* **Derived path (`path` and `inline` are unset):** The file is at
-  `{root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}`. Because
-  the filename depends on `fragment_id`, a fragment with a derived deletion
-  file cannot be assigned a different `fragment_id` at commit time.
-* **Explicit path (`path` is set):** The file is at `{root}/{path}`, formatted
-  as `_deletions/{uuid}.{extension}` (lowercase hyphenated UUID, with `.arrow`
-  or `.bin` matching `file_type`). Writers generate a fresh UUID per file so
-  readers can cache vectors by path, and the path stays valid if the fragment
-  is renumbered at commit time.
+When `path` and `inline` are unset, the file path is derived from the fragment metadata as
+`{root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}` (requires `FLAG_DELETION_FILES`).
+Because `fragment_id` is part of the filename, a fragment with a derived deletion file cannot be
+assigned a different `fragment_id` at commit time.
 
-Deletion files support two storage formats. The Arrow IPC format (`.arrow`
-extension) stores a flat Int32Array of deleted row offsets and is efficient for
-sparse deletions. The Roaring Bitmap format (`.bin` extension) stores a
-compressed roaring bitmap and is efficient for dense deletions. Readers must
-filter rows whose offsets appear in the deletion file for the fragment.
+When `DeletionFile.path` is set, the file is at `{root}/{path}`. The path must be a normalized relative
+object path (no leading or trailing `/`, and no empty, `.`, or `..` segments) and includes the file extension
+while `file_type` selects the decoder. Because the path does not depend on `fragment_id`, it stays valid if
+the fragment is renumbered. Writers must not overwrite an existing deletion file path while any manifest
+version references it. Setting `path` requires `FLAG_DELETION_FILE_PATHS` (`2^21`) in both reader and
+writer feature flags, which remain set on subsequent versions.
 
-!!! warning "Experimental"
+When `DeletionFile.inline` is set, the deletion vector is stored directly in the manifest as a
+Roaring bitmap with no external file (requires `FLAG_INLINE_DELETIONS`).
 
-    Using `DeletionFile.path` sets feature flag `2^20`
-    (`FLAG_UNSTABLE_DELETION_FILE_PATHS`) in both reader and writer feature
-    flags for that version and all later versions. Release builds require
-    `LANCE_ENABLE_UNSTABLE_DELETION_FILE_PATHS` to read or write tables with
-    this flag. Because Lance < 14.0 only checks feature flags on the version
-    it opens, upgrade all cleanup clients before writing explicit deletion
-    paths.
+Deletion files support two storage formats.
+The Arrow IPC format (`.arrow` extension) stores a flat Int32Array of deleted row offsets and is efficient for sparse deletions.
+The Roaring Bitmap format (`.bin` extension) stores a compressed roaring bitmap and is efficient for dense deletions.
+Readers must filter rows whose offsets appear in the deletion file for the fragment.
 
 Deletions can be materialized by rewriting data files with deleted rows removed.
 However, this invalidates row addresses and requires rebuilding indices, which can be expensive.

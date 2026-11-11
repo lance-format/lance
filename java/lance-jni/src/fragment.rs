@@ -1111,6 +1111,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             num_deleted_rows,
             file_type,
             base_id,
+            path: None,
             inline,
         })
     }

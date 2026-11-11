@@ -888,6 +888,7 @@ impl PyDeletionFile {
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            path: None,
             inline,
         }))
     }

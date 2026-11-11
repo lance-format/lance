@@ -267,11 +267,10 @@ async fn do_write_manifest(
             .is_some_and(|deletion_file| deletion_file.path.is_some())
     });
     if has_deletion_file_paths {
-        crate::feature_flags::ensure_deletion_file_paths_enabled()?;
-        let paths_flag = crate::feature_flags::FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        let paths_flag = crate::feature_flags::FLAG_DELETION_FILE_PATHS;
         if manifest.reader_feature_flags & manifest.writer_feature_flags & paths_flag == 0 {
             return Err(Error::internal(format!(
-                "Refusing to write manifest version {}: a deletion file has an explicit path, \
+                "Refusing to write manifest version {}: a deletion file has a path, \
                  but feature flag {paths_flag} is not set in both feature words",
                 manifest.version
             )));
@@ -541,9 +540,11 @@ mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
 
-    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS};
-    use crate::format::ClusteringDefinition;
+    use crate::feature_flags::{
+        FLAG_DELETION_FILE_PATHS, FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS,
+    };
     use crate::format::SelfDescribingFileReader;
+    use crate::format::{ClusteringDefinition, DeletionFile, DeletionFileType};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::deepsize::DeepSizeOf;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -692,10 +693,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_write_manifest_requires_flag_for_explicit_deletion_paths() {
-        use crate::feature_flags::FLAG_UNSTABLE_DELETION_FILE_PATHS;
-        use crate::format::{DeletionFile, DeletionFilePath, DeletionFileType, Fragment};
-
+    async fn test_write_manifest_requires_flag_for_deletion_file_path() {
         let mut fragment = Fragment::new(0).with_physical_rows(10);
         fragment.deletion_file = Some(DeletionFile {
             read_version: 1,
@@ -703,7 +701,7 @@ mod test {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
-            path: Some(DeletionFilePath::new_random()),
+            path: Some("ab/file.bin".to_string()),
             inline: None,
         });
         let mut manifest = Manifest::new(
@@ -713,19 +711,15 @@ mod test {
             HashMap::new(),
         );
         let store = ObjectStore::memory();
-        let path = Path::from("/explicit_deletion_paths");
+        let path = Path::from("/deletion_file_path");
         let mut writer = store.create(&path).await.unwrap();
         let err = write_manifest(writer.as_mut(), &mut manifest, None, None)
             .await
             .unwrap_err();
-        if !crate::feature_flags::deletion_file_paths_enabled() {
-            assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
-            return;
-        }
         assert!(matches!(err, Error::Internal { .. }), "{err:?}");
 
-        manifest.reader_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
-        manifest.writer_feature_flags = FLAG_UNSTABLE_DELETION_FILE_PATHS;
+        manifest.reader_feature_flags = FLAG_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags = FLAG_DELETION_FILE_PATHS;
         let mut writer = store.create(&path).await.unwrap();
         write_manifest(writer.as_mut(), &mut manifest, None, None)
             .await
@@ -734,8 +728,6 @@ mod test {
 
     #[tokio::test]
     async fn test_write_manifest_rejects_path_and_inline() {
-        use crate::format::{DeletionFile, DeletionFilePath, DeletionFileType, Fragment};
-
         let mut fragment = Fragment::new(0).with_physical_rows(10);
         fragment.deletion_file = Some(DeletionFile {
             read_version: 1,
@@ -743,7 +735,7 @@ mod test {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
-            path: Some(DeletionFilePath::new_random()),
+            path: Some("file.bin".to_string()),
             inline: Some(Bytes::from_static(&[1, 2, 3])),
         });
         let mut manifest = Manifest::new(
