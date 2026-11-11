@@ -5,7 +5,7 @@ description: Get started with the Lance Java SDK — write Arrow batches, scan w
 
 # Getting Started with Java
 
-The `org.lance:lance-core` artifact provides Java bindings to the Lance Rust core via JNI and Apache Arrow's C Data Interface. It powers JVM compute connectors (such as [Apache Spark](spark.md), Trino, and Flink) and can be embedded directly in Java and Scala services.
+The `org.lance:lance-core` artifact is the low-level Java SDK for the Lance format, providing JNI and Apache Arrow C Data Interface bindings to the Rust core. If you are running analytics or data pipelines on the JVM, prefer a query engine such as [Apache Spark](spark.md) or [Trino](../integrations/trino/index.md); use `lance-core` directly when building custom engine connectors or storage integrations.
 
 ## Add Dependencies
 

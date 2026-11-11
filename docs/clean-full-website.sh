@@ -39,23 +39,10 @@ EOF
 cat > "$docs_src/integrations/.pages" <<'EOF'
 nav:
   - Overview: index.md
-  - Database:
-    - LanceDB: https://docs.lancedb.com/
-  - Language SDKs:
-    - Python (PyLance): https://lance-format.github.io/lance-python-doc
-    - Rust (docs.rs): https://docs.rs/lance/latest/lance
-    - Java (Javadoc): https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html
-  - Query & Compute Engines:
-    - Apache Spark: spark
-    - DuckDB: duckdb
-    - Trino: trino
-    - Apache DataFusion: datafusion.md
-    - Ray: ray
-    - PostgreSQL: https://github.com/lance-format/pglance
-  - ML & AI Ecosystem:
-    - PyTorch: pytorch.md
-    - Hugging Face: huggingface
-    - TensorFlow: tensorflow.md
+  - Apache DataFusion: datafusion.md
+  - PostgreSQL: https://github.com/lance-format/pglance
+  - PyTorch: pytorch.md
+  - TensorFlow: tensorflow.md
 EOF
 
 mkdir -p "$docs_src/format/catalog/dir"

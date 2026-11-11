@@ -57,19 +57,19 @@ pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+    include!("pb/lance.index.pb.rs");
 }
 
 pub mod pbold {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+    include!("pb/lance.table.rs");
 }
 
 /// Protobuf headers for serialized index cache entries (FTS posting lists,
 /// scalar indices, and IVF vector partitions).
 pub mod cache_pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+    include!("pb/lance.index.cache.rs");
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -105,7 +105,11 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        assert!(IndexType::IvfHnswRq.version() as u32 > IVF_RQ_INDEX_VERSION);
+        assert_eq!(
+            IndexType::max_vector_version(),
+            IndexType::IvfHnswRq.version() as u32
+        );
     }
 
     #[test]
@@ -137,6 +141,7 @@ mod tests {
             IndexType::IvfHnswPq,
             IndexType::IvfHnswFlat,
             IndexType::IvfRq,
+            IndexType::IvfHnswRq,
         ];
 
         for index_type in all {
@@ -184,6 +189,7 @@ mod tests {
             ("IVF_HNSW_FLAT", IndexType::IvfHnswFlat),
             ("IVF_HNSW_SQ", IndexType::IvfHnswSq),
             ("IVF_HNSW_PQ", IndexType::IvfHnswPq),
+            ("IVF_HNSW_RQ", IndexType::IvfHnswRq),
             ("FragmentReuse", IndexType::FragmentReuse),
             ("MemWal", IndexType::MemWal),
         ];

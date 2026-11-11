@@ -162,5 +162,5 @@ Spark wrote an ordinary Lance table, so other engines can use it directly. For e
 ## Next Steps
 
 - Read the [Spark connector documentation](../integrations/spark/index.md) for the full set of supported DDL, DML, and query operations.
-- See the [LanceDB quickstart](lancedb.md) to build search into an application.
+- See the [LanceDB quickstart](index.md) to build search into an application.
 - See the [PyLance quickstart](pylance.md) to work directly with the Lance format.

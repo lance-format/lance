@@ -38,7 +38,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -176,6 +176,37 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     );
     batch_size
 });
+
+/// Fewest (query, partition) probes a batch scoring task is given when a loaded
+/// chunk is split across CPU tasks. A probe costs from about a microsecond (a
+/// small flat partition) to far more (a high-dimensional PQ distance table), so
+/// this keeps the cheapest tasks above the cost of dispatching them.
+const MIN_PROBES_PER_SCORING_TASK: usize = 8;
+
+/// Split `0..probes_per_query.len()` into at most `max_tasks` contiguous query
+/// ranges with roughly equal numbers of probes, giving each range at least
+/// [`MIN_PROBES_PER_SCORING_TASK`] probes where the chunk has enough. Ranges
+/// without probes are omitted.
+fn balanced_query_ranges(probes_per_query: &[usize], max_tasks: usize) -> Vec<Range<usize>> {
+    let total: usize = probes_per_query.iter().sum();
+    let task_count = (total / MIN_PROBES_PER_SCORING_TASK).clamp(1, max_tasks.max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut probes = 0;
+    for (query_index, &count) in probes_per_query.iter().enumerate() {
+        probes += count;
+        if probes >= target && ranges.len() + 1 < task_count {
+            ranges.push(start..query_index + 1);
+            start = query_index + 1;
+            probes = 0;
+        }
+    }
+    if probes > 0 {
+        ranges.push(start..probes_per_query.len());
+    }
+    ranges
+}
 
 /// Prepared partition storage (bytes) handed to a single `spawn_cpu` dispatch on the
 /// global-top-k search path.
@@ -960,6 +991,11 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     pub(super) fn new(index: S, storage: Q::Storage) -> Self {
+        let storage = if S::name() == HNSW::name() {
+            storage.for_graph_search()
+        } else {
+            storage
+        };
         Self {
             index,
             storage,
@@ -1274,7 +1310,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> Result<Option<Arc<RabitSearchCache>>> {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // HNSW walks its graph without the flat raw-query scan state.
+        if Q::quantization_type() != QuantizationType::Rabit || S::name() == HNSW::name() {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = storage.quantizer()? else {
@@ -1313,7 +1350,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         &self,
         query: &ArrayRef,
     ) -> Result<Option<Arc<RabitRawQueryContext>>> {
-        if Q::quantization_type() != QuantizationType::Rabit || self.use_query_residual {
+        if Q::quantization_type() != QuantizationType::Rabit
+            || self.use_query_residual
+            || S::name() == HNSW::name()
+        {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
@@ -1661,7 +1701,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> QueryScratchCapacity {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // Only the flat RaBitQ scan reads the per-row scratch; HNSW walks without it.
+        if Q::quantization_type() != QuantizationType::Rabit
+            || S::name() != <FlatIndex as IvfSubIndex>::name()
+        {
             return QueryScratchCapacity::default();
         }
 
@@ -1784,7 +1827,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
         .await?;
         let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::V0(remapper)) => {
+            Some(ResolvedRemapping::V0 { remapper, .. }) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
                     .await?
             }
@@ -1804,7 +1847,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
-        let rabit_scan = if storage.supports_rabit_planes() {
+        // A graph walks whole partitions, so it stays off the plane scan.
+        let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
             context
                 .rabit_scan_factory
                 .as_ref()
@@ -1981,7 +2025,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_cache: Option<&LanceCache>,
         session: ResidentColumnsSetting,
     ) -> Result<bool> {
-        if !storage.supports_rabit_planes() {
+        if S::name() == HNSW::name() || !storage.supports_rabit_planes() {
             return Ok(false);
         }
         resident_lifetime_setting()?;
@@ -2425,6 +2469,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if self.caches_partition_codes() {
             return self.prewarm_partition_codes_window(partitions).await;
         }
+        let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -2433,7 +2478,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
             let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
-            if self.index_cache.get_with_key(&leader_key).await.is_some() {
+            if index_cache.get_with_key(&leader_key).await.is_some() {
                 partition_id += 1;
                 continue;
             }
@@ -2444,14 +2489,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             let mut run_end = partition_id + 1;
             while run_end < partitions.end {
                 let key = IVFPartitionKey::<S, Q>::new(run_end);
-                if self.index_cache.get_with_key(&key).await.is_some() {
+                if index_cache.get_with_key(&key).await.is_some() {
                     break;
                 }
                 run_end += 1;
             }
             let run = partition_id..run_end;
-            let (_, was_cached) = self
-                .index_cache
+            let (_, was_cached) = index_cache
                 .get_or_insert_with_key_hit(leader_key, || async {
                     let (index_batches, storage_batches) = tokio::try_join!(
                         read_partition_window_batches(
@@ -2493,9 +2537,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     let mut follower_loads = FuturesUnordered::new();
                     for (offset, batches) in payloads.enumerate() {
                         let follower_id = run.start + offset + 1;
+                        let index_cache = &index_cache;
                         follower_loads.push(async move {
                             let key = IVFPartitionKey::<S, Q>::new(follower_id);
-                            self.index_cache
+                            index_cache
                                 .get_or_insert_with_key(key, || async move {
                                     let entry = self
                                         .materialize_prewarm_partition(follower_id, batches)
@@ -2549,13 +2594,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// holds nothing to warm, and the index loaded the resident store when
     /// it opened.
     async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
+        let raw_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
         let projection = self.storage.partition_codes_projection()?;
         let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
-            let cached = |partition| async move {
-                let key = PartitionCodesKey { partition };
-                self.raw_cache.get_with_key(&key).await.is_some()
+            let cached = |partition| {
+                let raw_cache = &raw_cache;
+                async move {
+                    let key = PartitionCodesKey { partition };
+                    raw_cache.get_with_key(&key).await.is_some()
+                }
             };
             if cached(partition_id).await {
                 partition_id += 1;
@@ -2588,7 +2637,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     !shares_resident_store(&codes.0),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
-                self.raw_cache
+                raw_cache
                     .get_or_insert_with_key(
                         PartitionCodesKey { partition },
                         || async move { Ok(codes) },
@@ -2711,7 +2760,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             self.uuid
         );
         if self.uses_rabit_plane_cache() {
-            self.storage.prewarm_planes(&self.raw_cache).await?;
+            let index_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
+            self.storage.prewarm_planes(&index_cache).await?;
         } else {
             self.prewarm_partitions().await?;
         }
@@ -2729,13 +2779,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
         }
     }
 
@@ -3669,50 +3713,86 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // each mutates the same per-query heaps — so a step costs about
         // max(load, score) rather than their sum, and a scored chunk's storage is
         // dropped before the next is scored, keeping peak memory bounded.
+        let max_scoring_tasks = get_num_compute_intensive_cpus().max(1);
+        let mut probes_per_query = vec![0; query_count];
         let mut pending = loaded_chunks.next().await;
         while let Some(chunk) = pending {
-            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
-            let index = self.clone();
-            let base_queries = base_queries.clone();
-            let raw_query_contexts = raw_query_contexts.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let search_metrics = metrics.clone();
-            let queued = Instant::now();
-            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
-                search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                scratch_pool.with_scratch(|scratch| -> Result<()> {
-                    for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
-                        let partition_centroid = index.ivf.centroid(*part_id);
-                        for (query_index, dist_q_c) in probing_queries {
-                            let prepared = PreparedPartitionSearch::<S, Q> {
-                                query: base_queries[*query_index].clone(),
-                                dist_q_c: *dist_q_c,
-                                pre_filter: pre_filter.clone(),
-                                partition_id: *part_id,
-                                partition_centroid: partition_centroid.clone(),
-                                rq_search_cache: index.rq_search_cache.clone(),
-                                raw_query_context: raw_query_contexts[*query_index].clone(),
-                                part_entry: part_entry.clone(),
-                                _in_flight: index.prepared_partitions.track(),
-                                _marker: PhantomData,
-                            };
-                            Self::accumulate_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                &mut heaps[*query_index],
-                                scratch,
-                                search_metrics.as_ref(),
-                            )?;
-                        }
-                    }
-                    Ok(())
-                })?;
-                Ok(heaps)
-            });
+            let chunk = Arc::new(chunk.into_iter().collect::<Result<Vec<_>>>()?);
+            // Score disjoint query ranges on separate CPU tasks. Each task owns
+            // its queries' heaps, and every query still visits the chunk's
+            // partitions in sorted order, so heap insertion order (and thus the
+            // tie-break above) matches scoring the chunk on a single task.
+            probes_per_query.fill(0);
+            for (_, _, probing_queries, _) in chunk.iter() {
+                for (query_index, _) in probing_queries {
+                    probes_per_query[*query_index] += 1;
+                }
+            }
+            let ranges = balanced_query_ranges(&probes_per_query, max_scoring_tasks);
+            let mut scoring = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let range_heaps: Vec<_> = heaps[range.clone()]
+                    .iter_mut()
+                    .map(std::mem::take)
+                    .collect();
+                let chunk = chunk.clone();
+                let index = self.clone();
+                let base_queries = base_queries.clone();
+                let raw_query_contexts = raw_query_contexts.clone();
+                let scratch_pool = self.scratch_pool.clone();
+                let search_metrics = metrics.clone();
+                let queued = Instant::now();
+                scoring.push(spawn_cpu(
+                    move || -> Result<(Range<usize>, Vec<BinaryHeap<OrderedNode<u64>>>)> {
+                        search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                        let mut range_heaps = range_heaps;
+                        scratch_pool.with_scratch(|scratch| -> Result<()> {
+                            for (part_id, part_entry, probing_queries, pre_filter) in chunk.iter() {
+                                // Each partition's probing queries are in ascending order.
+                                let start =
+                                    probing_queries.partition_point(|(q, _)| *q < range.start);
+                                let end = probing_queries.partition_point(|(q, _)| *q < range.end);
+                                if start == end {
+                                    continue;
+                                }
+                                let partition_centroid = index.ivf.centroid(*part_id);
+                                for (query_index, dist_q_c) in &probing_queries[start..end] {
+                                    let prepared = PreparedPartitionSearch::<S, Q> {
+                                        query: base_queries[*query_index].clone(),
+                                        dist_q_c: *dist_q_c,
+                                        pre_filter: pre_filter.clone(),
+                                        partition_id: *part_id,
+                                        partition_centroid: partition_centroid.clone(),
+                                        rq_search_cache: index.rq_search_cache.clone(),
+                                        raw_query_context: raw_query_contexts[*query_index].clone(),
+                                        part_entry: part_entry.clone(),
+                                        _in_flight: index.prepared_partitions.track(),
+                                        _marker: PhantomData,
+                                    };
+                                    Self::accumulate_prepared_partition_search(
+                                        use_query_residual,
+                                        use_residual_scratch,
+                                        prepared,
+                                        &mut range_heaps[*query_index - range.start],
+                                        scratch,
+                                        search_metrics.as_ref(),
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        Ok((range, range_heaps))
+                    },
+                ));
+            }
             // Load the next chunk while this one is scored on the CPU pool.
-            let (scored, next) = futures::join!(score, loaded_chunks.next());
-            heaps = scored?;
+            let (scored, next) =
+                futures::join!(futures::future::try_join_all(scoring), loaded_chunks.next());
+            for (range, range_heaps) in scored? {
+                for (heap, scored_heap) in heaps[range].iter_mut().zip(range_heaps) {
+                    *heap = scored_heap;
+                }
+            }
             pending = next;
         }
 
@@ -3924,7 +4004,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         )
     };
     let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
+        Some(ResolvedRemapping::V0 { remapper, .. }) => make_storage(Some(remapper)),
         Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
             make_storage(None).with_row_id_remapping(remapper)
         }
@@ -3939,7 +4019,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
-    let rabit_scan = if storage.supports_rabit_planes() {
+    let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
         context
             .rabit_scan_factory
             .as_ref()

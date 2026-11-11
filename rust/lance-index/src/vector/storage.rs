@@ -3,6 +3,8 @@
 
 //! Vector Storage, holding (quantized) vectors and providing distance calculation.
 
+mod prewarm;
+
 use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
 use crate::vector::bq::planes::{EntryColumns, PlaneBatch, PlaneKey, plane_columns};
@@ -159,6 +161,12 @@ pub trait DistCalculator {
     }
 
     fn prefetch(&self, _id: u32) {}
+
+    /// Whether the final score of `id`, scored `dist` by [`Self::distance`], lies
+    /// in `[lower, upper)`; [`VectorStore::rerank`] may replace `dist`.
+    fn in_range(&self, _id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        dist >= lower && dist < upper
+    }
 
     /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
     /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
@@ -664,6 +672,32 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
         selected
             .iter()
             .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
+    }
+
+    /// The calculator a graph search walks with; [`Self::rerank`] corrects it.
+    fn graph_dist_calculator(
+        &self,
+        query: ArrayRef,
+        dist_q_c: f32,
+    ) -> Self::DistanceCalculator<'_> {
+        self.dist_calculator(query, dist_q_c)
+    }
+
+    /// Prepares a partition's storage for searches over its graph.
+    fn for_graph_search(self) -> Self {
+        self
+    }
+
+    /// Re-scores and re-sorts the candidates of a graph search. Returns
+    /// `false`, the default, when the search scores are final.
+    fn rerank(&self, _query: ArrayRef, _dist_q_c: f32, _results: &mut [OrderedNode]) -> bool {
+        false
+    }
+
+    /// Gives a partition's storage its IVF `centroid` before a graph build; RQ
+    /// stages its rows for code-to-code scoring with it.
+    fn with_centroid(self, _centroid: &dyn Array) -> Result<Self> {
+        Ok(self)
     }
 }
 
@@ -1976,53 +2010,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         Ok((storage, hit))
     }
 
-    /// Warm every plane entry a full-precision scan reads. Backend admission
-    /// enforces its byte budget.
-    ///
-    /// A backend that gates lower planes on their sign plane is warmed plane
-    /// by plane: all sign planes first, then the other planes of partitions
-    /// whose sign plane stayed resident. Other backends admit plane entries
-    /// like any entry, so they are warmed partition by partition, which loads
-    /// (and persists) every plane whatever fits in RAM, as the native
-    /// partition prewarm does.
-    pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
-        let planes = [0, 1];
-        if !cache.plane_admission_gated() {
-            for part_id in 0..self.num_partitions() {
-                for &plane in &planes {
-                    cache
-                        .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                            Ok(plane_cache_entry(
-                                self.read_plane_entry(part_id, plane, None).await?,
-                            ))
-                        })
-                        .await?;
-                }
-            }
-            return Ok(());
-        }
-        for &plane in &planes {
-            for part_id in 0..self.num_partitions() {
-                if plane > 0
-                    && cache
-                        .get_resident_with_key(&self.plane_key(part_id, 0))
-                        .await
-                        .is_none()
-                {
-                    continue;
-                }
-                cache
-                    .get_or_insert_with_key(self.plane_key(part_id, plane), || async {
-                        Ok(plane_cache_entry(
-                            self.read_plane_entry(part_id, plane, None).await?,
-                        ))
-                    })
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
     /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
     /// Historical native encodings and one-bit indices keep their ordinary
     /// partition reader; they are not adapted into the new scan path.
@@ -2142,9 +2129,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let sign_resident = plane == 0
             || cache
-                .get_resident_with_key(&self.plane_key(part_id, 0))
-                .await
-                .is_some();
+                .peek_resident_with_key(&self.plane_key(part_id, 0))
+                .await;
         let batch = if sign_resident {
             cache
                 .get_or_insert_with_key_hit(key, || async {
