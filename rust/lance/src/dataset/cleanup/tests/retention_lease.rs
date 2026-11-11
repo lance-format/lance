@@ -170,8 +170,17 @@ async fn cleanup_keeps_files_staged_after_a_lease_was_created(
     assert!(!data_files(&dataset).await.contains("staged.lance"));
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MissingHistory {
+    Manifest,
+    TransactionFile,
+}
+
+#[rstest]
+#[case::manifest(MissingHistory::Manifest)]
+#[case::transaction_file(MissingHistory::TransactionFile)]
 #[tokio::test]
-async fn cleanup_refuses_to_delete_when_lease_history_is_missing() {
+async fn cleanup_refuses_to_delete_when_lease_history_is_missing(#[case] missing: MissingHistory) {
     MockClock::set_system_time(START);
     let fixture = MockDatasetFixture::try_new().unwrap();
     fixture.create_some_data().await.unwrap();
@@ -180,12 +189,22 @@ async fn cleanup_refuses_to_delete_when_lease_history_is_missing() {
     fixture.append_some_data().await.unwrap();
     fixture.append_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
-    let gap = dataset
-        .commit_handler
-        .resolve_version_location(&dataset.base, 4, dataset.object_store.inner.as_ref())
-        .await
-        .unwrap();
-    dataset.object_store.delete(&gap.path).await.unwrap();
+    let gap = match missing {
+        MissingHistory::Manifest => {
+            dataset
+                .commit_handler
+                .resolve_version_location(&dataset.base, 4, dataset.object_store.inner.as_ref())
+                .await
+                .unwrap()
+                .path
+        }
+        MissingHistory::TransactionFile => {
+            let version = dataset.checkout_version(4).await.unwrap();
+            let transaction_file = version.manifest.transaction_file.as_deref().unwrap();
+            dataset.base.child(TRANSACTIONS_DIR).child(transaction_file)
+        }
+    };
+    dataset.object_store.delete(&gap).await.unwrap();
     let before = fixture.count_files().await.unwrap();
 
     MockClock::set_system_time(START + MONTH);
