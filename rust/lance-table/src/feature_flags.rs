@@ -1498,7 +1498,7 @@ mod tests {
         apply_feature_flags(&mut legacy, false, false).unwrap();
         assert_eq!(legacy.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
 
-        let mut explicit = manifest_with(Some("ab/file.bin".to_string()));
+        let mut explicit = manifest_with(Some("_deletions/ab/file.bin".to_string()));
         apply_feature_flags(&mut explicit, false, false).unwrap();
         assert_eq!(
             explicit.reader_feature_flags & FLAG_DELETION_FILE_PATHS,

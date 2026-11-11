@@ -490,7 +490,7 @@ mod test {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(2),
             base_id: None,
-            path: Some("ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
             inline: None,
         };
         let object_store = ObjectStore::memory();
@@ -498,7 +498,7 @@ mod test {
         let stored = deletion_file_path(&base, 0, &file);
         assert_eq!(
             stored,
-            Path::from("/stored/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
+            Path::from("/stored/_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
         );
         let mut bytes = Vec::new();
         RoaringBitmap::from_iter([5u32, 9])

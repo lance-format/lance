@@ -219,7 +219,7 @@ Because `fragment_id` is part of the filename, a fragment with a derived deletio
 assigned a different `fragment_id` at commit time.
 
 When `DeletionFile.path` is set, the file is at `{root}/{path}`. The path must be a normalized relative
-object path (no leading or trailing `/`, and no empty, `.`, or `..` segments) and includes the file extension
+object path under `_deletions/` (no leading or trailing `/`, and no empty, `.`, or `..` segments) and includes the file extension
 while `file_type` selects the decoder. Because the path does not depend on `fragment_id`, it stays valid if
 the fragment is renumbered. Writers must not overwrite an existing deletion file path while any manifest
 version references it. Setting `path` requires `FLAG_DELETION_FILE_PATHS` (`2^21`) in both reader and

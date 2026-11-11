@@ -20,6 +20,7 @@ use super::row_ids::{
     RowIdMeta,
 };
 use crate::format::pb;
+use crate::io::deletion::DELETIONS_DIR;
 
 use crate::rowids::version::{
     RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
@@ -514,7 +515,7 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
-    /// Path relative to the dataset root selected by `base_id`.
+    /// Path under `_deletions/`, relative to the dataset root selected by `base_id`.
     /// When `None`, the path is derived via [`deletion_file_path`](crate::io::deletion::deletion_file_path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -571,14 +572,19 @@ impl DeletionFile {
     }
 }
 
-/// Validates that `path` is a normalized relative object path (no leading/trailing `/`, `.`, `..`, or empty segments)
-/// and ends with `.{file_type.suffix()}`.
+/// Validates that `path` is a normalized relative object path under `_deletions/`
+/// (no leading/trailing `/`, `.`, `..`, or empty segments) and ends with `.{file_type.suffix()}`.
 fn check_deletion_path(
     path: &str,
     file_type: &DeletionFileType,
 ) -> std::result::Result<(), String> {
     if path.is_empty() {
         return Err("deletion file path is empty".to_string());
+    }
+    if !path.starts_with(&format!("{DELETIONS_DIR}/")) {
+        return Err(format!(
+            "deletion file path {path:?} must be under {DELETIONS_DIR}/"
+        ));
     }
     let suffix = file_type.suffix();
     if !path.ends_with(&format!(".{suffix}")) {
@@ -1451,7 +1457,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(10),
             base_id: Some(3),
-            path: Some("ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
             inline: None,
         };
         let mut fragment = Fragment::new(42);
@@ -1460,7 +1466,7 @@ mod tests {
         let proto = pb::DataFragment::from(&fragment);
         assert_eq!(
             proto.deletion_file.as_ref().unwrap().path.as_deref(),
-            Some("ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
+            Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
         );
         assert_eq!(Fragment::try_from(proto.clone()).unwrap(), fragment);
         assert_eq!(
@@ -1470,7 +1476,10 @@ mod tests {
             fragment
         );
         let filename = relative_deletion_file_path(42, &deletion_file);
-        assert_eq!(filename, "ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin");
+        assert_eq!(
+            filename,
+            "_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin"
+        );
         assert_eq!(filename, relative_deletion_file_path(99, &deletion_file));
 
         let json = serde_json::to_value(&deletion_file).unwrap();
@@ -1484,16 +1493,18 @@ mod tests {
     fn test_deletion_file_rejects_bad_path_and_inline_conflict() {
         let bad_paths = [
             "",
-            "/file.bin",
-            "file.bin/",
-            "..",
-            "../file.bin",
-            "a/../b",
-            ".",
-            "a/./b",
-            "a//b",
-            "file.lance",
-            "file.arrow",
+            "/_deletions/file.bin",
+            "_deletions/file.bin/",
+            "_deletions/..",
+            "_deletions/../file.bin",
+            "_deletions/a/../b.bin",
+            "_deletions/.",
+            "_deletions/a/./b.bin",
+            "_deletions/a//b.bin",
+            "_deletions/file.lance",
+            "_deletions/file.arrow",
+            "ab/file.bin",
+            "_indices/file.bin",
         ];
         for path in bad_paths {
             let deletion_file = DeletionFile {
@@ -1532,7 +1543,7 @@ mod tests {
             file_type: pb::deletion_file::DeletionFileType::Bitmap as i32,
             num_deleted_rows: 1,
             base_id: None,
-            path: Some("file.bin".to_string()),
+            path: Some("_deletions/file.bin".to_string()),
             inline: Some(bytes::Bytes::from_static(&[1, 2, 3])),
         };
         let err = DeletionFile::try_from(proto).unwrap_err();
