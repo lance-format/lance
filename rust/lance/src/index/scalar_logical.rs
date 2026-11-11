@@ -2093,6 +2093,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // No committed index needs the compaction's record, so trim drops it
+        // and nothing maps the retired coverage.
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
 
         let direct_err = dataset
             .commit_existing_index_segments("text_ngram", "text", segments.clone())
