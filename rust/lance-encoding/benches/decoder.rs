@@ -470,12 +470,12 @@ fn bench_decode_compressed(c: &mut Criterion) {
 /// |-----------|------------------|----------------------------------|
 /// | 24        | NarrowU32 (SIMD) | decimal128(7,2)-typical          |
 /// | 40        | NarrowU64 (SIMD) | decimal128(12,2) / store_sales   |
-/// | 100       | SequentialU128   | scalar-fallback (rare in OLTP)   |
+/// | 100       | SplitU64         | values of 2^64 or more           |
 /// | 128       | Memcpy           | full-precision / signed columns  |
 ///
 /// Each variant constructs values that force every chunk's
 /// `Stat::BitWidth` to land in the target arm: positive values in
-/// `[2^(bw-1), 2^bw - 1]` for the narrow / sequential arms (the OR-fold
+/// `[2^(bw-1), 2^bw - 1]` for the narrow / split arms (the OR-fold
 /// reaches exactly `bw`), and bounded negative values for the Memcpy arm
 /// (every i128 has the high bit set, so OR-fold = u128::MAX → bw = 128).
 fn bench_decode_decimal128(c: &mut Criterion) {
@@ -496,12 +496,12 @@ fn bench_decode_decimal128(c: &mut Criterion) {
 
     // (label, target bit_width). Realistic decimal128(7,2) data lands at
     // bw≈24 (NarrowU32); decimal128(12,2)/store_sales-style values at bw≈40
-    // (NarrowU64); bw=100 exercises the scalar SequentialU128 arm; bw=128
+    // (NarrowU64); bw=100 exercises the SplitU64 arm; bw=128
     // hits Memcpy. One representative per non-Zero dispatch arm.
     let cases: &[(&str, u32)] = &[
         ("bw024_narrow_u32", 24),
         ("bw040_narrow_u64", 40),
-        ("bw100_sequential_u128", 100),
+        ("bw100_split_u64", 100),
         ("bw128_memcpy", 128),
     ];
 
@@ -565,7 +565,7 @@ fn bench_decode_decimal128(c: &mut Criterion) {
 ///   2^target_bw - 1]` by setting bit `target_bw - 1` and masking the
 ///   higher bits, so the per-chunk OR-fold lands at exactly `target_bw`
 ///   and routes to NarrowU32 (1 ≤ bw ≤ 32) or NarrowU64 (33 ≤ bw ≤ 64) or
-///   the scalar SequentialU128 (65 ≤ bw ≤ 127) arm.
+///   the SplitU64 (65 ≤ bw ≤ 127) arm.
 fn generate_decimal128_values(num_rows: usize, target_bw: u32, seed: u64) -> Vec<i128> {
     let mut state = seed | 1; // defend against the xorshift seed=0 fixed point
     (0..num_rows)

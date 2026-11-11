@@ -369,7 +369,7 @@ impl FixedWidthDataBlock {
     /// `bit_width` value into kernels with strict invariants:
     /// - 1..=32   → reinterpret-cast `&[u128] → &mut [u32]` and pack with FastLanes u32 SIMD
     /// - 33..=64  → reinterpret-cast `&[u128] → &mut [u64]` and pack with FastLanes u64 SIMD
-    /// - 65..=127 → scalar u128 sequential pack
+    /// - 65..=127 → low 64 bits raw, high bits packed with FastLanes u64
     /// - 128      → memcpy identity
     ///
     /// The narrow branches (≤32, ≤64) only correctly truncate the high u128 lanes if **every
@@ -1237,7 +1237,7 @@ mod tests {
         //   width 0  → all zeros
         //   width 24 → narrow u32
         //   width 40 → narrow u64
-        //   width 80 → sequential u128
+        //   width 80 → split u64
         //   width 128 → memcpy (sign bit set)
         // We construct each chunk as exactly 1024 values to force a chunk boundary.
         let chunk_size = 1024;

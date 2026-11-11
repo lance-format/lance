@@ -25,7 +25,8 @@
 //! | 0         | none, the block is empty                         |
 //! | 1..=32    | low 32 bits of each value, FastLanes u32 packing |
 //! | 33..=64   | low 64 bits of each value, FastLanes u64 packing |
-//! | 65..=127  | sequential u128 bit stream                       |
+//! | 65..=127  | low 64 bits as u64 words, then the high bits     |
+//! |           | with FastLanes u64 packing at `bit_width - 64`   |
 //! | 128       | values copied as-is                              |
 //!
 //! Every kernel writes `bit_width * 128` bytes per block. Inline chunks carry the width in
@@ -89,8 +90,9 @@ enum U128Kernel {
     NarrowU32,
     /// `33..=64`: reinterpret body as `&[u64]`, FastLanes u64 SIMD pack/unpack.
     NarrowU64,
-    /// `65..=127`: scalar sequential u128 bit-stream.
-    SequentialU128,
+    /// `65..=127`: the low 64 bits of each value as plain u64 words, then the high
+    /// `bit_width - 64` bits with FastLanes u64 pack/unpack.
+    SplitU64,
     /// `bit_width == 128`: identity — one u128 word per value, copied verbatim.
     Memcpy,
 }
@@ -105,7 +107,7 @@ fn u128_kernel_for(bit_width: usize) -> U128Kernel {
         0 => U128Kernel::Zero,
         1..=32 => U128Kernel::NarrowU32,
         33..=64 => U128Kernel::NarrowU64,
-        65..=127 => U128Kernel::SequentialU128,
+        65..=127 => U128Kernel::SplitU64,
         128 => U128Kernel::Memcpy,
         // Pre-condition asserted above; this arm exists so that any future
         // drift (e.g. caller passing a corrupt header) becomes a defined
@@ -281,9 +283,8 @@ impl InlineBitpacking {
         }
     }
 
-    /// u128-specific bitpacker that picks a narrow FastLanes lane (u32 or u64) per chunk
-    /// when the chunk's bit_width fits, falling back to the scalar sequential u128 kernel
-    /// only for chunks that genuinely need 65..=128 bits.
+    /// u128-specific bitpacker that picks a FastLanes kernel per chunk from the chunk's
+    /// bit_width (see `u128_kernel_for`).
     ///
     /// The on-disk framing is identical to a generic `bitpack_chunked::<u128>` output:
     /// each chunk is a 16-byte u128 header carrying `bit_width` (low 8 bits used, high
@@ -306,15 +307,8 @@ impl InlineBitpacking {
         let data_buffer = data.data.borrow_to_typed_slice::<u128>();
         let data_buffer = data_buffer.as_ref();
 
-        // The dispatch is u128-specific by design: u8/u16/u32/u64 already enjoy
-        // FastLanes SIMD pack/unpack via `BitPacking`, so per-chunk routing would
-        // add scheduling overhead with no measurable speedup. u128 is the only
-        // word size in `lance-bitpacking` whose default kernel is a scalar
-        // sequential bit-stream, which is why narrowing to u32/u64 (when the
-        // chunk fits) wins ~3.7× on real decimal128 workloads. Do not extend
-        // this dispatch to narrower word sizes without a benchmark showing it
-        // helps — the symmetry is an artifact of u128's missing SIMD kernel,
-        // not a generic optimization.
+        // `lance-bitpacking` has no u128 kernel, so every 128-bit width is built from
+        // the u32 and u64 FastLanes kernels.
         let bit_widths = data.expect_stat(Stat::BitWidth);
         let bit_widths_array = bit_widths
             .as_any()
@@ -390,13 +384,7 @@ impl InlineBitpacking {
         assert!(data.bits_per_value.is_multiple_of(8));
         assert_eq!(data.bits_per_value, self.uncompressed_bit_width);
         let bits_per_value = data.bits_per_value;
-        // The 128-bit arm is what makes Decimal128 columns benefit from inline bit-packing:
-        // common decimal precisions (e.g. Decimal128(7,2)) pack to ~24 bits, well below the
-        // full 128-bit storage. The u128 path uses per-chunk narrow dispatch: when a
-        // chunk's bit_width fits in u32 or u64 we route the body through the FastLanes
-        // SIMD kernels for those types, and only fall back to the scalar sequential
-        // u128 kernel when the chunk genuinely needs more than 64 bits. Chunk header
-        // (16 bytes carrying `bit_width`) and body byte count are unchanged.
+        // 128-bit chunks pick a kernel per chunk from their bit width (see `u128_kernel_for`).
         let compressed = match bits_per_value {
             8 => Self::bitpack_chunked::<u8>(data),
             16 => Self::bitpack_chunked::<u16>(data),
@@ -696,8 +684,8 @@ impl BlockCompressor for InlineBitpacking {
 
 impl MiniBlockDecompressor for InlineBitpacking {
     fn inline_bitpacking_width(&self) -> Option<u64> {
-        // The direct decode path unpacks with `T::unchecked_unpack_uninit`, the sequential
-        // kernel for u128, but 128-bit chunks are laid out by `u128_kernel_for`.
+        // The direct decode path unpacks one `BitPackingUninit` word type per chunk. 128-bit
+        // chunks are laid out by `u128_kernel_for`, so they decode through `decompress`.
         (self.uncompressed_bit_width != 128).then_some(self.uncompressed_bit_width)
     }
 
@@ -818,7 +806,8 @@ fn append_u128_chunk(
 ///   - bit_width == 0: no body bytes (`dest_u128` is empty).
 ///   - bit_width 1..=32: write FastLanes u32 lane×row layout into `dest_u128` (cast to u32).
 ///   - bit_width 33..=64: write FastLanes u64 lane×row layout (cast to u64).
-///   - bit_width 65..=127: write the existing scalar sequential u128 layout.
+///   - bit_width 65..=127: low 64 bits as u64 words, then the high bits in FastLanes u64
+///     layout at width `bit_width - 64`.
 ///   - bit_width == 128: identity — body holds raw u128 values, written via `copy_nonoverlapping`.
 ///
 /// The branch is selected by `u128_kernel_for(bit_width)` (single source of truth shared
@@ -842,16 +831,16 @@ fn append_u128_chunk(
 ///   reports `128 - leading_zeros(or_fold)` — a negative i128 (sign bit set) or
 ///   any value exceeding `2^bit_width - 1` therefore drives the chunk's reported
 ///   bit_width to at least the position of its highest set bit, so a chunk
-///   reaching the narrow or sequential branches is provably bounded by
+///   reaching the narrow or split branches is provably bounded by
 ///   `2^bit_width`. `debug_assertions` builds re-check each value to catch any
 ///   future drift in the statistics computation.
 /// - The `bit_width == 128` branch holds raw, full-range values that are written
 ///   verbatim via `copy_nonoverlapping` and is the only branch that can carry
 ///   negative i128 values.
 /// - `BitPacking::unchecked_pack`'s contract requires `bit_width <= size_of::<T>() * 8`,
-///   which is satisfied by construction: `T = u32` for 1..=32, `u64` for 33..=64,
-///   `u128` for 65..=127. The 0 and 128 arms short-circuit and never call into
-///   `BitPacking`.
+///   which is satisfied by construction: `T = u32` for 1..=32, `u64` for 33..=64, and
+///   `u64` at `bit_width - 64` for the high bits of 65..=127. The 0 and 128 arms
+///   short-circuit and never call into `BitPacking`.
 unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]) {
     debug_assert_eq!(src.len(), ELEMS_PER_CHUNK as usize);
     debug_assert!(
@@ -870,12 +859,7 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
             );
         }
         U128Kernel::Memcpy => {
-            // bit_width == 128: identity — at full width every value occupies one whole
-            // u128 word in the body, so the FastLanes scalar bit-loop degenerates to a
-            // sequence of single-word writes. `copy_nonoverlapping` short-circuits the
-            // same work and aligns with the dispatch's documented "memcpy path" —
-            // important for the worst case (negative i128 columns), which forces this
-            // branch on every chunk.
+            // bit_width == 128: every value occupies one whole u128 word in the body.
             debug_assert_eq!(dest_u128.len(), ELEMS_PER_CHUNK as usize);
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dest_u128.as_mut_ptr(), src.len());
@@ -905,7 +889,7 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
                     v >> bit_width == 0,
                     "pack_u128_chunk narrow-u32: value {v:#x} exceeds bit_width={bit_width} \
                      — Stat::BitWidth invariant violated (any high bit, including i128 sign, \
-                     must drive bit_width to 128 and route to the sequential/memcpy path)"
+                     must drive bit_width to 128 and route to the memcpy path)"
                 );
                 *n = v as u32;
             }
@@ -931,24 +915,29 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
                     v >> bit_width == 0,
                     "pack_u128_chunk narrow-u64: value {v:#x} exceeds bit_width={bit_width} \
                      — Stat::BitWidth invariant violated (any high bit, including i128 sign, \
-                     must drive bit_width to 128 and route to the sequential/memcpy path)"
+                     must drive bit_width to 128 and route to the memcpy path)"
                 );
                 *n = v as u64;
             }
             let dest_u64 = bytemuck::cast_slice_mut::<u128, u64>(dest_u128);
             unsafe { BitPacking::unchecked_pack(bit_width, &narrow, dest_u64) };
         }
-        U128Kernel::SequentialU128 => {
-            // bit_width 65..=127: scalar sequential u128 kernel. Same `v >> bit_width
-            // == 0` contract as the narrow branches.
-            for &v in src.iter() {
+        U128Kernel::SplitU64 => {
+            // bit_width 65..=127: the first 1024 u64 words hold the low halves; the
+            // remaining `16 * (bit_width - 64)` words hold the packed high halves.
+            let dest_u64 = bytemuck::cast_slice_mut::<u128, u64>(dest_u128);
+            let (low, high) = dest_u64.split_at_mut(ELEMS_PER_CHUNK as usize);
+            let mut high_halves = [0u64; ELEMS_PER_CHUNK as usize];
+            for ((l, h), &v) in low.iter_mut().zip(high_halves.iter_mut()).zip(src.iter()) {
                 debug_assert!(
                     v >> bit_width == 0,
-                    "pack_u128_chunk u128-sequential: value {v:#x} exceeds bit_width={bit_width} \
+                    "pack_u128_chunk split-u64: value {v:#x} exceeds bit_width={bit_width} \
                      — Stat::BitWidth invariant violated"
                 );
+                *l = v as u64;
+                *h = (v >> 64) as u64;
             }
-            unsafe { BitPacking::unchecked_pack(bit_width, src, dest_u128) };
+            unsafe { BitPacking::unchecked_pack(bit_width - 64, &high_halves, high) };
         }
     }
 }
@@ -975,9 +964,9 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
 /// - `dest.len() == ELEMS_PER_CHUNK` (1024).
 /// - `bit_width <= 128`.
 /// - `BitPacking::unchecked_unpack`'s contract requires `bit_width <= size_of::<T>() * 8`,
-///   which is satisfied by construction: `T = u32` for 1..=32, `u64` for 33..=64,
-///   `u128` for 65..=127. The 0 and 128 arms short-circuit (zero-fill and memcpy
-///   respectively) and never call into `BitPacking`.
+///   which is satisfied by construction: `T = u32` for 1..=32, `u64` for 33..=64, and
+///   `u64` at `bit_width - 64` for the high bits of 65..=127. The 0 and 128 arms
+///   short-circuit (zero-fill and memcpy respectively) and never call into `BitPacking`.
 unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u128]) {
     debug_assert_eq!(dest.len(), ELEMS_PER_CHUNK as usize);
     debug_assert!(
@@ -1063,21 +1052,31 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
                 *d = v as u128;
             }
         }
-        U128Kernel::SequentialU128 => {
-            // bit_width 65..=127: scalar sequential u128 kernel. Stage on-disk
-            // bytes into an aligned stack u128 buffer and unpack directly into
-            // dest. `words = bit_width * 8` for ELEMS_PER_CHUNK = 1024 / 128.
-            let words = bit_width * (ELEMS_PER_CHUNK as usize / 128);
-            debug_assert!(words <= ELEMS_PER_CHUNK as usize);
-            let mut packed = [0u128; ELEMS_PER_CHUNK as usize];
+        U128Kernel::SplitU64 => {
+            // bit_width 65..=127: stage the low halves and the packed high halves into
+            // aligned stack u64 buffers, unpack the high halves, then join.
+            let low_bytes = ELEMS_PER_CHUNK as usize * 8;
+            let high_width = bit_width - 64;
+            let high_words = high_width * (ELEMS_PER_CHUNK as usize / 64);
+            let mut low = [0u64; ELEMS_PER_CHUNK as usize];
+            let mut packed = [0u64; ELEMS_PER_CHUNK as usize];
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     body_bytes.as_ptr(),
+                    low.as_mut_ptr() as *mut u8,
+                    low_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    body_bytes[low_bytes..].as_ptr(),
                     packed.as_mut_ptr() as *mut u8,
-                    body_bytes.len(),
+                    body_bytes.len() - low_bytes,
                 );
             }
-            unsafe { BitPacking::unchecked_unpack(bit_width, &packed[..words], dest) };
+            let mut high = [0u64; ELEMS_PER_CHUNK as usize];
+            unsafe { BitPacking::unchecked_unpack(high_width, &packed[..high_words], &mut high) };
+            for ((d, &l), &h) in dest.iter_mut().zip(low.iter()).zip(high.iter()) {
+                *d = (u128::from(h) << 64) | u128::from(l);
+            }
         }
     }
 }
@@ -1919,7 +1918,7 @@ mod test {
     #[rstest]
     #[case::narrow_u32(24, false)]
     #[case::narrow_u64(40, false)]
-    #[case::sequential_u128(100, false)]
+    #[case::split_u64(100, false)]
     #[case::narrow_then_memcpy(128, false)]
     #[case::narrow_u32_with_nulls(24, true)]
     #[test_log::test(tokio::test)]
@@ -2210,7 +2209,9 @@ mod test {
     #[case::zero(0)]
     #[case::narrow_u32(24)]
     #[case::narrow_u64(40)]
-    #[case::sequential_u128(100)]
+    #[case::split_u64_lowest(65)]
+    #[case::split_u64(100)]
+    #[case::split_u64_highest(127)]
     #[case::full_width(128)]
     fn test_u128_block_layout_follows_kernel_table(#[case] bit_width: usize) {
         let values: Vec<u128> = (0..ELEMS_PER_CHUNK as u128)
@@ -2235,15 +2236,15 @@ mod test {
                 bytemuck::cast_slice(&packed).to_vec()
             }
             65..=127 => {
-                // Value `i` occupies stream bits `i * w ..(i + 1) * w`, least significant first.
-                let mut packed = vec![0u128; ELEMS_PER_CHUNK as usize * bit_width / 128];
-                for (i, &value) in values.iter().enumerate() {
-                    for bit in 0..bit_width {
-                        let pos = i * bit_width + bit;
-                        packed[pos / 128] |= ((value >> bit) & 1) << (pos % 128);
-                    }
-                }
-                packed.iter().flat_map(|w| w.to_le_bytes()).collect()
+                // The low 64 bits of every value, then the high bits packed at `w - 64`.
+                let high: Vec<u64> = values.iter().map(|&v| (v >> 64) as u64).collect();
+                let mut packed = vec![0u64; ELEMS_PER_CHUNK as usize * (bit_width - 64) / 64];
+                unsafe { BitPacking::unchecked_pack(bit_width - 64, &high, &mut packed) };
+                values
+                    .iter()
+                    .flat_map(|&v| (v as u64).to_le_bytes())
+                    .chain(bytemuck::cast_slice::<u64, u8>(&packed).iter().copied())
+                    .collect()
             }
             _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
         };
@@ -2474,8 +2475,8 @@ mod test {
     }
 
     #[test]
-    fn test_inline_bitpack_u128_width_80_sequential() {
-        // bit_width in (64, 127] routes through the u128 sequential bit-stream.
+    fn test_inline_bitpack_u128_width_80_split_u64() {
+        // bit_width in (64, 127] splits each value into a raw low u64 and packed high bits.
         // Values with bit 79 set force width >= 80; stay below 2^80 so high bits
         // remain zero and width does not escalate to 128.
         let mask: u128 = (1u128 << 80) - 1;
@@ -2524,7 +2525,7 @@ mod test {
     fn test_inline_bitpack_u128_mixed_widths_per_chunk_dispatch() {
         // Three full chunks crafted so each lands in a different dispatch
         // regime: chunk 0 → u32 narrow (width=24), chunk 1 → u64 narrow
-        // (width=40), chunk 2 → u128 sequential (width=80). This exercises the
+        // (width=40), chunk 2 → split u64 (width=80). This exercises the
         // per-chunk Stat::BitWidth driving distinct kernels in the same array.
         let mask24: u128 = (1u128 << 24) - 1;
         let mask40: u128 = (1u128 << 40) - 1;
@@ -2579,7 +2580,7 @@ mod test {
                 0 => U128Kernel::Zero,
                 1..=32 => U128Kernel::NarrowU32,
                 33..=64 => U128Kernel::NarrowU64,
-                65..=127 => U128Kernel::SequentialU128,
+                65..=127 => U128Kernel::SplitU64,
                 128 => U128Kernel::Memcpy,
                 _ => unreachable!("bit_width loop bound is 128"),
             };
@@ -2675,7 +2676,7 @@ mod test {
         /// Fuzz the u128 inline bitpacking round-trip across the full dispatch
         /// matrix. For each case, we pick:
         ///   * `bit_width` in `0..=128` — covers all five kernels (zero-fill,
-        ///     u32 narrow, u64 narrow, u128 sequential, memcpy at width=128).
+        ///     u32 narrow, u64 narrow, split u64, memcpy at width=128).
         ///   * `len` in `1..=3 * ELEMS_PER_CHUNK` — exercises 0..2 full chunks
         ///     and any partial trailing chunk size, including exactly
         ///     `2 * ELEMS_PER_CHUNK` and `3 * ELEMS_PER_CHUNK` (multiple-of-1024
@@ -2694,7 +2695,7 @@ mod test {
         /// We assert the public compress→decompress surface is bit-exact for
         /// every (width, count, payload) triple. This is the safety net behind
         /// the per-regime hand-written tests above: if a future refactor of
-        /// the dispatch logic, the FastLanes packers, or the sequential
+        /// the dispatch logic, the FastLanes packers, or the split-u64
         /// kernel breaks any width, proptest will surface a minimal failing
         /// example.
         #[test]

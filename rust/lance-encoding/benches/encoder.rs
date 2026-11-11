@@ -164,7 +164,7 @@ fn bench_encode_structural_pages(c: &mut Criterion) {
 
 /// Benchmark Decimal128 inline-bitpacking encode across the four non-trivial
 /// kernel arms of the per-chunk u128 dispatch (NarrowU32 / NarrowU64 /
-/// SequentialU128 / Memcpy). Symmetric to `bench_decode_decimal128` in
+/// SplitU64 / Memcpy). Symmetric to `bench_decode_decimal128` in
 /// `decoder.rs`: for each `bit_width`, every chunk's `Stat::BitWidth` is
 /// forced to the target arm so the encoder exercises the corresponding
 /// pack kernel.
@@ -185,7 +185,7 @@ fn bench_encode_decimal128(c: &mut Criterion) {
     let cases: &[(&str, u32)] = &[
         ("bw024_narrow_u32", 24),
         ("bw040_narrow_u64", 40),
-        ("bw100_sequential_u128", 100),
+        ("bw100_split_u64", 100),
         ("bw128_memcpy", 128),
     ];
 
@@ -225,7 +225,7 @@ fn bench_encode_decimal128(c: &mut Criterion) {
 /// See `decoder.rs::generate_decimal128_values` — kept in sync. Forces every
 /// 1024-element chunk's `Stat::BitWidth` to the target arm so the encoder's
 /// `pack_u128_chunk` dispatch routes deterministically to NarrowU32 (1 ≤ bw
-/// ≤ 32), NarrowU64 (33 ≤ bw ≤ 64), SequentialU128 (65 ≤ bw ≤ 127), or
+/// ≤ 32), NarrowU64 (33 ≤ bw ≤ 64), SplitU64 (65 ≤ bw ≤ 127), or
 /// Memcpy (bw = 128). For the Memcpy case, values are bounded negatives in
 /// `[-(2^64), -1]`: the sign bit alone guarantees `Stat::BitWidth = 128`,
 /// while the bounded magnitude stays within Decimal128(38, 0) precision
