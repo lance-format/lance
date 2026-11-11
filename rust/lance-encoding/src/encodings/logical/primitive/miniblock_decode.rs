@@ -2610,6 +2610,7 @@ mod tests {
             let mut padded = vec![0_u32; 1024];
             padded[..values.len()].copy_from_slice(values);
             let mut packed = vec![10_u32; 1 + 320];
+            // SAFETY: `padded` has 1024 elements, width `10 <= 32`, and `packed[1..]` has exact length `1024 * 10 / 32 == 320`.
             unsafe { <u32 as BitPacking>::unchecked_pack(10, &padded, &mut packed[1..]) };
             let val_payload = bytemuck::cast_slice::<u32, u8>(&packed);
             let def_payload = bytemuck::cast_slice::<u16, u8>(defs);

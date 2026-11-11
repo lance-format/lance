@@ -289,10 +289,12 @@ macro_rules! impl_bitpacking_compat {
                 // occupy disjoint bit ranges of `index`.
                 let lane = index & (LANES - 1);
                 let fl_o = (index & 127 & !(LANES - 1)) >> 4;
+                // SAFETY: `fl_o` masks `index` with `127` and shifts right by `4`, so `fl_o < 8 == FL_ORDER.len()`.
                 let o = unsafe { *FL_ORDER.get_unchecked(fl_o) };
                 let row = (o << 3) | (index >> 7);
 
                 if width == BITS {
+                    // SAFETY: `index < 1024` gives `row < 64` and `lane < LANES`, so `LANES * row + lane < 1024 <= input.len()`.
                     return unsafe { *input.get_unchecked(LANES * row + lane) };
                 }
 
@@ -300,10 +302,13 @@ macro_rules! impl_bitpacking_compat {
                 let bit_pos = row * width;
                 let curr_word = bit_pos / BITS;
                 let shift = bit_pos % BITS;
+                // SAFETY: `row < 1024 / LANES` and `width < BITS`, so `LANES * curr_word + lane < 1024 * width / BITS <= input.len()`.
                 let src0 = unsafe { *input.get_unchecked(LANES * curr_word + lane) };
                 if shift + width <= BITS {
                     (src0 >> shift) & mask
                 } else {
+                    // SAFETY: When `shift + width > BITS`, the value spans into `curr_word + 1 < 1024 * width / BITS`,
+                    // so `LANES * (curr_word + 1) + lane < input.len()`.
                     let src1 = unsafe { *input.get_unchecked(LANES * (curr_word + 1) + lane) };
                     ((src0 >> shift) | (src1 << (BITS - shift))) & mask
                 }
@@ -2474,8 +2479,10 @@ mod test {
                 }
             }
             let mut packed = vec![0u8; 1024 * width / u8::T];
+            // SAFETY: `values` has 1024 elements, `width <= 8`, and `packed` has exact length `1024 * width / 8`.
             unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
             for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 8`, and `packed` holds `1024 * width / 8` words.
                 let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
                 assert_eq!(actual, expected, "u8 mismatch at width={width}, idx={idx}");
             }
@@ -2494,8 +2501,10 @@ mod test {
                 }
             }
             let mut packed = vec![0u16; 1024 * width / u16::T];
+            // SAFETY: `values` has 1024 elements, `width <= 16`, and `packed` has exact length `1024 * width / 16`.
             unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
             for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 16`, and `packed` holds `1024 * width / 16` words.
                 let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
                 assert_eq!(actual, expected, "u16 mismatch at width={width}, idx={idx}");
             }
@@ -2514,8 +2523,10 @@ mod test {
                 }
             }
             let mut packed = vec![0u32; 1024 * width / u32::T];
+            // SAFETY: `values` has 1024 elements, `width <= 32`, and `packed` has exact length `1024 * width / 32`.
             unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
             for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 32`, and `packed` holds `1024 * width / 32` words.
                 let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
                 assert_eq!(actual, expected, "u32 mismatch at width={width}, idx={idx}");
             }
@@ -2534,8 +2545,10 @@ mod test {
                 }
             }
             let mut packed = vec![0u64; 1024 * width / u64::T];
+            // SAFETY: `values` has 1024 elements, `width <= 64`, and `packed` has exact length `1024 * width / 64`.
             unsafe { BitPacking::unchecked_pack(width, &values, &mut packed) };
             for (idx, &expected) in values.iter().enumerate() {
+                // SAFETY: `idx < 1024`, `width <= 64`, and `packed` holds `1024 * width / 64` words.
                 let actual = unsafe { BitPacking::unchecked_unpack_single(width, &packed, idx) };
                 assert_eq!(actual, expected, "u64 mismatch at width={width}, idx={idx}");
             }

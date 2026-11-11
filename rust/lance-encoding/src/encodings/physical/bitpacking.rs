@@ -372,9 +372,9 @@ impl InlineBitpacking {
         }
 
         let mut decompressed = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
+        // SAFETY: parse_chunk validated width and packed slice length; the kernel
+        // initializes all 1024 slots before set_len exposes them.
         unsafe {
-            // SAFETY: parse_chunk validated width and packed slice length; the kernel
-            // initializes all 1024 slots before set_len exposes them.
             BitPackingUninit::unchecked_unpack_uninit(
                 width,
                 &chunk_words[1..],
@@ -445,9 +445,9 @@ impl InlineBitpacking {
                         "inline bitpacking output capacity was underestimated".to_string(),
                     )
                 })?;
+            // SAFETY: parse_chunk checked width and the exact packed input length.
+            // The kernel writes all 1024 typed slots before set_len exposes them.
             unsafe {
-                // SAFETY: parse_chunk checked width and the exact packed input length.
-                // The kernel writes all 1024 typed slots before set_len exposes them.
                 T::unchecked_unpack_uninit(width, &words[1..], destination);
                 output.set_len(next_len);
             }
