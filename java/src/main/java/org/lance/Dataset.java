@@ -931,6 +931,7 @@ public class Dataset implements Closeable {
    * @param rowIds the row IDs to resolve
    * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
    *     is unknown or its row was deleted
+   * @throws IOException if row-id metadata or deletion files cannot be read
    * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
    *     row IDs are corrupt
    */
