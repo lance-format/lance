@@ -176,6 +176,10 @@ fn generate_datafusion(
     let proto_dir = repo_root.join("protos");
     let mut config = config(&out_dir)?;
     config.enable_type_names();
+    config.message_attribute(
+        ".lance.datafusion.FilteredReadExecV2Proto",
+        "#[non_exhaustive]",
+    );
     config.compile_protos(
         &[
             proto_dir.join("table_identifier.proto"),

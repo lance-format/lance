@@ -199,6 +199,10 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "index_visibility"
+harness = false
+
+[[bench]]
 name = "regex_ngram"
 harness = false
 
