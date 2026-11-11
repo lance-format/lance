@@ -15,8 +15,8 @@ use crate::feature_flags::{
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
     ensure_can_write_manifest, frag_reuse_with_stable_row_ids_enabled,
-    inherit_sticky_feature_flags, managed_blobs_enabled, retention_leases_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
+    validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -99,19 +99,13 @@ pub enum ManifestBuild {
     Unchanged,
 }
 
-/// Refuse an `AcquireLease` this build could not honor: it must be able to
-/// write the lease flag, and on a stable-row-ID table it must be able to
-/// record the fragment reuse transitions a lease requires.
+/// Refuse an `AcquireLease` this build could not honor: on a stable-row-ID
+/// table it must be able to record the fragment reuse transitions a lease
+/// requires.
 fn ensure_lease_acquisition_supported(
     manifest: &Manifest,
-    retention_leases_enabled: bool,
     frag_reuse_with_stable_row_ids_enabled: bool,
 ) -> Result<()> {
-    if !retention_leases_enabled {
-        return Err(Error::not_supported(
-            "Retention leases are not supported by this build of Lance",
-        ));
-    }
     if manifest.uses_stable_row_ids() && !frag_reuse_with_stable_row_ids_enabled {
         return Err(Error::not_supported(
             "Retention leases are not supported on tables with stable row IDs by this build \
@@ -979,11 +973,7 @@ impl Transaction {
         if let (Operation::AcquireLease { .. }, Some(manifest)) =
             (&self.operation, current_manifest)
         {
-            ensure_lease_acquisition_supported(
-                manifest,
-                retention_leases_enabled(),
-                frag_reuse_with_stable_row_ids_enabled(),
-            )?;
+            ensure_lease_acquisition_supported(manifest, frag_reuse_with_stable_row_ids_enabled())?;
         }
         let retention_leases = match derive_retention_leases(
             current_manifest.map_or(&[], |m| m.retention_leases.as_slice()),
@@ -8283,12 +8273,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case::supported(true, false, true, None)]
-    #[case::stable_row_ids_supported(true, true, true, None)]
-    #[case::no_lease_support(false, false, true, Some("not supported by this build"))]
-    #[case::stable_row_ids_unsupported(true, true, false, Some("stable row IDs"))]
+    #[case::supported(false, true, None)]
+    #[case::address_row_ids_without_frag_reuse_support(false, false, None)]
+    #[case::stable_row_ids_supported(true, true, None)]
+    #[case::stable_row_ids_unsupported(true, false, Some("stable row IDs"))]
     fn lease_acquisition_requires_support(
-        #[case] retention_leases_enabled: bool,
         #[case] stable_row_ids: bool,
         #[case] frag_reuse_with_stable_row_ids_enabled: bool,
         #[case] message: Option<&str>,
@@ -8298,11 +8287,8 @@ mod tests {
         } else {
             sample_manifest()
         };
-        let result = ensure_lease_acquisition_supported(
-            &manifest,
-            retention_leases_enabled,
-            frag_reuse_with_stable_row_ids_enabled,
-        );
+        let result =
+            ensure_lease_acquisition_supported(&manifest, frag_reuse_with_stable_row_ids_enabled);
         match message {
             None => result.unwrap(),
             Some(message) => {

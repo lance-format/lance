@@ -953,7 +953,7 @@ pub struct Manifest {
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
     /// * 1 << 20: retention leases. Writer-only; set exactly when retention_leases
-    ///    is nonempty, and maintenance must honor the list. Reserved until the lease contract is implemented.
+    ///    is nonempty, and maintenance must honor the list.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.

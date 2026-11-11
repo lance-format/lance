@@ -137,9 +137,10 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
 /// Writer-only retention requirements for retention leases in the current manifest.
-/// Set exactly when `Manifest::retention_leases` is nonempty. Supported only
-/// where [`retention_leases_enabled`] until lease-aware maintenance lands.
-/// Ordinary reads do not require support for the lease metadata.
+/// Set exactly when `Manifest::retention_leases` is nonempty. Writers must
+/// honor the leases: keep leased versions through cleanup and record the
+/// fragment reuse transitions leases require. Ordinary reads do not require
+/// support for the lease metadata.
 pub const FLAG_RETENTION_LEASES: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 21;
@@ -503,13 +504,6 @@ pub fn frag_reuse_with_stable_row_ids_enabled() -> bool {
     cfg!(debug_assertions)
 }
 
-/// Debug builds only, with no environment override, until lease-aware cleanup
-/// and fragment reuse trimming land. Hidden because it is removed then.
-#[doc(hidden)]
-pub fn retention_leases_enabled() -> bool {
-    cfg!(debug_assertions)
-}
-
 /// Clear `flag` from `flags` when its gating feature is not enabled in this
 /// build; leave it set otherwise. One call per unstable flag, so support for
 /// several unstable features chains cleanly.
@@ -525,7 +519,6 @@ fn mark_supported(flags: &mut u64, flag: u64, feature_enabled: bool) {
 fn supported_flags_when(
     overlay_enabled: bool,
     frag_reuse_with_stable_row_ids_enabled: bool,
-    retention_leases_enabled: bool,
 ) -> u64 {
     let mut supported = FLAG_UNKNOWN - 1;
     mark_supported(
@@ -543,11 +536,6 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
-    mark_supported(
-        &mut supported,
-        FLAG_RETENTION_LEASES,
-        retention_leases_enabled,
-    );
     supported
 }
 
@@ -555,7 +543,6 @@ fn supported_flags() -> u64 {
     supported_flags_when(
         data_overlay_files_enabled(),
         frag_reuse_with_stable_row_ids_enabled(),
-        retention_leases_enabled(),
     )
 }
 
@@ -854,32 +841,16 @@ mod tests {
     }
 
     #[rstest::rstest]
-    fn test_retention_lease_flag_release_gating(
+    fn test_retention_lease_flag_is_supported(
         #[values(false, true)] overlay_enabled: bool,
         #[values(false, true)] frag_reuse_with_stable_row_ids_enabled: bool,
     ) {
-        let flag = FLAG_RETENTION_LEASES;
-        assert_eq!(flag, 1 << 20);
-        let without_support = supported_flags_when(
-            overlay_enabled,
-            frag_reuse_with_stable_row_ids_enabled,
-            false,
-        );
-        assert_eq!(without_support & flag, 0);
-        let implemented_flags = FLAG_ROW_ADDR_INDICES | FLAG_INLINE_DELETIONS;
-        assert_eq!(
-            without_support & implemented_flags,
-            implemented_flags,
-            "gating the lease bit must not disable implemented features"
-        );
-        let enabled = supported_flags_when(
-            overlay_enabled,
-            frag_reuse_with_stable_row_ids_enabled,
-            true,
-        );
-        assert_eq!(enabled & flag, flag);
-        assert_eq!(enabled & !flag, without_support);
-        assert_eq!(can_write_dataset(flag), retention_leases_enabled());
+        assert_eq!(FLAG_RETENTION_LEASES, 1 << 20);
+        let supported =
+            supported_flags_when(overlay_enabled, frag_reuse_with_stable_row_ids_enabled);
+        assert_eq!(supported & FLAG_RETENTION_LEASES, FLAG_RETENTION_LEASES);
+        assert!(can_read_dataset(FLAG_RETENTION_LEASES));
+        assert!(can_write_dataset(FLAG_RETENTION_LEASES));
     }
 
     #[test]
@@ -887,14 +858,11 @@ mod tests {
         let mut manifest = empty_manifest();
         manifest.writer_feature_flags = FLAG_RETENTION_LEASES;
         ensure_can_read_manifest(&manifest).unwrap();
-        // Supported or not, a flag without a lease list is refused.
         let error = ensure_can_write_manifest(&manifest).unwrap_err();
-        let expected = if retention_leases_enabled() {
-            "writer feature flag is set"
-        } else {
-            "cannot be written"
-        };
-        assert!(error.to_string().contains(expected), "got: {error}");
+        assert!(
+            error.to_string().contains("writer feature flag is set"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -1031,10 +999,10 @@ mod tests {
     fn test_frag_reuse_with_stable_row_ids_flag_release_gating() {
         // v12.0.0's unknown boundary, so every released client refuses it.
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, 512);
-        let without_support = supported_flags_when(true, false, false);
+        let without_support = supported_flags_when(true, false);
         assert_ne!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !without_support, 0);
         assert_eq!(FLAG_STABLE_ROW_IDS & !without_support, 0);
-        let enabled = supported_flags_when(false, true, false);
+        let enabled = supported_flags_when(false, true);
         assert_eq!(FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS & !enabled, 0);
         for unrelated in [
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
@@ -1091,12 +1059,12 @@ mod tests {
     fn test_data_overlay_flag_release_gating() {
         // Release default (overlays disabled): the overlay flag is treated as
         // unknown so the dataset is refused, while other known flags still pass.
-        let supported = supported_flags_when(false, false, false);
+        let supported = supported_flags_when(false, false);
         assert_eq!(supported & FLAG_UNSTABLE_DATA_OVERLAY_FILES, 0);
         assert_eq!(FLAG_DELETION_FILES & !supported, 0);
         assert_ne!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
         // Enabled (debug or env opt-in): the overlay flag is understood.
-        let supported = supported_flags_when(true, false, false);
+        let supported = supported_flags_when(true, false);
         assert_eq!(FLAG_UNSTABLE_DATA_OVERLAY_FILES & !supported, 0);
     }
 
@@ -1104,7 +1072,7 @@ mod tests {
     fn test_spilled_row_lineage_flag_is_stable() {
         assert_eq!(FLAG_SPILLED_ROW_LINEAGE, 2048);
         // Support must not depend on enabling unrelated experimental formats.
-        let supported = supported_flags_when(false, false, false);
+        let supported = supported_flags_when(false, false);
         let flags = FLAG_STABLE_ROW_IDS | FLAG_SPILLED_ROW_LINEAGE;
         assert_eq!(flags & !supported, 0);
         assert!(can_read_dataset(flags));
