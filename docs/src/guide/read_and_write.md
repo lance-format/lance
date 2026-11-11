@@ -558,6 +558,7 @@ Currently, Lance supports a growing list of expressions.
 * `IN`
 * `LIKE`, `NOT LIKE`
 * `regexp_match(column, pattern)`
+* `any_element(list_column, 'predicate')` (experimental), see [below](#filtering-on-elements-of-a-list-of-structs)
 * `CAST`
 
 For example, the following filter string is acceptable:
@@ -627,6 +628,35 @@ Lance internally stores data in Arrow format. The mapping from SQL types to Arro
 | `binary` | `Binary` |
 
 (1) See precision mapping in previous table.
+
+#### Filtering on elements of a list of structs
+
+!!! warning "Experimental API"
+
+    `any_element` is experimental. Its function name, call syntax, and
+    predicate syntax are not finalized and may change incompatibly in future
+    releases. Do not rely on the current syntax as a stable API.
+
+`any_element(list_column, 'predicate')` keeps a row when at least one element of
+a `list<struct>` column satisfies the predicate, with every condition evaluated
+on that same element. For a column `detections: list<struct<label: string, confidence: float>>`:
+
+```sql
+any_element(detections, 'label = ''car'' AND confidence > 0.9')
+```
+
+matches rows with a car detected above 0.9 confidence, and not rows that have
+a car below 0.9 next to another object above it.
+
+The predicate is a string literal that refers to the element's fields by name,
+and accepts the same expressions as any other filter. Because it is a string,
+single quotes inside it are doubled. It cannot refer to columns outside the
+element; combine those with `AND` or `OR` outside the call. It may only call
+immutable functions, so functions such as `now()` and `random()` are rejected.
+
+The result follows SQL three-valued logic: NULL for a null list, TRUE if the
+predicate is TRUE on some element, otherwise NULL if it is NULL on some element,
+otherwise FALSE. An empty list is FALSE.
 
 ### Random read
 
