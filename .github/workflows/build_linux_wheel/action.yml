@@ -30,6 +30,37 @@ runs:
       run: |
         # Ensure no cached pylance wheels linger across cache restores
         rm -f python/target/wheels/pylance-*.whl || true
+    - name: Pull manylinux image
+      id: manylinux-image
+      shell: bash
+      env:
+        HOST_ARCH: ${{ runner.arch }}
+        ARM_BUILD: ${{ inputs.arm-build }}
+        MANYLINUX: ${{ inputs.manylinux }}
+      run: |
+        # maturin-action pulls its image once with no retry, and skips the pull
+        # when the image is already present. The names match its defaults.
+        case "${HOST_ARCH}/${ARM_BUILD}/${MANYLINUX}" in
+          X64/false/2_17) image="quay.io/pypa/manylinux2014_x86_64:latest" ;;
+          X64/false/2_28) image="quay.io/pypa/manylinux_2_28_x86_64:latest" ;;
+          ARM64/true/2_17) image="quay.io/pypa/manylinux2014_aarch64:latest" ;;
+          ARM64/true/2_28) image="quay.io/pypa/manylinux_2_28_aarch64:latest" ;;
+          *)
+            echo "No pinned image for ${HOST_ARCH}/${ARM_BUILD}/${MANYLINUX}; maturin-action picks its default"
+            exit 0
+            ;;
+        esac
+        for attempt in 1 2 3 4 5; do
+          if docker image inspect "${image}" > /dev/null 2>&1 || docker pull "${image}"; then
+            echo "image=${image}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if (( attempt < 5 )); then
+            sleep "$((attempt * 20))"
+          fi
+        done
+        echo "Failed to pull ${image} after 5 attempts" >&2
+        exit 1
     - name: Build x86_64 Manylinux2014 wheel
       if: ${{ inputs.arm-build == 'false' && inputs.manylinux == '2_17' }}
       uses: PyO3/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad # v1
@@ -38,6 +69,7 @@ runs:
         working-directory: python
         target: x86_64-unknown-linux-gnu
         manylinux: ${{ inputs.manylinux }}
+        container: ${{ steps.manylinux-image.outputs.image }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
         before-script-linux: |
@@ -52,6 +84,7 @@ runs:
         working-directory: python
         target: x86_64-unknown-linux-gnu
         manylinux: ${{ inputs.manylinux }}
+        container: ${{ steps.manylinux-image.outputs.image }}
         docker-options: |
           -e CC=clang
           -e CXX=clang++
@@ -69,6 +102,7 @@ runs:
         working-directory: python
         target: aarch64-unknown-linux-gnu
         manylinux: ${{ inputs.manylinux }}
+        container: ${{ steps.manylinux-image.outputs.image }}
         args: ${{ inputs.args }}
         maturin-version: "1.10.2"
         before-script-linux: |
