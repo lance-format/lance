@@ -21,13 +21,14 @@
 //! Only this shape is accepted. The body may refer to the fields of the lambda
 //! parameter and nothing else, and any other lambda is an error.
 
+use std::collections::VecDeque;
 use std::ops::ControlFlow;
 
 use arrow_schema::DataType;
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Expr as SQLExpr, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart, OneOrManyWithParens,
-    Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
+    AccessExpr, BinaryOperator, Expr as SQLExpr, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart,
+    OneOrManyWithParens, Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
     visit_expressions_mut,
 };
 use lance_core::{Error, Result};
@@ -43,12 +44,23 @@ const SUPPORTED_FORM: &str =
 /// Rewrite every `array_any_match(list, x -> predicate)` in a parsed filter to
 /// `any_element(list, 'predicate')`, and reject any other lambda.
 ///
+/// Before visiting, each chain of one logical operator (`AND` or `OR`) is
+/// regrouped into a balanced tree. The visitors below recurse over the AST,
+/// and `a AND b AND ...` parses as a chain as deep as its operand count, so
+/// balancing bounds that recursion. Only one operator is regrouped at a time,
+/// which leaves the filter's meaning unchanged.
+///
 /// `type_of` returns the data type of an argument, to check that it is a
 /// `list<struct>`.
 pub fn rewrite_element_lambdas(
     filter: &mut SQLExpr,
     type_of: impl Fn(&SQLExpr) -> Result<DataType>,
 ) -> Result<()> {
+    // The visitors below recurse over the AST, and a filter such as
+    // `a AND b AND ...` parses as a chain as deep as its number of operands.
+    // Balance those chains first; `Planner::binary_expr` rebuilds the same
+    // chains balanced after parsing, so the result is unchanged.
+    let _ = VisitMut::visit(filter, &mut BalanceLogicalBinaryExprs);
     if let ControlFlow::Break(err) = VisitMut::visit(filter, &mut LambdaRewriter { type_of }) {
         return Err(err);
     }
@@ -65,6 +77,81 @@ pub fn rewrite_element_lambdas(
             "the lambda `{lambda}` is not supported: Lance filters only accept lambdas as {SUPPORTED_FORM}"
         ))),
         None => Ok(()),
+    }
+}
+
+struct BalanceLogicalBinaryExprs;
+
+impl VisitorMut for BalanceLogicalBinaryExprs {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut SQLExpr) -> ControlFlow<()> {
+        balance_logical_binary_expr(expr);
+        ControlFlow::Continue(())
+    }
+}
+
+/// Rebuild `expr`, when it is a chain of `AND` or `OR`, as a balanced tree.
+///
+/// Only one associative operator is regrouped: `(a AND b) AND c` becomes
+/// `a AND (b AND c)`, while `AND` and `OR` are never mixed.
+fn balance_logical_binary_expr(expr: &mut SQLExpr) {
+    let SQLExpr::BinaryOp { op, .. } = expr else {
+        return;
+    };
+    if !matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+        return;
+    }
+
+    let placeholder = SQLExpr::value(Value::Null);
+    let (left, op, right) = match std::mem::replace(expr, placeholder) {
+        SQLExpr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => (left, op, right),
+        other => {
+            *expr = other;
+            return;
+        }
+    };
+
+    let mut stack = vec![*right, *left];
+    let mut leaves = Vec::new();
+    while let Some(expr) = stack.pop() {
+        match expr {
+            SQLExpr::BinaryOp {
+                left,
+                op: child_op,
+                right,
+            } if child_op == op => {
+                stack.push(*right);
+                stack.push(*left);
+            }
+            leaf => leaves.push(leaf),
+        }
+    }
+
+    let mut exprs = VecDeque::from(leaves);
+    while exprs.len() > 1 {
+        let mut next = VecDeque::with_capacity(exprs.len().div_ceil(2));
+        while let Some(left) = exprs.pop_front() {
+            if let Some(right) = exprs.pop_front() {
+                next.push_back(SQLExpr::BinaryOp {
+                    left: Box::new(left),
+                    op: op.clone(),
+                    right: Box::new(right),
+                });
+            } else {
+                next.push_back(left);
+            }
+        }
+        exprs = next;
+    }
+
+    debug_assert_eq!(exprs.len(), 1, "balancing keeps one expression");
+    if let Some(balanced) = exprs.pop_front() {
+        *expr = balanced;
     }
 }
 
@@ -346,6 +433,45 @@ mod tests {
     )]
     fn test_rewrite(#[case] filter: &str, #[case] expected: &str) {
         assert_eq!(rewritten(filter).unwrap(), expected);
+    }
+
+    /// A lambda at the far end of a long `AND`/`OR` chain is still rewritten.
+    /// The chain is balanced first, so this walks its leaves with an explicit
+    /// stack rather than assuming the parsed left-deep shape.
+    #[rstest]
+    fn test_rewrite_deep_logical_filter(#[values("AND", "OR")] op: &str) {
+        let mut conditions = vec!["width > 1"; 1000];
+        conditions.push("array_any_match(detections, d -> d.label = 'car')");
+        let mut expr = parse_sql_filter(&conditions.join(&format!(" {op} "))).unwrap();
+        planner().rewrite_filter_lambdas(&mut expr).unwrap();
+
+        let mut stack = vec![&expr];
+        let mut leaves = Vec::new();
+        while let Some(expr) = stack.pop() {
+            match expr {
+                SQLExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And | BinaryOperator::Or,
+                    right,
+                } => {
+                    stack.push(right.as_ref());
+                    stack.push(left.as_ref());
+                }
+                leaf => leaves.push(leaf),
+            }
+        }
+        assert_eq!(leaves.len(), 1001);
+        assert_eq!(
+            leaves.last().unwrap().to_string(),
+            "any_element(detections, 'label = ''car''')"
+        );
+
+        let mut has_lambda = false;
+        let _ = visit_expressions(&expr, |expr| {
+            has_lambda |= matches!(expr, SQLExpr::Lambda(_));
+            ControlFlow::<()>::Continue(())
+        });
+        assert!(!has_lambda, "a lambda was left unrewritten");
     }
 
     #[rstest]

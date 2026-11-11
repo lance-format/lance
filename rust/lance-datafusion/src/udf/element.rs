@@ -546,6 +546,37 @@ mod tests {
         assert_eq!(eval(lambda, false), eval(call, false));
     }
 
+    /// A deep chain below `NOT` is balanced before the recursive visitors
+    /// reach it, and its lambda calls are still rewritten: if they were not,
+    /// the filter could not be parsed.
+    #[test]
+    fn test_deep_filter_with_lambda_calls() {
+        let lambda = "array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)";
+        let chain = std::iter::repeat_n(lambda, 1000)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(
+            eval(&format!("NOT ({chain})"), false),
+            BooleanArray::from(vec![T, F, T, N, F, N, N, T, F])
+        );
+    }
+
+    /// A deep predicate inside the lambda body is balanced before the body is
+    /// cloned, checked and printed, all of which recurse over the AST.
+    #[test]
+    fn test_deep_lambda_body() {
+        let predicate = std::iter::repeat_n("d.label = 'car'", 1000)
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(
+            eval(
+                &format!("array_any_match(detections, d -> {predicate})"),
+                false
+            ),
+            BooleanArray::from(vec![T, T, F, N, T, N, T, T, T])
+        );
+    }
+
     #[test]
     fn test_predicate_forms() {
         // >=, IN, BETWEEN, IS NULL and OR inside the element predicate.
