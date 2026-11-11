@@ -174,7 +174,7 @@ as expiring nothing. In those cases references and cleanup race as they would wi
 
 ### Pins
 
-A pin is a short-lived reference that a restore holds while it commits. Pins are JSON files stored at
+A pin is a short-lived reference that a restore writes before it commits. Pins are JSON files stored at
 `_refs/pins/{uuid}.json` in the dataset root:
 
 | JSON Key    | Type   | Optional | Description                                                              |
@@ -183,10 +183,13 @@ A pin is a short-lived reference that a restore holds while it commits. Pins are
 | `version`   | number |          | Version number being pinned within that branch.                          |
 | `createdAt` | string |          | RFC 3339 timestamp for when the pin was created.                         |
 
-Cleanup treats a pinned version like a tagged one. It may delete pins created more than 24 hours
-ago, which are left behind by restores that did not finish.
+Cleanup treats a pinned version like a tagged one. A pin is **stale** once it was created more than
+24 hours ago. Cleanup ignores stale pins and may delete them.
 
 ### Cleanup
+
+At most one cleanup may run on a table at a time. Deployments that schedule cleanup from more than
+one process must serialize it, for example with a lock held for the whole run.
 
 Before deleting any manifest, cleanup must:
 
@@ -210,8 +213,11 @@ Restore of version `v` of branch `b` must:
 
 1. Write a pin for `v`.
 2. Read the current rule of `b`. If `v` is expired there, delete the pin and fail.
-3. Commit the restore.
-4. Delete the pin.
+3. Commit the restore within 24 hours of writing the pin.
+
+The restore must not delete its pin after committing. A cleanup that planned before the commit does
+not see the restored version, so until the pin is stale it is what keeps that cleanup from deleting
+the restored files. By then any later cleanup plans with the restored version in view.
 
 Implementations may offer an explicit option that skips these checks.
 
@@ -219,4 +225,5 @@ Implementations may offer an explicit option that skips these checks.
 
 When cleanup and the publishing writer both implement this section, a reference published while
 cleanup runs either keeps its version from deletion or is rejected. There is no guarantee when
-either side does not implement it, or when the current rule is missing or malformed.
+either side does not implement it, when the current rule is missing or malformed, when cleanups
+overlap on one table, or when a restore commits more than 24 hours after writing its pin.
