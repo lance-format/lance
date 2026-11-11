@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::{ops::Range, sync::Arc};
 
 use bytes::Bytes;
