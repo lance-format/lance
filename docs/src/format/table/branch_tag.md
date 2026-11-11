@@ -130,52 +130,41 @@ Each tag file is a JSON file with the following fields:
 
 ## History Retention
 
-Cleanup can run at the same time as operations that publish a reference to an old version: tag
-creation and update, branch creation, and restore. To stop a reference from being published to a
-version that cleanup is deleting, cleanup records which versions it **expires** in a retention file
-before it deletes anything.
+Cleanup can run while another writer publishes a reference to an old version: creating or updating
+a tag, creating a branch, or restoring. So that such a reference never points at a version cleanup
+is deleting, cleanup first records the versions it **expires**. Readers may still check out an
+expired version until it is deleted, but no new tag, branch, or restore may reference it.
 
-Expiration affects only new references. Readers may still check out an expired version until cleanup
-deletes it, but tags, branches, and restores must not newly reference it.
+When cleanup and the publishing writer both follow this section, a reference published while
+cleanup runs either keeps its version or is rejected.
 
 ### Retention Files
 
-Each branch keeps its retention files in a `_retention/` directory under its own root: the dataset
-root for the default branch, and `tree/{branch_name}/` for a named branch. Files are named
-`{n}.json`, where `n` is a positive decimal integer. The file with the largest `n` holds the
-branch's current rule:
+Each branch records its rule in the `_retention/` directory of its own root (see
+[Branch Dataset Layout](#branch-dataset-layout)), in files named `{n}.json` where `n` is a positive
+integer. The file with the largest `n` holds the current rule:
 
-| JSON Key        | Type             | Description                                                                 |
-|-----------------|------------------|-----------------------------------------------------------------------------|
-| `expiredBefore` | number           | A version number `F`.                                                       |
-| `retained`      | array of numbers | Ascending version numbers below `F` that are not expired. May be empty.     |
+| JSON Key        | Type             | Optional | Description                                                            |
+|-----------------|------------------|----------|------------------------------------------------------------------------|
+| `expiredBefore` | number           |          | A version number `F`.                                                  |
+| `retained`      | array of numbers | Yes      | Ascending versions below `F` that are not expired. Absent means empty. |
 
-A version `v` of a branch is **expired** when the branch's current rule has `v < F` and `v` is not
-in `retained`. Retained versions are typically tagged versions, branch points, and versions kept by
-thinning retention rules.
+A version `v` is **expired** when `v < F` and `v` is not in `retained`. A missing directory or a
+current file that cannot be parsed expires nothing.
 
-A branch continues its parent's numbering (a branch created from version 50 starts at version 51),
-and a new branch has no retention files.
+To write a rule, read the current file `{n}.json` and create `{n+1}.json`, or `1.json` if there is
+none, with [put-if-not-exists](transaction.md#storage-primitives). If that file already exists,
+read it and retry.
 
-To write a rule, a writer reads the current file `{n}.json` and creates `{n+1}.json` with
-put-if-not-exists, the same operation that commits manifests. If `{n+1}.json` already exists, the
-writer reads it and tries again. A writer that finds no retention files creates `1.json`.
-
-Expiration is monotonic. A new rule must not lift the expiration of any version that its
-predecessor expires, so a writer always merges its rule `(F_own, R_own)` with the current rule
-`(F', R')`. The merged rule has `F = max(F_own, F')`, and lists as retained exactly the versions below
-`F` that neither rule expires: those with `v >= F_own` or `v` in `R_own`, and also `v >= F'` or
-`v` in `R'`. Implementations may offer an explicit override that writes any rule. Lifting expiration
-is safe only when no cleanup that read an earlier rule is still deleting.
-
-The protection is best-effort. Writers that do not implement this section ignore retention files
-and pins. A missing `_retention/` directory or a current file that cannot be parsed must be treated
-as expiring nothing. In those cases references and cleanup race as they would without this section.
+Expiration is never lifted: a new rule is always merged with the current one, so it expires every
+version that either expires. `F` is the larger of the two, and `retained` lists the versions below it
+that neither rule expires. Implementations may offer an override that writes any rule for repairs;
+it is safe only while no cleanup is running.
 
 ### Pins
 
-A pin is a short-lived reference that a restore writes before it commits. Pins are JSON files stored at
-`_refs/pins/{uuid}.json` in the dataset root:
+A restore writes a pin to protect its target version. Pins are stored at `_refs/pins/{uuid}.json` in
+the dataset root:
 
 | JSON Key    | Type   | Optional | Description                                                              |
 |-------------|--------|----------|--------------------------------------------------------------------------|
@@ -183,51 +172,30 @@ A pin is a short-lived reference that a restore writes before it commits. Pins a
 | `version`   | number |          | Version number being pinned within that branch.                          |
 | `createdAt` | string |          | RFC 3339 timestamp for when the pin was created.                         |
 
-Cleanup treats a pinned version like a tagged one. A pin is **stale** for a cleanup if it was
-created more than 24 hours before that cleanup began. Cleanup ignores pins that are stale for it and
-may delete them. Age is measured from the start of the cleanup, not from the current time, so a pin
-cannot become stale partway through a long cleanup.
+Cleanup treats a pinned version like a tagged one, but ignores, and may delete, pins created more
+than 24 hours before the cleanup began.
 
 ### Cleanup
 
-At most one cleanup may run on a table at a time. Deployments that schedule cleanup from more than
-one process must serialize it, for example with a lock held for the whole run.
+Only one cleanup may run on a dataset at a time. Before deleting any version, cleanup must:
 
-Before deleting any manifest, cleanup must:
-
-1. Determine the versions it will delete and the versions below `F` it will keep.
-2. Write a rule with `F` greater than every version it will delete, merged with the current rule as
-   described above. If the merged rule equals the current rule, the write is skipped.
-3. After the write succeeds, list tags, branches, and pins and keep every version they reference.
-4. Delete.
-5. Delete retention files other than the one with the largest `n`.
-
-A version kept in step 3 stays expired. Written rules remain valid if cleanup stops before deleting,
-and a later cleanup continues from them.
+1. Plan which versions it will delete.
+2. Write a rule with `F` above every version it will delete, retaining the versions below `F` that
+   it keeps. The write may be skipped if the merged rule equals the current one.
+3. List tags, branches, and pins, and keep every version they reference.
+4. Delete, then delete every retention file except the current one.
 
 ### Publishing References
 
-Tag creation, tag update, and branch creation that target version `v` of branch `b` must write the
-reference first and then read the current rule of `b`. If `v` is expired there, the writer must remove
-the reference it wrote and fail.
+To create or update a tag, or create a branch, at version `v` of branch `b`, a writer must write the
+reference, then read the current rule of `b`. If `v` is expired, it must remove the reference and
+fail.
 
-Restore of version `v` of branch `b` must:
+To restore version `v` of branch `b`, a writer must:
 
 1. Write a pin for `v`.
-2. Read the current rule of `b`. If `v` is expired there, delete the pin and fail.
-3. Commit the restore within 24 hours of writing the pin.
+2. Read the current rule of `b`. If `v` is expired, delete the pin and fail.
+3. Commit within 24 hours of writing the pin, and leave the pin in place.
 
-The restore must not delete its pin after committing. A cleanup that began before the commit does
-not see the restored version, and the pin is not stale for it, so the pin keeps that cleanup from
-deleting the restored files however long it runs. A cleanup for which the pin is stale began more
-than 24 hours after the pin was written, so after the commit, and plans with the restored version in
-view.
-
-Implementations may offer an explicit option that skips these checks.
-
-### Guarantees
-
-When cleanup and the publishing writer both implement this section, a reference published while
-cleanup runs either keeps its version from deletion or is rejected. There is no guarantee when
-either side does not implement it, when the current rule is missing or malformed, when cleanups
-overlap on one table, or when a restore commits more than 24 hours after writing its pin.
+The pin outlives the commit because a cleanup that began earlier cannot see the restored version. A
+cleanup that ignores the pin began after the commit.
