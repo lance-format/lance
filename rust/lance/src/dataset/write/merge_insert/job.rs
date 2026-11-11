@@ -16,14 +16,13 @@ use super::{
     check_source_schema, created_blob_payloads, exec, fill_missing_target_columns, logical_plan,
     one_shot_provider, resolve_target_bases, target_blob_handling, uncommitted_transaction,
 };
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::dataset::rowids::{get_row_id_index, translate_addr_treemap_to_row_ids};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::retry::{RetryConfig, RetryExecutor, execute_with_retry};
 use crate::dataset::write::{CommitBuilder, write_fragments_internal};
 use crate::index::DatasetIndexExt;
-use crate::index::scalar_logical::load_named_scalar_segments;
+use crate::index::visibility::IndexVisibility;
 use crate::{
     Dataset,
     datafusion::dataframe::{LanceTableProvider, SessionContextExt},
@@ -77,7 +76,7 @@ use lance_datafusion::{
     utils::StreamingWriteSource,
 };
 use lance_index::IndexCriteria;
-use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
 use log::info;
@@ -192,32 +191,21 @@ impl MergeInsertJob {
         Ok(unindexed.into_values().collect())
     }
 
-    /// Physical rows whose join-key index entries may be stale due to newer overlays.
+    /// Resolve stale join keys using the same segment policy as scalar filtering.
     async fn overlay_stale_rows_for_keys(
         &self,
         indexed_keys: &[(String, IndexMetadata)],
-    ) -> Result<RowAddrTreeMap> {
-        let overlaid_frags = overlaid_fragments(self.dataset.fragments());
-        if overlaid_frags.is_empty() {
-            return Ok(RowAddrTreeMap::new());
-        }
-        let mut stale = HashMap::new();
-        for (column, index) in indexed_keys {
-            let segments = load_named_scalar_segments(&self.dataset, column, &index.name).await?;
-            for segment in &segments {
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut stale,
-                    self.dataset.schema(),
-                )?;
-            }
-        }
-        let mut rows = RowAddrTreeMap::new();
-        for (fragment_id, offsets) in stale {
-            rows.insert_bitmap(fragment_id, offsets);
-        }
-        Ok(rows)
+    ) -> Result<IndexVisibility> {
+        IndexVisibility::for_scalar_indices(
+            self.dataset.clone(),
+            &indexed_keys
+                .iter()
+                .map(|(column, index)| (column.as_str(), index.name.as_str()))
+                .collect::<Vec<_>>(),
+            self.dataset.fragments(),
+            None,
+        )
+        .await
     }
 
     async fn create_indexed_scan_joined_stream(
@@ -336,11 +324,7 @@ impl MergeInsertJob {
         if !overlay_stale_rows.is_empty() {
             // The fallback scan below reads these rows using their current keys. Block
             // old index hits so a row cannot enter the target side of the join twice.
-            let stale_row_ids = if self.dataset.manifest().uses_stable_row_ids() {
-                translate_addr_treemap_to_row_ids(&self.dataset, &overlay_stale_rows).await?
-            } else {
-                overlay_stale_rows.clone()
-            };
+            let stale_row_ids = overlay_stale_rows.result_rows().await?.clone();
             index_mapper = Arc::new(RowAddrMaskFilterExec::new(
                 index_mapper,
                 Arc::new(RowAddrMask::from_block(stale_row_ids)),
@@ -422,7 +406,7 @@ impl MergeInsertJob {
             if overlay_stale_rows.is_empty() {
                 builder.with_fragments(unindexed_fragments);
             } else {
-                let mut fallback_rows = overlay_stale_rows;
+                let mut fallback_rows = overlay_stale_rows.physical_selection();
                 for fragment in unindexed_fragments {
                     fallback_rows.insert_fragment(fragment.id as u32);
                 }

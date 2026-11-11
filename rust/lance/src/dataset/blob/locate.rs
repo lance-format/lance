@@ -157,7 +157,7 @@ impl<'a> StoredBlob<'a> {
 }
 
 /// Resolve blob v1 descriptors without dropping null selection slots.
-pub(super) fn collect_blob_files_v1(
+pub(super) async fn collect_blob_files_v1(
     dataset: &Arc<Dataset>,
     blob_field_id: u32,
     descriptions: &StructArray,
@@ -200,19 +200,18 @@ pub(super) fn collect_blob_files_v1(
                 row_addr, frag_id
             ))
         })?;
-        let data_file = frag.data_file_for_field(blob_field_id).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Blob field {} has no data file in fragment {} for row address {}",
-                blob_field_id, frag_id, row_addr
-            ))
-        })?;
-        let data_file_path = dataset.data_dir().join(data_file.path.as_str());
+        let data_file = frag
+            .data_file_for_field(blob_field_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Blob field {} has no data file in fragment {} for row address {}",
+                    blob_field_id, frag_id, row_addr
+                ))
+            })?;
+        let (store, data_file_path) = dataset.resolve_data_file_location(&data_file).await?;
         files.push(Some(BlobFile::with_source(
-            shared_blob_source(
-                &mut source_cache,
-                dataset.object_store.clone(),
-                &data_file_path,
-            ),
+            shared_blob_source(&mut source_cache, store, &data_file_path),
             position,
             size,
             BlobKind::Inline,
@@ -857,6 +856,7 @@ mod tests {
         let row_addrs = UInt64Array::from(vec![(999_u64 << 32) | 7]);
 
         let err = collect_blob_files_v1(&fixture.dataset, blob_field_id, &descriptions, &row_addrs)
+            .await
             .unwrap_err();
 
         assert!(err.to_string().contains("references missing fragment"));

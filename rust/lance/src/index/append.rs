@@ -4511,9 +4511,10 @@ mod tests {
         for (pattern, expected) in [("old alpha", 1), ("new gamma", 1), ("needle", 2)] {
             let query = TextQuery::StringContains(pattern.to_string());
             let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let row_addrs = match result {
-                SearchResult::Exact(row_addrs) => row_addrs,
-                other => panic!("expected exact result for {pattern}, got {other:?}"),
+            let row_addrs = match (pattern, result) {
+                ("old alpha" | "new gamma", SearchResult::AtMost(row_addrs)) => row_addrs,
+                ("needle", SearchResult::Exact(row_addrs)) => row_addrs,
+                (_, other) => panic!("unexpected result for {pattern}: {other:?}"),
             };
             let count = row_addrs.true_rows().row_addrs().unwrap().count();
             assert_eq!(

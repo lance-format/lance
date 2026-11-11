@@ -110,9 +110,9 @@ use super::frag_reuse::{
 use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
-    index_type_is_known, retain_committed_inverted_files, segment_has_inverted_details,
-    segment_has_merge_primitive, segment_has_vector_details, unsupported_index_version,
-    validate_segment_metadata,
+    index_is_usable, index_type_is_known, retain_committed_inverted_files,
+    segment_has_inverted_details, segment_has_merge_primitive, segment_has_vector_details,
+    unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -234,6 +234,15 @@ pub(crate) fn optimizable_indices<'a>(
                  skipping its optimization",
                 name,
                 max_supported_version,
+            );
+            continue;
+        }
+        if let Some(index) = deltas.iter().find(|index| !index_is_usable(index)) {
+            log::warn!(
+                "Index {} has a segment with unsupported field dependencies {:?}; \
+                 skipping its optimization",
+                name,
+                index.dependency_fields(),
             );
             continue;
         }
