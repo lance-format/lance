@@ -61,8 +61,12 @@ class CachedDataset:
                     for batch in self.stream:
                         if writer is None:
                             self.cache_file = Path(self.cache_dir.name) / "cache.arrow"
+                            # Closing the IPC writer does not close its sink.
+                            sink = resources.enter_context(
+                                pa.OSFile(str(self.cache_file), "wb")
+                            )
                             writer = resources.enter_context(
-                                pa.ipc.new_stream(str(self.cache_file), batch.schema)
+                                pa.ipc.new_stream(sink, batch.schema)
                             )
                         writer.write(batch)
                         yield batch
@@ -70,8 +74,8 @@ class CachedDataset:
                 self.finished_origin_stream = True
             finally:
                 if not self.finished_origin_stream:
-                    # Partial caches cannot be replayed. Close the writer before
-                    # removing its directory, including on Windows.
+                    # Partial caches cannot be replayed. Close the writer and sink
+                    # before removing their directory, including on Windows.
                     self.close()
         else:
             # Follow up iteration
