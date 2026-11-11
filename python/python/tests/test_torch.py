@@ -212,11 +212,11 @@ class _CleanupDataset(torch.utils.data.IterableDataset):
 
 def _async_lifecycle_scenario(scenario, start_method):
     multiprocessing.set_start_method(start_method, force=True)
-    # Exercise escalation without spending a production grace period per case.
+    # Shorten only the grace period to exercise escalation. Keep production reap
+    # waits: the OS may need more time to report process exit on a loaded runner.
     shutdown_timeout = (
         0.05 if scenario in ("blocked_user_code", "ignored_termination") else 0.5
     )
-    async_module._REAP_TIMEOUT_SECONDS = shutdown_timeout
     async_module._QUEUE_POLL_SECONDS = 0.01
     if scenario == "unused_context":
         with async_dataset(_creator_failure) as dataset:
@@ -450,15 +450,36 @@ def _async_lifecycle_scenario(scenario, start_method):
                 dataset.worker.join(timeout=5)
                 assert not dataset.worker.is_alive(), "Worker did not finish cleanup"
                 assert dataset.worker.exitcode == 0
+            exit_codes = []
+            native_close = dataset.worker.close
+
+            def record_worker_exit():
+                exit_codes.append(dataset.worker.exitcode)
+                native_close()
+
             with (
+                patch.object(dataset.worker, "join", wraps=dataset.worker.join) as join,
                 patch.object(
                     dataset.worker, "terminate", wraps=dataset.worker.terminate
                 ) as terminate,
                 patch.object(dataset.worker, "kill", wraps=dataset.worker.kill) as kill,
+                patch.object(dataset.worker, "close", side_effect=record_worker_exit),
             ):
                 dataset.close()
                 assert terminate.call_count == int(scenario != "blocked_producer")
                 assert kill.call_count == int(scenario == "ignored_termination")
+                assert [call.kwargs["timeout"] for call in join.call_args_list] == [
+                    shutdown_timeout
+                ] + [async_module._REAP_TIMEOUT_SECONDS] * (
+                    terminate.call_count + kill.call_count
+                )
+                if scenario == "blocked_producer":
+                    assert exit_codes == [0]
+                elif scenario == "ignored_termination":
+                    assert exit_codes == [-signal.SIGKILL]
+                else:
+                    assert len(exit_codes) == 1
+                    assert exit_codes[0] is not None and exit_codes[0] != 0
         finally:
             if scenario == "blocked_producer":
                 finish_cleanup.set()
@@ -537,6 +558,7 @@ def _async_lifecycle_scenario(scenario, start_method):
                 "cancel_epoch_endless_1",
                 "graceful_cleanup_custom",
                 "cached_first_peek_path",
+                "ignored_termination",
             )
         ]
         if "forkserver" in multiprocessing.get_all_start_methods()
