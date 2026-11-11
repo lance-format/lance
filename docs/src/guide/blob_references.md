@@ -6,9 +6,10 @@ reference arrays through exchange, spill, and retries. It does not change stored
 Blob v2 descriptors or any persisted Lance format.
 
 Protocol version 1 supplies transport, descriptor capture, validation, context
-remapping, and planned Rust reference reads. Java/Python bindings and coordinated
-snapshot retention are separate capabilities. Serializing a reference does not
-authenticate a worker or retain source files.
+remapping, and planned reference reads through Rust, Java/JNI, and Python.
+The application must coordinate source snapshot lifetime with cleanup and branch
+deletion. Serializing a reference does not authenticate a worker or retain source
+files.
 
 ## Source contexts
 
@@ -387,3 +388,107 @@ The application must retain the exact source snapshots and coordinate cleanup.
 External objects remain subject to their own ownership and immutability contract.
 Cross-query persistence or export needs an explicit retention agreement extending
 beyond the original query. Protocol version 1 does not acquire such retention.
+
+## Python and Java/JNI bindings
+
+Python exposes `BlobSourceContext`, `BlobRefCapture`, `BlobRefBatch`,
+`BlobRefReader`, and `BlobRefReadStream` from `lance.blob`
+and `lance`. Java exposes the corresponding operations through
+`org.lance.BlobReferences`, with `SourceContext`, `Capture`, `Batch`, `Reader`,
+and `ReadStream` types. The bindings capture and validate exact snapshot identity
+without writing table metadata or protecting files from cleanup. The application
+must keep source snapshots available through every deferred read and retry. It
+can use existing tags together with application-level coordination of cleanup and
+branch deletion. Creating a tag alone does not coordinate concurrent cleanup.
+Closing a capture, reader, or stream releases its native resources; it does not
+change snapshot lifetime.
+
+Query the protocol version, source capabilities, and supported SDK operations
+before scheduling workers. Python provides
+`BlobSourceContext.protocol_version()`, `supported_capabilities()`, and
+`supported_operations()`; Java provides `getProtocolVersion()`,
+`getSupportedCapabilities()`, and `getSupportedOperations()` on `BlobReferences`.
+Require `capture_top_level`, `read_whole`, `read_range`, `streaming`, and
+`cancellation`.
+Reject executors missing required operations. Unknown wire versions/capabilities
+also fail during decode, before any payload request.
+
+Both bindings use the Rust capture validator and payload planner. Source contexts
+and reference batches have opaque protobuf encodings. A reference
+batch also exposes its Arrow extension field and array for engine operators; keep
+its source table and remap context slots when combining independently captured
+arrays. Workers reopen the exact branch/version with their own storage binding.
+Native driver pointers and credentials are not part of the transport.
+
+This example assumes the caller has coordinated cleanup and branch deletion so
+the exact source snapshot remains available until all consumers finish.
+
+```python
+from lance.blob import (
+    BlobRefCapture, BlobRefReader, BlobSourceContext,
+)
+
+def read_values(dataset, worker_dataset, consume):
+    source = BlobSourceContext.from_dataset(dataset, "catalog/table", "workers")
+    field_id = dataset.lance_schema.field("blob").id()
+    with BlobRefCapture(dataset, source, field_id) as capture:
+        with BlobRefReader(
+            [(source, worker_dataset)],
+            io_buffer_size_bytes=8 << 20,
+            materialization_readahead_bytes=32 << 20,
+        ) as reader:
+            scanner = dataset.scanner(
+                columns=["blob"], with_row_address=True,
+                blob_handling="all_descriptions",
+            )
+            for scanned in scanner.to_batches():
+                refs = capture.capture(
+                    source, scanned.schema.field("blob"),
+                    scanned["_rowaddr"], scanned["blob"],
+                )
+                # Correlate completed requests with the engine's output rows.
+                indices = list(range(len(refs)))
+                with reader.read(refs, indices, indices) as stream:
+                    for result in stream:
+                        consume(result)
+                        del result  # Release before waiting for another batch.
+```
+
+A read stream yields one completed request per Arrow batch, with
+`request_index: uint64` and nullable `data: large_binary`. Completion order is
+unspecified; use the request index to place results. Null and valid empty bytes
+remain distinct. Python consumes the stream as an iterator/context manager.
+Java calls `ReadStream.next(allocator)` until it returns null and must close every
+returned `VectorSchemaRoot`, preferably with try-with-resources.
+For range demands, Python passes a `ranges` list with `(offset, length)` tuples
+or `None` for whole values. Java uses `Request.range(...)` or `Request.whole(...)`.
+Invalid ranges fail; neither binding clamps them to the blob length.
+
+The Arrow payload buffers retain their native `Bytes` owners and materialization
+reservations without copying. Close/drop consumed batches before waiting for work
+that needs the same budget. A retained slice or array keeps its reservation even
+after the stream is cancelled or closed. Additional copies made by an engine are
+outside this native budget and need separate accounting.
+
+Both factories require finite, nonzero `io_buffer_size_bytes` and
+`materialization_readahead_bytes` limits (camel case in Java). One oversized demand
+may run alone when idle; use chunked ranges if an engine requires a per-value cap.
+Streams from one reader share these limits. Closing the reader factory prevents
+new submissions; existing streams and returned arrays keep their owners and must
+be closed/released separately. Cancellation can interrupt a blocked `next` or a
+budget wait. Pending requests terminate with an error instead of becoming nulls.
+
+Java represents unsigned indices, versions, offsets, lengths, and limits as `long`
+bit patterns; use `Long.parseUnsignedLong`/`Long.toUnsignedString` as needed.
+Python accepts integers in `0..=2**64-1`. Neither binding truncates high bits.
+
+| Capability | Rust | Java/JNI | Python |
+| --- | --- | --- | --- |
+| Context/ref transport and Arrow remapping | Yes | Yes | Yes |
+| Top-level scanned Blob V2 capture | Yes | Yes | Yes |
+| Planned whole/range reads and cancellation | Yes | Yes | Yes |
+| Streaming results retaining native budgets | Yes | Yes | Yes |
+| Source snapshot lifetime | Application-managed | Application-managed | Application-managed |
+| Automatic expiration/renewal | No | No | No |
+| Foreign dataset owner retention | Separate agreement | Separate agreement | Separate agreement |
+| Nested reference capture | No | No | No |

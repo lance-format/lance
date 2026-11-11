@@ -33,6 +33,9 @@ use prost::Message;
 
 use crate::Dataset;
 
+mod bindings;
+pub use bindings::BlobRefReadSession;
+
 pub use crate::dataset::blob::capture::BlobRefCapture;
 pub use crate::dataset::blob::{
     BlobMaterializationAdmission, BlobMaterializationContext, BlobMaterializationReservation,
@@ -44,7 +47,19 @@ pub(crate) mod pb {
     include!("../pb/lance.blob.reference.rs");
 }
 
-const VERSION: u32 = 1;
+/// Supported execution-wire version. Query it before scheduling remote workers.
+pub const BLOB_REFERENCE_PROTOCOL_VERSION: u32 = 1;
+/// Supported source capabilities: object ranges and immutable external objects.
+pub const BLOB_REFERENCE_CAPABILITIES: &[u32] = &[1, 2];
+/// SDK operations available independently of the source transport capabilities.
+pub const BLOB_REFERENCE_OPERATIONS: &[&str] = &[
+    "capture_top_level",
+    "read_whole",
+    "read_range",
+    "streaming",
+    "cancellation",
+];
+const VERSION: u32 = BLOB_REFERENCE_PROTOCOL_VERSION;
 const OBJECT_RANGES: u32 = 1;
 const IMMUTABLE_EXTERNAL: u32 = 2;
 const EXTENSION_NAME: &str = "lance.blob.ref";
@@ -587,6 +602,49 @@ impl BlobRefBatch {
             locator: Bytes::copy_from_slice(locators.value(index)),
             length: lengths.is_valid(index).then(|| lengths.value(index)),
         }))
+    }
+
+    /// Build demands from batch-local reference indices and engine correlation indices.
+    ///
+    /// Every input has the same length. `None` in `ranges` requests the whole
+    /// value; `Some` uses logical blob-local coordinates. Indices are unsigned
+    /// 64-bit values in every binding. This validates shape and reference indices;
+    /// [`BlobRefReader::read`] validates ranges, bindings, and unique request indices.
+    pub fn read_requests(
+        &self,
+        reference_indices: &[u64],
+        request_indices: &[u64],
+        ranges: &[Option<BlobReadRange>],
+    ) -> Result<Vec<BlobRefRequest>> {
+        if reference_indices.len() != request_indices.len()
+            || reference_indices.len() != ranges.len()
+        {
+            return Err(Error::invalid_input(format!(
+                "Blob request counts differ: reference_indices={}, request_indices={}, ranges={}",
+                reference_indices.len(),
+                request_indices.len(),
+                ranges.len(),
+            )));
+        }
+        reference_indices
+            .iter()
+            .zip(request_indices)
+            .zip(ranges)
+            .map(|((&reference_index, &request_index), &range)| {
+                let index = usize::try_from(reference_index).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Blob reference index {reference_index} exceeds usize"
+                    ))
+                })?;
+                Ok(BlobRefRequest::new(
+                    request_index,
+                    self.reference(index)?,
+                    range
+                        .map(BlobRefDemand::Range)
+                        .unwrap_or(BlobRefDemand::Whole),
+                ))
+            })
+            .collect()
     }
 
     /// Remap this array into a shared context table when combining batches.
@@ -2344,6 +2402,120 @@ mod tests {
         assert_eq!(results[&200].as_ref(), b"xyz");
         assert_eq!(first_recorded.requested_blob_ranges(), vec![0..3]);
         assert_eq!(second_recorded.requested_blob_ranges(), vec![0..3]);
+    }
+
+    #[tokio::test]
+    async fn binding_arrow_results_preserve_demands_and_nulls() {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = capture_dataset(directory.path().to_str().unwrap()).await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/bindings", "workers")
+            .await
+            .unwrap();
+        let captured = capture_ref_batch(&dataset, &source).await;
+        let requests = captured.read_requests(&[2], &[u64::MAX], &[None]).unwrap();
+        let budget = BlobMaterializationContext::try_new(1024, 1024).unwrap();
+        let held = budget.admission().reserve(1024).await.unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source.clone(), dataset.clone()).unwrap()],
+            budget.clone(),
+        )
+        .unwrap();
+        let session = Arc::new(BlobRefReadSession::try_new(&reader, requests).unwrap());
+        let pending = session.next_batch();
+        tokio::pin!(pending);
+        assert!(pending.as_mut().now_or_never().is_none());
+
+        drop(held);
+        let first = pending.await.unwrap().unwrap();
+        let mut values = HashMap::from([(
+            first["request_index"].as_primitive::<UInt64Type>().value(0),
+            if first["data"].is_null(0) {
+                None
+            } else {
+                Some(first["data"].as_binary::<i64>().value(0).to_vec())
+            },
+        )]);
+        drop(first);
+        assert!(session.next_batch().await.is_none());
+        let remaining = captured
+            .read_requests(
+                &[0, 1, 3, 4, 2],
+                &[0, 1, 2, 3, 4],
+                &[
+                    None,
+                    Some(BlobReadRange::new(1, 3)),
+                    None,
+                    None,
+                    Some(BlobReadRange::new(2, 4)),
+                ],
+            )
+            .unwrap();
+        let session = BlobRefReadSession::try_new(&reader, remaining).unwrap();
+        while let Some(batch) = session.next_batch().await {
+            let batch = batch.unwrap();
+            values.insert(
+                batch["request_index"].as_primitive::<UInt64Type>().value(0),
+                if batch["data"].is_null(0) {
+                    None
+                } else {
+                    Some(batch["data"].as_binary::<i64>().value(0).to_vec())
+                },
+            );
+        }
+        assert_eq!(
+            values,
+            HashMap::from([
+                (u64::MAX, Some(b"abcdefghij".to_vec())),
+                (0, Some(b"abc".to_vec())),
+                (1, Some(b"bcd".to_vec())),
+                (2, None),
+                (3, Some(vec![])),
+                (4, Some(b"cdef".to_vec()))
+            ])
+        );
+        session.close().await;
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn binding_arrow_results_keep_native_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = capture_dataset(directory.path().to_str().unwrap()).await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/owners", "workers")
+            .await
+            .unwrap();
+        let captured = capture_ref_batch(&dataset, &source).await;
+        let budget = BlobMaterializationContext::try_new(1, 1).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            budget.clone(),
+        )
+        .unwrap();
+        let session = BlobRefReadSession::try_new(
+            &reader,
+            captured
+                .read_requests(&[0, 1], &[0, 1], &[None, None])
+                .unwrap(),
+        )
+        .unwrap();
+        let first = session.next_batch().await.unwrap().unwrap();
+        let cloned = first.clone();
+        assert_eq!(first["data"].as_binary::<i64>().value(0), b"abc");
+        assert!(budget.reserved_bytes().unwrap() >= 3);
+        let pending = session.next_batch();
+        tokio::pin!(pending);
+        assert!(pending.as_mut().now_or_never().is_none());
+        session.cancel();
+        let error = pending.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("cancel"));
+        session.close().await;
+        drop(first);
+        assert!(budget.reserved_bytes().unwrap() >= 3);
+        assert_eq!(cloned["data"].as_binary::<i64>().value(0), b"abc");
+        drop(cloned);
+        wait_for_ref_budget_release(&budget).await;
+        assert!(session.next_batch().await.is_none());
+        session.close().await;
     }
 
     #[tokio::test]
