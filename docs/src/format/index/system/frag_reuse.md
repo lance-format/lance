@@ -222,6 +222,11 @@ Fragment 3 was never rewritten, so neither its index nor the lease needs a
 transition for it. Fragment 8 was written after version 12 and compacted
 before any index covered it, so its transition can be trimmed.
 
+Only the sources of a transition decide whether it is required. If a new index
+is built on fragment 9, the `{8} -> {9}` transition can still be trimmed: the
+index already covers the destination, and nothing that needs translating
+references fragment 8.
+
 External mapping files can be deleted only when no retained dataset version
 references them.
 

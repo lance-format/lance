@@ -28,10 +28,6 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
-[Retention leases](retention_leases.md) retain a leased version, the versions
-and transactions after it, and the FRI transitions connecting it to the current
-layout. The current manifest owns the lease list.
-
 `max_allocated_field_id` is optional. If a manifest sets it, the dataset uses non-reusable field IDs from
 that version onward. See [Field IDs](schema.md#field-ids).
 
@@ -291,6 +287,13 @@ See [Row ID & Lineage Specification](row_id_lineage.md)
 Vector indices, scalar indices, full-text search, and index management.
 
 See [Index Formats](../index/index.md)
+
+### Retention Leases
+
+Temporarily retaining a version, the history after it, and the FRI transitions
+a long-running job needs to publish a result computed from that version.
+
+See [Retention Leases Specification](retention_leases.md)
 
 ### Versioning
 

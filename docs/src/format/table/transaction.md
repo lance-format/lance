@@ -626,7 +626,7 @@ For an incoming operation rebasing across AcquireLease, RenewLease, or ReleaseLe
 | Rewrite | If the rewrite replaces fragments a listed lease requires, it must record FRI transitions for them; otherwise it conflicts and must be replanned. |
 | Restore, Overwrite | Remove all leases. Existing data conflicts remain. |
 | Clone | Start the destination with no leases and no lease flag. |
-| AcquireLease | Return a listed ID without changing it. Otherwise, add the lease against the new head with an unexpired request. |
+| AcquireLease | Add the lease against the new head with an unexpired request if the ID is not listed. Otherwise, return it without changing it. |
 | RenewLease | Recheck membership and expiration. Missing or expired is an error; a requested time not later than the current one is a no-op; otherwise extend only `expires_at`. |
 | ReleaseLease | Remove the target ID; absent is a no-op. |
 

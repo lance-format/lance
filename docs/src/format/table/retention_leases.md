@@ -52,7 +52,8 @@ computed against fragment 4 can be translated to fragment 7.
 
 `Manifest.retention_leases` (field 27) stores the lease list. Only the current
 manifest's list is authoritative; missing or empty means no leases. A lease is
-**listed** while its record is in that list, including after it expires.
+**listed** while its record is in that list (including after it expires, since
+an expired lease retains resources until a commit removes it).
 
 <details>
 <summary>Lease protobuf message</summary>
@@ -67,14 +68,16 @@ manifest's list is authoritative; missing or empty means no leases. A lease is
   differ from the acquisition transaction's own UUID, or the acquisition commit
   would release its own lease.
 - `version` is the version created by the acquisition commit. The holder does
-  not choose it: an older version's files or FRI transitions could already be
-  removed or approved for deletion, but the newly created head cannot be.
+  not choose it: it is handed the version its acquisition creates, so
+  acquisition never races cleanup. An older version's files or FRI transitions
+  could already be removed or approved for deletion, but the newly created head
+  cannot be.
 - `created_at` and `expires_at` are absolute UTC times; expiration must be
   later than creation.
 - `label` is optional, human-readable context with no retention meaning.
 
 Writers **must reject** lists with incomplete records, invalid values, or
-duplicate IDs. Writer flag 20 (`FLAG_RETENTION_LEASES`) **must be set exactly
+duplicate IDs. Writer flag `FLAG_RETENTION_LEASES` **must be set exactly
 when the list is nonempty**, so writers that do not support leases reject the
 table only while leases exist. Readers may ignore the list.
 
@@ -120,9 +123,10 @@ The holder's publication must rebase over every commit after F, so each
 commit while leases are listed **must record its [transaction](transaction.md)**,
 and cleanup must retain the transactions of versions after F. If cleanup cannot
 confirm that a required version or transaction is present, it **must not
-delete** files that version might need.
-
-Acquisition does not cancel deletions that cleanup approved before it.
+delete** files that version might need. A lease-aware writer never removes them,
+so a gap means the table was damaged or cleaned by a writer without lease
+support; without the missing manifest, cleanup cannot tell which files that
+version references.
 
 ### Unreferenced files
 
@@ -150,7 +154,7 @@ transitions listed leases require, even when no index needs them. If the table
 has no FRI, compaction creates one: at index version 1, which sets the sticky
 `FLAG_FRAGMENT_REUSE_INDEX` reader and writer flags, or at index version 0 on
 stable-row-ID tables, where index version 1 is not allowed. Every rewrite
-or trim **must recheck** these requirements against its predecessor before
+or FRI trim **must recheck** these requirements against its predecessor before
 committing, including after conflicts.
 
 ## Other operations
@@ -158,7 +162,7 @@ committing, including after conflicts.
 - **Restore and overwrite** remove all leases. A holder's publication would
   conflict with them anyway.
 - **New branches and clones** start with an empty lease list and therefore no
-  flag 20.
+  `FLAG_RETENTION_LEASES`.
 - **Detached commits** neither carry nor change leases, and are outside the
   retention window.
 - **Branch deletion** does not check leases; deleting a branch ends its leases.
