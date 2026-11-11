@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::execution::context::SessionContext;
+
 use lance_core::cache::{
     CacheBackend, CacheDiagnostics, CacheMetricsKind, CacheSnapshotMode, LanceCache,
     QuickCacheBackend, QuickCacheShardPolicy,
@@ -107,6 +109,9 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+    /// See [`Self::with_datafusion_session`].
+    datafusion_session: Option<SessionContext>,
 }
 
 impl DeepSizeOf for Session {
@@ -140,6 +145,7 @@ impl std::fmt::Debug for Session {
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
             .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
+            .field("has_datafusion_session", &self.datafusion_session.is_some())
             .finish()
     }
 }
@@ -179,6 +185,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -207,6 +214,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -323,6 +331,19 @@ impl Session {
         self.rabit_scan_factory.clone()
     }
 
+    /// Attach a DataFusion session for planning expressions over this
+    /// session's datasets, e.g. with
+    /// [`lance_datafusion::planner::Planner::new_with_session`].
+    pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
+        self.datafusion_session = Some(session);
+        self
+    }
+
+    /// The session set by [`Self::with_datafusion_session`], if any.
+    pub fn datafusion_session(&self) -> Option<&SessionContext> {
+        self.datafusion_session.as_ref()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -387,6 +408,7 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -985,5 +1007,19 @@ mod tests {
             ),
             "expected DiskCapExceeded, got {err}"
         );
+    }
+
+    #[test]
+    fn test_datafusion_session_is_shared_with_clones() {
+        assert!(Session::default().datafusion_session().is_none());
+
+        let datafusion_session = SessionContext::new();
+        let session = Session::default().with_datafusion_session(datafusion_session.clone());
+        for session in [&session, &session.clone()] {
+            assert_eq!(
+                session.datafusion_session().unwrap().session_id(),
+                datafusion_session.session_id()
+            );
+        }
     }
 }

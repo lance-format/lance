@@ -25,8 +25,8 @@ use crate::metrics::NoOpMetricsCollector;
 use crate::pbold;
 use crate::scalar::expression::{ScalarQueryParser, TextQueryParser};
 use crate::scalar::registry::{
-    BasicTrainer, DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    TrainingRequest, VALUE_COLUMN_NAME,
+    BasicTrainer, DefaultTrainingRequest, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{CreatedIndex, RowIdRemapper, UpdateCriteria};
 use crate::{Index, IndexType};
@@ -254,28 +254,10 @@ impl CacheKey for NGramPostingListKey {
 }
 
 impl NGramPostingList {
-    fn try_from_batch(
-        batch: RecordBatch,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
+    fn bitmap_from_batch(batch: &RecordBatch) -> Result<RoaringTreemap> {
         let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let mut bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
-            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
-        if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-            bitmap = frag_reuse_index_ref.remap_row_ids_roaring_tree_map(&bitmap);
-        }
-        Ok(Self { bitmap })
-    }
-
-    async fn try_from_batch_with_remapping(
-        batch: RecordBatch,
-        remapper: Arc<dyn BatchRowIdRemapper>,
-    ) -> Result<Self> {
-        let bitmap_bytes = batch.column(0).as_binary::<i32>().value(0);
-        let bitmap = RoaringTreemap::deserialize_from(bitmap_bytes)
-            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))?;
-        let bitmap = remap_row_ids_roaring_tree_map_async(remapper.as_ref(), &bitmap).await?;
-        Ok(Self { bitmap })
+        RoaringTreemap::deserialize_from(bitmap_bytes)
+            .map_err(|e| Error::internal(format!("Error deserializing ngram list: {}", e)))
     }
 
     fn intersect<'a>(lists: impl IntoIterator<Item = &'a Self>) -> RoaringTreemap {
@@ -315,6 +297,21 @@ impl std::fmt::Debug for NGramPostingListReader {
 }
 
 impl NGramPostingListReader {
+    /// The posting list holding `bitmap`, with its row ids translated by this
+    /// reader's remapper, if any.
+    async fn posting_list(&self, bitmap: RoaringTreemap) -> Result<NGramPostingList> {
+        let bitmap = if let Some(remapper) = self.batch_remapper.as_ref() {
+            // Tagged asynchronous path.
+            remap_row_ids_roaring_tree_map_async(remapper.as_ref(), &bitmap).await?
+        } else if let Some(frag_reuse_index) = self.frag_reuse_index.as_ref() {
+            // Legacy synchronous remapping path.
+            frag_reuse_index.remap_row_ids_roaring_tree_map(&bitmap)
+        } else {
+            bitmap
+        };
+        Ok(NGramPostingList { bitmap })
+    }
+
     #[instrument(level = "debug", skip(self, metrics))]
     pub async fn ngram_list(
         &self,
@@ -331,13 +328,7 @@ impl NGramPostingListReader {
                         Some(&[POSTING_LIST_COL]),
                     )
                     .await?;
-                if let Some(remapper) = self.batch_remapper.clone() {
-                    // Tagged asynchronous path.
-                    NGramPostingList::try_from_batch_with_remapping(batch, remapper).await
-                } else {
-                    // Legacy synchronous remapping path.
-                    NGramPostingList::try_from_batch(batch, self.frag_reuse_index.clone())
-                }
+                self.posting_list(NGramPostingList::bitmap_from_batch(&batch)?).await
         }).await;
         match &result {
             Ok((_, true)) => metrics.record_index_cache_hit(),
@@ -363,7 +354,7 @@ impl NGramPostingListReader {
 /// Note that it cannot return false negatives.
 pub struct NGramIndex {
     /// The mapping from tokens to row offsets
-    tokens: HashMap<u32, u32>,
+    tokens: Arc<HashMap<u32, u32>>,
     /// The reader for the posting lists
     list_reader: Arc<NGramPostingListReader>,
     /// The tokenizer used to tokenize text.  Note: not all tokenizers can be used with this index.  For
@@ -422,7 +413,7 @@ impl NGramIndex {
 
         Ok(Self {
             io_parallelism: store.io_parallelism(),
-            tokens: tokens_map,
+            tokens: Arc::new(tokens_map),
             list_reader: posting_reader,
             tokenizer: NGRAM_TOKENIZER.clone(),
             store,
@@ -584,7 +575,33 @@ impl Index for NGramIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        // TODO: NGram index can pre-warm by loading all posting lists into memory
+        // One sequential pass over the posting file, rather than one read per
+        // token as a query would make.
+        let mut lists = NGramIndexBuilder::stream_spill_reader(
+            self.list_reader.reader.clone(),
+            MAX_POSTING_LIST_BATCH_BYTES,
+        )?;
+        while let Some(state) = lists.try_next().await? {
+            for (token, bitmap) in state.tokens.values().iter().zip(state.bitmaps) {
+                let row_offset = *self.tokens.get(token).ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        POSTINGS_FILENAME,
+                        format!("ngram token {token} has a posting list but no token entry"),
+                    )
+                })?;
+                let list = self.list_reader.posting_list(bitmap).await?;
+                let inserted = self
+                    .list_reader
+                    .index_cache
+                    .insert_with_key(&NGramPostingListKey { row_offset }, Arc::new(list))
+                    .await;
+                if !inserted {
+                    return Err(Error::internal(
+                        "Failed to prewarm index: cache is no longer available".to_string(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1875,6 +1892,64 @@ impl NGramIndexBuilder {
     }
 }
 
+/// Token positions are immutable; readers and remappers belong to a request.
+#[derive(Debug, DeepSizeOf)]
+struct NGramIndexState {
+    tokens: Arc<HashMap<u32, u32>>,
+}
+
+impl NGramIndexState {
+    fn from_index(index: &dyn ScalarIndex) -> Result<Self> {
+        let index = index
+            .as_any()
+            .downcast_ref::<NGramIndex>()
+            .ok_or_else(|| Error::internal("NGram cache received a non-NGram index"))?;
+        Ok(Self {
+            tokens: index.tokens.clone(),
+        })
+    }
+
+    async fn reconstruct(
+        &self,
+        store: Arc<dyn IndexStore>,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let reader = store.open_index_file(POSTINGS_FILENAME).await?;
+        Ok(Arc::new(NGramIndex {
+            tokens: self.tokens.clone(),
+            list_reader: Arc::new(NGramPostingListReader {
+                reader,
+                frag_reuse_index: remapper,
+                batch_remapper: None,
+                index_cache: WeakLanceCache::from(cache),
+            }),
+            tokenizer: NGRAM_TOKENIZER.clone(),
+            io_parallelism: store.io_parallelism(),
+            store,
+        }))
+    }
+}
+
+struct NGramIndexStateKey;
+
+impl CacheKey for NGramIndexStateKey {
+    type ValueType = NGramIndexState;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "state".into()
+    }
+    fn type_name() -> &'static str {
+        "NGramIndexState"
+    }
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.ngram-index-state-key", 1)
+    }
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_variant(0);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NGramIndexPlugin;
 
@@ -1931,6 +2006,54 @@ impl BasicTrainer for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(state) = cache.get_with_key(&NGramIndexStateKey).await else {
+            return Ok(None);
+        };
+        Ok(Some(
+            state
+                .reconstruct(index_store, frag_reuse_index, cache)
+                .await?,
+        ))
+    }
+
+    async fn put_in_cache(
+        &self,
+        _index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        cache
+            .insert_with_key(
+                &NGramIndexStateKey,
+                Arc::new(NGramIndexState::from_index(index.as_ref())?),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let state = cache
+            .get_or_insert_with_key(NGramIndexStateKey, || async {
+                NGramIndexState::from_index(load.await?.as_ref())
+            })
+            .await?;
+        state
+            .reconstruct(index_store, frag_reuse_index, cache)
+            .await
+    }
+
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
     }
@@ -2036,7 +2159,11 @@ mod tests {
         lance_format::LanceIndexStore,
         ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions},
     };
-    use crate::{metrics::NoOpMetricsCollector, scalar::registry::VALUE_COLUMN_NAME};
+    use crate::{
+        Index,
+        metrics::{MetricsCollector, NoOpMetricsCollector},
+        scalar::registry::VALUE_COLUMN_NAME,
+    };
 
     use super::{
         MAX_POSTING_LIST_BATCH_BYTES, NGRAM_TOKENIZER, NGramIndexSpillState, NGramPostingList,
@@ -2374,6 +2501,117 @@ mod tests {
             .unwrap();
         let expected = SearchResult::at_most(RowAddrTreeMap::from_iter([8]));
         assert_eq!(expected, res);
+    }
+
+    /// Counts the posting lists a search loads from storage.
+    #[derive(Default)]
+    struct PartLoads(AtomicUsize);
+
+    impl MetricsCollector for PartLoads {
+        fn record_parts_loaded(&self, num_parts: usize) {
+            self.0.fetch_add(num_parts, Ordering::Relaxed);
+        }
+        fn record_index_loads(&self, _num_indexes: usize) {}
+        fn record_comparisons(&self, _num_comparisons: usize) {}
+    }
+
+    /// Prewarm caches every posting list in one sequential pass over the
+    /// posting file, so a search afterwards reads none from storage.
+    #[tokio::test]
+    async fn test_prewarm_caches_every_posting_list() {
+        // Three hex digits each: one trigram, and so one posting list, per row
+        let values = (0..4096).map(|i| format!("{i:03x}")).collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(&values)),
+                Arc::new(UInt64Array::from_iter_values(0..values.len() as u64)),
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let spill_files = builder.train(data).await.unwrap();
+        let tmpdir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        builder
+            .write_index(store.as_ref(), spill_files, None)
+            .await
+            .unwrap();
+
+        let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+        let index = NGramIndex::load(store, None, &cache).await.unwrap();
+        let num_lists = index.tokens.len();
+        assert_eq!(num_lists, values.len());
+
+        object_store.io_stats_incremental();
+        index.prewarm().await.unwrap();
+        let prewarm_iops = object_store.io_stats_incremental().read_iops;
+        assert!(
+            prewarm_iops < num_lists as u64 / 4,
+            "prewarm issued {prewarm_iops} requests for {num_lists} posting lists"
+        );
+        for row_offset in index.tokens.values() {
+            let key = NGramPostingListKey {
+                row_offset: *row_offset,
+            };
+            assert!(
+                cache.get_with_key(&key).await.is_some(),
+                "posting list {row_offset} was not prewarmed"
+            );
+        }
+
+        let loads = PartLoads::default();
+        let result = index
+            .search(&TextQuery::StringContains("0ab".to_string()), &loads)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([0xab]))
+        );
+        assert_eq!(loads.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_applies_runtime_remapping() {
+        use crate::scalar::lookup_test_util::CompactedToFragmentOne;
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (stored_index, _merges, _tmpdir) = do_train(builder, simple_data_with_nulls()).await;
+        let remapper = CompactedToFragmentOne {
+            deleted: HashSet::from([4]),
+        };
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = NGramIndex::load(stored_index.store.clone(), Some(Arc::new(remapper)), &cache)
+            .await
+            .unwrap();
+
+        index.prewarm().await.unwrap();
+
+        let loads = PartLoads::default();
+        let result = index
+            .search(&TextQuery::StringContains("cat".to_string()), &loads)
+            .await
+            .unwrap();
+        let moved = CompactedToFragmentOne::moved;
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter([moved(0)]))
+        );
+        assert_eq!(loads.0.load(Ordering::Relaxed), 0);
     }
 
     #[test_log::test(tokio::test)]
