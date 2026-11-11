@@ -454,6 +454,28 @@ impl Scanner {
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
+        if self.nearest_refine.is_some() {
+            let query = self.nearest.as_ref().ok_or_else(|| {
+                Error::invalid_input("refine_column requires nearest".to_string())
+            })?;
+            let factor = query
+                .refine_factor
+                .filter(|factor| *factor > 0)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        "refine_column requires an explicit positive refine_factor".to_string(),
+                    )
+                })?;
+            query.k.checked_mul(factor as usize).ok_or_else(|| {
+                Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+            })?;
+            if self.filter.query_filter.is_some() || self.full_text_query.is_some() {
+                return Err(Error::not_supported(
+                    "cross-column refinement does not support a vector or full-text query filter"
+                        .to_string(),
+                ));
+            }
+        }
         if let Some(QueryFilter::Vector(query)) = &self.filter.query_filter {
             query.validate_search_effort()?;
         }
