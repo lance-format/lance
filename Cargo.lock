@@ -4673,6 +4673,7 @@ dependencies = [
  "bitpacking",
  "crunchy",
  "paste",
+ "rstest",
  "seq-macro",
 ]
 
