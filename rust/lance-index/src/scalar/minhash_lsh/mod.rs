@@ -109,24 +109,15 @@ use crate::{pb, pbold};
 /// version onward; a segment persisted before it stores row ids (`_rowid`)
 /// instead and is still read, never written.
 pub const MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
-/// Format version of a segment persisted before the row-address-domain move.
-pub const MINHASH_LSH_ROW_ID_DOMAIN_VERSION: u32 = 0;
 /// On-disk format version of the index files a writer produces. A reader
 /// rejects a segment newer than this; an older one (down to version 0) is
-/// still supported for reading.
+/// still supported for reading. `rebuild_from` (behind remap, update and
+/// merge) always writes this version, regardless of a source segment's own
+/// domain -- unlike NGram/RTree, MinHash has no legacy physical layout it
+/// can reproduce, so there is no equivalent of their per-call
+/// domain-preserving version selector here.
 pub const MINHASH_LSH_INDEX_VERSION: u32 = MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION;
 
-/// The format version to stamp a created segment with: the one matching
-/// `results_are_row_addresses`, so remapping or merging new data onto an
-/// existing segment preserves its own domain instead of silently flipping a
-/// row-id-domain segment to address domain (or vice versa).
-fn minhash_lsh_index_version(results_are_row_addresses: bool) -> u32 {
-    if results_are_row_addresses {
-        MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION
-    } else {
-        MINHASH_LSH_ROW_ID_DOMAIN_VERSION
-    }
-}
 /// Version of the signature generation behavior (the token streams of the
 /// tokenizers that ship with Lance, shingle hashing, permutation family, the
 /// 16-bit compression and the band keys); bumped whenever a

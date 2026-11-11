@@ -445,11 +445,14 @@ impl MinHashLshIndex {
     fn created_index(&self, files: Vec<IndexFile>) -> Result<CreatedIndex> {
         Ok(CreatedIndex {
             index_details: self.params.details_any()?,
-            // Preserve this segment's own domain: remapping or merging new
-            // data onto a row-id-domain segment (valid without stable row
-            // ids, where a row id already is a row address) must not
-            // silently flip it to address domain.
-            index_version: minhash_lsh_index_version(self.results_are_row_addresses),
+            // `rebuild_from` (the sole writer behind remap/update/merge)
+            // always stamps the file itself with MINHASH_LSH_INDEX_VERSION,
+            // regardless of this segment's own domain -- unlike NGram/RTree,
+            // there is no legacy physical layout it can reproduce. Report
+            // that same version here instead of `self.results_are_row_addresses`'s
+            // (possibly stale, pre-rebuild) domain, so the manifest entry
+            // never disagrees with the file a loader actually reads.
+            index_version: MINHASH_LSH_INDEX_VERSION,
             files,
         })
     }
