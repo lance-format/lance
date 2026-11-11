@@ -1185,11 +1185,16 @@ impl DatasetIndexExt for Dataset {
     ) -> Result<()> {
         // Validating against the leased version lets the commit rebase the
         // segments over everything committed since they were built.
-        if self.manifest.version != lease.version() {
-            *self = self.checkout_lease(lease).await?;
-        }
-        self.commit_index_segments(index_name, column, segments, Some(lease))
-            .await
+        let mut leased = if self.manifest.version == lease.version() {
+            self.clone()
+        } else {
+            self.checkout_lease(lease).await?
+        };
+        leased
+            .commit_index_segments(index_name, column, segments, Some(lease))
+            .await?;
+        *self = leased;
+        Ok(())
     }
 
     async fn load_scalar_index<'a, 'b>(

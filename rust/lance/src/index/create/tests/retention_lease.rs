@@ -161,7 +161,8 @@ async fn test_leased_segments_with_missing_files_are_refused() {
     let removed = leased.indices_dir().join(segments[0].uuid.to_string());
     leased.object_store.remove_dir_all(removed).await.unwrap();
 
-    let error = leased
+    let mut coordinator = dataset.clone();
+    let error = coordinator
         .commit_existing_index_segments_for_lease("value_idx", "value", segments, &lease)
         .await
         .unwrap_err();
@@ -169,4 +170,6 @@ async fn test_leased_segments_with_missing_files_are_refused() {
     let message = error.to_string();
     assert!(message.contains("has no files"), "{message}");
     assert_eq!(listed_leases(&dataset).await, vec![lease]);
+    // A failed commit leaves the caller's handle where it was.
+    assert_eq!(coordinator.version().version, 1);
 }
