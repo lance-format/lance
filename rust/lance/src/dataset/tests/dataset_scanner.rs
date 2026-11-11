@@ -479,6 +479,66 @@ async fn test_vector_filter_fts_search() {
         &[300, 255],
     )
     .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector query bounds them.
+    let phrase_query = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("text".to_string()).with_column(Some("text".to_string())),
+    ));
+    // Case 7: Case 3 with limit 2
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[299, 300],
+    )
+    .await;
+
+    // Case 8: Case 5 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .full_text_search(phrase_query.clone())
+        .unwrap()
+        .prefilter(false)
+        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema.try_with_column(SCORE_FIELD.clone()).unwrap().into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 3 with limit 0
+    let batch = dataset
+        .scan()
+        .full_text_search(phrase_query)
+        .unwrap()
+        .prefilter(true)
+        .filter_query(QueryFilter::Vector(vector_query))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[tokio::test]
@@ -628,10 +688,10 @@ async fn test_fts_filter_vector_search() {
     // 296..=300; 296..=298 hold "noop" text and are dropped by the filter. A
     // limit pushed below the filter would only let 298 and one of the tied
     // 297/299 reach it.
-    let query_vector = Float32Array::from(vec![298f32, 298f32, 298f32, 298f32]);
+    let postfilter_query_vector = Float32Array::from(vec![298f32, 298f32, 298f32, 298f32]);
     let mut scanner = dataset.scan();
     let stream = scanner
-        .nearest("vector", &query_vector, 5)
+        .nearest("vector", &postfilter_query_vector, 5)
         .unwrap()
         .refine(1)
         .prefilter(false)
@@ -653,6 +713,52 @@ async fn test_fts_filter_vector_search() {
         &[299, 300],
     )
     .await;
+
+    // The scan's limit pages the results above. It must not cut the FTS
+    // matches down before the vector search picks its neighbours from them.
+    // Case 8: Case 1 with limit 3
+    let mut scanner = dataset.scan();
+    let stream = scanner
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(3), None)
+        .unwrap()
+        .try_into_stream()
+        .await
+        .unwrap();
+    check_results(
+        stream,
+        schema
+            .try_with_column(ArrowField::new(DIST_COL, DataType::Float32, true))
+            .unwrap()
+            .into(),
+        &[300, 299, 255],
+    )
+    .await;
+
+    // Case 9: Case 1 with limit 0
+    let batch = dataset
+        .scan()
+        .nearest("vector", &query_vector, 5)
+        .unwrap()
+        .refine(1)
+        .prefilter(true)
+        .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
+            "text".to_string(),
+        )))
+        .unwrap()
+        .limit(Some(0), None)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 0);
 }
 
 #[rstest]
@@ -1283,4 +1389,275 @@ async fn test_decimal_column_filters_with_fractional_literals() {
         .count();
     dataset.delete("discount < 0.055").await.unwrap();
     assert_eq!(dataset.count_rows(None).await.unwrap(), 60 - deleted);
+}
+
+/// label, confidence, area
+type Detection = (&'static str, f32, f32);
+type Detections = Option<Vec<Option<Detection>>>;
+type DetectionCheck = fn(i32, &Detections) -> bool;
+
+const DETECTION_ROWS: i32 = 2000;
+
+/// Row `id` of the `any_element` fixture: (width, detections). Rows 0 to 5 are
+/// the edge cases; the rest are generated, with null lists and null detections.
+fn detection_row(id: i32) -> (i32, Detections) {
+    let det = |label: &'static str, confidence: f32, area: f32| Some((label, confidence, area));
+    match id {
+        // A low-confidence car next to a high-confidence person.
+        0 => (
+            3840,
+            Some(vec![det("car", 0.30, 20000.0), det("person", 0.95, 5000.0)]),
+        ),
+        // Confidence exactly at the boundary.
+        1 => (3840, Some(vec![det("car", 0.90, 20000.0)])),
+        // The area condition holds on another detection.
+        2 => (
+            3840,
+            Some(vec![det("car", 0.95, 9999.0), det("person", 0.1, 20000.0)]),
+        ),
+        // `carrot` is not `car`.
+        3 => (3840, Some(vec![det("carrot", 0.99, 20000.0)])),
+        4 => (3840, Some(vec![])),
+        5 => (3840, None),
+        _ => {
+            let i = id as usize;
+            let width = [1280, 1920, 2560, 3840][i % 4];
+            if i % 97 == 13 {
+                return (width, None);
+            }
+            let detections = (0..(i * 7) % 6)
+                .map(|j| {
+                    if (i + 3 * j).is_multiple_of(23) {
+                        return None;
+                    }
+                    let label = ["car", "person", "truck", "carrot"][(i * 5 + j * 3) % 4];
+                    let confidence = ((i * 37 + j * 11) % 101) as f32 / 100.0;
+                    let area = ((i * 13 + j * 29) % 41) as f32 * 500.0;
+                    det(label, confidence, area)
+                })
+                .collect();
+            (width, Some(detections))
+        }
+    }
+}
+
+/// SQL three-valued `any_element` over a fixture row: a null detection makes
+/// every comparison NULL.
+fn any_detection(detections: &Detections, predicate: impl Fn(&Detection) -> bool) -> Option<bool> {
+    let detections = detections.as_ref()?;
+    let mut is_unknown = false;
+    for detection in detections {
+        match detection {
+            Some(detection) if predicate(detection) => return Some(true),
+            Some(_) => {}
+            None => is_unknown = true,
+        }
+    }
+    if is_unknown { None } else { Some(false) }
+}
+
+fn detection_batch(ids: std::ops::Range<i32>) -> RecordBatch {
+    let fields = Fields::from(vec![
+        ArrowField::new("label", DataType::Utf8, true),
+        ArrowField::new("confidence", DataType::Float32, true),
+        ArrowField::new("area", DataType::Float32, true),
+    ]);
+    let item = Arc::new(ArrowField::new(
+        "item",
+        DataType::Struct(fields.clone()),
+        true,
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("width", DataType::Int32, false),
+        ArrowField::new("detections", DataType::List(item.clone()), true),
+    ]));
+    let (mut labels, mut confidences, mut areas) = (vec![], vec![], vec![]);
+    let (mut is_valid, mut lengths, mut is_list_valid, mut widths) =
+        (vec![], vec![], vec![], vec![]);
+    for id in ids.clone() {
+        let (width, detections) = detection_row(id);
+        widths.push(width);
+        is_list_valid.push(detections.is_some());
+        let detections = detections.unwrap_or_default();
+        lengths.push(detections.len());
+        for detection in detections {
+            is_valid.push(detection.is_some());
+            // A null detection hides values that would match every filter.
+            let (label, confidence, area) = detection.unwrap_or(("car", 0.99, 99999.0));
+            labels.push(label);
+            confidences.push(confidence);
+            areas.push(area);
+        }
+    }
+    let elements = StructArray::try_new(
+        fields,
+        vec![
+            Arc::new(StringArray::from(labels)) as ArrayRef,
+            Arc::new(Float32Array::from(confidences)),
+            Arc::new(Float32Array::from(areas)),
+        ],
+        Some(NullBuffer::from(is_valid)),
+    )
+    .unwrap();
+    let detections = ListArray::try_new(
+        item,
+        OffsetBuffer::from_lengths(lengths),
+        Arc::new(elements),
+        Some(NullBuffer::from(is_list_valid)),
+    )
+    .unwrap();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from_iter_values(ids)),
+            Arc::new(Int32Array::from(widths)),
+            Arc::new(detections),
+        ],
+    )
+    .unwrap()
+}
+
+/// Three fragments with a BTree on `width`, then a fourth the index does not
+/// cover.
+async fn detection_dataset() -> Dataset {
+    let params = WriteParams {
+        max_rows_per_file: 500,
+        ..Default::default()
+    };
+    let indexed = detection_batch(0..1500);
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed)], schema.clone()),
+        "memory://",
+        Some(params.clone()),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["width"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(detection_batch(1500..DETECTION_ROWS))], schema),
+            Some(params),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    dataset
+}
+
+async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(use_scalar_index);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+#[rstest]
+#[case::same_element(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true)
+)]
+#[case::inclusive_range(
+    "any_element(detections, 'label = ''car'' AND confidence >= 0.9')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 >= 0.9) == Some(true)
+)]
+#[case::in_list(
+    "any_element(detections, 'label IN (''truck'', ''carrot'') AND confidence > 0.95')",
+    |_, d: &Detections| any_detection(d, |d| (d.0 == "truck" || d.0 == "carrot") && d.1 > 0.95) == Some(true)
+)]
+#[case::three_conditions(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9 && d.2 > 10000.0) == Some(true)
+)]
+#[case::negated(
+    "NOT any_element(detections, 'label = ''car'' AND confidence > 0.9')",
+    |_, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(false)
+)]
+#[case::and_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') AND width > 1920",
+    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true) && w > 1920
+)]
+#[case::or_indexed_column(
+    "any_element(detections, 'label = ''car'' AND confidence > 0.9') OR width = 1280",
+    |w, d: &Detections| any_detection(d, |d| d.0 == "car" && d.1 > 0.9) == Some(true) || w == 1280
+)]
+#[tokio::test]
+async fn test_any_element_filter(#[case] filter: &str, #[case] keep: DetectionCheck) {
+    let dataset = detection_dataset().await;
+    let expected: Vec<i32> = (0..DETECTION_ROWS)
+        .filter(|id| {
+            let (width, detections) = detection_row(*id);
+            keep(width, &detections)
+        })
+        .collect();
+    assert!(!expected.is_empty(), "`{filter}` should match some rows");
+    for use_scalar_index in [true, false] {
+        assert_eq!(
+            any_element_ids(&dataset, filter, use_scalar_index).await,
+            expected,
+            "`{filter}`, index: {use_scalar_index}"
+        );
+    }
+    assert_eq!(
+        dataset.count_rows(Some(filter.to_string())).await.unwrap(),
+        expected.len()
+    );
+}
+
+#[tokio::test]
+async fn test_any_element_edge_rows() {
+    let dataset = detection_dataset().await;
+    let filter = "any_element(detections, 'label = ''car'' AND confidence > 0.9')";
+    let matched = any_element_ids(&dataset, filter, true).await;
+    // Only row 2 has a car above 0.9 among the edge cases.
+    for id in [0, 1, 3, 4, 5] {
+        assert!(!matched.contains(&id), "row {id} must not match `{filter}`");
+    }
+    assert!(matched.contains(&2));
+    // The empty list is FALSE, so NOT selects it; the null list is NULL, so
+    // neither does.
+    let negated = any_element_ids(&dataset, &format!("NOT {filter}"), true).await;
+    assert!(negated.contains(&4) && !negated.contains(&5));
+}
+
+/// A predicate that names a column outside the element, or calls a function
+/// that is not immutable (compiled predicates are reused across queries, so
+/// `now()` would freeze), is rejected before any data is read.
+#[rstest]
+#[case::outside_column("any_element(detections, 'width > 1')", "width")]
+#[case::stable_function("any_element(detections, 'now() IS NOT NULL')", "calls now()")]
+#[tokio::test]
+async fn test_any_element_rejects_invalid_predicates(#[case] filter: &str, #[case] reason: &str) {
+    let dataset = detection_dataset().await;
+    let mut scanner = dataset.scan();
+    scanner.filter(filter).unwrap();
+    let err = scanner.try_into_batch().await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+    let message = err.to_string();
+    assert!(
+        message.contains("any_element") && message.contains(reason),
+        "{message}"
+    );
+    let err = dataset
+        .count_rows(Some(filter.to_string()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains(reason), "{err}");
 }

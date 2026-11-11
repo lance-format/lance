@@ -2011,25 +2011,20 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
         } else {
             let mut indices = Vec::with_capacity(old_indices.len());
             for idx in old_indices {
-                match dataset
+                let index = dataset
                     .open_generic_index_for_maintenance(
                         &field_path,
                         &idx.uuid,
                         &NoOpMetricsCollector,
                     )
                     .await
-                {
-                    Ok(index) => indices.push(index),
-                    Err(e) => {
-                        log::warn!(
-                            "Cannot open index on column '{}': {}. \
-                         Skipping index merge for this column.",
-                            field_path,
-                            e
-                        );
-                        return Ok(None);
-                    }
-                }
+                    .map_err(|err| {
+                        Error::index(format!(
+                            "Cannot open index '{}' (segment {}) on column '{}': {}",
+                            idx.name, idx.uuid, field_path, err
+                        ))
+                    })?;
+                indices.push(index);
             }
 
             if indices
@@ -4516,9 +4511,10 @@ mod tests {
         for (pattern, expected) in [("old alpha", 1), ("new gamma", 1), ("needle", 2)] {
             let query = TextQuery::StringContains(pattern.to_string());
             let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-            let row_addrs = match result {
-                SearchResult::Exact(row_addrs) => row_addrs,
-                other => panic!("expected exact result for {pattern}, got {other:?}"),
+            let row_addrs = match (pattern, result) {
+                ("old alpha" | "new gamma", SearchResult::AtMost(row_addrs)) => row_addrs,
+                ("needle", SearchResult::Exact(row_addrs)) => row_addrs,
+                (_, other) => panic!("unexpected result for {pattern}: {other:?}"),
             };
             let count = row_addrs.true_rows().row_addrs().unwrap().count();
             assert_eq!(

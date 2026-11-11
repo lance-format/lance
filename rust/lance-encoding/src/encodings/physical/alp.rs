@@ -58,7 +58,9 @@ use crate::encodings::logical::primitive::miniblock::{
     MiniBlockCompressor,
 };
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::{bitpack_out_of_line_vec, unpack_out_of_line};
+use crate::encodings::physical::bitpacking::{
+    bitpack_out_of_line_vec, out_of_line_payload_byte_lengths, unpack_out_of_line,
+};
 use crate::encodings::physical::value::ValueEncoder;
 use crate::format::EncodingUtils;
 use crate::format::metadata;
@@ -1332,6 +1334,30 @@ fn parse_header(header: &[u8], bits_per_value: u64) -> Result<ChunkHeader> {
     })
 }
 
+#[cfg(feature = "bitpacking")]
+fn validate_packed_buffer(
+    name: &str,
+    buffer: &LanceBuffer,
+    num_values: u64,
+    word_bits: u64,
+    bit_width: u8,
+) -> Result<()> {
+    let [raw_tail_bytes, padded_tail_bytes] =
+        out_of_line_payload_byte_lengths(num_values, word_bits, bit_width as u64)?;
+    if buffer.len() as u64 != raw_tail_bytes && buffer.len() as u64 != padded_tail_bytes {
+        return Err(Error::corrupt_file_named(
+            name,
+            format!(
+                "packed payload has {} bytes, expected {raw_tail_bytes} bytes (raw tail) or \
+                 {padded_tail_bytes} bytes (padded tail) for {num_values} values at \
+                 {bit_width} bits per value in {word_bits}-bit words",
+                buffer.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
     fn num_buffers(&self) -> usize {
         4
@@ -1370,7 +1396,19 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
             }
             let rd = parse_rd_header(header.as_ref())?;
             #[cfg(feature = "bitpacking")]
-            return self.decode_rd64(&rd, packed, buffer2, buffer3, n);
+            {
+                validate_packed_buffer("ALP-RD right parts", &packed, num_values, 64, rd.d)?;
+                if rd.index_bits > 0 {
+                    validate_packed_buffer(
+                        "ALP-RD indices",
+                        &buffer3,
+                        num_values,
+                        64,
+                        rd.index_bits,
+                    )?;
+                }
+                return self.decode_rd64(&rd, packed, buffer2, buffer3, n);
+            }
             #[cfg(not(feature = "bitpacking"))]
             {
                 let _ = (packed, buffer2, buffer3);
@@ -1379,6 +1417,23 @@ impl MiniBlockDecompressor for AlpMiniBlockDecompressor {
         }
 
         let header = parse_header(header.as_ref(), self.bits_per_value)?;
+
+        #[cfg(feature = "bitpacking")]
+        {
+            // Delta stores the first value in the header, leaving n - 1 offsets.
+            let offset_count = if header.mode & MODE_DELTA != 0 {
+                num_values - 1
+            } else {
+                num_values
+            };
+            validate_packed_buffer(
+                "ALP offsets",
+                &packed,
+                offset_count,
+                self.bits_per_value,
+                header.bit_width,
+            )?;
+        }
 
         let mut out = vec![0u8; n * (self.bits_per_value as usize / 8)];
         #[cfg(feature = "bitpacking")]
@@ -1586,17 +1641,7 @@ impl AlpMiniBlockDecompressor {
         let indices = if header.index_bits == 0 {
             Vec::new()
         } else {
-            let indices = unpack(index_buffer, n, header.index_bits as usize)?;
-            if indices.len() != n {
-                return Err(Error::invalid_input(format!(
-                    "ALP-RD index stream has wrong length: n={n} d={} index_bits={} dict_len={} packed_indices={}",
-                    header.d,
-                    header.index_bits,
-                    header.dict_len,
-                    indices.len()
-                )));
-            }
-            indices
+            unpack(index_buffer, n, header.index_bits as usize)?
         };
 
         let dict_words = dict_buffer_entries(&dict_buffer, header.dict_len);
@@ -1672,6 +1717,131 @@ mod tests {
     use rand::Rng;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rstest::rstest;
+
+    #[cfg_attr(coverage, coverage(off))]
+    fn packed_zeros(count: usize, bits: u64, width: usize, is_padded: bool) -> LanceBuffer {
+        // Pack full blocks, then either pack a padded tail or append a raw tail.
+        let packed_count = if is_padded {
+            count.div_ceil(1024) * 1024
+        } else {
+            count / 1024 * 1024
+        };
+        let block = FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0u8; packed_count * (bits as usize / 8)]),
+            bits_per_value: bits,
+            num_values: packed_count as u64,
+            block_info: BlockInfo::new(),
+        };
+        let packed = match bits {
+            32 => LanceBuffer::reinterpret_vec(bitpack_out_of_line_vec::<u32>(block, width)),
+            64 => LanceBuffer::reinterpret_vec(bitpack_out_of_line_vec::<u64>(block, width)),
+            _ => unreachable!(),
+        };
+        let mut bytes = packed.as_ref().to_vec();
+        if !is_padded {
+            bytes.resize(bytes.len() + (count % 1024) * (bits as usize / 8), 0);
+        }
+        LanceBuffer::from(bytes)
+    }
+
+    #[rstest]
+    #[case::for32(32, false)]
+    #[case::delta32(32, true)]
+    #[case::for64(64, false)]
+    #[case::delta64(64, true)]
+    fn test_packed_offsets_buffer_validation(
+        #[case] bits: u64,
+        #[case] is_delta: bool,
+        #[values(1, 17, 1024, 1025)] n: usize,
+        #[values(false, true)] is_padded: bool,
+    ) {
+        let offset_count = n - usize::from(is_delta);
+        let packed = packed_zeros(offset_count, bits, 3, is_padded);
+        let mut header = vec![MODE_DIV | if is_delta { MODE_DELTA } else { 0 }, 1, 0, 3];
+        let word_bytes = bits as usize / 8;
+        header.extend_from_slice(&10i64.to_le_bytes()[..word_bytes]);
+        if is_delta {
+            header.extend_from_slice(&1i64.to_le_bytes()[..word_bytes]);
+        }
+        let buffers = vec![
+            packed,
+            LanceBuffer::from(header),
+            LanceBuffer::empty(),
+            LanceBuffer::empty(),
+        ];
+        let decompressor = AlpMiniBlockDecompressor {
+            bits_per_value: bits,
+        };
+        let decoded = decompressor.decompress(buffers.clone(), n as u64).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("expected fixed width");
+        };
+        let expected: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let value = 10 + if is_delta { i } else { 0 };
+                if bits == 32 {
+                    ((value as f32) / 10.0).to_le_bytes().to_vec()
+                } else {
+                    ((value as f64) / 10.0).to_le_bytes().to_vec()
+                }
+            })
+            .collect();
+        assert_eq!(decoded.data.as_ref(), expected);
+
+        let len = buffers[0].len();
+        let invalid_lengths = if len == 0 {
+            vec![word_bytes]
+        } else {
+            vec![0, len / 2, len - 1, len - word_bytes, len + word_bytes]
+        };
+        for len in invalid_lengths {
+            let mut damaged = buffers.clone();
+            damaged[0] = LanceBuffer::from(vec![0u8; len]);
+            let error = decompressor.decompress(damaged, n as u64).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("ALP offsets"), "{error}");
+            assert!(error.to_string().contains("expected"), "{error}");
+        }
+    }
+
+    #[rstest]
+    fn test_rd_packed_buffer_validation(
+        #[values(19, 1024, 1025)] n: usize,
+        #[values(false, true)] is_padded: bool,
+        #[values(0, 3)] buffer_index: usize,
+    ) {
+        let buffers = vec![
+            packed_zeros(n, 64, 3, is_padded),
+            LanceBuffer::from(vec![MODE_RD, 3, 1, 0, 2, 0, 0, 0]),
+            LanceBuffer::reinterpret_vec(vec![1.0f64.to_bits(), (-1.0f64).to_bits()]),
+            packed_zeros(n, 64, 1, is_padded),
+        ];
+        let decompressor = AlpMiniBlockDecompressor { bits_per_value: 64 };
+        let decoded = decompressor.decompress(buffers.clone(), n as u64).unwrap();
+        let DataBlock::FixedWidth(decoded) = decoded else {
+            panic!("expected fixed width");
+        };
+        assert_eq!(
+            decoded.data.borrow_to_typed_slice::<f64>().as_ref(),
+            vec![1.0; n]
+        );
+
+        let len = buffers[buffer_index].len();
+        for len in [0, len / 2, len - 1, len - 8, len + 8] {
+            let mut damaged = buffers.clone();
+            damaged[buffer_index] = LanceBuffer::from(vec![0u8; len]);
+            let error = decompressor.decompress(damaged, n as u64).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            let stream = if buffer_index == 0 {
+                "ALP-RD right parts"
+            } else {
+                "ALP-RD indices"
+            };
+            assert!(error.to_string().contains(stream), "{error}");
+            assert!(error.to_string().contains("expected"), "{error}");
+        }
+    }
 
     fn stat_block(values: &[f64]) -> FixedWidthDataBlock {
         let bytes = values
@@ -1806,10 +1976,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_round_trip_decimal_f32_uses_alp() {
-        let mut values = Vec::with_capacity(4096);
-        for i in 0..4096 {
+    #[rstest]
+    #[case::full_chunks(4096)]
+    #[case::short_chunk(1000)]
+    #[case::raw_tail(1025)]
+    fn test_round_trip_decimal_f32_uses_alp(#[case] num_values: usize) {
+        let mut values = Vec::with_capacity(num_values);
+        for i in 0..num_values {
             values.push(((i * 73) % 10000) as f32 / 100.0);
         }
         let encoding = round_trip_f32(&values);
@@ -1819,10 +1992,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_round_trip_sensor_f64() {
-        let mut values = Vec::with_capacity(4096);
-        for i in 0..4096 {
+    #[rstest]
+    #[case::full_chunks(4096)]
+    #[case::short_chunk(1000)]
+    #[case::raw_tail(1025)]
+    fn test_round_trip_sensor_f64(#[case] num_values: usize) {
+        let mut values = Vec::with_capacity(num_values);
+        for i in 0..num_values {
             let v = 20.0 + (i as f64 / 10.0).sin();
             values.push((v * 10.0).round() / 10.0);
         }
