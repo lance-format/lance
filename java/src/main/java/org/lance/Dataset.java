@@ -71,6 +71,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -1211,6 +1212,113 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeRestore();
+
+  /**
+   * Acquire a retention lease on a new version of this dataset.
+   *
+   * <p>While the lease is listed, cleanup keeps the leased version and every later one, so the
+   * holder can build on the leased version for as long as it keeps the lease. The lease ends when
+   * the holder commits a transaction for it (see {@link Transaction.Builder#forLease}), releases it
+   * with {@link #releaseRetentionLease}, or lets it expire without {@link #renewRetentionLease}.
+   *
+   * <p>The acquisition commits a new version on the latest version of this dataset's branch; that
+   * version is the leased one. This dataset stays at its current version; use {@link
+   * #checkoutLease} to read the leased version.
+   *
+   * <p>Example:
+   *
+   * <pre>{@code
+   * RetentionLease lease =
+   *     dataset.acquireRetentionLease(LeaseOptions.builder().label("index build").build());
+   * try (Dataset leased = dataset.checkoutLease(lease)) {
+   *   // build on leased, then commit with new Transaction.Builder().forLease(lease)
+   * }
+   * }</pre>
+   *
+   * @param options the lease duration and label
+   * @return the acquired lease
+   * @throws UnsupportedOperationException if this build of Lance cannot honor leases on this
+   *     dataset, for example on a dataset with stable row IDs
+   */
+  public RetentionLease acquireRetentionLease(LeaseOptions options) {
+    Preconditions.checkNotNull(options, "options cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeAcquireRetentionLease(
+          options.getTtl().orElse(null), options.getLabel().orElse(null));
+    }
+  }
+
+  private native RetentionLease nativeAcquireRetentionLease(Duration ttl, String label);
+
+  /**
+   * Check out the version {@code lease} retains, for example on a worker that received the lease
+   * from its holder.
+   *
+   * @param lease the lease whose version to check out
+   * @return a new Dataset instance at the leased version
+   */
+  public Dataset checkoutLease(RetentionLease lease) {
+    Preconditions.checkNotNull(lease, "lease cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return initializeCheckoutDataset(nativeCheckoutLease(lease));
+    }
+  }
+
+  private native Dataset nativeCheckoutLease(RetentionLease lease);
+
+  /**
+   * Extend {@code lease} to expire {@code ttl} from now.
+   *
+   * <p>A time not later than the current expiry changes nothing and commits no version.
+   *
+   * @param lease the lease to renew
+   * @param ttl how long from now the lease should last; must be positive
+   * @return the lease as listed after the renewal
+   * @throws IllegalArgumentException if the lease is no longer listed or has already expired
+   */
+  public RetentionLease renewRetentionLease(RetentionLease lease, Duration ttl) {
+    Preconditions.checkNotNull(lease, "lease cannot be null");
+    Preconditions.checkNotNull(ttl, "ttl cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeRenewRetentionLease(lease, ttl);
+    }
+  }
+
+  private native RetentionLease nativeRenewRetentionLease(RetentionLease lease, Duration ttl);
+
+  /**
+   * Release {@code lease}, ending its retention without publishing a result. Releasing a lease
+   * that is no longer listed changes nothing.
+   *
+   * @param lease the lease to release
+   */
+  public void releaseRetentionLease(RetentionLease lease) {
+    Preconditions.checkNotNull(lease, "lease cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeReleaseRetentionLease(lease);
+    }
+  }
+
+  private native void nativeReleaseRetentionLease(RetentionLease lease);
+
+  /**
+   * The retention leases listed in this version of the dataset. Expired leases stay listed until a
+   * later commit removes them; only the latest version's list is authoritative.
+   *
+   * @return the listed leases
+   */
+  public List<RetentionLease> getRetentionLeases() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetRetentionLeases();
+    }
+  }
+
+  private native List<RetentionLease> nativeGetRetentionLeases();
 
   /**
    * Creates a new index on the dataset
