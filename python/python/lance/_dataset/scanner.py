@@ -489,6 +489,9 @@ def _build_vector_search_query(
     search_effort: Optional[float] = None,
     multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
     warp_imputation_rank: Optional[int] = None,
+    refine_column: Optional[str] = None,
+    refine_q: Optional[QueryVectorLike] = None,
+    refine_metric: Optional[str] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -574,6 +577,14 @@ def _build_vector_search_query(
         not observe by the estimated similarity of its ``t'``-th most similar
         indexed token. Defaults to the number of tokens XTR retrieves per query
         token.
+    refine_column, refine_q, refine_metric: optional
+        Supply all three to rerank ``k * refine_factor`` coarse candidates
+        using another Float32 fixed-size vector column. ``refine_q`` must
+        match that column's dimension and the number of coarse queries.
+        Requires an explicit positive ``refine_factor``. Final ``_distance``
+        and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
+        coarse TopM still precedes refinement. Query filters are unsupported;
+        scalar filters retain their usual prefilter/postfilter behavior.
 
     Returns
     -------
@@ -581,6 +592,13 @@ def _build_vector_search_query(
         The scanner builder for method chaining.
     """
     q, q_dim = _coerce_query_vector(q)
+    refine_args = (refine_column, refine_q, refine_metric)
+    if any(value is not None for value in refine_args):
+        if not all(value is not None for value in refine_args):
+            raise ValueError(
+                "refine_column, refine_q, and refine_metric must be provided together"
+            )
+        refine_q, _ = _coerce_query_vector(cast("QueryVectorLike", refine_q))
 
     if dataset is not None:
         lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
@@ -668,6 +686,9 @@ def _build_vector_search_query(
         "distance_range": distance_range,
         "multivector_algorithm": multivector_algorithm,
         "warp_imputation_rank": warp_imputation_rank,
+        "refine_column": refine_column,
+        "refine_q": refine_q,
+        "refine_metric": refine_metric,
     }
 
 
@@ -1040,6 +1061,9 @@ class ScannerBuilder:
         quantized_refine_factor: Optional[int] = None,
         multivector_algorithm: Optional[Literal["xtr", "warp"]] = None,
         warp_imputation_rank: Optional[int] = None,
+        refine_column: Optional[str] = None,
+        refine_q: Optional[QueryVectorLike] = None,
+        refine_metric: Optional[str] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1113,6 +1137,28 @@ class ScannerBuilder:
             not observe by the estimated similarity of its ``t'``-th most similar
             indexed token. Defaults to the number of tokens XTR retrieves per query
             token.
+        refine_column, refine_q, refine_metric: optional
+            Supply all three to rerank ``k * refine_factor`` coarse candidates
+            using another Float32 fixed-size vector column. ``refine_q`` must
+            match that column's dimension and the number of coarse queries.
+            Requires an explicit positive ``refine_factor``. Final ``_distance``
+            and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
+            coarse TopM still precedes refinement. Query filters are unsupported;
+            scalar filters retain their usual prefilter/postfilter behavior.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            builder.nearest(
+                "pca128",
+                q128,
+                k=10,
+                refine_factor=2,
+                refine_column="embedding",
+                refine_q=q1024,
+                refine_metric="cosine",
+            )
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -1133,6 +1179,9 @@ class ScannerBuilder:
             distance_range=distance_range,
             multivector_algorithm=multivector_algorithm,
             warp_imputation_rank=warp_imputation_rank,
+            refine_column=refine_column,
+            refine_q=refine_q,
+            refine_metric=refine_metric,
         )
         return self
 

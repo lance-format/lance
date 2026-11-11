@@ -35,7 +35,10 @@
 //! [`OptimizeOptions::consolidate`] instead selects a suffix of complete vector
 //! segments within a physical-row budget, leaving unindexed fragments alone.
 //! Shared models merge directly; differing models are re-encoded in tasks under
-//! the newest selected model, then merged into one output. All selected coverage
+//! the newest selected model, then merged into one output. A segment selection
+//! ([`OptimizeOptions::consolidate_selected`]) instead trains a model on its own
+//! rows when the models differ, and may pack its output into several segments
+//! of at most `max_rows_per_segment` live rows. All selected coverage
 //! must be present before committing. A caller may retry the same results on a
 //! refreshed dataset after a concurrent append or delete; a changed source owner
 //! or restored source rows require replanning. Tagged fragment reuse is not
@@ -96,9 +99,9 @@ use super::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
 use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
-    index_type_is_known, retain_committed_inverted_files, segment_has_inverted_details,
-    segment_has_merge_primitive, segment_has_vector_details, unsupported_index_version,
-    validate_segment_metadata,
+    index_is_usable, index_type_is_known, retain_committed_inverted_files,
+    segment_has_inverted_details, segment_has_merge_primitive, segment_has_vector_details,
+    unsupported_index_version, validate_segment_metadata,
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
@@ -220,6 +223,15 @@ pub(crate) fn optimizable_indices<'a>(
                  skipping its optimization",
                 name,
                 max_supported_version,
+            );
+            continue;
+        }
+        if let Some(index) = deltas.iter().find(|index| !index_is_usable(index)) {
+            log::warn!(
+                "Index {} has a segment with unsupported field dependencies {:?}; \
+                 skipping its optimization",
+                name,
+                index.dependency_fields(),
             );
             continue;
         }
@@ -588,7 +600,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
     };
     for (name, segments) in optimizable_indices(dataset, indices, options)? {
         let last = *segments.last().expect("an index has at least one segment");
-        if options.max_rows_to_consolidate.is_some() {
+        if consolidate::is_consolidation(options) {
             consolidate::plan_index(&mut plan, dataset, &segments, options, tagged).await?;
             continue;
         }
@@ -917,27 +929,56 @@ async fn plan_split_rebuild(
             "the column has too few rows to train the index",
         );
     }
+    let reference = train_model_segment(
+        dataset,
+        field_path,
+        last,
+        &params,
+        None,
+        options.progress.clone(),
+    )
+    .await?;
+    Ok(Some(SplitInputs {
+        reference,
+        fragments: dataset.fragments().as_ref().clone(),
+        absorbed: Vec::new(),
+        replaces: segments.iter().map(|segment| segment.uuid).collect(),
+    }))
+}
+
+/// Train a model for `segment`'s index, from `fragment_ids` or the whole
+/// table, and describe it as a segment outside the manifest that build tasks
+/// encode against.
+async fn train_model_segment(
+    dataset: &Dataset,
+    field_path: &str,
+    segment: &IndexMetadata,
+    params: &VectorIndexParams,
+    fragment_ids: Option<&[u32]>,
+    progress: Arc<dyn IndexBuildProgress>,
+) -> Result<IndexMetadata> {
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let built = build_vector_model_segment(
         dataset,
         field_path,
-        name,
+        &segment.name,
         uuid,
-        &params,
+        params,
         frag_reuse_index,
-        options.progress.clone(),
+        fragment_ids,
+        progress,
     )
     .await?;
-    let reference = IndexMetadata {
+    Ok(IndexMetadata {
         uuid,
-        name: name.to_string(),
-        fields: last.fields.clone(),
+        name: segment.name.clone(),
+        fields: segment.fields.clone(),
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
         index_details: Some(Arc::new(vector_index_details(
-            &params,
+            params,
             built.target_partition_size,
         ))),
         index_version: params.index_type().version(),
@@ -946,13 +987,7 @@ async fn plan_split_rebuild(
         files: Some(built.files),
         clustering_id: None,
         metadata: Default::default(),
-    };
-    Ok(Some(SplitInputs {
-        reference,
-        fragments: dataset.fragments().as_ref().clone(),
-        absorbed: Vec::new(),
-        replaces: segments.iter().map(|segment| segment.uuid).collect(),
-    }))
+    })
 }
 
 /// Drop the candidates a split merge cannot absorb. A segment with no live
@@ -1394,7 +1429,7 @@ pub async fn commit_optimize_indices(
     }
     let planned = dataset_at_version(dataset, read_version).await?;
     let mut results = results;
-    let read_version = if options.max_rows_to_consolidate.is_some() {
+    let read_version = if consolidate::is_consolidation(options) {
         consolidate::validate_commit(dataset, &planned, &mut results).await?;
         if results.is_empty() {
             return Ok(());
@@ -1403,7 +1438,7 @@ pub async fn commit_optimize_indices(
     } else {
         read_version
     };
-    let committed_segments = if options.max_rows_to_consolidate.is_some() {
+    let committed_segments = if consolidate::is_consolidation(options) {
         load_all_indices(dataset).await?
     } else {
         load_all_indices(&planned).await?

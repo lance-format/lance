@@ -10,10 +10,10 @@
 //! `dataset/tests/dataset_scanner_knn.rs` and
 //! `dataset/tests/dataset_scanner_segments.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::common::DFSchema;
@@ -50,6 +50,7 @@ use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::knn::warp::{WarpExec, WarpParams, warp_supports_segments};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
@@ -83,6 +84,13 @@ fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct VectorRefinement {
+    pub(super) column: String,
+    pub(super) key: ArrayRef,
+    pub(super) metric: MetricType,
+}
+
 impl Scanner {
     pub(super) async fn vector_search_source(
         &self,
@@ -102,7 +110,9 @@ impl Scanner {
             // If we are prefiltering then the ann / knn node will take care of the filter
             let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
                 Some(fts_query) => {
-                    let mut fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
+                    let mut fts_plan = self
+                        .fts(&filter_plan.expr_filter_plan, fts_query, fts_query.params())
+                        .await?;
                     if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
                         fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
                     }
@@ -144,6 +154,15 @@ impl Scanner {
             return Err(Error::invalid_input(
                 "Quantized refine factor cannot be zero".to_string(),
             ));
+        }
+
+        if let Some(refine) = &self.nearest_refine {
+            if self.is_batch_nearest {
+                return self.batch_per_query_vector_search(filter_plan, &q).await;
+            }
+            return self
+                .cross_column_vector_search(filter_plan, &q, refine)
+                .await;
         }
 
         // Sanity check
@@ -383,7 +402,7 @@ impl Scanner {
             // fragment, so sparse overlays incur near-zero overhead.
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let overlay_block = stale_rows.block_mask().await?;
 
             let ann_query = if self.quantized_refine_factor.is_some() {
                 let exact_factor = q.refine_factor.unwrap_or(1) as usize;
@@ -551,6 +570,49 @@ impl Scanner {
             }
             self.flat_knn(plan, &q).await
         }
+    }
+
+    async fn cross_column_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+        refine: &VectorRefinement,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let factor = q
+            .refine_factor
+            .filter(|factor| *factor > 0)
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    "refine_column requires an explicit positive refine_factor".to_string(),
+                )
+            })?;
+        let mut coarse = q.clone();
+        coarse.k = q.k.checked_mul(factor as usize).ok_or_else(|| {
+            Error::invalid_input("k * refine_factor overflows the candidate budget".to_string())
+        })?;
+        coarse.refine_factor = None;
+        // Bounds apply to the final distance space, not the coarse index.
+        coarse.lower_bound = None;
+        coarse.upper_bound = None;
+
+        let mut coarse_scanner = self.clone();
+        coarse_scanner.nearest_refine = None;
+        coarse_scanner.nearest = Some(coarse.clone());
+        // Merge indexed, appended, and updated rows before cross-column scoring.
+        let candidates = coarse_scanner.vector_search(filter_plan, &coarse).await?;
+        let projection = self
+            .dataset
+            .empty_projection()
+            .union_column(&refine.column, OnMissing::Error)?;
+        let candidates = self.take(candidates, projection)?;
+
+        let mut final_query = q.clone();
+        final_query.column = refine.column.clone();
+        final_query.key = refine.key.clone();
+        final_query.metric_type = Some(refine.metric);
+        final_query.refine_factor = None;
+        final_query.use_index = false;
+        self.flat_knn(candidates, &final_query).await
     }
 
     /// Whether a batch (multi-query) vector search can use the shared-scan
@@ -752,6 +814,14 @@ impl Scanner {
             };
         }
 
+        self.batch_per_query_vector_search(filter_plan, q).await
+    }
+
+    async fn batch_per_query_vector_search(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let query_dim = q.key.len() / self.nearest_query_count;
         let mut query_plans = Vec::with_capacity(self.nearest_query_count);
 
@@ -763,6 +833,12 @@ impl Scanner {
             single_scanner.nearest_query_count = 1;
             single_scanner.is_batch_nearest = false;
             single_scanner.nearest = Some(single_query.clone());
+            if let Some(refine) = &self.nearest_refine {
+                let refine_dim = refine.key.len() / self.nearest_query_count;
+                let mut single_refine = refine.clone();
+                single_refine.key = refine.key.slice(query_index * refine_dim, refine_dim);
+                single_scanner.nearest_refine = Some(single_refine);
+            }
 
             let single_plan = single_scanner
                 .vector_search(filter_plan, &single_query)
@@ -833,7 +909,7 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_rows: &HashMap<u32, RoaringBitmap>,
+        stale_rows: &IndexVisibility,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -936,7 +1012,8 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
+            let mut stale_node =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
@@ -1052,7 +1129,7 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, HashMap<u32, RoaringBitmap>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, IndexVisibility)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let stale_rows = self
             .overlay_stale_index_rows(index_expr, &fragments)

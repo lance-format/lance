@@ -11,8 +11,9 @@ use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ipc::writer::StreamWriter;
 use jni::JNIEnv;
-use jni::objects::{JObject, JString, JValue};
+use jni::objects::{JLongArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
+use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{ProjectionRequest, Version};
 use lance::table::format::Fragment;
@@ -590,6 +591,44 @@ pub extern "system" fn Java_org_lance_Dataset_nativeHasStableRowIds(
     java_dataset: JObject,
 ) -> jboolean {
     ok_or_throw_with_return!(env, inner_has_stable_row_ids(&mut env, java_dataset), 0u8)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetRowAddresses<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+    row_ids_obj: JObject, // List<Long>
+) -> JLongArray<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_row_addresses(&mut env, java_dataset, row_ids_obj),
+        unsafe { JLongArray::from_raw(std::ptr::null_mut()) }
+    )
+}
+
+/// Unresolved ids are returned as -1, which the Java side maps to null.
+fn inner_get_row_addresses<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+    row_ids_obj: JObject,
+) -> Result<JLongArray<'local>> {
+    let row_ids: Vec<u64> = env
+        .get_longs(&row_ids_obj)?
+        .into_iter()
+        .map(|id| id as u64)
+        .collect();
+    let addrs = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        block_on(row_ids_to_row_addrs(&dataset_guard.inner, &row_ids))?
+    };
+    let addrs: Vec<i64> = addrs
+        .into_iter()
+        .map(|addr| addr.map_or(-1, |addr| addr as i64))
+        .collect();
+    let arr = env.new_long_array(addrs.len() as i32)?;
+    env.set_long_array_region(&arr, 0, &addrs)?;
+    Ok(arr)
 }
 
 #[unsafe(no_mangle)]

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::Array;
-use arrow_array::{RecordBatch, RecordBatchReader, make_array};
+use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array, make_array};
 use arrow_cast::cast_with_options;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder, parse_cleanup_policy};
 use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::rowids::row_ids_to_row_addrs;
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
     MaterializationStyle, MultivectorAlgorithm, RowAddrMask,
@@ -785,6 +786,33 @@ impl Dataset {
         Ok(frag_reuse_index.map(|fri| PyArrowType(fri.remap_row_ids_array(array).to_data())))
     }
 
+    /// Look up the current row address of each row id. Null ids and ids that
+    /// aren't live in this version come back as null. Without stable row ids,
+    /// row ids are row addresses, so non-null ids are returned unchanged.
+    fn row_ids_to_row_addrs(
+        &self,
+        py: Python,
+        row_ids: PyArrowType<ArrayData>,
+    ) -> PyResult<PyArrowType<ArrayData>> {
+        let array = make_array(row_ids.0);
+        let row_ids = array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                PyValueError::new_err(format!("row ids must be uint64, got {}", array.data_type()))
+            })?;
+        let valid: Vec<u64> = row_ids.iter().flatten().collect();
+        let mut addrs = rt()
+            .block_on(Some(py), row_ids_to_row_addrs(self.ds.as_ref(), &valid))?
+            .infer_error()?
+            .into_iter();
+        let result: UInt64Array = row_ids
+            .iter()
+            .map(|id| id.and_then(|_| addrs.next().flatten()))
+            .collect();
+        Ok(PyArrowType(result.to_data()))
+    }
+
     fn serialized_manifest(&self, py: Python) -> Py<PyAny> {
         let manifest_bytes = self.ds.manifest().serialized();
         PyBytes::new(py, &manifest_bytes).into()
@@ -1194,7 +1222,7 @@ impl Dataset {
                     _ => None,
                 };
 
-            scanner
+            let scanner = scanner
                 .and_then(|s| {
                     let mut s = s.minimum_nprobes(minimum_nprobes);
                     if let Some(maximum_nprobes) = maximum_nprobes {
@@ -1228,6 +1256,27 @@ impl Dataset {
                     Ok(s)
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            let refine_column = nearest.get_item("refine_column")?.filter(|v| !v.is_none());
+            let refine_q = nearest.get_item("refine_q")?.filter(|v| !v.is_none());
+            let refine_metric = nearest.get_item("refine_metric")?.filter(|v| !v.is_none());
+            match (refine_column, refine_q, refine_metric) {
+                (None, None, None) => {}
+                (Some(column), Some(query), Some(metric)) => {
+                    let column: String = column.extract()?;
+                    let key = make_array(ArrayData::from_pyarrow_bound(&query)?);
+                    let metric: String = metric.extract()?;
+                    let metric = MetricType::try_from(metric.to_lowercase().as_str())
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                    scanner
+                        .with_refine_column(&column, key.as_ref(), metric)
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                }
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "refine_column, refine_q, and refine_metric must be provided together",
+                    ));
+                }
+            }
         }
         if let Some(orderings) = order_by {
             scanner

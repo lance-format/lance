@@ -45,13 +45,13 @@ use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
-use super::{AnnIndexMetrics, KNN_INDEX_SCHEMA, build_dataset_prefilter, prefilter_for_segment};
+use super::{AnnIndexMetrics, KNN_INDEX_SCHEMA, prefilter_for_segment};
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::ivf::IVFIndex;
 use crate::index::vector::ivf::v2::GLOBAL_TOPK_CHUNK_BYTES;
-use crate::io::exec::utils::{PreFilterMasks, PreFilterSource};
+use crate::io::exec::utils::{PreFilterMasks, PreFilterSource, build_prefilter};
 use crate::{Error, Result};
 
 /// WARPselect output for one index segment.
@@ -782,12 +782,12 @@ impl ExecutionPlan for WarpExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let pre_filter = build_dataset_prefilter(
+        let pre_filter = build_prefilter(
+            context,
+            partition,
+            &self.prefilter_source,
             self.dataset.clone(),
             &self.indices,
-            &self.prefilter_source,
-            partition,
-            context,
             PreFilterMasks {
                 overlay_block: self.overlay_block.clone(),
                 external_mask: self.external_mask.clone(),
