@@ -2500,6 +2500,8 @@ mod tests {
             let mut padded = vec![0_u32; 1024];
             padded[..values.len()].copy_from_slice(values);
             let mut packed = vec![12_u32; 1 + 384];
+            // SAFETY: `padded` holds 1024 values and `packed[1..]` exactly the 384 words that
+            // 1024 12-bit values take.
             unsafe { <u32 as BitPacking>::unchecked_pack(12, &padded, &mut packed[1..]) };
             let payload = bytemuck::cast_slice::<u32, u8>(&packed);
             let mut chunk = vec![0_u8; 2];

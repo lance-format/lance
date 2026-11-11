@@ -2002,11 +2002,13 @@ pub struct FilteredReadOptions {
     pub materialization_readahead_bytes: Option<u64>,
     /// If true, skip fragments that are not covered by the scalar index result.
     pub only_indexed_fragments: bool,
-    /// Row addresses whose index entries may be stale because an overlay committed after the
+    /// Row IDs whose index entries may be stale because an overlay committed after the
     /// index was built touches an indexed field. They are blocked from the index result so the
     /// index never emits them; the scanner re-evaluates just these rows against their current
     /// (overlay-merged) values on a targeted take path. Their fragments stay in the covered set,
-    /// so non-stale rows keep the index. `None` on the common no-overlay fast path.
+    /// so non-stale rows keep the index. This must be a block list in the index result's
+    /// identifier domain: stable row IDs on stable-ID datasets, physical addresses otherwise.
+    /// `None` on the common no-overlay fast path.
     pub overlay_block: Option<RowAddrMask>,
 }
 

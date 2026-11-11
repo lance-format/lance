@@ -94,7 +94,7 @@ impl BlobSource {
         if should_spawn {
             let source = self.clone();
             let scheduler = scheduler.clone();
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 let result = AssertUnwindSafe(source.clone().drain_pending_reads(scheduler))
                     .catch_unwind()
                     .await;
@@ -128,7 +128,7 @@ impl BlobSource {
                 std::mem::take(&mut pending_reads.requests)
             };
             let scheduler = scheduler.clone();
-            tokio::spawn(async move {
+            lance_core::utils::tokio::spawn(async move {
                 fulfill_pending_blob_reads(&scheduler, batch).await;
             });
         }

@@ -16,9 +16,9 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{FutureExt, future::BoxFuture};
+use lance_core::utils::tokio::JoinHandle;
 use lance_core::{Error, Result, cache::LanceCache, utils::parse::str_is_truthy};
 use log::trace;
-use tokio::task::JoinHandle;
 
 use crate::{
     EncodingsIo,
@@ -493,7 +493,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         let decoder_interest = Arc::new(());
 
         // Immediately spawn the indirect scheduling
-        let indirect_fut = tokio::spawn(indirect_schedule_task(
+        let indirect_fut = lance_core::utils::tokio::spawn(indirect_schedule_task(
             next_offsets_decoder,
             list_reqs,
             null_offset_adjustment,
@@ -1068,7 +1068,7 @@ impl ListOffsetsEncoder {
         let offset_arrays = arrays.iter().step_by(2).cloned().collect::<Vec<_>>();
         let validity_arrays = arrays.into_iter().skip(1).step_by(2).collect::<Vec<_>>();
 
-        tokio::task::spawn(async move {
+        lance_core::utils::tokio::spawn(async move {
             let num_rows =
                 offset_arrays.iter().map(|arr| arr.len()).sum::<usize>() - offset_arrays.len();
             let num_rows = num_rows as u64;
