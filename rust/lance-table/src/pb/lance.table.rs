@@ -350,10 +350,13 @@ impl ::prost::Name for FieldCoverage {
 }
 /// Deletion File
 ///
-/// Stored inline in the manifest when `inline` is set, at `{root}/{path}` when
-/// `path` is set, or derived from the owning fragment ID as:
+/// The path of the deletion file is `{root}/{path}` when `path` is set, or
+/// constructed as:
 ///    {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
-/// where {root} is the dataset root named by `base_id` (or this dataset when absent).
+/// where {extension} depends on DeletionFileType.
+///
+/// When `inline` is set there is no such file: the deletion vector lives in the
+/// manifest itself.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletionFile {
     /// Type of deletion file.
@@ -369,13 +372,9 @@ pub struct DeletionFile {
     /// The number of rows that are marked as deleted.
     #[prost(uint64, tag = "4")]
     pub num_deleted_rows: u64,
-    /// EXPERIMENTAL. Explicit path relative to {root}, formatted as
-    /// `_deletions/{uuid}.{extension}` (lowercase hyphenated UUID, extension
-    /// matching `file_type`). Cannot be set together with `inline`.
-    ///
-    /// Writers must use a new UUID for each file and never overwrite an existing
-    /// file. Readers must reject invalid paths without falling back to legacy
-    /// naming. Requires sticky feature flag `2^20` (`FLAG_UNSTABLE_DELETION_FILE_PATHS`)
+    /// Normalized relative path to the deletion file from the dataset root selected
+    /// by `base_id`, ending in `.arrow` or `.bin` to match `file_type`. Cannot be
+    /// set together with `inline`. Requires `FLAG_DELETION_FILE_PATHS` (1 << 21)
     /// in both reader and writer feature flags.
     #[prost(string, optional, tag = "5")]
     pub path: ::core::option::Option<::prost::alloc::string::String>,
