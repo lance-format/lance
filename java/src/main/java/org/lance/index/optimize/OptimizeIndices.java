@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  * OptimizeOptions#getMaxRowsPerSegment()} every index is one task: the single-process optimize over
  * all of its segments and all of its unindexed fragments, with the caller's options, and a merge
  * that passes the result through. With a bound set, an index whose kind can merge segments (vector,
- * BTree, Bitmap, BloomFilter, NGram, RTree, Inverted, LabelList) is split: tasks build one
+ * BTree, Bitmap, BloomFilter, NGram, RTree, Inverted, LabelList, ZoneMap) is split: tasks build one
  * uncommitted segment each over a group of fragments, and merges combine the task results of their
  * group with the committed segments they absorb into one segment. Other indices stay one task, and
  * an index a split build cannot handle is skipped with a warning unless {@link
@@ -56,6 +56,11 @@ import java.util.stream.Collectors;
  * <p>LabelList keeps old segments in the merge stage even when only one task builds new fragments.
  * Its segments must match the identifier domain written by the dataset; incompatible groups use one
  * unsplit task instead.
+ *
+ * <p>ZoneMap reuses compatible v1 segments and distributes rebuilding of v0 or incompatible
+ * segments without pending remaps. Pending remaps retain old segments and only index new data;
+ * tagged fragment reuse follows the same skip/error policy as other split indices. Fragments are
+ * indivisible.
  *
  * <p>An ordinary commit publishes every merged segment in one transaction anchored at the plan's
  * read version, so conflict detection covers everything committed since the plan was made. Results
