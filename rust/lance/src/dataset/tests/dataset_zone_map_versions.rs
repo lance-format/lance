@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, RecordBatchIterator,
-    UInt64Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -356,6 +356,37 @@ async fn test_version_0_float_segment_is_read_then_rebuilt() {
         v0.uuid,
         "a version 0 segment is usable"
     );
+
+    let zones = dataset
+        .statistics()
+        .zone_statistics(INDEX_NAME)
+        .await
+        .unwrap();
+    assert_eq!(
+        zones
+            .schema_ref()
+            .metadata()
+            .get("rows_per_zone")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert!(
+        zones
+            .schema_ref()
+            .field_with_name("negative_nan_count")
+            .unwrap()
+            .is_nullable()
+    );
+    let negative_nan_count = zones
+        .column_by_name("negative_nan_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert!(negative_nan_count.is_null(0));
+    assert_eq!(negative_nan_count.value(1), 0);
+    assert!(negative_nan_count.is_null(2));
+    assert_eq!(negative_nan_count.value(3), 0);
 
     // Version 0 contract: zones with NaNs carry the marker and an unknown
     // split, which keeps them as candidates; results are still exact after

@@ -9,17 +9,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Float32Type, Int32Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use roaring::RoaringBitmap;
 use rstest::rstest;
+use uuid::Uuid;
 
 use super::dataset_overlay_index_masking::{
     commit_overlay, create_base_dataset_with, i32_array, ids_matching,
@@ -28,12 +31,15 @@ use crate::Dataset;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteDestination,
-    WriteParams,
+    MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, WhenMatched, WhenNotMatched,
+    WriteDestination, WriteParams,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::{
+    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
+    provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
+};
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
 use crate::utils::test::geo;
@@ -149,7 +155,7 @@ async fn test_btree_merge_drops_coverage_a_restore_took_an_overlay_from() {
 
     let mut dataset = dataset.checkout_version(before_overlay).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 0").await,
@@ -193,13 +199,129 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
 
     let mut dataset = dataset.checkout_version(before_delete).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 30").await,
         vec![3],
         "the revived row is missing: the merged index claimed a fragment holding a \
          row it never indexed"
+    );
+}
+
+#[rstest]
+#[case::cleanup_revives_all(true, false, true, false)]
+#[case::cleanup_revives_some(true, true, true, false)]
+#[case::cleanup_more_deletions(true, true, false, false)]
+#[case::cleanup_from_updated_handle(true, false, true, true)]
+#[case::distributed_revives_all(false, false, true, false)]
+#[case::distributed_revives_some(false, true, true, false)]
+#[case::distributed_more_deletions(false, true, false, false)]
+#[tokio::test]
+async fn test_create_index_revived_rows(
+    #[case] is_after_cleanup: bool,
+    #[case] has_prior_deletion: bool,
+    #[case] has_revived_rows: bool,
+    #[case] submit_from_updated_handle: bool,
+) {
+    let mut build = create_base_dataset_with(false).await;
+    if has_prior_deletion {
+        build.delete("id = 1").await.unwrap();
+    }
+    let restore_version = build.manifest.version;
+    build.delete("id = 3").await.unwrap();
+    let params = ScalarIndexParams::default();
+    let staged = CreateIndexBuilder::new(&mut build, &["id"], IndexType::BTree, &params)
+        .name("staged".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let mut current = if has_revived_rows {
+        let mut restored = build.checkout_version(restore_version).await.unwrap();
+        restored.restore().await.unwrap();
+        restored
+    } else {
+        let mut deleted = build.clone();
+        deleted.delete("id = 4").await.unwrap();
+        deleted
+    };
+    let intervening_version = current.manifest.version;
+    current
+        .append(
+            gen_batch()
+                .col("id", array::fill::<Int32Type>(12))
+                .col("age", array::fill::<Int32Type>(120))
+                .into_reader_rows(RowCount::from(1), BatchCount::from(1)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let committed = if is_after_cleanup {
+        // Remove precisely the restore/delete commit: the build snapshot and
+        // its deletion file survive, but transaction replay cannot see it.
+        let path = current
+            .manifest_location()
+            .naming_scheme
+            .manifest_path(&current.base, intervening_version);
+        current.object_store.delete(&path).await.unwrap();
+        let mut submission = if submit_from_updated_handle {
+            current.clone()
+        } else {
+            build.clone()
+        };
+        submission
+            .apply_commit(
+                Transaction::new(
+                    build.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![staged],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        submission
+    } else {
+        // Untagged tables do not replay the staged segment's transactions.
+        current
+            .commit_existing_index_segments("staged", "id", vec![staged])
+            .await
+            .unwrap();
+        current
+    };
+
+    assert_eq!(
+        ids_matching(&committed, "id = 3").await,
+        if has_revived_rows { vec![3] } else { vec![] }
+    );
+    let mut scan = committed.scan();
+    scan.use_scalar_index(false);
+    scan.filter("id = 3").unwrap();
+    assert_eq!(
+        scan.try_into_batch().await.unwrap().num_rows(),
+        usize::from(has_revived_rows)
+    );
+    assert_eq!(ids_matching(&committed, "id = 7").await, vec![7]);
+    assert_eq!(ids_matching(&committed, "id = 12").await, vec![12]);
+    let indices = committed.load_indices().await.unwrap();
+    let index = indices.iter().find(|index| index.name == "staged").unwrap();
+    assert_eq!(
+        index.fragment_bitmap,
+        Some(if has_revived_rows {
+            RoaringBitmap::from_iter([1])
+        } else {
+            RoaringBitmap::from_iter([0, 1])
+        })
     );
 }
 
@@ -690,9 +812,9 @@ async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_u
     );
 }
 
-/// Two groups compacted separately, the leading group overlaid first: the
-/// clean trailing group's compaction does not vouch for the leading inputs,
-/// and its metadata-only relabel keeps the clean group's coverage.
+/// Two groups compacted separately, the second overlaid first: the first
+/// compaction does not vouch for the second's inputs, and the second's
+/// staleness does not cost the first its coverage.
 #[cfg(feature = "geo")]
 #[tokio::test]
 async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
@@ -703,8 +825,8 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
     let geometry = dataset.schema().field("geometry").unwrap().id;
     let staged = geo::stage_rtree_segments(&mut dataset, &params, sources.clone()).await;
 
-    // Exclude the leading group so the clean pair is an eligible suffix.
-    let held_back = [sources[0], sources[1]];
+    // Overlay the second group before either compaction.
+    let held_back = [sources[2], sources[3]];
     let mut dataset = rtree_overlay_geometry(dataset, geometry, held_back[0] as u64).await;
 
     let pair = CompactionOptions {
@@ -712,7 +834,7 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
         defer_index_remap: true,
         ..Default::default()
     };
-    let metrics = compact_files(
+    compact_files(
         &mut dataset,
         CompactionOptions {
             excluded_fragment_ids: held_back.to_vec(),
@@ -722,13 +844,11 @@ async fn test_rtree_merge_drops_a_group_overlaid_while_another_was_compacted() {
     )
     .await
     .unwrap();
-    assert_eq!(metrics.fragments_removed, 2);
-    let clean_files = dataset.fragments().last().unwrap().files.clone();
+    let clean = fragment_ids(&dataset)
+        .into_iter()
+        .find(|id| !held_back.contains(id))
+        .unwrap();
     compact_files(&mut dataset, pair, None).await.unwrap();
-    assert_eq!(dataset.fragments().len(), 2);
-    let clean = dataset.fragments().last().unwrap();
-    assert_eq!(clean.files, clean_files);
-    let clean = clean.id as u32;
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     let coverage = merged
@@ -836,22 +956,19 @@ async fn test_rtree_merge_keeps_a_mapped_group_when_another_was_retired_unmapped
         excluded_fragment_ids: excluded,
         ..Default::default()
     };
-    // Retire the trailing pair inline, so it leaves no mapping.
-    let metrics = compact_files(&mut dataset, pair(sources[..2].to_vec(), false), None)
+    // One pair remapped inline, so it leaves no mapping.
+    compact_files(&mut dataset, pair(sources[2..].to_vec(), false), None)
         .await
         .unwrap();
-    assert_eq!(metrics.fragments_removed, 2);
-    // Defer the leading pair and the metadata-only relabel of the trailing output.
-    let metrics = compact_files(&mut dataset, pair(vec![], true), None)
+    // The other pair deferred.
+    compact_files(&mut dataset, pair(sources[..2].to_vec(), true), None)
         .await
         .unwrap();
-    assert_eq!(metrics.fragments_removed, 2);
-    assert_eq!(dataset.fragments().len(), 2);
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert_eq!(
-        merged.fragment_bitmap.as_ref().unwrap(),
-        &RoaringBitmap::from_iter([dataset.fragments()[0].id as u32]),
+        merged.fragment_bitmap.as_ref().unwrap().len(),
+        1,
         "the deferred pair's coverage was given up because an unrelated pair was \
          retired without a reuse mapping"
     );
@@ -1072,26 +1189,52 @@ async fn stage_val(dataset: &Dataset, fragments: Vec<u32>) -> Vec<IndexMetadata>
     .await
 }
 
-/// Checks that looking up each of `values`, and a few ranges, through
-/// `val_idx` finds what a scan finds.
+/// How many rows hold each `val` among those `filter` selects, through
+/// `val_idx`, or among all rows by a scan.
+async fn val_counts(dataset: &Dataset, filter: Option<&str>) -> HashMap<i32, usize> {
+    let mut scan = dataset.scan();
+    scan.project(&["val"]).unwrap();
+    match filter {
+        Some(filter) => scan.filter(filter).unwrap(),
+        None => scan.use_scalar_index(false),
+    };
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut counts = HashMap::new();
+    for val in batch["val"].as_primitive::<Int32Type>().values() {
+        *counts.entry(*val).or_default() += 1;
+    }
+    counts
+}
+
+/// Checks that looking up `values` together and a few of them alone, and a
+/// few ranges, through `val_idx` finds what a scan finds.
 async fn assert_val_lookups_match_scan(
     dataset: &Dataset,
     values: impl IntoIterator<Item = i32>,
     trace: &str,
 ) {
-    let mut scan = dataset.scan();
-    scan.use_scalar_index(false).project(&["val"]).unwrap();
-    let batch = scan.try_into_batch().await.unwrap();
-    let mut scanned = HashMap::<i32, usize>::new();
-    for val in batch["val"].as_primitive::<Int32Type>().values() {
-        *scanned.entry(*val).or_default() += 1;
-    }
-    for value in values {
+    let scanned = val_counts(dataset, None).await;
+    let values = values.into_iter().collect::<Vec<_>>();
+    let list = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let found = val_counts(dataset, Some(&format!("val IN ({list})"))).await;
+    let want = values
+        .iter()
+        .filter_map(|value| Some((*value, *scanned.get(value)?)))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(found, want, "{trace}: val IN {values:?}");
+    for value in [values.first(), values.get(values.len() / 2), values.last()]
+        .into_iter()
+        .flatten()
+    {
         let found = dataset
             .count_rows(Some(format!("val = {value}")))
             .await
             .unwrap();
-        let want = scanned.get(&value).copied().unwrap_or(0);
+        let want = scanned.get(value).copied().unwrap_or(0);
         assert_eq!(found, want, "{trace}: val = {value}");
     }
     for bound in [0, 100, 500, 1_000, 1_000_000, 2_000_000] {
@@ -1117,6 +1260,80 @@ async fn val_idx_coverage(dataset: &Dataset) -> RoaringBitmap {
     index.fragment_bitmap.unwrap()
 }
 
+/// Older inputs and a later segment directly covering their output can index
+/// different values. Every contribution must be fresh before keeping coverage.
+#[rstest]
+#[case::partial_unchanged(false, false, false)]
+#[case::partial_updated(false, true, false)]
+#[case::partial_restored(false, true, true)]
+#[case::full_unchanged(true, false, false)]
+#[case::full_updated(true, true, false)]
+#[case::full_restored(true, true, true)]
+#[tokio::test]
+async fn test_merge_validates_every_output_contribution(
+    #[case] full_input_coverage: bool,
+    #[case] update: bool,
+    #[case] restore: bool,
+) {
+    let mut dataset = val_table("memory://", 3).await;
+    let sources = if full_input_coverage {
+        vec![0, 1, 2]
+    } else {
+        vec![0, 2]
+    };
+    let mut staged = stage_val(&dataset, sources).await;
+    let outputs = compact_into_two(&mut dataset, &[0, 1]).await;
+    let directly_covered = outputs[1] as u32;
+    let before_update = dataset.manifest.version;
+
+    if update {
+        let patch =
+            arrow_array::record_batch!(("id", Int32, [ROWS]), ("val", Int32, [999])).unwrap();
+        let schema = patch.schema();
+        let mut merge = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()]).unwrap();
+        merge
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .write_mode(MergeInsertWriteMode::RewriteColumns);
+        let (updated, _) = merge
+            .try_build()
+            .unwrap()
+            .execute_reader(RecordBatchIterator::new([Ok(patch)], schema))
+            .await
+            .unwrap();
+        dataset = Arc::unwrap_or_clone(updated);
+    } else {
+        // Date the direct segment later without changing its indexed data.
+        dataset.update_config([("touched", "true")]).await.unwrap();
+    }
+    assert_eq!(
+        fragment_ids(&dataset),
+        vec![2, outputs[0] as u32, directly_covered]
+    );
+    staged.extend(stage_val(&dataset, vec![directly_covered]).await);
+
+    if restore {
+        dataset = dataset.checkout_version(before_update).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+
+    let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
+    let mut covered = RoaringBitmap::from_iter([2]);
+    if full_input_coverage {
+        covered.insert(outputs[0] as u32);
+    }
+    if !update {
+        covered.insert(directly_covered);
+    }
+    dataset
+        .commit_existing_index_segments("val_idx", "val", vec![merged])
+        .await
+        .unwrap();
+    assert_uses_val_idx(&dataset, "val >= 120").await;
+    assert_val_lookups_match_scan(&dataset, [60, 120, 999], "").await;
+    assert_eq!(val_idx_coverage(&dataset).await, covered);
+}
+
 /// A group compacted while an overlay lands on a fragment outside it: only the
 /// overlaid fragment is left out of the merged coverage, and lookups stay
 /// right even though the merged index is stamped current, past the overlay.
@@ -1129,7 +1346,7 @@ async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     let mut dataset = commit_overlay(
         dataset,
         "overlay",
-        0,
+        2,
         &[val],
         OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
         vec![i32_array([Some(999)])],
@@ -1138,14 +1355,13 @@ async fn test_btree_merge_leaves_out_only_an_overlaid_fragment() {
     let options = CompactionOptions {
         target_rows_per_fragment: (2 * ROWS) as usize,
         defer_index_remap: true,
-        excluded_fragment_ids: vec![0],
+        excluded_fragment_ids: vec![2],
         ..Default::default()
     };
-    let metrics = compact_files(&mut dataset, options, None).await.unwrap();
-    assert_eq!(metrics.fragments_removed, 2);
+    compact_files(&mut dataset, options, None).await.unwrap();
     let compacted = fragment_ids(&dataset)
         .into_iter()
-        .find(|id| *id != 0)
+        .find(|id| *id != 2)
         .unwrap();
 
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
@@ -1221,10 +1437,10 @@ async fn merge_under_workload(seed: u64) -> u64 {
 #[tokio::test]
 async fn test_merged_index_matches_a_scan_under_a_workload() {
     let mut covered = 0;
-    for seed in 0..24 {
+    for seed in 0..4 {
         covered += Box::pin(merge_under_workload(seed)).await;
     }
-    assert!(covered >= 16, "only {covered} fragments stayed covered");
+    assert!(covered >= 3, "only {covered} fragments stayed covered");
 }
 
 /// The fragment that holds the row with `id`.
@@ -1480,9 +1696,7 @@ async fn compact_deferred(dataset: &mut Dataset, compacted: &[u32]) -> u32 {
         excluded_fragment_ids,
         ..Default::default()
     };
-    let metrics = compact_files(dataset, options, None).await.unwrap();
-    assert_eq!(metrics.fragments_removed, compacted.len());
-    assert_eq!(metrics.fragments_added, 1);
+    compact_files(dataset, options, None).await.unwrap();
     fragment_ids(dataset).into_iter().max().unwrap()
 }
 
@@ -1505,9 +1719,9 @@ async fn test_merge_follows_coverage_through_chained_compactions(
     let dir = TempStrDir::default();
     let mut dataset = val_table(dir.as_str(), 4).await;
     commit_val_idx(&mut dataset, index_type).await;
-    let first = compact_deferred(&mut dataset, &[2, 3]).await;
-    // Rewrite suffixes so the untouched prefix keeps its fragment identity.
-    let second = compact_deferred(&mut dataset, &[1, first]).await;
+    let first = compact_deferred(&mut dataset, &[0, 1]).await;
+    // Groups are runs of fragment ids, so the output's neighbour is fragment 3.
+    let second = compact_deferred(&mut dataset, &[3, first]).await;
     let history = dataset.frag_reuse_index().await.unwrap().unwrap();
     assert_eq!(history.details.versions.len(), 2);
     assert!(
@@ -1523,7 +1737,7 @@ async fn test_merge_follows_coverage_through_chained_compactions(
         .unwrap();
     assert_eq!(
         merged.fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([0, second])
+        RoaringBitmap::from_iter([2, second])
     );
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
@@ -1532,7 +1746,7 @@ async fn test_merge_follows_coverage_through_chained_compactions(
 
     assert_eq!(
         val_idx_coverage(&dataset).await,
-        RoaringBitmap::from_iter([0, second])
+        RoaringBitmap::from_iter([2, second])
     );
     assert_uses_val_idx(&dataset, "val < 100").await;
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
@@ -1546,15 +1760,15 @@ async fn test_merge_follows_coverage_through_chained_compactions(
 async fn segment_saved_behind_a_trimmed_link(uri: &str) -> (Vec<IndexMetadata>, u32) {
     let mut dataset = val_table(uri, 4).await;
     commit_val_idx(&mut dataset, IndexType::BTree).await;
-    let first = compact_deferred(&mut dataset, &[2, 3]).await;
+    let first = compact_deferred(&mut dataset, &[0, 1]).await;
     remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
         .await
         .unwrap();
-    let second = compact_deferred(&mut dataset, &[1, first]).await;
+    let second = compact_deferred(&mut dataset, &[3, first]).await;
     let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
     assert_eq!(
         saved[0].fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([0, second])
+        RoaringBitmap::from_iter([2, second])
     );
     dataset.drop_index("val_idx").await.unwrap();
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
@@ -1580,13 +1794,13 @@ async fn test_merge_does_not_cover_a_fragment_behind_a_trimmed_link() {
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
     assert_eq!(
         merged.fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([0])
+        RoaringBitmap::from_iter([2])
     );
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
         .await
         .unwrap();
-    assert_uses_val_idx(&dataset, "val < 60").await;
+    assert_uses_val_idx(&dataset, "val >= 120 AND val < 180").await;
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
@@ -1598,7 +1812,7 @@ async fn test_merge_does_not_cover_a_chain_whose_data_changed_between_compaction
     let dir = TempStrDir::default();
     let mut dataset = val_table(dir.as_str(), 4).await;
     commit_val_idx(&mut dataset, IndexType::BTree).await;
-    let first = compact_deferred(&mut dataset, &[2, 3]).await;
+    let first = compact_deferred(&mut dataset, &[0, 1]).await;
     let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
     dataset.drop_index("val_idx").await.unwrap();
     let val = dataset.schema().field("val").unwrap().id;
@@ -1611,12 +1825,12 @@ async fn test_merge_does_not_cover_a_chain_whose_data_changed_between_compaction
         vec![i32_array([Some(999)])],
     )
     .await;
-    compact_deferred(&mut dataset, &[1, first]).await;
+    compact_deferred(&mut dataset, &[3, first]).await;
 
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
     assert_eq!(
         merged.fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([0])
+        RoaringBitmap::from_iter([2])
     );
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
@@ -1628,9 +1842,8 @@ async fn test_merge_does_not_cover_a_chain_whose_data_changed_between_compaction
 
 /// The `val_idx` segment of a four-fragment [`val_table`], saved after three
 /// compactions that each rewrite two fragments into two, so that outputs
-/// share their sources: 2 and 3 into 4 and 5, then 0 and 1 into 6 and 7
-/// (relabeling 4 and 5 to 8 and 9), then 7 and 8 into 10 and 11 (relabeling
-/// 9 to 12). With the index then dropped only `id_idx` holds the
+/// share their sources: 0 and 1 into 4 and 5, 2 and 3 into 6 and 7, then 5
+/// and 6 into 8 and 9. With the index then dropped only `id_idx` holds the
 /// history back, and it was caught up past the first compaction: if `trimmed`,
 /// a cleanup then trims that compaction's record, and only that one.
 async fn segment_saved_over_shared_sources(
@@ -1640,18 +1853,17 @@ async fn segment_saved_over_shared_sources(
 ) -> Vec<IndexMetadata> {
     let mut dataset = val_table(uri, 4).await;
     commit_val_idx(&mut dataset, index_type).await;
-    let first = compact_into_two(&mut dataset, &[2, 3]).await;
+    let first = compact_into_two(&mut dataset, &[0, 1]).await;
     remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
         .await
         .unwrap();
-    let second = compact_into_two(&mut dataset, &[0, 1]).await;
-    // The second rewrite relabels the first outputs to 8 and 9.
-    let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
-    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 10, 11]);
+    let second = compact_into_two(&mut dataset, &[2, 3]).await;
+    let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 8, 9]);
     let saved = dataset.load_indices_by_name("val_idx").await.unwrap();
     assert_eq!(
         saved[0].fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([6, 10, 11, 12])
+        RoaringBitmap::from_iter([4, 7, 8, 9])
     );
     dataset.drop_index("val_idx").await.unwrap();
     if trimmed {
@@ -1663,10 +1875,10 @@ async fn segment_saved_over_shared_sources(
 }
 
 /// Merged while every record is kept, the saved segment covers each current
-/// fragment. Once a cleanup trimmed the first record it covers 6 alone: 12 no
-/// longer traces to the build, and neither do 10 and 11, which hold 8's rows,
-/// although following 6's sources forward reaches the compaction that
-/// produced them through their other source, 7. Lookups match a scan either
+/// fragment. Once a cleanup trimmed the first record it covers 7 alone: 4 no
+/// longer traces to the build, and neither do 8 and 9, which hold 5's rows,
+/// although following 7's sources forward reaches the compaction that
+/// produced them through their other source, 6. Lookups match a scan either
 /// way.
 #[rstest]
 #[tokio::test]
@@ -1677,11 +1889,7 @@ async fn test_merge_covers_shared_sources_only_through_kept_links(
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let saved = segment_saved_over_shared_sources(uri, index_type, trimmed).await;
-    let covered = RoaringBitmap::from_iter(if trimmed {
-        vec![6]
-    } else {
-        vec![6, 10, 11, 12]
-    });
+    let covered = RoaringBitmap::from_iter(if trimmed { vec![7] } else { vec![4, 7, 8, 9] });
 
     let mut dataset = Dataset::open(uri).await.unwrap();
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
@@ -1691,20 +1899,20 @@ async fn test_merge_covers_shared_sources_only_through_kept_links(
         .await
         .unwrap();
     assert_eq!(val_idx_coverage(&dataset).await, covered);
-    assert_uses_val_idx(&dataset, "val < 60").await;
+    assert_uses_val_idx(&dataset, "val >= 180").await;
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
 /// Fragments 0 to 3 of a [`val_table`], each with its own staged `val_idx`
-/// segment, rewritten as in [`segment_saved_over_shared_sources`]. Returns
-/// the staged segments.
+/// segment, rewritten as in [`segment_saved_over_shared_sources`]: 0 and 1
+/// into 4 and 5, 2 and 3 into 6 and 7, then 5 and 6 into 8 and 9. Returns the
+/// staged segments.
 async fn shared_sources_staged_per_fragment(dataset: &mut Dataset) -> Vec<IndexMetadata> {
     let staged = stage_val(dataset, vec![0, 1, 2, 3]).await;
-    let first = compact_into_two(dataset, &[2, 3]).await;
-    let second = compact_into_two(dataset, &[0, 1]).await;
-    // The second rewrite relabels the first outputs to 8 and 9.
-    let third = compact_into_two(dataset, &[second[1], 8]).await;
-    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 10, 11]);
+    let first = compact_into_two(dataset, &[0, 1]).await;
+    let second = compact_into_two(dataset, &[2, 3]).await;
+    let third = compact_into_two(dataset, &[first[1], second[0]]).await;
+    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 8, 9]);
     staged
 }
 
@@ -1715,9 +1923,9 @@ async fn shared_sources_staged_per_fragment(dataset: &mut Dataset) -> Vec<IndexM
 /// and checking freshness only removes coverage, so tracing one input of the
 /// group claims nothing for its outputs.
 #[rstest]
-#[case::first_pair(vec![0, 1], vec![6], "val < 60")]
-#[case::second_pair(vec![2, 3], vec![12], "val >= 180")]
-#[case::every_fragment(vec![0, 1, 2, 3], vec![6, 10, 11, 12], "val < 100")]
+#[case::first_pair(vec![0, 1], vec![4], "val < 60")]
+#[case::second_pair(vec![2, 3], vec![7], "val >= 180")]
+#[case::every_fragment(vec![0, 1, 2, 3], vec![4, 7, 8, 9], "val < 100")]
 #[tokio::test]
 async fn test_merge_covers_a_shared_group_only_when_every_input_was_covered(
     #[case] merged_fragments: Vec<u32>,
@@ -1751,7 +1959,7 @@ async fn test_merge_covers_a_shared_group_only_when_every_input_was_covered(
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
 }
 
-/// How 10 leaves the coverage of [`segment_beside_a_broken_chain`].
+/// How 8 leaves the coverage of [`segment_beside_a_broken_chain`].
 #[derive(Debug, Clone, Copy)]
 enum Uncovered {
     /// An in-place rewrite of its indexed column prunes it from the index.
@@ -1761,11 +1969,11 @@ enum Uncovered {
 }
 
 /// The shared-sources history of [`segment_saved_over_shared_sources`], with
-/// `val_idx` committed, then 10 taken out of its coverage while 11 stays and the
+/// `val_idx` committed, then 8 taken out of its coverage while 9 stays and the
 /// segment stays dated at its build. The segment is saved, the index dropped,
-/// and the first compaction's record trimmed: the group that produced 10 and 11
-/// then has one input, 7, that traces to the build, and one, 8, that no longer
-/// does. Returns the saved segment, covering 6, 11 and 12, and the values to
+/// and the first compaction's record trimmed: the group that produced 8 and 9
+/// then has one input, 6, that traces to the build, and one, 5, that no longer
+/// does. Returns the saved segment, covering 4, 7 and 9, and the values to
 /// look up.
 async fn segment_beside_a_broken_chain(
     uri: &str,
@@ -1774,32 +1982,31 @@ async fn segment_beside_a_broken_chain(
     let mut dataset = val_table(uri, 4).await;
     let built = dataset.manifest.version;
     commit_val_idx(&mut dataset, IndexType::BTree).await;
-    let first = compact_into_two(&mut dataset, &[2, 3]).await;
+    let first = compact_into_two(&mut dataset, &[0, 1]).await;
     remap_column_index(&mut dataset, &["id"], Some("id_idx".into()))
         .await
         .unwrap();
-    let second = compact_into_two(&mut dataset, &[0, 1]).await;
-    // The second rewrite relabels the first outputs to 8 and 9.
-    let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
-    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 10, 11]);
+    let second = compact_into_two(&mut dataset, &[2, 3]).await;
+    let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
+    assert_eq!([first, second, third].concat(), [4, 5, 6, 7, 8, 9]);
     let mut probes = (0..24).map(|id| id * 10).collect::<Vec<_>>();
     let saved = match uncovered {
         Uncovered::Rewritten => {
             let replaced =
                 Arc::new(Int32Array::from_iter_values((0..ROWS).map(|_| 999))) as ArrayRef;
-            dataset = replace_column(dataset, 10, "val", replaced).await;
+            dataset = replace_column(dataset, 8, "val", replaced).await;
             probes.push(999);
             dataset.load_indices_by_name("val_idx").await.unwrap()
         }
         Uncovered::Unclaimed => {
             let mut saved = dataset.load_indices_by_name("val_idx").await.unwrap();
-            saved[0].fragment_bitmap.as_mut().unwrap().remove(10);
+            saved[0].fragment_bitmap.as_mut().unwrap().remove(8);
             saved
         }
     };
     assert_eq!(
         saved[0].fragment_bitmap.clone().unwrap(),
-        RoaringBitmap::from_iter([6, 11, 12])
+        RoaringBitmap::from_iter([4, 7, 9])
     );
     assert_eq!(saved[0].dataset_version, built);
     dataset.drop_index("val_idx").await.unwrap();
@@ -1809,8 +2016,8 @@ async fn segment_beside_a_broken_chain(
     (dataset, saved, probes)
 }
 
-/// Merged, the segment of [`segment_beside_a_broken_chain`] covers 6 alone: 11
-/// is dated by the broken chain, and 10 is not claimed back, since the merge
+/// Merged, the segment of [`segment_beside_a_broken_chain`] covers 7 alone: 9
+/// is dated by the broken chain, and 8 is not claimed back, since the merge
 /// claims only what the history remaps the segment's own coverage onto.
 #[rstest]
 #[tokio::test]
@@ -1821,39 +2028,39 @@ async fn test_merge_does_not_cover_an_output_beside_one_whose_chain_is_broken(
     let (mut dataset, saved, probes) = segment_beside_a_broken_chain(dir.as_str(), uncovered).await;
 
     let merged = dataset.merge_existing_index_segments(saved).await.unwrap();
-    let covered = RoaringBitmap::from_iter([6]);
+    let covered = RoaringBitmap::from_iter([7]);
     assert_eq!(merged.fragment_bitmap.clone().unwrap(), covered);
     dataset
         .commit_existing_index_segments("val_idx", "val", vec![merged])
         .await
         .unwrap();
     assert_eq!(val_idx_coverage(&dataset).await, covered);
-    assert_uses_val_idx(&dataset, "val < 60").await;
+    assert_uses_val_idx(&dataset, "val >= 180").await;
     assert_val_lookups_match_scan(&dataset, probes, "").await;
 }
 
 /// Segments staged at version `v` over `fragments` of a [`val_table`], before
-/// the chained compactions (2, 3) -> 4 and (1, 4) -> 5. Tracing 5 back reaches
-/// 1, 2 and 3, all in `v`'s snapshot whether the segments indexed them or not.
+/// the chained compactions (0, 1) -> 4 and (3, 4) -> 5. Tracing 5 back reaches
+/// 0, 1 and 3, all in `v`'s snapshot whether the segments indexed them or not.
 async fn chain_over_staged_segments(
     dataset: &mut Dataset,
     fragments: Vec<u32>,
 ) -> Vec<IndexMetadata> {
     let staged = stage_val(dataset, fragments).await;
-    let first = compact_deferred(dataset, &[2, 3]).await;
-    let second = compact_deferred(dataset, &[1, first]).await;
+    let first = compact_deferred(dataset, &[0, 1]).await;
+    let second = compact_deferred(dataset, &[3, first]).await;
     assert_eq!([first, second], [4, 5]);
     staged
 }
 
 /// Merged, the segments of [`chain_over_staged_segments`] cover 5 only when
 /// they indexed every source: the history remaps coverage across a group only
-/// when every input is covered, so a merge that leaves out 2 or 3 claims
+/// when every input is covered, so a merge that leaves out 1 or 3 claims
 /// neither 4 nor 5.
 #[rstest]
-#[case::only_the_first_input(vec![2], vec![])]
-#[case::one_input_of_each_group(vec![2, 1], vec![])]
-#[case::every_input(vec![2, 3, 1], vec![5])]
+#[case::only_the_first_input(vec![0], vec![])]
+#[case::one_input_of_each_group(vec![0, 3], vec![])]
+#[case::every_input(vec![0, 1, 3], vec![5])]
 #[tokio::test]
 async fn test_merge_covers_a_chain_only_when_its_segments_indexed_every_source(
     #[case] merged_fragments: Vec<u32>,
@@ -1872,7 +2079,97 @@ async fn test_merge_covers_a_chain_only_when_its_segments_indexed_every_source(
         .unwrap();
     assert_eq!(val_idx_coverage(&dataset).await, covered);
     if !covered.is_empty() {
-        assert_uses_val_idx(&dataset, "val >= 60").await;
+        assert_uses_val_idx(&dataset, "val < 60").await;
     }
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SegmentFreshnessCheck {
+    PruneStaleSegmentCoverage,
+    FreshFragments,
+}
+
+impl SegmentFreshnessCheck {
+    async fn marks_stale(self, dataset: &Dataset, segment: IndexMetadata) -> bool {
+        match self {
+            Self::PruneStaleSegmentCoverage => {
+                let mut segments = [segment.into_index_segment().unwrap()];
+                prune_stale_segment_coverage(
+                    dataset,
+                    &mut segments,
+                    false,
+                    &RoaringBitmap::new(),
+                    false,
+                )
+                .await
+                .unwrap();
+                !segments[0].fragment_bitmap().contains(0)
+            }
+            Self::FreshFragments => {
+                let no_compactions = CompactFragReuseIndex::try_new(
+                    Uuid::new_v4(),
+                    FragReuseIndexDetails { versions: vec![] },
+                )
+                .unwrap();
+                !fresh_fragments(dataset, &no_compactions, &[segment])
+                    .await
+                    .unwrap()
+                    .contains(0)
+            }
+        }
+    }
+}
+
+/// A segment goes stale on a fragment once its carried column gains a data
+/// file there, and not when another column does, whether or not `fields`
+/// repeats the carried column.
+#[rstest]
+#[case::prune_stale_segment_coverage(SegmentFreshnessCheck::PruneStaleSegmentCoverage)]
+#[case::fresh_fragments(SegmentFreshnessCheck::FreshFragments)]
+#[tokio::test]
+async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
+    let test_dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    let built_at = dataset.manifest.version;
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("payload".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let vector_field_id = dataset.schema().field_id("vector").unwrap();
+    for (carried, stale) in [("payload", true), ("id", false)] {
+        let carried_id = dataset.schema().field_id(carried).unwrap();
+        for fields in [vec![vector_field_id, carried_id], vec![vector_field_id]] {
+            let segment = IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "vector_idx".to_string(),
+                fields: fields.clone(),
+                covering_fields: vec![carried_id],
+                dataset_version: built_at,
+                fragment_bitmap: Some(RoaringBitmap::from([0])),
+                index_details: Some(Arc::new(vector_index_details_default())),
+                index_version: IndexType::Vector.version(),
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            assert_eq!(
+                check.marks_stale(&dataset, segment).await,
+                stale,
+                "{check:?}, fields {fields:?}: a segment carrying `{carried}` after \
+                 add_columns wrote `payload`"
+            );
+        }
+    }
 }

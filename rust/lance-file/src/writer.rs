@@ -188,6 +188,16 @@ impl FileWriter {
         }
     }
 
+    /// Mark the next batch as ending the current file page.
+    pub fn prepare_for_flush(&mut self) {
+        match self {
+            Self::V2_0(writer) => writer.prepare_for_flush(),
+            Self::V2_1(writer) => writer.prepare_for_flush(),
+            Self::V2_2(writer) => writer.prepare_for_flush(),
+            Self::V2_3(writer) => writer.prepare_for_flush(),
+        }
+    }
+
     /// Write one top-level column.
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         match self {

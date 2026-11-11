@@ -1,21 +1,68 @@
 # Read and Write Data
 
+Lance datasets exchange Apache Arrow batches across the Python (`pylance`), Rust (`lance`), and Java (`org.lance:lance-core`) SDKs. The core read, write, mutation, and maintenance workflows below include examples for all three languages.
+
 ## Writing Lance Dataset
 
-If you're familiar with [Apache PyArrow](https://arrow.apache.org/docs/python/getstarted.html), you'll find that creating a Lance dataset is straightforward.
-Begin by writing a `pyarrow.Table` using the `lance.write_dataset` function.
+Create a new Lance dataset from an Arrow table or record batch reader:
 
-```python
-import lance
-import pyarrow as pa
+=== "Python"
 
-table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
-                              {"name": "Bob", "age": 30}])
-ds = lance.write_dataset(table, "./alice_and_bob.lance")
-```
+    ```python
+    import lance
+    import pyarrow as pa
 
-If the dataset is too large to fully load into memory, you can stream data using `lance.write_dataset`
-also supports `Iterator` of `pyarrow.RecordBatch` es.
+    table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                                  {"name": "Bob", "age": 30}])
+    ds = lance.write_dataset(table, "./alice_and_bob.lance")
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::Dataset;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            Arc::new(Int32Array::from(vec![20, 30])),
+        ],
+    )?;
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let ds = Dataset::write(reader, "./alice_and_bob.lance", None).await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.memory.BufferAllocator;
+    import org.apache.arrow.memory.RootAllocator;
+    import org.apache.arrow.vector.ipc.ArrowReader;
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset ds =
+            Dataset.write()
+                .allocator(allocator)
+                .reader(reader) // ArrowReader supplying (name: Utf8, age: Int32) batches
+                .uri("./alice_and_bob.lance")
+                .mode(WriteParams.WriteMode.CREATE)
+                .execute()) {
+      System.out.println("Rows written: " + ds.countRows());
+    }
+    ```
+
+If the dataset is too large to fully load into memory, `lance.write_dataset`
+also supports streaming an `Iterator` of `pyarrow.RecordBatch`es.
 You will need to provide a `pyarrow.Schema` for the dataset in this case.
 
 ```python
@@ -40,146 +87,190 @@ print(ds.count_rows())  # Output: 2
 `lance.write_dataset` supports writing `pyarrow.Table`, `pandas.DataFrame`,
 `pyarrow.dataset.Dataset`, and `Iterator[pyarrow.RecordBatch]`.
 
-## Choosing a data file version
-
-`data_storage_version` selects the format of newly written data files. For an
-existing V2 dataset, an operation can select `"2.0"`, `"2.1"`, `"2.2"`, or `"2.3"`
-without rewriting the other files. The dataset's `data_storage_version` property
-is the default for writes that omit a target, not a summary of its existing
-files. Create and overwrite establish this default; append, update, merge-insert,
-and compaction do not change it. V1 and V2 cannot be mixed.
-
-```python
-import lance
-import pyarrow as pa
-
-data = pa.table({"id": [1, 2], "value": [10, 20]})
-ds = lance.write_dataset(data, "./versions.lance", data_storage_version="2.1")
-ds.update({"value": "value + 1"}, data_storage_version="2.2")
-assert ds.data_storage_version == "2.1"
-
-ds.merge_insert("id").when_not_matched_insert_all().data_storage_version("2.2").execute(
-    pa.table({"id": [3], "value": [30]})
-)
-ds.optimize.compact_files(data_storage_version="2.2")
-```
-
-The `"stable"` and `"next"` selectors resolve according to the engine release.
-Use exact versions when the output identity must be independent of that release.
-V2.3 is currently unstable: files written by one unstable revision may not be
-readable by a later revision. Use it only for experimentation.
-Compaction plans fix the target before distributing tasks, including when the
-target comes from the dataset default. The target survives Python pickle and
-Java serialization; workers do not reinterpret it using their own release defaults.
-
-Java update, merge-insert, and compaction options use
-`withDataStorageVersion(DataStorageVersion.V2_2)`. The shared `DataStorageVersion`
-enum also provides `STABLE` and `NEXT` selectors.
-
-Compaction can convert selected fragments to another supported V2 version.
-Binary copy requires every selected file to match the output version, as well
-as the usual eligibility checks. In particular, overlays need reencoding to
-preserve updated values. `try_binary_copy` falls back to reencoding when inputs
-are ineligible; `force_binary_copy` rejects them. A version mismatch error includes
-the target version, actual version, and file path. A persistent compaction target
-can be set through `lance.compaction.data_storage_version` in the table config;
-an explicit operation target takes precedence.
-
-### Upgrading clients before mixed-version writes
-
-Before writing files that differ from the dataset default, upgrade every reader
-and writer to a mixed-version-aware release. Drain, restart, or fence writers
-that opened the dataset using an older release. The commit automatically sets
-the paired mixed-version reader/writer feature flags when needed; there is no
-separate activation API. These flags remain set even if compaction later makes
-the files homogeneous again.
-
-Older clients that do not recognize the flags reject the resulting snapshots.
-The flags cannot retroactively fence an older writer that already read a prior
-manifest. Historical homogeneous datasets remain readable by clients that
-support their file versions; see [table versioning](../format/table/versioning.md)
-for the feature flag contract.
-
 ## Adding Rows
 
-To insert data into your dataset, you can use either `LanceDataset.insert`
-or `lance.write_dataset` with `mode=append`.
+Append new batches to an existing dataset without rewriting existing fragments:
 
-```python
-import lance
-import pyarrow as pa
+=== "Python"
 
-table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
-                              {"name": "Bob", "age": 30}])
-ds = lance.write_dataset(table, "./insert_example.lance")
+    ```python
+    import lance
+    import pyarrow as pa
 
-new_table = pa.Table.from_pylist([{"name": "Carla", "age": 37}])
-ds.insert(new_table)
-print(ds.to_table().to_pandas())
-#     name  age
-# 0  Alice   20
-# 1    Bob   30
-# 2  Carla   37
+    table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                                  {"name": "Bob", "age": 30}])
+    ds = lance.write_dataset(table, "./insert_example.lance")
 
-new_table2 = pa.Table.from_pylist([{"name": "David", "age": 42}])
-ds = lance.write_dataset(new_table2, ds, mode="append")
-print(ds.to_table().to_pandas())
-#     name  age
-# 0  Alice   20
-# 1    Bob   30
-# 2  Carla   37
-# 3  David   42
-```
+    new_table = pa.Table.from_pylist([{"name": "Carla", "age": 37}])
+    ds.insert(new_table)
+
+    new_table2 = pa.Table.from_pylist([{"name": "David", "age": 42}])
+    ds = lance.write_dataset(new_table2, ds, mode="append")
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use lance::Dataset;
+
+    let mut ds = Dataset::open("./alice_and_bob.lance").await?;
+    let arrow_schema = Arc::new(arrow_schema::Schema::from(ds.schema()));
+    let new_batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["Carla"])),
+            Arc::new(Int32Array::from(vec![37])),
+        ],
+    )?;
+    ds.append(RecordBatchIterator::new(vec![Ok(new_batch)], arrow_schema), None)
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+
+    try (Dataset ds =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(newBatchReader)
+            .uri("./alice_and_bob.lance")
+            .mode(WriteParams.WriteMode.APPEND)
+            .execute()) {
+      System.out.println("Total rows: " + ds.countRows());
+    }
+    ```
 
 ## Deleting rows
 
 Lance supports deleting rows from a dataset using a SQL filter, as described in [Filter push-down](#filter-push-down).
 For example, to delete Bob's row from the dataset above, one could use:
 
-```python
-import lance
+=== "Python"
 
-dataset = lance.dataset("./alice_and_bob.lance")
-dataset.delete("name = 'Bob'")
-dataset2 = lance.dataset("./alice_and_bob.lance")
-print(dataset2.to_table().to_pandas())
-#     name  age
-# 0  Alice   20
-```
+    ```python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.delete("name = 'Bob'")
+    print(dataset.to_table().to_pandas())
+    #     name  age
+    # 0  Alice   20
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::Dataset;
+
+    let mut dataset = Dataset::open("./alice_and_bob.lance").await?;
+    dataset.delete("name = 'Bob'").await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+
+    try (Dataset dataset = Dataset.open("./alice_and_bob.lance", allocator)) {
+      dataset.delete("name = 'Bob'");
+    }
+    ```
 
 !!! note
 
-    [Lance Format is immutable](../format/index.md). Each write operation creates a new version of the dataset,
-    so users must reopen the dataset to see the changes. Likewise, rows are removed by marking
+    [Lance Format is immutable](../format/index.md). Every mutation commits a new dataset version:
+    in-place methods such as `delete` advance that `dataset` handle to the committed version, whereas operations
+    that return a new `Dataset` (such as Rust's `UpdateBuilder` or Java's `Dataset.update`) leave the previous handle
+    on its original snapshot. Other open `Dataset` handles also continue reading their pinned snapshot until reopened
+    or checked out to the latest version. Rows are removed by marking
     them as deleted in a separate deletion index, rather than rewriting the files. This approach
     is faster and avoids invalidating any indices that reference the files, ensuring that subsequent
     queries do not return the deleted rows.
 
 ## Updating rows
 
-Lance supports updating rows based on SQL expressions with the
-`lance.LanceDataset.update` method. For example, if we notice
+Lance supports updating rows based on SQL expressions. For example, if we notice
 that Bob's name in our dataset has been sometimes written as `Blob`, we can fix
 that with:
 
-```python
-import lance
+=== "Python"
 
-dataset = lance.dataset("./alice_and_bob.lance")
-dataset.update({"name": "'Bob'"}, where="name = 'Blob'")
-```
+    ```python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.update({"name": "'Bob'"}, where="name = 'Blob'")
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use lance::dataset::UpdateBuilder;
+    use lance::Dataset;
+
+    let dataset = Arc::new(Dataset::open("./alice_and_bob.lance").await?);
+    let update_result = UpdateBuilder::new(dataset)
+        .update_where("name = 'Blob'")?
+        .set("name", "'Bob'")?
+        .build()?
+        .execute()
+        .await?;
+    let dataset = update_result.new_dataset;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.update.UpdateParams;
+    import org.lance.update.UpdateResult;
+    import java.util.Map;
+
+    UpdateResult result =
+        dataset.update(new UpdateParams(Map.of("name", "'Bob'")).withWhere("name = 'Blob'"));
+    try (Dataset updated = result.getDataset()) {
+      System.out.println("Updated rows: " + result.getNumRowsUpdated());
+    }
+    ```
 
 The update values are SQL expressions, which is why `'Bob'` is wrapped in single
 quotes. This means we can use complex expressions that reference existing columns if
 we wish. For example, if two years have passed and we wish to update the ages
 of Alice and Bob in the same example, we could write:
 
-```python
-import lance
+=== "Python"
 
-dataset = lance.dataset("./alice_and_bob.lance")
-dataset.update({"age": "age + 2"})
-```
+    ```python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.update({"age": "age + 2"})
+    ```
+
+=== "Rust"
+
+    ```rust
+    let update_result = UpdateBuilder::new(dataset)
+        .set("age", "age + 2")?
+        .build()?
+        .execute()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    UpdateResult result = dataset.update(new UpdateParams(Map.of("age", "age + 2")));
+    try (Dataset updated = result.getDataset()) {
+      // updated reflects the new dataset version
+    }
+    ```
 
 If you are trying to update a set of individual rows with new values then it is often
 more efficient to use the merge insert operation described below.
@@ -336,19 +427,43 @@ print(dataset.to_table().to_pandas())
 
 ## Reading Lance Dataset
 
-To open a Lance dataset, use the `lance.dataset` function:
+Open an existing Lance dataset from a local path or cloud URI:
 
-```python
-import lance
-ds = lance.dataset("s3://bucket/path/imagenet.lance")
-# Or local path
-ds = lance.dataset("./imagenet.lance")
-```
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset("s3://bucket/path/imagenet.lance")
+    # Or local path
+    ds = lance.dataset("./imagenet.lance")
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::Dataset;
+
+    let ds = Dataset::open("s3://bucket/path/imagenet.lance").await?;
+    // Or local path
+    let ds = Dataset::open("./imagenet.lance").await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+
+    try (Dataset ds = Dataset.open("./imagenet.lance", allocator)) {
+      // read from ds
+    }
+    ```
 
 !!! note
 
-    Lance supports local file system, AWS `s3` and Google Cloud Storage(`gs`) as storage backends
-    at the moment. Read more in [Object Store Configuration](object_store.md).
+    Lance supports local file systems as well as cloud object stores including AWS S3 (`s3://`),
+    Google Cloud Storage (`gs://`), Azure Blob Storage (`az://`), and S3-compatible stores.
+    Read more in [Object Store Configuration](object_store.md).
 
 The most straightforward approach for reading a Lance dataset is to utilize the `lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
@@ -360,13 +475,56 @@ table = ds.to_table()
 Due to Lance being a high-performance columnar format, it enables efficient reading of subsets of the dataset by utilizing
 **Column (projection)** push-down and **filter (predicates)** push-downs.
 
-```python
-table = ds.to_table(
-    columns=["image", "label"],
-    filter="label = 2 AND text IS NOT NULL",
-    limit=1000,
-    offset=3000)
-```
+=== "Python"
+
+    ```python
+    table = ds.to_table(
+        columns=["image", "label"],
+        filter="label = 2 AND text IS NOT NULL",
+        limit=1000,
+        offset=3000,
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use arrow_array::RecordBatch;
+    use futures::TryStreamExt;
+
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .project(&["image", "label"])?
+        .filter("label = 2 AND text IS NOT NULL")?
+        .limit(Some(1000), Some(3000))?
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.ipc.ArrowReader;
+    import org.lance.ipc.LanceScanner;
+    import org.lance.ipc.ScanOptions;
+    import java.util.Arrays;
+
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Arrays.asList("image", "label"))
+            .filter("label = 2 AND text IS NOT NULL")
+            .limit(1000)
+            .offset(3000)
+            .build();
+    try (LanceScanner scanner = ds.newScan(options);
+        ArrowReader reader = scanner.scanBatches()) {
+      while (reader.loadNextBatch()) {
+        // process reader.getVectorSchemaRoot()
+      }
+    }
+    ```
 
 Lance understands the cost of reading heavy columns such as `image`.
 Consequently, it employs an optimized query plan to execute the operation efficiently.
@@ -400,6 +558,7 @@ Currently, Lance supports a growing list of expressions.
 * `IN`
 * `LIKE`, `NOT LIKE`
 * `regexp_match(column, pattern)`
+* `any_element(list_column, 'predicate')` (experimental), see [below](#filtering-on-elements-of-a-list-of-structs)
 * `CAST`
 
 For example, the following filter string is acceptable:
@@ -435,6 +594,12 @@ and timestamp_col = timestamp '2021-01-01 00:00:00'
 and decimal_col = decimal(8,3) '1.000'
 ```
 
+A plain number in a comparison, `BETWEEN` or `IN` with a decimal column, such as
+`decimal_col < 0.055`, is compared exactly with the digits as written; it is not
+rounded to the column's scale or converted to a float. A number whose digits as
+written do not fit a 256-bit decimal, such as `1e-80` or `1e200`, is not
+supported.
+
 For timestamp columns, the precision can be specified as a number in the type
 parameter. Microsecond precision (6) is the default.
 
@@ -464,14 +629,85 @@ Lance internally stores data in Arrow format. The mapping from SQL types to Arro
 
 (1) See precision mapping in previous table.
 
+#### Filtering on elements of a list of structs
+
+!!! warning "Experimental API"
+
+    `any_element` is experimental. Its function name, call syntax, and
+    predicate syntax are not finalized and may change incompatibly in future
+    releases. Do not rely on the current syntax as a stable API.
+
+`any_element(list_column, 'predicate')` keeps a row when at least one element of
+a `list<struct>` column satisfies the predicate, with every condition evaluated
+on that same element. For a column `detections: list<struct<label: string, confidence: float>>`:
+
+```sql
+any_element(detections, 'label = ''car'' AND confidence > 0.9')
+```
+
+matches rows with a car detected above 0.9 confidence, and not rows that have
+a car below 0.9 next to another object above it.
+
+The predicate is a string literal that refers to the element's fields by name,
+and accepts the same expressions as any other filter. Because it is a string,
+single quotes inside it are doubled. It cannot refer to columns outside the
+element; combine those with `AND` or `OR` outside the call. It may only call
+immutable functions, so functions such as `now()` and `random()` are rejected.
+
+The result follows SQL three-valued logic: NULL for a null list, TRUE if the
+predicate is TRUE on some element, otherwise NULL if it is NULL on some element,
+otherwise FALSE. An empty list is FALSE.
+
+The same filter can be written as a lambda, which needs no quoting:
+
+```sql
+array_any_match(detections, d -> d.label = 'car' AND d.confidence > 0.9)
+```
+
+Lance rewrites it to the `any_element` call above, so the two behave the same.
+`any_match` is an alias, and fields can also be written `d['label']`. The lambda
+has one parameter, and its body may only refer to that parameter's fields.
+Other lambdas, such as in `array_filter`, are not supported in filters.
+
 ### Random read
 
 One distinct feature of Lance, as columnar format, is that it allows you to read random samples quickly.
 
-```python
-# Access the 2nd, 101th and 501th rows
-data = ds.take([1, 100, 500], columns=["image", "label"])
-```
+=== "Python"
+
+    ```python
+    # Access the 2nd, 101st, and 501st rows
+    data = ds.take([1, 100, 500], columns=["image", "label"])
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::dataset::ProjectionRequest;
+
+    // Access the 2nd, 101st, and 501st rows
+    let batch = ds
+        .take(
+            &[1, 100, 500],
+            ProjectionRequest::from_columns(["image", "label"], ds.schema()),
+        )
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.ipc.ArrowReader;
+    import java.util.Arrays;
+
+    // Access the 2nd, 101st, and 501st rows
+    try (ArrowReader reader =
+        ds.take(Arrays.asList(1L, 100L, 500L), Arrays.asList("image", "label"))) {
+      while (reader.loadNextBatch()) {
+        // process reader.getVectorSchemaRoot()
+      }
+    }
+    ```
 
 The ability to achieve fast random access to individual rows plays a crucial role in facilitating various workflows
 such as random sampling and shuffling in ML training.
@@ -490,7 +726,7 @@ To address this, Lance provides methods for optimizing dataset layout.
 ### Compact data files
 
 Data files can be rewritten so there are fewer files. When passing a
-`target_rows_per_fragment` to `lance.dataset.DatasetOptimizer.compact_files`,
+`target_rows_per_fragment` to `dataset.optimize.compact_files(...)`,
 Lance will skip any fragments that are already above that row count, and rewrite
 others. Fragments will be merged according to their fragment ids, so the inherent
 ordering of the data will be preserved.
@@ -500,22 +736,56 @@ ordering of the data will be preserved.
     Compaction creates a new version of the table. It does not delete the old
     version of the table and the files referenced by it.
 
-```python
-import lance
+=== "Python"
 
-dataset = lance.dataset("./alice_and_bob.lance")
-dataset.optimize.compact_files(target_rows_per_fragment=1024 * 1024)
-```
+    ```python
+    import lance
+
+    dataset = lance.dataset("./alice_and_bob.lance")
+    dataset.optimize.compact_files(target_rows_per_fragment=1024 * 1024)
+    ```
+
+=== "Rust"
+
+    ```rust
+    use lance::dataset::optimize::{compact_files, CompactionOptions};
+    use lance::Dataset;
+
+    let mut dataset = Dataset::open("./alice_and_bob.lance").await?;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 1024 * 1024,
+            ..Default::default()
+        },
+        None,
+    )
+    .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.compaction.CompactionOptions;
+
+    try (Dataset dataset = Dataset.open("./alice_and_bob.lance", allocator)) {
+      dataset.compact(
+          CompactionOptions.builder()
+              .withTargetRowsPerFragment(1024 * 1024L)
+              .build());
+    }
+    ```
 
 During compaction, Lance can also remove deleted rows. Rewritten fragments will
 not have deletion files. This can improve scan performance since the soft deleted
 rows don't have to be skipped during the scan.
 
-When files are rewritten, the original row addresses are invalidated. This means the
-affected files are no longer part of any ANN index if they were before. Because
-of this, it's recommended to rewrite files before re-building indices.
-
-<!-- TODO: remove this last comment once stable row ids are default. -->
+When files are rewritten, the physical row addresses (`_rowaddr`) of the compacted rows change.
+Run `compact_files()` before `optimize_indices()` or index rebuilds so Lance can remap or update
+secondary indices against the compacted fragments (see [Compaction and Rebuilding](indexing.md#compaction-and-rebuilding)).
+If your application needs logical row identifiers that remain constant across updates and compaction,
+enable [Stable Row IDs](row_ids.md).
 
 ### Cleanup old versions
 
@@ -529,7 +799,7 @@ means storage grows with each operation — inserts, updates, and deletes alike.
 Keeping old versions has important benefits: readers that opened an older version
 can continue reading it without interference from concurrent writers, providing
 snapshot isolation. Old versions also enable time travel queries, letting you
-read the dataset as it existed at any prior point in time.
+read snapshots from the retained version history.
 
 `cleanup_old_versions` deletes old version metadata and any data files that are
 no longer referenced by any version, reclaiming the accumulated storage.
@@ -540,6 +810,14 @@ no longer referenced by any version, reclaiming the accumulated storage.
     no longer possible. Choose your retention window (`older_than`) accordingly —
     any version removed by cleanup cannot be recovered.
 
+    `lance.dataset(uri, asof=t)` selects the latest retained version created before
+    `t`. If the version that was current at `t` has been removed, it can return an
+    older retained version, including one kept by a tag or branch. For example,
+    if `t` falls between versions 2 and 3 and cleanup removes version 2 but keeps
+    version 1, `asof=t` returns version 1. It raises `ValueError` only when no
+    retained version predates `t`. Use `version=N` to request a specific snapshot;
+    opening that version fails if it has been removed.
+
 ```python
 import lance
 
@@ -547,7 +825,7 @@ dataset = lance.dataset("./my_dataset.lance")
 dataset.cleanup_old_versions()
 ```
 
-By default, versions older than 7 days are removed. You can override this with
+By default, versions older than two weeks are removed. You can override this with
 the `older_than` parameter (a `timedelta`):
 
 ```python
@@ -555,6 +833,93 @@ from datetime import timedelta
 
 dataset.cleanup_old_versions(older_than=timedelta(days=1))
 ```
+
+For multiple retention windows, pass a `CleanupPolicy` containing ordered `CleanupRule` entries. This example keeps
+full recent history, hourly samples between two and seven days, daily samples
+between seven and thirty days, and expires everything older than thirty days:
+
+```python
+from lance import CleanupPolicy, KeepOne, RemoveAll
+
+dataset.cleanup_old_versions(
+    policy=CleanupPolicy(rules=[
+        KeepOne(per_interval=timedelta(hours=1), older_than=timedelta(days=2)),
+        KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+        RemoveAll(older_than=timedelta(days=30)),
+    ])
+)
+```
+
+`KeepOne` and `RemoveAll` implement `CleanupRule`. A `CleanupPolicy` contains
+the ordered rules; `CleanupPolicy()` defaults to a single
+`RemoveAll(older_than=timedelta(days=14))`, matching existing cleanup behavior.
+Ages must strictly increase. Each version uses the oldest matching `KeepOne`
+rule, with separate buckets for each band. `RemoveAll` is optional and must be
+last; without it, sampled history has no expiration limit. Empty policies,
+duplicate thresholds and unsupported rules are rejected. Comparisons are strictly
+older-than: a version exactly at a threshold stays in the younger band.
+
+`KeepOne.older_than` must be at least two days. Sampling ages are relative to the
+hinted commit timestamp, falling back to this dataset's commit when no hint
+exists. The hinted version and every later version are protected from thinning,
+even with backwards clocks or `LANCE_USE_VERSION_HINT=0` in the cleaner.
+`RemoveAll.older_than` is a wall-clock expiration age and expires sampled versions
+too. Each sampling interval aligns to the UTC Unix epoch and selects the newest
+eligible commit timestamp, breaking ties by version number.
+
+Tags, current versions and branch dependencies remain protected. `versions` and
+`retain_versions` limit which versions either operation can remove. Cleanup also
+preserves the data, indices and blobs needed by retained snapshots. The same
+`policy` is accepted by `explain_cleanup_old_versions` for a read-only preview.
+
+Retention rules work with both values of `delete_unverified`. By default, cleanup
+preserves recent files that no manifest references. With `delete_unverified=True`,
+it can remove those files immediately; files needed by retained snapshots remain
+protected in either mode.
+
+The existing top-level `older_than` keeps its wall-clock expiration meaning.
+Existing cleanup calls and defaults continue to work. The single-window shorthand
+`older_than=timedelta(days=7), keep_one=KeepOne(timedelta(days=1), timedelta(days=2))`
+is also supported. Do not combine `policy` with `older_than` or `keep_one`.
+
+Rust uses `cleanup::retention::CleanupPolicy::new(Vec<CleanupRule>)` through
+`.with_retention_policy(...)`; the legacy `cleanup::CleanupPolicy` remains
+available for version and file-cleanup filters. Java accepts
+`dataset.cleanup(new CleanupPolicy(rules))`, using
+`CleanupRule.keepOne(perInterval, olderThan)` and
+`CleanupRule.removeAll(olderThan)`. Existing native policy filters still apply.
+
+For automatic cleanup, use the same rules with duration strings:
+
+```python
+import json
+
+dataset.update_config({
+    "lance.auto_cleanup.interval": None,
+    "lance.auto_cleanup.older_than": None,
+    "lance.auto_cleanup.policy_interval": "100",
+    "lance.auto_cleanup.policy": json.dumps({"rules": [
+        {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+        {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+        {"type": "remove_all", "older_than": "30days"},
+    ]}),
+})
+```
+
+The policy interval is a version count. Older clients ignore this activation key
+and leave automatic retention cleanup disabled. The legacy interval must be
+removed atomically when activating either policy form; unsafe combinations are
+rejected before publication. Do not combine this policy with
+`lance.auto_cleanup.older_than` or the
+single-window `lance.auto_cleanup.keep_one.*` settings.
+
+Thinning also supports local filesystems and S3 Express. The hint-relative
+two-day minimum provides a retention buffer for delayed hint writes; it does not
+make hint updates monotonic. On stores using hints, unreadable or malformed hints
+fail cleanup instead of using the wall clock. If explicit expiration has removed
+an older hinted manifest, cleanup falls back to the dataset snapshot, as latest
+version discovery does when a hint target is missing. A missing current manifest
+still fails cleanup.
 
 !!! note
 
@@ -619,7 +984,7 @@ Auto cleanup can be enabled when creating a new dataset:
 ```python
 import lance
 import pyarrow as pa
-from lance.dataset import AutoCleanupConfig
+from lance import AutoCleanupConfig
 
 table = pa.table({"id": range(100)})
 ds = lance.write_dataset(
@@ -676,3 +1041,63 @@ It is common to run cleanup as a periodic background task on a dedicated server
 (for example, via a cron job or scheduled workflow). This keeps cleanup off the
 write path entirely, avoiding any impact to write latency, but requires setting
 up and maintaining additional infrastructure.
+
+## Choosing a data file version
+
+`data_storage_version` selects the format of newly written data files. For an
+existing V2 dataset, an operation can select `"2.0"`, `"2.1"`, `"2.2"`, or `"2.3"`
+without rewriting the other files. The dataset's `data_storage_version` property
+is the default for writes that omit a target, not a summary of its existing
+files. Create and overwrite establish this default; append, update, merge-insert,
+and compaction do not change it. V1 and V2 cannot be mixed.
+
+```python
+import lance
+import pyarrow as pa
+
+data = pa.table({"id": [1, 2], "value": [10, 20]})
+ds = lance.write_dataset(data, "./versions.lance", data_storage_version="2.1")
+ds.update({"value": "value + 1"}, data_storage_version="2.2")
+assert ds.data_storage_version == "2.1"
+
+ds.merge_insert("id").when_not_matched_insert_all().data_storage_version("2.2").execute(
+    pa.table({"id": [3], "value": [30]})
+)
+ds.optimize.compact_files(data_storage_version="2.2")
+```
+
+The `"stable"` and `"next"` selectors resolve according to the engine release.
+Use exact versions when the output identity must be independent of that release.
+V2.3 is currently unstable: files written by one unstable revision may not be
+readable by a later revision. Use it only for experimentation.
+Compaction plans fix the target before distributing tasks, including when the
+target comes from the dataset default. The target survives Python pickle and
+Java serialization; workers do not reinterpret it using their own release defaults.
+
+Java update, merge-insert, and compaction options use
+`withDataStorageVersion(DataStorageVersion.V2_2)`. The shared `DataStorageVersion`
+enum also provides `STABLE` and `NEXT` selectors.
+
+Compaction can convert selected fragments to another supported V2 version.
+Binary copy requires every selected file to match the output version, as well
+as the usual eligibility checks. In particular, overlays need reencoding to
+preserve updated values. `try_binary_copy` falls back to reencoding when inputs
+are ineligible; `force_binary_copy` rejects them. A version mismatch error includes
+the target version, actual version, and file path. A persistent compaction target
+can be set through `lance.compaction.data_storage_version` in the table config;
+an explicit operation target takes precedence.
+
+### Upgrading clients before mixed-version writes
+
+Before writing files that differ from the dataset default, upgrade every reader
+and writer to a mixed-version-aware release. Drain, restart, or fence writers
+that opened the dataset using an older release. The commit automatically sets
+the paired mixed-version reader/writer feature flags when needed; there is no
+separate activation API. These flags remain set even if compaction later makes
+the files homogeneous again.
+
+Older clients that do not recognize the flags reject the resulting snapshots.
+The flags cannot retroactively fence an older writer that already read a prior
+manifest. Historical homogeneous datasets remain readable by clients that
+support their file versions; see [table versioning](../format/table/versioning.md)
+for the feature flag contract.

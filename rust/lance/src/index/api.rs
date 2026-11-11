@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,9 +11,36 @@ use lance_index::{
 };
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{Error, Result};
+
+/// Statistics for one physical index segment, collected at a dataset read version.
+///
+/// The payload is opaque to the aggregation API: callers may serialize it, move it
+/// to another process, and aggregate it with
+/// [`DatasetIndexExt::index_statistics_from_segments`] without the payload being
+/// recomputed. Values produced by different index types are not portable between
+/// those types.
+///
+/// ```
+/// # use lance::index::IndexSegmentStatistics;
+/// # fn round_trip(statistics: &IndexSegmentStatistics) -> serde_json::Result<IndexSegmentStatistics> {
+/// let json = serde_json::to_string(statistics)?;
+/// serde_json::from_str(&json)
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexSegmentStatistics {
+    /// Manifest read version, not the segment's build version.
+    pub read_version: u64,
+    pub index_uuid: Uuid,
+    /// Empty for natively maintained segments with no fragment coverage.
+    pub index_type_uri: String,
+    /// Index-specific payload; `{}` for natively maintained segments with no fragment coverage.
+    pub statistics: serde_json::Value,
+}
 
 /// A single physical segment of a logical index.
 ///
@@ -37,6 +65,10 @@ pub struct IndexSegment {
     index_version: i32,
     /// Dataset version at which this segment's physical contents were built.
     dataset_version: u64,
+    /// The clustering definition this segment was built under, if any.
+    clustering_id: Option<u32>,
+    /// Generic metadata published with the segment; see `IndexMetadata::metadata`.
+    metadata: HashMap<String, String>,
 }
 
 impl IndexSegment {
@@ -63,7 +95,34 @@ impl IndexSegment {
             index_details,
             index_version,
             dataset_version,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
+    }
+
+    /// Publish the segment with a clustering reference and generic metadata.
+    ///
+    /// `clustering_id` must name a definition in the dataset's manifest. The
+    /// entries are stored verbatim and preserved by later changes to the
+    /// segment; a segment built from this one does not inherit them.
+    pub fn with_object_metadata(
+        mut self,
+        clustering_id: Option<u32>,
+        metadata: HashMap<String, String>,
+    ) -> Self {
+        self.clustering_id = clustering_id;
+        self.metadata = metadata;
+        self
+    }
+
+    /// Return the clustering definition this segment was built under.
+    pub fn clustering_id(&self) -> Option<u32> {
+        self.clustering_id
+    }
+
+    /// Return the generic metadata published with this segment.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
     }
 
     /// Return the UUID of this segment.
@@ -169,6 +228,8 @@ impl IndexSegment {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: self.clustering_id,
+            metadata: self.metadata,
         }
     }
 }
@@ -202,7 +263,8 @@ impl IntoIndexSegment for IndexMetadata {
             self.index_version,
             self.dataset_version,
             self.covering_fields,
-        ))
+        )
+        .with_object_metadata(self.clustering_id, self.metadata))
     }
 }
 
@@ -301,10 +363,11 @@ pub trait DatasetIndexExt {
 
     /// Read the indices of this Dataset version that this build can use.
     ///
-    /// An index whose declared type has no reader in this build, or whose format
-    /// version is newer than this build supports, is omitted: it is still in the
-    /// manifest and still belongs to the dataset, but nothing here can decode
-    /// it. Code deciding what the *next* manifest should say must not use this
+    /// An index whose declared type has no reader in this build, whose format
+    /// version is newer than this build supports, or whose fields are reserved
+    /// and unsupported is omitted: it is still in the manifest and still belongs
+    /// to the dataset, but this build cannot use it. Code deciding what the *next*
+    /// manifest should say must not use this
     /// list - it would drop what it omits.
     ///
     /// The indices are lazy loaded and cached in memory within the `Dataset` instance.
@@ -370,6 +433,62 @@ pub trait DatasetIndexExt {
 
     /// Find an index with the given name and return its serialized statistics.
     async fn index_statistics(&self, index_name: &str) -> Result<String>;
+
+    /// Collect statistics for physical segments of an index.
+    ///
+    /// Returns results in UUID request order at the current manifest version.
+    /// UUIDs must be nonempty, unique, and belong to `index_name`; system indices
+    /// are unsupported. The returned payloads can be aggregated by
+    /// [`Self::index_statistics_from_segments`] on another dataset instance that
+    /// reads the same version and index segments.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::DatasetIndexExt};
+    /// # async fn collect(dataset: &Dataset) -> Result<()> {
+    /// let segments = dataset.load_indices_by_name("vector_idx").await?;
+    /// let uuids: Vec<_> = segments.iter().map(|segment| segment.uuid).collect();
+    /// let statistics = dataset.index_segment_statistics("vector_idx", &uuids).await?;
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", statistics)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_segment_statistics(
+        &self,
+        _index_name: &str,
+        _index_uuids: &[Uuid],
+    ) -> Result<Vec<IndexSegmentStatistics>> {
+        Err(Error::not_supported(
+            "segment statistics are not supported by this dataset implementation".to_owned(),
+        ))
+    }
+
+    /// Aggregate statistics collected from every physical segment of an index.
+    ///
+    /// Requires exactly one result per segment from this dataset and read version.
+    /// Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+    /// Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegmentStatistics}};
+    /// # async fn aggregate(dataset: &Dataset, stats: Vec<IndexSegmentStatistics>) -> Result<()> {
+    /// let json = dataset
+    ///     .index_statistics_from_segments("vector_idx", stats)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn index_statistics_from_segments(
+        &self,
+        _index_name: &str,
+        _segment_statistics: Vec<IndexSegmentStatistics>,
+    ) -> Result<String> {
+        Err(Error::not_supported(
+            "segment statistics aggregation is not supported by this dataset implementation"
+                .to_owned(),
+        ))
+    }
 
     /// Merge one or more existing uncommitted index segments into a single uncommitted segment.
     async fn merge_existing_index_segments(
@@ -441,6 +560,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();
@@ -496,10 +617,37 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();
         assert_eq!(segment.fields(), &[7, 11]);
         assert_eq!(segment.covering_fields(), &[11]);
+    }
+
+    #[test]
+    fn object_metadata_round_trips_through_index_metadata() {
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".to_string(), "3".to_string()),
+            ("org.example.unknown".to_string(), "opaque".to_string()),
+        ]);
+        let segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [1u32, 2],
+            [7],
+            Arc::new(prost_types::Any::default()),
+            1,
+            5,
+            [],
+        )
+        .with_object_metadata(Some(4), metadata.clone());
+        let committed = segment.clone().into_metadata("idx");
+        assert_eq!(committed.clustering_id, Some(4));
+        assert_eq!(committed.metadata, metadata);
+        let restored = committed.into_index_segment().unwrap();
+        assert_eq!(restored.clustering_id(), Some(4));
+        assert_eq!(restored.metadata(), &metadata);
+        assert_eq!(restored.fragment_bitmap(), segment.fragment_bitmap());
     }
 }

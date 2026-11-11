@@ -22,9 +22,13 @@
 //! transparent).
 
 use arrow_buffer::ArrowNativeType;
+use futures::{FutureExt, future::BoxFuture, future::join_all};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
@@ -159,12 +163,19 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     }
 
     fn config(&self) -> CompressionConfig;
+
+    /// Returns the decompressed size of a single compressed value by reading its
+    /// frame header, without decompressing.
+    ///
+    /// Returns `None` if the format does not embed the decompressed size.
+    fn decompressed_size_of_value(&self, _compressed: &[u8]) -> Option<u64> {
+        None
+    }
 }
 
 #[cfg(feature = "zstd")]
 mod zstd {
     use std::io::{Cursor, Write};
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
 
@@ -177,6 +188,26 @@ mod zstd {
         /// shared pool, so a per-thread context avoids both per-value context
         /// setup and cross-thread lock contention.
         static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> = const { RefCell::new(None) };
+        /// One compression context per thread, keyed by level, so pages compressed
+        /// on several threads do not serialize on a shared context.
+        static COMPRESSOR: RefCell<Option<(i32, Compressor<'static>)>> = const { RefCell::new(None) };
+    }
+
+    fn compress_frame_into(
+        level: i32,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+    ) -> std::io::Result<usize> {
+        COMPRESSOR.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().map(|(l, _)| *l) != Some(level) {
+                *slot = Some((level, Compressor::new(level)?));
+            }
+            slot.as_mut()
+                .expect("initialized above")
+                .1
+                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+        })
     }
 
     /// Appends into `buf`'s spare capacity (reserved by the caller) without
@@ -219,7 +250,6 @@ mod zstd {
     /// contention.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
-        compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
     }
 
     impl std::fmt::Debug for ZstdBufferCompressor {
@@ -232,21 +262,7 @@ mod zstd {
 
     impl ZstdBufferCompressor {
         pub fn new(compression_level: i32) -> Self {
-            Self {
-                compression_level,
-                compressor: OnceLock::new(),
-            }
-        }
-
-        fn get_compressor(&self) -> Result<&Mutex<Compressor<'static>>> {
-            self.compressor
-                .get_or_init(|| {
-                    Compressor::new(self.compression_level)
-                        .map(Mutex::new)
-                        .map_err(|e| e.to_string())
-                })
-                .as_ref()
-                .map_err(|e| Error::internal(format!("Failed to create zstd compressor: {}", e)))
+            Self { compression_level }
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -295,14 +311,22 @@ mod zstd {
             let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
             len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
 
-            let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+            let uncompressed_len = usize::try_from(u64::from_le_bytes(len_buf)).map_err(|_| {
+                Error::invalid_input("Zstd declared output length does not fit usize")
+            })?;
 
             let start = output_buf.len();
-            output_buf.reserve(uncompressed_len);
+            // The prefix comes from the file, so a corrupt one must fail to reserve
+            // rather than panic or abort the process.
+            output_buf.try_reserve(uncompressed_len).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Zstd could not reserve {uncompressed_len} output bytes: {error}"
+                ))
+            })?;
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
             let written = decompress_frame_into(compressed_data, output_buf)?;
             if written != uncompressed_len {
-                // `reserve` may over-allocate, so a frame longer than its prefix can
+                // `try_reserve` may over-allocate, so a frame longer than its prefix can
                 // still fit; drop whatever it appended so an error leaves the
                 // buffer exactly as the caller passed it.
                 output_buf.truncate(start);
@@ -319,10 +343,7 @@ mod zstd {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
 
             output_buf.reserve(::zstd::zstd_safe::compress_bound(input_buf.len()));
-            self.get_compressor()?
-                .lock()
-                .unwrap()
-                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+            compress_frame_into(self.compression_level, input_buf, output_buf)
                 .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
             Ok(())
         }
@@ -404,6 +425,20 @@ mod zstd {
                 level: Some(self.compression_level),
             }
         }
+
+        fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            if self.is_raw_stream_format(compressed) {
+                // Legacy raw Zstd frames (see `decompress`) have no length prefix of
+                // our own; read the content size out of the Zstd frame header itself.
+                ::zstd::zstd_safe::get_frame_content_size(compressed)
+                    .ok()
+                    .flatten()
+            } else {
+                // compress() always writes an 8-byte LE decompressed-length prefix first.
+                let prefix: [u8; 8] = compressed.get(..8)?.try_into().ok()?;
+                Some(u64::from_le_bytes(prefix))
+            }
+        }
     }
 }
 
@@ -451,10 +486,28 @@ mod lz4 {
                 u32::from_le_bytes([input_buf[0], input_buf[1], input_buf[2], input_buf[3]])
                     as usize;
 
+            // A match length grows by at most 255 per input byte, so no LZ4 block
+            // decodes to more than 255 times its size, and the decoder refuses any
+            // size `compress_bound` rejects. A larger prefix is corrupt and must not
+            // make us allocate and zero-fill up to 4 GiB.
+            if uncompressed_size > input_buf.len().saturating_mul(255)
+                || ::lz4::block::compress_bound(uncompressed_size).is_err()
+            {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 declares {uncompressed_size} output bytes for a {}-byte payload",
+                    input_buf.len()
+                )));
+            }
+
             // Remember the starting position
             let start_pos = output_buf.len();
 
-            // Resize to ensure we have the exact space needed
+            // Reserve fallibly, then size the buffer for the decoder
+            output_buf.try_reserve(uncompressed_size).map_err(|error| {
+                Error::invalid_input(format!(
+                    "LZ4 could not reserve {uncompressed_size} output bytes: {error}"
+                ))
+            })?;
             output_buf.resize(start_pos + uncompressed_size, 0);
 
             // Now decompress directly into the buffer slice
@@ -524,6 +577,12 @@ mod lz4 {
                 level: None,
             }
         }
+
+        fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            // compress_to_buffer with prepend_size=true writes a 4-byte LE size header.
+            let prefix: [u8; 4] = compressed.get(..4)?.try_into().ok()?;
+            Some(u32::from_le_bytes(prefix) as u64)
+        }
     }
 }
 
@@ -562,6 +621,10 @@ impl BufferCompressor for NoopBufferCompressor {
             scheme: CompressionScheme::None,
             level: None,
         }
+    }
+
+    fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+        u64::try_from(compressed.len()).ok()
     }
 }
 
@@ -638,7 +701,7 @@ impl BlockDecompressor for GeneralBlockDecompressor {
 // An encoder which uses generic compression, such as zstd/lz4 to encode buffers
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
-    pub(crate) compressor: Box<dyn BufferCompressor>,
+    pub(crate) compressor: Arc<dyn BufferCompressor>,
     // Runtime compressors normalize levels that they default or ignore. Block descriptors must
     // retain the selected configuration so stable writers preserve those present/absent values.
     block_compression: CompressionConfig,
@@ -655,7 +718,8 @@ impl Default for CompressedBufferEncoder {
         let (scheme, level) = (CompressionScheme::None, None);
 
         let block_compression = CompressionConfig { scheme, level };
-        let compressor = GeneralBufferCompressor::get_compressor(block_compression).unwrap();
+        let compressor =
+            Arc::from(GeneralBufferCompressor::get_compressor(block_compression).unwrap());
         Self {
             compressor,
             block_compression,
@@ -665,7 +729,7 @@ impl Default for CompressedBufferEncoder {
 
 impl CompressedBufferEncoder {
     pub fn try_new(compression_config: CompressionConfig) -> Result<Self> {
-        let compressor = GeneralBufferCompressor::get_compressor(compression_config)?;
+        let compressor = Arc::from(GeneralBufferCompressor::get_compressor(compression_config)?);
         Ok(Self {
             compressor,
             block_compression: compression_config,
@@ -679,7 +743,7 @@ impl CompressedBufferEncoder {
             level: Some(0),
         };
         Ok(Self {
-            compressor: GeneralBufferCompressor::get_compressor(block_compression)?,
+            compressor: Arc::from(GeneralBufferCompressor::get_compressor(block_compression)?),
             block_compression,
         })
     }
@@ -692,17 +756,89 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         compressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
-        new_offsets.push(T::from_usize(0).unwrap());
+        map_values(data, offsets, compressed, &|value, out| {
+            self.compressor.compress(value, out)
+        })
+    }
 
-        for off in offsets.windows(2) {
-            let start = off[0].as_usize();
-            let end = off[1].as_usize();
-            self.compressor.compress(&data[start..end], compressed)?;
-            new_offsets.push(T::from_usize(compressed.len()).unwrap());
+    async fn per_value_compress_async(
+        &self,
+        data: VariableWidthBlock,
+    ) -> Result<VariableWidthBlock> {
+        let data = Arc::new(data);
+        match data.bits_per_offset {
+            32 => self.per_value_compress_async_typed::<u32>(data).await,
+            64 => self.per_value_compress_async_typed::<u64>(data).await,
+            bits => Err(Error::invalid_input(format!(
+                "Per-value compression does not support variable-width data with {bits}-bit offsets"
+            ))),
+        }
+    }
+
+    async fn per_value_compress_async_typed<T>(
+        &self,
+        data: Arc<VariableWidthBlock>,
+    ) -> Result<VariableWidthBlock>
+    where
+        T: ArrowNativeType + bytemuck::Pod + Send + Sync + 'static,
+    {
+        let offsets = data.offsets.borrow_to_typed_view::<T>();
+        let total = input_bytes(offsets.as_ref());
+        let in_flight = LargePagesInFlight::enter(total);
+        let chunks = parallelism(total, in_flight.count, get_num_compute_intensive_cpus());
+        if chunks <= 1 {
+            let compressor = self.compressor.clone();
+            let chunk_data = data.clone();
+            let (compressed, ends) = spawn_cpu(move || {
+                compress_chunk::<T>(
+                    &chunk_data,
+                    compressor.as_ref(),
+                    0,
+                    offsets_len(&chunk_data)?,
+                )
+            })
+            .await?;
+            let offsets = chunk_offsets::<T>(ends)?;
+            return Ok(VariableWidthBlock {
+                data: LanceBuffer::from(compressed),
+                offsets,
+                bits_per_offset: data.bits_per_offset,
+                num_values: data.num_values,
+                block_info: data.block_info.clone(),
+            });
         }
 
-        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+        let bounds = chunk_bounds(offsets.as_ref(), chunks);
+        let mut chunks = Vec::with_capacity(bounds.len().saturating_sub(1));
+        for window in bounds.windows(2) {
+            let compressor = self.compressor.clone();
+            let chunk_data = data.clone();
+            let (lo, hi) = (window[0], window[1]);
+            chunks.push(spawn_cpu(move || {
+                compress_chunk::<T>(&chunk_data, compressor.as_ref(), lo, hi)
+            }));
+        }
+        let parts = join_all(chunks)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let (compressed, offsets) = spawn_cpu(move || stitch_chunks::<T>(parts)).await?;
+        Ok(VariableWidthBlock {
+            data: LanceBuffer::from(compressed),
+            offsets,
+            bits_per_offset: data.bits_per_offset,
+            num_values: data.num_values,
+            block_info: data.block_info.clone(),
+        })
+    }
+
+    fn per_value_encoding(&self, bits_per_offset: u8) -> Result<CompressiveEncoding> {
+        // TODO: Support setting the level
+        // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
+        EncodingUtils::wrapped(
+            self.compressor.config(),
+            EncodingUtils::variable(EncodingUtils::flat(bits_per_offset as u64, None), None),
+        )
     }
 
     pub fn per_value_decompress<T: ArrowNativeType>(
@@ -711,22 +847,207 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         decompressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
-        new_offsets.push(T::from_usize(0).unwrap());
-
-        for off in offsets.windows(2) {
-            let start = off[0].as_usize();
-            let end = off[1].as_usize();
-            // Full-zip omits null payloads; LZ4 rejects empty input.
-            if start < end {
-                self.compressor
-                    .decompress(&data[start..end], decompressed)?;
+        map_values(data, offsets, decompressed, &|value, out| {
+            if value.is_empty() {
+                Ok(())
+            } else {
+                self.compressor.decompress(value, out)
             }
-            new_offsets.push(T::from_usize(decompressed.len()).unwrap());
-        }
-
-        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+        })
     }
+}
+
+/// Below this many input bytes a page's values are processed in one CPU task.
+const PARALLEL_MIN_BYTES: usize = 8 * 1024 * 1024;
+/// Each parallel chunk gets at least this many input bytes.
+const PARALLEL_MIN_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Pages of at least [`PARALLEL_MIN_BYTES`] currently in async per-value compression.
+static LARGE_PAGES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers a page while it is being compressed. A page splits over the pool only
+/// while at most half of it is claimed by other large pages; once concurrent page
+/// tasks fill the pool on their own they take the serial loop, which stages and
+/// copies nothing.
+struct LargePagesInFlight {
+    /// Large pages in flight, this one included; 1 for a small page.
+    count: usize,
+    registered: bool,
+}
+
+impl LargePagesInFlight {
+    fn enter(total: usize) -> Self {
+        if total < PARALLEL_MIN_BYTES {
+            return Self {
+                count: 1,
+                registered: false,
+            };
+        }
+        Self {
+            count: LARGE_PAGES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1,
+            registered: true,
+        }
+    }
+}
+
+impl Drop for LargePagesInFlight {
+    fn drop(&mut self) {
+        if self.registered {
+            LARGE_PAGES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn input_bytes<T: ArrowNativeType>(offsets: &[T]) -> usize {
+    match offsets {
+        [first, .., last] => last.as_usize() - first.as_usize(),
+        _ => 0,
+    }
+}
+
+/// Chunks for a page of `total` input bytes when `in_flight` large pages (this one
+/// included) share a pool of `cpus` threads. A split page gets `cpus` chunks rather
+/// than its share, so it still fills the pool after its neighbours finish; with more
+/// than half the pool claimed, staging the chunks costs more than the idle threads
+/// would gain (21% at full load in a four-page, four-thread encode).
+fn parallelism(total: usize, in_flight: usize, cpus: usize) -> usize {
+    if total < PARALLEL_MIN_BYTES || in_flight > cpus / 2 {
+        return 1;
+    }
+    cpus.min(total / PARALLEL_MIN_CHUNK_BYTES).max(1)
+}
+
+/// Chunk boundaries are indices into `offsets`, balanced by input bytes.
+fn chunk_bounds<T: ArrowNativeType>(offsets: &[T], chunks: usize) -> Vec<usize> {
+    let first = offsets[0].as_usize();
+    let total = offsets[offsets.len() - 1].as_usize() - first;
+    let target = (total / chunks).max(1);
+    let mut bounds = vec![0usize];
+    let mut next = first + target;
+    for (i, off) in offsets.iter().enumerate().take(offsets.len() - 1).skip(1) {
+        if off.as_usize() >= next {
+            bounds.push(i);
+            next = off.as_usize() + target;
+        }
+    }
+    bounds.push(offsets.len() - 1);
+    bounds
+}
+
+fn offsets_len(data: &VariableWidthBlock) -> Result<usize> {
+    let bytes_per_offset = match data.bits_per_offset {
+        32 | 64 => data.bits_per_offset as usize / 8,
+        bits => {
+            return Err(Error::invalid_input(format!(
+                "Per-value compression does not support {bits}-bit offsets"
+            )));
+        }
+    };
+    if data.offsets.len() < bytes_per_offset || !data.offsets.len().is_multiple_of(bytes_per_offset)
+    {
+        return Err(Error::invalid_input(format!(
+            "Variable-width offsets buffer has {} bytes for {}-bit offsets",
+            data.offsets.len(),
+            data.bits_per_offset
+        )));
+    }
+    Ok(data.offsets.len() / bytes_per_offset - 1)
+}
+
+fn compress_chunk<T: ArrowNativeType + bytemuck::Pod>(
+    data: &VariableWidthBlock,
+    compressor: &dyn BufferCompressor,
+    lo: usize,
+    hi: usize,
+) -> Result<(Vec<u8>, Vec<usize>)> {
+    let offsets = data.offsets.borrow_to_typed_view::<T>();
+    // Sized for incompressible input so the chunk rarely regrows.
+    let mut out = Vec::with_capacity(offsets[hi].as_usize() - offsets[lo].as_usize());
+    let mut ends = Vec::with_capacity(hi - lo);
+    for off in offsets[lo..=hi].windows(2) {
+        compressor.compress(&data.data[off[0].as_usize()..off[1].as_usize()], &mut out)?;
+        ends.push(out.len());
+    }
+    Ok((out, ends))
+}
+
+fn chunk_offsets<T: ArrowNativeType>(ends: Vec<usize>) -> Result<LanceBuffer> {
+    let mut offsets = Vec::with_capacity(ends.len() + 1);
+    offsets.push(zero_offset::<T>()?);
+    offsets.extend(
+        ends.into_iter()
+            .map(|end| {
+                T::from_usize(end).ok_or_else(|| {
+                    Error::internal(format!(
+                        "Per-value compressed output size {end} does not fit in a {} bit offset",
+                        std::mem::size_of::<T>() * 8
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    Ok(LanceBuffer::reinterpret_vec(offsets))
+}
+
+fn stitch_chunks<T: ArrowNativeType>(
+    parts: Vec<(Vec<u8>, Vec<usize>)>,
+) -> Result<(Vec<u8>, LanceBuffer)> {
+    let total = parts.iter().map(|(out, _)| out.len()).sum();
+    let num_offsets = parts.iter().map(|(_, ends)| ends.len()).sum::<usize>() + 1;
+    let mut output = Vec::with_capacity(total);
+    let mut offsets = Vec::with_capacity(num_offsets);
+    offsets.push(zero_offset::<T>()?);
+    for (part, ends) in parts {
+        let base = output.len();
+        output.extend_from_slice(&part);
+        offsets.extend(
+            ends.into_iter()
+                .map(|end| {
+                    T::from_usize(base + end).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Per-value compressed output size {} does not fit in a {} bit offset",
+                            base + end,
+                            std::mem::size_of::<T>() * 8
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    Ok((output, LanceBuffer::reinterpret_vec(offsets)))
+}
+
+fn zero_offset<T: ArrowNativeType>() -> Result<T> {
+    T::from_usize(0).ok_or_else(|| Error::internal("zero does not fit in the offset type"))
+}
+
+/// Appends the encoded form of one value to the output buffer.
+type ValueCodec<'a> = dyn Fn(&[u8], &mut Vec<u8>) -> Result<()> + Sync + 'a;
+
+/// Applies `f` to every value delimited by `offsets`, appending the results to `output`
+/// in value order, and returns the output offsets.
+fn map_values<T: ArrowNativeType>(
+    data: &[u8],
+    offsets: &[T],
+    output: &mut Vec<u8>,
+    f: &ValueCodec<'_>,
+) -> Result<LanceBuffer> {
+    let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
+    new_offsets.push(zero_offset::<T>()?);
+    if offsets.len() < 2 {
+        return Ok(LanceBuffer::reinterpret_vec(new_offsets));
+    }
+    for off in offsets.windows(2) {
+        f(&data[off[0].as_usize()..off[1].as_usize()], output)?;
+        new_offsets.push(T::from_usize(output.len()).ok_or_else(|| {
+            Error::internal(format!(
+                "Per-value compressed output size {} does not fit in a {} bit offset",
+                output.len(),
+                std::mem::size_of::<T>() * 8
+            ))
+        })?);
+    }
+    Ok(LanceBuffer::reinterpret_vec(new_offsets))
 }
 
 impl PerValueCompressor for CompressedBufferEncoder {
@@ -762,18 +1083,36 @@ impl PerValueCompressor for CompressedBufferEncoder {
             block_info: BlockInfo::new(),
         });
 
-        // TODO: Support setting the level
-        // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
-        let encoding = EncodingUtils::wrapped(
-            self.compressor.config(),
-            EncodingUtils::variable(EncodingUtils::flat(data.bits_per_offset as u64, None), None),
-        )?;
+        let encoding = self.per_value_encoding(data.bits_per_offset)?;
 
         Ok((compressed, encoding))
+    }
+
+    fn compress_with_validity_async(
+        self: Arc<Self>,
+        data: DataBlock,
+        _validity: Option<arrow_buffer::BooleanBuffer>,
+    ) -> BoxFuture<'static, Result<(PerValueDataBlock, CompressiveEncoding)>> {
+        async move {
+            let data_type = data.name();
+            let data = data.as_variable_width().ok_or(Error::internal(format!(
+                "Attempt to use CompressedBufferEncoder on data of type {}",
+                data_type
+            )))?;
+            let bits_per_offset = data.bits_per_offset;
+            let compressed = self.per_value_compress_async(data).await?;
+            let encoding = self.per_value_encoding(bits_per_offset)?;
+            Ok((PerValueDataBlock::Variable(compressed), encoding))
+        }
+        .boxed()
     }
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
         let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
@@ -799,6 +1138,63 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
             block_info: BlockInfo::new(),
         }))
     }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        offsets_bytes: &[u8],
+        bits_per_offset: u8,
+    ) -> Option<u64> {
+        // Iterate the per-value offset pairs and sum frame-header sizes.
+        // Each value was independently compressed so each has its own frame header.
+        if !matches!(bits_per_offset, 32 | 64)
+            || !offsets_bytes
+                .len()
+                .is_multiple_of(bits_per_offset as usize / 8)
+        {
+            return None;
+        }
+        let bytes_per_offset = bits_per_offset as usize / 8;
+        let num_offsets = offsets_bytes.len() / bytes_per_offset;
+        if num_offsets < 2 {
+            return Some(0);
+        }
+
+        let base = usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
+        let mut total = 0u64;
+        for i in 0..num_offsets - 1 {
+            let start = usize::try_from(read_offset(offsets_bytes, i, bits_per_offset)?).ok()?;
+            let end = usize::try_from(read_offset(offsets_bytes, i + 1, bits_per_offset)?).ok()?;
+            // Rebase: offsets stored in self.offsets are absolute into self.data, but
+            // offsets_bytes here is the raw slice starting at offset_starts[row_start],
+            // so the first offset value is the base we subtract.
+            let val_start = start.checked_sub(base)?;
+            let val_end = end.checked_sub(base)?;
+            if val_start == val_end {
+                // Null / zero-length value — contributes 0 decompressed bytes.
+                continue;
+            }
+            let value_bytes = data.get(val_start..val_end)?;
+            total = total.checked_add(self.compressor.decompressed_size_of_value(value_bytes)?)?;
+        }
+        Some(total)
+    }
+}
+
+/// Read an offset value (u32 or u64) from a packed byte slice at position `idx`.
+fn read_offset(offsets_bytes: &[u8], idx: usize, bits_per_offset: u8) -> Option<u64> {
+    if !matches!(bits_per_offset, 32 | 64) {
+        return None;
+    }
+    let bpo = bits_per_offset as usize / 8;
+    let start = idx.checked_mul(bpo)?;
+    let end = start.checked_add(bpo)?;
+    let bytes = offsets_bytes.get(start..end)?;
+    Some(match bits_per_offset {
+        32 => u32::from_le_bytes(bytes.try_into().ok()?) as u64,
+        64 => u64::from_le_bytes(bytes.try_into().ok()?),
+        _ => return None,
+    })
 }
 
 impl BlockCompressor for CompressedBufferEncoder {
@@ -857,6 +1253,91 @@ mod tests {
     use std::str::FromStr;
 
     use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
+
+    #[rstest::rstest]
+    #[case::small_page(PARALLEL_MIN_BYTES - 1, 1, 64, 1)]
+    #[case::alone(64 << 20, 1, 8, 8)]
+    #[case::bounded_by_chunk_size(16 << 20, 1, 64, 16)]
+    #[case::half_pool_free(64 << 20, 4, 8, 8)]
+    #[case::pool_mostly_claimed(64 << 20, 5, 8, 1)]
+    #[case::pool_oversubscribed(64 << 20, 20, 8, 1)]
+    #[case::single_thread(64 << 20, 1, 1, 1)]
+    fn test_parallelism(
+        #[case] total: usize,
+        #[case] in_flight: usize,
+        #[case] cpus: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(parallelism(total, in_flight, cpus), expected);
+    }
+
+    async fn assert_async_per_value_matches_sequential<T>(bits_per_offset: u8)
+    where
+        T: ArrowNativeType + bytemuck::Pod + Send + Sync + std::fmt::Debug + 'static,
+    {
+        let encoder = CompressedBufferEncoder::default();
+        // 2560 values of ~4 KiB (10 MiB total) cross PARALLEL_MIN_BYTES.
+        let mut data = Vec::new();
+        let mut offsets = vec![T::from_usize(0).unwrap()];
+        for i in 0..2560u32 {
+            let len = if i % 7 == 0 {
+                0
+            } else {
+                4000 + (i % 200) as usize
+            };
+            data.extend((0..len).map(|j| ((i as usize * 31 + j * 7) % 251) as u8));
+            offsets.push(T::from_usize(data.len()).unwrap());
+        }
+        let mut seq = Vec::new();
+        let seq_offsets = map_values(&data, &offsets, &mut seq, &|v, out| {
+            encoder.compressor.compress(v, out)
+        })
+        .unwrap();
+        let data_block = DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::from(data.clone()),
+            offsets: LanceBuffer::reinterpret_vec(offsets.clone()),
+            bits_per_offset,
+            num_values: (offsets.len() - 1) as u64,
+            block_info: BlockInfo::new(),
+        });
+        let (compressed, _) =
+            PerValueCompressor::compress_with_validity_async(Arc::new(encoder), data_block, None)
+                .await
+                .unwrap();
+        let PerValueDataBlock::Variable(compressed) = compressed else {
+            panic!("expected variable-width output");
+        };
+        assert_eq!(seq, compressed.data.as_ref());
+        assert_eq!(
+            seq_offsets.borrow_to_typed_slice::<T>().as_ref(),
+            compressed.offsets.borrow_to_typed_slice::<T>().as_ref()
+        );
+
+        let compressed_offsets = compressed.offsets.borrow_to_typed_slice::<T>();
+        let mut back = Vec::new();
+        let back_offsets = CompressedBufferEncoder::default()
+            .per_value_decompress(
+                compressed.data.as_ref(),
+                compressed_offsets.as_ref(),
+                &mut back,
+            )
+            .unwrap();
+        assert_eq!(back, data);
+        assert_eq!(
+            back_offsets.borrow_to_typed_slice::<T>().as_ref(),
+            offsets.as_slice()
+        );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_per_value_parallel_matches_sequential_u32() {
+        assert_async_per_value_matches_sequential::<u32>(32).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_per_value_parallel_matches_sequential_u64() {
+        assert_async_per_value_matches_sequential::<u64>(64).await;
+    }
 
     #[test]
     fn test_compression_scheme_from_str() {
@@ -1019,6 +1500,19 @@ mod tests {
                     );
                     assert_eq!(output, b"keep", "declared {declared}, spare {spare}");
                 }
+            }
+        }
+
+        /// A length prefix too large to allocate is an error, not a panic or an abort.
+        #[test]
+        fn test_zstd_decompress_rejects_unallocatable_length_prefix() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut bad = reference_frame(b"bounded", 3);
+            for declared in [u64::MAX, isize::MAX as u64] {
+                bad[..8].copy_from_slice(&declared.to_le_bytes());
+                let mut output = b"keep".to_vec();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output, b"keep");
             }
         }
 
@@ -1251,6 +1745,59 @@ mod tests {
                 .decompress(&compressed_data, &mut decompressed_data)
                 .unwrap();
             assert_eq!(input_data, decompressed_data.as_slice());
+
+            // `decompressed_size_of_value` must detect the raw stream format and read
+            // the content size out of the Zstd frame header itself, instead of
+            // misreading the frame's leading bytes as our 8-byte length prefix (which
+            // used to report a nonsensical size like `29651633825625384` for a 13-byte
+            // value). This particular frame is produced by the streaming encoder,
+            // which does not pledge a source size, so the honest answer is `None`
+            // rather than a guess.
+            assert_eq!(
+                compressor.decompressed_size_of_value(&compressed_data),
+                None
+            );
+        }
+
+        #[test]
+        fn test_zstd_decompressed_size_of_value_raw_stream_with_known_content_size() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let input_data = b"Hello, world!";
+
+            // Unlike the streaming `Encoder` used above, the one-shot bulk API pledges
+            // the source size up front, so the resulting raw Zstd frame embeds its
+            // content size and `decompressed_size_of_value` can report it exactly
+            // without decompressing.
+            let compressed_data = ::zstd::bulk::compress(input_data, 0).unwrap();
+
+            let mut decompressed_data = Vec::new();
+            compressor
+                .decompress(&compressed_data, &mut decompressed_data)
+                .unwrap();
+            assert_eq!(input_data, decompressed_data.as_slice());
+
+            assert_eq!(
+                compressor.decompressed_size_of_value(&compressed_data),
+                Some(input_data.len() as u64)
+            );
+        }
+
+        #[test]
+        fn test_compressed_buffer_decoded_size_rejects_max_length_prefix() {
+            let compressor = CompressedBufferEncoder::try_new(CompressionConfig::new(
+                CompressionScheme::Zstd,
+                Some(0),
+            ))
+            .unwrap();
+            let offsets: Vec<u8> = [0_u32, 8, 16]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+
+            assert_eq!(
+                compressor.decompressed_size(&[u8::MAX; 16], &offsets, 32),
+                None
+            );
         }
     }
 
@@ -1305,6 +1852,32 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("declares"));
             assert!(output.is_empty());
+        }
+
+        /// A length prefix beyond what the payload can decode to is rejected before
+        /// any output is allocated, while the most compressible input still decodes.
+        #[test]
+        fn test_lz4_decompress_bounds_length_prefix() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            // A payload large enough that 255x its size exceeds any u32 is still bounded
+            // by the largest size LZ4 handles.
+            let mut large = vec![0u8; 17 << 20];
+            large[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            for bad in [compressed, large] {
+                let mut output = Vec::new();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output.capacity(), 0);
+            }
+
+            let zeros = vec![0u8; 16 << 20];
+            let mut compressed = Vec::new();
+            compressor.compress(&zeros, &mut compressed).unwrap();
+            let mut output = Vec::new();
+            compressor.decompress(&compressed, &mut output).unwrap();
+            assert!(output == zeros);
         }
 
         #[test]

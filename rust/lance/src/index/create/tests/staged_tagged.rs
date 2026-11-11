@@ -161,7 +161,7 @@ async fn assert_queries_match_scans(dataset: &Dataset, indexed: bool) {
 }
 
 async fn stored_segment(dataset: &Dataset, name: &str) -> IndexMetadata {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
@@ -426,6 +426,232 @@ async fn staged_segments_merge_across_deferred_compaction_on_tagged_table() {
         );
         assert_eq!(values(&dataset, Some(&predicate), true).await, vec![value]);
     }
+}
+
+/// A staged inverted segment whose metadata is still only under `staging/`:
+/// the fragment-masked distributed build writes partition metadata there and
+/// the root `metadata.lance` is published by the finalize that the commit
+/// runs. Reading that absence as the LEGACY layout makes the staged replay's
+/// withdrawal selector treat a modern segment as untranslatable, so a
+/// deferred compaction committed in the build's window withdraws exactly the
+/// coverage the merge is about to claim.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_table() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    // The appended rows the staged build indexes. Two hold the query term in
+    // another case form or inflection, which only the index's own analyzer
+    // (lowercasing and stemming) reaches; the bare tokenizer the flat path
+    // falls back to matches neither.
+    let texts = ["Running", "RUNS", "walked", "walking"];
+    let batch = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step_custom::<Int32Type>(8, 1))
+        .col("text", lance_datagen::array::cycle_utf8_literals(&texts))
+        .into_batch_rows(lance_datagen::RowCount::from(4))
+        .unwrap();
+    let mut dataset = crate::dataset::InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: crate::dataset::WriteMode::Append,
+            max_rows_per_file: 2,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap();
+    let appended: Vec<u32> = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .filter(|id| *id > 11)
+        .collect();
+    assert_eq!(appended.len(), 2, "{appended:?}");
+
+    // The distributed build: one fragment-masked worker segment each, never
+    // finalized, so neither has a root metadata file yet.
+    let s1 = staged_inverted_segment(&mut dataset, "text", vec![appended[0]]).await;
+    let s2 = staged_inverted_segment(&mut dataset, "text", vec![appended[1]]).await;
+    for segment in [&s1, &s2] {
+        assert!(
+            !root_metadata_exists(&dataset, segment).await,
+            "the staged build must not have published a root metadata file yet"
+        );
+    }
+
+    // The row set the staged configuration's analyzer defines for this query.
+    // Taken against the fallback tokenizer first: with no committed index on
+    // the column the flat path answers with a STRICTLY SMALLER set, so a
+    // withdrawn segment is detectable in the row set and not merely in the
+    // coverage bitmap.
+    let expected_ids = vec![8, 9];
+    let (fallback_ids, fallback_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert!(
+        fallback_plan
+            .lines()
+            .any(|line| line.trim_start().starts_with("FlatMatchQuery:")),
+        "with no committed index on the column this baseline must come from \
+         the flat (fallback tokenizer) path: {fallback_plan}"
+    );
+    assert_ne!(
+        fallback_ids, expected_ids,
+        "the fallback tokenizer must answer differently from the staged \
+         analyzer, or the test cannot tell the two configurations apart: \
+         {fallback_plan}"
+    );
+
+    // A committed index over the appended fragments makes the compaction
+    // record a transition for them (uncovered fragments would compact plainly).
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::BTree,
+            Some("committed".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let compacted: Vec<u32> = dataset
+        .fragments()
+        .iter()
+        .map(|f| f.id as u32)
+        .filter(|id| !appended.contains(id) && *id > 11)
+        .collect();
+    assert_eq!(compacted.len(), 1, "{compacted:?}");
+    let destination: RoaringBitmap = compacted.iter().copied().collect();
+
+    let merged = dataset
+        .merge_existing_index_segments(vec![s1, s2])
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.fragment_bitmap.as_ref().unwrap(),
+        &destination,
+        "the staged replay must not withdraw a modern segment's coverage for \
+         a root metadata file the build has not published yet"
+    );
+    dataset
+        .commit_existing_index_segments("staged", "text", vec![merged])
+        .await
+        .unwrap();
+
+    // Immediately after the replay committed, on the handle that performed
+    // it: the row set must already be the staged configuration's, so the
+    // answer never passes through the default tokenizer.
+    let (replayed_ids, replayed_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert_eq!(
+        replayed_ids, expected_ids,
+        "the replayed segment must answer with its own tokenizer's row set: \
+         {replayed_plan}"
+    );
+
+    // Finalization happened at commit time, so the committed segment now has
+    // its root metadata and the reader derives the compacted coverage.
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(
+        root_metadata_exists(&dataset, &stored_segment(&dataset, "staged").await).await,
+        "the commit must have finalized the staged segment"
+    );
+    assert_eq!(
+        derived_coverage(&dataset, "staged").await,
+        Some(destination)
+    );
+
+    // The same row set the staged configuration defined, now answered through
+    // the finalized index rather than by a stemming flat scan.
+    let (final_ids, final_plan) = fts_ids(&dataset, "text", ANALYZER_SENSITIVE_QUERY).await;
+    assert!(
+        final_plan
+            .lines()
+            .any(|line| line.trim_start().starts_with("MatchQuery:")),
+        "the finalized segment must serve full-text search from the index: \
+         {final_plan}"
+    );
+    assert_eq!(
+        final_ids, expected_ids,
+        "the committed index must answer with the row set its own tokenizer \
+         defines, not the default tokenizer's stemmed superset: {final_plan}"
+    );
+}
+
+/// The staged build's inverted configuration. Its analyzer lowercases and
+/// stems; the tokenizer the flat path falls back to when no segment is
+/// available is a bare simple tokenizer that does neither. So a query in one
+/// case form matches a differently-cased or inflected document only through
+/// the index, which is what makes a withdrawn segment visible in the ROW SET
+/// and not merely in the coverage bitmap.
+fn analyzed_params() -> InvertedIndexParams {
+    InvertedIndexParams::default()
+        .lower_case(true)
+        .stem(true)
+        .remove_stop_words(false)
+}
+
+/// A lowercase query whose matches in the fixture are written in other case
+/// forms, so only the index's own analyzer finds them.
+const ANALYZER_SENSITIVE_QUERY: &str = "running";
+
+/// A fragment-masked uncommitted inverted build, as a distributed worker
+/// produces it.
+async fn staged_inverted_segment(
+    dataset: &mut Dataset,
+    column: &str,
+    fragments: Vec<u32>,
+) -> IndexMetadata {
+    let params = analyzed_params();
+    CreateIndexBuilder::new(dataset, &[column], IndexType::Inverted, &params)
+        .name("staged".to_string())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap()
+}
+
+/// The sorted `i` values full-text search returns for `query` on `column`,
+/// with the plan, so a test can compare the ACTUAL matching row set rather
+/// than a count.
+async fn fts_ids(dataset: &Dataset, column: &str, query: &str) -> (Vec<i32>, String) {
+    let mut scan = dataset.scan();
+    scan.full_text_search(
+        FullTextSearchQuery::new(query.to_string())
+            .with_column(column.to_string())
+            .unwrap(),
+    )
+    .unwrap();
+    scan.project(&["i"]).unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids: Vec<i32> = batch["i"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+    ids.sort_unstable();
+    (ids, plan)
+}
+
+/// Whether the segment has published the root metadata file that marks a
+/// finalized inverted index.
+async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> bool {
+    let path = dataset
+        .indices_dir()
+        .join(segment.uuid.to_string())
+        .join(lance_index::scalar::inverted::METADATA_FILE);
+    dataset.object_store.exists(&path).await.unwrap()
 }
 
 /// The NGram merge reads spill files and translates only through the v0
@@ -788,7 +1014,7 @@ async fn withdrawn_vector_index_is_rebuilt_by_optimize() {
         "the new segment claims the live fragments"
     );
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -875,7 +1101,7 @@ async fn staged_segments_survive_a_same_name_optimize_in_the_window() {
         .await
         .unwrap();
     let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
-    let delta = crate::index::load_all_indices(&dataset)
+    let delta = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -898,7 +1124,7 @@ async fn staged_segments_survive_a_same_name_optimize_in_the_window() {
         .await
         .unwrap();
     let dataset = Dataset::open(dir.as_str()).await.unwrap();
-    let remaining: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+    let remaining: Vec<Uuid> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -1030,7 +1256,7 @@ async fn staged_segments_refuse_a_history_with_a_cleaned_up_version() {
         "{error}"
     );
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -1196,7 +1422,7 @@ fn fragment_ids(dataset: &Dataset) -> Vec<u32> {
 
 /// The stored segments of the logical index `name`, in manifest order.
 async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
@@ -1206,7 +1432,7 @@ async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
 }
 
 async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
@@ -1461,7 +1687,7 @@ async fn assert_scalar_queries_match(dataset: &Dataset) {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // The file still addresses the retired sources.
     let stale = raw_segment_row_addrs(&dataset, &old, 101).await;
@@ -1562,7 +1788,7 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     let dir = TempStrDir::default();
-    let (mut dataset, first_destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (mut dataset, first_destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // Round two: every remaining fragment (F0, F1 and the first destination)
     // is indexed, so the planner bins them together.
@@ -1676,7 +1902,7 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     let (dataset, sp_destinations) = upgrade_by_stable_partition(dataset, 300).await;
     let mut dataset = append_scalar_rows(dataset, 400, 4).await;

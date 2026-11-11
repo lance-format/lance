@@ -18,8 +18,10 @@ import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.index.IndexFragmentCoverage;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.BTreeIndexParams;
@@ -57,7 +59,11 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -260,6 +266,46 @@ public class DatasetTest {
         () -> {
           dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
         });
+  }
+
+  @Test
+  void testOpenMissingDatasetThrowsDatasetNotFound(@TempDir Path tempDir) {
+    String missingPath = tempDir.resolve("missing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      DatasetNotFoundException error =
+          assertThrows(DatasetNotFoundException.class, () -> Dataset.open(missingPath, allocator));
+      assertTrue(error.getMessage().contains("missing_dataset"), error.getMessage());
+      // Handlers written for the IllegalArgumentException thrown before still catch it.
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testCreateExistingDatasetThrowsDatasetAlreadyExists(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("existing_dataset").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      DatasetAlreadyExistsException error =
+          assertThrows(DatasetAlreadyExistsException.class, testDataset::createEmptyDataset);
+      assertTrue(error.getMessage().contains("existing_dataset"), error.getMessage());
+      assertInstanceOf(IllegalArgumentException.class, error);
+    }
+  }
+
+  @Test
+  void testOpenUnknownSchemeIsNotDatasetNotFound() {
+    // Invalid input is still reported as a plain IllegalArgumentException, so callers can tell it
+    // apart from a missing dataset.
+    try (BufferAllocator allocator = new RootAllocator()) {
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> Dataset.open("nosuchscheme://bucket/table.lance", allocator));
+      assertEquals(IllegalArgumentException.class, error.getClass(), error.getMessage());
+      assertTrue(error.getMessage().contains("nosuchscheme"), error.getMessage());
+    }
   }
 
   @Test
@@ -544,6 +590,14 @@ public class DatasetTest {
         assertEquals(2, dataset2.tags().list().size());
         dataset2.tags().delete("tag_on_branch");
         assertEquals(1, dataset2.tags().list().size());
+
+        dataset2.tags().update("tag1", 2);
+        assertEquals(2, dataset2.tags().getVersion("tag1"));
+        Dataset.Tags tags = dataset2.tags();
+        dataset2.close();
+        IllegalArgumentException closed =
+            assertThrows(IllegalArgumentException.class, () -> tags.update("tag1", 1));
+        assertTrue(closed.getMessage().contains("Dataset is closed"));
       }
     }
   }
@@ -1630,6 +1684,46 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetRowAddresses(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build());
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        // Row ids 0-4 live in the first fragment and 5-9 in the second.
+        long second = ds.getFragments().get(1).getId();
+        assertEquals(
+            Arrays.asList(second << 32 | 2, null), ds.getRowAddresses(Arrays.asList(7L, 99L)));
+
+        // Compaction moves every row into one new fragment but keeps its id; deleted rows
+        // (ids 2 and 7 hold id = 2) no longer resolve.
+        ds.compact();
+        ds.delete("id = 2");
+        assertEquals(1, ds.getFragments().size());
+        long compacted = ds.getFragments().get(0).getId();
+        assertEquals(
+            Arrays.asList(compacted << 32 | 8, null, compacted << 32 | 1, compacted << 32 | 8),
+            ds.getRowAddresses(Arrays.asList(8L, 7L, 1L, 8L)));
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("plain").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset ds = testDataset.write(1, 5)) {
+        // Without stable row ids a row id is its address, so ids pass through unchanged.
+        List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
+        assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
@@ -2078,8 +2172,32 @@ public class DatasetTest {
                   assertTrue(branch2Meta.getCreateAt() > 0);
                   assertTrue(branch2Meta.getManifestSize() > 0);
 
-                  // Delete branch1 and verify listing
+                  // Delete branch2 and reject checkout and writes through its stale handle.
                   mainV2.branches().delete("branch2");
+                  assertEquals(1, mainV2.branches().list().size());
+                  RuntimeException deletedBranch =
+                      assertThrows(
+                          RuntimeException.class, () -> mainV2.checkout(Ref.ofBranch("branch2")));
+                  assertTrue(
+                      deletedBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      deletedBranch.getMessage());
+                  RuntimeException staleCommit =
+                      assertThrows(
+                          RuntimeException.class,
+                          () ->
+                              branch2V4
+                                  .newTransactionBuilder()
+                                  .operation(appendC)
+                                  .build()
+                                  .commit());
+                  assertTrue(
+                      staleCommit
+                          .getMessage()
+                          .contains("Ref not found error: branch branch2 does not exist"),
+                      staleCommit.getMessage());
+                  assertEquals(4, branch2V4.version());
                   assertEquals(1, mainV2.branches().list().size());
 
                   // Step 6. use checkout_branch to checkout branch1
@@ -2139,11 +2257,15 @@ public class DatasetTest {
                     assertEquals(8, opened.countRows()); // A(5) + B(3)
                     assertTrue(opened.uri().contains("tree/branch1"), opened.uri());
                   }
-                  IOException missing =
+                  RuntimeException missingBranch =
                       assertThrows(
-                          IOException.class,
+                          RuntimeException.class,
                           () -> openAt(allocator, datasetPath, Ref.ofBranch("no_such_branch")));
-                  assertTrue(missing.getMessage().contains("no_such_branch"), missing.getMessage());
+                  assertTrue(
+                      missingBranch
+                          .getMessage()
+                          .contains("Ref not found error: branch no_such_branch does not exist"),
+                      missingBranch.getMessage());
                   RuntimeException missingTag =
                       assertThrows(
                           RuntimeException.class,
@@ -2662,6 +2784,90 @@ public class DatasetTest {
             "BTree",
             stats.get("index_type"),
             "Index statistics should contain index_type information");
+
+        Index physicalSegment =
+            dataset.getIndexes().stream()
+                .filter(index -> TestVectorDataset.indexName.equals(index.name()))
+                .findFirst()
+                .orElseThrow();
+        IndexSegmentStatistics segmentStatistics =
+            dataset
+                .getIndexSegmentStatistics(
+                    TestVectorDataset.indexName, Collections.singletonList(physicalSegment.uuid()))
+                .get(0);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+          output.writeObject(segmentStatistics);
+        }
+        IndexSegmentStatistics restored;
+        try (ObjectInputStream input =
+            new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+          restored = (IndexSegmentStatistics) input.readObject();
+        }
+        assertEquals(segmentStatistics.getIndexUuid(), restored.getIndexUuid());
+        assertEquals(
+            stats,
+            dataset.getIndexStatisticsFromSegments(
+                TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Arrays.asList(restored, restored)));
+        dataset.delete("i = 0");
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexSegmentStatistics(
+                    "", Collections.singletonList(physicalSegment.uuid())));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexSegmentStatistics(TestVectorDataset.indexName, null));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexStatisticsFromSegments(TestVectorDataset.indexName, null));
+      }
+    }
+  }
+
+  @Test
+  public void testIndexStatisticsForDetachedVersion(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      testDataset.createEmptyDataset(true).close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+        Append append =
+            Append.builder()
+                .fragments(Collections.singletonList(testDataset.createNewFragment(3)))
+                .build();
+        SourcedTransaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        try (Dataset detached = dataset.commitTransaction(transaction.transaction(), true, false)) {
+          assertTrue(detached.version() < 0);
+          Map<String, Object> expected = detached.getIndexStatistics("id_idx");
+          assertEquals(5L, ((Number) expected.get("num_indexed_rows")).longValue());
+          assertEquals(3L, ((Number) expected.get("num_unindexed_rows")).longValue());
+          List<IndexSegmentStatistics> statistics =
+              detached.getIndexSegmentStatistics(
+                  "id_idx", Collections.singletonList(detached.getIndexes().get(0).uuid()));
+          assertEquals(1, statistics.size());
+          assertEquals(detached.version(), statistics.get(0).getReadVersion());
+          assertEquals(expected, detached.getIndexStatisticsFromSegments("id_idx", statistics));
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.getIndexStatisticsFromSegments("id_idx", statistics));
+        }
       }
     }
   }
@@ -2713,6 +2919,33 @@ public class DatasetTest {
             desc.getSegments().get(0).getSizeBytes(),
             desc.getTotalSizeBytes(),
             "single-segment size should equal the logical index size");
+        IndexFragmentCoverage coverage =
+            desc.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertTrue(coverage.getCurrentFragmentCount() > 0);
+        assertEquals(coverage.getCurrentFragmentCount(), coverage.getCoveredFragmentCount());
+        assertEquals(0, coverage.getMissingFragmentCount());
+        assertEquals(0, coverage.getStaleFragmentCount());
+        assertTrue(coverage.getFragmentBitmapSizeBytes() > 0);
+        assertEquals(1.0, coverage.getCoverageRatio().orElseThrow(AssertionError::new));
+
+        List<IndexDescription> summaries = dataset.describeIndexSummaries(criteria);
+        assertEquals(1, summaries.size());
+        IndexDescription summary = summaries.get(0);
+        assertEquals(desc.getName(), summary.getName());
+        assertEquals(desc.getRowsIndexed(), summary.getRowsIndexed());
+        assertEquals(desc.getTotalSizeBytes(), summary.getTotalSizeBytes());
+        assertTrue(summary.getSegments().isEmpty());
+        IndexFragmentCoverage summaryCoverage =
+            summary.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertEquals(coverage.getCoveredFragmentCount(), summaryCoverage.getCoveredFragmentCount());
+        assertEquals(coverage.getCurrentFragmentCount(), summaryCoverage.getCurrentFragmentCount());
+        assertEquals(coverage.getMissingFragmentCount(), summaryCoverage.getMissingFragmentCount());
+        assertEquals(coverage.getStaleFragmentCount(), summaryCoverage.getStaleFragmentCount());
+        assertEquals(
+            coverage.getFragmentBitmapSizeBytes(), summaryCoverage.getFragmentBitmapSizeBytes());
+        assertTrue(
+            new IndexFragmentCoverage(0, 0, 0, 0, 0).getCoverageRatio().isEmpty(),
+            "an empty fragment set has no coverage ratio");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");

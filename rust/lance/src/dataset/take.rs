@@ -422,7 +422,7 @@ pub fn take_scan(
                     .await
                     .map_err(|err| DataFusionError::External(Box::new(err)))
             };
-            async move { tokio::task::spawn(fut).await.unwrap() }
+            async move { lance_core::utils::tokio::spawn(fut).await.unwrap() }
         })
         .buffered(batch_readahead);
 
@@ -1114,6 +1114,7 @@ mod test {
             dataset.version().version,
             &DeletionVector::from_iter(0..4),
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap();

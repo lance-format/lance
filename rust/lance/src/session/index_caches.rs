@@ -16,7 +16,7 @@ use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_select::RowAddrMask;
-use lance_table::format::IndexMetadata;
+use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
 use uuid::Uuid;
 
 /// A type-safe wrapper around a LanceCache that enforces namespaces for index data.
@@ -92,6 +92,55 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
+/// Whole-dataset row-id lookup for one manifest and deletion mode.
+#[derive(Debug)]
+pub(crate) struct RowIdIndexKey<'a> {
+    pub version: u64,
+    /// Whether the index knows the deleted rows (it then maps them to `None`).
+    /// An index built without deletion vectors reads no deletion file.
+    pub with_deletions: bool,
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1, so a long-lived session's cache can otherwise return the
+    /// previous incarnation's index for a version number the new incarnation
+    /// now also holds. The e-tag disambiguates generations the same way
+    /// [`super::caches::ManifestKey::e_tag`] does. Callers without one must not
+    /// share the cached index at all (see `get_row_id_index`).
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for RowIdIndexKey<'_> {
+    type ValueType = RowIdIndex;
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_index/{}/{}/{}",
+            self.version,
+            self.with_deletions,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+    fn type_name() -> &'static str {
+        "RowIdIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_u64(self.with_deletions as u64);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+}
+
+/// Decoded fragment reuse history with `index_version = 0`, keyed by
+/// `index::frag_reuse::v0_cache_identity`.
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
@@ -230,11 +279,15 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        // v2 holds every index the manifest names; v1 held only the ones the
-        // writing build could read. The fields are identical, so on a persistent
-        // backend shared with another release nothing but this version stops each
-        // build from reading the other's entry as its own meaning.
-        CacheKeySchema::new("lance.index.metadata-key", 2)
+        // v3 entries carry each segment's clustering reference and metadata;
+        // a v2 entry, written by a build that did not know those fields, holds
+        // every segment unlabelled, and a writer trusting it would republish
+        // the index section without the labels. v2 in turn holds every index
+        // the manifest names where v1 held only the readable ones. On a
+        // persistent backend shared with another release nothing but this
+        // version stops each build from reading the other's entry as its own
+        // meaning.
+        CacheKeySchema::new("lance.index.metadata-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -256,6 +309,8 @@ impl CacheKey for IndexMetadataKey<'_> {
 
 /// Cache key for the query-time index listing DERIVED from a v1 (tagged) FRI:
 /// the coverage-rewritten, filtered listing produced by `frag_reuse_reader`.
+/// For a v0 FRI it holds the listing `load_all_indices` remapped through it; a
+/// snapshot carries one FRI entry, so the two never share a key.
 ///
 /// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
 /// listing. This one caches the per-snapshot result of the coverage backtrack so
@@ -359,6 +414,47 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::generation(5, true, "second-etag")]
+    #[case::version(6, true, "first-etag")]
+    #[case::deletions(5, false, "first-etag")]
+    #[tokio::test]
+    async fn row_id_index_key_separates_snapshots(
+        #[case] version: u64,
+        #[case] with_deletions: bool,
+        #[case] e_tag: &str,
+    ) {
+        let global = GlobalIndexCache(LanceCache::with_capacity(4096));
+        let cache = global.for_dataset("first");
+        let key = RowIdIndexKey {
+            version: 5,
+            with_deletions: true,
+            e_tag: Some("first-etag"),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        assert!(
+            cache
+                .get_with_key(&RowIdIndexKey {
+                    version,
+                    with_deletions,
+                    e_tag: Some(e_tag),
+                })
+                .await
+                .is_none()
+        );
+        assert!(
+            global
+                .for_dataset("second")
+                .get_with_key(&key)
+                .await
+                .is_none()
+        );
+    }
 
     #[test]
     fn index_metadata_key_isolates_object_store_identity() {

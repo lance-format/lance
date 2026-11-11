@@ -21,7 +21,7 @@ use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_index::scalar::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable, RowAddrTranslator,
 };
-use lance_table::format::overlay::staleness::overlay_affects_index;
+use lance_table::format::overlay::staleness::remove_overlay_stale_frags;
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
@@ -335,7 +335,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // leaves missing mappings unchanged, so no composed per-row map is needed.
     // This also handles the sibling-coverage-remap case: remapping is driven by
     // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result = index::remap_index(
+    let remap_result = index::remap::remap_index(
         dataset,
         index_id,
         &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
@@ -347,19 +347,12 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // does not incorporate overlays committed after the source index was built.
     // Exclude those fragments so queries scan their current values instead.
     if let Some(fragment_bitmap) = &mut bitmap_after_remap {
-        for fragment in dataset.manifest.fragments.iter() {
-            let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
-                overlay_affects_index(
-                    overlay,
-                    &curr_index_meta.fields,
-                    curr_index_meta.dataset_version,
-                    dataset.schema(),
-                )
-            });
-            if has_newer_indexed_overlay {
-                fragment_bitmap.remove(fragment.id as u32);
-            }
-        }
+        remove_overlay_stale_frags(
+            fragment_bitmap,
+            &dataset.manifest.fragments,
+            &curr_index_meta,
+            dataset.schema(),
+        );
     }
     let new_dataset_version = if has_unknown_coverage {
         curr_index_meta.dataset_version
@@ -370,7 +363,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     let new_index_meta = match remap_result {
         // Nothing to commit: either the composed remap emptied the index (every
         // row deleted), matching the prior per-version behavior, or
-        // `index::remap_index` withdrew a covered index it cannot carry payload
+        // `index::remap::remap_index` withdrew a covered index it cannot carry payload
         // through. Either way the existing entry is left untouched.
         //
         // The withdrawal case is unreachable here today: the only caller is
@@ -390,6 +383,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -403,6 +398,8 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 
@@ -935,12 +932,35 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             );
             return Ok(());
         }
+        // Not a verdict about the segment: the store could not be read. The
+        // caller named this index, so it hears that nothing was remapped and
+        // can retry, rather than a success log for a remap that did nothing.
+        Some(reason @ MissingCoverageReason::Unverifiable) => {
+            return Err(Error::index(format!(
+                "could not classify index {} (segment {}) for remapping: {reason}. \
+                 Its format marker could not be read; retry once the index files \
+                 are readable",
+                curr_index_meta.name, curr_index_meta.uuid
+            )));
+        }
         Some(MissingCoverageReason::Corrupt) => {
             return Err(Error::index(format!(
                 "index {} ({}) has metadata this build cannot interpret; rebuild the index",
                 curr_index_meta.name, curr_index_meta.uuid
             )));
         }
+    }
+    // Runs after the segment's own probe above, which only reports an
+    // unreadable marker for the segment it visits. Without this, a readable
+    // older segment would be replaced while an unreadable newer sibling of the
+    // same logical index is still unaccounted for.
+    let listing = dataset.derived_index_listing().await?;
+    if listing.unverifiable.contains(&curr_index_meta.name) {
+        return Err(Error::index(format!(
+            "could not verify the coverage of index {} (segment {}): a segment's index \
+             file could not be read; retry once the index files are readable",
+            curr_index_meta.name, curr_index_meta.uuid
+        )));
     }
     let Some(stored_bitmap) = curr_index_meta.fragment_bitmap.clone() else {
         log::warn!(
@@ -996,12 +1016,10 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // actually holds those rows. (For types that stream raw pages, e.g.
         // BTree, the rows the reader cedes are dropped by the translator's
         // claim filter below, so file and bitmap agree.)
-        use crate::index::DatasetIndexExt;
-        if let Some(listed) = dataset
-            .load_indices()
-            .await?
-            .iter()
-            .find(|idx| idx.uuid == *index_id)
+        // The narrowing reads the same listing the guard above verified, so a
+        // read outage between the two steps cannot change the published
+        // ownership.
+        if let Some(listed) = listing.indices.iter().find(|idx| idx.uuid == *index_id)
             && let Some(servable) = &listed.fragment_bitmap
         {
             coverage &= servable;
@@ -1011,19 +1029,12 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     // Overlays committed after the source index was built are not
     // incorporated by the remap; exclude those fragments so queries scan
     // their current values instead (mirrors the v0 path).
-    for fragment in dataset.manifest.fragments.iter() {
-        let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
-            overlay_affects_index(
-                overlay,
-                &curr_index_meta.fields,
-                curr_index_meta.dataset_version,
-                dataset.schema(),
-            )
-        });
-        if has_newer_indexed_overlay {
-            coverage.remove(fragment.id as u32);
-        }
-    }
+    remove_overlay_stale_frags(
+        &mut coverage,
+        &dataset.manifest.fragments,
+        &curr_index_meta,
+        dataset.schema(),
+    );
 
     // Straddle-only outcome: coverage was dropped but no address moves, so
     // the index files stay as they are and only the swapped bitmap (plus the
@@ -1038,7 +1049,7 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         // is dropped.
         let translator =
             materialize_hops(dataset, &ledger, hops, admitted, coverage.clone()).await?;
-        match index::remap_index(dataset, index_id, &translator, None).await {
+        match index::remap::remap_index(dataset, index_id, &translator, None).await {
             Ok(result) => result,
             // The index only knows the legacy in-memory remap and this build
             // cannot prepare a complete mapping for it within budget: not an
@@ -1093,6 +1104,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             // this dataset's own index directory.)
             base_id: curr_index_meta.base_id,
             files: curr_index_meta.files.clone(),
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
         RemapResult::Remapped(remapped_index) => IndexMetadata {
             uuid: remapped_index.new_id,
@@ -1106,6 +1119,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             created_at: curr_index_meta.created_at,
             base_id: None,
             files: remapped_index.files,
+            clustering_id: curr_index_meta.clustering_id,
+            metadata: curr_index_meta.metadata.clone(),
         },
     };
 
@@ -1160,12 +1175,12 @@ pub async fn remap_column_index(
     // re-reads the manifest by uuid, so the uuids taken here stay valid.
     // Tagged tables resolve from the stored list: the query listing may
     // exclude a straddled segment that maintenance must still reach.
-    let tagged = crate::index::load_all_indices(dataset)
+    let tagged = crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
         .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version != 0);
     let segments: Vec<IndexMetadata> = if tagged {
-        crate::index::load_all_indices_by_name(dataset, &index_name).await?
+        crate::index::loading::load_all_indices_by_name(dataset, &index_name).await?
     } else {
         dataset
             .load_indices()
@@ -1184,7 +1199,7 @@ pub async fn remap_column_index(
     for index in &segments {
         // The real question is "does this index belong to this column",
         // i.e. its one keyed field is `field.id`. Carried fields are
-        // irrelevant here, same as in `index::remap_index`.
+        // irrelevant here, same as in `index::remap::remap_index`.
         if index.keyed_field() != Some(field.id) {
             return Err(Error::index(format!(
                 "Index name {} already exists with fields {:?} (carried fields {:?}); \
@@ -1220,8 +1235,8 @@ pub async fn remap_column_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::DatasetIndexInternalExt;
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    use crate::index::loading::DatasetIndexInternalExt;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
     use lance_core::utils::tempfile::TempStrDir;
@@ -1947,6 +1962,7 @@ mod tests {
         use crate::utils::test::FailingProxyStore;
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, Int32Array, UInt64Array};
         use lance_index::IndexType;
         use lance_index::optimize::OptimizeOptions;
         use lance_index::scalar::ScalarIndexParams;
@@ -2013,7 +2029,7 @@ mod tests {
         /// returns for `i = value`, read straight from its files (no
         /// planner, no bitmap filter): what the remapped file holds.
         async fn segment_fragments_for(dataset: &Dataset, value: i32) -> Vec<u32> {
-            use crate::index::DatasetIndexInternalExt;
+            use crate::index::loading::DatasetIndexInternalExt;
             use lance_index::metrics::NoOpMetricsCollector;
             use lance_index::scalar::{SargableQuery, SearchResult};
             let segment = stored_index(dataset, "i_idx").await;
@@ -3162,8 +3178,9 @@ mod tests {
             let source_uri = format!("{}/source", dir.as_str());
             let clone_uri = format!("{}/clone", dir.as_str());
 
-            // Keep the healthy fragment {0} before the compacted pair {1,2},
-            // so its physical addresses stay unchanged by suffix relabeling.
+            // Source: fragments {0,1} of 4 rows, fragment {2} of 8 rows (at
+            // the compaction target, so it stays untouched), indexed by
+            // i_idx.
             let batch = lance_datagen::gen_batch()
                 .col("i", lance_datagen::array::step::<Int32Type>())
                 .into_batch_rows(lance_datagen::RowCount::from(8))
@@ -3173,7 +3190,7 @@ mod tests {
                 RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
                 &source_uri,
                 Some(crate::dataset::WriteParams {
-                    max_rows_per_file: 8,
+                    max_rows_per_file: 4,
                     ..Default::default()
                 }),
             )
@@ -3186,7 +3203,7 @@ mod tests {
             let mut source = InsertBuilder::new(Arc::new(source.clone()))
                 .with_params(&WriteParams {
                     mode: WriteMode::Append,
-                    max_rows_per_file: 4,
+                    max_rows_per_file: 8,
                     ..Default::default()
                 })
                 .execute(vec![batch])
@@ -3236,7 +3253,7 @@ mod tests {
                 .filter(|id| *id > 2)
                 .collect();
             let mut dataset = commit_stable_partition(dataset, &appended, 10).await;
-            let metrics = compact_files(
+            compact_files(
                 &mut dataset,
                 CompactionOptions {
                     target_rows_per_fragment: 8,
@@ -3247,13 +3264,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(metrics.fragments_removed, 4);
-            assert_eq!(metrics.fragments_added, 2);
-            assert_eq!(dataset.fragments()[0].id, 0);
-            // The compaction consumed {1,2}; narrow the inherited segment so
+            // The compaction consumed {0,1}; narrow the inherited segment so
             // the remap straddles that group while keeping live coverage of
-            // the untouched fragment {0}.
-            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 1]).await;
+            // the untouched fragment {2}.
+            narrow_index_bitmap(&mut dataset, "i_idx", &[0, 2]).await;
 
             remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
                 .await
@@ -3269,19 +3283,196 @@ mod tests {
             );
             assert_eq!(
                 after.fragment_bitmap.as_ref().unwrap(),
-                &RoaringBitmap::from_iter([0u32])
+                &RoaringBitmap::from_iter([2u32])
             );
 
             // The surviving coverage is served by opening the files from the
             // source base.
             assert_eq!(
-                sorted_values(&dataset, Some("i = 1")).await,
-                vec![1],
+                sorted_values(&dataset, Some("i = 9")).await,
+                vec![9],
                 "queries must still open the inherited files from the source base"
             );
             assert_eq!(
                 sorted_values(&dataset, None).await,
                 (0..24).collect::<Vec<_>>()
+            );
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum RemapPath {
+            Untagged,
+            Tagged,
+        }
+
+        /// `remap_index` publishes nothing for a covered index, so only the
+        /// tagged path has a carried column to check.
+        #[rstest::rstest]
+        #[case::untagged_keyed(RemapPath::Untagged, &["i"], "i", true)]
+        #[case::untagged_unrelated(RemapPath::Untagged, &["i"], "v", false)]
+        #[case::tagged_keyed(RemapPath::Tagged, &["i"], "i", true)]
+        #[case::tagged_carried(RemapPath::Tagged, &["i", "w"], "w", true)]
+        #[case::tagged_unrelated(RemapPath::Tagged, &["i", "w"], "v", false)]
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn remap_drops_fragments_a_newer_overlay_made_stale(
+            #[case] path: RemapPath,
+            #[case] fields: &[&str],
+            #[case] overlaid: &str,
+            #[case] stale: bool,
+        ) {
+            let columns = |start: i32| {
+                lance_datagen::gen_batch()
+                    .col(
+                        "i",
+                        lance_datagen::array::step_custom::<Int32Type>(start, 1),
+                    )
+                    .col(
+                        "w",
+                        lance_datagen::array::step_custom::<Int32Type>(start, 1),
+                    )
+                    .col(
+                        "v",
+                        lance_datagen::array::step_custom::<Int32Type>(start, 1),
+                    )
+                    .into_batch_rows(lance_datagen::RowCount::from(8))
+                    .unwrap()
+            };
+            let append = |dataset: Dataset, start: i32, max_rows_per_file: usize| async move {
+                InsertBuilder::new(Arc::new(dataset))
+                    .with_params(&WriteParams {
+                        mode: WriteMode::Append,
+                        max_rows_per_file,
+                        ..Default::default()
+                    })
+                    .execute(vec![columns(start)])
+                    .await
+                    .unwrap()
+            };
+            // The compaction consumes {0,1}; {2} is at the target size and
+            // takes the overlay.
+            let dataset = InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                })
+                .execute(vec![columns(0)])
+                .await
+                .unwrap();
+            let mut dataset = append(dataset, 8, 8).await;
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let overlaid_id = dataset.schema().field_id(overlaid).unwrap();
+            let batch = arrow_array::RecordBatch::try_from_iter_with_nullable([
+                (
+                    lance_core::ROW_ADDR,
+                    Arc::new(UInt64Array::from(vec![u64::from(
+                        RowAddress::new_from_parts(2, 0),
+                    )])) as ArrayRef,
+                    true,
+                ),
+                (
+                    overlaid,
+                    Arc::new(Int32Array::from(vec![-1])) as ArrayRef,
+                    true,
+                ),
+            ])
+            .unwrap();
+            let mut writer = dataset
+                .get_fragment(2)
+                .unwrap()
+                .write_overlay(&dataset.schema().project_by_ids(&[overlaid_id], true))
+                .await
+                .unwrap();
+            writer.write_batch(&batch).await.unwrap();
+            let group = writer.finish().await.unwrap().unwrap();
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::DataOverlay {
+                            groups: vec![group],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            if let RemapPath::Tagged = path {
+                let mut appended = append(dataset, 16, 4).await;
+                reserve_fragments(&mut appended, 40).await;
+                dataset = commit_stable_partition(appended, &[3, 4], 10).await;
+            }
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 8,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            if let RemapPath::Tagged = path {
+                let original = stored_index(&dataset, "i_idx").await;
+                let field_ids: Vec<i32> = fields
+                    .iter()
+                    .map(|name| dataset.schema().field_id(name).unwrap())
+                    .collect();
+                // Straddling the compacted {0,1} while keeping {2} moves no
+                // address, so the remap keeps the files of a covered index.
+                let segment = IndexMetadata {
+                    fields: field_ids.clone(),
+                    covering_fields: field_ids[1..].to_vec(),
+                    fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 2])),
+                    ..original.clone()
+                };
+                dataset
+                    .apply_commit(
+                        Transaction::new(
+                            dataset.manifest.version,
+                            Operation::CreateIndex {
+                                new_indices: vec![segment],
+                                removed_indices: vec![original],
+                            },
+                            None,
+                        ),
+                        &Default::default(),
+                        &Default::default(),
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            let index_id = stored_index(&dataset, "i_idx").await.uuid;
+            let version = dataset.manifest.version;
+            match path {
+                RemapPath::Untagged => remap_index(&mut dataset, &index_id).await.unwrap(),
+                RemapPath::Tagged => remap_index_tagged(&mut dataset, &index_id).await.unwrap(),
+            }
+            assert!(
+                dataset.manifest.version > version,
+                "{path:?}: the remap commits"
+            );
+            let coverage = stored_index(&dataset, "i_idx")
+                .await
+                .fragment_bitmap
+                .unwrap();
+            assert_eq!(
+                coverage.contains(2),
+                !stale,
+                "{path:?}, fields {fields:?}: an overlay on {overlaid} left coverage {coverage:?}"
             );
         }
 
@@ -3397,7 +3588,7 @@ mod tests {
         /// The bitmap of `name` as `load_all_indices` serves it: on a v0
         /// table the bitmap a deferred compaction swapped in memory.
         async fn loaded_bitmap(dataset: &Dataset, name: &str) -> RoaringBitmap {
-            crate::index::load_all_indices(dataset)
+            crate::index::loading::load_all_indices(dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -4087,6 +4278,83 @@ mod tests {
                 assert!(!plan.contains("ANN"), "{plan}");
                 assert_eq!(indexed, exact, "ranking for i = {key}");
             }
+        }
+
+        /// A remap commits each vector segment it translates as a
+        /// `CreateIndex`, whose check reads every segment of the index. A
+        /// sibling the history cannot translate, here one without a fragment
+        /// bitmap, is left for a rebuild, and its commit check reads it from
+        /// its file rather than through the history.
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn vector_remap_beside_an_untranslatable_segment() {
+            use crate::index::frag_reuse::{MissingCoverageReason, segment_coverage_reason};
+            use crate::index::vector::VectorIndexParams;
+            use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+            use arrow_array::types::Float32Type;
+            use lance_datagen::Dimension;
+            use lance_linalg::distance::DistanceType;
+
+            let mut dataset = lance_datagen::gen_batch()
+                .col("i", lance_datagen::array::step::<Int32Type>())
+                .col(
+                    "vec",
+                    lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(VEC_DIM)),
+                )
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+                .await
+                .unwrap();
+            let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+            dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("vec_idx".into()),
+                    &params,
+                    false,
+                )
+                .await
+                .unwrap();
+            let translated = stored_index(&dataset, "vec_idx").await.uuid;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+
+            let mut sibling = dataset
+                .create_index_builder(&["vec"], IndexType::Vector, &params)
+                .name("worker_idx".into())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            sibling.name = "vec_idx".into();
+            sibling.fragment_bitmap = None;
+            let mut indices = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .as_ref()
+                .clone();
+            indices.push(sibling.clone());
+            reader_tests::persist_fixture(&mut dataset, indices).await;
+            assert_eq!(
+                segment_coverage_reason(&dataset, &sibling).await.unwrap(),
+                Some(MissingCoverageReason::Unsupported)
+            );
+
+            remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+                .await
+                .unwrap();
+            let segments = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "vec_idx")
+                .map(|index| (index.uuid, index.fragment_bitmap.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(segments.len(), 2, "{segments:?}");
+            assert!(segments.contains(&(sibling.uuid, None)), "{segments:?}");
+            assert!(
+                segments.iter().all(|(uuid, _)| *uuid != translated),
+                "the translatable segment is replaced by its remap: {segments:?}"
+            );
         }
 
         // ------------------------------------------------------------------
@@ -4836,7 +5104,7 @@ mod tests {
     /// that covers nothing with no indication why.
     ///
     /// Asserting on committed metadata here would prove nothing: the flow is
-    /// `remap_column_index` -> the private `remap_index` -> `index::remap_index`,
+    /// `remap_column_index` -> the private `remap_index` -> `index::remap::remap_index`,
     /// which withdraws a covered index before the fully-deleted `Keep` check, and
     /// the `Drop` arm returns without committing. The `Keep`/`Remapped` arms are
     /// therefore unreachable for a covered index, so a "declaration preserved"
@@ -4960,7 +5228,7 @@ mod tests {
         let cloned_index = clone.load_index_by_name("i_idx").await.unwrap().unwrap();
         assert!(cloned_index.base_id.is_some());
 
-        // Dropping every indexed row makes `index::remap_index` return `Keep`.
+        // Dropping every indexed row makes `index::remap::remap_index` return `Keep`.
         let mut no_survivors = Vec::new();
         RoaringTreemap::new()
             .serialize_into(&mut no_survivors)
