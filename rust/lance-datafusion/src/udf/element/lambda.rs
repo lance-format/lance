@@ -435,6 +435,45 @@ mod tests {
         assert_eq!(rewritten(filter).unwrap(), expected);
     }
 
+    /// A lambda at the far end of a long `AND`/`OR` chain is still rewritten.
+    /// The chain is balanced first, so this walks its leaves with an explicit
+    /// stack rather than assuming the parsed left-deep shape.
+    #[rstest]
+    fn test_rewrite_deep_logical_filter(#[values("AND", "OR")] op: &str) {
+        let mut conditions = vec!["width > 1"; 1000];
+        conditions.push("array_any_match(detections, d -> d.label = 'car')");
+        let mut expr = parse_sql_filter(&conditions.join(&format!(" {op} "))).unwrap();
+        planner().rewrite_filter_lambdas(&mut expr).unwrap();
+
+        let mut stack = vec![&expr];
+        let mut leaves = Vec::new();
+        while let Some(expr) = stack.pop() {
+            match expr {
+                SQLExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::And | BinaryOperator::Or,
+                    right,
+                } => {
+                    stack.push(right.as_ref());
+                    stack.push(left.as_ref());
+                }
+                leaf => leaves.push(leaf),
+            }
+        }
+        assert_eq!(leaves.len(), 1001);
+        assert_eq!(
+            leaves.last().unwrap().to_string(),
+            "any_element(detections, 'label = ''car''')"
+        );
+
+        let mut has_lambda = false;
+        let _ = visit_expressions(&expr, |expr| {
+            has_lambda |= matches!(expr, SQLExpr::Lambda(_));
+            ControlFlow::<()>::Continue(())
+        });
+        assert!(!has_lambda, "a lambda was left unrewritten");
+    }
+
     #[rstest]
     #[case::outside_column(
         "array_any_match(detections, d -> d.label = 'car' AND width > 1)",
