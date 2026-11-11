@@ -101,9 +101,12 @@ is never used.
   operations and Clone never release a lease this way, since they do not
   publish the holder's result.
 
-No-op lease requests create no version. An expired lease remains listed, and
-still retains resources, until the next commit removes it. Cleanup does not commit, so it never judges
-expiration by its own clock.
+A lease request whose derived list equals its predecessor's creates no
+version. A request that would otherwise be a no-op still commits if it removes
+expired records, so releasing an expired lease frees what it retained. An
+expired lease remains listed, and still retains resources, until the next
+commit removes it. Cleanup does not commit, so it never judges expiration by
+its own clock.
 
 ## Retention
 
@@ -144,8 +147,9 @@ version, using the [FRI history](../index/system/frag_reuse.md#fri-index-version
 FRI trimming **must retain** the union of the transitions required by listed
 leases and by existing indices. Compaction **must record** the
 transitions listed leases require, even when no index needs them. If the table
-has no FRI, compaction creates one at index version 1, which sets the sticky
-`FLAG_FRAGMENT_REUSE_INDEX` reader and writer flags. Every rewrite
+has no FRI, compaction creates one: at index version 1, which sets the sticky
+`FLAG_FRAGMENT_REUSE_INDEX` reader and writer flags, or at index version 0 on
+stable-row-ID tables, where index version 1 is not allowed. Every rewrite
 or trim **must recheck** these requirements against its predecessor before
 committing, including after conflicts.
 
