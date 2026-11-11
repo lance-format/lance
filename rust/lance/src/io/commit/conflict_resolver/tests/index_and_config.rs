@@ -2,6 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_table::transaction::action::{
+    Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, TombstoneFieldData,
+    UserStep,
+};
 
 #[test]
 fn test_mem_wal_install_conflicts_with_merge() {
@@ -610,6 +614,153 @@ async fn test_add_bases_non_conflicting() {
         .await
         .unwrap();
     assert!(rebase.check_txn(&txn2, 2).is_ok());
+}
+
+fn action_txn(actions: Vec<TxnAction>) -> Transaction {
+    Transaction::new_from_version(
+        1,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step", actions,
+        )])),
+    )
+}
+
+fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
+    action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
+        fragment: ActionRef::Committed(fragment),
+        field_ids: vec![FieldRef::Committed(field)],
+        data_change: true,
+    })])
+}
+
+/// Assert the verdict holds whichever transaction is the one rebasing.
+async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
+    for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
+        let mut rebase = TransactionRebase::try_new(dataset, ours, None)
+            .await
+            .unwrap();
+        assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
+    }
+}
+
+#[tokio::test]
+async fn test_action_txns_on_disjoint_coordinates_do_not_conflict() {
+    let dataset = test_dataset(10, 2).await;
+    assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(1, 0), false).await;
+    assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 1), false).await;
+}
+
+#[tokio::test]
+async fn test_action_txns_writing_the_same_field_data_conflict() {
+    let dataset = test_dataset(10, 2).await;
+    assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 0), true).await;
+}
+
+/// A named operation on the other side conflicts whatever it names, even
+/// when it plainly touches nothing the action set does. Footprints are only
+/// defined over actions, so there is nothing to compare a post-image
+/// against; the pair fails closed rather than guessing.
+#[rstest::rstest]
+#[case::append(Operation::Append {
+    fragments: vec![{
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(5);
+        fragment
+    }],
+})]
+#[case::delete(Operation::Delete {
+    updated_fragments: vec![],
+    deleted_fragment_ids: vec![7],
+    predicate: "a > 5".into(),
+})]
+#[case::update_config(Operation::UpdateConfig {
+    config_updates: None,
+    table_metadata_updates: None,
+    schema_metadata_updates: None,
+    field_metadata_updates: HashMap::new(),
+})]
+// The two operations whose checkers would otherwise answer Ok without
+// inspecting the other side: UpdateBases, which treats every named operation
+// as compatible, and Clone, which has no checker of its own.
+#[case::update_bases(Operation::UpdateBases {
+    new_bases: vec![lance_table::format::BasePath {
+        id: 1,
+        path: "s3://bucket/base".to_string(),
+        name: Some("base".to_string()),
+        is_dataset_root: false,
+    }],
+})]
+#[case::clone(Operation::Clone {
+    is_shallow: true,
+    ref_name: None,
+    ref_version: 1,
+    ref_path: "memory://source".to_string(),
+    branch_name: None,
+})]
+#[case::update(Operation::Update {
+    removed_fragment_ids: vec![],
+    updated_fragments: vec![],
+    new_fragments: vec![],
+    fields_modified: vec![],
+    compacted_sstables: vec![],
+    mem_wal_dir_id: None,
+    fields_for_preserving_frag_bitmap: vec![],
+    update_mode: None,
+    inserted_rows_filter: None,
+    updated_fragment_offsets: None,
+})]
+#[case::create_index(Operation::CreateIndex {
+    new_indices: vec![],
+    removed_indices: vec![],
+})]
+#[case::rewrite(Operation::Rewrite {
+    groups: vec![],
+    rewritten_indices: vec![],
+    frag_reuse_index: None,
+})]
+#[case::overwrite(Operation::Overwrite {
+    fragments: vec![],
+    schema: lance_core::datatypes::Schema::default(),
+    config_upsert_values: None,
+    initial_bases: None,
+})]
+#[case::data_replacement(Operation::DataReplacement { replacements: vec![] })]
+#[case::data_overlay(Operation::DataOverlay { groups: vec![] })]
+#[case::merge(Operation::Merge {
+    fragments: vec![],
+    schema: lance_core::datatypes::Schema::default(),
+    preserves_nullability: true,
+})]
+#[case::restore(Operation::Restore { version: 1 })]
+#[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 })]
+#[case::project(Operation::Project {
+    schema: lance_core::datatypes::Schema::default(),
+    preserves_nullability: true,
+})]
+#[case::update_mem_wal_state(Operation::UpdateMemWalState {
+    compacted_sstables: vec![],
+    dir_id: String::new(),
+})]
+#[tokio::test]
+async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Operation) {
+    let dataset = test_dataset(10, 2).await;
+    let legacy = Transaction::new_from_version(1, legacy);
+    let action = tombstone_txn(0, 0);
+
+    // Retryable, not incompatible: the mixed pair may well commute, so the
+    // loser re-runs against the winner rather than giving up.
+    for (ours, theirs) in [(action.clone(), legacy.clone()), (legacy, action)] {
+        let ours_name = ours.operation.to_string();
+        let mut rebase = TransactionRebase::try_new(&dataset, ours, None)
+            .await
+            .unwrap();
+        let result = rebase.check_txn(&theirs, 2);
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{ours_name} against {}: expected a retryable conflict, got {result:?}",
+            theirs.operation
+        );
+    }
 }
 
 #[tokio::test]

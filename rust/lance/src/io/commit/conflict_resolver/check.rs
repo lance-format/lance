@@ -5,6 +5,7 @@ mod create_index;
 mod rewrite;
 
 use super::*;
+use lance_table::transaction::action::Footprint;
 
 impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -75,7 +76,19 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
-            Operation::Clone { .. } => Ok(()),
+            // Clone has no checker of its own, so the cross-form rule has to be
+            // stated here: it is compatible with every named operation, but a
+            // concurrent action set still fails closed like everywhere else.
+            Operation::Clone { .. } => {
+                if matches!(
+                    &other_transaction.operation,
+                    Operation::CompositeOperation(_)
+                ) {
+                    self.check_action_txn(other_transaction, other_version)
+                } else {
+                    Ok(())
+                }
+            }
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
@@ -83,7 +96,38 @@ impl<'a> TransactionRebase<'a> {
             Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
         }
+    }
+
+    /// Whether an action-based transaction conflicts with `other_transaction`.
+    ///
+    /// Reached from both directions: when the transaction being committed is
+    /// action-based, and when a concurrent one is.
+    ///
+    /// Two action sets are compared by footprint. Anything else -- a named
+    /// operation on the other side -- conflicts unconditionally. The two forms
+    /// describe a change in different vocabularies, and deciding whether a
+    /// named operation's post-image overlaps an action set's coordinates would
+    /// mean specifying every named operation in terms of coordinates. Until that
+    /// exists, a mixed pair fails closed rather than guessing.
+    fn check_action_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let (Operation::CompositeOperation(ours), Operation::CompositeOperation(theirs)) =
+            (&self.transaction.operation, &other_transaction.operation)
+        else {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        };
+
+        if Footprint::from(ours).conflicts_with(&Footprint::from(theirs)) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
     }
 
     fn check_delete_txn(
@@ -93,6 +137,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -251,6 +299,10 @@ impl<'a> TransactionRebase<'a> {
             }
 
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -457,6 +509,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Overwrite { .. } => {
                 if self
                     .transaction
@@ -513,6 +569,10 @@ impl<'a> TransactionRebase<'a> {
             return Err(wrong_operation_err(&self.transaction.operation));
         };
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // Append is not compatible with any operation that completely
             // overwrites the schema.
             Operation::Overwrite { .. }
@@ -561,6 +621,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -743,6 +807,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
@@ -866,6 +934,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // See the MemWAL exception in check_create_index_txn.
             Operation::CreateIndex { new_indices, .. } => {
                 if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
@@ -907,6 +979,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
@@ -938,6 +1014,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -968,6 +1048,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
             | Operation::Update { .. }
@@ -1008,6 +1092,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
@@ -1075,6 +1163,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
                     ..
@@ -1177,8 +1269,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 // UpdateBases doesn't conflict with data operations
-                _ => Ok(()),
+                Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Overwrite { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::Rewrite { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
+                | Operation::Merge { .. }
+                | Operation::Restore { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Update { .. }
+                | Operation::Project { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::UpdateMemWalState { .. }
+                | Operation::Unknown { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))

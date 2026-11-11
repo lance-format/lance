@@ -316,13 +316,14 @@ pub fn classify(
         Operation::UpdateMemWalState { .. } => Ok(Admission::MaintainsMemWalState),
         // A bare rewrite beside an entry of a newer version or carrying
         // rewritten indices, or a v0 snapshot, would misinterpret the
-        // history; overlays, clones and base changes have no tagged
-        // semantics yet. A CreateIndex reaching here touches the entry
-        // without being its trim.
+        // history; overlays, clones, base changes and action-based
+        // transactions have no tagged semantics yet. A CreateIndex reaching
+        // here touches the entry without being its trim.
         Operation::Rewrite { .. }
         | Operation::CreateIndex { .. }
         | Operation::DataOverlay { .. }
         | Operation::Clone { .. }
+        | Operation::CompositeOperation(_)
         | Operation::Unknown { .. } => Err(Error::not_supported(
             "Tagged FRI history maintenance is not implemented for this operation; upgrade to a writer supporting tagged histories",
         )),

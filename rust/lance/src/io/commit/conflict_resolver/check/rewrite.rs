@@ -17,6 +17,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
