@@ -268,11 +268,15 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::Manifest;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
     };
     use crate::transaction::action::{Action, AddField, DropField};
     use crate::transaction::update_map::UpdateMapEntry;
+    use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+    use lance_core::datatypes::Schema;
+    use std::sync::Arc;
 
     fn merge(entries: &[(&str, Option<&str>)]) -> UpdateMap {
         UpdateMap {
@@ -378,6 +382,77 @@ mod tests {
             field.metadata.get("comment"),
             Some(&"brand new".to_string())
         );
+    }
+
+    /// `attrs: Map<Utf8, Binary>` with no fragments, and the id of its value
+    /// field.
+    fn map_manifest() -> (Manifest, i32) {
+        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        let entries = ArrowField::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("key", DataType::Utf8, false),
+                    ArrowField::new("value", DataType::Binary, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let attrs = ArrowField::new("attrs", DataType::Map(Arc::new(entries), false), true);
+        let mut manifest = backed_manifest();
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![attrs])).unwrap();
+        manifest.fragments = Arc::new(Vec::new());
+        let value = manifest.schema.field("attrs.entries.value").unwrap().id;
+        (manifest, value)
+    }
+
+    fn promote_to_blob_v2(field: i32) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            field_metadata: vec![FieldMetadataUpdate {
+                field: FieldRef::Committed(field),
+                updates: merge(&[(ARROW_EXT_NAME_KEY, Some(BLOB_V2_EXT_NAME))]),
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// Readers cannot scan a Blob v2 field nested in a Map, so the action path
+    /// must refuse to publish one, as the named metadata update does.
+    #[test]
+    fn test_config_update_rejects_a_blob_nested_in_a_map() {
+        let (manifest, value) = map_manifest();
+
+        let error = apply(&manifest, vec![promote_to_blob_v2(value)]).unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("nested in Map field 'attrs'"),
+            "{error}"
+        );
+    }
+
+    /// A table that already has such a field can still be maintained.
+    #[test]
+    fn test_config_update_keeps_a_blob_already_nested_in_a_map() {
+        let (mut manifest, value) = map_manifest();
+        manifest
+            .schema
+            .mut_field_by_id(value)
+            .unwrap()
+            .metadata
+            .insert(ARROW_EXT_NAME_KEY.into(), BLOB_V2_EXT_NAME.into());
+
+        let next = apply(
+            &manifest,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                schema_metadata: Some(merge(&[("note", Some("kept"))])),
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+
+        assert!(next.schema.field_by_id(value).unwrap().is_blob_v2());
     }
 
     #[test]

@@ -94,6 +94,32 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .is_some_and(|value| str_is_truthy(value))
 }
 
+/// Reject a Blob v2 field nested in a Map or FixedSizeList, which readers
+/// cannot scan. A field `parent` already nested this way may stay, e.g. to be
+/// dropped; `parent` is `None` when `manifest` defines a new table.
+pub(super) fn check_blob_nesting(manifest: &Manifest, parent: Option<&Manifest>) -> Result<()> {
+    let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+        field.is_blob_v2()
+            || matches!(
+                manifest.data_storage_format.lance_file_format(),
+                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+            )
+    };
+    let already_nested: HashSet<i32> = parent
+        .map(|parent| {
+            parent
+                .schema
+                .nested_blob_fields()
+                .filter(|prior| unsupported(parent, prior))
+                .map(|prior| prior.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    manifest.schema.check_blob_nesting(|field| {
+        unsupported(manifest, field) && !already_nested.contains(&field.id)
+    })
+}
+
 fn changes_auto_cleanup_config(operation: &Operation) -> bool {
     let is_auto_cleanup_key = |key: &str| key.starts_with("lance.auto_cleanup.");
     match operation {
@@ -2157,27 +2183,10 @@ impl Transaction {
         // Every schema change lands here: the Blob v2 promotion and the field
         // metadata updates above, which can turn a nested field into a blob.
         // An Overwrite defines a new table, so its schema is checked in full.
-        // Otherwise a field the parent schema already nested this way may stay,
-        // e.g. to be dropped.
-        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
-            field.is_blob_v2()
-                || matches!(
-                    manifest.data_storage_format.lance_file_format(),
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                )
-        };
-        let already_nested: HashSet<i32> = match current_manifest {
-            Some(current) if !matches!(self.operation, Operation::Overwrite { .. }) => current
-                .schema
-                .nested_blob_fields()
-                .filter(|prior| unsupported(current, prior))
-                .map(|prior| prior.id)
-                .collect(),
-            _ => HashSet::new(),
-        };
-        manifest.schema.check_blob_nesting(|field| {
-            unsupported(&manifest, field) && !already_nested.contains(&field.id)
-        })?;
+        check_blob_nesting(
+            &manifest,
+            current_manifest.filter(|_| !matches!(self.operation, Operation::Overwrite { .. })),
+        )?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;

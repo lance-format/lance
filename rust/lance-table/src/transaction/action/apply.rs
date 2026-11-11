@@ -33,6 +33,7 @@ use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
+use crate::transaction::manifest_build::check_blob_nesting;
 use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
@@ -319,6 +320,8 @@ impl<'a> ApplyState<'a> {
             None,
             config,
         )?;
+        // After assembly, which may promote a blob to v2.
+        check_blob_nesting(&manifest, Some(current_manifest))?;
         inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         apply_index_object_metadata_flag(&mut manifest, &indices);
 
