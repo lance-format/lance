@@ -329,6 +329,54 @@ message JsonIndexDetails {
    */
   optional uint32 target_index_version = 4;
 }
+/* How a list-element index encodes the key tuple of one element into the
+ * bytes its B-tree orders.
+ */
+enum ListElementKeyEncoding {
+  /* Not recorded. A reader must not use the index, because the bytes in its
+   * B-tree have no known meaning.
+   */
+  LIST_ELEMENT_KEY_ENCODING_UNSPECIFIED = 0;
+  /* The Arrow row format with every key ascending and nulls first, as
+   * specified in the list-element index documentation.
+   */
+  LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1 = 1;
+}
+
+/* Details of a list-element index: a B-tree over the elements of a
+ * `list<struct>` column, keyed by a tuple of fields of the element struct.
+ *
+ * EXPERIMENTAL: this index is an experimental format feature. This message
+ * and the index files may change incompatibly without a separate vote, in
+ * which case the index must be rebuilt (the data is never rewritten), and
+ * the feature is removed if its stabilization vote does not pass. Datasets
+ * that do not use the index are not affected either way.
+ *
+ * Every segment of one logical index carries the same `keys`, `key_types`
+ * and `key_encoding`.
+ */
+message ListElementIndexDetails {
+  /* The names of the element struct's fields that form the key, in key
+   * order. Each names a direct child of the element struct, and no name
+   * appears twice. There is at least one.
+   */
+  repeated string keys = 1;
+  /* The Lance logical type of each key field when the index was trained,
+   * parallel to `keys` (for example "string" or "float"). A reader must not
+   * use the index for a column whose key fields now have other types, because
+   * the encoded keys would not compare correctly against encoded query
+   * values.
+   */
+  repeated string key_types = 2;
+  ListElementKeyEncoding key_encoding = 3;
+  // Details of the B-tree that stores the encoded keys.
+  google.protobuf.Any target_details = 4;
+  /* The B-tree's own format version, the `index_version` it would have in
+   * `IndexMetadata` as a standalone index.
+   */
+  uint32 target_index_version = 5;
+}
+
 message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
