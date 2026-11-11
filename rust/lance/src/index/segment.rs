@@ -266,7 +266,15 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 ///
 /// System indices have dedicated readers rather than scalar plugins. Ordinary
 /// indices need both a reader for their exact declared type and a supported
-/// format version.
+/// format version. Their field dependencies must belong to the user schema:
+/// reserved negative IDs require dedicated support, not schema lookups.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    index_type_is_known(index) && unsupported_index_version(index).is_none()
+    index_type_is_known(index)
+        && unsupported_index_version(index).is_none()
+        && (is_system_index(index)
+            || index
+                .fields
+                .iter()
+                .chain(&index.covering_fields)
+                .all(|field_id| *field_id >= 0))
 }

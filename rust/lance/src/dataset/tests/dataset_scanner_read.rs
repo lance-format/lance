@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 
 use arrow::array::as_primitive_array;
 use arrow::datatypes::{Int32Type, Int64Type};
+use arrow_array::builder::{LargeBinaryBuilder, MapBuilder, StringBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, DictionaryArray,
+    FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array,
+    Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, NullArray,
+    RecordBatch, RecordBatchIterator, StringArray, StructArray,
 };
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
@@ -20,11 +24,16 @@ use futures::stream::StreamExt;
 use half::f16;
 use lance_arrow::SchemaExt;
 use lance_core::ROW_ID;
+use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datagen::{
     ArrayGeneratorExt, BatchCount, ByteCount, Dimension, RowCount, array, gen_batch,
 };
+use lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY;
+use lance_encoding::decoder::{DecoderPlugins, PageEncoding};
+use lance_encoding::format::metadata::page_layout::Layout as PageLayout;
+use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::query::MatchQuery;
@@ -35,6 +44,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_io::object_store::ObjectStoreParams;
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_linalg::distance::MetricType;
 use lance_testing::datagen::{BatchGenerator, IncrementingInt32, RandomVector};
 use object_store::throttle::ThrottleConfig;
@@ -42,6 +52,7 @@ use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, assert_scan_slice_matches, find_filtered_read,
 };
@@ -53,6 +64,662 @@ use crate::index::vector::VectorIndexParams;
 use crate::io::exec::filtered_read::FilteredReadThreadingMode;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper};
 use crate::{Error, Result};
+
+fn structural_list_test_values(kind: &str) -> ArrayRef {
+    match kind {
+        "null" => Arc::new(NullArray::new(6)),
+        "empty_struct" => Arc::new(StructArray::new_empty_fields(
+            6,
+            Some(NullBuffer::from(vec![true, false, true, true, false, true])),
+        )),
+        "bool" => Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(false),
+            None,
+        ])),
+        "int" => Arc::new(Int64Array::from(vec![
+            Some(71),
+            None,
+            Some(-2),
+            Some(i64::MAX),
+            Some(0),
+            Some(9),
+        ])),
+        "float" => Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            None,
+            Some(-0.0),
+            Some(3.5),
+            Some(f64::INFINITY),
+            Some(-2.0),
+        ])),
+        "decimal" => Arc::new(
+            Decimal128Array::from(vec![
+                Some(12345),
+                None,
+                Some(-11),
+                Some(0),
+                Some(90),
+                Some(81),
+            ])
+            .with_precision_and_scale(20, 4)
+            .unwrap(),
+        ),
+        "string" => Arc::new(LargeStringArray::from(vec![
+            Some("payload"),
+            None,
+            Some(""),
+            Some("αβγ"),
+            Some("other"),
+            Some("last"),
+        ])),
+        "binary" => Arc::new(LargeBinaryArray::from_iter(
+            (0..6).map(|i| (i != 1).then(|| vec![i as u8; 1024])),
+        )),
+        "blob" => {
+            let mut builder = BlobArrayBuilder::new(6);
+            builder.push_bytes(vec![71; 16 * 1024]).unwrap();
+            builder.push_null().unwrap();
+            builder.push_empty().unwrap();
+            builder.push_bytes(vec![72; 16 * 1024]).unwrap();
+            builder.push_bytes(vec![73; 16 * 1024]).unwrap();
+            builder.push_null().unwrap();
+            builder.finish().unwrap()
+        }
+        "fixed_binary" => Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                (0..6).map(|i| (i != 1).then(|| vec![i as u8; 32])),
+                32,
+            )
+            .unwrap(),
+        ),
+        "fixed_list" => Arc::new(FixedSizeListArray::new(
+            Arc::new(ArrowField::new("item", DataType::Int32, false)),
+            128,
+            Arc::new(Int32Array::from_iter_values(0..6 * 128)),
+            Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+        )),
+        "fixed_nested" => {
+            let values = structural_list_test_values("nested");
+            let values = arrow_select::concat::concat(&[values.as_ref(), values.as_ref()]).unwrap();
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(ArrowField::new("item", values.data_type().clone(), true)),
+                2,
+                values,
+                Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+            ))
+        }
+        "list" | "large_list" => {
+            let values = structural_list_test_values("int");
+            let field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+            let nulls = Some(NullBuffer::from(vec![true, true, false, true, false, true]));
+            if kind == "list" {
+                Arc::new(ListArray::new(
+                    field,
+                    OffsetBuffer::new(vec![0_i32, 2, 2, 4, 5, 5, 6].into()),
+                    values,
+                    nulls,
+                ))
+            } else {
+                Arc::new(LargeListArray::new(
+                    field,
+                    OffsetBuffer::new(vec![0_i64, 2, 2, 4, 5, 5, 6].into()),
+                    values,
+                    nulls,
+                ))
+            }
+        }
+        "struct" | "nested" => {
+            let child =
+                structural_list_test_values(if kind == "nested" { "list" } else { "binary" });
+            Arc::new(StructArray::new(
+                vec![
+                    ArrowField::new("id", DataType::Int32, false),
+                    ArrowField::new("value", child.data_type().clone(), true),
+                ]
+                .into(),
+                vec![Arc::new(Int32Array::from_iter_values(0..6)), child],
+                Some(NullBuffer::from(vec![true, false, true, true, true, true])),
+            ))
+        }
+        "map" => {
+            let mut builder =
+                MapBuilder::new(None, StringBuilder::new(), LargeBinaryBuilder::new());
+            for i in 0..6 {
+                if i > 1 {
+                    builder.keys().append_value(format!("key-{i}"));
+                    builder.values().append_value(vec![i as u8; 512]);
+                }
+                builder.append(i != 0).unwrap();
+            }
+            Arc::new(builder.finish())
+        }
+        "dictionary" => Arc::new(
+            DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+                arrow_array::Int16Array::from(vec![
+                    Some(0),
+                    None,
+                    Some(1),
+                    Some(0),
+                    Some(2),
+                    Some(1),
+                ]),
+                Arc::new(StringArray::from(vec!["red", "green", "blue"])),
+            )
+            .unwrap(),
+        ),
+        _ => panic!("Unknown fixture {kind}"),
+    }
+}
+
+#[rstest]
+#[case::null("null")]
+#[case::empty_struct("empty_struct")]
+#[case::boolean("bool")]
+#[case::integer("int")]
+#[case::float("float")]
+#[case::decimal("decimal")]
+#[case::string("string")]
+#[case::binary("binary")]
+#[case::fixed_binary("fixed_binary")]
+#[case::fixed_list("fixed_list")]
+#[case::fixed_nested("fixed_nested")]
+#[case::list("list")]
+#[case::large_list("large_list")]
+#[case::structure("struct")]
+#[case::nested("nested")]
+#[case::map("map")]
+#[case::dictionary("dictionary")]
+#[case::blob("blob")]
+#[tokio::test]
+async fn test_list_structure_element_types(
+    #[case] kind: &str,
+    #[values(false, true)] large_list: bool,
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+) {
+    let values = structural_list_test_values(kind);
+    let field = if kind == "blob" {
+        Arc::new(blob_field("item", true))
+    } else {
+        Arc::new(ArrowField::new("item", values.data_type().clone(), true))
+    };
+    let nulls = Some(NullBuffer::from(vec![false, true, true, true, true, true]));
+    let lists: ArrayRef = if large_list {
+        Arc::new(LargeListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i64, 0, 0, 1, 3, 4, 6].into()),
+            values,
+            nulls,
+        ))
+    } else {
+        Arc::new(ListArray::new(
+            field,
+            OffsetBuffer::new(vec![0_i32, 0, 0, 1, 3, 4, 6].into()),
+            values,
+            nulls,
+        ))
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "items",
+        lists.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![lists]).unwrap();
+    let expressions = [
+        ("length", "array_length(items)"),
+        ("present", "array_length(items) > 0"),
+        ("missing", "items IS NULL"),
+    ];
+    // Evaluate the original arrays with DataFusion, independently of the file reader.
+    let projection = lance_datafusion::projection::ProjectionPlan::from_expressions(
+        Arc::new(Schema::try_from(schema.as_ref()).unwrap()),
+        &expressions,
+    )
+    .unwrap();
+    let expected = projection.project_batch(batch.clone()).await.unwrap();
+    let dir = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await;
+    // V2.2 never supported writing empty structs under lists. Preserve that
+    // existing format boundary; V2.3 exercises their structural read below.
+    if kind == "empty_struct" && version == LanceFileVersion::V2_2 {
+        let error = dataset.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Empty structs with rep/def information")
+        );
+        return;
+    }
+    let dataset = dataset.unwrap();
+    let stored_baseline = dataset.scan().try_into_batch().await.unwrap();
+    let actual = dataset
+        .scan()
+        .project_with_transform(&expressions)
+        .unwrap()
+        .batch_size(1)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(actual, expected, "{kind}, {version:?}");
+    let inner_expression = [("inner_length", "array_length(items, 2)")];
+    let inner_projection = lance_datafusion::projection::ProjectionPlan::from_expressions(
+        Arc::new(Schema::try_from(stored_baseline.schema().as_ref()).unwrap()),
+        &inner_expression,
+    )
+    .unwrap();
+    let expected_inner = inner_projection
+        .project_batch(stored_baseline.slice(2, 4))
+        .await
+        .unwrap();
+    let actual_inner = dataset
+        .scan()
+        .filter("array_length(items) > 0")
+        .unwrap()
+        .project_with_transform(&inner_expression)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(actual_inner, expected_inner, "Nested dimension, {kind}");
+    assert_eq!(
+        dataset
+            .count_rows(Some(
+                "items IS NOT NULL AND array_length(items) > 0".to_string()
+            ))
+            .await
+            .unwrap(),
+        4
+    );
+    let actual = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        actual, stored_baseline,
+        "Normal reads must not observe placeholders"
+    );
+}
+
+#[rstest]
+#[case::list_binary_22(false, false, false, LanceFileVersion::V2_2, "fullzip")]
+#[case::list_binary_23(false, false, false, LanceFileVersion::V2_3, "fullzip")]
+#[case::large_list_large_binary_22(true, true, true, LanceFileVersion::V2_2, "fullzip")]
+#[case::large_list_large_binary_23(true, true, true, LanceFileVersion::V2_3, "fullzip")]
+#[case::list_large_binary_22(false, true, true, LanceFileVersion::V2_2, "fullzip")]
+#[case::list_large_binary_23(false, true, true, LanceFileVersion::V2_3, "fullzip")]
+#[case::large_list_binary_22(true, false, false, LanceFileVersion::V2_2, "fullzip")]
+#[case::large_list_binary_23(true, false, false, LanceFileVersion::V2_3, "fullzip")]
+#[case::miniblock_22(false, true, true, LanceFileVersion::V2_2, "miniblock")]
+#[case::miniblock_23(true, false, true, LanceFileVersion::V2_3, "miniblock")]
+#[case::sparse_23(true, true, true, LanceFileVersion::V2_3, "sparse")]
+#[tokio::test]
+async fn test_list_structure_omits_image_payload(
+    #[case] large_list: bool,
+    #[case] large_binary: bool,
+    #[case] sliced: bool,
+    #[case] version: LanceFileVersion,
+    #[case] layout: &str,
+    #[values(false, true)] nested_column: bool,
+) {
+    let payloads = (1..=4)
+        .map(|seed| {
+            let mut state = seed * 0x9E37_79B9_u64;
+            (0..4096)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // A sliced input has a real child before the first visible row. The writer
+    // must normalize it without changing NULL / empty / NULL-element semantics.
+    let mut values: Vec<Option<&[u8]>> = if sliced {
+        vec![Some(b"prefix")]
+    } else {
+        vec![]
+    };
+    let base = values.len() as i64;
+    values.extend([
+        None,
+        Some(b"".as_slice()),
+        Some(&payloads[0]),
+        None,
+        Some(&payloads[1]),
+        Some(&payloads[2]),
+        Some(&payloads[3]),
+    ]);
+    let values: ArrayRef = if large_binary {
+        Arc::new(LargeBinaryArray::from(values))
+    } else {
+        Arc::new(BinaryArray::from(values))
+    };
+    let item = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+    let mut offsets = vec![
+        base,
+        base,
+        base,
+        base + 1,
+        base + 2,
+        base + 3,
+        base + 5,
+        base + 7,
+    ];
+    let mut validity = vec![false, true, true, true, true, true, true];
+    if sliced {
+        offsets.insert(0, 0);
+        validity.insert(0, true);
+    }
+    let images: ArrayRef = if large_list {
+        Arc::new(LargeListArray::new(
+            item,
+            OffsetBuffer::new(offsets.into()),
+            values,
+            Some(NullBuffer::from(validity)),
+        ))
+    } else {
+        Arc::new(ListArray::new(
+            item,
+            OffsetBuffer::new(
+                offsets
+                    .into_iter()
+                    .map(|n| n as i32)
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            values,
+            Some(NullBuffer::from(validity)),
+        ))
+    };
+    let images = if sliced { images.slice(1, 7) } else { images };
+    let expected_images = images.clone();
+    let column = if nested_column {
+        "meta.images"
+    } else {
+        "images"
+    };
+    let (field, images): (ArrowField, ArrayRef) = if nested_column {
+        let fields: Fields =
+            vec![ArrowField::new("images", images.data_type().clone(), true)].into();
+        (
+            ArrowField::new("meta", DataType::Struct(fields.clone()), false),
+            Arc::new(StructArray::new(fields, vec![images], None)),
+        )
+    } else {
+        (
+            ArrowField::new("images", images.data_type().clone(), true),
+            images,
+        )
+    };
+    let field = field.with_metadata(std::collections::HashMap::from([(
+        STRUCTURAL_ENCODING_META_KEY.to_string(),
+        layout.to_string(),
+    )]));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        field,
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..7)), images],
+    )
+    .unwrap();
+    let dir = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    // Locate the input's actual, incompressible payloads in the written files.
+    // This oracle does not use the new reader's offset/header parsing.
+    let mut forbidden = std::collections::HashMap::new();
+    let mut found = 0;
+    let mut actual_layouts = BTreeSet::new();
+    let scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.object_store),
+    );
+    for fragment in dataset.get_fragments() {
+        for file in &fragment.metadata().files {
+            let path = dataset
+                .data_file_dir(file)
+                .unwrap()
+                .join(file.path.as_str());
+            let bytes = dataset.object_store.read_one_all(&path).await.unwrap();
+            let reader = FileReader::try_open(
+                scheduler
+                    .open_file(&path, &file.file_size_bytes)
+                    .await
+                    .unwrap(),
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            for page in reader.metadata().column_infos[1].page_infos.iter() {
+                let page_layout = match &page.encoding {
+                    PageEncoding::Structural(layout) => layout.clone(),
+                    PageEncoding::Planar(layout) if layout.sparse().is_some() => {
+                        actual_layouts.insert("sparse");
+                        continue;
+                    }
+                    PageEncoding::Planar(layout) => layout.dense_execution_layout().unwrap(),
+                    PageEncoding::Legacy(_) => panic!("expected current-format fixture"),
+                };
+                actual_layouts.insert(match page_layout.layout.unwrap() {
+                    PageLayout::FullZipLayout(_) => "fullzip",
+                    PageLayout::MiniBlockLayout(_) => "miniblock",
+                    PageLayout::ConstantLayout(_) => "constant",
+                    PageLayout::BlobLayout(_) => "blob",
+                });
+            }
+            let spans = payloads
+                .iter()
+                .filter_map(|payload| {
+                    bytes
+                        .windows(payload.len())
+                        .position(|window| window == payload)
+                        .map(|start| {
+                            found += 1;
+                            start as u64..(start + payload.len()) as u64
+                        })
+                })
+                .collect::<Vec<_>>();
+            forbidden.insert(path, spans);
+        }
+    }
+    assert!(
+        actual_layouts.contains(layout),
+        "requested {layout}, actual layouts: {actual_layouts:?}"
+    );
+    assert_eq!(
+        found,
+        payloads.len(),
+        "fixture must store each image inline and uncompressed"
+    );
+
+    for expression in [
+        format!("array_length({column})"),
+        format!("list_length({column})"),
+        format!("array_length({column}, 1)"),
+    ] {
+        let dataset = Dataset::open(&dir).await.unwrap();
+        dataset.object_store.io_stats_incremental();
+        let lengths = dataset
+            .scan()
+            .project_with_transform(&[("length", expression.as_str())])
+            .unwrap()
+            .batch_size(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            lengths
+                .column(0)
+                .as_primitive::<UInt64Type>()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![None, Some(0), Some(1), Some(1), Some(1), Some(2), Some(2)]
+        );
+        let stats = dataset.object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0);
+        for request in &stats.requests {
+            if let Some(payloads) = forbidden.get(&request.path) {
+                if let Some(range) = &request.range {
+                    assert!(
+                        !payloads
+                            .iter()
+                            .any(|payload| range.start < payload.end && payload.start < range.end),
+                        "{expression} read image payload: {request:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        request.method, "head",
+                        "unexpected whole-file read: {request:?}"
+                    );
+                }
+            }
+        }
+        // Reusing this session must not expose placeholders or poison a normal read.
+        let full = dataset
+            .scan()
+            .project_with_transform(&[("images", column)])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(full.column(0).to_data(), expected_images.to_data());
+    }
+
+    let mut dataset = Dataset::open(&dir).await.unwrap();
+    dataset.delete("id = 4").await.unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset.object_store.io_stats_incremental();
+    let count = dataset
+        .count_rows(Some(format!(
+            "id >= 2 AND {column} IS NOT NULL AND array_length({column}) > 0"
+        )))
+        .await
+        .unwrap();
+    assert_eq!(count, 4);
+    for request in &dataset.object_store.io_stats_incremental().requests {
+        if let (Some(payloads), Some(range)) = (forbidden.get(&request.path), &request.range) {
+            assert!(
+                !payloads
+                    .iter()
+                    .any(|p| range.start < p.end && p.start < range.end),
+                "count read payload: {request:?}"
+            );
+        }
+    }
+    let mut mixed = dataset.scan();
+    mixed
+        .project_with_transform(&[
+            ("images", column),
+            ("length", format!("array_length({column})").as_str()),
+        ])
+        .unwrap();
+    let mixed = mixed.try_into_batch().await.unwrap();
+    assert_eq!(mixed.num_rows(), 6);
+    assert_eq!(
+        mixed.column(0).to_data(),
+        arrow_select::take::take(
+            expected_images.as_ref(),
+            &arrow_array::UInt32Array::from(vec![0, 1, 2, 3, 5, 6]),
+            None
+        )
+        .unwrap()
+        .to_data()
+    );
+}
+
+#[rstest]
+#[case::primitive("int")]
+#[case::nested_structure("nested")]
+#[tokio::test]
+async fn test_list_structure_fixed_outer(
+    #[case] kind: &str,
+    #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+) {
+    let values = structural_list_test_values(kind);
+    let lists = Arc::new(FixedSizeListArray::new(
+        Arc::new(ArrowField::new("item", values.data_type().clone(), true)),
+        2,
+        values,
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "items",
+        lists.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![lists]).unwrap();
+    let dir = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let lengths = dataset
+        .scan()
+        .project_with_transform(&[("length", "array_length(items)")])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        lengths
+            .column(0)
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some(2), None, Some(2)]
+    );
+    assert_eq!(
+        dataset
+            .count_rows(Some("array_length(items) > 0".to_string()))
+            .await
+            .unwrap(),
+        2
+    );
+}
 
 #[tokio::test]
 async fn test_batch_size() {
@@ -1579,6 +2246,9 @@ async fn test_ann_with_deletion(
             dataset.index_cache_entry_count().await,
             2, // 2 for index metadata at version 1 and 2.
         );
+        // Load the row-id lookup explicitly so cache counts are independent of
+        // which scan path resolves stable row ids.
+        get_row_id_index(&dataset).await.unwrap();
         let results = scan
             .try_into_stream()
             .await
@@ -1589,9 +2259,9 @@ async fn test_ann_with_deletion(
 
         assert_eq!(
             dataset.index_cache_entry_count().await,
-            // the index, its partitions and the segment ownership mask, plus
-            // the index metadata of every version
-            6 + dataset.versions().await.unwrap().len()
+            // The vector index, its partitions and the segment ownership mask,
+            // plus versioned index metadata and the stable-row-id lookup.
+            6 + dataset.versions().await.unwrap().len() + usize::from(stable_row_ids)
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];

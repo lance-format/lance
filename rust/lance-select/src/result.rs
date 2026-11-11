@@ -135,6 +135,35 @@ impl NullableIndexExprResult {
         self.exact
     }
 
+    /// Transform the endpoints, evaluating `transform` only once for an exact result.
+    ///
+    /// The same transformation must apply to both bounds and preserve their
+    /// ordering and NULL semantics, for example when translating physical row
+    /// addresses to stable row IDs. Inexact results retain both transformed
+    /// bounds, becoming exact if the transformed endpoints compare equal.
+    ///
+    /// ```
+    /// # use lance_select::{NullableIndexExprResult, NullableRowAddrMask};
+    /// # async fn example() -> Result<(), std::convert::Infallible> {
+    /// let result = NullableIndexExprResult::exact(NullableRowAddrMask::allow_nothing());
+    /// let mapped = result.try_map(|mask| async { Ok::<_, std::convert::Infallible>(mask) }).await?;
+    /// assert!(mapped.is_exact());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn try_map<E, F, Fut>(self, mut transform: F) -> std::result::Result<Self, E>
+    where
+        F: FnMut(NullableRowAddrMask) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<NullableRowAddrMask, E>>,
+    {
+        let lower = transform(self.lower).await?;
+        if self.exact {
+            Ok(Self::exact(lower))
+        } else {
+            Ok(Self::new(lower, transform(self.upper).await?))
+        }
+    }
+
     /// True if `lower` matches no rows (canonical `AllowList(∅)`) — the
     /// index gives only an upper bound on the answer.
     ///
@@ -284,40 +313,6 @@ impl IndexExprResult {
     /// convention consumers should follow.
     pub fn is_at_least(&self) -> bool {
         matches!(&self.upper, RowAddrMask::BlockList(set) if set.is_empty())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{NullableRowAddrSet, RowAddrTreeMap};
-
-    fn allow(rows: &[u64]) -> NullableRowAddrMask {
-        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
-            RowAddrTreeMap::from_iter(rows.iter().copied()),
-            RowAddrTreeMap::new(),
-        ))
-    }
-
-    #[test]
-    fn nullable_index_expr_result_new_canonicalizes_exact() {
-        let lower = allow(&[1, 2]);
-        let result = NullableIndexExprResult::new(lower.clone(), lower.clone());
-
-        assert!(result.is_exact());
-        assert_eq!(result.lower, lower);
-        assert_eq!(result.upper, lower);
-    }
-
-    #[test]
-    fn nullable_index_expr_result_new_preserves_interval() {
-        let lower = allow(&[1, 2]);
-        let upper = allow(&[1, 2, 3]);
-        let result = NullableIndexExprResult::new(lower.clone(), upper.clone());
-
-        assert!(!result.is_exact());
-        assert_eq!(result.lower, lower);
-        assert_eq!(result.upper, upper);
     }
 }
 
@@ -532,5 +527,84 @@ impl IndexExprResult {
         let fragments = RoaringBitmap::deserialize_from(frags_col.value(0))?;
 
         Ok((index_result, fragments))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use super::*;
+    use crate::{NullableRowAddrSet, RowAddrTreeMap};
+
+    fn allow(rows: &[u64]) -> NullableRowAddrMask {
+        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter(rows.iter().copied()),
+            RowAddrTreeMap::new(),
+        ))
+    }
+
+    #[test]
+    fn nullable_index_expr_result_new_canonicalizes_exact() {
+        let lower = allow(&[1, 2]);
+        let result = NullableIndexExprResult::new(lower.clone(), lower.clone());
+
+        assert!(result.is_exact());
+        assert_eq!(result.lower, lower);
+        assert_eq!(result.upper, lower);
+    }
+
+    #[test]
+    fn nullable_index_expr_result_new_preserves_interval() {
+        let lower = allow(&[1, 2]);
+        let upper = allow(&[1, 2, 3]);
+        let result = NullableIndexExprResult::new(lower.clone(), upper.clone());
+
+        assert!(!result.is_exact());
+        assert_eq!(result.lower, lower);
+        assert_eq!(result.upper, upper);
+    }
+
+    #[test]
+    fn nullable_mapping_preserves_bounds_and_counts_endpoint_work() {
+        let exact = NullableIndexExprResult::exact(allow(&[1, 2]));
+        let interval = NullableIndexExprResult::new(allow(&[1]), allow(&[1, 2]));
+        let calls = Cell::new(0);
+        let transform = |mask| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok::<_, ()>(mask))
+        };
+        let mut context = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok(mapped)) = pin!(exact.try_map(transform)).poll(&mut context) else {
+            panic!("ready transform must complete");
+        };
+        assert!(mapped.is_exact());
+        assert_eq!(mapped.lower, allow(&[1, 2]));
+        assert_eq!(calls.get(), 1);
+
+        calls.set(0);
+        let Poll::Ready(Ok(mapped)) = pin!(interval.try_map(transform)).poll(&mut context) else {
+            panic!("ready transform must complete");
+        };
+        assert!(!mapped.is_exact());
+        assert_eq!(mapped.lower, allow(&[1]));
+        assert_eq!(mapped.upper, allow(&[1, 2]));
+        assert_eq!(calls.get(), 2);
+
+        // Restricting an interval may collapse its bounds. Do not keep a stale
+        // inexact marker merely because the input was inexact.
+        let interval = NullableIndexExprResult::new(allow(&[1]), allow(&[1, 2]));
+        let Poll::Ready(Ok(mapped)) =
+            pin!(interval.try_map(|_| { std::future::ready(Ok::<_, ()>(allow(&[1]))) }))
+                .poll(&mut context)
+        else {
+            panic!("ready transform must complete");
+        };
+        assert!(mapped.is_exact());
     }
 }
