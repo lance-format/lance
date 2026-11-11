@@ -61,7 +61,8 @@ class CachedDataset:
                 writer.write(batch)
                 yield batch
                 del batch
-            writer.close()
+            if writer is not None:
+                writer.close()
             self.finished_origin_stream = True
         else:
             # Follow up iteration
