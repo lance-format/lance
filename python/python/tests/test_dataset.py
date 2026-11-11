@@ -2702,23 +2702,33 @@ def test_fragment_object_metadata_round_trips_through_append(tmp_path: Path):
         "org.example.unknown": "  opaque value: 東京  ",
         "org.example.empty": "",
     }
+
+    def user_metadata(fragment):
+        # The schema fingerprint is internal metadata used by append validation.
+        return {
+            key: value
+            for key, value in fragment.metadata.items()
+            if key != "lance.schema.fingerprint"
+        }
+
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     assert fragment.clustering_id is None
-    assert fragment.metadata == {}
+    assert user_metadata(fragment) == {}
+    assert "lance.schema.fingerprint" in fragment.metadata
     stamped = dataclasses.replace(fragment, metadata=metadata)
 
     dataset = lance.LanceDataset.commit(
         dataset, lance.LanceOperation.Append([stamped]), read_version=dataset.version
     )
     committed = [f.metadata for f in dataset.get_fragments()]
-    assert committed[0].metadata == {}
-    assert committed[1].metadata == metadata
+    assert user_metadata(committed[0]) == {}
+    assert user_metadata(committed[1]) == metadata
     assert committed[1].clustering_id is None
 
     # Operations on the same fragment keep the map.
     dataset.delete("a = 3")
     kept = dataset.get_fragments()[1].metadata
-    assert kept.metadata == metadata
+    assert user_metadata(kept) == metadata
     assert kept.deletion_file is not None
 
 

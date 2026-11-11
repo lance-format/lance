@@ -162,6 +162,19 @@ operations on the same fragment, including column replacement, overlays, and del
 A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
 `writer_feature_flags`. Readers may ignore it.
 
+The reserved key `lance.schema.fingerprint` carries an optional schema identity
+for staged fragments. Its value is `v1:<blake3 hex>` over the field identities
+(id, parent, name, and logical type) for the non-negative field ids referenced
+by the fragment's data files. Packed-struct children are included by name,
+type, order, nesting, and direct-child count even when only their parent id is
+physically referenced.
+Writers that produce fragments for
+later assembly should set it; append validation may use it to reject a fragment
+whose field-id-to-name/type mapping differs from the target dataset without
+reading data file footers. Fragments without the key retain the legacy append
+behavior. The fingerprint is writer-provided metadata, not a cryptographic
+authentication mechanism.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.
