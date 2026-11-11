@@ -45,6 +45,22 @@ async fn clean_everything(fixture: &MockDatasetFixture, delete_unverified: bool)
         .unwrap()
 }
 
+/// Run `future` with WARN-level logs captured into the returned string.
+async fn with_warnings<T>(future: impl std::future::Future<Output = T>) -> (T, String) {
+    let logs = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(logs.reopen().unwrap())
+        .finish();
+    let output = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        future.await
+    };
+    (output, std::fs::read_to_string(logs.path()).unwrap())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LeaseEnd {
     Release,
@@ -83,9 +99,12 @@ async fn cleanup_retains_versions_from_the_oldest_lease_to_head(
         LeaseEnd::ExpireThenCommit => START + MONTH,
         _ => START + MINUTE,
     });
-    let removed = clean_everything(&fixture, delete_unverified).await;
+    let (removed, warnings) =
+        with_warnings(Box::pin(clean_everything(&fixture, delete_unverified))).await;
     assert_eq!(removed.old_versions, 2);
     assert_eq!(versions(&fixture).await, vec![3, 4, 5]);
+    assert_contains!(&warnings, "Retention leases kept 2 version(s) (3..=4)");
+    assert_contains!(&warnings, &format!("{} on version 3", lease.id()));
     let head = fixture.open().await.unwrap();
     let leased = head.checkout_lease(&lease).await.unwrap();
     assert_eq!(leased.count_rows(None).await.unwrap(), leased_rows);
@@ -110,9 +129,11 @@ async fn cleanup_retains_versions_from_the_oldest_lease_to_head(
         LeaseEnd::ExpireThenCommit => fixture.append_some_data().await.unwrap(),
     }
     MockClock::set_system_time(START + 2 * MONTH);
-    let removed = clean_everything(&fixture, delete_unverified).await;
+    let (removed, warnings) =
+        with_warnings(Box::pin(clean_everything(&fixture, delete_unverified))).await;
     assert_eq!(removed.old_versions, 3);
     assert_eq!(versions(&fixture).await, vec![6]);
+    assert!(!warnings.contains("Retention leases kept"), "{warnings}");
 }
 
 /// Names of the files under `data/`. Listing, unlike a HEAD, leaves the mock store's

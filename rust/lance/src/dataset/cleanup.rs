@@ -513,6 +513,8 @@ struct CleanupInspection {
     /// each to the path of that transaction file, which must still exist; `None` for the
     /// leased version itself, which no holder rebases over.
     lease_history: HashMap<u64, Option<Path>>,
+    /// Versions the policy would have removed that only the lease window keeps.
+    lease_kept_versions: BTreeSet<u64>,
     /// The earliest `staged_files_since` among leases listed on the read version or any
     /// newer one, so a lease acquired since the read still protects its staged output.
     staged_files_since: Option<DateTime<Utc>>,
@@ -1102,6 +1104,7 @@ impl<'a> CleanupTask<'a> {
         };
         let inspection = self.process_manifests(&tagged_versions, inspection).await?;
         self.ensure_lease_history_confirmed(&inspection).await?;
+        self.warn_lease_kept_versions(&inspection);
 
         if self.policy.error_if_tagged_old_versions && !inspection.tagged_old_versions.is_empty() {
             return Err(tagged_old_versions_cleanup_error(
@@ -1248,6 +1251,36 @@ impl<'a> CleanupTask<'a> {
                 &unconfirmed[..unconfirmed.len().min(10)],
             ),
         })
+    }
+
+    /// Leases silently narrowing what a cleanup removes would look like a cleanup bug,
+    /// so say which leases did it.
+    fn warn_lease_kept_versions(&self, inspection: &CleanupInspection) {
+        let (Some(leases), Some(first), Some(last)) = (
+            self.lease_retention,
+            inspection.lease_kept_versions.first(),
+            inspection.lease_kept_versions.last(),
+        ) else {
+            return;
+        };
+        let holders = self
+            .dataset
+            .manifest
+            .retention_leases()
+            .iter()
+            .map(|lease| match lease.label() {
+                Some(label) => format!("{} ({label}) on version {}", lease.id(), lease.version()),
+                None => format!("{} on version {}", lease.id(), lease.version()),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "Retention leases kept {} version(s) ({first}..={last}) that the cleanup policy \
+             would have removed; cleanup keeps every version from the oldest leased version \
+             {} until those leases end. Leases: {holders}",
+            inspection.lease_kept_versions.len(),
+            leases.oldest_version,
+        );
     }
 
     async fn inspect_managed_blobs(
@@ -1513,6 +1546,15 @@ impl<'a> CleanupTask<'a> {
         }
         let mut inspection = inspection.lock().unwrap();
 
+        if in_lease_window
+            && hard_expired
+            && !retain_bucket_survivor
+            && !is_latest
+            && !is_tagged
+            && !branch_versions.contains(&manifest.version)
+        {
+            inspection.lease_kept_versions.insert(manifest.version);
+        }
         if let Some(leases) = self.lease_retention
             && in_lease_window
         {
