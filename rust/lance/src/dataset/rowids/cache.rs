@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! One charged current view, with immutable fragment state reused on replacement.
+//! Weak snapshot directories over cache-owned immutable prepared allocations.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -12,12 +12,15 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::{Fragment, ROW_ID_FIELD_ID, RowIdMeta};
 use lance_table::io::deletion::read_deletion_file;
-use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence};
+use lance_table::rowids::{
+    FragmentRowIdIndex, RowIdIndex, RowIdIndexPart, RowIdIndexView, RowIdSequence,
+};
 
 use crate::session::caches::{DeletionFileKey, RowIdSequenceKey};
-use crate::session::index_caches::RowIdIndexKey;
+use crate::session::index_caches::{LatestRowIdIndexKey, PreparedRowIdPartKey, RowIdIndexKey};
 use crate::{Dataset, Error, Result};
 
 use super::{overlapping_id_spans, read_row_id_sequence};
@@ -27,11 +30,58 @@ use super::{overlapping_id_spans, read_row_id_sequence};
 #[derive(Default)]
 pub struct RowIdIndexBuildLocks {
     locks: Mutex<DatasetBuildLocks>,
+    fragments: Mutex<FragmentBuilds>,
 }
 
 type DatasetBuildLocks = HashMap<String, Weak<tokio::sync::Mutex<()>>>;
 
+type FragmentBuildKey = (String, InternalCacheKey, Option<InternalCacheKey>);
+type FragmentBuild = tokio::sync::Mutex<Option<Arc<super::resolve::PreparedFragment>>>;
+type FragmentBuilds = HashMap<FragmentBuildKey, FragmentBuildEntry>;
+
+#[derive(Default)]
+struct FragmentBuildEntry {
+    build: Weak<FragmentBuild>,
+    active: Weak<super::resolve::PreparedFragment>,
+}
+
 impl RowIdIndexBuildLocks {
+    pub(super) fn for_fragment(
+        &self,
+        uri: &str,
+        key: &crate::session::index_caches::PreparedRowIdFragmentKey,
+    ) -> Result<Arc<FragmentBuild>> {
+        let mut fragments = self.fragments.lock().map_err(|error| {
+            Error::internal(format!("row id fragment build registry poisoned: {error}"))
+        })?;
+        fragments
+            .retain(|_, entry| entry.build.strong_count() > 0 || entry.active.strong_count() > 0);
+        let entry = fragments
+            .entry((uri.to_owned(), key.source, key.deletion))
+            .or_default();
+        if let Some(build) = entry.build.upgrade() {
+            return Ok(build);
+        }
+        let build = Arc::new(tokio::sync::Mutex::new(entry.active.upgrade()));
+        entry.build = Arc::downgrade(&build);
+        Ok(build)
+    }
+
+    pub(super) fn prepared(
+        &self,
+        uri: &str,
+        key: &crate::session::index_caches::PreparedRowIdFragmentKey,
+        active: &Arc<super::resolve::PreparedFragment>,
+    ) -> Result<()> {
+        let mut fragments = self.fragments.lock().map_err(|error| {
+            Error::internal(format!("row id fragment build registry poisoned: {error}"))
+        })?;
+        if let Some(entry) = fragments.get_mut(&(uri.to_owned(), key.source, key.deletion)) {
+            entry.active = Arc::downgrade(active);
+        }
+        Ok(())
+    }
+
     pub(super) fn for_dataset(&self, uri: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         let mut locks = self.locks.lock().map_err(|error| {
             Error::internal(format!("row id index build lock poisoned: {error}"))
@@ -49,46 +99,131 @@ impl RowIdIndexBuildLocks {
 
 impl DeepSizeOf for RowIdIndexBuildLocks {
     fn deep_size_of_children(&self, _context: &mut Context) -> usize {
-        self.locks
+        self.fragments
             .lock()
-            .map(|locks| {
-                locks.capacity() * std::mem::size_of::<(String, Weak<tokio::sync::Mutex<()>>)>()
-                    + locks.keys().map(|uri| uri.capacity()).sum::<usize>()
+            .map(|fragments| {
+                fragments.capacity() * std::mem::size_of::<(FragmentBuildKey, FragmentBuildEntry)>()
+                    + fragments
+                        .keys()
+                        .map(|(uri, _, _)| uri.capacity())
+                        .sum::<usize>()
             })
             .unwrap_or(0)
+            + self
+                .locks
+                .lock()
+                .map(|locks| {
+                    locks.capacity() * std::mem::size_of::<(String, Weak<tokio::sync::Mutex<()>>)>()
+                        + locks.keys().map(|uri| uri.capacity()).sum::<usize>()
+                })
+                .unwrap_or(0)
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct CachedFragment {
+    pub(super) fragment_id: u32,
     pub(super) identity: InternalCacheKey,
     pub(super) span: Option<RangeInclusive<u64>>,
     pub(super) deletion_identity: Option<InternalCacheKey>,
 }
 
-/// Replacing this entry drops the cache's ownership of the previous view. Active
-/// readers may retain it, just as they may retain any evicted cache value.
+/// An active caller's view and leases on its immutable prepared allocations.
 #[derive(Debug)]
 pub struct CachedRowIdIndex {
     version: u64,
     e_tag: String,
     pub(crate) index: Arc<RowIdIndex>,
-    fragments: Vec<CachedFragment>,
+    fragments: Arc<Vec<CachedFragment>>,
+    parts: Vec<Arc<RowIdIndexPart>>,
+    part_keys: Vec<PreparedRowIdPartKey>,
 }
 
 impl DeepSizeOf for CachedRowIdIndex {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.e_tag.capacity()
             + self.index.deep_size_of_children(context)
-            + self.fragments.capacity() * std::mem::size_of::<CachedFragment>()
+            + self.fragments.deep_size_of_children(context)
+            + self.parts.deep_size_of_children(context)
+            + self.part_keys.deep_size_of_children(context)
     }
 }
 
-impl CachedRowIdIndex {
+/// Cacheable routing metadata. Neither this value nor a reuse hint owns graphs.
+#[derive(Debug)]
+pub struct CachedRowIdIndexView {
+    version: u64,
+    e_tag: String,
+    index: RowIdIndexView,
+    fragments: Arc<Vec<CachedFragment>>,
+    part_keys: Vec<PreparedRowIdPartKey>,
+    active: Weak<RowIdIndex>,
+}
+
+impl DeepSizeOf for CachedFragment {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+impl DeepSizeOf for CachedRowIdIndexView {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.e_tag.capacity()
+            + self.index.deep_size_of_children(context)
+            + self.fragments.deep_size_of_children(context)
+            + self.part_keys.deep_size_of_children(context)
+            + std::mem::size_of::<RowIdIndex>()
+    }
+}
+
+impl CachedRowIdIndexView {
     pub(super) fn matches(&self, dataset: &Dataset) -> bool {
         self.version == dataset.manifest.version
             && Some(self.e_tag.as_str()) == dataset.manifest_location.e_tag.as_deref()
     }
+
+    pub(super) async fn resolve(
+        &self,
+        dataset: &Dataset,
+        row_ids: &[u64],
+    ) -> Result<Option<Vec<Option<lance_core::utils::address::RowAddress>>>> {
+        let parts = super::parts::acquire(dataset, &self.part_keys).await;
+        let result = self.index.get_many(row_ids);
+        drop(parts);
+        result
+    }
+
+    async fn upgrade(&self, dataset: &Dataset) -> Option<Arc<CachedRowIdIndex>> {
+        let parts = super::parts::acquire(dataset, &self.part_keys).await;
+        let index = match self.active.upgrade() {
+            Some(index) => index,
+            None => Arc::new(self.index.upgrade()?),
+        };
+        Some(Arc::new(CachedRowIdIndex {
+            version: self.version,
+            e_tag: self.e_tag.clone(),
+            index,
+            fragments: self.fragments.clone(),
+            parts,
+            part_keys: self.part_keys.clone(),
+        }))
+    }
+}
+
+pub(super) fn view_key(dataset: &Dataset, with_deletions: bool) -> Result<RowIdIndexKey> {
+    Ok(RowIdIndexKey {
+        with_deletions,
+        version: dataset.manifest.version,
+        e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
+            Error::internal("cached row id index requires a manifest generation token")
+        })?,
+    })
+}
+
+pub(super) fn entry_bytes(value: &impl DeepSizeOf) -> usize {
+    value.deep_size_of()
+        + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
+        + std::mem::size_of::<InternalCacheKey>()
 }
 
 /// One measured complete-view size per deletion mode, replaced on version
@@ -99,18 +234,34 @@ impl CachedRowIdIndex {
 pub(super) struct RowIdIndexSize {
     version: u64,
     e_tag: String,
-    bytes: usize,
+    pub(super) bytes: usize,
 }
 
 impl RowIdIndexSize {
     pub(super) fn new(cached: &CachedRowIdIndex) -> Self {
+        let view = CachedRowIdIndexView {
+            version: cached.version,
+            e_tag: cached.e_tag.clone(),
+            index: cached.index.downgrade(),
+            fragments: cached.fragments.clone(),
+            part_keys: cached.part_keys.clone(),
+            active: Arc::downgrade(&cached.index),
+        };
+        let hint = RowIdIndexKey {
+            version: cached.version,
+            e_tag: cached.e_tag.clone(),
+            with_deletions: true,
+        };
         Self {
             version: cached.version,
             e_tag: cached.e_tag.clone(),
-            // Capacity includes the canonical key as well as the cached Arc.
-            bytes: cached.deep_size_of()
-                + 2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>()
-                + std::mem::size_of::<InternalCacheKey>(),
+            bytes: entry_bytes(&view)
+                + entry_bytes(&hint)
+                + cached
+                    .parts
+                    .iter()
+                    .map(|part| entry_bytes(part.as_ref()))
+                    .sum::<usize>(),
         }
     }
 
@@ -146,37 +297,46 @@ impl CacheKey for RowIdIndexSizeKey {
 }
 
 pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<CachedRowIdIndex>> {
-    let key = RowIdIndexKey { with_deletions };
-    if let Some(cached) = dataset.index_cache.get_with_key(&key).await
-        && cached.matches(dataset)
+    let key = view_key(dataset, with_deletions)?;
+    if let Some(view) = dataset.index_cache.get_with_key(&key).await
+        && view.matches(dataset)
+        && let Some(cached) = view.upgrade(dataset).await
     {
         return Ok(cached);
     }
-
     let lock = dataset
         .session()
         .row_id_index_builds
         .for_dataset(&dataset.uri)?;
     let _guard = lock.lock().await;
-    // Recheck after waiting: another dataset handle may have built this version.
-    let mut previous = dataset.index_cache.get_with_key(&key).await;
-    if let Some(cached) = &previous
-        && cached.matches(dataset)
+    if let Some(view) = dataset.index_cache.get_with_key(&key).await
+        && view.matches(dataset)
+        && let Some(cached) = view.upgrade(dataset).await
     {
-        return Ok(cached.clone());
+        return Ok(cached);
     }
-    if previous.is_none() {
-        // Effective deletion fingerprints decide which prepared units are valid
-        // across modes; a mode change need not duplicate every unchanged unit.
-        previous = dataset
+    let mut previous = None;
+    for mode in [with_deletions, !with_deletions] {
+        if let Some(last) = dataset
             .index_cache
-            .get_with_key(&RowIdIndexKey {
-                with_deletions: !with_deletions,
+            .get_with_key(&LatestRowIdIndexKey {
+                with_deletions: mode,
             })
-            .await;
+            .await
+            && let Some(view) = dataset.index_cache.get_with_key(last.as_ref()).await
+            && let Some(cached) = view.upgrade(dataset).await
+        {
+            previous = Some(cached);
+            break;
+        }
     }
-    let (cached, restore_units) = if let Some(promotion) =
-        super::resolve::promote_fragments(dataset, with_deletions).await?
+    let mut retained = previous
+        .as_ref()
+        .map_or_else(Vec::new, |cached| cached.parts.clone());
+    // A complete previous view already has global routing. Prefer its shared
+    // groups over remerging the fragment units that remain in the part cache.
+    let mut cached = if previous.is_none()
+        && let Some(promotion) = super::resolve::promote_fragments(dataset, with_deletions).await?
     {
         let super::resolve::FragmentPromotion {
             index,
@@ -184,6 +344,9 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<C
             units,
             loaded_fragments,
         } = promotion;
+        for (_, unit) in units {
+            retained.extend(unit.parts.iter().cloned());
+        }
         tracing::debug!(
             event = "row_id_index_build",
             total_fragments = fragments.len(),
@@ -192,43 +355,43 @@ pub(super) async fn get(dataset: &Dataset, with_deletions: bool) -> Result<Arc<C
             prepared_fragments = loaded_fragments,
             "combined prepared row id fragments"
         );
-        (
-            CachedRowIdIndex {
-                version: dataset.manifest.version,
-                e_tag: dataset.manifest_location.e_tag.clone().ok_or_else(|| {
-                    Error::internal("cached row id index requires a manifest generation token")
-                })?,
-                index: Arc::new(index),
-                fragments,
-            },
-            Some(units),
-        )
+        CachedRowIdIndex {
+            version: dataset.manifest.version,
+            e_tag: key.e_tag.clone(),
+            index: Arc::new(index),
+            fragments: Arc::new(fragments),
+            parts: Vec::new(),
+            part_keys: Vec::new(),
+        }
     } else {
-        (
-            build(dataset, with_deletions, previous.as_deref()).await?,
-            None,
-        )
+        build(dataset, with_deletions, previous.as_deref()).await?
     };
+    let (part_keys, parts) =
+        super::parts::prepare(dataset, &cached.index, &cached.fragments, &retained).await?;
+    cached.parts = parts;
+    cached.part_keys = part_keys;
     let cached = Arc::new(cached);
-    dataset
-        .index_cache
-        .insert_with_key(&key, cached.clone())
-        .await;
-    if let Some(units) = restore_units {
-        let admitted = dataset
-            .index_cache
-            .get_with_key(&key)
-            .await
-            .is_some_and(|value| Arc::ptr_eq(&value, &cached));
-        if !admitted {
-            // A complete view may exceed admission even when individual units
-            // fit. Keep the bounded fragment working set; the returned complete
-            // index is owned only by its active caller and shares those units.
-            for (key, unit) in units {
-                dataset.index_cache.insert_with_key(&key, unit).await;
-            }
+    if let Some(limit) = dataset.index_cache.max_entry_bytes() {
+        let size = RowIdIndexSize::new(&cached);
+        if size.exceeds(dataset, limit) {
+            return Ok(cached);
         }
     }
+    super::parts::admit(dataset, &cached.part_keys, &cached.parts).await;
+    let view = Arc::new(CachedRowIdIndexView {
+        version: cached.version,
+        e_tag: cached.e_tag.clone(),
+        index: cached.index.downgrade(),
+        fragments: cached.fragments.clone(),
+        // Match the directory allocation used by the admission estimate.
+        part_keys: cached.part_keys.clone(),
+        active: Arc::downgrade(&cached.index),
+    });
+    dataset.index_cache.insert_with_key(&key, view).await;
+    dataset
+        .index_cache
+        .insert_with_key(&LatestRowIdIndexKey { with_deletions }, Arc::new(key))
+        .await;
     Ok(cached)
 }
 
@@ -239,7 +402,7 @@ pub(super) async fn build(
 ) -> Result<CachedRowIdIndex> {
     let previous_fragments: HashMap<_, _> = previous
         .into_iter()
-        .flat_map(|cached| &cached.fragments)
+        .flat_map(|cached| cached.fragments.iter())
         .map(|fragment| (fragment.identity, fragment))
         .collect();
     let mut loads = Vec::with_capacity(dataset.manifest.fragments.len());
@@ -294,6 +457,7 @@ pub(super) async fn build(
                 Some(load_source(dataset, fragment, sequence, *needs_deletions).await?)
             };
             let cached = CachedFragment {
+                fragment_id: fragment.id as u32,
                 identity,
                 span,
                 deletion_identity,
@@ -315,10 +479,16 @@ pub(super) async fn build(
         .filter_map(|(fragment, source)| source.is_none().then_some(fragment.id as u32))
         .collect();
     let changed: Vec<_> = sources.iter_mut().filter_map(Option::take).collect();
-    let reused = previous
-        .map(|previous| previous.index.try_reuse_fragments(&retained, &changed))
-        .transpose()?
-        .flatten();
+    let retained_fragments = retained.len();
+    let previous_index = previous.map(|previous| previous.index.clone());
+    let (reused, changed) = spawn_cpu(move || {
+        let reused = previous_index
+            .map(|previous| previous.try_reuse_fragments(&retained, &changed))
+            .transpose()?
+            .flatten();
+        Ok::<_, Error>((reused, changed))
+    })
+    .await?;
     let has_reused_index = reused.is_some();
     let changed_fragments = changed.len();
     let index = if let Some(index) = reused {
@@ -347,12 +517,16 @@ pub(super) async fn build(
             .buffered(dataset.object_store.io_parallelism())
             .try_collect()
             .await?;
-        RowIdIndex::new(&sources)?
+        spawn_cpu(move || RowIdIndex::new(&sources)).await?
     };
     tracing::debug!(
         event = "row_id_index_build",
         total_fragments = fragments.len(),
-        retained_fragments = if has_reused_index { retained.len() } else { 0 },
+        retained_fragments = if has_reused_index {
+            retained_fragments
+        } else {
+            0
+        },
         loaded_fragments = if has_reused_index {
             changed_fragments
         } else {
@@ -371,7 +545,9 @@ pub(super) async fn build(
             Error::internal("cached row id index requires a manifest generation token")
         })?,
         index: Arc::new(index),
-        fragments,
+        fragments: Arc::new(fragments),
+        parts: Vec::new(),
+        part_keys: Vec::new(),
     })
 }
 
@@ -577,6 +753,136 @@ pub(super) mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn preparing_parts_does_not_admit_an_unchecked_working_set() {
+        let dataset = dataset(false).await;
+        let cached = build(&dataset, true, None).await.unwrap();
+        dataset.index_cache.clear().await;
+        let (keys, parts) =
+            super::super::parts::prepare(&dataset, &cached.index, &cached.fragments, &[])
+                .await
+                .unwrap();
+        assert!(!parts.is_empty());
+        assert_eq!(
+            dataset.index_cache.size_bytes().await,
+            0,
+            "preparing an unchecked working set must not evict resident cache entries"
+        );
+        super::super::parts::admit(&dataset, &keys, &parts).await;
+        assert!(dataset.index_cache.size_bytes().await > 0);
+    }
+
+    #[tokio::test]
+    async fn admission_estimate_matches_actual_cache_charge() {
+        let dataset = dataset(false).await;
+        dataset.index_cache.clear().await;
+        let cached = get(&dataset, true).await.unwrap();
+        let actual_charge = dataset.index_cache.size_bytes().await;
+        assert!(actual_charge > 0);
+        assert_eq!(
+            RowIdIndexSize::new(&cached).bytes,
+            actual_charge,
+            "admission estimate must match actual cache weight"
+        );
+    }
+
+    #[tokio::test]
+    async fn alternating_snapshots_across_delete_reuses_prepared_state() {
+        let mut current = dataset(true).await;
+        let original = current.clone();
+        assert!(
+            get_row_id_index(&original)
+                .await
+                .unwrap()
+                .unwrap()
+                .get(7)
+                .unwrap()
+                .is_some()
+        );
+        current.delete("i = 7").await.unwrap();
+
+        for round in 0..3 {
+            let before = current.object_store.io_stats_snapshot();
+            for (snapshot, deleted) in [(&original, false), (&current, true)] {
+                let index = get_row_id_index(snapshot).await.unwrap().unwrap();
+                assert_eq!(index.get(7).unwrap().is_none(), deleted);
+                assert!(index.get(23).unwrap().is_some());
+            }
+            if round > 0 {
+                assert_eq!(
+                    current.object_store.io_stats_snapshot().read_bytes,
+                    before.read_bytes,
+                    "resident snapshots must not reread spilled IDs after a delete round trip"
+                );
+            }
+        }
+        assert_payload(&original, &[23, 7, 23]).await;
+        assert_payload(&current, &[23, 0, 23]).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_directories_share_charged_parts_and_release_evicted_graphs() {
+        let mut current = dataset(true).await;
+        let old = current.clone();
+        let old_index = get_row_id_index(&old).await.unwrap().unwrap();
+        let old_view = old
+            .index_cache
+            .get_with_key(&view_key(&old, true).unwrap())
+            .await
+            .unwrap();
+        let batch = record_batch!(("i", Int32, [40, 41])).unwrap();
+        current
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let current_index = get_row_id_index(&current).await.unwrap().unwrap();
+        let current_view = current
+            .index_cache
+            .get_with_key(&view_key(&current, true).unwrap())
+            .await
+            .unwrap();
+        for key in &old_view.part_keys {
+            assert!(
+                current_view
+                    .part_keys
+                    .iter()
+                    .any(|new| new.sources == key.sources && new.allocation == key.allocation)
+            );
+        }
+        let mut expected_charge = 0;
+        for key in &current_view.part_keys {
+            let part = current.index_cache.get_with_key(key).await.unwrap();
+            expected_charge += entry_bytes(part.as_ref());
+        }
+        let types = current
+            .index_cache
+            .diagnostics_by_type(lance_core::cache::CacheSnapshotMode::Approximate)
+            .await
+            .by_type
+            .unwrap()
+            .occupancy
+            .unwrap()
+            .types;
+        let charged = types
+            .iter()
+            .find(|entry| entry.type_name == PreparedRowIdPartKey::stable_type_id())
+            .unwrap();
+        assert_eq!(charged.num_entries as usize, current_view.part_keys.len());
+        assert_eq!(charged.size_bytes as usize, expected_charge);
+        assert!(current_view.index.upgrade().is_some());
+        current.index_cache.clear().await;
+        // Active readers still work after eviction; directories alone do not
+        // keep either graph alive when those real readers disappear.
+        assert_eq!(old_index.get(7).unwrap(), current_index.get(7).unwrap());
+        drop(old_index);
+        drop(current_index);
+        assert!(old_view.index.upgrade().is_none());
+        assert!(current_view.index.upgrade().is_none());
+    }
+
     #[rstest]
     #[case::inline(false)]
     #[case::spilled(true)]
@@ -585,11 +891,9 @@ pub(super) mod tests {
         let mut current = dataset(spilled).await;
         let original = current.clone();
         let original_index = get_row_id_index(&original).await.unwrap().unwrap();
-        let key = RowIdIndexKey {
-            with_deletions: true,
-        };
+        let key = view_key(&original, true).unwrap();
         let before = original.index_cache.get_with_key(&key).await.unwrap();
-        let charge_before = row_id_occupancy(&original).await.size_bytes;
+
         let batch = record_batch!(("i", Int32, [40, 41, 42])).unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         current.append(reader, None).await.unwrap();
@@ -600,9 +904,13 @@ pub(super) mod tests {
             current.object_store.io_stats_snapshot().read_iops,
             reads_before.read_iops
         );
-        let after = current.index_cache.get_with_key(&key).await.unwrap();
+        let after = current
+            .index_cache
+            .get_with_key(&view_key(&current, true).unwrap())
+            .await
+            .unwrap();
         assert_eq!(after.fragments.len(), before.fragments.len() + 1);
-        for (old, new) in before.fragments.iter().zip(&after.fragments) {
+        for (old, new) in before.fragments.iter().zip(after.fragments.iter()) {
             assert_eq!(old.identity, new.identity);
             assert_eq!(old.span, new.span);
             assert_eq!(old.deletion_identity, new.deletion_identity);
@@ -618,11 +926,16 @@ pub(super) mod tests {
             ]
         );
         let occupancy = row_id_occupancy(&current).await;
-        let charge_after = occupancy.size_bytes;
-        assert!(charge_after < charge_before * 2);
-        // A single replacement entry owns the current graph; old readers do
-        // not leave another full charged version in the cache.
-        assert_eq!(occupancy.num_entries, 1);
+        for key in &before.part_keys {
+            assert!(
+                after
+                    .part_keys
+                    .iter()
+                    .any(|new| new.sources == key.sources && new.allocation == key.allocation)
+            );
+        }
+        // Each snapshot retains a lightweight directory over shared parts.
+        assert_eq!(occupancy.num_entries, 2);
         assert_payload(&current, &[23, 0, 23, 40]).await;
         assert_payload(&original, &[31, 7, 31]).await;
 
@@ -776,11 +1089,21 @@ pub(super) mod tests {
             .execute(transaction)
             .await
             .unwrap();
+        dataset.index_cache.clear().await;
         let old = dataset.clone();
+        let expected = [7, 9, 7].map(|offset| Some(RowAddress::new_from_parts(0, offset)));
+        // Exercise demand preparation and its global promotion before append.
+        for _ in 0..2 {
+            assert_eq!(
+                super::super::resolve_row_ids(&old, &[9, 23, 9], true)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+        }
         let old_index = get_row_id_index(&old).await.unwrap().unwrap();
-        let key = RowIdIndexKey {
-            with_deletions: true,
-        };
+        let key = view_key(&old, true).unwrap();
         let before = old.index_cache.get_with_key(&key).await.unwrap();
         let batch = record_batch!(("i", Int32, [40, 41])).unwrap();
         dataset
@@ -796,8 +1119,21 @@ pub(super) mod tests {
             dataset.object_store.io_stats_snapshot().read_iops,
             reads_before.read_iops
         );
-        let after = dataset.index_cache.get_with_key(&key).await.unwrap();
-        for (old, new) in before.fragments.iter().zip(&after.fragments) {
+        let after = dataset
+            .index_cache
+            .get_with_key(&view_key(&dataset, true).unwrap())
+            .await
+            .unwrap();
+        for old in &before.part_keys {
+            assert!(
+                after
+                    .part_keys
+                    .iter()
+                    .any(|new| new.sources == old.sources && new.allocation == old.allocation),
+                "append must reuse the promoted complete view's prepared allocations"
+            );
+        }
+        for (old, new) in before.fragments.iter().zip(after.fragments.iter()) {
             assert_eq!(old.identity, new.identity);
             assert_eq!(old.span, new.span);
         }

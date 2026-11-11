@@ -683,6 +683,8 @@ async fn test_distributed_compaction_with_stable_row_ids(
         // Recording reads fragment metadata, not a row-id index of the table.
         let row_id_index = RowIdIndexKey {
             with_deletions: true,
+            version: worker.manifest.version,
+            e_tag: worker.manifest_location.e_tag.clone().unwrap(),
         };
         assert!(
             worker

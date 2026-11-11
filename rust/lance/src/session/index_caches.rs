@@ -92,33 +92,98 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
-/// The current whole-dataset row-id view for one deletion mode.
-///
-/// The value verifies its manifest identity before use. Replacing one entry
-/// instead of retaining one per version charges shared immutable fragments once.
-#[derive(Debug)]
+/// A snapshot directory; prepared allocations have separate cache ownership.
+#[derive(Clone, Debug, DeepSizeOf)]
 pub(crate) struct RowIdIndexKey {
     /// Whether the index knows the deleted rows (it then maps them to `None`).
     /// Without them, only overlapping ID spans require deletion files to
     /// disambiguate copies produced by updates.
     pub with_deletions: bool,
+    pub version: u64,
+    pub e_tag: String,
 }
 
 impl CacheKey for RowIdIndexKey {
-    type ValueType = crate::dataset::rowids::cache::CachedRowIdIndex;
+    type ValueType = crate::dataset::rowids::cache::CachedRowIdIndexView;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("row_id_index/current/{}", self.with_deletions))
+        Cow::Owned(format!(
+            "row_id_index/{}/{}",
+            self.version, self.with_deletions
+        ))
     }
     fn type_name() -> &'static str {
         "CachedRowIdIndex"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 2)
+        CacheKeySchema::new("lance.dataset.row-id-index-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.with_deletions as u64);
+        builder.write_u64(self.version);
+        builder.write_str(&self.e_tag);
+    }
+}
+
+/// A small reuse hint, holding a snapshot key rather than an index graph.
+pub(crate) struct LatestRowIdIndexKey {
+    pub with_deletions: bool,
+}
+
+impl CacheKey for LatestRowIdIndexKey {
+    type ValueType = RowIdIndexKey;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_latest_view")
+    }
+
+    fn type_name() -> &'static str {
+        "LatestRowIdIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-latest-view", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.with_deletions as u64);
+    }
+}
+
+/// One cache-owned immutable prepared allocation group.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedRowIdPartKey {
+    pub sources: InternalCacheKey,
+    pub merged: bool,
+    pub allocation: u64,
+}
+
+impl DeepSizeOf for PreparedRowIdPartKey {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+impl CacheKey for PreparedRowIdPartKey {
+    type ValueType = lance_table::rowids::RowIdIndexPart;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_prepared_part")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdIndexPart"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-prepared-part", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.sources.as_bytes());
+        builder.write_u64(self.merged as u64);
+        builder.write_u64(self.allocation);
     }
 }
 
@@ -156,7 +221,7 @@ pub(crate) struct PreparedRowIdFragmentKey {
 }
 
 impl CacheKey for PreparedRowIdFragmentKey {
-    type ValueType = crate::dataset::rowids::resolve::PreparedFragment;
+    type ValueType = crate::dataset::rowids::resolve::CachedPreparedFragment;
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Borrowed("row_id_fragment")
@@ -465,7 +530,12 @@ mod tests {
                 RowIdIndexKey::stable_type_id(),
                 RowIdIndexKey::schema(),
             );
-            RowIdIndexKey { with_deletions }.write_key(&mut builder);
+            RowIdIndexKey {
+                with_deletions,
+                version: 7,
+                e_tag: "generation".into(),
+            }
+            .write_key(&mut builder);
             builder.finish()
         };
         assert_ne!(physical_key("first", true), physical_key("first", false));

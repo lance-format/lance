@@ -18,8 +18,11 @@ use roaring::RoaringBitmap;
 
 mod batch;
 mod combine;
+mod parts;
 mod positions;
 mod sparse;
+
+pub use parts::{RowIdIndexPart, RowIdIndexView};
 
 use positions::Positions;
 

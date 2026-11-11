@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub(crate) mod cache;
+mod parts;
 pub(crate) mod resolve;
 mod spill;
 mod validate;
@@ -556,7 +557,6 @@ mod test {
     use crate::index::DatasetIndexExt;
     use crate::index::visibility::IndexVisibility;
     use crate::session::Session;
-    use crate::session::index_caches::RowIdIndexKey;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type, UInt64Type};
@@ -684,7 +684,7 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert_eq!(
             session.index_cache_stats().await.num_entries,
-            index_before.num_entries + 1
+            index_before.num_entries + 3
         );
         assert!(
             session.index_cache_stats().await.size_bytes - index_before.size_bytes
@@ -745,12 +745,12 @@ mod test {
             index.get(21).unwrap(),
             Some(RowAddress::new_from_parts(2, 1))
         );
-        let weak = Arc::downgrade(&index);
+        let weak = index.downgrade();
         drop(index);
         assert_eq!(weak.upgrade().is_some(), is_cached);
         assert_eq!(
             session.index_cache_stats().await.num_entries,
-            entries_before + usize::from(is_cached)
+            entries_before + 3 * usize::from(is_cached)
         );
         assert_eq!(
             session.metadata_cache_stats().await.size_bytes,
@@ -784,26 +784,21 @@ mod test {
         .unwrap();
         let metadata_before = session.metadata_cache_stats().await;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        let weak = Arc::downgrade(&index);
+        let weak = index.downgrade();
         drop(index);
         assert!(weak.upgrade().is_some());
 
         // QuickCache resists scans of small cold entries. Compete with other
         // loaded indices of the same size, without touching this one's recency.
         for version in 100..132 {
-            let key = RowIdIndexKey {
-                with_deletions: true,
-            };
-            let pressure = dataset
-                .index_cache
-                .with_key_prefix(&format!("pressure-{version}"));
-            pressure
-                .insert_with_key(
-                    &key,
-                    Arc::new(cache::build(&dataset, true, None).await.unwrap()),
-                )
-                .await;
-            assert!(pressure.get_with_key(&key).await.is_some());
+            let mut competing = dataset.clone();
+            competing.index_cache = Arc::new(
+                dataset
+                    .session
+                    .index_cache
+                    .for_dataset(&format!("{}#pressure-{version}", dataset.uri)),
+            );
+            cache::get(&competing, true).await.unwrap();
         }
         assert!(weak.upgrade().is_none());
         let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();
