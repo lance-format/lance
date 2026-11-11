@@ -8043,6 +8043,72 @@ async fn test_label_list_index_types(#[case] large_list: bool) {
     );
 }
 
+/// DataFusion types the literal list as Int64 and casts a narrower integer column to
+/// match, which must not stop the LabelList index from answering. Literals outside the
+/// item range must keep falling back to a scan instead of matching NULL items.
+#[tokio::test]
+async fn test_label_list_index_on_int32_items() {
+    let test_uri = TempStrDir::default();
+    let labels = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2)]),
+        Some(vec![Some(3)]),
+        Some(vec![Some(2), Some(3)]),
+        None,
+        Some(vec![None, Some(1)]),
+    ]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("labels", labels.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4])),
+            Arc::new(labels),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(
+            &["labels"],
+            IndexType::LabelList,
+            Some("labels_idx".to_owned()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for (filter, expected_ids, uses_index) in [
+        ("array_has(labels, 2)", vec![0, 2], true),
+        ("array_has_any(labels, [1, 3])", vec![0, 1, 2, 4], true),
+        ("array_has_all(labels, [2, 3])", vec![2], true),
+        ("array_has(labels, 3000000000)", vec![], false),
+        ("array_has_any(labels, [3, 3000000000])", vec![1, 2], false),
+        ("array_has_all(labels, [1, 3000000000])", vec![], false),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .values()
+            .to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "{filter}");
+
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert_eq!(
+            plan.contains("ScalarIndexQuery") && plan.contains("LabelList"),
+            uses_index,
+            "{filter}: {plan}"
+        );
+    }
+}
+
 /// LabelList analogue: after prewarming, an `array_has_any` query against a
 /// `LabelList` index serves results without any further IO. Exercises the
 /// `LabelListIndexState` codec (which embeds the inner bitmap state and the
