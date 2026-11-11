@@ -717,12 +717,13 @@ impl Transaction {
             .map(|f| f.id)
             .collect::<HashSet<_>>();
 
-        // Remove indices for fields no longer in schema
+        // Reserved fields never belong to the user schema, so their absence
+        // does not mean a column was dropped.
         indices.retain(|existing_index| {
             existing_index
                 .dependency_fields()
                 .iter()
-                .all(|field_id| field_ids.contains(field_id))
+                .all(|field_id| *field_id < 0 || field_ids.contains(field_id))
                 || is_system_index(existing_index)
         });
 
@@ -1339,8 +1340,16 @@ mod tests {
         assert!(error.to_string().contains("id=2"));
     }
 
-    #[test]
-    fn test_retain_indices_removes_missing_fields() {
+    #[rstest]
+    #[case::missing_user_field(vec![99], false)]
+    #[case::row_id(vec![crate::format::ROW_ID_FIELD_ID], true)]
+    #[case::unknown_reserved_field(vec![-100], true)]
+    #[case::reserved_and_present_user_field(vec![-3, 1], true)]
+    #[case::reserved_and_missing_user_field(vec![-3, 99], false)]
+    fn test_retain_indices_removes_missing_fields(
+        #[case] fields: Vec<i32>,
+        #[case] is_retained: bool,
+    ) {
         let schema = create_test_schema(&[1, 2]);
         let fragments = vec![Fragment::new(1), Fragment::new(2)];
 
@@ -1349,11 +1358,12 @@ mod tests {
             create_test_index("idx2", 2, 1, Some(RoaringBitmap::from_iter([1])), false),
             create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
         ];
+        indices[2].fields = fields;
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        assert_eq!(indices.len(), 2);
-        assert!(indices.iter().all(|idx| idx.fields[0] != 99));
+        assert_eq!(indices.len(), 2 + usize::from(is_retained));
+        assert_eq!(indices.iter().any(|idx| idx.name == "idx3"), is_retained);
     }
 
     #[test]
