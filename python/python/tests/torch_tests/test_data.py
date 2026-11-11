@@ -179,6 +179,16 @@ def test_empty_cache_replays():
     assert stream.iterations == 1
 
 
+def test_cache_with_empty_result(tmp_path):
+    lance.write_dataset(pa.table({"x": range(8)}), tmp_path / "data.lance")
+    torch_ds = LanceDataset(
+        tmp_path / "data.lance", batch_size=4, filter="x > 100", cache=True
+    )
+    assert list(torch_ds) == []
+    # A second pass is also empty.
+    assert list(torch_ds) == []
+
+
 def test_iter_filter(tmp_path):
     arr = pa.array(range(1000))
     tbl = pa.Table.from_arrays([arr], ["ids"])
