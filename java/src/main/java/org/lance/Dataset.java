@@ -928,10 +928,12 @@ public class Dataset implements Closeable {
    * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
    * is its row address, and each input is returned unchanged without checking that the row exists.
    *
+   * <p>Reading stable row IDs may access row-id metadata and deletion files; I/O failures surface
+   * as {@link IOException}.
+   *
    * @param rowIds the row IDs to resolve
    * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
    *     is unknown or its row was deleted
-   * @throws IOException if row-id metadata or deletion files cannot be read
    * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
    *     row IDs are corrupt
    */
