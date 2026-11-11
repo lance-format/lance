@@ -232,13 +232,33 @@ impl ScalarIndexExec {
     /// Address-domain results are restricted before translation to stable row ids. Native
     /// row-id results can still cover other fragments, so the consumer remains responsible
     /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Codecs can inspect this setting with [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -256,6 +276,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading and address-to-row-ID translation.
+    /// `None` searches every selected segment. Native row-ID results are not bounded by this scope.
+    /// See [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]

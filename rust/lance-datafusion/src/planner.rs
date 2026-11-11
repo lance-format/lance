@@ -31,8 +31,8 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
@@ -1169,7 +1169,8 @@ impl Planner {
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let ast_expr = parse_sql_filter(filter)?;
+        let mut ast_expr = parse_sql_filter(filter)?;
+        self.rewrite_filter_lambdas(&mut ast_expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
@@ -1177,6 +1178,16 @@ impl Planner {
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
+    }
+
+    /// Rewrite each `array_any_match(list, x -> predicate)` in a parsed filter
+    /// to `any_element(list, 'predicate')`, and reject any other lambda.
+    pub(crate) fn rewrite_filter_lambdas(&self, filter: &mut SQLExpr) -> Result<()> {
+        crate::udf::rewrite_element_lambdas(filter, |list| {
+            let expr = self.parse_sql_expr(list)?;
+            let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+            Ok(expr.get_type(&schema)?)
+        })
     }
 
     /// Create Logical [Expr] from a SQL expression.

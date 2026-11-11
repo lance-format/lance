@@ -57,19 +57,34 @@ pub(super) fn restore_chunk32(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`.
+    assert!(
+        out.len() >= offsets.len() * 4,
+        "ALP restore of {} f32 values needs {} output bytes, got {}",
+        offsets.len(),
+        offsets.len() * 4,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F) {
+            // SAFETY: the host supports AVX-512F, and the assert above keeps the kernel's
+            // vector stores into `out` in bounds.
             return unsafe { restore_chunk32_avx512(offsets, base, div, e, f, out) };
         }
         if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
             return unsafe { restore_chunk32_avx2(offsets, base, div, e, f, out) };
         }
         restore_chunk32_scalar(offsets, base, div, e, f, out)
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_chunk32_neon(offsets, base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -87,17 +102,30 @@ pub(super) fn restore_chunk64(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`.
+    assert!(
+        out.len() >= offsets.len() * 8,
+        "ALP restore of {} f64 values needs {} output bytes, got {}",
+        offsets.len(),
+        offsets.len() * 8,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
+            // SAFETY: the host supports AVX-512F and AVX-512DQ, and the assert above keeps
+            // the kernel's vector stores into `out` in bounds.
             return unsafe { restore_chunk64_avx512(offsets, base, div, e, f, out) };
         }
         restore_chunk64_scalar(offsets, base, div, e, f, out)
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_chunk64_neon(offsets, base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -168,15 +196,28 @@ pub(super) fn restore_delta_chunk32(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`; the safe scalar tail writes the last one.
+    assert!(
+        out.len() >= (offsets.len() + 1) * 4,
+        "ALP delta restore of {} f32 values needs {} output bytes, got {}",
+        offsets.len() + 1,
+        (offsets.len() + 1) * 4,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F) {
+            // SAFETY: the host supports AVX-512F, and the assert above keeps the kernel's
+            // vector stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk32_avx512(offsets, base, delta_base, div, e, f, out)
             };
         }
         if host.contains(CpuFeatures::AVX2) {
+            // SAFETY: the host supports AVX2, and the assert above keeps the kernel's vector
+            // stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk32_avx2(offsets, base, delta_base, div, e, f, out)
             };
@@ -185,6 +226,8 @@ pub(super) fn restore_delta_chunk32(
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_delta_chunk32_neon(offsets, base, delta_base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -203,11 +246,22 @@ pub(super) fn restore_delta_chunk64(
     f: usize,
     out: &mut [u8],
 ) {
+    // The SIMD kernels store whole vectors through raw pointers into the first
+    // `offsets.len()` values of `out`; the safe scalar tail writes the last one.
+    assert!(
+        out.len() >= (offsets.len() + 1) * 8,
+        "ALP delta restore of {} f64 values needs {} output bytes, got {}",
+        offsets.len() + 1,
+        (offsets.len() + 1) * 8,
+        out.len()
+    );
     #[cfg(target_arch = "x86_64")]
     {
         // `i64 -> f64` conversion needs AVX-512DQ as well as AVX-512F.
         let host = CpuFeatures::host();
         if host.contains(CpuFeatures::AVX512F.union(CpuFeatures::AVX512DQ)) {
+            // SAFETY: the host supports AVX-512F and AVX-512DQ, and the assert above keeps
+            // the kernel's vector stores into `out` in bounds.
             return unsafe {
                 restore_delta_chunk64_avx512(offsets, base, delta_base, div, e, f, out)
             };
@@ -216,6 +270,8 @@ pub(super) fn restore_delta_chunk64(
     }
     #[cfg(target_arch = "aarch64")]
     {
+        // SAFETY: NEON is part of the aarch64 baseline, and the assert above keeps the
+        // kernel's vector stores into `out` in bounds.
         unsafe { restore_delta_chunk64_neon(offsets, base, delta_base, div, e, f, out) }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -1294,6 +1350,8 @@ mod tests {
                         f,
                         &mut expected,
                     );
+                    // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                    // they have just detected, and `got` has room for every value it writes.
                     unsafe { kernel(&offsets, base, delta_base, div, e, f, &mut got) };
                     assert_eq!(
                         got, expected,
@@ -1336,6 +1394,8 @@ mod tests {
                         f,
                         &mut expected,
                     );
+                    // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                    // they have just detected, and `got` has room for every value it writes.
                     unsafe { kernel(&offsets, base, delta_base, div, e, f, &mut got) };
                     assert_eq!(
                         got, expected,
@@ -1362,6 +1422,8 @@ mod tests {
                 let mut expected = vec![0u8; n * 4];
                 let mut got = vec![0u8; n * 4];
                 restore_chunk32_scalar(&offsets, base, div, e, f, &mut expected);
+                // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                // they have just detected, and `got` has room for every value it writes.
                 unsafe { kernel(&offsets, base, div, e, f, &mut got) };
                 assert_eq!(
                     got, expected,
@@ -1387,6 +1449,8 @@ mod tests {
                 let mut expected = vec![0u8; n * 8];
                 let mut got = vec![0u8; n * 8];
                 restore_chunk64_scalar(&offsets, base, div, e, f, &mut expected);
+                // SAFETY: callers pass a safe dispatcher or a kernel whose target features
+                // they have just detected, and `got` has room for every value it writes.
                 unsafe { kernel(&offsets, base, div, e, f, &mut got) };
                 assert_eq!(
                     got, expected,
