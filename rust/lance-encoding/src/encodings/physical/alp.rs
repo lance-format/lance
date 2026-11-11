@@ -57,9 +57,11 @@ use crate::encodings::logical::primitive::miniblock::{
     MAX_MINIBLOCK_BYTES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
     MiniBlockCompressor,
 };
+#[cfg(all(test, feature = "bitpacking"))]
+use crate::encodings::physical::bitpacking::bitpack_out_of_line_vec;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{
-    bitpack_out_of_line_vec, out_of_line_payload_byte_lengths, unpack_out_of_line,
+    bitpack_out_of_line_slice_into, out_of_line_payload_byte_lengths, unpack_out_of_line,
 };
 use crate::encodings::physical::value::ValueEncoder;
 use crate::format::EncodingUtils;
@@ -68,6 +70,8 @@ use crate::format::metadata::CompressiveEncoding;
 use crate::statistics::{GetStat, Stat};
 use arrow_array::cast::AsArray;
 
+#[cfg(all(feature = "bitpacking", target_arch = "x86_64"))]
+use lance_core::utils::cpu::CpuFeatures;
 use lance_core::{Error, Result};
 
 const MODE_DELTA: u8 = 0b0000_0001;
@@ -490,6 +494,38 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
     }
 }
 
+#[cfg(feature = "bitpacking")]
+struct EncodeScratch<T, U> {
+    encoded: Vec<T>,
+    offsets: Vec<U>,
+    exception_positions: Vec<u16>,
+    exception_bits: Vec<u8>,
+}
+
+#[cfg(feature = "bitpacking")]
+impl<T: Copy + Default, U: Copy + Default> EncodeScratch<T, U> {
+    fn with_chunk_capacity(max_chunk: usize) -> Self {
+        Self {
+            encoded: vec![T::default(); max_chunk],
+            offsets: vec![U::default(); max_chunk],
+            exception_positions: Vec::new(),
+            exception_bits: Vec::new(),
+        }
+    }
+
+    fn prepare(&mut self, n: usize) {
+        if self.encoded.len() < n {
+            self.encoded.resize(n, T::default());
+        }
+        if self.offsets.len() < n {
+            self.offsets.resize(n, U::default());
+        }
+        self.exception_positions.clear();
+        self.exception_bits.clear();
+    }
+}
+
+#[cfg(feature = "bitpacking")]
 fn encode_page_f32(
     data: &FixedWidthDataBlock,
     max_chunk: usize,
@@ -500,42 +536,33 @@ fn encode_page_f32(
         return Ok(None);
     };
 
-    let mut buf0: Vec<u32> = Vec::new();
-    let mut buf1: Vec<u8> = Vec::new();
+    let num_chunks = words.len().div_ceil(max_chunk);
+    let mut buf0: Vec<u32> = Vec::with_capacity(words.len() / 2);
+    let mut buf1: Vec<u8> = Vec::with_capacity(num_chunks * 12);
     let mut buf2: Vec<u8> = Vec::new();
     let mut buf3: Vec<u8> = Vec::new();
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(num_chunks);
     let mut compressed_size = 0usize;
+    let mut scratch = EncodeScratch::<i32, u32>::with_chunk_capacity(max_chunk);
 
     for chunk in words.chunks(max_chunk) {
-        let Some(encoded) = encode_chunk_f32(chunk, params)? else {
+        let Some(sizes) = encode_chunk_f32_into(
+            chunk,
+            params,
+            &mut scratch,
+            &mut buf0,
+            &mut buf1,
+            &mut buf2,
+            &mut buf3,
+        )?
+        else {
             return Ok(None);
         };
-        if encoded.total_bytes() > MAX_MINIBLOCK_BYTES as usize {
-            return Ok(None);
-        }
-        let delta_bytes = encoded.packed_offsets.len() * 4;
-        let header_bytes = encoded.header.len();
-        let pos_bytes = encoded.exception_positions.len() * 2;
-        let exc_bytes = encoded.exception_bits.len();
-        buf0.extend(encoded.packed_offsets);
-        buf1.extend_from_slice(&encoded.header);
-        #[cfg(target_endian = "little")]
-        buf2.extend_from_slice(bytemuck::cast_slice(&encoded.exception_positions));
-        #[cfg(not(target_endian = "little"))]
-        for pos in encoded.exception_positions {
-            buf2.extend_from_slice(&pos.to_le_bytes());
-        }
-        buf3.extend_from_slice(&encoded.exception_bits);
-        compressed_size += delta_bytes + header_bytes + pos_bytes + exc_bytes;
+        compressed_size +=
+            sizes[0] as usize + sizes[1] as usize + sizes[2] as usize + sizes[3] as usize;
 
         chunks.push(MiniBlockChunk {
-            buffer_sizes: vec![
-                delta_bytes as u32,
-                header_bytes as u32,
-                pos_bytes as u32,
-                exc_bytes as u32,
-            ],
+            buffer_sizes: sizes.to_vec(),
             log_num_values: if chunk.len() < max_chunk {
                 0
             } else {
@@ -562,6 +589,16 @@ fn encode_page_f32(
     )))
 }
 
+#[cfg(not(feature = "bitpacking"))]
+fn encode_page_f32(
+    _data: &FixedWidthDataBlock,
+    _max_chunk: usize,
+    _raw_size: usize,
+) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
+    Ok(None)
+}
+
+#[cfg(feature = "bitpacking")]
 fn encode_page_f64(
     data: &FixedWidthDataBlock,
     max_chunk: usize,
@@ -572,42 +609,33 @@ fn encode_page_f64(
         return encode_page_f64_rd(&words, max_chunk, raw_size);
     };
 
-    let mut buf0: Vec<u64> = Vec::new();
-    let mut buf1: Vec<u8> = Vec::new();
+    let num_chunks = words.len().div_ceil(max_chunk);
+    let mut buf0: Vec<u64> = Vec::with_capacity(words.len() / 2);
+    let mut buf1: Vec<u8> = Vec::with_capacity(num_chunks * 20);
     let mut buf2: Vec<u8> = Vec::new();
     let mut buf3: Vec<u8> = Vec::new();
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(num_chunks);
     let mut compressed_size = 0usize;
+    let mut scratch = EncodeScratch::<i64, u64>::with_chunk_capacity(max_chunk);
 
     for chunk in words.chunks(max_chunk) {
-        let Some(encoded) = encode_chunk_f64(chunk, params)? else {
+        let Some(sizes) = encode_chunk_f64_into(
+            chunk,
+            params,
+            &mut scratch,
+            &mut buf0,
+            &mut buf1,
+            &mut buf2,
+            &mut buf3,
+        )?
+        else {
             return encode_page_f64_rd(&words, max_chunk, raw_size);
         };
-        if encoded.total_bytes() > MAX_MINIBLOCK_BYTES as usize {
-            return encode_page_f64_rd(&words, max_chunk, raw_size);
-        }
-        let delta_bytes = encoded.packed_offsets.len() * 8;
-        let header_bytes = encoded.header.len();
-        let pos_bytes = encoded.exception_positions.len() * 2;
-        let exc_bytes = encoded.exception_bits.len();
-        buf0.extend(encoded.packed_offsets);
-        buf1.extend_from_slice(&encoded.header);
-        #[cfg(target_endian = "little")]
-        buf2.extend_from_slice(bytemuck::cast_slice(&encoded.exception_positions));
-        #[cfg(not(target_endian = "little"))]
-        for pos in encoded.exception_positions {
-            buf2.extend_from_slice(&pos.to_le_bytes());
-        }
-        buf3.extend_from_slice(&encoded.exception_bits);
-        compressed_size += delta_bytes + header_bytes + pos_bytes + exc_bytes;
+        compressed_size +=
+            sizes[0] as usize + sizes[1] as usize + sizes[2] as usize + sizes[3] as usize;
 
         chunks.push(MiniBlockChunk {
-            buffer_sizes: vec![
-                delta_bytes as u32,
-                header_bytes as u32,
-                pos_bytes as u32,
-                exc_bytes as u32,
-            ],
+            buffer_sizes: sizes.to_vec(),
             log_num_values: if chunk.len() < max_chunk {
                 0
             } else {
@@ -634,49 +662,79 @@ fn encode_page_f64(
     )))
 }
 
-struct EncodedChunk32 {
-    packed_offsets: Vec<u32>,
-    header: Vec<u8>,
-    exception_positions: Vec<u16>,
-    exception_bits: Vec<u8>,
+#[cfg(not(feature = "bitpacking"))]
+fn encode_page_f64(
+    _data: &FixedWidthDataBlock,
+    _max_chunk: usize,
+    _raw_size: usize,
+) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
+    Ok(None)
 }
 
-impl EncodedChunk32 {
-    fn total_bytes(&self) -> usize {
-        self.packed_offsets.len() * 4
-            + self.header.len()
-            + self.exception_positions.len() * 2
-            + self.exception_bits.len()
-    }
-}
-
-struct EncodedChunk64 {
-    packed_offsets: Vec<u64>,
-    header: Vec<u8>,
-    exception_positions: Vec<u16>,
-    exception_bits: Vec<u8>,
-}
-
-impl EncodedChunk64 {
-    fn total_bytes(&self) -> usize {
-        self.packed_offsets.len() * 8
-            + self.header.len()
-            + self.exception_positions.len() * 2
-            + self.exception_bits.len()
-    }
-}
-
-/// Transform a chunk into the integer stream and exception lists.
-/// Transform a chunk into the integer stream and exception lists.
-///
-/// The transformation is written branchless so the compiler can vectorize the
-/// multiply/round/cast/divide chain; exception decisions fall out of the
-/// bitwise round-trip check instead of special-casing NaN, infinities, signed
-/// zeros and subnormals up front.
 #[cfg(feature = "bitpacking")]
-fn encode_chunk_f32(words: &[u32], params: AlpParams) -> Result<Option<EncodedChunk32>> {
-    let n = words.len();
-    let mut state = EncodeState::new(n);
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn record_slot_32(
+    i: usize,
+    w: u32,
+    enc: i32,
+    ok: bool,
+    encoded: &mut [i32],
+    first_encodable: &mut Option<i32>,
+    prev: &mut i32,
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) {
+    if ok {
+        if first_encodable.is_none() {
+            *first_encodable = Some(enc);
+        }
+        *prev = enc;
+        encoded[i] = enc;
+    } else {
+        encoded[i] = *prev;
+        exception_positions.push(i as u16);
+        exception_bits.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+#[cfg(feature = "bitpacking")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn record_slot_64(
+    i: usize,
+    w: u64,
+    enc: i64,
+    ok: bool,
+    encoded: &mut [i64],
+    first_encodable: &mut Option<i64>,
+    prev: &mut i64,
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) {
+    if ok {
+        if first_encodable.is_none() {
+            *first_encodable = Some(enc);
+        }
+        *prev = enc;
+        encoded[i] = enc;
+    } else {
+        encoded[i] = *prev;
+        exception_positions.push(i as u16);
+        exception_bits.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+#[cfg(feature = "bitpacking")]
+fn transform_chunk_f32_scalar(
+    words: &[u32],
+    params: AlpParams,
+    encoded: &mut [i32],
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) -> Option<i32> {
+    let mut first_encodable = None;
+    let mut prev = 0i32;
     let e = params.e as usize;
 
     if params.use_div {
@@ -686,94 +744,229 @@ fn encode_chunk_f32(words: &[u32], params: AlpParams) -> Result<Option<EncodedCh
             let scaled = v * scale;
             let enc = scaled.round_ties_even() as i32;
             let ok = scaled.is_finite() && ((enc as f32) / scale).to_bits() == w;
-            state.record32(i, w, enc, ok);
+            record_slot_32(
+                i,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
         }
     } else {
         let f = params.f as usize;
+        let scale_e = F10_F32[e];
+        let inv_f = IF10_F32[f];
         let reconstruct_scale = F10_F32[f];
         let reconstruct_inv = IF10_F32[e];
         for (i, &w) in words.iter().enumerate() {
             let v = f32::from_bits(w);
-            let scaled = (v * F10_F32[e]) * IF10_F32[f];
+            let scaled = (v * scale_e) * inv_f;
             let enc = scaled.round_ties_even() as i32;
             let ok = scaled.is_finite()
                 && (((enc as f32) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
-            state.record32(i, w, enc, ok);
+            record_slot_32(
+                i,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
         }
     }
 
-    let Some(first) = state.first_encodable else {
-        return Ok(None);
-    };
-    if !state.exception_positions.is_empty() {
-        backfill_exceptions(&mut state.encoded, &state.exception_positions);
-    }
-    if state.exception_positions.first() == Some(&0) {
-        state.encoded[0] = first;
-    }
-    pack_chunk_f32(
-        state.encoded,
-        params,
-        state.exception_positions,
-        state.exception_bits,
-    )
+    first_encodable
 }
 
-/// Mutable state for one chunk's transform: the integer stream plus the
-/// exception bookkeeping that runs alongside it.
-struct EncodeState<T> {
-    encoded: Vec<T>,
-    exception_positions: Vec<u16>,
-    exception_bits: Vec<u8>,
-    first_encodable: Option<T>,
-    prev: Option<T>,
-}
+/// 8-lane AVX2 fast path for `f32` ALP transformation.
+///
+/// Processes 8 lanes via `_mm256_round_ps::<0x08>` (explicit round-ties-to-even)
+/// when all 8 scaled magnitudes are strictly below `2^30` (guaranteeing exact
+/// `i32` conversion) and all 8 lanes bitwise round-trip. Any 8-lane group with
+/// an out-of-range value, `NaN`/`±inf`, `-0.0`, or exception falls back to the
+/// scalar loop for bit-for-bit identical exception bookkeeping.
+#[cfg(all(feature = "bitpacking", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn transform_chunk_f32_avx2(
+    words: &[u32],
+    params: AlpParams,
+    encoded: &mut [i32],
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) -> Option<i32> {
+    use std::arch::x86_64::*;
 
-impl<T: Copy + Default> EncodeState<T> {
-    fn new(n: usize) -> Self {
-        Self {
-            encoded: Vec::with_capacity(n),
-            exception_positions: Vec::new(),
-            exception_bits: Vec::new(),
-            first_encodable: None,
-            prev: None,
-        }
-    }
-
-    #[inline]
-    fn record(&mut self, i: usize, value_bits: u64, bytes_per_value: usize, enc: T, ok: bool) {
-        if ok {
-            if self.first_encodable.is_none() {
-                self.first_encodable = Some(enc);
-            }
-            self.prev = Some(enc);
-            self.encoded.push(enc);
-        } else {
-            self.encoded.push(self.prev.unwrap_or_default());
-            self.exception_positions.push(i as u16);
-            self.exception_bits
-                .extend_from_slice(&value_bits.to_le_bytes()[..bytes_per_value]);
-        }
-    }
-}
-
-impl EncodeState<i32> {
-    fn record32(&mut self, i: usize, w: u32, enc: i32, ok: bool) {
-        self.record(i, w as u64, 4, enc, ok);
-    }
-}
-
-impl EncodeState<i64> {
-    fn record64(&mut self, i: usize, w: u64, enc: i64, ok: bool) {
-        self.record(i, w, 8, enc, ok);
-    }
-}
-
-/// Transform a chunk into the integer stream and exception lists.
-#[cfg(feature = "bitpacking")]
-fn encode_chunk_f64(words: &[u64], params: AlpParams) -> Result<Option<EncodedChunk64>> {
     let n = words.len();
-    let mut state = EncodeState::new(n);
+    let mut i = 0usize;
+    let mut first_encodable = None;
+    let mut prev = 0i32;
+    let e = params.e as usize;
+
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let limit_2p30 = _mm256_set1_ps(1_073_741_824.0); // 2^30
+
+    if params.use_div {
+        let scale = F10_F32[e];
+        let scale_v = _mm256_set1_ps(scale);
+        while i + 8 <= n {
+            // SAFETY: `i + 8 <= n == words.len() <= encoded.len()`.
+            let raw_w = unsafe { _mm256_loadu_si256(words.as_ptr().add(i).cast()) };
+            let v = _mm256_castsi256_ps(raw_w);
+            let scaled = _mm256_mul_ps(v, scale_v);
+            let abs_scaled = _mm256_andnot_ps(sign_mask, scaled);
+            let in_range = _mm256_cmp_ps::<_CMP_LT_OQ>(abs_scaled, limit_2p30);
+            if _mm256_movemask_ps(in_range) == 0xFF {
+                let rounded = _mm256_round_ps::<0x08>(scaled);
+                let enc_v = _mm256_cvttps_epi32(rounded);
+                let enc_f32 = _mm256_cvtepi32_ps(enc_v);
+                let recon = _mm256_div_ps(enc_f32, scale_v);
+                let eq = _mm256_cmpeq_epi32(_mm256_castps_si256(recon), raw_w);
+                if _mm256_movemask_ps(_mm256_castsi256_ps(eq)) == 0xFF {
+                    // SAFETY: `encoded` has at least `n` initialized elements.
+                    unsafe { _mm256_storeu_si256(encoded.as_mut_ptr().add(i).cast(), enc_v) };
+                    if first_encodable.is_none() {
+                        first_encodable = Some(encoded[i]);
+                    }
+                    prev = encoded[i + 7];
+                    i += 8;
+                    continue;
+                }
+            }
+            for (off, &w) in words[i..i + 8].iter().enumerate() {
+                let j = i + off;
+                let vf = f32::from_bits(w);
+                let sc = vf * scale;
+                let enc = sc.round_ties_even() as i32;
+                let ok = sc.is_finite() && ((enc as f32) / scale).to_bits() == w;
+                record_slot_32(
+                    j,
+                    w,
+                    enc,
+                    ok,
+                    encoded,
+                    &mut first_encodable,
+                    &mut prev,
+                    exception_positions,
+                    exception_bits,
+                );
+            }
+            i += 8;
+        }
+        for (j, &w) in words[i..n].iter().enumerate() {
+            let idx = i + j;
+            let vf = f32::from_bits(w);
+            let sc = vf * scale;
+            let enc = sc.round_ties_even() as i32;
+            let ok = sc.is_finite() && ((enc as f32) / scale).to_bits() == w;
+            record_slot_32(
+                idx,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
+        }
+    } else {
+        let f = params.f as usize;
+        let scale_e = F10_F32[e];
+        let inv_f = IF10_F32[f];
+        let reconstruct_scale = F10_F32[f];
+        let reconstruct_inv = IF10_F32[e];
+        let scale_e_v = _mm256_set1_ps(scale_e);
+        let inv_f_v = _mm256_set1_ps(inv_f);
+        let recon_scale_v = _mm256_set1_ps(reconstruct_scale);
+        let recon_inv_v = _mm256_set1_ps(reconstruct_inv);
+
+        while i + 8 <= n {
+            // SAFETY: `i + 8 <= n == words.len() <= encoded.len()`.
+            let raw_w = unsafe { _mm256_loadu_si256(words.as_ptr().add(i).cast()) };
+            let v = _mm256_castsi256_ps(raw_w);
+            let scaled = _mm256_mul_ps(_mm256_mul_ps(v, scale_e_v), inv_f_v);
+            let abs_scaled = _mm256_andnot_ps(sign_mask, scaled);
+            let in_range = _mm256_cmp_ps::<_CMP_LT_OQ>(abs_scaled, limit_2p30);
+            if _mm256_movemask_ps(in_range) == 0xFF {
+                let rounded = _mm256_round_ps::<0x08>(scaled);
+                let enc_v = _mm256_cvttps_epi32(rounded);
+                let enc_f32 = _mm256_cvtepi32_ps(enc_v);
+                let recon = _mm256_mul_ps(_mm256_mul_ps(enc_f32, recon_scale_v), recon_inv_v);
+                let eq = _mm256_cmpeq_epi32(_mm256_castps_si256(recon), raw_w);
+                if _mm256_movemask_ps(_mm256_castsi256_ps(eq)) == 0xFF {
+                    // SAFETY: `encoded` has at least `n` initialized elements.
+                    unsafe { _mm256_storeu_si256(encoded.as_mut_ptr().add(i).cast(), enc_v) };
+                    if first_encodable.is_none() {
+                        first_encodable = Some(encoded[i]);
+                    }
+                    prev = encoded[i + 7];
+                    i += 8;
+                    continue;
+                }
+            }
+            for (off, &w) in words[i..i + 8].iter().enumerate() {
+                let j = i + off;
+                let vf = f32::from_bits(w);
+                let sc = (vf * scale_e) * inv_f;
+                let enc = sc.round_ties_even() as i32;
+                let ok = sc.is_finite()
+                    && (((enc as f32) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
+                record_slot_32(
+                    j,
+                    w,
+                    enc,
+                    ok,
+                    encoded,
+                    &mut first_encodable,
+                    &mut prev,
+                    exception_positions,
+                    exception_bits,
+                );
+            }
+            i += 8;
+        }
+        for (j, &w) in words[i..n].iter().enumerate() {
+            let idx = i + j;
+            let vf = f32::from_bits(w);
+            let sc = (vf * scale_e) * inv_f;
+            let enc = sc.round_ties_even() as i32;
+            let ok = sc.is_finite()
+                && (((enc as f32) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
+            record_slot_32(
+                idx,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
+        }
+    }
+
+    first_encodable
+}
+
+#[cfg(feature = "bitpacking")]
+fn transform_chunk_f64_scalar(
+    words: &[u64],
+    params: AlpParams,
+    encoded: &mut [i64],
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) -> Option<i64> {
+    let mut first_encodable = None;
+    let mut prev = 0i64;
     let e = params.e as usize;
 
     if params.use_div {
@@ -783,41 +976,340 @@ fn encode_chunk_f64(words: &[u64], params: AlpParams) -> Result<Option<EncodedCh
             let scaled = v * scale;
             let enc = scaled.round_ties_even() as i64;
             let ok = scaled.is_finite() && ((enc as f64) / scale).to_bits() == w;
-            state.record64(i, w, enc, ok);
+            record_slot_64(
+                i,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
         }
     } else {
         let f = params.f as usize;
+        let scale_e = F10_F64[e];
+        let inv_f = IF10_F64[f];
         let reconstruct_scale = F10_F64[f];
         let reconstruct_inv = IF10_F64[e];
         for (i, &w) in words.iter().enumerate() {
             let v = f64::from_bits(w);
-            let scaled = (v * F10_F64[e]) * IF10_F64[f];
+            let scaled = (v * scale_e) * inv_f;
             let enc = scaled.round_ties_even() as i64;
             let ok = scaled.is_finite()
                 && (((enc as f64) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
-            state.record64(i, w, enc, ok);
+            record_slot_64(
+                i,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
         }
     }
 
-    let Some(first) = state.first_encodable else {
+    first_encodable
+}
+
+/// 4-lane AVX2 magic-double fast path for `f64` ALP transformation.
+///
+/// AVX2 lacks 64-bit float<->int conversions (`vcvttpd2qq`/`vcvtqq2pd` require
+/// AVX-512DQ). For finite `|scaled| < 2^51`, adding `MAGIC = 3 * 2^51`
+/// (`0x4338_0000_0000_0000`) places `m = scaled + MAGIC` inside `(2^52, 2^53)`,
+/// where IEEE-754 addition rounds to the nearest integer with ties-to-even,
+/// `m - MAGIC` recovers `enc as f64`, and `bits(m) - bits(MAGIC)` yields the
+/// exact two's-complement `i64`. Any 4-lane group outside `(-2^51, 2^51)` or
+/// failing bitwise round-trip falls back to the scalar loop.
+#[cfg(all(feature = "bitpacking", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn transform_chunk_f64_avx2(
+    words: &[u64],
+    params: AlpParams,
+    encoded: &mut [i64],
+    exception_positions: &mut Vec<u16>,
+    exception_bits: &mut Vec<u8>,
+) -> Option<i64> {
+    use std::arch::x86_64::*;
+
+    const MAGIC_F64: f64 = 6_755_399_441_055_744.0; // 3 * 2^51 = 0x4338_0000_0000_0000
+    const MAGIC_BITS: i64 = 0x4338_0000_0000_0000_u64 as i64;
+    const LIMIT_2P51: f64 = 2_251_799_813_685_248.0; // 2^51
+
+    let n = words.len();
+    let mut i = 0usize;
+    let mut first_encodable = None;
+    let mut prev = 0i64;
+    let e = params.e as usize;
+
+    let sign_mask = _mm256_set1_pd(-0.0);
+    let limit_v = _mm256_set1_pd(LIMIT_2P51);
+    let magic_pd = _mm256_set1_pd(MAGIC_F64);
+    let magic_i64 = _mm256_set1_epi64x(MAGIC_BITS);
+
+    if params.use_div {
+        let scale = F10_F64[e];
+        let scale_v = _mm256_set1_pd(scale);
+        while i + 4 <= n {
+            // SAFETY: `i + 4 <= n == words.len() <= encoded.len()`.
+            let raw_w = unsafe { _mm256_loadu_si256(words.as_ptr().add(i).cast()) };
+            let v = _mm256_castsi256_pd(raw_w);
+            let scaled = _mm256_mul_pd(v, scale_v);
+            let abs_scaled = _mm256_andnot_pd(sign_mask, scaled);
+            let in_range = _mm256_cmp_pd::<_CMP_LT_OQ>(abs_scaled, limit_v);
+            if _mm256_movemask_pd(in_range) == 0xF {
+                let m = _mm256_add_pd(scaled, magic_pd);
+                let rounded = _mm256_sub_pd(m, magic_pd);
+                let recon = _mm256_div_pd(rounded, scale_v);
+                let eq = _mm256_cmpeq_epi64(_mm256_castpd_si256(recon), raw_w);
+                if _mm256_movemask_pd(_mm256_castsi256_pd(eq)) == 0xF {
+                    let enc_v = _mm256_sub_epi64(_mm256_castpd_si256(m), magic_i64);
+                    // SAFETY: `encoded` has at least `n` initialized elements.
+                    unsafe { _mm256_storeu_si256(encoded.as_mut_ptr().add(i).cast(), enc_v) };
+                    if first_encodable.is_none() {
+                        first_encodable = Some(encoded[i]);
+                    }
+                    prev = encoded[i + 3];
+                    i += 4;
+                    continue;
+                }
+            }
+            for (off, &w) in words[i..i + 4].iter().enumerate() {
+                let j = i + off;
+                let vf = f64::from_bits(w);
+                let sc = vf * scale;
+                let enc = sc.round_ties_even() as i64;
+                let ok = sc.is_finite() && ((enc as f64) / scale).to_bits() == w;
+                record_slot_64(
+                    j,
+                    w,
+                    enc,
+                    ok,
+                    encoded,
+                    &mut first_encodable,
+                    &mut prev,
+                    exception_positions,
+                    exception_bits,
+                );
+            }
+            i += 4;
+        }
+        for (j, &w) in words[i..n].iter().enumerate() {
+            let idx = i + j;
+            let vf = f64::from_bits(w);
+            let sc = vf * scale;
+            let enc = sc.round_ties_even() as i64;
+            let ok = sc.is_finite() && ((enc as f64) / scale).to_bits() == w;
+            record_slot_64(
+                idx,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
+        }
+    } else {
+        let f = params.f as usize;
+        let scale_e = F10_F64[e];
+        let inv_f = IF10_F64[f];
+        let reconstruct_scale = F10_F64[f];
+        let reconstruct_inv = IF10_F64[e];
+        let scale_e_v = _mm256_set1_pd(scale_e);
+        let inv_f_v = _mm256_set1_pd(inv_f);
+        let recon_scale_v = _mm256_set1_pd(reconstruct_scale);
+        let recon_inv_v = _mm256_set1_pd(reconstruct_inv);
+
+        while i + 4 <= n {
+            // SAFETY: `i + 4 <= n == words.len() <= encoded.len()`.
+            let raw_w = unsafe { _mm256_loadu_si256(words.as_ptr().add(i).cast()) };
+            let v = _mm256_castsi256_pd(raw_w);
+            let scaled = _mm256_mul_pd(_mm256_mul_pd(v, scale_e_v), inv_f_v);
+            let abs_scaled = _mm256_andnot_pd(sign_mask, scaled);
+            let in_range = _mm256_cmp_pd::<_CMP_LT_OQ>(abs_scaled, limit_v);
+            if _mm256_movemask_pd(in_range) == 0xF {
+                let m = _mm256_add_pd(scaled, magic_pd);
+                let rounded = _mm256_sub_pd(m, magic_pd);
+                let recon = _mm256_mul_pd(_mm256_mul_pd(rounded, recon_scale_v), recon_inv_v);
+                let eq = _mm256_cmpeq_epi64(_mm256_castpd_si256(recon), raw_w);
+                if _mm256_movemask_pd(_mm256_castsi256_pd(eq)) == 0xF {
+                    let enc_v = _mm256_sub_epi64(_mm256_castpd_si256(m), magic_i64);
+                    // SAFETY: `encoded` has at least `n` initialized elements.
+                    unsafe { _mm256_storeu_si256(encoded.as_mut_ptr().add(i).cast(), enc_v) };
+                    if first_encodable.is_none() {
+                        first_encodable = Some(encoded[i]);
+                    }
+                    prev = encoded[i + 3];
+                    i += 4;
+                    continue;
+                }
+            }
+            for (off, &w) in words[i..i + 4].iter().enumerate() {
+                let j = i + off;
+                let vf = f64::from_bits(w);
+                let sc = (vf * scale_e) * inv_f;
+                let enc = sc.round_ties_even() as i64;
+                let ok = sc.is_finite()
+                    && (((enc as f64) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
+                record_slot_64(
+                    j,
+                    w,
+                    enc,
+                    ok,
+                    encoded,
+                    &mut first_encodable,
+                    &mut prev,
+                    exception_positions,
+                    exception_bits,
+                );
+            }
+            i += 4;
+        }
+        for (j, &w) in words[i..n].iter().enumerate() {
+            let idx = i + j;
+            let vf = f64::from_bits(w);
+            let sc = (vf * scale_e) * inv_f;
+            let enc = sc.round_ties_even() as i64;
+            let ok = sc.is_finite()
+                && (((enc as f64) * reconstruct_scale) * reconstruct_inv).to_bits() == w;
+            record_slot_64(
+                idx,
+                w,
+                enc,
+                ok,
+                encoded,
+                &mut first_encodable,
+                &mut prev,
+                exception_positions,
+                exception_bits,
+            );
+        }
+    }
+
+    first_encodable
+}
+
+#[cfg(feature = "bitpacking")]
+fn encode_chunk_f32_into(
+    words: &[u32],
+    params: AlpParams,
+    scratch: &mut EncodeScratch<i32, u32>,
+    buf0: &mut Vec<u32>,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    buf3: &mut Vec<u8>,
+) -> Result<Option<[u32; 4]>> {
+    let n = words.len();
+    scratch.prepare(n);
+
+    #[cfg(target_arch = "x86_64")]
+    let first_opt = if CpuFeatures::host().contains(CpuFeatures::AVX2) {
+        // SAFETY: `CpuFeatures::host().contains(CpuFeatures::AVX2)` verified AVX2 support.
+        unsafe {
+            transform_chunk_f32_avx2(
+                words,
+                params,
+                &mut scratch.encoded[..n],
+                &mut scratch.exception_positions,
+                &mut scratch.exception_bits,
+            )
+        }
+    } else {
+        transform_chunk_f32_scalar(
+            words,
+            params,
+            &mut scratch.encoded[..n],
+            &mut scratch.exception_positions,
+            &mut scratch.exception_bits,
+        )
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let first_opt = transform_chunk_f32_scalar(
+        words,
+        params,
+        &mut scratch.encoded[..n],
+        &mut scratch.exception_positions,
+        &mut scratch.exception_bits,
+    );
+
+    let Some(first) = first_opt else {
         return Ok(None);
     };
-    if !state.exception_positions.is_empty() {
-        backfill_exceptions(&mut state.encoded, &state.exception_positions);
+    if !scratch.exception_positions.is_empty() {
+        backfill_exceptions(&mut scratch.encoded[..n], &scratch.exception_positions);
+        if scratch.exception_positions.first() == Some(&0) {
+            scratch.encoded[0] = first;
+        }
     }
-    if state.exception_positions.first() == Some(&0) {
-        state.encoded[0] = first;
-    }
-    pack_chunk_f64(
-        state.encoded,
+    pack_chunk_f32_into(n, params, scratch, buf0, buf1, buf2, buf3)
+}
+
+#[cfg(feature = "bitpacking")]
+fn encode_chunk_f64_into(
+    words: &[u64],
+    params: AlpParams,
+    scratch: &mut EncodeScratch<i64, u64>,
+    buf0: &mut Vec<u64>,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    buf3: &mut Vec<u8>,
+) -> Result<Option<[u32; 4]>> {
+    let n = words.len();
+    scratch.prepare(n);
+
+    #[cfg(target_arch = "x86_64")]
+    let first_opt = if CpuFeatures::host().contains(CpuFeatures::AVX2) {
+        // SAFETY: `CpuFeatures::host().contains(CpuFeatures::AVX2)` verified AVX2 support.
+        unsafe {
+            transform_chunk_f64_avx2(
+                words,
+                params,
+                &mut scratch.encoded[..n],
+                &mut scratch.exception_positions,
+                &mut scratch.exception_bits,
+            )
+        }
+    } else {
+        transform_chunk_f64_scalar(
+            words,
+            params,
+            &mut scratch.encoded[..n],
+            &mut scratch.exception_positions,
+            &mut scratch.exception_bits,
+        )
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let first_opt = transform_chunk_f64_scalar(
+        words,
         params,
-        state.exception_positions,
-        state.exception_bits,
-    )
+        &mut scratch.encoded[..n],
+        &mut scratch.exception_positions,
+        &mut scratch.exception_bits,
+    );
+
+    let Some(first) = first_opt else {
+        return Ok(None);
+    };
+    if !scratch.exception_positions.is_empty() {
+        backfill_exceptions(&mut scratch.encoded[..n], &scratch.exception_positions);
+        if scratch.exception_positions.first() == Some(&0) {
+            scratch.encoded[0] = first;
+        }
+    }
+    pack_chunk_f64_into(n, params, scratch, buf0, buf1, buf2, buf3)
 }
 
 /// Backfill exception slots with the preceding encodable integer so Delta
 /// streams do not see artificial spikes.
+#[cfg(feature = "bitpacking")]
 fn backfill_exceptions<T: Copy>(encoded: &mut [T], exception_positions: &[u16]) {
     let mut running = encoded[0];
     let mut exc = 0usize;
@@ -832,44 +1324,49 @@ fn backfill_exceptions<T: Copy>(encoded: &mut [T], exception_positions: &[u16]) 
     debug_assert_eq!(exc, exception_positions.len());
 }
 
-/// Pack the cheaper of the FOR and Delta offset streams. Only the winning
-/// stream is bit-packed; the loser is dismissed from its (exact) size so the
-/// FOR-vs-Delta decision stays identical to packing both.
+/// Pack the cheaper of the FOR and Delta offset streams directly into the page
+/// output buffers. Only the winning stream is bit-packed.
 #[cfg(feature = "bitpacking")]
-fn pack_chunk_f32(
-    mut encoded: Vec<i32>,
+fn pack_chunk_f32_into(
+    n: usize,
     params: AlpParams,
-    exception_positions: Vec<u16>,
-    exception_bits: Vec<u8>,
-) -> Result<Option<EncodedChunk32>> {
-    let n = encoded.len();
+    scratch: &mut EncodeScratch<i32, u32>,
+    buf0: &mut Vec<u32>,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    buf3: &mut Vec<u8>,
+) -> Result<Option<[u32; 4]>> {
+    if n == 0 {
+        return Ok(None);
+    }
+    let encoded = &scratch.encoded[..n];
     let mut min = i32::MAX;
     let mut max = i32::MIN;
-    let mut delta_min = 0i128;
-    let mut delta_bit_width = 0u8;
-    let mut delta_usable = false;
-    let mut lo = i64::MAX as i128;
-    let mut hi = i64::MIN as i128;
-    let mut prev = 0i32;
-    for (i, &v) in encoded.iter().enumerate() {
+    for &v in encoded {
         min = min.min(v);
         max = max.max(v);
-        if i > 0 {
-            let delta = v as i128 - prev as i128;
-            lo = lo.min(delta);
-            hi = hi.max(delta);
-        }
-        prev = v;
     }
-    let for_bit_width = bits_required_u128((max as i128 - min as i128) as u128);
+    let for_range = (max as i64 - min as i64) as u64;
+    let for_bit_width = (64 - for_range.leading_zeros()) as u8;
     if for_bit_width >= 32 {
         return Ok(None);
     }
     let for_width = for_bit_width.max(1);
 
-    // Delta range is computed in i128 so extreme pairs cannot wrap.
+    let mut delta_min = 0i32;
+    let mut delta_bit_width = 0u8;
+    let mut delta_usable = false;
     if n > 1 {
-        let width = bits_required_u128((hi - lo) as u128);
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        for pair in encoded.windows(2) {
+            // Cannot overflow i32 because `max - min < 2^31`.
+            let delta = pair[1] - pair[0];
+            lo = lo.min(delta);
+            hi = hi.max(delta);
+        }
+        let delta_range = (hi as i64 - lo as i64) as u64;
+        let width = (64 - delta_range.leading_zeros()) as u8;
         if width < 32 {
             delta_min = lo;
             delta_bit_width = width.max(1);
@@ -884,78 +1381,95 @@ fn pack_chunk_f32(
         usize::MAX
     };
 
-    if for_len <= delta_len {
-        // Transform `encoded` in place into unsigned FOR offsets (same 32-bit bit pattern).
-        for v in &mut encoded {
-            *v = v.wrapping_sub(min);
+    let pos_bytes = scratch.exception_positions.len() * 2;
+    let exc_bytes = scratch.exception_bits.len();
+    let winning_len = for_len.min(delta_len);
+    if winning_len + pos_bytes + exc_bytes > MAX_MINIBLOCK_BYTES as usize {
+        return Ok(None);
+    }
+
+    let buf0_before = buf0.len();
+    let header_bytes = if for_len <= delta_len {
+        let min_u32 = min as u32;
+        for (&v, dst) in encoded.iter().zip(&mut scratch.offsets[..n]) {
+            *dst = (v as u32).wrapping_sub(min_u32);
         }
-        let Some(packed) = pack_i32_as_u32(encoded, for_width as usize) else {
-            return Ok(None);
-        };
-        let mut header = Vec::with_capacity(8);
-        header.push(if params.use_div { MODE_DIV } else { 0 });
-        header.push(params.e);
-        header.push(params.f);
-        header.push(for_width);
-        header.extend_from_slice(&min.to_le_bytes());
-        Ok(Some(EncodedChunk32 {
-            packed_offsets: packed,
-            header,
-            exception_positions,
-            exception_bits,
-        }))
+        bitpack_out_of_line_slice_into::<u32>(&scratch.offsets[..n], for_width as usize, buf0);
+        let mut header = [0u8; 8];
+        header[0] = if params.use_div { MODE_DIV } else { 0 };
+        header[1] = params.e;
+        header[2] = params.f;
+        header[3] = for_width;
+        header[4..8].copy_from_slice(&min.to_le_bytes());
+        buf1.extend_from_slice(&header);
+        8usize
     } else {
         let first = encoded[0];
-        let width = delta_bit_width as usize;
-        for i in 0..n - 1 {
-            encoded[i] = ((encoded[i + 1] as i128 - encoded[i] as i128 - delta_min) as u32) as i32;
+        let delta_min_u32 = delta_min as u32;
+        for ((&curr, &next), dst) in encoded[..n - 1]
+            .iter()
+            .zip(&encoded[1..n])
+            .zip(&mut scratch.offsets[..n - 1])
+        {
+            *dst = (next as u32)
+                .wrapping_sub(curr as u32)
+                .wrapping_sub(delta_min_u32);
         }
-        encoded.truncate(n - 1);
-        let Some(packed) = pack_i32_as_u32(encoded, width) else {
-            return Ok(None);
-        };
-        let mut header = Vec::with_capacity(12);
-        header.push(MODE_DELTA | if params.use_div { MODE_DIV } else { 0 });
-        header.push(params.e);
-        header.push(params.f);
-        header.push(delta_bit_width);
-        header.extend_from_slice(&first.to_le_bytes());
-        header.extend_from_slice(&(delta_min as i32).to_le_bytes());
-        Ok(Some(EncodedChunk32 {
-            packed_offsets: packed,
-            header,
-            exception_positions,
-            exception_bits,
-        }))
+        bitpack_out_of_line_slice_into::<u32>(
+            &scratch.offsets[..n - 1],
+            delta_bit_width as usize,
+            buf0,
+        );
+        let mut header = [0u8; 12];
+        header[0] = MODE_DELTA | if params.use_div { MODE_DIV } else { 0 };
+        header[1] = params.e;
+        header[2] = params.f;
+        header[3] = delta_bit_width;
+        header[4..8].copy_from_slice(&first.to_le_bytes());
+        header[8..12].copy_from_slice(&delta_min.to_le_bytes());
+        buf1.extend_from_slice(&header);
+        12usize
+    };
+
+    let delta_bytes = (buf0.len() - buf0_before) * 4;
+    debug_assert_eq!(delta_bytes + header_bytes, winning_len);
+    #[cfg(target_endian = "little")]
+    buf2.extend_from_slice(bytemuck::cast_slice(&scratch.exception_positions));
+    #[cfg(not(target_endian = "little"))]
+    for &pos in &scratch.exception_positions {
+        buf2.extend_from_slice(&pos.to_le_bytes());
     }
+    buf3.extend_from_slice(&scratch.exception_bits);
+
+    Ok(Some([
+        delta_bytes as u32,
+        header_bytes as u32,
+        pos_bytes as u32,
+        exc_bytes as u32,
+    ]))
 }
 
-/// Pack the cheaper of the FOR and Delta offset streams.
+/// Pack the cheaper of the FOR and Delta offset streams directly into the page
+/// output buffers.
 #[cfg(feature = "bitpacking")]
-fn pack_chunk_f64(
-    mut encoded: Vec<i64>,
+fn pack_chunk_f64_into(
+    n: usize,
     params: AlpParams,
-    exception_positions: Vec<u16>,
-    exception_bits: Vec<u8>,
-) -> Result<Option<EncodedChunk64>> {
-    let n = encoded.len();
+    scratch: &mut EncodeScratch<i64, u64>,
+    buf0: &mut Vec<u64>,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    buf3: &mut Vec<u8>,
+) -> Result<Option<[u32; 4]>> {
+    if n == 0 {
+        return Ok(None);
+    }
+    let encoded = &scratch.encoded[..n];
     let mut min = i64::MAX;
     let mut max = i64::MIN;
-    let mut delta_min = 0i128;
-    let mut delta_bit_width = 0u8;
-    let mut delta_usable = false;
-    let mut lo = i64::MAX as i128;
-    let mut hi = i64::MIN as i128;
-    let mut prev = 0i64;
-    for (i, &v) in encoded.iter().enumerate() {
+    for &v in encoded {
         min = min.min(v);
         max = max.max(v);
-        if i > 0 {
-            let delta = v as i128 - prev as i128;
-            lo = lo.min(delta);
-            hi = hi.max(delta);
-        }
-        prev = v;
     }
     let for_bit_width = bits_required_u128((max as i128 - min as i128) as u128);
     if for_bit_width >= 63 {
@@ -963,8 +1477,20 @@ fn pack_chunk_f64(
     }
     let for_width = for_bit_width.max(1);
 
+    let mut delta_min = 0i64;
+    let mut delta_bit_width = 0u8;
+    let mut delta_usable = false;
     if n > 1 {
-        let width = bits_required_u128((hi - lo) as u128);
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for pair in encoded.windows(2) {
+            // Cannot overflow i64 because `max - min < 2^62`.
+            let delta = pair[1] - pair[0];
+            lo = lo.min(delta);
+            hi = hi.max(delta);
+        }
+        let delta_range = (hi as u64).wrapping_sub(lo as u64);
+        let width = (64 - delta_range.leading_zeros()) as u8;
         if width < 64 {
             delta_min = lo;
             delta_bit_width = width.max(1);
@@ -979,50 +1505,72 @@ fn pack_chunk_f64(
         usize::MAX
     };
 
-    if for_len <= delta_len {
+    let pos_bytes = scratch.exception_positions.len() * 2;
+    let exc_bytes = scratch.exception_bits.len();
+    let winning_len = for_len.min(delta_len);
+    if winning_len + pos_bytes + exc_bytes > MAX_MINIBLOCK_BYTES as usize {
+        return Ok(None);
+    }
+
+    let buf0_before = buf0.len();
+    let header_bytes = if for_len <= delta_len {
         let min_u64 = min as u64;
-        for v in &mut encoded {
-            *v = (*v as u64).wrapping_sub(min_u64) as i64;
+        for (&v, dst) in encoded.iter().zip(&mut scratch.offsets[..n]) {
+            *dst = (v as u64).wrapping_sub(min_u64);
         }
-        let Some(packed) = pack_i64_as_u64(encoded, for_width as usize) else {
-            return Ok(None);
-        };
-        let mut header = Vec::with_capacity(12);
-        header.push(if params.use_div { MODE_DIV } else { 0 });
-        header.push(params.e);
-        header.push(params.f);
-        header.push(for_width);
-        header.extend_from_slice(&min.to_le_bytes());
-        Ok(Some(EncodedChunk64 {
-            packed_offsets: packed,
-            header,
-            exception_positions,
-            exception_bits,
-        }))
+        bitpack_out_of_line_slice_into::<u64>(&scratch.offsets[..n], for_width as usize, buf0);
+        let mut header = [0u8; 12];
+        header[0] = if params.use_div { MODE_DIV } else { 0 };
+        header[1] = params.e;
+        header[2] = params.f;
+        header[3] = for_width;
+        header[4..12].copy_from_slice(&min.to_le_bytes());
+        buf1.extend_from_slice(&header);
+        12usize
     } else {
         let first = encoded[0];
-        let width = delta_bit_width as usize;
-        for i in 0..n - 1 {
-            encoded[i] = ((encoded[i + 1] as i128 - encoded[i] as i128 - delta_min) as u64) as i64;
+        let delta_min_u64 = delta_min as u64;
+        for ((&curr, &next), dst) in encoded[..n - 1]
+            .iter()
+            .zip(&encoded[1..n])
+            .zip(&mut scratch.offsets[..n - 1])
+        {
+            *dst = (next as u64)
+                .wrapping_sub(curr as u64)
+                .wrapping_sub(delta_min_u64);
         }
-        encoded.truncate(n - 1);
-        let Some(packed) = pack_i64_as_u64(encoded, width) else {
-            return Ok(None);
-        };
-        let mut header = Vec::with_capacity(20);
-        header.push(MODE_DELTA | if params.use_div { MODE_DIV } else { 0 });
-        header.push(params.e);
-        header.push(params.f);
-        header.push(delta_bit_width);
-        header.extend_from_slice(&first.to_le_bytes());
-        header.extend_from_slice(&(delta_min as i64).to_le_bytes());
-        Ok(Some(EncodedChunk64 {
-            packed_offsets: packed,
-            header,
-            exception_positions,
-            exception_bits,
-        }))
+        bitpack_out_of_line_slice_into::<u64>(
+            &scratch.offsets[..n - 1],
+            delta_bit_width as usize,
+            buf0,
+        );
+        let mut header = [0u8; 20];
+        header[0] = MODE_DELTA | if params.use_div { MODE_DIV } else { 0 };
+        header[1] = params.e;
+        header[2] = params.f;
+        header[3] = delta_bit_width;
+        header[4..12].copy_from_slice(&first.to_le_bytes());
+        header[12..20].copy_from_slice(&delta_min.to_le_bytes());
+        buf1.extend_from_slice(&header);
+        20usize
+    };
+
+    let delta_bytes = (buf0.len() - buf0_before) * 8;
+    debug_assert_eq!(delta_bytes + header_bytes, winning_len);
+    #[cfg(target_endian = "little")]
+    buf2.extend_from_slice(bytemuck::cast_slice(&scratch.exception_positions));
+    #[cfg(not(target_endian = "little"))]
+    for &pos in &scratch.exception_positions {
+        buf2.extend_from_slice(&pos.to_le_bytes());
     }
+    buf3.extend_from_slice(&scratch.exception_bits);
+
+    Ok(Some([
+        delta_bytes as u32,
+        header_bytes as u32,
+        pos_bytes as u32,
+        exc_bytes as u32,
+    ]))
 }
 
 /// ALP-RD page fallback for `f64` pages where the scalar transform does not
@@ -1039,37 +1587,31 @@ fn encode_page_f64_rd(
     max_chunk: usize,
     raw_size: usize,
 ) -> Result<Option<(MiniBlockCompressed, CompressiveEncoding)>> {
-    let mut buf0: Vec<u64> = Vec::new();
-    let mut buf1: Vec<u8> = Vec::new();
-    let mut buf2: Vec<u8> = Vec::new();
-    let mut buf3: Vec<u64> = Vec::new();
-    let mut chunks = Vec::new();
+    let num_chunks = words.len().div_ceil(max_chunk);
+    let mut buf0: Vec<u64> = Vec::with_capacity(words.len() / 2);
+    let mut buf1: Vec<u8> = Vec::with_capacity(num_chunks * 8);
+    let mut buf2: Vec<u8> = Vec::with_capacity(num_chunks * 128);
+    let mut buf3: Vec<u64> = Vec::with_capacity(words.len() / 8);
+    let mut chunks = Vec::with_capacity(num_chunks);
     let mut compressed_size = 0usize;
+    let mut scratch = vec![0u64; max_chunk];
 
     for chunk in words.chunks(max_chunk) {
-        let Some(encoded) = encode_chunk_f64_rd(chunk) else {
+        let Some(sizes) = encode_chunk_f64_rd(
+            chunk,
+            &mut scratch,
+            &mut buf0,
+            &mut buf1,
+            &mut buf2,
+            &mut buf3,
+        ) else {
             return Ok(None);
         };
-        if encoded.total_bytes() > MAX_MINIBLOCK_BYTES as usize {
-            return Ok(None);
-        }
-        let right_len = encoded.right.len() * 8;
-        let header_len = encoded.header.len();
-        let dict_len = encoded.dict.len();
-        let index_len = encoded.indices.len() * 8;
-        buf0.extend(encoded.right);
-        buf1.extend_from_slice(&encoded.header);
-        buf2.extend_from_slice(&encoded.dict);
-        buf3.extend(encoded.indices);
-        compressed_size += right_len + header_len + dict_len + index_len;
+        compressed_size +=
+            sizes[0] as usize + sizes[1] as usize + sizes[2] as usize + sizes[3] as usize;
 
         chunks.push(MiniBlockChunk {
-            buffer_sizes: vec![
-                right_len as u32,
-                header_len as u32,
-                dict_len as u32,
-                index_len as u32,
-            ],
+            buffer_sizes: sizes.to_vec(),
             log_num_values: if chunk.len() < max_chunk {
                 0
             } else {
@@ -1096,23 +1638,17 @@ fn encode_page_f64_rd(
     )))
 }
 
-struct EncodedRdChunk64 {
-    right: Vec<u64>,
-    header: Vec<u8>,
-    dict: Vec<u8>,
-    indices: Vec<u64>,
-}
-
-impl EncodedRdChunk64 {
-    fn total_bytes(&self) -> usize {
-        self.right.len() * 8 + self.header.len() + self.dict.len() + self.indices.len() * 8
-    }
-}
-
-/// Encode one chunk with the best ALP-RD split, or `None` when no split beats
-/// the raw representation within the chunk budget.
+/// Encode one chunk with the best ALP-RD split directly into the page buffers,
+/// or `None` when no split beats the raw representation within the chunk budget.
 #[cfg(feature = "bitpacking")]
-fn encode_chunk_f64_rd(words: &[u64]) -> Option<EncodedRdChunk64> {
+fn encode_chunk_f64_rd(
+    words: &[u64],
+    scratch: &mut Vec<u64>,
+    buf0: &mut Vec<u64>,
+    buf1: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    buf3: &mut Vec<u64>,
+) -> Option<[u32; 4]> {
     let n = words.len();
     let raw_bytes = n * 8;
     if n == 0 {
@@ -1158,86 +1694,107 @@ fn encode_chunk_f64_rd(words: &[u64]) -> Option<EncodedRdChunk64> {
     }
 
     let (d, index_bits, dict_len) = best?;
+    if d >= 64 || index_bits >= 64 {
+        return None;
+    }
     let mask = (1u64 << d) - 1;
     let high_mask = !mask;
 
     // Build the sorted dictionary (`(w >> d) << d == w & high_mask`) in one pass over `sorted`.
-    let mut dict = Vec::with_capacity(dict_len);
-    let mut prev_high = sorted[0] & high_mask;
-    dict.push(prev_high);
-    for &w in &sorted[1..] {
-        let cur_high = w & high_mask;
-        if cur_high != prev_high {
-            dict.push(cur_high);
-            prev_high = cur_high;
-        }
-    }
-    debug_assert_eq!(dict.len(), dict_len);
-
-    let mut scratch: Vec<u64> = words.iter().map(|&w| w & mask).collect();
-    let right = pack_offsets_u64(std::mem::take(&mut scratch), d as usize)?;
-
-    let indices: Vec<u64> = if index_bits == 0 {
-        Vec::new()
-    } else if dict_len <= 1024 {
-        // Open-addressed stack hash table (load factor <= 0.5 since `dict_len <= 1024`
-        // for 8 KiB chunks), avoiding `HashMap` heap allocation and SipHash per value.
-        const EMPTY: u16 = u16::MAX;
-        const HASH_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut slots = [EMPTY; 2048];
-        for (i, &high) in dict.iter().enumerate() {
-            let mut slot = (((high >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
-            while slots[slot] != EMPTY {
-                slot = (slot + 1) & 2047;
+    let mut stack_dict = [0u64; 1024];
+    let mut heap_dict: Vec<u64>;
+    let dict: &[u64] = if dict_len <= stack_dict.len() {
+        let mut count = 1usize;
+        let mut prev_high = sorted[0] & high_mask;
+        stack_dict[0] = prev_high;
+        for &w in &sorted[1..] {
+            let cur_high = w & high_mask;
+            if cur_high != prev_high {
+                stack_dict[count] = cur_high;
+                count += 1;
+                prev_high = cur_high;
             }
-            slots[slot] = i as u16;
         }
-        let mut index_values = Vec::with_capacity(n);
-        for &w in words {
-            let high = w & high_mask;
-            let mut slot = (((w >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
-            let idx = loop {
-                let candidate = slots[slot] as usize;
-                if dict[candidate] == high {
-                    break candidate as u64;
-                }
-                slot = (slot + 1) & 2047;
-            };
-            index_values.push(idx);
-        }
-        pack_offsets_u64(index_values, index_bits as usize)?
+        debug_assert_eq!(count, dict_len);
+        &stack_dict[..dict_len]
     } else {
-        let index_values: Vec<u64> = words
-            .iter()
-            .map(|&w| dict.binary_search(&(w & high_mask)).unwrap() as u64)
-            .collect();
-        pack_offsets_u64(index_values, index_bits as usize)?
+        heap_dict = Vec::with_capacity(dict_len);
+        let mut prev_high = sorted[0] & high_mask;
+        heap_dict.push(prev_high);
+        for &w in &sorted[1..] {
+            let cur_high = w & high_mask;
+            if cur_high != prev_high {
+                heap_dict.push(cur_high);
+                prev_high = cur_high;
+            }
+        }
+        debug_assert_eq!(heap_dict.len(), dict_len);
+        heap_dict.as_slice()
     };
+
+    if scratch.len() < n {
+        scratch.resize(n, 0);
+    }
+    for (&w, dst) in words.iter().zip(&mut scratch[..n]) {
+        *dst = w & mask;
+    }
+    let buf0_before = buf0.len();
+    bitpack_out_of_line_slice_into::<u64>(&scratch[..n], d as usize, buf0);
+    let right_len = (buf0.len() - buf0_before) * 8;
+
+    let buf3_before = buf3.len();
+    if index_bits > 0 {
+        if dict_len <= 1024 {
+            // Open-addressed stack hash table (load factor <= 0.5 since `dict_len <= 1024`
+            // for 8 KiB chunks), avoiding `HashMap` heap allocation and SipHash per value.
+            const EMPTY: u16 = u16::MAX;
+            const HASH_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut slots = [EMPTY; 2048];
+            for (i, &high) in dict.iter().enumerate() {
+                let mut slot = (((high >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
+                while slots[slot] != EMPTY {
+                    slot = (slot + 1) & 2047;
+                }
+                slots[slot] = i as u16;
+            }
+            for (&w, dst) in words.iter().zip(&mut scratch[..n]) {
+                let high = w & high_mask;
+                let mut slot = (((w >> d).wrapping_mul(HASH_MUL)) >> 53) as usize;
+                *dst = loop {
+                    let candidate = slots[slot] as usize;
+                    if dict[candidate] == high {
+                        break candidate as u64;
+                    }
+                    slot = (slot + 1) & 2047;
+                };
+            }
+        } else {
+            for (&w, dst) in words.iter().zip(&mut scratch[..n]) {
+                *dst = dict.binary_search(&(w & high_mask)).unwrap() as u64;
+            }
+        }
+        bitpack_out_of_line_slice_into::<u64>(&scratch[..n], index_bits as usize, buf3);
+    }
+    let index_len = (buf3.len() - buf3_before) * 8;
 
     #[cfg(target_endian = "little")]
-    let dict_bytes = bytemuck::cast_slice::<u64, u8>(&dict).to_vec();
+    buf2.extend_from_slice(bytemuck::cast_slice::<u64, u8>(dict));
     #[cfg(not(target_endian = "little"))]
-    let dict_bytes = {
-        let mut bytes = Vec::with_capacity(dict.len() * 8);
-        for &high in &dict {
-            bytes.extend_from_slice(&high.to_le_bytes());
-        }
-        bytes
-    };
+    for &high in dict {
+        buf2.extend_from_slice(&high.to_le_bytes());
+    }
+    let dict_bytes_len = dict.len() * 8;
 
-    let mut header = Vec::with_capacity(8);
-    header.push(MODE_RD);
-    header.push(d);
-    header.push(index_bits);
-    header.push(0);
-    header.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    let mut header = [0u8; 8];
+    header[0] = MODE_RD;
+    header[1] = d;
+    header[2] = index_bits;
+    header[3] = 0;
+    header[4..8].copy_from_slice(&(dict.len() as u32).to_le_bytes());
+    buf1.extend_from_slice(&header);
 
-    Some(EncodedRdChunk64 {
-        right,
-        header,
-        dict: dict_bytes,
-        indices,
-    })
+    debug_assert_eq!(right_len + 8 + dict_bytes_len + index_len, best_cost);
+    Some([right_len as u32, 8, dict_bytes_len as u32, index_len as u32])
 }
 
 #[cfg(not(feature = "bitpacking"))]
@@ -1249,8 +1806,9 @@ fn encode_page_f64_rd(
     Ok(None)
 }
 
-/// Number of payload bytes `bitpack_out_of_line_vec` produces for `num_items`
+/// Number of payload bytes `bitpack_out_of_line_slice_into` produces for `num_items`
 /// values at `bit_width`. Mirrors its tail padding decisions exactly.
+#[cfg(feature = "bitpacking")]
 fn out_of_line_bytes(num_items: usize, bit_width: usize, bits_per_value: usize) -> usize {
     const ELEMS_PER_CHUNK: usize = 1024;
     let words_per_chunk = (ELEMS_PER_CHUNK * bit_width).div_ceil(bits_per_value);
@@ -1268,63 +1826,6 @@ fn out_of_line_bytes(num_items: usize, bit_width: usize, bits_per_value: usize) 
         }
     }
     words * bits_per_value / 8
-}
-
-#[cfg(feature = "bitpacking")]
-fn pack_i32_as_u32(offsets: Vec<i32>, bit_width: usize) -> Option<Vec<u32>> {
-    if offsets.is_empty() || bit_width >= 32 {
-        return None;
-    }
-    let num_values = offsets.len() as u64;
-    let block = FixedWidthDataBlock {
-        data: LanceBuffer::reinterpret_vec(offsets),
-        bits_per_value: 32,
-        num_values,
-        block_info: BlockInfo::new(),
-    };
-    Some(bitpack_out_of_line_vec::<u32>(block, bit_width))
-}
-
-#[cfg(feature = "bitpacking")]
-fn pack_i64_as_u64(offsets: Vec<i64>, bit_width: usize) -> Option<Vec<u64>> {
-    if offsets.is_empty() || bit_width >= 64 {
-        return None;
-    }
-    let num_values = offsets.len() as u64;
-    let block = FixedWidthDataBlock {
-        data: LanceBuffer::reinterpret_vec(offsets),
-        bits_per_value: 64,
-        num_values,
-        block_info: BlockInfo::new(),
-    };
-    Some(bitpack_out_of_line_vec::<u64>(block, bit_width))
-}
-
-#[cfg(feature = "bitpacking")]
-fn pack_offsets_u64(offsets: Vec<u64>, bit_width: usize) -> Option<Vec<u64>> {
-    if offsets.is_empty() || bit_width >= 64 {
-        return None;
-    }
-    let num_values = offsets.len() as u64;
-    let block = FixedWidthDataBlock {
-        data: LanceBuffer::reinterpret_vec(offsets),
-        bits_per_value: 64,
-        num_values,
-        block_info: BlockInfo::new(),
-    };
-    Some(bitpack_out_of_line_vec::<u64>(block, bit_width))
-}
-
-#[cfg(not(feature = "bitpacking"))]
-fn encode_chunk_f32(_words: &[u32], _params: AlpParams) -> Result<Option<EncodedChunk32>> {
-    // Without bitpacking there is no payload kernel; degrade to the flat
-    // page-level fallback rather than failing the write.
-    Ok(None)
-}
-
-#[cfg(not(feature = "bitpacking"))]
-fn encode_chunk_f64(_words: &[u64], _params: AlpParams) -> Result<Option<EncodedChunk64>> {
-    Ok(None)
 }
 
 /// Decodes values encoded by [`AlpMiniBlockEncoder`].
@@ -2353,5 +2854,150 @@ mod tests {
             enc2.compression.as_ref().unwrap(),
             metadata::compressive_encoding::Compression::Alp(_)
         ));
+    }
+
+    #[cfg(all(feature = "bitpacking", target_arch = "x86_64"))]
+    #[test]
+    fn test_avx2_transform_matches_scalar_edge_cases() {
+        if !CpuFeatures::host().contains(CpuFeatures::AVX2) {
+            return;
+        }
+
+        // Stress leading exceptions, NaN payloads, signed zeros, subnormals,
+        // boundary powers near 2^51 / 2^60, negative ties, and non-4/8 tails.
+        let mut f64_vals = vec![
+            -0.0_f64,
+            f64::NAN,
+            f64::from_bits(0x7FF8_1234_5678_9ABC),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MIN_POSITIVE,
+            -f64::from_bits(1),
+            0.0,
+            -0.01,
+            -0.02,
+            0.05,
+            12345.67,
+            -9876543.21,
+            22_517_998_136_852.47, // near 2^51 / 100
+            22_517_998_136_852.49, // crosses 2^51 when scaled by 100
+            -22_517_998_136_852.49,
+            1.0e18,
+            std::f64::consts::PI,
+        ];
+        for i in 0..77 {
+            f64_vals.push(((i as i64 - 38) as f64) * 0.01);
+        }
+        let words64: Vec<u64> = f64_vals.iter().map(|v| v.to_bits()).collect();
+
+        for params in [
+            AlpParams {
+                e: 2,
+                f: 0,
+                use_div: false,
+            },
+            AlpParams {
+                e: 2,
+                f: 0,
+                use_div: true,
+            },
+            AlpParams {
+                e: 4,
+                f: 2,
+                use_div: false,
+            },
+        ] {
+            let mut enc_scalar = vec![0i64; words64.len()];
+            let mut pos_scalar = Vec::new();
+            let mut bits_scalar = Vec::new();
+            let first_scalar = transform_chunk_f64_scalar(
+                &words64,
+                params,
+                &mut enc_scalar,
+                &mut pos_scalar,
+                &mut bits_scalar,
+            );
+
+            let mut enc_avx2 = vec![0i64; words64.len()];
+            let mut pos_avx2 = Vec::new();
+            let mut bits_avx2 = Vec::new();
+            // SAFETY: checked `CpuFeatures::host().contains(CpuFeatures::AVX2)` above.
+            let first_avx2 = unsafe {
+                transform_chunk_f64_avx2(
+                    &words64,
+                    params,
+                    &mut enc_avx2,
+                    &mut pos_avx2,
+                    &mut bits_avx2,
+                )
+            };
+
+            assert_eq!(first_avx2, first_scalar);
+            assert_eq!(pos_avx2, pos_scalar);
+            assert_eq!(bits_avx2, bits_scalar);
+            assert_eq!(enc_avx2, enc_scalar);
+        }
+
+        let mut f32_vals = vec![
+            -0.0_f32,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE,
+            0.0,
+            -0.25,
+            12.34,
+            -56.78,
+            10_737_418.0, // near 2^30 / 100
+            20_000_000.0, // crosses 2^30 when scaled by 100
+            std::f32::consts::E,
+        ];
+        for i in 0..69 {
+            f32_vals.push(((i - 34) as f32) * 0.01);
+        }
+        let words32: Vec<u32> = f32_vals.iter().map(|v| v.to_bits()).collect();
+
+        for params in [
+            AlpParams {
+                e: 2,
+                f: 0,
+                use_div: false,
+            },
+            AlpParams {
+                e: 2,
+                f: 0,
+                use_div: true,
+            },
+        ] {
+            let mut enc_scalar = vec![0i32; words32.len()];
+            let mut pos_scalar = Vec::new();
+            let mut bits_scalar = Vec::new();
+            let first_scalar = transform_chunk_f32_scalar(
+                &words32,
+                params,
+                &mut enc_scalar,
+                &mut pos_scalar,
+                &mut bits_scalar,
+            );
+
+            let mut enc_avx2 = vec![0i32; words32.len()];
+            let mut pos_avx2 = Vec::new();
+            let mut bits_avx2 = Vec::new();
+            // SAFETY: checked `CpuFeatures::host().contains(CpuFeatures::AVX2)` above.
+            let first_avx2 = unsafe {
+                transform_chunk_f32_avx2(
+                    &words32,
+                    params,
+                    &mut enc_avx2,
+                    &mut pos_avx2,
+                    &mut bits_avx2,
+                )
+            };
+
+            assert_eq!(first_avx2, first_scalar);
+            assert_eq!(pos_avx2, pos_scalar);
+            assert_eq!(bits_avx2, bits_scalar);
+            assert_eq!(enc_avx2, enc_scalar);
+        }
     }
 }
