@@ -1644,7 +1644,12 @@ mod tests {
     #[rstest]
     #[case::deleted_offset(false, &[0, 1, 3], Ok(vec![0, 3]))]
     #[case::fragmented_sequence(true, &[0, 1, 2, 5, 9], Ok(vec![0, 3, 7, 11]))]
-    #[case::offset_past_fragment(false, &[0, 4], Err("physical_offset=4"))]
+    #[case::offset_past_fragment(false, &[0, 4], Err("no entry for 1 of 2 selected offsets"))]
+    #[case::offset_past_fragmented_sequence(
+        true,
+        &[0, 1, 10, 11],
+        Err("no entry for 2 of 3 selected offsets")
+    )]
     #[tokio::test]
     async fn test_translate_partial_addrs_with_deletions(
         #[case] compact: bool,

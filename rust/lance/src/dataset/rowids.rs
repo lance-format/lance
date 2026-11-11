@@ -290,22 +290,28 @@ pub(crate) async fn translate_addr_treemap_to_row_ids(
                         .as_ref()
                         .is_some_and(|dv| dv.contains(*offset))
                 };
+                // The bitmap yields offsets in order, so one pass over the sequence maps them.
+                let mut selected = 0_u64;
+                let live_offsets = offsets
+                    .iter()
+                    .filter(is_live)
+                    .inspect(|_| selected += 1)
+                    .map(|offset| offset as usize);
+                let mut translated = 0_u64;
+                for id in sequence.select(live_offsets) {
+                    row_ids.insert(id);
+                    translated += 1;
+                }
                 // A selected offset with no sequence entry points past the fragment's rows.
                 // Silently dropping it would let a stale index result escape masking, so
                 // treat the mismatch as corruption.
-                if let Some(max_offset) = offsets.iter().rev().find(is_live)
-                    && u64::from(max_offset) >= sequence.len()
-                {
+                if translated != selected {
                     return Err(Error::internal(format!(
-                        "fragment_id={fragment_id} row-id sequence has no entry at \
-                         physical_offset={max_offset} (sequence len={})",
+                        "fragment_id={fragment_id} row-id sequence has no entry for {} of \
+                         {selected} selected offsets (sequence len={})",
+                        selected - translated,
                         sequence.len()
                     )));
-                }
-                // The bitmap yields offsets in order, so one pass over the sequence maps them.
-                let live_offsets = offsets.iter().filter(is_live).map(|offset| offset as usize);
-                for id in sequence.select(live_offsets) {
-                    row_ids.insert(id);
                 }
             }
         }
