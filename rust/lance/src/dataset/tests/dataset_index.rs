@@ -10330,7 +10330,7 @@ async fn test_load_scalar_segment_params_rejects_invalid_metadata(
 }
 
 /// Both parameter loaders must match the fully opened segment's params,
-/// including `custom_stop_words`, without populating the index cache.
+/// including `custom_stop_words`, while caching only the decoded parameters.
 #[rstest]
 #[case::row(DocumentGranularity::Row, InvertedListFormatVersion::V2)]
 #[case::list_element_v2(DocumentGranularity::ListElement, InvertedListFormatVersion::V2)]
@@ -10382,10 +10382,15 @@ async fn test_load_segment_params_full_fidelity(
     let read = crate::index::scalar::load_segment_params(&dataset, &segments[0])
         .await
         .unwrap();
+    let params_cache_entries = dataset.index_cache_entry_count().await;
+    assert_eq!(params_cache_entries, cache_entries + 1);
     let recovered = load_scalar_segment_params(&dataset, &segments[0])
         .await
         .unwrap();
-    assert_eq!(dataset.index_cache_entry_count().await, cache_entries);
+    assert_eq!(
+        dataset.index_cache_entry_count().await,
+        params_cache_entries
+    );
 
     let generic = dataset
         .open_generic_index("text", &segments[0].uuid, &NoOpMetricsCollector)
@@ -10413,7 +10418,7 @@ async fn test_load_segment_params_full_fidelity(
         recovered_json,
         serde_json::from_str::<serde_json::Value>(derived.params.as_deref().unwrap()).unwrap()
     );
-    assert!(dataset.index_cache_entry_count().await > cache_entries);
+    assert!(dataset.index_cache_entry_count().await > params_cache_entries);
 }
 
 #[rstest]
