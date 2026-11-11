@@ -25,9 +25,9 @@ use std::ops::ControlFlow;
 
 use arrow_schema::DataType;
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Expr as SQLExpr, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart, OneOrManyWithParens,
-    Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
+    AccessExpr, BinaryOperator, Expr as SQLExpr, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident, LambdaFunction, ObjectName, ObjectNamePart,
+    OneOrManyWithParens, Subscript, Value, Visit, VisitMut, Visitor, VisitorMut, visit_expressions,
     visit_expressions_mut,
 };
 use lance_core::{Error, Result};
@@ -49,11 +49,36 @@ pub fn rewrite_element_lambdas(
     filter: &mut SQLExpr,
     type_of: impl Fn(&SQLExpr) -> Result<DataType>,
 ) -> Result<()> {
-    if let ControlFlow::Break(err) = VisitMut::visit(filter, &mut LambdaRewriter { type_of }) {
+    let mut rewriter = LambdaRewriter { type_of };
+    // AND/OR chains are walked with an explicit stack, as the planner walks
+    // them, so a filter with thousands of conditions does not overflow the
+    // stack here. Each operand is then visited recursively.
+    let mut stack = vec![filter];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            SQLExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And | BinaryOperator::Or,
+                right,
+            } => {
+                stack.push(right.as_mut());
+                stack.push(left.as_mut());
+            }
+            operand => rewrite_operand(operand, &mut rewriter)?,
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_operand<F: Fn(&SQLExpr) -> Result<DataType>>(
+    operand: &mut SQLExpr,
+    rewriter: &mut LambdaRewriter<F>,
+) -> Result<()> {
+    if let ControlFlow::Break(err) = VisitMut::visit(operand, rewriter) {
         return Err(err);
     }
     let mut unsupported = None;
-    let _ = visit_expressions(filter, |expr| match expr {
+    let _ = visit_expressions(operand, |expr| match expr {
         SQLExpr::Lambda(lambda) => {
             unsupported = Some(lambda.to_string());
             ControlFlow::Break(())
@@ -346,6 +371,25 @@ mod tests {
     )]
     fn test_rewrite(#[case] filter: &str, #[case] expected: &str) {
         assert_eq!(rewritten(filter).unwrap(), expected);
+    }
+
+    /// A long AND/OR chain is walked without recursion, so it does not
+    /// overflow the stack, and a lambda at its far end is still rewritten.
+    #[rstest]
+    fn test_rewrite_deep_logical_filter(#[values("AND", "OR")] op: &str) {
+        let mut conditions = vec!["width > 1"; 1000];
+        conditions.push("array_any_match(detections, d -> d.label = 'car')");
+        let mut expr = parse_sql_filter(&conditions.join(&format!(" {op} "))).unwrap();
+        planner().rewrite_filter_lambdas(&mut expr).unwrap();
+        // The chain nests to the left, so the last condition is the top-level
+        // right operand. (Printing the whole chain would recurse.)
+        let SQLExpr::BinaryOp { right, .. } = &expr else {
+            panic!("not a binary operation");
+        };
+        assert_eq!(
+            right.to_string(),
+            "any_element(detections, 'label = ''car''')"
+        );
     }
 
     #[rstest]
