@@ -538,14 +538,32 @@ fn partition_query(
     }
 }
 
+/// The bounds of a query's distance range: inclusive lower, exclusive upper.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DistanceRange {
+    pub lower: Option<f32>,
+    pub upper: Option<f32>,
+}
+
+impl DistanceRange {
+    fn contains(&self, distance: f32) -> bool {
+        self.lower.is_none_or(|lower| distance >= lower)
+            && self.upper.is_none_or(|upper| distance < upper)
+    }
+}
+
 /// The `k` best documents of a WARP query from its strides, best first, as
 /// `(row_id, WARP score)`.
+///
+/// Only documents whose distance (the number of query tokens minus the score,
+/// as [`WarpExec`] reports it) lies in `distance_range` compete for the top k.
 ///
 /// Each query token's strides are merged on the CPU pool in parallel; the sum
 /// across tokens is then split by row id range, also in parallel.
 pub async fn warp_top_k(
     strides: Vec<Vec<Stride>>,
     missing_similarities: Vec<f32>,
+    distance_range: DistanceRange,
     k: usize,
 ) -> Result<Vec<(u64, f32)>> {
     // Below this many scored rows per range, splitting costs more than it saves.
@@ -567,7 +585,11 @@ pub async fn warp_top_k(
     let tops = try_join_all(ranges.into_iter().map(|rows| {
         let token_scores = token_scores.clone();
         let missing_similarities = missing_similarities.clone();
-        spawn_cpu(move || top_k_documents(&token_scores, &missing_similarities, rows, k))
+        spawn_cpu(move || {
+            let num_query_tokens = missing_similarities.len() as f32;
+            let is_eligible = |score| distance_range.contains(num_query_tokens - score);
+            top_k_documents(&token_scores, &missing_similarities, rows, is_eligible, k)
+        })
     }))
     .await?;
     Ok(merge_top_k(tops, k))
@@ -823,7 +845,11 @@ impl ExecutionPlan for WarpExec {
             let num_query_tokens = selection.missing_similarities.len() as f32;
             let missing_similarities = selection.missing_similarities;
             let k = query.k * query.refine_factor.unwrap_or(1) as usize;
-            let top = warp_top_k(strides, missing_similarities, k).await?;
+            let distance_range = DistanceRange {
+                lower: query.lower_bound,
+                upper: query.upper_bound,
+            };
+            let top = warp_top_k(strides, missing_similarities, distance_range, k).await?;
             let (row_ids, distances): (Vec<_>, Vec<_>) = top
                 .into_iter()
                 .map(|(row_id, score)| (row_id, num_query_tokens - score))
@@ -1394,9 +1420,14 @@ mod tests {
 
         let expected = reference_top_k(&reference, &selection.missing_similarities, k);
         assert_eq!(expected.len(), k);
-        let top = warp_top_k(strides, selection.missing_similarities.clone(), k)
-            .await
-            .unwrap();
+        let top = warp_top_k(
+            strides,
+            selection.missing_similarities.clone(),
+            DistanceRange::default(),
+            k,
+        )
+        .await
+        .unwrap();
         assert_eq!(top, expected);
     }
 
@@ -1507,6 +1538,64 @@ mod tests {
                 .prepared_partitions();
             assert!(tracker.peak() >= 1);
             assert_eq!(tracker.in_flight(), 0);
+        }
+    }
+
+    /// A distance range bounds WARP's documents before top-k selection, with
+    /// and without refinement, returning what exact search returns.
+    #[rstest]
+    #[case::upper(None, Some(0.000001), None)]
+    #[case::lower(Some(0.8), Some(1.2), None)]
+    #[case::lower_refined(Some(0.8), Some(1.2), Some(2))]
+    #[tokio::test]
+    async fn test_warp_distance_range(
+        #[case] lower: Option<f32>,
+        #[case] upper: Option<f32>,
+        #[case] refine: Option<u32>,
+    ) {
+        use crate::dataset::scanner::MultivectorAlgorithm;
+        let mut rng = StdRng::seed_from_u64(42);
+        let (dataset, _) = two_segment_dataset(
+            &VectorIndexParams::ivf_flat(4, DistanceType::Cosine),
+            &mut rng,
+        )
+        .await;
+        let query = Float32Array::from(vec![0.5; DIM]);
+        let expected = dataset
+            .scan()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .use_index(false)
+            .distance_range(lower, upper)
+            .try_into_batch()
+            .await
+            .unwrap();
+        for algorithm in [MultivectorAlgorithm::Xtr, MultivectorAlgorithm::Warp] {
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .nprobes(4)
+                .multivector_algorithm(algorithm)
+                .distance_range(lower, upper);
+            if let Some(factor) = refine {
+                scanner.refine(factor);
+            }
+            let result = scanner.try_into_batch().await.unwrap();
+            let distances = result[DIST_COL].as_primitive::<Float32Type>();
+            assert_eq!(
+                result.num_rows(),
+                expected.num_rows(),
+                "{algorithm:?}: result count"
+            );
+            assert!(
+                distances
+                    .values()
+                    .iter()
+                    .all(|&d| lower.is_none_or(|l| d >= l) && upper.is_none_or(|u| d < u)),
+                "{algorithm:?} returned out-of-range distances: {:?}",
+                distances.values()
+            );
         }
     }
 }

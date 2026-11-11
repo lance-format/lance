@@ -359,7 +359,10 @@ impl Eq for Candidate {}
 /// does not observe it. Following Section 5.3, this is computed as
 /// `Σ_i m_i + Σ_{i observes D} (f_i(D) - m_i)`, adding tokens in ascending
 /// order, by merging the token lists by row id, so no candidate × token score
-/// matrix is built. Documents no token observes are never candidates.
+/// matrix is built. Documents no token observes are never candidates, and
+/// neither are documents whose score fails `is_eligible`: a distance range
+/// must be applied here, before selection, or the top k can crowd out every
+/// document in range.
 ///
 /// ```
 /// # use lance_index::vector::warp::{Stride, top_k_documents};
@@ -370,13 +373,14 @@ impl Eq for Candidate {}
 /// // Token 0 observes rows 1 and 2, token 1 only row 2.
 /// let token_scores = [stride(vec![1, 2], vec![0.5, 0.75]), stride(vec![2], vec![0.5])];
 /// // Row 1 misses token 1, which imputes m_1 = 0.125.
-/// let top = top_k_documents(&token_scores, &[0.0, 0.125], .., 2).unwrap();
+/// let top = top_k_documents(&token_scores, &[0.0, 0.125], .., |_| true, 2).unwrap();
 /// assert_eq!(top, vec![(2, 1.25), (1, 0.625)]);
 /// ```
 pub fn top_k_documents(
     token_scores: &[Stride],
     missing_similarities: &[f32],
     rows: impl RangeBounds<u64>,
+    is_eligible: impl Fn(f32) -> bool,
     k: usize,
 ) -> Result<Vec<(u64, f32)>> {
     if token_scores.len() != missing_similarities.len() {
@@ -427,6 +431,9 @@ pub fn top_k_documents(
                     token,
                 )));
             }
+        }
+        if !is_eligible(score) {
+            continue;
         }
         top.push(Reverse(Candidate { score, row_id }));
         if top.len() > k {
@@ -644,14 +651,14 @@ mod tests {
             .collect::<Vec<_>>();
         let expected = brute_force_top_k(&strides, &missing, k);
         assert_eq!(
-            top_k_documents(&token_scores, &missing, .., k).unwrap(),
+            top_k_documents(&token_scores, &missing, .., |_| true, k).unwrap(),
             expected
         );
         // Splitting by row range and merging the parts gives the same top k.
         for max_ranges in [1, 2, 3, 7, 100] {
             let tops = split_row_ids(&token_scores, max_ranges)
                 .into_iter()
-                .map(|rows| top_k_documents(&token_scores, &missing, rows, k).unwrap());
+                .map(|rows| top_k_documents(&token_scores, &missing, rows, |_| true, k).unwrap());
             assert_eq!(merge_top_k(tops, k), expected, "max_ranges={max_ranges}");
         }
     }
@@ -700,16 +707,25 @@ mod tests {
         #[case] k: usize,
     ) {
         assert!(
-            top_k_documents(&token_scores, &missing, .., k)
+            top_k_documents(&token_scores, &missing, .., |_| true, k)
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
+    fn test_top_k_documents_skips_ineligible_scores() {
+        let token_scores = [stride(vec![1, 2, 3, 4], vec![0.9, 0.8, 0.3, 0.2])];
+        // Only scores at most 0.5 compete, so the two best rows do not crowd
+        // them out of a top 2.
+        let top = top_k_documents(&token_scores, &[0.0], .., |score| score <= 0.5, 2).unwrap();
+        assert_eq!(top, vec![(3, 0.3), (4, 0.2)]);
+    }
+
+    #[test]
     fn test_top_k_documents_ties_prefer_lower_row_id() {
         let token_scores = [stride(vec![3, 5, 9], vec![1.0, 1.0, 1.0])];
-        let top = top_k_documents(&token_scores, &[0.0], .., 2).unwrap();
+        let top = top_k_documents(&token_scores, &[0.0], .., |_| true, 2).unwrap();
         assert_eq!(top, vec![(3, 1.0), (5, 1.0)]);
         assert_eq!(
             merge_top_k([vec![(9, 1.0)], vec![(3, 1.0), (5, 0.5)]], 2),
@@ -724,7 +740,7 @@ mod tests {
         #[case] token_scores: Vec<Stride>,
         #[case] missing: Vec<f32>,
     ) {
-        let err = top_k_documents(&token_scores, &missing, .., 3).unwrap_err();
+        let err = top_k_documents(&token_scores, &missing, .., |_| true, 3).unwrap_err();
         assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
     }
 
