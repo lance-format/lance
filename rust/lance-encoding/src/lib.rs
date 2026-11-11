@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![cfg_attr(coverage, feature(coverage_attribute))]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use std::{ops::Range, sync::Arc};
 
