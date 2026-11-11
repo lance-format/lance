@@ -136,8 +136,12 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Reserved for local fragment aliases (`IndexMetadata.fragment_id_map`).
+/// Readers and writers reject it until readers and index maintenance support aliases.
+/// This takes the next free bit.
+pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 20;
+pub const FLAG_UNKNOWN: u64 = 1 << 21;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -158,6 +162,7 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_LOCAL_FRAGMENT_ALIASES < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -523,6 +528,7 @@ fn supported_flags_when(
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
+    mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
     supported
@@ -811,7 +817,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert_eq!(FLAG_UNKNOWN, 1 << 21);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -907,6 +913,13 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("zone write seed"));
         }
+    }
+
+    #[test]
+    fn test_local_fragment_aliases_flag_is_reserved() {
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
     }
 
     #[test]

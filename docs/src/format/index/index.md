@@ -105,8 +105,8 @@ Index segments are created and updated through a transactional process:
      that carries no extra columns. Declaring a column here does not by itself make it servable --
      see [Serving carried columns](#serving-carried-columns).
    - `fragment_bitmap`: The set of fragment IDs covered by this segment
-   - `fragment_id_map`: An optional mapping from stored local fragment IDs to committed
-     source fragment IDs (see [Fragment ID Mapping](#fragment-id-mapping)).
+   - `fragment_id_map`: local fragment aliases. An empty map means no mapping
+     (see [Local fragment aliases](#local-fragment-aliases)).
    - `index_details`: Index-specific configuration and parameters
    - `version`: The format version of this index type
    - See the full protobuf definition in [table.proto](https://github.com/lance-format/lance/blob/main/protos/table.proto).
@@ -232,8 +232,8 @@ The `IndexMetadata` message contains important information about the index segme
   [Serving carried columns](#serving-carried-columns) and the legacy interpretation under
   [Covering-field contracts](#covering-field-contracts).
 - `fragment_bitmap`: the set of fragment IDs covered by this index segment.
-- `fragment_id_map`: an optional mapping from stored local fragment IDs to committed
-  source fragment IDs (see [Fragment ID Mapping](#fragment-id-mapping)).
+- `fragment_id_map`: local fragment aliases. An empty map means no mapping
+  (see [Local fragment aliases](#local-fragment-aliases)).
 - `index_details`: a protobuf `Any` message that contains index-specific details, such as index type,
   parameters, and storage format. This allows different index types to store their own metadata.
 
@@ -250,56 +250,36 @@ There are both part of the `table.proto` file in the Lance source code.
 
 </details>
 
-### Fragment ID Mapping
+### Local fragment aliases
 
-`IndexMetadata.fragment_id_map` (field 15) maps local fragment IDs in a segment's
-physical row addresses to committed source fragment IDs, preserving row offsets.
-This lets commit retries reuse prepared index files when a concurrent append
-changes the allocation. When absent, the index keeps its normal committed row
-references.
+`IndexMetadata.fragment_id_map` (field 15) renames fragment IDs inside a
+segment's physical row addresses so commit retries can reuse prepared index
+files when fragment allocation changes. An empty map means no mapping. The map
+is sparse: an entry `{17: 42}` maps fragment 17 to 42, while any unmapped
+fragment ID (such as 29) keeps its original ID. Each stored fragment ID is
+looked up once and never transitively.
 
-For example, stored address `(17, 5)` with entry `17 -> 42` resolves to `(42, 5)`.
-If another append takes fragment 42 first, a retry can publish `17 -> 43` without
-rewriting the files. The manifest must publish the segment, map, and new source
-fragments atomically using its fragment allocation. Each mapped value must point
-to a committed fragment containing those indexed rows.
+Apply `fragment_id_map` to valid physical row addresses before any other
+address transformation, including [Fragment Reuse Index (FRI)](system/frag_reuse.md)
+remap and deletion filtering, while preserving the 32-bit row offset. Logical
+row IDs and column values are unchanged. For example, with entry `17 -> 42` and
+FRI translation `(42, 5) -> (60, 3)`, stored address `(17, 5)` resolves to
+`(60, 3)`. Retargeting the map directly to fragment 60 would lose the row
+offset change.
 
-```protobuf
-%%% proto.message.FragmentIdMap %%%
-```
+The index segment, its aliases, and any newly assigned fragments must be
+committed together in one manifest, with each alias pointing to the fragment
+that holds those indexed rows. Operations that retain an index file must retain
+the aliases needed to decode it, while index rewrites and merges resolve each
+input segment's aliases once. Keys and values must be less than `2^32 - 1`, and
+two stored fragment IDs in the same segment must not resolve to the same final
+fragment ID (for example, `{17: 42}` is invalid if the segment also stores 42
+and leaves 42 unmapped).
 
-A mapped segment must follow these rules:
-
-- **Complete physical mapping:** Map keys are scoped to the segment. The map must
-  be nonempty and cover every stored physical fragment ID, including unchanged
-  IDs as explicit `id -> id` entries. Keys and values must be less than `2^32 - 1`,
-  and distinct keys must have distinct values. Null and tombstone markers are
-  unchanged. Readers must reject invalid or unsupported maps. Only index types
-  and versions supporting physical addresses and this mapping may use it.
-  Logical row IDs and column values, including `_rowid` search keys, are unchanged.
-
-- **Resolution order:** Apply the map before the
-  [Fragment Reuse Index (FRI)](system/frag_reuse.md), then apply visibility,
-  deletion, and fragment ownership checks before ranking. With entry `17 -> 42`
-  and FRI translation `(42, 5) -> (60, 3)`, stored address `(17, 5)` resolves to
-  `(60, 3)`. Retargeting the map to fragment 60 would lose the offset change.
-  Cached translated addresses must be scoped to the effective map and FRI state.
-
-- **Coverage:** `fragment_bitmap` follows the applicable FRI coverage and
-  provenance rules. The map decodes immutable files and need not match current
-  coverage. Removing coverage must retain map entries needed to decode retained
-  files.
-
-- **Maintenance:** Operations that keep index files keep their map. Rewrites and
-  merges resolve each input segment's references exactly once. Output containing
-  committed IDs omits the map. Output containing local IDs carries a complete map
-  matching those files. Unsupported maintenance must fail before commit or
-  withdraw affected coverage so queries fall back to a scan.
-
-- **Feature flags:** Every manifest containing a mapped segment must set both
-  reader and writer [feature flags](../table/versioning.md#feature-flags). The bit
-  is unassigned. Writers must not emit field 15 until it is assigned and reader
-  and writer support, including maintenance, is available.
+A nonempty map requires `FLAG_LOCAL_FRAGMENT_ALIASES` (`2^20`) in both reader
+and writer [feature flags](../table/versioning.md#feature-flags). The bit is
+currently reserved and rejected by both readers and writers until runtime and
+maintenance support lands.
 
 ### Index Segment Metadata
 

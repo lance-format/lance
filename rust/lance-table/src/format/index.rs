@@ -492,8 +492,8 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             })
             .transpose()?;
 
-        // Reject mapped segments until stored fragment IDs can be resolved.
-        if proto.fragment_id_map.is_some() {
+        // An empty map means the segment uses its stored fragment IDs.
+        if !proto.fragment_id_map.is_empty() {
             return Err(Error::not_supported(
                 "index segment has a fragment ID map, which this build does not support yet",
             ));
@@ -582,7 +582,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
-            fragment_id_map: None,
+            fragment_id_map: Default::default(),
         }
     }
 }
@@ -742,43 +742,22 @@ mod tests {
     }
 
     #[test]
-    fn test_index_metadata_without_fragment_id_map() {
+    fn test_index_metadata_empty_fragment_id_map_round_trips() {
         let metadata = index_metadata_with(vec![0], vec![]);
         let proto = pb::IndexMetadata::from(&metadata);
-        assert!(proto.fragment_id_map.is_none());
+        assert!(proto.fragment_id_map.is_empty());
 
         let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert!(decoded.fragment_id_map.is_none());
+        assert!(decoded.fragment_id_map.is_empty());
         assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
     }
 
-    #[rstest]
-    #[case::mapped(vec![(17, 42), (29, 47)])]
-    #[case::empty(vec![])]
-    #[case::reserved_key(vec![(u32::MAX, 42)])]
-    #[case::reserved_source(vec![(17, u32::MAX)])]
-    #[case::aliased_sources(vec![(17, 42), (29, 42)])]
-    fn test_index_metadata_rejects_fragment_id_map(#[case] entries: Vec<(u32, u32)>) {
-        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
-        proto.fragment_id_map = Some(pb::FragmentIdMap {
-            entries: entries.into_iter().collect(),
-        });
-        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded.fragment_id_map, proto.fragment_id_map);
-
-        let err = IndexMetadata::try_from(decoded).unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
-        assert!(err.to_string().contains("fragment ID map"), "got: {err}");
-    }
-
     #[test]
-    fn test_index_metadata_rejects_unknown_fragment_id_map_content() {
-        let proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
-        let mut bytes = proto.encode_to_vec();
-        // Field 15 contains only an unknown field in FragmentIdMap.
-        bytes.extend_from_slice(&[0x7a, 0x02, 0x10, 0x01]);
-        let decoded = pb::IndexMetadata::decode(bytes.as_slice()).unwrap();
-        assert_eq!(decoded.fragment_id_map, Some(pb::FragmentIdMap::default()));
+    fn test_index_metadata_rejects_fragment_id_map() {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.fragment_id_map.insert(17, 42);
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.fragment_id_map.get(&17), Some(&42));
 
         let err = IndexMetadata::try_from(decoded).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
