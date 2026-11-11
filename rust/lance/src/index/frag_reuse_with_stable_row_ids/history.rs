@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use lance_core::{Error, Result};
 use lance_table::format::{IndexMetadata, Manifest, is_detached_version};
+use lance_table::system_index::frag_reuse::leases::requires_legacy_version;
 use lance_table::system_index::frag_reuse::{
     FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion, is_frag_reuse_index_entry,
 };
@@ -313,14 +314,22 @@ fn index_needing<'a>(
 }
 
 /// How many of the oldest versions a cleanup of a stable-row-id table removes:
-/// those before the first version an index of `indices` still needs. The kept
-/// versions stay a complete suffix of the history, so an address they map
-/// translates through every later move.
-pub fn trimmable_versions(versions: &[FragReuseVersion], indices: &[IndexMetadata]) -> usize {
+/// those before the first version an index of `indices` still needs, or a
+/// retention lease on `oldest_leased_version` requires. The kept versions stay
+/// a complete suffix of the history, so an address they map translates
+/// through every later move.
+pub fn trimmable_versions(
+    versions: &[FragReuseVersion],
+    indices: &[IndexMetadata],
+    oldest_leased_version: Option<u64>,
+) -> usize {
     let chain = reuse_chain_frag_bitmap(versions);
     versions
         .iter()
-        .position(|version| index_needing(version, indices, &chain).is_some())
+        .position(|version| {
+            requires_legacy_version(oldest_leased_version, version.dataset_version)
+                || index_needing(version, indices, &chain).is_some()
+        })
         .unwrap_or(versions.len())
 }
 
@@ -758,6 +767,25 @@ pub mod tests {
         DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
         padding_reuse_versions,
     };
+
+    #[rstest]
+    #[case::no_lease(None, 3)]
+    #[case::lease_before_history(Some(1), 0)]
+    #[case::lease_mid_history(Some(5), 1)]
+    #[case::lease_after_history(Some(8), 3)]
+    fn trimmable_versions_stop_at_first_leased_stamp(
+        #[case] oldest_leased_version: Option<u64>,
+        #[case] expected: usize,
+    ) {
+        let versions = [3, 5, 7].map(|dataset_version| FragReuseVersion {
+            dataset_version,
+            groups: vec![],
+        });
+        assert_eq!(
+            trimmable_versions(&versions, &[], oldest_leased_version),
+            expected
+        );
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum Storage {

@@ -141,26 +141,22 @@ pub async fn ensure_rewrite_records_lease_transitions(
     let Some(requirement) = lease_requirement(dataset).await? else {
         return Ok(());
     };
-    let required: Vec<u64> = groups
+    let rewritten: Vec<u64> = groups
         .iter()
         .flat_map(|group| group.old_fragments.iter().map(|fragment| fragment.id))
-        .filter(|id| requirement.requires_sources([*id]))
         .collect();
-    if required.is_empty() {
+    // Skip reading the rewrite's records when it touches nothing required.
+    if requirement
+        .unrecorded_sources(rewritten.iter().copied(), &[])
+        .is_empty()
+    {
         return Ok(());
     }
-    let recorded: BTreeSet<u64> = match frag_reuse_index {
-        Some(entry) => record_lineages(dataset, entry)
-            .await?
-            .iter()
-            .flat_map(|record| record.sources().collect::<Vec<_>>())
-            .collect(),
-        None => BTreeSet::new(),
+    let recorded = match frag_reuse_index {
+        Some(entry) => record_lineages(dataset, entry).await?,
+        None => Vec::new(),
     };
-    let missing: Vec<u64> = required
-        .into_iter()
-        .filter(|id| !recorded.contains(id))
-        .collect();
+    let missing = requirement.unrecorded_sources(rewritten, &recorded);
     if missing.is_empty() {
         return Ok(());
     }

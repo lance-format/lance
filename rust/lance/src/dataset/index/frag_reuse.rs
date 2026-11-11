@@ -239,13 +239,7 @@ async fn cleanup_stable_row_id_history(
     indices: &[IndexMetadata],
 ) -> Result<()> {
     let details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-    let oldest_leased = oldest_leased_version(dataset);
-    let first_leased = details
-        .versions
-        .iter()
-        .position(|version| requires_legacy_version(oldest_leased, version.dataset_version))
-        .unwrap_or(details.versions.len());
-    let trimmed = trimmable_versions(&details.versions, indices).min(first_leased);
+    let trimmed = trimmable_versions(&details.versions, indices, oldest_leased_version(dataset));
     if trimmed == 0 {
         return Ok(());
     }
@@ -3095,6 +3089,9 @@ pub(crate) mod tests {
                 assert_eq!(recorded.len(), 2);
                 assert!(recorded[0] < lease.version(), "{recorded:?}");
                 assert!(recorded[1] >= lease.version(), "{recorded:?}");
+                // Stamped with the version the rewrite was based on: its
+                // publishing version minus one.
+                assert_eq!(recorded[1], dataset.manifest.version - 1, "{recorded:?}");
 
                 dataset
                     .create_index(

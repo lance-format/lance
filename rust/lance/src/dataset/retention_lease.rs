@@ -250,6 +250,15 @@ mod tests {
         latest
     }
 
+    async fn transaction_files(dataset: &Dataset) -> usize {
+        dataset
+            .object_store
+            .read_dir(dataset.base.clone().join(crate::dataset::TRANSACTIONS_DIR))
+            .await
+            .unwrap()
+            .len()
+    }
+
     fn has_lease_flag(dataset: &Dataset) -> bool {
         dataset.manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0
     }
@@ -300,10 +309,14 @@ mod tests {
             ..Default::default()
         };
         let (lease, _) = dataset.acquire_retention_lease(options).await.unwrap();
+        let transactions_before = transaction_files(&dataset).await;
 
         let unchanged = dataset.renew_retention_lease(&lease, MINUTE).await.unwrap();
         assert_eq!(unchanged, lease);
         assert_eq!(latest(&dataset).await.version().version, 2);
+        // The attempt wrote a transaction file before learning it had nothing
+        // to commit; no version references it, so it must not be left behind.
+        assert_eq!(transaction_files(&dataset).await, transactions_before);
 
         let renewed = dataset
             .renew_retention_lease(&lease, 20 * MINUTE)
@@ -442,21 +455,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_append_and_acquire_both_commit() {
+    async fn test_acquire_rebased_over_append_leases_the_version_it_creates() {
         MockClock::set_system_time(Duration::from_secs(1_000));
-        let dataset = create_dataset("memory://").await;
-        let mut appender = dataset.clone();
-        let (appended, acquired) = futures::join!(
-            appender.append(rows(), None),
-            dataset.acquire_retention_lease(LeaseOptions::default())
-        );
-        appended.unwrap();
-        let (lease, _) = acquired.unwrap();
+        let stale = create_dataset("memory://").await;
+        let mut appender = stale.clone();
+        appender.append(rows(), None).await.unwrap();
 
-        let head = latest(&dataset).await;
+        let lease_id = Uuid::new_v4();
+        let acquire = Operation::AcquireLease {
+            lease_id,
+            created_at: utc_now(),
+            expires_at: utc_now() + chrono::Duration::minutes(10),
+            label: None,
+        };
+        let head = commit_from(&stale, acquire).await.unwrap();
+
         assert_eq!(head.version().version, 3);
         assert_eq!(head.count_rows(None).await.unwrap(), 20);
-        assert_eq!(head.retention_leases(), std::slice::from_ref(&lease));
+        let [lease] = head.retention_leases() else {
+            panic!("expected one lease, got {:?}", head.retention_leases());
+        };
+        assert_eq!(lease.id(), lease_id);
+        assert_eq!(lease.version(), 3);
     }
 
     /// Commit `operation` read at `read`'s version, so it rebases over every

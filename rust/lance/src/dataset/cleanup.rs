@@ -1519,7 +1519,7 @@ impl<'a> CleanupTask<'a> {
             let transaction_path = manifest
                 .transaction_file
                 .as_deref()
-                .map(|file| self.dataset.base.child(TRANSACTIONS_DIR).child(file));
+                .map(|file| self.dataset.base.clone().join(TRANSACTIONS_DIR).join(file));
             if manifest.version == leases.oldest_version {
                 inspection.lease_history.insert(manifest.version, None);
             } else if let Some(path) = transaction_path {

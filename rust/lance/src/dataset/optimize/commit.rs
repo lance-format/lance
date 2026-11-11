@@ -125,12 +125,12 @@ async fn records_stable_row_id_moves(
 /// rewrite if a lease requires its fragments, and the caller replans. Boxed
 /// because the options are large and held across every await of the commit.
 fn deferred_by_leases(
-    dataset: &Dataset,
+    leases_listed: bool,
     completed_tasks: &[RewriteResult],
     options: &CompactionOptions,
 ) -> Option<Box<CompactionOptions>> {
     (!options.defer_index_remap
-        && !dataset.manifest.retention_leases().is_empty()
+        && leases_listed
         && completed_tasks.iter().all(|task| task.row_addrs.is_some()))
     .then(|| {
         Box::new(CompactionOptions {
@@ -162,7 +162,11 @@ pub async fn commit_compaction(
         return Ok(CompactionMetrics::default());
     }
 
-    let deferred_by_leases = deferred_by_leases(dataset, &completed_tasks, options);
+    let deferred_by_leases = deferred_by_leases(
+        !dataset.manifest.retention_leases().is_empty(),
+        &completed_tasks,
+        options,
+    );
     let options = deferred_by_leases.as_deref().unwrap_or(options);
 
     // A tagged FRI history stores row translation in the manifest entry and
@@ -665,4 +669,43 @@ pub async fn normalize_source_fragments(
         normalized.push(fragment);
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn task(recorded_row_addrs: bool) -> RewriteResult {
+        RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: vec![],
+            read_version: 1,
+            original_fragments: vec![],
+            row_addrs: recorded_row_addrs.then(Vec::new),
+        }
+    }
+
+    #[rstest]
+    #[case::no_leases(false, false, vec![true], false)]
+    #[case::already_deferred(true, true, vec![true], false)]
+    #[case::all_tasks_recorded(true, false, vec![true, true], true)]
+    #[case::some_task_unrecorded(true, false, vec![true, false], false)]
+    #[case::no_task_recorded(true, false, vec![false], false)]
+    fn deferred_by_leases_only_when_every_task_recorded(
+        #[case] leases_listed: bool,
+        #[case] defer_index_remap: bool,
+        #[case] recorded: Vec<bool>,
+        #[case] expected: bool,
+    ) {
+        let tasks: Vec<_> = recorded.into_iter().map(task).collect();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
+        let deferred = deferred_by_leases(leases_listed, &tasks, &options);
+        assert_eq!(deferred.is_some(), expected);
+        assert!(deferred.is_none_or(|options| options.defer_index_remap));
+    }
 }

@@ -30,7 +30,7 @@
 //! assert!(!required.requires_sources([9]));
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roaring::RoaringBitmap;
 
@@ -191,6 +191,20 @@ impl LeaseRequirement {
             .unwrap_or(false)
     }
 
+    /// The `rewritten` fragments this requirement needs transitions for that
+    /// no record in `recorded` takes as a source.
+    pub fn unrecorded_sources(
+        &self,
+        rewritten: impl IntoIterator<Item = u64>,
+        recorded: &[RecordLineage],
+    ) -> Vec<u64> {
+        let recorded: HashSet<u64> = recorded.iter().flat_map(RecordLineage::sources).collect();
+        rewritten
+            .into_iter()
+            .filter(|id| self.requires_sources([*id]) && !recorded.contains(id))
+            .collect()
+    }
+
     /// Whether a rewrite consuming `sources` must record a transition for
     /// them: some source is a leased fragment or reached from one.
     pub fn requires_sources(&self, sources: impl IntoIterator<Item = u64>) -> bool {
@@ -231,6 +245,36 @@ mod tests {
         (0..records.len())
             .filter(|position| requirement.requires_record(*position))
             .collect()
+    }
+
+    #[rstest]
+    #[case::none_recorded(vec![], vec![4, 6])]
+    #[case::some_recorded(vec![RecordLineage::transition([4], [8])], vec![6])]
+    #[case::all_recorded(
+        vec![RecordLineage::transition([4], [8]), RecordLineage::transition([6], [9])],
+        vec![]
+    )]
+    #[case::recorded_in_legacy_group(
+        vec![RecordLineage::legacy_version([(vec![1], vec![2]), (vec![4, 6], vec![8])])],
+        vec![]
+    )]
+    fn unrecorded_sources_ignores_unleased_and_recorded_fragments(
+        #[case] recorded: Vec<RecordLineage>,
+        #[case] expected: Vec<u64>,
+    ) {
+        // Fragment 6 is required because the earlier transition 4 -> 6 is.
+        let history = [RecordLineage::transition([3], [6])];
+        let requirement = LeaseRequirement::compute(&known(&[3, 4]), &history);
+        assert_eq!(
+            requirement.unrecorded_sources([4, 5, 6], &recorded),
+            expected
+        );
+    }
+
+    #[test]
+    fn unrecorded_sources_with_unknown_lease_requires_every_fragment() {
+        let requirement = LeaseRequirement::compute(&LeasedFragments::Unknown, &[]);
+        assert_eq!(requirement.unrecorded_sources([1, 2], &[]), vec![1, 2]);
     }
 
     #[test]

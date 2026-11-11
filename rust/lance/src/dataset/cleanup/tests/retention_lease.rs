@@ -201,7 +201,11 @@ async fn cleanup_refuses_to_delete_when_lease_history_is_missing(#[case] missing
         MissingHistory::TransactionFile => {
             let version = dataset.checkout_version(4).await.unwrap();
             let transaction_file = version.manifest.transaction_file.as_deref().unwrap();
-            dataset.base.child(TRANSACTIONS_DIR).child(transaction_file)
+            dataset
+                .base
+                .clone()
+                .join(TRANSACTIONS_DIR)
+                .join(transaction_file)
         }
     };
     dataset.object_store.delete(&gap).await.unwrap();
