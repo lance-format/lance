@@ -1243,8 +1243,6 @@ def test_remap_row_addrs(tmp_path: Path):
     before = ds.scanner(columns=["id"], with_row_address=True).to_table()
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
 
-    # A deferred-remap compaction records a fragment-reuse index only when it
-    # rewrites data an index covers, so index a column first.
     ds.create_scalar_index("id", "BTREE")
 
     ds.optimize.compact_files(
