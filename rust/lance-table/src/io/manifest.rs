@@ -808,7 +808,7 @@ mod test {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
-            path: Some("ab/file.bin".to_string()),
+            path: Some("_deletions/ab/file.bin".to_string()),
             inline: None,
         });
         let mut manifest = Manifest::new(
@@ -842,7 +842,7 @@ mod test {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
-            path: Some("file.bin".to_string()),
+            path: Some("_deletions/file.bin".to_string()),
             inline: Some(Bytes::from_static(&[1, 2, 3])),
         });
         let mut manifest = Manifest::new(
