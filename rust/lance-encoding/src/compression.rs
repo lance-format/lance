@@ -1154,7 +1154,7 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
@@ -1202,7 +1202,7 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
