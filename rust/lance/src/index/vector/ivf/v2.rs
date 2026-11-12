@@ -132,7 +132,7 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     /// both to avoid using wrong row offsets during reconstruction.
     pub(crate) aux_ivf: IvfModel,
     pub(crate) distance_type: DistanceType,
-    pub(crate) sub_index_metadata: Vec<String>,
+    pub(crate) sub_index_metadata: Arc<[String]>,
     /// Parsed quantizer metadata — stored directly to avoid JSON re-parsing on
     /// every warm-path reconstruction.
     pub(crate) metadata: <Q::Storage as QuantizerStorage>::Metadata,
@@ -978,7 +978,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 ivf,
                 aux_ivf,
                 distance_type,
-                sub_index_metadata: header.sub_index_metadata,
+                sub_index_metadata: header.sub_index_metadata.into(),
                 metadata,
                 sub_index_type,
                 quantization_type,
@@ -1049,7 +1049,7 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
             index_file_path: self.index_file_path.clone(),
             uuid: self.uuid.to_string(),
             distance_type: self.distance_type.to_string(),
-            sub_index_metadata: self.sub_index_metadata.clone(),
+            sub_index_metadata: self.sub_index_metadata.to_vec(),
             sub_index_type: self.sub_index_type.to_string(),
             quantization_type: self.quantization_type.to_string(),
             quantizer_metadata_json,
@@ -1392,7 +1392,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// every column. Built once here because it is fallible and only depends on
     /// the file schema.
     read_projection: Option<ReaderProjection>,
-    sub_index_metadata: Vec<String>,
+    sub_index_metadata: Arc<[String]>,
     storage: IvfQuantizationStorage<Q>,
 
     distance_type: DistanceType,
@@ -1951,7 +1951,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             reader: index_reader,
             read_projection,
             storage,
-            sub_index_metadata,
+            sub_index_metadata: sub_index_metadata.into(),
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
             raw_cache,
@@ -1974,7 +1974,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: IvfModel,
         reader: FileReader,
         storage: IvfQuantizationStorage<Q>,
-        sub_index_metadata: Vec<String>,
+        sub_index_metadata: Arc<[String]>,
         distance_type: DistanceType,
         index_cache: LanceCache,
         raw_cache: WeakLanceCache,

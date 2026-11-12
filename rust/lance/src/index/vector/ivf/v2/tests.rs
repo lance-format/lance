@@ -7952,6 +7952,17 @@ async fn test_join_partition_on_delete_multivec() {
     let index_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(index_ctx.num_partitions(), 3);
 
+    // Every query reopens the index from its cached state. The per-partition
+    // metadata must be shared with that state, not copied: one `String` per
+    // partition, cloned and freed per query, dominates warm queries on indices
+    // with ~100k partitions.
+    let reopened_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+    assert!(!Arc::ptr_eq(&index_ctx.index, &reopened_ctx.index));
+    assert!(Arc::ptr_eq(
+        &index_ctx.ivf().sub_index_metadata,
+        &reopened_ctx.ivf().sub_index_metadata
+    ));
+
     let mut logical_row_ids = {
         let ivf = index_ctx.ivf();
         let mut smallest: Option<HashSet<u64>> = None;
