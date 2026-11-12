@@ -35,6 +35,7 @@ pub(crate) mod segment;
 pub(crate) mod segment_coverage;
 mod statistics;
 pub mod vector;
+pub(crate) mod visibility;
 
 pub use crate::index::api::{
     DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment,

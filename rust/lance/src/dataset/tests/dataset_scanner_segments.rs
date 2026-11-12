@@ -20,6 +20,8 @@ use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
+use lance_io::object_store::ObjectStoreParams;
+use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::{DistanceType, MetricType};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -28,7 +30,9 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::scanner::test_dataset::{TestVectorDataset, assert_query_index_field};
+use crate::dataset::scanner::test_dataset::{
+    TestVectorDataset, assert_query_index_field, batch_knn_two_queries,
+};
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -534,6 +538,116 @@ async fn test_vector_search_fragment_filter_prunes_segment_fanout() {
 
 #[rstest]
 #[tokio::test]
+async fn test_hybrid_prefilter_consumers(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] fast_search: bool,
+    #[values("ann", "batch", "fts")] consumer: &str,
+) {
+    let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+        .await
+        .unwrap();
+    fixture.make_scalar_index().await.unwrap();
+    fixture.append_data_with_range(400, 410).await.unwrap();
+    fixture
+        .dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    fixture.make_fts_index().await.unwrap();
+    let mut before_delete = fixture.dataset.scan();
+    before_delete.use_scalar_index(false).with_row_id();
+    before_delete.filter("i >= 250 AND i % 2 = 0").unwrap();
+    before_delete.with_fragments(fixture.dataset.fragments()[1..].to_vec());
+    let before_delete = before_delete.try_into_batch().await.unwrap();
+    let external = lance_select::RowAddrMask::from_allowed(
+        before_delete[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    fixture.dataset.delete("i = 252").await.unwrap();
+    let dataset = &fixture.dataset;
+    let mut oracle = dataset.scan();
+    oracle.use_scalar_index(false).with_row_id();
+    oracle
+        .filter(if consumer == "batch" {
+            "i >= 250"
+        } else {
+            "i >= 250 AND i % 2 = 0"
+        })
+        .unwrap();
+    oracle.with_fragments(dataset.fragments()[1..].to_vec());
+    let expected = oracle.try_into_batch().await.unwrap();
+    let mut scanner = dataset.scan();
+    scanner.with_fragments(dataset.fragments()[1..].to_vec());
+    scanner.filter("i >= 250").unwrap().prefilter(true);
+    if consumer != "batch" {
+        scanner.with_row_id_prefilter(external);
+    }
+    scanner.project(&["i"]).unwrap();
+    if fast_search {
+        scanner.fast_search();
+    }
+    if consumer == "fts" {
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap();
+    } else if consumer == "batch" {
+        scanner
+            .nearest("vec", &batch_knn_two_queries().0, 200)
+            .unwrap()
+            .nprobes(1);
+    } else {
+        scanner
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), 200)
+            .unwrap()
+            .nprobes(1);
+    }
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("PrefilterUnion:"), "{plan}");
+    if consumer == "batch" {
+        assert!(plan.contains("ANNIvfBatch:"), "{plan}");
+    }
+    assert_eq!(
+        plan.contains("projection=[], num_fragments=1"),
+        !fast_search,
+        "{plan}"
+    );
+    let actual = scanner.try_into_batch().await.unwrap();
+    let ids = |batch: &RecordBatch| {
+        batch["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    };
+    let expected: BTreeSet<_> = ids(&expected)
+        .into_iter()
+        .filter(|id| !fast_search || *id < 400)
+        .collect();
+    let actual_ids = ids(&actual);
+    assert_eq!(actual_ids, expected);
+    assert_eq!(
+        actual.num_rows(),
+        expected.len() * if consumer == "batch" { 2 } else { 1 }
+    );
+    assert_eq!(
+        actual_ids.intersection(&expected).count() as f64 / expected.len() as f64,
+        1.0
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_vector_prefilter_prunes_scalar_segments(
     #[values(false, true)] stable_row_ids: bool,
     #[values(false, true)] explicit_fragments: bool,
@@ -543,6 +657,28 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         .unwrap();
     let vector_segments = test_ds.make_segmented_vector_index().await.unwrap();
     test_ds.make_segmented_scalar_index().await.unwrap();
+    let excluded_segment = test_ds
+        .dataset
+        .load_indices_by_name("i_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+        .unwrap();
+    let excluded_path = test_ds
+        .dataset
+        .indices_dir()
+        .join(excluded_segment.uuid.to_string());
+    let tracker = Arc::new(IOTracker::default());
+    test_ds.dataset = crate::dataset::builder::DatasetBuilder::from_uri(test_ds.tmp_dir.as_str())
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(tracker.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap();
+    tracker.incremental_stats();
     let fragments = test_ds.dataset.fragments();
     let query: Float32Array = (0..32).map(|value| value as f32).collect();
 
@@ -561,6 +697,15 @@ async fn test_vector_prefilter_prunes_scalar_segments(
     scanner.filter("NOT (i < 250)").unwrap();
 
     let analyzed = scanner.analyze_plan().await.unwrap();
+    let stats = tracker.incremental_stats();
+    assert!(
+        !stats
+            .requests
+            .iter()
+            .any(|request| request.path.as_ref().starts_with(excluded_path.as_ref())),
+        "excluded scalar segment was opened: {:?}",
+        stats.requests
+    );
     let scalar_index_node = analyzed
         .lines()
         .find(|line| line.trim_start().starts_with("ScalarIndexQuery:"))
@@ -569,12 +714,15 @@ async fn test_vector_prefilter_prunes_scalar_segments(
         scalar_index_node.contains("indices_loaded=1,"),
         "expected one scalar segment to be loaded, plan was:\n{analyzed}"
     );
-    if explicit_fragments {
-        assert!(
-            analyzed.contains("projection=[], num_fragments=1"),
-            "segment pruning must preserve the FilteredRead row-ID path, plan was:\n{analyzed}"
-        );
-    }
+    assert_eq!(
+        analyzed.contains("PrefilterUnion:"),
+        explicit_fragments,
+        "{analyzed}"
+    );
+    assert!(
+        !analyzed.contains("projection=[], num_fragments=1"),
+        "{analyzed}"
+    );
 
     let actual = scanner.try_into_batch().await.unwrap();
     let actual = actual["i"]
