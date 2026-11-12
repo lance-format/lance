@@ -36,7 +36,7 @@ use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -472,6 +472,22 @@ impl UntaggedReuse {
                 self.groups
                     .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
             })
+    }
+
+    /// Every fragment a recorded group moved `fragment`'s rows into, through
+    /// later groups that compacted those in turn.
+    fn moved_to(&self, fragment: u32) -> Vec<u32> {
+        let mut reached = Vec::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            for (output, sources) in &self.sources {
+                if sources.contains(&u64::from(id)) && !reached.contains(output) {
+                    reached.push(*output);
+                    pending.push(*output);
+                }
+            }
+        }
+        reached
     }
 
     fn compacted_from(&self, fragment: u32) -> RoaringBitmap {

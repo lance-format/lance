@@ -283,17 +283,12 @@ impl<'a> TransactionRebase<'a> {
             Operation::CreateIndex { .. } => {}
             Operation::CompositeOperation(composite_operation) => {
                 self.current_schema = Some(dataset.schema().clone());
-                // An action set gets the untagged history only: a segment it
-                // adds over fragments a tagged history retired conflicts
-                // instead.
-                if composite_operation
+                if !composite_operation
                     .iter_actions()
                     .any(|action| matches!(action, Action::AddIndexSegment(_)))
                 {
-                    let indices = crate::index::loading::load_all_indices(dataset).await?;
-                    return self.load_untagged_reuse(dataset, &indices).await;
+                    return Ok(());
                 }
-                return Ok(());
             }
             _ => return Ok(()),
         }
