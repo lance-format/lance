@@ -704,9 +704,8 @@ const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
 
 /// Prefixed partition terms per automaton state that fuzzy expansion may
 /// build. Building a state costs about as much as an edit distance or two, so
-/// with more than a few hundred such terms, a build that reaches this limit
-/// and falls back costs less than the edit distances the fallback then
-/// computes.
+/// a build that reaches this limit and falls back costs at most about as much
+/// as the edit distances the fallback then computes.
 const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
 
 /// Most automaton states fuzzy expansion builds, `fst`'s default limit for
@@ -717,8 +716,8 @@ const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
 /// `prefixed_terms` terms with the required prefix, or `None` to scan their
 /// dictionaries instead. `fst`'s automaton can miss matches for a non-ASCII
 /// term (lance-index keeps its own Unicode automaton for those), and building
-/// one for a long term or a small dictionary can cost far more than the scan
-/// it replaces.
+/// one for a long term or for few terms with the prefix can cost far more
+/// than the scan it replaces.
 fn fuzzy_automaton(term: &str, max_distance: u32, prefixed_terms: usize) -> Option<Levenshtein> {
     let state_limit =
         (prefixed_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
@@ -2821,13 +2820,15 @@ impl FtsMemIndex {
                     }
                 }
                 None => {
-                    for key in p.collect_terms() {
-                        if !key.starts_with(prefix) {
-                            continue;
-                        }
+                    let mut stream = p
+                        .term_fst
+                        .search(Str::new(prefix).starts_with())
+                        .into_stream();
+                    while let Some((key, _)) = stream.next() {
+                        let key = std::str::from_utf8(key).expect("FTS terms are UTF-8");
                         #[cfg(test)]
                         count_fuzzy_distance_computed();
-                        let dist = levenshtein_distance(term, key.as_ref());
+                        let dist = levenshtein_distance(term, key);
                         if dist <= max_distance {
                             matches.insert(key.to_string(), dist);
                         }
@@ -4545,7 +4546,7 @@ impl Partition {
     }
 
     /// All terms, indexed by term id (recovered from the FST). Used by the
-    /// flush, merge, and fuzzy-expansion paths; not on the hot search path.
+    /// flush and merge paths; not on the hot search path.
     fn collect_terms(&self) -> Vec<Arc<str>> {
         let mut out: Vec<Arc<str>> = vec![Arc::from(""); self.term_fst.len()];
         let mut stream = self.term_fst.stream();
@@ -4557,7 +4558,8 @@ impl Partition {
 
     /// Number of terms that start with `prefix`. Term ids are dense and follow
     /// term order, so this is the difference between the ids of the first
-    /// terms at or after two keys, found without walking the terms in between.
+    /// terms at or after `prefix` and after every term with it, found without
+    /// walking the terms in between.
     fn count_terms_with_prefix(&self, prefix: &str) -> usize {
         if prefix.is_empty() {
             return self.term_fst.len();
@@ -6986,11 +6988,12 @@ mod tests {
     #[case::empty("", 7)]
     #[case::shared("bra", 3)]
     #[case::whole_term("brave", 2)]
-    #[case::past_terms("bravest", 0)]
+    #[case::longer_than_a_term("bravest", 0)]
     #[case::before_all("a", 0)]
     #[case::between_terms("zz", 0)]
-    #[case::non_ascii("caf", 2)]
-    #[case::last_term("ü", 1)]
+    #[case::shared_with_non_ascii_term("caf", 2)]
+    #[case::non_ascii("ü", 1)]
+    #[case::after_all("ž", 0)]
     fn test_count_terms_with_prefix(#[case] prefix: &str, #[case] expected: usize) {
         let terms = [
             "banana", "brava", "brave", "bravery", "cafe", "café", "über",
@@ -7035,7 +7038,7 @@ mod tests {
             .with_freeze_threshold_rows(1);
         let rows = [
             "cafe café cave care face cafes bravo brave bravos grave crave",
-            "cafe cake safe caff brava bravi bravo drove über uber naïve naive banana",
+            "cafe cake safe caff brava bravi bravo drove über uber naïve naive banana cucumber",
             "zebra cafeteria calf cage bravado bravery bravobravobravo",
         ];
         let batch = |text: &str| {
@@ -7116,6 +7119,8 @@ mod tests {
                     .count()
             })
             .sum();
+        // Otherwise the count cannot tell the two paths apart.
+        assert_ne!(partition_matches, partition_terms);
         let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
         assert_eq!(
             fuzzy_automaton(term, max_distance, partition_terms).is_some(),
