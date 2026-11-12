@@ -5,7 +5,7 @@ mod create_index;
 mod rewrite;
 
 use super::*;
-use lance_table::transaction::action::{Action, Footprint, Overlap, Verdict};
+use lance_table::transaction::action::{Footprint, Overlap, Verdict};
 
 impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -152,12 +152,23 @@ impl<'a> TransactionRebase<'a> {
         };
         if !overlaps
             .iter()
-            .all(|overlap| self.can_rebase_past(overlap, before))
+            .all(|overlap| self.can_rebase_past(overlap, before, other_transaction))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
+        for overlap in &overlaps {
+            if !self.flag_rows_to_check(overlap) {
+                return Err(self.retryable_conflict_err(other_transaction, other_version));
+            }
+        }
         // Rebased as each committed set is checked, so the next one is
         // compared against what this transaction has become.
+        let row_level_only = overlaps.iter().all(|overlap| {
+            matches!(
+                overlap,
+                Overlap::Deletions { .. } | Overlap::RowsMovedUnderOverlay { .. }
+            )
+        });
         match &mut self.transaction.operation {
             Operation::CompositeOperation(composite_operation) => {
                 composite_operation.rebase(&overlaps)
@@ -166,8 +177,57 @@ impl<'a> TransactionRebase<'a> {
                 rebase_index_build(new_indices, &overlaps, self.untagged_reuse.as_deref());
                 Ok(())
             }
+            // Flagged above on the marks their own checks set, so `finish`
+            // settles them row by row as it does against a named operation.
+            Operation::Delete { .. } | Operation::Update { .. } | Operation::DataOverlay { .. }
+                if row_level_only =>
+            {
+                Ok(())
+            }
             _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
         }
+    }
+
+    /// Flag a fragment `overlap` names for `finish` to check row by row, as
+    /// the legacy checks flag one through `initial_fragments`: deletions to
+    /// merge with the latest version's, or an overlay to check against the
+    /// rows moved since this transaction read. A no-op for any other overlap.
+    ///
+    /// Returns false where the overlap cannot be resolved: this transaction
+    /// does not say which rows it deleted, or the fragment as it read it is
+    /// not known.
+    fn flag_rows_to_check(&mut self, overlap: &Overlap) -> bool {
+        let fragment = match overlap {
+            Overlap::Deletions { fragment } if self.affected_rows.is_some() => *fragment,
+            Overlap::RowsMovedUnderOverlay { fragment }
+                if overlay_coverage(&self.transaction.operation, *fragment).is_some() =>
+            {
+                *fragment
+            }
+            Overlap::Deletions { .. } => return false,
+            // This transaction moved the rows; `can_rebase_past` checked them.
+            Overlap::RowsMovedUnderOverlay { .. }
+            | Overlap::CompactedUnderIndex { .. }
+            | Overlap::UpdatedUnderIndex { .. }
+            | Overlap::FieldDropped { .. } => return true,
+        };
+        if let Some((_, flagged)) = self.initial_fragments.get_mut(&fragment) {
+            *flagged = true;
+            return true;
+        }
+        // By version rather than `manifests.read`: the handle this commit goes
+        // through may be newer than the version the transaction read.
+        let Some(initial) = self
+            .manifests
+            .by_version
+            .get(&self.transaction.read_version)
+            .and_then(|read| read.fragments.iter().find(|f| f.id == fragment))
+        else {
+            return false;
+        };
+        self.initial_fragments
+            .insert(fragment, (initial.clone(), true));
+        true
     }
 
     /// Whether the rebase can resolve `overlap`, given the manifest `before`
@@ -183,9 +243,24 @@ impl<'a> TransactionRebase<'a> {
     /// coverage at query time, and an overlay newer than the segment that the
     /// compaction folded into base data would no longer be masked out of it;
     /// legacy withdraws the latter from coverage, and this conflicts instead.
-    fn can_rebase_past(&self, overlap: &Overlap, before: &Manifest) -> bool {
-        let Overlap::CompactedUnderIndex { segment, fragment } = overlap else {
-            return true;
+    ///
+    /// Rows this transaction moved out from under an overlay `committed`
+    /// added are resolvable where they miss the overlay's coverage, as
+    /// `check_update_txn` decides it for a named `Update`.
+    fn can_rebase_past(
+        &self,
+        overlap: &Overlap,
+        before: &Manifest,
+        committed: &Transaction,
+    ) -> bool {
+        let (segment, fragment) = match overlap {
+            Overlap::CompactedUnderIndex { segment, fragment } => (segment, fragment),
+            Overlap::RowsMovedUnderOverlay { fragment }
+                if overlay_coverage(&self.transaction.operation, *fragment).is_none() =>
+            {
+                return self.moved_rows_miss(*fragment, &committed.operation);
+            }
+            _ => return true,
         };
         let Some(built) = added_segment(&self.transaction, *segment) else {
             return false;
@@ -216,6 +291,23 @@ impl<'a> TransactionRebase<'a> {
                 })
             });
         recorded && !is_ngram && !folds_newer_overlay
+    }
+
+    /// Whether the rows this transaction moved out of `fragment` miss every
+    /// overlay `committed` added to it.
+    fn moved_rows_miss(&self, fragment: u64, committed: &Operation) -> bool {
+        let (Some(affected_rows), Some(coverage), Ok(fragment)) = (
+            self.affected_rows,
+            overlay_coverage(committed, fragment),
+            u32::try_from(fragment),
+        ) else {
+            return false;
+        };
+        match affected_rows.get(&fragment) {
+            None => true,
+            Some(RowAddrSelection::Full) => coverage.is_empty(),
+            Some(RowAddrSelection::Partial(moved)) => moved.is_disjoint(&coverage),
+        }
     }
 
     fn check_delete_txn(

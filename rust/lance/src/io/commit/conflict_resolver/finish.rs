@@ -44,12 +44,8 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. }
-            // An action set needs no rewriting to move to a newer version: its
-            // minted ids are allocated when the actions are applied, against
-            // whichever manifest they land on, and its committed references
-            // name coordinates that do not move.
-            | Operation::CompositeOperation(_) => Ok(self.transaction),
+            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            Operation::CompositeOperation(_) => self.finish_action_set(dataset).await,
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
@@ -233,6 +229,149 @@ impl<'a> TransactionRebase<'a> {
     /// concurrent Update touched the same flagged fragment, the Delete's rows are
     /// also counted and may trigger an unnecessary retry — never data loss. Pure
     /// concurrent deletes leave the fragment unflagged and are not examined here.
+    /// Settle the fragments `flag_rows_to_check` flagged against `dataset`, the
+    /// latest version, the way `finish_delete_update` and `finish_data_overlay`
+    /// settle them for a named operation.
+    ///
+    /// Otherwise an action set needs no rewriting to move to a newer version:
+    /// its minted ids are allocated when the actions are applied, against
+    /// whichever manifest they land on, and its committed references name
+    /// coordinates that do not move.
+    async fn finish_action_set(mut self, dataset: &Dataset) -> Result<Transaction> {
+        let mut flagged: Vec<u64> = self
+            .initial_fragments
+            .iter()
+            .filter_map(|(id, (_, flagged))| flagged.then_some(*id))
+            .collect();
+        flagged.sort_unstable();
+        for fragment_id in flagged {
+            self.settle_rows(dataset, fragment_id).await?;
+        }
+        Ok(self.transaction)
+    }
+
+    /// Check one flagged fragment's rows against the latest version, and
+    /// rewrite the deletion file this action set gives it to hold what was
+    /// deleted there since it read.
+    ///
+    /// Only additions merge: a concurrent change that dropped a deletion, or a
+    /// file of this set's that holds anything other than the rows it read as
+    /// deleted plus the rows it says it deletes, conflicts.
+    async fn settle_rows(&mut self, dataset: &Dataset, fragment_id: u64) -> Result<()> {
+        let conflict = |reason: String| {
+            Error::retryable_commit_conflict_source(
+                dataset.manifest.version,
+                format!(
+                    "This {} transaction was preempted on fragment {fragment_id}: {reason}. \
+                     Please retry.",
+                    self.transaction.uuid
+                )
+                .into(),
+            )
+        };
+        let Some(current) = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == fragment_id)
+        else {
+            return Err(conflict("a concurrent transaction removed it".into()));
+        };
+        let Some((initial, _)) = self.initial_fragments.get(&fragment_id) else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
+        let current_deletions = read_fragment_deletion_bitmap(dataset, current).await?;
+        let initial_deletions = read_fragment_deletion_bitmap(dataset, initial).await?;
+        let deleted_since = &current_deletions - &initial_deletions;
+
+        if let Some(coverage) = overlay_coverage(&self.transaction.operation, fragment_id) {
+            let lost = &deleted_since & &coverage;
+            if !lost.is_empty() {
+                let sample: Vec<u32> = lost.iter().take(5).collect();
+                return Err(conflict(format!(
+                    "a concurrent update moved overlaid rows at offsets {sample:?}"
+                )));
+            }
+        }
+
+        let Operation::CompositeOperation(composite_operation) = &mut self.transaction.operation
+        else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
+        let ours = composite_operation
+            .iter_actions()
+            .find_map(|action| match action {
+                Action::SetDeletionFile(set) if set.fragment() == fragment_id => {
+                    Some(set.deletion_file().cloned())
+                }
+                _ => None,
+            });
+        let Some(ours) = ours else {
+            return Ok(());
+        };
+        let affected = self
+            .affected_rows
+            .zip(u32::try_from(fragment_id).ok())
+            .and_then(|(rows, id)| rows.get_fragment_bitmap(id));
+        let (Some(ours), Some(affected)) = (ours, affected) else {
+            return Err(conflict(
+                "the rows this transaction deletes there are not known".into(),
+            ));
+        };
+        if !initial_deletions.is_subset(&current_deletions) {
+            return Err(conflict(
+                "a concurrent transaction removed deletions this one read".into(),
+            ));
+        }
+        let written = RoaringBitmap::from(
+            read_dataset_deletion_file(dataset, fragment_id, &ours)
+                .await?
+                .as_ref(),
+        );
+        if written != &initial_deletions | affected {
+            return Err(conflict(
+                "its deletion file does not add exactly the rows it deletes to the ones it read"
+                    .into(),
+            ));
+        }
+        let both = &deleted_since & affected;
+        if !both.is_empty() {
+            let sample: Vec<u32> = both.iter().take(5).collect();
+            return Err(conflict(format!(
+                "a concurrent transaction also deleted the rows at offsets {sample:?}"
+            )));
+        }
+
+        let merged = DeletionVector::from(&current_deletions | affected);
+        let merged_file = if current
+            .physical_rows
+            .is_some_and(|rows| merged.len() == rows)
+        {
+            None
+        } else {
+            let deletion_file = write_deletion_file(
+                &dataset.base,
+                fragment_id,
+                dataset.manifest.version,
+                &merged,
+                dataset.object_store.as_ref(),
+                dataset.inline_deletions_max_bytes()?,
+            )
+            .await?;
+            if let Some(deletion_file) = &deletion_file {
+                let key = crate::session::caches::DeletionFileKey {
+                    fragment_id,
+                    deletion_file,
+                };
+                dataset
+                    .metadata_cache
+                    .insert_with_key(&key, Arc::new(merged))
+                    .await;
+            }
+            deletion_file
+        };
+        composite_operation.set_merged_deletions(fragment_id, merged_file)
+    }
+
     async fn finish_data_overlay(self, dataset: &Dataset) -> Result<Transaction> {
         let fragments_to_check: HashSet<u64> = self
             .initial_fragments
