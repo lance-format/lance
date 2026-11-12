@@ -678,6 +678,11 @@ impl ReadBlobsExecution {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::dataset::blob) fn num_schedulers(&self) -> usize {
+        self.schedulers.lock().unwrap().len()
+    }
+
     fn scheduler_for(&self, source: &BlobSource) -> Arc<ScanScheduler> {
         let mut schedulers = self.schedulers.lock().unwrap();
         schedulers
@@ -1611,6 +1616,37 @@ mod tests {
         let remaining = stream.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(remaining[0].data.as_deref(), Some(b"abc".as_slice()));
         assert_eq!(remaining[1].data.as_deref(), Some(b"xyz".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn test_blob_execution_isolates_store_instances_with_the_same_prefix() {
+        let (cached, _) = recording_range_store(Bytes::from_static(b"cached"));
+        let (fresh, _) = recording_range_store(Bytes::from_static(b"origin"));
+        assert_eq!(cached.store_prefix, fresh.store_prefix);
+        let path = Path::from("blobs/shared.bin");
+        let mut sources = HashMap::new();
+        let cached_source =
+            crate::dataset::blob::file::shared_blob_source(&mut sources, cached.clone(), &path);
+        let fresh_source =
+            crate::dataset::blob::file::shared_blob_source(&mut sources, fresh, &path);
+        assert!(!Arc::ptr_eq(&cached_source, &fresh_source));
+        assert!(Arc::ptr_eq(
+            &cached_source,
+            &crate::dataset::blob::file::shared_blob_source(&mut sources, cached, &path)
+        ));
+        let entries = [cached_source, fresh_source]
+            .into_iter()
+            .enumerate()
+            .map(|(selection_index, source)| BlobEntry {
+                selection_index,
+                file: BlobFile::with_source(source, 0, 6, BlobKind::External, None),
+                requested_range: None,
+            })
+            .collect();
+        let mut blobs = execute_blob_entries(entries, 2, None).await.unwrap();
+        blobs.sort_by_key(|blob| blob.selection_index);
+        assert_eq!(blobs[0].data.as_ref(), b"cached");
+        assert_eq!(blobs[1].data.as_ref(), b"origin");
     }
 
     #[tokio::test]

@@ -377,7 +377,8 @@ Note:
 
 - By default, external blob URIs must map to a registered non-dataset-root base path.
 - If you need to reference external objects outside those bases, set
-  `allow_external_blob_outside_bases=True` when writing.
+  `allow_external_blob_outside_bases=True` when writing in embedded mode.
+  A controlled service can reject these references regardless of this option.
 - Blob v2 storage layout thresholds can be configured per column with
   `blob_field(..., inline_size_threshold=..., dedicated_size_threshold=...)`.
   The inline threshold controls when values move from the data file to packed
@@ -391,6 +392,43 @@ Note:
 - Blob v2 fields can be nested inside structs and variable-length lists. Blob-aware
   scans preserve the surrounding nested layout; use `blob_handling="all_binary"`
   to materialize nested blob payloads as bytes.
+
+### Service access policy and external object caches
+
+Rust services can restrict external blobs to registered storage bases when
+constructing their shared session:
+
+```rust
+use std::sync::Arc;
+use lance::session::{Session, UnregisteredExternalBlobPolicy};
+use lance_io::object_store::ObjectStoreRegistry;
+
+let registry = ObjectStoreRegistry::default()
+    .without_providers(["file", "file-object-store", "file+uring"])?;
+let session = Session::new(0, 0, Arc::new(registry))
+    .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
+```
+
+Pass this session through `ReadParams.session`, `DatasetBuilder::with_session`,
+or `WriteParams.session`. Reads reject unregistered external descriptors
+(`base_id == 0`) before parsing the URI, opening a store, or probing its size.
+Logical URI writes under this policy must resolve to a registered storage base;
+the local `allow_external_blob_outside_bases` option cannot override the policy.
+The default session allows unregistered references for embedded use.
+
+`without_providers` consumes an unshared registry and discards its cached store
+bindings. Apply it before handing out sessions or store handles; it does not
+revoke handles that already exist. Registered bases still need appropriate
+credentials and deployment restrictions.
+
+Externally owned objects can change independently of table versions. Rust store
+wrappers prepare their external read view through
+`WrappingObjectStore::wrap_external_blob`, reusing the same physical store,
+credentials, endpoint, and connection pool. This hook retains the regular
+wrapper by default. A service's immutable page-cache wrapper should return the
+provided original view to bypass that cache, while retaining authorization and
+observation wrappers in the chain. Inline, Packed, Dedicated, and Managed
+payloads continue through the regular wrapping path.
 
 ### Example: packed external blobs (single container file)
 

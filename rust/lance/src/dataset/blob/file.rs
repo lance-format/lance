@@ -227,8 +227,8 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
 
 /// Cache key for sharing one [`BlobSource`] across multiple blob descriptors.
 ///
-/// Store instance identity keeps credentials and endpoints isolated even when
-/// two stores use the same prefix and path.
+/// Store instance identity keeps credentials, endpoints, and wrappers isolated
+/// even when two stores use the same prefix and path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BlobSourceKey {
     pub(super) store_id: usize,
