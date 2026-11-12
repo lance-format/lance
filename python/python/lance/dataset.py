@@ -2608,19 +2608,35 @@ class LanceDataset(pa.dataset.Dataset):
             data_storage_version,
         )
 
-    def versions(self) -> List[Version]:
+    def versions(
+        self,
+        *,
+        offset: int = 0,
+        limit: Optional[int] = None,
+        descending: bool = False,
+    ) -> List[Version]:
         """
-        Return all versions in this dataset.
+        Return versions in this dataset.
 
         Each entry is a :class:`Version` with ``version``, ``timestamp``,
         ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
         bytes of that version's manifest file, or ``None`` if the commit
         handler could not report it.
         """
-        versions = self._ds.versions()
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be non-negative, got {limit}")
+        versions = self._ds.versions(offset, limit, descending)
         for v in versions:
             _convert_version_timestamp(v)
         return versions
+
+    def count_versions(self) -> int:
+        """
+        Return the number of versions in this dataset.
+        """
+        return self._ds.count_versions()
 
     def get_version(self) -> Version:
         """

@@ -419,6 +419,42 @@ public class DatasetTest {
   }
 
   @Test
+  void testListVersionsWithOptions(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("list_versions_with_options").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 5).close();
+      testDataset.write(2, 5).close();
+      testDataset.write(3, 5).close();
+      try (Dataset dataset = testDataset.write(4, 5)) {
+        List<Version> all = dataset.listVersions();
+        assertEquals(5, all.size());
+        assertEquals(5, dataset.getVersionCount());
+
+        List<Version> newest = dataset.listVersions(0, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(4), all.get(3)), newest);
+
+        List<Version> secondPage = dataset.listVersions(2, Optional.of(2L), true);
+        assertEquals(Arrays.asList(all.get(2), all.get(1)), secondPage);
+
+        List<Version> ascending = dataset.listVersions(3, Optional.empty(), false);
+        assertEquals(Arrays.asList(all.get(3), all.get(4)), ascending);
+
+        assertEquals(all, dataset.listVersions(0, Optional.empty(), false));
+        assertTrue(dataset.listVersions(5, Optional.of(2L), false).isEmpty());
+        assertTrue(dataset.listVersions(0, Optional.of(0L), false).isEmpty());
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.listVersions(-1, Optional.empty(), false));
+        assertThrows(
+            IllegalArgumentException.class, () -> dataset.listVersions(0, Optional.of(-1L), false));
+      }
+    }
+  }
+
+  @Test
   void testDatasetCheckoutVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("dataset_checkout_version").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {

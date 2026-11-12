@@ -3103,27 +3103,62 @@ impl Dataset {
 
     /// Get all versions.
     pub async fn versions(&self) -> Result<Vec<Version>> {
-        let mut versions: Vec<Version> = self
-            .commit_handler
-            .list_manifest_locations(&self.base, &self.object_store, false)
-            .try_filter_map(|location| async move {
-                let manifest_size = location.size;
-                match read_manifest(&self.object_store, &location.path, manifest_size).await {
-                    Ok(manifest) => {
-                        let mut version = Version::from(&manifest);
-                        version.manifest_size = manifest_size;
-                        Ok(Some(version))
-                    }
-                    Err(e) => Err(e),
+        self.versions_with_options(0, None, false).await
+    }
+
+    /// Get a page of versions in the current version history.
+    ///
+    /// Only the manifests for the requested page are read.
+    pub async fn versions_with_options(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<Version>> {
+        let limit = limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let locations: Vec<ManifestLocation> = if descending {
+            let mut stream =
+                self.commit_handler
+                    .list_manifest_locations(&self.base, &self.object_store, true);
+            let mut skipped = 0;
+            let mut page = Vec::new();
+            while page.len() < limit {
+                let Some(location) = stream.try_next().await? else {
+                    break;
+                };
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    page.push(location);
                 }
+            }
+            page
+        } else {
+            let mut all: Vec<ManifestLocation> = self
+                .commit_handler
+                .list_manifest_locations(&self.base, &self.object_store, false)
+                .try_collect()
+                .await?;
+            all.sort_unstable_by_key(|location| location.version);
+            all.into_iter().skip(offset).take(limit).collect()
+        };
+
+        stream::iter(locations)
+            .map(|location| async move {
+                let manifest_size = location.size;
+                let manifest =
+                    read_manifest(&self.object_store, &location.path, manifest_size).await?;
+                let mut version = Version::from(&manifest);
+                version.manifest_size = manifest_size;
+                Ok::<_, Error>(version)
             })
+            .buffered(self.object_store.io_parallelism())
             .try_collect()
-            .await?;
-
-        // TODO: this API should support pagination
-        versions.sort_by_key(|v| v.version);
-
-        Ok(versions)
+            .await
     }
 
     /// Get the number of versions in the current version history.

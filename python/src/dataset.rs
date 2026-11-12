@@ -1781,14 +1781,30 @@ impl Dataset {
         Ok(())
     }
 
-    fn versions(self_: PyRef<'_, Self>) -> PyResult<Vec<Py<PyAny>>> {
+    #[pyo3(signature = (offset = 0, limit = None, descending = false))]
+    fn versions(
+        self_: PyRef<'_, Self>,
+        offset: usize,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> PyResult<Vec<Py<PyAny>>> {
         let py = self_.py();
-        let versions = self_.list_versions()?;
+        let versions = rt()
+            .block_on(
+                Some(py),
+                self_.ds.versions_with_options(offset, limit, descending),
+            )?
+            .infer_error()?;
         let pyvers: Vec<Py<PyAny>> = versions
             .iter()
             .map(|v| version_to_py(py, v))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(pyvers)
+    }
+
+    fn count_versions(self_: PyRef<'_, Self>) -> PyResult<u64> {
+        rt().block_on(Some(self_.py()), self_.ds.count_versions())?
+            .infer_error()
     }
 
     /// Fetches the currently checked out version of the dataset, with its
@@ -4267,10 +4283,6 @@ impl Dataset {
             ds: Arc::new(ds),
             uri: self.uri.clone(),
         })
-    }
-
-    fn list_versions(&self) -> PyResult<Vec<Version>> {
-        rt().block_on(None, self.ds.versions())?.infer_error()
     }
 
     fn list_version_refs(&self) -> PyResult<Vec<VersionRef>> {

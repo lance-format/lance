@@ -233,6 +233,124 @@ async fn test_v2_manifest_path_commit() {
     assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_versions_with_options(
+    #[values(true, false)] lexical_store: bool,
+    #[values(true, false)] enable_v2_manifest_paths: bool,
+) {
+    let tmp_dir = TempStrDir::default();
+    let test_uri = if lexical_store {
+        "memory://".to_string()
+    } else {
+        tmp_dir.as_str().to_string()
+    };
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    let schema = data.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        &test_uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let ids = |versions: Vec<crate::dataset::Version>| {
+        versions.into_iter().map(|v| v.version).collect::<Vec<_>>()
+    };
+
+    assert_eq!(ids(dataset.versions().await.unwrap()), vec![1, 2, 3, 4, 5]);
+    assert_eq!(dataset.count_versions().await.unwrap(), 5);
+
+    let cases = [
+        ((0, None, false), vec![1, 2, 3, 4, 5]),
+        ((0, None, true), vec![5, 4, 3, 2, 1]),
+        ((0, Some(2), true), vec![5, 4]),
+        ((2, Some(2), true), vec![3, 2]),
+        ((4, Some(2), true), vec![1]),
+        ((5, Some(2), true), vec![]),
+        ((1, Some(3), false), vec![2, 3, 4]),
+        ((3, None, false), vec![4, 5]),
+        ((0, Some(0), true), vec![]),
+    ];
+    for ((offset, limit, descending), expected) in cases {
+        let actual = ids(dataset
+            .versions_with_options(offset, limit, descending)
+            .await
+            .unwrap());
+        assert_eq!(
+            actual, expected,
+            "offset={offset}, limit={limit:?}, descending={descending}"
+        );
+    }
+
+    dataset.object_store.io_stats_incremental();
+    let full = dataset.versions().await.unwrap();
+    let full_reads = dataset.object_store.io_stats_incremental().read_iops;
+    dataset
+        .versions_with_options(0, Some(2), true)
+        .await
+        .unwrap();
+    let page_reads = dataset.object_store.io_stats_incremental().read_iops;
+    assert_eq!(full_reads - page_reads, 3);
+
+    let latest = dataset
+        .versions_with_options(0, Some(1), true)
+        .await
+        .unwrap();
+    assert_eq!(latest[0].version, full[4].version);
+    assert_eq!(latest[0].timestamp, full[4].timestamp);
+    assert_eq!(latest[0].metadata, full[4].metadata);
+    assert_eq!(latest[0].manifest_size, full[4].manifest_size);
+    assert!(latest[0].manifest_size.unwrap() > 0);
+}
+
+#[tokio::test]
+async fn test_versions_with_options_excludes_detached() {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    let schema = data.schema();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(data.clone())], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Arc::new(dataset);
+    let detached = CommitBuilder::new(dataset.clone())
+        .with_detached(true)
+        .execute(Transaction::new(
+            dataset.version().version,
+            Operation::Append { fragments: vec![] },
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(detached.version().version, dataset.version().version);
+
+    let page = dataset.versions_with_options(0, None, true).await.unwrap();
+    assert_eq!(page.iter().map(|v| v.version).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(dataset.count_versions().await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn test_strict_overwrite() {
     let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(

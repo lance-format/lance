@@ -560,6 +560,37 @@ def test_versions(tmp_path: Path):
     assert current["manifest_size"] == _manifest_file_size(base_dir, 2)
 
 
+@pytest.mark.parametrize("uri", ["memory://versions_pagination", "local"])
+def test_versions_pagination(tmp_path: Path, uri: str):
+    if uri == "local":
+        uri = str(tmp_path / "test")
+    table = pa.table({"a": [1, 2]})
+    dataset = lance.write_dataset(table, uri)
+    for _ in range(4):
+        dataset = lance.write_dataset(table, dataset, mode="append")
+
+    def ids(versions):
+        return [v["version"] for v in versions]
+
+    all_versions = dataset.versions()
+    assert ids(all_versions) == [1, 2, 3, 4, 5]
+    assert dataset.count_versions() == 5
+
+    assert ids(dataset.versions(limit=2, descending=True)) == [5, 4]
+    assert ids(dataset.versions(offset=2, limit=2, descending=True)) == [3, 2]
+    assert ids(dataset.versions(offset=4, limit=2, descending=True)) == [1]
+    assert ids(dataset.versions(offset=1, limit=3)) == [2, 3, 4]
+    assert ids(dataset.versions(offset=3)) == [4, 5]
+    assert dataset.versions(offset=5, limit=2) == []
+    assert dataset.versions(limit=0) == []
+    assert dataset.versions(limit=1, descending=True) == [all_versions[-1]]
+
+    with pytest.raises(ValueError, match="offset"):
+        dataset.versions(offset=-1)
+    with pytest.raises(ValueError, match="limit"):
+        dataset.versions(limit=-1)
+
+
 def test_version_id(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
