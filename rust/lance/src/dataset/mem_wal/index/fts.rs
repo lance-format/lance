@@ -696,6 +696,36 @@ pub fn levenshtein_distance(a: &str, b: &str) -> u32 {
     prev_row[n]
 }
 
+/// Longest ASCII term, in bytes, that fuzzy expansion builds a Levenshtein
+/// automaton for. The work and memory per automaton state grow with the term
+/// length, and with two edits `fst` already gives up at about 50 bytes for
+/// most terms, so a longer term scans the dictionary.
+const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
+
+/// Partition terms per automaton state that fuzzy expansion may build.
+/// Building a state costs about as much as a few edit distances, so a build
+/// that reaches this limit and falls back adds less than the dictionary scan
+/// that follows it.
+const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
+
+/// Most automaton states fuzzy expansion builds, `fst`'s default limit for
+/// `Levenshtein::new`.
+const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
+
+/// The Levenshtein automaton that expands `term` over partitions holding
+/// `partition_terms` terms, or `None` to scan their dictionaries instead.
+/// `fst`'s automaton can miss matches for a non-ASCII term (lance-index keeps
+/// its own Unicode automaton for those), and building one for a long term or
+/// a small dictionary can cost far more than the scan it replaces.
+fn fuzzy_automaton(term: &str, max_distance: u32, partition_terms: usize) -> Option<Levenshtein> {
+    let state_limit =
+        (partition_terms / FUZZY_AUTOMATON_TERMS_PER_STATE).min(FUZZY_AUTOMATON_MAX_STATES);
+    if !term.is_ascii() || term.len() > FUZZY_AUTOMATON_MAX_TERM_BYTES || state_limit == 0 {
+        return None;
+    }
+    Levenshtein::new_with_limit(term, max_distance, state_limit).ok()
+}
+
 fn char_prefix(term: &str, prefix_length: u32) -> &str {
     if prefix_length == 0 {
         return "";
@@ -2761,12 +2791,9 @@ impl FtsMemIndex {
         }
         // A partition's dictionary is an FST, so a Levenshtein automaton
         // yields only the terms within `max_distance`, as the committed index
-        // does. `fst`'s automaton can miss matches for a non-ASCII query
-        // (lance-index keeps its own Unicode automaton for those), so such a
-        // query, or one too large to compile, scans the dictionary instead.
-        let automaton = (term.is_ascii() && !st.partitions.is_empty())
-            .then(|| Levenshtein::new(term, max_distance).ok())
-            .flatten();
+        // does. Without one, every partition term with the prefix is checked.
+        let partition_terms = st.partitions.iter().map(|p| p.term_fst.len()).sum();
+        let automaton = fuzzy_automaton(term, max_distance, partition_terms);
         for p in st.partitions.iter() {
             match &automaton {
                 Some(automaton) => {
@@ -6897,22 +6924,53 @@ mod tests {
         assert!(matches.len() <= 3);
     }
 
+    #[rstest]
+    #[case::two_edits("bravo", 2, 10_000, true)]
+    #[case::small_dictionary("bravo", 2, 100, false)]
+    #[case::no_partitions("bravo", 2, 0, false)]
+    #[case::non_ascii("café", 1, usize::MAX, false)]
+    #[case::longest_term(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobrav",
+        1,
+        usize::MAX,
+        true
+    )]
+    #[case::too_long(
+        "bravobravobravobravobravobravobravobravobravobravobravobravobravo",
+        1,
+        usize::MAX,
+        false
+    )]
+    #[case::too_many_states("bravobravobravob", 3, usize::MAX, false)]
+    fn test_fuzzy_automaton_bounds(
+        #[case] term: &str,
+        #[case] max_distance: u32,
+        #[case] partition_terms: usize,
+        #[case] builds: bool,
+    ) {
+        assert_eq!(
+            fuzzy_automaton(term, max_distance, partition_terms).is_some(),
+            builds
+        );
+    }
+
     /// Partitions expand an ASCII term with a Levenshtein automaton over their
     /// term FST; the result must equal a scan of every dictionary term,
     /// including non-ASCII terms, prefix lengths, and a `max_expansions` cap.
     #[rstest]
-    #[case::one_edit("cafe", 1, 0, 50, true)]
-    #[case::two_edits("bravo", 2, 0, 50, true)]
-    #[case::prefix("bravo", 2, 1, 50, true)]
-    #[case::capped("cafe", 2, 0, 3, true)]
-    #[case::non_ascii_query("café", 1, 0, 50, false)]
-    // Too many states for `fst` to build the automaton.
-    #[case::automaton_too_large("bravobravobravob", 3, 0, 50, false)]
+    #[case::one_edit("cafe", 1, 0, 50, 2_000, true)]
+    #[case::two_edits("bravo", 2, 0, 50, 2_000, true)]
+    #[case::prefix("bravo", 2, 1, 50, 2_000, true)]
+    #[case::capped("cafe", 2, 0, 3, 2_000, true)]
+    #[case::non_ascii_query("café", 1, 0, 50, 2_000, false)]
+    // Too few terms to pay for building the automaton.
+    #[case::small_dictionary("bravo", 2, 0, 50, 0, false)]
     fn test_expand_fuzzy_matches_dictionary_scan(
         #[case] term: &str,
         #[case] max_distance: u32,
         #[case] prefix_length: u32,
         #[case] max_expansions: usize,
+        #[case] fillers_per_partition: usize,
         #[case] uses_automaton: bool,
     ) {
         let schema = create_test_schema();
@@ -6937,10 +6995,19 @@ mod tests {
             )
             .unwrap()
         };
+        // Far from every query term, these only grow the dictionary.
+        let fillers: Vec<String> = (0..fillers_per_partition)
+            .map(|i| format!("x{i:05}"))
+            .collect();
+        let fillers = fillers.join(" ");
         // The first two rows freeze into separate partitions, the third stays
         // in the tail.
-        index.insert(&batch(rows[0]), 0).unwrap();
-        index.insert(&batch(rows[1]), 1).unwrap();
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[0])), 0)
+            .unwrap();
+        index
+            .insert(&batch(&format!("{} {fillers}", rows[1])), 1)
+            .unwrap();
         index.freeze_threshold_rows = usize::MAX;
         index.insert(&batch(rows[2]), 2).unwrap();
         let st = index.state.load_full();
@@ -6996,8 +7063,9 @@ mod tests {
             })
             .sum();
         let computed = FUZZY_DISTANCES_COMPUTED.with(|count| count.get());
+        let dictionary_size = st.partitions.iter().map(|p| p.term_fst.len()).sum();
         assert_eq!(
-            Levenshtein::new(term, max_distance).is_ok() && term.is_ascii(),
+            fuzzy_automaton(term, max_distance, dictionary_size).is_some(),
             uses_automaton
         );
         if uses_automaton {
