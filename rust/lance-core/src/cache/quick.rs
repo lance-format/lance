@@ -263,7 +263,25 @@ impl QuickCacheBackend {
             }
             dropped
         };
+        self.record_priority_removals(&dropped);
         drop(dropped);
+    }
+
+    /// Record evictions from the priority tier.
+    ///
+    /// Priority entries live outside quick_cache, so its lifecycle hooks never
+    /// observe them. Charge them with the same per-entry weight used on
+    /// admission: fixed key footprint plus declared payload.
+    fn record_priority_removals(&self, dropped: &[QuickEntry]) {
+        if dropped.is_empty() {
+            return;
+        }
+        let bytes = dropped.iter().fold(0_u64, |total, value| {
+            total.saturating_add(
+                (std::mem::size_of::<InternalCacheKey>()).saturating_add(value.size_bytes) as u64,
+            )
+        });
+        self.metrics.size_removal(dropped.len() as u64, bytes);
     }
 
     fn admit_priority(
@@ -320,13 +338,7 @@ impl QuickCacheBackend {
             (dropped, replaced)
         };
         if !dropped.is_empty() {
-            let bytes = dropped.iter().fold(0_u64, |total, value| {
-                total.saturating_add(
-                    (std::mem::size_of::<InternalCacheKey>()).saturating_add(value.size_bytes)
-                        as u64,
-                )
-            });
-            self.metrics.size_removal(dropped.len() as u64, bytes);
+            self.record_priority_removals(&dropped);
         }
         drop((dropped, replaced));
     }
@@ -1039,12 +1051,22 @@ mod tests {
                 .await;
         }
         assert_eq!(cache.num_entries().await, 3);
+        let before = cache.diagnostics();
+        let before_removals = before.size_removals.unwrap();
+        let before_bytes = before.size_removed_bytes.unwrap();
 
         cache.set_capacity(2 * entry_weight);
         assert_eq!(cache.capacity_bytes(), Some(2 * entry_weight));
         assert_eq!(cache.num_entries().await, 2);
         assert!(cache.get_resident(&key(1)).await.is_none());
         assert!(cache.get_resident(&key(3)).await.is_some());
+
+        let after = cache.diagnostics();
+        assert_eq!(after.size_removals.unwrap() - before_removals, 1);
+        assert_eq!(
+            after.size_removed_bytes.unwrap() - before_bytes,
+            entry_weight as u64
+        );
     }
 
     fn keys_in_shard(
