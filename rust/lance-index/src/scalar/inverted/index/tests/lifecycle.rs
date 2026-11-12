@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::ROW_ADDR;
 
 use crate::Index;
 
@@ -24,6 +25,7 @@ async fn test_calculate_included_frags_is_unsupported() -> Result<()> {
         TokenSetFormat::default(),
         "hello",
         100,
+        true,
     )
     .await?;
 
@@ -89,7 +91,7 @@ async fn build_multi_partition_index(
     // Keep the cache alive and return it: the partition readers hold only a
     // WeakLanceCache, so the prewarmed entries vanish if this Arc is dropped.
     let cache = Arc::new(LanceCache::with_capacity(1 << 20));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
     (index, cache)
@@ -209,13 +211,13 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(index.format_version(), format_version);
     assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V2);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("doc", DataType::Utf8, true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     let docs = Arc::new(StringArray::from(vec![Some("hello again")]));
     let row_ids = Arc::new(UInt64Array::from(vec![101u64]));
@@ -227,7 +229,7 @@ async fn test_update_preserves_v2_format_version() -> Result<()> {
 
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V2);
 
-    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(updated.format_version(), format_version);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V2);
     // Consolidating the two tiny partitions must preserve their V2 format.
@@ -281,7 +283,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
 
     write_test_metadata(&src_store, vec![0], params).await;
 
-    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache()).await?;
+    let index = InvertedIndex::load(src_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(index.format_version(), InvertedListFormatVersion::V3);
     assert_eq!(index.index_version(), INVERTED_INDEX_VERSION_V3);
 
@@ -290,7 +292,7 @@ async fn test_block_size_256_writes_v3_metadata_and_index_version() -> Result<()
         .await?;
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V3);
 
-    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let updated = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(updated.format_version(), InvertedListFormatVersion::V3);
     assert_eq!(updated.index_version(), INVERTED_INDEX_VERSION_V3);
 
@@ -318,6 +320,7 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
         TokenSetFormat::Arrow,
         "hello",
         100,
+        false,
     )
     .await?;
     assert_eq!(index.index_version(), 0);
@@ -331,7 +334,7 @@ async fn test_merge_segments_preserves_arrow_token_set_format() -> Result<()> {
     .await?;
 
     assert_eq!(created.index_version, 0);
-    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(merged.index_version(), 0);
     assert_eq!(merged.token_set_format, TokenSetFormat::Arrow);
 
@@ -374,7 +377,8 @@ async fn test_merge_segments_preserves_format_version(
         .format_version(format_version);
 
     let index =
-        write_single_partition_index(src_store, params, TokenSetFormat::Fst, "hello", 100).await?;
+        write_single_partition_index(src_store, params, TokenSetFormat::Fst, "hello", 100, false)
+            .await?;
     assert_eq!(index.format_version(), format_version);
 
     let created = InvertedIndex::merge_segments(
@@ -387,7 +391,7 @@ async fn test_merge_segments_preserves_format_version(
     .await?;
     assert_eq!(created.index_version, format_version.index_version());
 
-    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(merged.format_version(), format_version);
     assert_eq!(merged.index_version(), format_version.index_version());
 
@@ -420,7 +424,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     let params = InvertedIndexParams::default().format_version(InvertedListFormatVersion::V1);
 
     write_test_metadata(&empty_store, Vec::new(), params.clone()).await;
-    let empty = InvertedIndex::load(empty_store, None, &LanceCache::no_cache()).await?;
+    let empty = InvertedIndex::load(empty_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(empty.partition_count(), 0);
     assert_eq!(empty.format_version(), InvertedListFormatVersion::V1);
 
@@ -430,6 +434,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
         TokenSetFormat::default(),
         "hello",
         100,
+        false,
     )
     .await?;
     let segments = if is_empty_first {
@@ -448,7 +453,7 @@ async fn test_merge_v1_segments_with_empty_segment(#[case] is_empty_first: bool)
     .await?;
     assert_eq!(created.index_version, INVERTED_INDEX_VERSION_V1);
 
-    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), false).await?;
     assert_eq!(merged.format_version(), InvertedListFormatVersion::V1);
     assert_eq!(merged.index_version(), INVERTED_INDEX_VERSION_V1);
 
@@ -492,11 +497,18 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
         TokenSetFormat::default(),
         "alpha",
         100,
+        true,
     )
     .await?;
-    let second =
-        write_single_partition_index(src_store_2, params, TokenSetFormat::default(), "beta", 200)
-            .await?;
+    let second = write_single_partition_index(
+        src_store_2,
+        params,
+        TokenSetFormat::default(),
+        "beta",
+        200,
+        true,
+    )
+    .await?;
 
     let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default().memory_limit_mb(0))
         .with_token_set_format(TokenSetFormat::default());
@@ -509,7 +521,7 @@ async fn test_merge_segments_uses_memory_limit_for_old_partitions() -> Result<()
         )
         .await?;
 
-    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache()).await?;
+    let merged = InvertedIndex::load(dest_store, None, &LanceCache::no_cache(), true).await?;
     assert_eq!(merged.partitions.len(), 2);
     let mut partition_ids = merged
         .partitions
@@ -563,7 +575,7 @@ async fn test_modern_index_without_deleted_col_has_empty_bitmap() {
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache(), true)
         .await
         .unwrap();
     assert!(

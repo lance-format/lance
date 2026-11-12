@@ -38,6 +38,11 @@ pub struct InvertedIndex {
     /// Rows this segment may report, intersected into every mask it searches with.
     /// See [`Self::with_allowed_rows`].
     pub(super) allowed_rows: Option<Arc<RowAddrMask>>,
+    /// Whether `docs.lance`'s identity column holds physical row addresses
+    /// (`true`) or row ids directly (`false`, a segment persisted before
+    /// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`]). See
+    /// [`ScalarIndex::results_are_row_addresses`].
+    pub(super) results_are_row_addresses: bool,
 }
 
 impl Debug for InvertedIndex {
@@ -64,6 +69,9 @@ impl InvertedIndex {
     }
 
     pub(super) fn index_version(&self) -> u32 {
+        if self.results_are_row_addresses {
+            return INVERTED_ROW_ADDR_DOMAIN_VERSION;
+        }
         if self.params.get_document_granularity().is_list_element() {
             return INVERTED_INDEX_VERSION_V3;
         }
@@ -214,6 +222,13 @@ impl InvertedIndex {
                         .to_string(),
                 ));
             }
+            if segment.results_are_row_addresses != first.results_are_row_addresses {
+                return Err(Error::index(
+                    "cannot merge inverted index segments that disagree on whether they store \
+                     row ids or row addresses -- rebuild them into one segment first"
+                        .to_string(),
+                ));
+            }
         }
 
         let can_update = match (segments, old_data_filters, first.partitions.as_slice()) {
@@ -325,6 +340,7 @@ impl InvertedIndex {
             document_projections_resident: self.document_projections_resident.clone(),
             deleted_fragments: self.deleted_fragments.clone(),
             allowed_rows: self.allowed_rows.clone(),
+            results_are_row_addresses: self.results_are_row_addresses,
         }))
     }
 
@@ -393,6 +409,9 @@ impl InvertedIndex {
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
             allowed_rows: None,
+            // This ancient (pre-partitioned, no `metadata.lance`) format
+            // predates the row-address-domain migration entirely.
+            results_are_row_addresses: false,
         }))
     }
 
@@ -463,6 +482,9 @@ impl InvertedIndex {
             document_projections_resident: Arc::new(AtomicBool::new(false)),
             deleted_fragments: RoaringBitmap::new(),
             allowed_rows: None,
+            // This ancient (pre-partitioned, no `metadata.lance`) format
+            // predates the row-address-domain migration entirely.
+            results_are_row_addresses: false,
         }))
     }
 
@@ -574,6 +596,7 @@ impl InvertedIndex {
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -674,6 +697,7 @@ impl InvertedIndex {
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
                     allowed_rows: None,
+                    results_are_row_addresses,
                 }))
             }
             Err(_) => {
@@ -689,6 +713,7 @@ impl InvertedIndex {
         store: Arc<dyn IndexStore>,
         remapping: Option<Arc<dyn BatchRowIdRemapper>>,
         index_cache: &LanceCache,
+        results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
         // for new index format, there is a metadata file and multiple partitions,
@@ -787,6 +812,7 @@ impl InvertedIndex {
                     document_projections_resident: Arc::new(AtomicBool::new(false)),
                     deleted_fragments,
                     allowed_rows: None,
+                    results_are_row_addresses,
                 }))
             }
             Err(_) => {
@@ -1187,7 +1213,7 @@ impl ScalarIndex for InvertedIndex {
     }
 
     fn update_criteria(&self) -> UpdateCriteria {
-        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_addr();
         if self.is_legacy() {
             UpdateCriteria::requires_old_data(criteria)
         } else {
@@ -1197,5 +1223,9 @@ impl ScalarIndex for InvertedIndex {
 
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         Self::params_for_training(self.params.clone(), self.format_version())
+    }
+
+    fn results_are_row_addresses(&self) -> bool {
+        self.results_are_row_addresses
     }
 }

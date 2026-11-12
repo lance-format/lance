@@ -564,7 +564,7 @@ async fn test_grouped_bm25_search_correct_and_cache_stable() {
     writer.finish_with_metadata(metadata).await.unwrap();
 
     let cache = Arc::new(LanceCache::with_capacity(1 << 20));
-    let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+    let index = InvertedIndex::load(store.clone(), None, cache.as_ref(), true)
         .await
         .unwrap();
 

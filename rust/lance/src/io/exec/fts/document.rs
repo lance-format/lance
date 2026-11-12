@@ -108,7 +108,10 @@ impl FtsDocumentExec {
     }
 
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, resolved: ResolvedFtsField) -> Self {
-        let schema = fts_document_schema(resolved.coordinate_rank());
+        // This node is only used on the flat/residual query-time path
+        // (`dataset::scanner::fts`), which always scans and must keep
+        // emitting genuine row ids -- never row addresses.
+        let schema = fts_document_schema(resolved.coordinate_rank(), ROW_ID);
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             input.output_partitioning().clone(),

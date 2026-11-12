@@ -200,7 +200,7 @@ impl ExecutionPlan for BoostQueryExec {
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
 
-            let batch = document_key_scores_batch(schema, documents)?;
+            let batch = document_key_scores_batch(schema, documents, None)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -549,7 +549,7 @@ impl ExecutionPlan for BooleanQueryExec {
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
-            let batch = document_key_scores_batch(schema, documents)?;
+            let batch = document_key_scores_batch(schema, documents, None)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(

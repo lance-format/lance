@@ -19,6 +19,7 @@ use lance_index::scalar::inverted::{
     DOC_INDEX_COL, InvertedIndex, MemBM25Scorer, PreparedBm25Query, SCORE_COL, prepare_bm25_query,
 };
 
+use super::segments::RowAddrToRowId;
 use super::selection::FtsIndexMetrics;
 
 #[derive(Clone)]
@@ -50,8 +51,18 @@ impl PreparedMatch {
 
 pub(super) fn scored_documents_batch(
     schema: SchemaRef,
-    documents: Vec<ScoredDoc>,
+    mut documents: Vec<ScoredDoc>,
+    row_addr_to_row_id: Option<&RowAddrToRowId>,
 ) -> Result<RecordBatch> {
+    if let Some(translate) = row_addr_to_row_id {
+        documents.retain_mut(|document| match translate(document.row_id) {
+            Some(row_id) => {
+                document.row_id = row_id;
+                true
+            }
+            None => false,
+        });
+    }
     let row_ids = UInt64Array::from_iter_values(documents.iter().map(|document| document.row_id));
     let scores = Float32Array::from_iter_values(documents.iter().map(|document| document.score.0));
     let mut columns = vec![Arc::new(row_ids) as Arc<dyn Array>];
@@ -151,6 +162,7 @@ pub(super) fn batch_scored_document_keys_sum_scores(
 pub(super) fn document_key_scores_batch(
     schema: SchemaRef,
     values: impl IntoIterator<Item = (DocumentKey, f32)>,
+    row_addr_to_row_id: Option<&RowAddrToRowId>,
 ) -> Result<RecordBatch> {
     scored_documents_batch(
         schema,
@@ -158,6 +170,7 @@ pub(super) fn document_key_scores_batch(
             .into_iter()
             .map(|(key, score)| ScoredDoc::with_doc_index(key.row_id, key.doc_index, score))
             .collect(),
+        row_addr_to_row_id,
     )
 }
 

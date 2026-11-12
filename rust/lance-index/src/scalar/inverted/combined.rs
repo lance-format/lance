@@ -59,7 +59,9 @@ pub struct CombinedFieldColumn {
     pub weight: f32,
     /// Opened inverted-index segments for this column.
     pub indices: Vec<Arc<InvertedIndex>>,
-    /// Rows an overlay made stale, in the row-id domain index results use.
+    /// Rows an overlay made stale, in the domain `indices` store their
+    /// identifiers in (row addresses from
+    /// `INVERTED_ROW_ADDR_DOMAIN_VERSION` onward, row ids before it).
     ///
     /// The flat scan folds their current values into the corpus, so their old
     /// values are subtracted from `indices` to avoid counting them twice.
