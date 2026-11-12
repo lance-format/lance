@@ -16,6 +16,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::ROW_ADDR;
 use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::scalar::json::JsonIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, ScalarIndex, index_files_to_table};
@@ -243,7 +244,7 @@ pub(in crate::index) async fn open_dyn_sources(
     Ok(sources)
 }
 
-/// One opened source as its concrete type.
+/// An opened source, or its JSON target, as the concrete index type.
 pub(in crate::index) fn downcast_source<'a, T>(
     source: &'a Arc<dyn ScalarIndex>,
     segment: &IndexMetadata,
@@ -252,14 +253,23 @@ pub(in crate::index) fn downcast_source<'a, T>(
 where
     T: ScalarIndex + 'static,
 {
-    source.as_any().downcast_ref::<T>().ok_or_else(|| {
-        Error::index(format!(
-            "merge_existing_index_segments: expected {} segment {}, got {:?}",
-            index_type,
-            segment.uuid,
-            source.index_type()
-        ))
-    })
+    source
+        .as_any()
+        .downcast_ref::<T>()
+        .or_else(|| {
+            source
+                .as_any()
+                .downcast_ref::<JsonIndex>()
+                .and_then(|json| json.target_index().as_any().downcast_ref::<T>())
+        })
+        .ok_or_else(|| {
+            Error::index(format!(
+                "merge_existing_index_segments: expected {} segment {}, got {:?}",
+                index_type,
+                segment.uuid,
+                source.index_type()
+            ))
+        })
 }
 
 /// The opened sources as their concrete type.
@@ -333,7 +343,8 @@ pub(in crate::index) fn empty_value_row_id_stream(
         ))
     })?;
     let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
+        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true)
+            .with_metadata(field.metadata.clone()),
         ArrowField::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     Ok(Box::pin(RecordBatchStreamAdapter::new(

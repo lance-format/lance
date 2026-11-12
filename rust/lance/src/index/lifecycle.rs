@@ -304,6 +304,21 @@ impl Dataset {
                 ));
             }
         }
+        let all_json = source_segments.iter().all(|segment| {
+            segment
+                .index_details
+                .as_deref()
+                .and_then(scalar::json::merge_target_type)
+                .is_some()
+        });
+        let all_json_ngram = all_json
+            && source_segments.iter().all(|segment| {
+                segment
+                    .index_details
+                    .as_deref()
+                    .and_then(scalar::json::merge_target_type)
+                    == Some(IndexType::NGram)
+            });
         let all_vector = source_segments.iter().all(segment_has_vector_details);
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
@@ -315,7 +330,8 @@ impl Dataset {
         let all_rtree = source_segments.iter().all(segment_has_rtree_details);
         let all_ngram = source_segments.iter().all(segment_has_ngram_details);
         let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
-        if !all_vector
+        if !all_json
+            && !all_vector
             && !all_inverted
             && !all_bitmap
             && !all_bloomfilter
@@ -401,7 +417,9 @@ impl Dataset {
         };
 
         let staged = staged.as_ref();
-        let mut merged_segment = if all_vector {
+        let mut merged_segment = if all_json {
+            scalar::json::merge_segments(self, source_segments, staged).await?
+        } else if all_vector {
             crate::index::vector::ivf::merge_segments(self, source_segments).await?
         } else if all_inverted {
             crate::index::scalar::inverted::merge_segments(
@@ -443,7 +461,7 @@ impl Dataset {
         } else {
             crate::index::scalar::btree::merge_segments(self, source_segments, staged).await?
         };
-        if !all_ngram && !all_fmindex {
+        if !all_ngram && !all_json_ngram && !all_fmindex {
             merged_segment.dataset_version = merged_dataset_version;
         }
         Ok(merged_segment)
@@ -895,6 +913,8 @@ impl DatasetIndexExt for Dataset {
                 .index_details()
                 .type_url
                 .ends_with("NGramIndexDetails")
+                || scalar::json::merge_target_type(segment.index_details())
+                    == Some(IndexType::NGram)
         }) {
             let has_retired_coverage = segments
                 .iter()

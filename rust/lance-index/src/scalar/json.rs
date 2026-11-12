@@ -196,10 +196,8 @@ impl JsonIndex {
     ///
     /// Prefers what the details already recorded, so a variant this build does
     /// not recognize survives. Falls back to asking the target index, which
-    /// upgrades an index built before the field existed: total on the `update`
-    /// path, which already requires the target to report its training type, and
-    /// BTree-only on the `remap` path, where an index that cannot answer is left
-    /// no worse off than before.
+    /// preserves the existing type recovery for indices built before the field
+    /// existed. A target that cannot report its type remains unspecified.
     ///
     /// Deliberately infallible: a type with no representation here is recorded
     /// as `Unspecified`, leaving details exactly as lossy as they already were,
@@ -335,8 +333,57 @@ impl Index for JsonIndex {
 }
 
 impl JsonIndex {
-    /// The JSON index over a rewritten target index.
-    fn wrap_target(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
+    /// The scalar index storing the extracted path values.
+    ///
+    /// ```
+    /// # use lance_index::scalar::json::JsonIndex;
+    /// fn target_type(index: &JsonIndex) -> lance_index::IndexType {
+    ///     index.target_index().index_type()
+    /// }
+    /// ```
+    pub fn target_index(&self) -> &Arc<dyn ScalarIndex> {
+        &self.target_index
+    }
+
+    /// Extract and order new path values using the persisted target type.
+    /// Used by both single-segment updates and multi-segment merges.
+    ///
+    /// ```
+    /// # use lance_index::scalar::{json::JsonIndex, IndexStore, CreatedIndex};
+    /// # use datafusion_execution::SendableRecordBatchStream;
+    /// # async fn update(index: &JsonIndex, data: SendableRecordBatchStream,
+    /// #                 store: &dyn IndexStore) -> lance_core::Result<CreatedIndex> {
+    /// let values = index.prepare_update_data(data).await?;
+    /// let target = index.target_index().update(values, store, None).await?;
+    /// index.wrap_target(target)
+    /// # }
+    /// ```
+    pub async fn prepare_update_data(
+        &self,
+        new_data: SendableRecordBatchStream,
+    ) -> Result<SendableRecordBatchStream> {
+        let target_criteria = self.target_index.update_criteria().data_criteria;
+        let target_type = self.resolve_target_data_type()?.map(DataType::from).ok_or_else(|| {
+            Error::not_supported(format!(
+                "JSON index updates for path '{}' cannot recover the training data type of target index {}",
+                self.path,
+                self.target_index.index_type()
+            ))
+        })?;
+        let new_data = JsonIndexPlugin::extract_json(new_data, self.path.clone())?;
+        let new_data =
+            JsonIndexPlugin::convert_stream_by_type(new_data, target_type, self.path.clone())?;
+        let new_data = if target_criteria.ordering == TrainingOrdering::Values {
+            JsonIndexPlugin::sort_stream_by_value(new_data).await?
+        } else {
+            new_data
+        };
+        Ok(new_data)
+    }
+
+    /// Preserve the JSON path and value type around a rewritten target index.
+    /// See [`Self::prepare_update_data`] for an example.
+    pub fn wrap_target(&self, target_created: CreatedIndex) -> Result<CreatedIndex> {
         let index_version = json_index_version_for_target(
             &target_created.index_details,
             target_created.index_version,
@@ -422,22 +469,7 @@ impl ScalarIndex for JsonIndex {
         dest_store: &dyn IndexStore,
         old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let target_criteria = self.target_index.update_criteria().data_criteria;
-        let target_type = self.target_index.training_data_type().ok_or_else(|| {
-            Error::not_supported(format!(
-                "JSON index updates for path '{}' require target index {} to report its training data type",
-                self.path,
-                self.target_index.index_type()
-            ))
-        })?;
-        let new_data = JsonIndexPlugin::extract_json(new_data, self.path.clone())?;
-        let new_data =
-            JsonIndexPlugin::convert_stream_by_type(new_data, target_type, self.path.clone())?;
-        let new_data = if target_criteria.ordering == TrainingOrdering::Values {
-            JsonIndexPlugin::sort_stream_by_value(new_data).await?
-        } else {
-            new_data
-        };
+        let new_data = self.prepare_update_data(new_data).await?;
         let target_created = self
             .target_index
             .update(new_data, dest_store, old_data_filter)
@@ -3087,7 +3119,8 @@ mod tests {
     // test process, so keep them in one resource group.
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_json_btree_update_uses_trained_target_type(
+    async fn test_json_update_uses_trained_target_type(
+        #[values("btree", "bitmap")] target: &str,
         #[case] initial_docs: &[&str],
         #[case] update_docs: &[&str],
         #[case] query: SargableQuery,
@@ -3099,7 +3132,7 @@ mod tests {
         let (source_store, _source_dir) = local_json_index_store();
         let index = train_and_load_json_index(
             source_store,
-            "btree",
+            target,
             TrainingOrdering::None,
             "v",
             initial_docs,
@@ -3110,7 +3143,16 @@ mod tests {
         } else {
             DataType::Float64
         };
-        assert_eq!(index.training_data_type(), Some(expected_type));
+        assert_eq!(
+            index
+                .as_any()
+                .downcast_ref::<JsonIndex>()
+                .unwrap()
+                .resolve_target_data_type()
+                .unwrap()
+                .map(DataType::from),
+            Some(expected_type)
+        );
 
         let (dest_store, _dest_dir) = local_json_index_store();
         let row_ids =

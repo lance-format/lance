@@ -132,7 +132,8 @@ pub(crate) fn validate_segment_index_details(
 /// rescanning the table: the kinds the single-process optimize merges rather
 /// than rebuilds, vector, BTree, Bitmap, BloomFilter, NGram, MinHash LSH and RTree
 /// (`merge_scalar_indices`), Inverted (`InvertedIndex::merge_segments`), and
-/// LabelList (`merge_label_list_indices`). LabelList's pure merge is supported
+/// LabelList (`merge_label_list_indices`), including JSON wrappers over BTree,
+/// Bitmap, and NGram. LabelList's pure merge is supported
 /// even though its ordinary append path cannot merge several old segments with
 /// a new stream.
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
@@ -145,6 +146,11 @@ pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
         || (cfg!(feature = "geo") && segment_has_rtree_details(segment))
         || segment_has_inverted_details(segment)
         || segment_has_label_list_details(segment)
+        || segment
+            .index_details
+            .as_deref()
+            .and_then(super::scalar::json::merge_target_type)
+            .is_some()
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.
