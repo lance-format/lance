@@ -2357,10 +2357,21 @@ impl Dataset {
                 index_type: "btree".to_string(),
                 params: None,
             }),
-            "BITMAP" => Box::new(ScalarIndexParams {
-                index_type: "bitmap".to_string(),
-                params: None,
-            }),
+            "BITMAP" => {
+                // Preserve legacy options so the Rust core can reject them before training.
+                let params = if let Some(kwargs) = kwargs
+                    && let Some(shard_id) = kwargs.get_item("shard_id")?
+                {
+                    let shard_id: Option<u32> = shard_id.extract()?;
+                    Some(serde_json::json!({ "shard_id": shard_id }).to_string())
+                } else {
+                    None
+                };
+                Box::new(ScalarIndexParams {
+                    index_type: "bitmap".to_string(),
+                    params,
+                })
+            }
             "NGRAM" => Box::new(ScalarIndexParams {
                 index_type: "ngram".to_string(),
                 params: None,

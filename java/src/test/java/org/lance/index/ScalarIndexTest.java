@@ -18,6 +18,7 @@ import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
 import org.lance.WriteParams;
+import org.lance.index.scalar.BitmapIndexParams;
 import org.lance.index.scalar.FmIndexParams;
 import org.lance.index.scalar.InvertedIndexParams;
 import org.lance.index.scalar.MinHashLshIndexParams;
@@ -1335,6 +1336,35 @@ public class ScalarIndexTest {
             ex.getMessage() != null
                 && ex.getMessage().contains("no longer supports merge_index_metadata"),
             "expected BTree merge_index_metadata soft-break error, got: " + ex.getMessage());
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"BITMAP", "SCALAR"})
+  @SuppressWarnings("deprecation")
+  public void testBitmapShardBuildRejected(IndexType indexType, @TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("bitmap_shard").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 2)) {
+        IndexParams params =
+            IndexParams.builder()
+                .setScalarIndexParams(BitmapIndexParams.builder().shardId(0).build())
+                .build();
+        IndexOptions options =
+            IndexOptions.builder(Collections.singletonList("id"), indexType, params)
+                .withFragmentIds(Collections.singletonList(dataset.getFragments().get(0).getId()))
+                .build();
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class, () -> dataset.createIndex(options));
+        assertTrue(error.getMessage().contains("shard_id=0 is no longer supported"));
       }
     }
   }

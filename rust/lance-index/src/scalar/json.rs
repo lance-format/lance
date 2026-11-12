@@ -465,6 +465,23 @@ pub struct JsonIndexParameters {
     path: String,
 }
 
+impl JsonIndexParameters {
+    /// The target scalar index type, whose construction constraints also apply
+    /// when the index is wrapped by JSON extraction.
+    ///
+    /// ```
+    /// use lance_index::scalar::json::JsonIndexParameters;
+    ///
+    /// let params: JsonIndexParameters =
+    ///     serde_json::from_str(r#"{"target_index_type":"bitmap","path":"x"}"#)?;
+    /// assert_eq!(params.target_index_type(), "bitmap");
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
+    pub fn target_index_type(&self) -> &str {
+        &self.target_index_type
+    }
+}
+
 /// The target index type named by a JSON index's own serialized parameters
 /// (the `params` field of the `ScalarIndexParams` that `JsonIndex::derive_index_params`
 /// returns -- not the target's own params). `None` if `params_json` doesn't parse as

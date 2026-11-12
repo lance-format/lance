@@ -3257,6 +3257,9 @@ class LanceDataset(pa.dataset.Dataset):
             if lance_field is None and logical_index_type not in ["INVERTED", "FTS"]:
                 raise KeyError(f"{column} not found in schema")
             parameters = dict(index_type.parameters)
+            if logical_index_type == "BITMAP" and kwargs.get("shard_id") is not None:
+                # Forward the legacy option to the core instead of silently dropping it.
+                parameters["shard_id"] = kwargs["shard_id"]
             if logical_index_type in ["INVERTED", "FTS"]:
                 parameters["document_granularity"] = kwargs["document_granularity"]
             config = json.dumps(parameters)
@@ -3452,6 +3455,8 @@ class LanceDataset(pa.dataset.Dataset):
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
             passed via kwargs internally.
+            Bitmap fragment builds reject this option and generate independent
+            segment UUIDs.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -4389,6 +4394,8 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - Bitmap builds reject ``shard_id`` and a caller-supplied ``index_uuid``;
+          each build returns an independent segment with its own UUID.
         - Vector segments support both shared and independent model scopes. Pass
           the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
           worker when segments need shared model semantics or physical merge
