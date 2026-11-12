@@ -2754,6 +2754,20 @@ impl Dataset {
                 return Ok(());
             }
 
+            // Reads decode a replacement file's columns as the dataset field
+            // types, so a column stored as another type reads back wrong or
+            // not at all. Blob columns are skipped: their file layout can
+            // legitimately differ from the dataset's logical type.
+            if dataset_field.logical_type != file_field.logical_type
+                && !field_contains_blob(dataset_field)
+                && !field_contains_blob(file_field)
+            {
+                return Err(Error::invalid_input(format!(
+                    "Schema mismatch: field '{}' has type {} in dataset schema but {} in file schema",
+                    path, dataset_field.logical_type, file_field.logical_type
+                )));
+            }
+
             if dataset_field.children.len() != file_field.children.len() {
                 return Err(Error::invalid_input(format!(
                     "Schema mismatch: field '{}' has {} children in dataset schema but {} children in file schema",

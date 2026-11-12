@@ -623,6 +623,80 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
     );
 }
 
+/// A replacement file must store each column as the dataset field's type:
+/// reads decode it as the dataset type, so `x: double` under `x: int64`
+/// returns the doubles' bit patterns. Nullability may differ.
+#[rstest::rstest]
+#[case::same_width(DataType::Float64, false)]
+#[case::narrower(DataType::Int32, false)]
+#[case::wider_string(DataType::LargeUtf8, false)]
+#[case::same_type(DataType::Int64, true)]
+#[tokio::test]
+async fn test_create_data_file_checks_column_types(
+    #[case] file_type: DataType,
+    #[case] accepted: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("x", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 11, 12])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // A non-nullable column under the dataset's nullable `x` is still allowed.
+    let file_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x", file_type, false,
+    )]));
+    let values = arrow::compute::cast(
+        &Int64Array::from(vec![20, 21, 22]),
+        file_schema.field(0).data_type(),
+    )
+    .unwrap();
+    let file_batch = RecordBatch::try_new(file_schema.clone(), vec![values]).unwrap();
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join("x.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        crate::datatypes::Schema::try_from(file_schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&file_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let result = dataset.create_data_file("x.lance", None).await;
+    if accepted {
+        result.unwrap();
+    } else {
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("field 'x' has type int64 in dataset schema"),
+            "{err}"
+        );
+    }
+}
+
 async fn write_multi_fragment_source(uri: &str) -> Dataset {
     let batch = gen_batch()
         .col("id", array::step::<Int32Type>())
