@@ -12,7 +12,7 @@ use std::{
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::runtime::SpawnedTask;
@@ -20,6 +20,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::ChildStats;
 use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::StatisticsContext;
@@ -33,7 +34,10 @@ use datafusion::physical_plan::{
 use datafusion_expr::Expr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::project_ordering;
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
+use datafusion_physical_expr::{
+    EquivalenceProperties, Partitioning, PhysicalExpr, conjunction, split_conjunction,
+};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
@@ -52,6 +56,7 @@ use lance_datafusion::utils::{
     DECODE_TIME_METRIC, ExecutionPlanMetricsSetExt, FRAGMENTS_SCANNED_METRIC,
     RANGES_SCANNED_METRIC, ROWS_SCANNED_METRIC, TASK_WAIT_TIME_METRIC,
 };
+use lance_encoding::decoder::ValuePredicate;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::object_store::{
@@ -71,7 +76,7 @@ use tracing::{Instrument, instrument};
 
 use crate::Dataset;
 use crate::dataset::blob::{BlobMaterializationContext, MaterializedBlobBatch};
-use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig};
+use crate::dataset::fragment::{BaseSchedulers, FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::fragment_slice::validate_physical_rows;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::dataset::scanner::{
@@ -92,6 +97,93 @@ fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef
     let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
     let schema: ArrowSchema = (&schema).into();
     Arc::new(schema)
+}
+
+/// A filter planned once and shared by all fragments that use it.
+struct PlannedFilter {
+    read_projection: Arc<Projection>,
+    physical_filter: Arc<dyn PhysicalExpr>,
+    column_predicates: Arc<[(i32, ColumnPredicate)]>,
+}
+
+impl PlannedFilter {
+    fn new(options: &FilteredReadOptions, filter: &Expr) -> Result<Self> {
+        let (read_projection, physical_filter) = options.plan_filter(filter)?;
+        // Deleted rows are read as nulls, so `IS NULL` could match pages without nulls.
+        let column_predicates = if options.with_deleted_rows {
+            Arc::from([])
+        } else {
+            ColumnPredicate::split(&physical_filter, &read_projection.to_bare_schema()).into()
+        };
+        Ok(Self {
+            read_projection: Arc::new(read_projection),
+            physical_filter,
+            column_predicates,
+        })
+    }
+}
+
+/// The conditions of a filter on a single column, checked against page values.
+struct ColumnPredicate {
+    expr: Arc<dyn PhysicalExpr>,
+    schema: SchemaRef,
+}
+
+impl ColumnPredicate {
+    /// Groups the conditions of `filter` that reference a single top-level field of `schema`,
+    /// returning one predicate per field id. `filter` is a conjunction, so each predicate can
+    /// skip a page on its own.
+    fn split(filter: &Arc<dyn PhysicalExpr>, schema: &LanceSchema) -> Vec<(i32, Self)> {
+        let mut conditions_by_column = BTreeMap::<String, Vec<Arc<dyn PhysicalExpr>>>::new();
+        for condition in split_conjunction(filter) {
+            let columns = collect_columns(condition);
+            if let (1, Some(column)) = (columns.len(), columns.iter().next())
+                && !is_volatile(condition)
+            {
+                conditions_by_column
+                    .entry(column.name().to_string())
+                    .or_default()
+                    .push(condition.clone());
+            }
+        }
+        conditions_by_column
+            .into_iter()
+            .filter_map(|(name, conditions)| {
+                // Match the name exactly, `LanceSchema::field` treats `a.b` as a nested path.
+                let field = schema.fields.iter().find(|field| field.name == name)?;
+                // Nullable, so the predicate can also be evaluated on nulls.
+                let predicate_schema = Arc::new(ArrowSchema::new(vec![
+                    arrow_schema::Field::from(field).with_nullable(true),
+                ]));
+                let expr =
+                    reassign_expr_columns(conjunction(conditions), &predicate_schema).ok()?;
+                Some((
+                    field.id,
+                    Self {
+                        expr,
+                        schema: predicate_schema,
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
+impl ValuePredicate for ColumnPredicate {
+    fn any_may_match(&self, values: &ArrayRef) -> bool {
+        let evaluate = || -> Result<bool> {
+            let batch = RecordBatch::try_new(self.schema.clone(), vec![values.clone()])?;
+            let matches = self.expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            Ok(matches
+                .as_boolean_opt()
+                .is_none_or(|matches| matches.true_count() > 0))
+        };
+        // Values can come from rows that aren't going to be read, so we shouldn't fail the whole query over this.
+        evaluate().unwrap_or_else(|error| {
+            log::debug!("Failed to evaluate page values, skipping prune: {error}");
+            true
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -236,6 +328,8 @@ struct ScopedFragmentRead {
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
     // pushed down into the index query)
     physical_filter: Option<Arc<dyn PhysicalExpr>>,
+    // `physical_filter` split per field, used to skip pages
+    column_predicates: Arc<[(i32, ColumnPredicate)]>,
     priority: u32,
     scan_scheduler: Arc<ScanScheduler>,
     base_schedulers: BaseSchedulers,
@@ -1111,10 +1205,8 @@ impl FilteredReadStream {
         });
         let projection = Arc::new(options.projection.clone());
         let mut scoped_fragments = Vec::new();
-        // Read projection and physical filter for each distinct filter, keyed by
-        // `Arc` identity since fragments share their filter's `Arc`
-        let mut planned_filters: HashMap<*const Expr, (Arc<Projection>, Arc<dyn PhysicalExpr>)> =
-            HashMap::new();
+        // Plan each distinct filter once. Fragments share the filter's `Arc`, so key by pointer.
+        let mut planned_filters: HashMap<*const Expr, PlannedFilter> = HashMap::new();
 
         for (priority, fragment) in fragments.iter().enumerate() {
             let fragment_id = fragment.id as u32;
@@ -1125,21 +1217,23 @@ impl FilteredReadStream {
                     continue;
                 }
 
-                let (read_projection, physical_filter) = match plan.filters.get(&fragment_id) {
-                    None => (projection.clone(), None),
-                    Some(filter) => {
-                        let (read_projection, physical_filter) =
-                            match planned_filters.entry(Arc::as_ptr(filter)) {
+                let (read_projection, physical_filter, column_predicates) =
+                    match plan.filters.get(&fragment_id) {
+                        None => (projection.clone(), None, Arc::from([])),
+                        Some(filter) => {
+                            let planned = match planned_filters.entry(Arc::as_ptr(filter)) {
                                 Entry::Occupied(planned) => planned.into_mut(),
                                 Entry::Vacant(entry) => {
-                                    let (read_projection, physical_filter) =
-                                        options.plan_filter(filter)?;
-                                    entry.insert((Arc::new(read_projection), physical_filter))
+                                    entry.insert(PlannedFilter::new(options, filter)?)
                                 }
                             };
-                        (read_projection.clone(), Some(physical_filter.clone()))
-                    }
-                };
+                            (
+                                planned.read_projection.clone(),
+                                Some(planned.physical_filter.clone()),
+                                planned.column_predicates.clone(),
+                            )
+                        }
+                    };
 
                 scoped_fragments.push(ScopedFragmentRead {
                     fragment: Arc::new(FileFragment::new(dataset.clone(), fragment.clone())),
@@ -1150,6 +1244,7 @@ impl FilteredReadStream {
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
                     physical_filter,
+                    column_predicates,
                     priority: priority as u32,
                     scan_scheduler: scan_scheduler.clone(),
                     base_schedulers: base_schedulers.clone(),
@@ -1286,6 +1381,23 @@ impl FilteredReadStream {
         }
 
         physical_ranges.truncate(write_idx);
+    }
+
+    /// Removes the ranges of pages with no value matching a column predicate, e.g. pages whose
+    /// dictionary has none of the ids in `id IN (...)`.
+    async fn prune_ranges_by_page_values(
+        fragment_reader: &FragmentReader,
+        column_predicates: &[(i32, ColumnPredicate)],
+        mut ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<Range<u64>>> {
+        let lookups = column_predicates.iter().map(|(field_id, predicate)| {
+            fragment_reader.rows_that_may_match(*field_id, &ranges, predicate)
+        });
+        let matches = futures::future::try_join_all(lookups).await?;
+        for rows in matches.into_iter().flatten() {
+            ranges = Self::intersect_ranges(&ranges, &rows);
+        }
+        Ok(ranges)
     }
 
     /// Intersect two sets of sorted ranges.
@@ -1656,6 +1768,18 @@ impl FilteredReadStream {
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
         let physical_filter = fragment_read_task.physical_filter;
+
+        if !fragment_read_task.column_predicates.is_empty() {
+            fragment_read_task.ranges = Self::prune_ranges_by_page_values(
+                &fragment_reader,
+                &fragment_read_task.column_predicates,
+                fragment_read_task.ranges,
+            )
+            .await?;
+            if fragment_read_task.ranges.is_empty() {
+                return Ok(futures::stream::empty().boxed());
+            }
+        }
 
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
@@ -4187,6 +4311,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::OneShotExec;
     use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
+    use lance_file::version::LanceFileVersion;
     use lance_index::{
         IndexType,
         optimize::OptimizeOptions,
@@ -6827,6 +6952,144 @@ mod tests {
             "bytes_read ({}) should be > 0: io_metrics.record is only called when output batches \
              are produced, so bytes_read stays 0 even though I/O occurred",
             bytes_read
+        );
+    }
+
+    /// 4 fragments of 200 rows each. Fragment `i` has `id` = `seg-{i}`, with every 10th row null,
+    /// so each fragment's `id` column is a single dictionary page.
+    async fn dataset_with_one_id_per_fragment(version: LanceFileVersion) -> Dataset {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("layer", arrow_schema::DataType::Utf8, false),
+        ]));
+        let ids = arrow_array::StringArray::from_iter(
+            (0..800).map(|i| (i % 10 != 0).then(|| format!("seg-{}", i / 200))),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(ids),
+                Arc::new(arrow_array::StringArray::from(vec!["base"; 800])),
+            ],
+        )
+        .unwrap();
+        let params = WriteParams {
+            max_rows_per_file: 200,
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        Dataset::write(reader, "memory://", Some(params))
+            .await
+            .unwrap()
+    }
+
+    /// Returns the number of rows matching `filter` and the number of fragments read.
+    async fn scan_with_page_pruning(
+        dataset: &Dataset,
+        columns: &[&str],
+        filter: &str,
+    ) -> (usize, usize) {
+        let dataset = Arc::new(dataset.clone());
+        let planner = Planner::new(Arc::new(arrow_schema::Schema::from(dataset.schema())));
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let index_info = dataset.scalar_index_info().await.unwrap();
+        let projection = dataset
+            .empty_projection()
+            .union_columns(columns, OnMissing::Error)
+            .unwrap();
+        let options = FilteredReadOptions::new(projection)
+            .with_filter_plan(create_filter_plan(expr, &index_info, false).unwrap());
+        let read = FilteredReadExec::try_new(dataset, options, None).unwrap();
+        let num_rows = read
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        let fragments_scanned = read
+            .metrics()
+            .unwrap()
+            .sum_by_name("fragments_scanned")
+            .map_or(0, |count| count.as_usize());
+        (num_rows, fragments_scanned)
+    }
+
+    #[rstest]
+    #[case::equals("id = 'seg-1'", (180, 1))]
+    // Lists of up to 3 values are rewritten to `OR`s of `=`.
+    #[case::short_list("id IN ('seg-1', 'seg-2')", (360, 2))]
+    #[case::long_list("id IN ('seg-1', 'm-1', 'm-2', 'm-3', 'm-4')", (180, 1))]
+    #[case::missing("id = 'missing'", (0, 0))]
+    #[case::other_column("layer = 'base' AND id = 'seg-2'", (180, 1))]
+    #[case::range("id > 'seg-2'", (180, 1))]
+    #[case::like("id LIKE '%-3'", (180, 1))]
+    #[case::is_null("id IS NULL", (80, 4))]
+    #[case::is_null_or_equals("id IS NULL OR id = 'seg-1'", (260, 4))]
+    #[case::null_in_list("id IN ('seg-1', NULL)", (180, 1))]
+    #[case::two_columns("id = 'seg-1' OR layer = 'other'", (180, 4))]
+    #[tokio::test]
+    async fn test_page_value_pruning(
+        #[case] filter: &str,
+        #[case] expected: (usize, usize),
+        #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+    ) {
+        let dataset = dataset_with_one_id_per_fragment(version).await;
+        assert_eq!(
+            scan_with_page_pruning(&dataset, &["id", "layer"], filter).await,
+            expected
+        );
+        // The second scan gets page values from the cache and doesn't project `id`.
+        assert_eq!(
+            scan_with_page_pruning(&dataset, &["layer"], filter).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn test_page_value_pruning_with_deletions() {
+        let mut dataset = dataset_with_one_id_per_fragment(LanceFileVersion::V2_1).await;
+        // Deleted values stay in the page dictionary, but their rows are not returned.
+        dataset.delete("id = 'seg-1'").await.unwrap();
+        assert_eq!(
+            scan_with_page_pruning(&dataset, &["id", "layer"], "id IN ('seg-1', 'seg-2')").await,
+            (180, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_page_value_pruning_filter_error_on_unread_value() {
+        let ids = arrow_array::StringArray::from_iter_values((0..10_000).map(|i| {
+            if i < 5_000 {
+                "not-a-number-padding"
+            } else {
+                "00000000000000000005"
+            }
+        }));
+        let batch = RecordBatch::try_from_iter(vec![("id", Arc::new(ids) as ArrayRef)]).unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        };
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(reader, "memory://", Some(params))
+            .await
+            .unwrap();
+        // The page is dictionary-encoded, so it can be skipped.
+        assert_eq!(
+            scan_with_page_pruning(&dataset, &["id"], "id = 'missing'").await,
+            (0, 0)
+        );
+        // The dictionary still has the deleted value the cast fails on. The scan must not fail.
+        dataset.delete("id = 'not-a-number-padding'").await.unwrap();
+        assert_eq!(
+            scan_with_page_pruning(&dataset, &["id"], "CAST(id AS INT) * 2 = 10").await,
+            (5_000, 1)
         );
     }
 
