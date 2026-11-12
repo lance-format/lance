@@ -307,6 +307,9 @@ impl Schema {
                     candidates.push(projected_field);
                 }
             } else if crate::is_system_column(first) {
+                if err_on_missing_nested && split.len() > 1 {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 if preserve_system_columns {
                     if first == ROW_ID {
                         candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
@@ -2550,7 +2553,7 @@ mod tests {
 
         // A missing nested field is an error, wherever the path stops resolving
         // and whether or not another path under the same column comes first.
-        for missing in ["b.nope", "c.nope", "b.f1.nope", "nope"] {
+        for missing in ["b.nope", "c.nope", "b.f1.nope", "nope", "_rowid.x"] {
             for columns in [["a", missing], ["b.f1", missing]] {
                 let err = schema
                     .project_preserve_system_columns(&columns)
