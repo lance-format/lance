@@ -1310,12 +1310,12 @@ impl Dataset {
                 ));
             }
             (Some(columns), None) => {
-                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+                ProjectionRequest::try_from_columns(columns, self_.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
             }
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
-        }
-        .infer_error()?;
+        }?;
         let batch = rt()
             .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -1338,12 +1338,12 @@ impl Dataset {
                 ));
             }
             (Some(columns), None) => {
-                Ok(ProjectionRequest::from_columns(columns, self_.ds.schema()))
+                ProjectionRequest::try_from_columns(columns, self_.ds.schema())
+                    .map_err(|err| PyValueError::new_err(err.to_string()))
             }
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
-        }
-        .infer_error()?;
+        }?;
 
         let builder = self_
             .ds
