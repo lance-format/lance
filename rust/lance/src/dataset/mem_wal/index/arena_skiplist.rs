@@ -168,11 +168,18 @@ struct SkipListCore<K> {
     arena_bytes: AtomicUsize,
 }
 
-// SAFETY: `arena` (the only non-Sync field) is mutated exclusively by the single
-// writer; readers never access it. Reader/writer interaction on `head`/towers
-// goes through atomics with Acquire/Release. `K: Send + Sync` covers the keys
-// shared with readers.
+// SAFETY: the raw pointers in `arena`, `head` and the node towers are null or
+// point into chunks the core owns, so moving the core moves that ownership
+// with it. Whichever thread drops the core frees the chunks and drops the
+// keys, which `K: Send` allows.
 unsafe impl<K: Send + Sync> Send for SkipListCore<K> {}
+// SAFETY: `arena` (the only non-Sync field) is mutated only by the one
+// `SkipListWriter` that `new_skiplist` creates per core, which inserts through
+// `&mut self` and cannot be cloned; readers never access it. The writer fully
+// initializes a node, pointing it only at nodes already published, before the
+// Release stores that link it, so a reader following Acquire loads from `head`
+// sees every node it reaches initialized. `K: Sync` covers the keys shared
+// with readers.
 unsafe impl<K: Send + Sync> Sync for SkipListCore<K> {}
 
 impl<K> SkipListCore<K> {
@@ -221,6 +228,9 @@ impl<K> Drop for SkipListCore<K> {
             // SAFETY: `node` is a live node in the arena; tower[0] is its
             // level-0 successor (or null at the end).
             let next = unsafe { (*tower(node)).load(Ordering::Relaxed) };
+            // SAFETY: the level-0 walk reaches each node once, so its key is
+            // dropped exactly once, and the node is not read again: `next`
+            // was loaded above.
             unsafe { ptr::drop_in_place(ptr::addr_of_mut!((*node).key)) };
             node = next;
         }
@@ -240,7 +250,8 @@ pub fn new_skiplist<K: Ord + Send + Sync>() -> (SkipListWriter<K>, SkipListReade
     (writer, reader)
 }
 
-/// The sole mutator of a skiplist. Not `Sync`: only one writer may exist.
+/// The sole mutator of a skiplist. Not `Clone`: only one writer exists per
+/// skiplist, and it inserts through `&mut self`.
 pub struct SkipListWriter<K> {
     core: Arc<SkipListCore<K>>,
     rng: u64,
@@ -290,6 +301,9 @@ impl<K: Ord> SkipListWriter<K> {
             if level < cur_height {
                 loop {
                     let next = self.core.next_slot(pred, level).load(Ordering::Acquire);
+                    // SAFETY: a non-null `next` is a node this writer linked
+                    // earlier; nodes stay allocated and initialized until the
+                    // core drops.
                     if !next.is_null() && unsafe { (*next).key < key } {
                         pred = next;
                     } else {
@@ -387,6 +401,10 @@ impl<K: Ord> SkipListReader<K> {
         for level in (0..height).rev() {
             loop {
                 let next = self.core.next_slot(pred, level).load(Ordering::Acquire);
+                // SAFETY: a non-null `next` was reached by Acquire loads from
+                // `head`, so it is initialized (see `SkipListCore`'s `Sync`
+                // impl), and nodes stay allocated until the core drops, which
+                // `self` prevents.
                 if !next.is_null() && unsafe { (*next).key <= *target } {
                     pred = next;
                 } else {
@@ -404,6 +422,10 @@ impl<K: Ord> SkipListReader<K> {
         for level in (0..height).rev() {
             loop {
                 let next = self.core.next_slot(pred, level).load(Ordering::Acquire);
+                // SAFETY: a non-null `next` was reached by Acquire loads from
+                // `head`, so it is initialized (see `SkipListCore`'s `Sync`
+                // impl), and nodes stay allocated until the core drops, which
+                // `self` prevents.
                 if !next.is_null() && unsafe { (*next).key < *start } {
                     pred = next;
                 } else {
@@ -466,10 +488,13 @@ impl<'a, K> Iterator for Iter<'a, K> {
         if self.node.is_null() {
             return None;
         }
-        // SAFETY: non-null node owned by the core; the borrow lifetime `'a` is
-        // bounded by the reader, which keeps the core (and node) alive. tower[0]
-        // is the level-0 successor.
+        // SAFETY: a non-null node reached by Acquire loads from `head`, so it
+        // is initialized (see `SkipListCore`'s `Sync` impl); the borrow
+        // lifetime `'a` is bounded by the reader, which keeps the core (and
+        // node) alive.
         let node = unsafe { &*self.node };
+        // SAFETY: the same live node; every node has a tower slot at level 0,
+        // which holds its successor.
         self.node = unsafe { (*tower(self.node)).load(Ordering::Acquire) };
         Some(&node.key)
     }

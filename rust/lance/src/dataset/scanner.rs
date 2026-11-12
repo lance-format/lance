@@ -978,127 +978,89 @@ impl From<DatasetRecordBatchStream> for SendableRecordBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test::rerun_in_child_process;
+    use rstest::rstest;
 
-    #[test]
-    fn test_env_var_parsing() {
-        // Test that invalid environment variable values don't panic
-
-        // Test invalid LANCE_DEFAULT_BATCH_SIZE
-        unsafe {
-            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "not_a_number");
+    // Invalid values of LANCE_DEFAULT_BATCH_SIZE must not panic.
+    #[rstest]
+    #[case::invalid(Some("not_a_number"), None)]
+    #[case::valid(Some("2048"), Some(2048))]
+    #[case::unset(None, None)]
+    fn test_env_var_parsing(#[case] value: Option<&str>, #[case] expected: Option<usize>) {
+        if rerun_in_child_process(&[("LANCE_DEFAULT_BATCH_SIZE", value)]) {
+            return;
         }
-        let result = get_default_batch_size();
-        assert_eq!(result, None, "Should return None for invalid batch size");
-
-        // Test valid LANCE_DEFAULT_BATCH_SIZE
-        unsafe {
-            std::env::set_var("LANCE_DEFAULT_BATCH_SIZE", "2048");
-        }
-        let result = get_default_batch_size();
-        assert_eq!(result, Some(2048), "Should parse valid batch size");
-
-        // Test unset LANCE_DEFAULT_BATCH_SIZE
-        unsafe {
-            std::env::remove_var("LANCE_DEFAULT_BATCH_SIZE");
-        }
-        let result = get_default_batch_size();
-        assert_eq!(result, None, "Should return None when env var is not set");
+        assert_eq!(get_default_batch_size(), expected);
     }
 
     #[test]
     fn test_parse_env_var() {
-        // Test parse_env_var with different types to ensure full coverage
-
-        // Test with a unique env var name to avoid conflicts
-        let test_var = "LANCE_TEST_PARSE_ENV_VAR_USIZE";
-
-        // Test valid usize parsing
-        unsafe {
-            std::env::set_var(test_var, "12345");
+        // Test parse_env_var with different types to ensure full coverage. Every
+        // check reads its own variable, so one child process covers them all.
+        if rerun_in_child_process(&[
+            ("LANCE_TEST_PARSE_ENV_VAR_USIZE", Some("12345")),
+            (
+                "LANCE_TEST_PARSE_ENV_VAR_USIZE_INVALID",
+                Some("not_a_number"),
+            ),
+            ("LANCE_TEST_PARSE_ENV_VAR_USIZE_UNSET", None),
+            ("LANCE_TEST_PARSE_ENV_VAR_U32", Some("42")),
+            ("LANCE_TEST_PARSE_ENV_VAR_U32_INVALID", Some("invalid")),
+            ("LANCE_TEST_PARSE_ENV_VAR_U64", Some("9999999999")),
+            ("LANCE_TEST_PARSE_ENV_VAR_U64_NEGATIVE", Some("-1")),
+        ]) {
+            return;
         }
-        let result: Option<usize> = parse_env_var(test_var, "Using default.");
+
+        let result: Option<usize> =
+            parse_env_var("LANCE_TEST_PARSE_ENV_VAR_USIZE", "Using default.");
         assert_eq!(result, Some(12345));
-
-        // Test invalid usize parsing (triggers warning log)
-        unsafe {
-            std::env::set_var(test_var, "not_a_number");
-        }
-        let result: Option<usize> = parse_env_var(test_var, "Using default.");
+        // An invalid value logs a warning and yields None.
+        let result: Option<usize> =
+            parse_env_var("LANCE_TEST_PARSE_ENV_VAR_USIZE_INVALID", "Using default.");
+        assert_eq!(result, None);
+        let result: Option<usize> =
+            parse_env_var("LANCE_TEST_PARSE_ENV_VAR_USIZE_UNSET", "Using default.");
         assert_eq!(result, None);
 
-        // Test unset env var
-        unsafe {
-            std::env::remove_var(test_var);
-        }
-        let result: Option<usize> = parse_env_var(test_var, "Using default.");
-        assert_eq!(result, None);
-
-        // Test with u32 type
-        let test_var_u32 = "LANCE_TEST_PARSE_ENV_VAR_U32";
-        unsafe {
-            std::env::set_var(test_var_u32, "42");
-        }
-        let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
+        let result: Option<u32> =
+            parse_env_var("LANCE_TEST_PARSE_ENV_VAR_U32", "Using default value.");
         assert_eq!(result, Some(42));
-
-        unsafe {
-            std::env::set_var(test_var_u32, "invalid");
-        }
-        let result: Option<u32> = parse_env_var(test_var_u32, "Using default value.");
+        let result: Option<u32> = parse_env_var(
+            "LANCE_TEST_PARSE_ENV_VAR_U32_INVALID",
+            "Using default value.",
+        );
         assert_eq!(result, None);
 
-        unsafe {
-            std::env::remove_var(test_var_u32);
-        }
-
-        // Test with u64 type
-        let test_var_u64 = "LANCE_TEST_PARSE_ENV_VAR_U64";
-        unsafe {
-            std::env::set_var(test_var_u64, "9999999999");
-        }
-        let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
+        let result: Option<u64> =
+            parse_env_var("LANCE_TEST_PARSE_ENV_VAR_U64", "Using default value.");
         assert_eq!(result, Some(9999999999));
-
-        unsafe {
-            std::env::set_var(test_var_u64, "-1");
-        }
-        let result: Option<u64> = parse_env_var(test_var_u64, "Using default value.");
+        let result: Option<u64> = parse_env_var(
+            "LANCE_TEST_PARSE_ENV_VAR_U64_NEGATIVE",
+            "Using default value.",
+        );
         assert_eq!(result, None);
-
-        unsafe {
-            std::env::remove_var(test_var_u64);
-        }
     }
 
-    // The env var key scopes serial_test's lock so this test only blocks others
-    // that touch LANCE_DEFAULT_IO_BUFFER_SIZE — unrelated tests still run in
-    // parallel.
-    #[test]
-    #[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
-    fn test_default_io_buffer_size_override_env_var() {
-        // Force the sibling LazyLock to evaluate before we mutate the env var.
-        // It caches forever on first read, so another test concurrently reading
-        // *DEFAULT_IO_BUFFER_SIZE during our mutation window would otherwise
-        // cache one of our test values and poison the rest of the suite.
-        let _ = *DEFAULT_IO_BUFFER_SIZE;
-
-        // FilteredReadExec consults this when no explicit io_buffer_size was set
-        // on the scanner, so the LANCE_DEFAULT_IO_BUFFER_SIZE env var takes
-        // precedence over the max_bandwidth fallback.
-        unsafe {
-            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "4096");
+    // FilteredReadExec consults this when no explicit io_buffer_size was set on
+    // the scanner, so the LANCE_DEFAULT_IO_BUFFER_SIZE env var takes precedence
+    // over the max_bandwidth fallback.
+    #[rstest]
+    #[case::valid(Some("4096"), Some(4096))]
+    #[case::invalid(Some("not_a_number"), None)]
+    #[case::unset(None, None)]
+    fn test_default_io_buffer_size_override_env_var(
+        #[case] value: Option<&str>,
+        #[case] expected: Option<u64>,
+    ) {
+        if rerun_in_child_process(&[("LANCE_DEFAULT_IO_BUFFER_SIZE", value)]) {
+            return;
         }
-        assert_eq!(get_default_io_buffer_size_override(), Some(4096));
-
-        unsafe {
-            std::env::set_var("LANCE_DEFAULT_IO_BUFFER_SIZE", "not_a_number");
-        }
-        assert_eq!(get_default_io_buffer_size_override(), None);
-
-        unsafe {
-            std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
-        }
-        assert_eq!(get_default_io_buffer_size_override(), None);
+        assert_eq!(get_default_io_buffer_size_override(), expected);
+        assert_eq!(
+            *DEFAULT_IO_BUFFER_SIZE,
+            expected.unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
+        );
     }
 
     mod multi_column_planner {

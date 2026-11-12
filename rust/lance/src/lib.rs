@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![warn(clippy::undocumented_unsafe_blocks)]
 // The streaming IVF training stack (see index::vector::ivf), awaited whole by
 // its training tests, has a future type that nests past the default limit of
 // 128. `recursion_limit` is a crate-level inner attribute, so it necessarily
