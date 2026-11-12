@@ -138,8 +138,8 @@ async fn test_stable_row_indices() {
 /// NGram also reports matches as physical row addresses, but -- unlike these
 /// three -- it supports eager remap (`ScalarIndexPlugin::can_remap`), so an
 /// eager compaction keeps it covering the rewritten fragments instead of
-/// losing coverage of them; see
-/// `test_defer_index_remap_ngram_with_stable_row_ids` for that case instead.
+/// losing coverage of them; see `test_compact_ngram_with_stable_row_ids` for
+/// that case instead.
 #[rstest]
 #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i > 0", 199)]
 #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]

@@ -2579,6 +2579,58 @@ mod tests {
         assert_eq!(expected, res);
     }
 
+    /// The plugin derives a segment's result domain from the manifest's
+    /// `index_version`; pin that mapping for both versions so a query never
+    /// misreads a row-id-domain segment as row addresses (or vice versa).
+    #[rstest]
+    #[case::row_id_domain(super::NGRAM_ROW_ID_DOMAIN_VERSION, false)]
+    #[case::row_addr_domain(super::NGRAM_ROW_ADDR_DOMAIN_VERSION, true)]
+    #[tokio::test]
+    async fn test_plugin_load_index_domain(
+        #[case] index_version: u32,
+        #[case] expect_row_addresses: bool,
+    ) {
+        use crate::scalar::registry::ScalarIndexPlugin;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(["cat", "dog"])),
+                Arc::new(UInt64Array::from_iter_values([0, 1])),
+            ],
+        )
+        .unwrap();
+        let data = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (_index, _merges, tmpdir) = do_train(builder, data).await;
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let details =
+            prost_types::Any::from_msg(&crate::pbold::NGramIndexDetails::default()).unwrap();
+        let index = super::NGramIndexPlugin
+            .load_index(
+                store,
+                &details,
+                index_version,
+                None,
+                &LanceCache::no_cache(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index.results_are_row_addresses(), expect_row_addresses);
+    }
+
     /// Counts the posting lists a search loads from storage.
     #[derive(Default)]
     struct PartLoads(AtomicUsize);

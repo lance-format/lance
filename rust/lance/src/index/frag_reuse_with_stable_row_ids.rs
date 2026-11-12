@@ -406,7 +406,8 @@ mod tests {
     #[case::inverted(details(&pbold::InvertedIndexDetails::default()), 0, false)]
     #[case::vector(details(&pb::VectorIndexDetails::default()), 0, false)]
     #[case::fm(details(&pb::FmIndexDetails::default()), 0, false)]
-    #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 1, false)]
+    #[case::min_hash(details(&pb::MinHashLshIndexDetails::default()), 0, false)]
+    #[case::min_hash_address_domain(details(&pb::MinHashLshIndexDetails::default()), 1, false)]
     #[case::json(details(&pb::JsonIndexDetails::default()), 0, false)]
     #[case::json_over_zone_map(
         json_over(details(&pbold::ZoneMapIndexDetails::default())),

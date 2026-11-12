@@ -2672,11 +2672,13 @@ async fn test_defer_index_remap_zonemap_with_stable_row_ids() {
     assert_zonemap_answers_match_scan(&dataset).await;
     assert_zonemap_is_used(&dataset).await;
 }
-/// NGram stores row addresses too, so -- like the zone map above -- it
-/// coexists with the FRI a deferred compaction writes on a stable-row-id
-/// dataset, answering through it on load and after it is drained.
+/// NGram stores row addresses too. On a stable-row-id dataset, a deferred
+/// compaction leaves it answering through the FRI it writes (on load and after
+/// the FRI is drained), and an eager one remaps it in place so it keeps
+/// covering the rewritten fragments.
+#[rstest::rstest]
 #[tokio::test]
-async fn test_defer_index_remap_ngram_with_stable_row_ids() {
+async fn test_compact_ngram_with_stable_row_ids(#[values(false, true)] defer_index_remap: bool) {
     async fn assert_ngram_answers(dataset: &Dataset) {
         let filter = "contains(cat, 'cat-1')";
         for use_scalar_index in [false, true] {
@@ -2717,23 +2719,38 @@ async fn test_defer_index_remap_ngram_with_stable_row_ids() {
         &mut dataset,
         CompactionOptions {
             target_rows_per_fragment: 512,
-            defer_index_remap: true,
+            defer_index_remap,
             ..Default::default()
         },
         None,
     )
     .await
     .unwrap();
-    assert!(
+    assert_eq!(
         dataset
             .load_index_by_name(FRAG_REUSE_INDEX_NAME)
             .await
             .unwrap()
             .is_some(),
-        "a deferred compaction over an address-domain index must write an FRI"
+        defer_index_remap,
+        "only a deferred compaction writes an FRI"
+    );
+    let live_fragments: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+    let ngram = dataset
+        .load_index_by_name("cat_idx")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ngram.effective_fragment_bitmap(&live_fragments),
+        Some(live_fragments),
+        "the NGram index must keep covering the rewritten fragments"
     );
     assert_ngram_answers(&dataset).await;
 
+    if !defer_index_remap {
+        return;
+    }
     // Draining the FRI into the index must not change any answer.
     let merged = dataset
         .merge_existing_index_segments(dataset.load_indices_by_name("cat_idx").await.unwrap())

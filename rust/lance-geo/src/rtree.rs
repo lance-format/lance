@@ -395,8 +395,17 @@ impl std::fmt::Debug for RTreeIndex {
 }
 
 impl RTreeIndex {
-    /// Load a segment written in the current format, which stores physical
-    /// row addresses.
+    /// Load a segment written in the current format
+    /// ([`RTREE_ROW_ADDR_DOMAIN_VERSION`]), which stores physical row
+    /// addresses.
+    ///
+    /// This does not inspect the segment's `index_version`, so the result
+    /// always reports [`ScalarIndex::results_are_row_addresses`] as `true`.
+    /// A segment written before [`RTREE_ROW_ADDR_DOMAIN_VERSION`] stores row
+    /// ids; load it through [`RTreeIndexPlugin`]'s
+    /// [`ScalarIndexPlugin::load_index`] with the manifest's `index_version`
+    /// so its results are not misread as row addresses on a dataset with
+    /// stable row ids.
     pub async fn load(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -2622,17 +2631,30 @@ mod tests {
         // A freshly trained segment is address-domain.
         assert!(index.results_are_row_addresses());
 
-        // The same store, loaded at each index_version, must report the
-        // domain the caller passed in: this is the only thing that tells a
-        // query whether to translate a segment's results.
-        let addr_domain =
-            RTreeIndex::load_inner(store.clone(), None, None, &LanceCache::no_cache(), true)
-                .await
-                .unwrap();
+        // Load the same store through the plugin at each manifest
+        // index_version: the plugin's version -> domain mapping is the only
+        // thing that tells a query whether to translate a segment's results.
+        let details = prost_types::Any::from_msg(&pb::RTreeIndexDetails::default()).unwrap();
+        let load_at = |index_version: u32| {
+            let store = store.clone();
+            let details = details.clone();
+            async move {
+                let index = RTreeIndexPlugin
+                    .load_index(
+                        store,
+                        &details,
+                        index_version,
+                        None,
+                        &LanceCache::no_cache(),
+                    )
+                    .await
+                    .unwrap();
+                Arc::new(index.as_any().downcast_ref::<RTreeIndex>().unwrap().clone())
+            }
+        };
+        let addr_domain = load_at(RTREE_ROW_ADDR_DOMAIN_VERSION).await;
         assert!(addr_domain.results_are_row_addresses());
-        let id_domain = RTreeIndex::load_inner(store, None, None, &LanceCache::no_cache(), false)
-            .await
-            .unwrap();
+        let id_domain = load_at(RTREE_ROW_ID_DOMAIN_VERSION).await;
         assert!(!id_domain.results_are_row_addresses());
 
         let merge = |sources: Vec<Arc<RTreeIndex>>| async move {

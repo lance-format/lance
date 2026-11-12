@@ -40,6 +40,21 @@ pub(in crate::index) async fn merge_segments(
         .map(|segment| segment.dataset_version)
         .min()
         .unwrap_or(dataset.manifest.version);
+    // The merged segment is always written in the current (row-address)
+    // format with each source's identifiers copied as-is, so a pre-migration
+    // segment's row ids would be misread as addresses wherever the two differ.
+    if dataset.manifest.uses_stable_row_ids()
+        && let Some(legacy) = segments
+            .iter()
+            .find(|segment| !segment.results_are_row_addrs())
+    {
+        return Err(Error::invalid_input(format!(
+            "MinHash LSH segment {} predates row-address-domain support and cannot be merged \
+             on a dataset with stable row IDs; rebuild the index first (e.g. with \
+             create_index(..., replace: true))",
+            legacy.uuid,
+        )));
+    }
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
     // MinHash LSH only reads its current format, which stores row addresses.
     let (fragment_bitmap, filters) =

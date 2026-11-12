@@ -440,7 +440,7 @@ impl IndexDetails {
 
 /// The format version of `index_type` from before it moved to the row-address
 /// domain, for the index types that did so with a version bump.
-fn row_id_domain_version(index_type: &str) -> Option<u32> {
+pub(in crate::index) fn row_id_domain_version(index_type: &str) -> Option<u32> {
     use lance_index::scalar::{bitmap, btree, label_list, ngram};
     let is = |builtin: BuiltinIndexType| index_type.eq_ignore_ascii_case(builtin.as_str());
     #[cfg(feature = "geo")]

@@ -1329,15 +1329,10 @@ async fn merge_scalar_indices<'a>(
 /// domain store row ids, so a stable-row-id dataset must rebuild rather than
 /// merge them with newly scanned (address-domain) data.
 fn has_legacy_row_id_domain(index_type: IndexType) -> bool {
-    matches!(
-        index_type,
-        IndexType::BTree
-            | IndexType::Bitmap
-            | IndexType::LabelList
-            | IndexType::NGram
-            | IndexType::RTree
-            | IndexType::MinHashLsh
-    )
+    // MinHash LSH moved too, but it never writes its row-id-domain layout, so
+    // it has no `row_id_domain_version` to relabel a new segment with.
+    index_type == IndexType::MinHashLsh
+        || super::scalar::row_id_domain_version(&index_type.to_string()).is_some()
 }
 
 async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> Result<bool> {

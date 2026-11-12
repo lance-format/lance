@@ -1770,6 +1770,14 @@ impl ScalarIndex for MinHashLshIndex {
 /// Merge segments into one new segment in `dest_store`, keeping only the rows
 /// each segment's filter selects. Every segment must have been built with the
 /// same parameters.
+///
+/// Like [`ScalarIndex::update`] and [`ScalarIndex::remap`], this always writes
+/// the current (row-address-domain) format and copies each source's stored
+/// identifiers as-is. A source persisted before
+/// [`MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`] stores row ids, which equal row
+/// addresses only on a dataset without stable row ids; on a dataset with
+/// stable row ids the caller must rebuild such a segment instead of passing it
+/// here, or its matches are silently lost.
 pub async fn merge_minhash_indices(
     sources: &[(&MinHashLshIndex, Option<&OldIndexDataFilter>)],
     dest_store: &dyn IndexStore,
@@ -1785,19 +1793,6 @@ pub async fn merge_minhash_indices(
                 "MinHash LSH segments were built with different parameters and cannot be merged: {:?} vs {:?}; rebuild the index with replace=true instead",
                 first.params, index.params
             )));
-        }
-        // MinHash LSH is an experimental format with no compatibility path
-        // (see AGENTS.md): `rebuild_from` always writes the current
-        // (row-address-domain) layout, regardless of a source's own domain.
-        // Merging a segment persisted before that move would carry its
-        // stored row ids into a file the next load unconditionally reads as
-        // row addresses, silently corrupting every id it holds.
-        if !index.results_are_row_addresses() {
-            return Err(Error::invalid_input(
-                "MinHash LSH segments persisted before the row-address-domain format change \
-                 cannot be merged; rebuild the index with replace=true instead"
-                    .to_string(),
-            ));
         }
     }
     let total_docs: u64 = sources.iter().map(|(index, _)| index.num_docs as u64).sum();
