@@ -1,102 +1,62 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use roaring::RoaringBitmap;
-use std::sync::Arc;
-use uuid::Uuid;
-
+use datafusion::execution::SendableRecordBatchStream;
+use lance_index::scalar::fmindex::FMIndexScalarIndex;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
 
-use super::segment_merge::SegmentMerge;
+use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
+use crate::index::frag_reuse::StagedRemappingPlans;
 use crate::{Dataset, Result};
 
+/// Merge existing partitions and optional newly appended text without rebuilding BWTs.
+pub(in crate::index) async fn open_and_merge_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: Option<SendableRecordBatchStream>,
+    new_store: &LanceIndexStore,
+    old_data_filters: &[Option<OldIndexDataFilter>],
+    staged: Option<&StagedRemappingPlans>,
+) -> Result<CreatedIndex> {
+    let sources = open_dyn_sources(dataset, field_path, segments, staged).await?;
+    let indices = downcast_sources::<FMIndexScalarIndex>(&sources, segments, "FMIndex")?;
+    FMIndexScalarIndex::merge_segments(&indices, new_data, new_store, old_data_filters).await
+}
+
 /// Merge one caller-defined group of source FM-Index segments into a single segment.
-///
-/// FM-Index merge requires rebuilding from source text — there is no cheap way
-/// to combine two BWT structures. This function re-reads text data from the
-/// dataset for all fragments covered by the source segments and builds a fresh
-/// FM-Index over the combined data.
-///
-/// As an exception, a single source segment whose fragment coverage is still
-/// fully live is returned as-is: rebuilding it would produce equivalent content
-/// over the same fragments, which makes distributed builds (one uncommitted
-/// segment per worker, merged 1:1 into final segments) pay for every segment
-/// twice. `is_rebuild_required` disables that passthrough when the caller has
-/// moved coverage into the current fragment space and the stored row addresses
-/// must be rebuilt to match it.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
-    is_rebuild_required: bool,
-    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    staged: Option<&StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    let merge = SegmentMerge::new(dataset, "FM-Index", &segments)?;
-    let column = merge.field_path();
-    let mut fragment_bitmap = merge.stored_coverage_union()?;
-
-    // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior. Under a tagged history the
-    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
-    // dataset, so it rebuilds over the live coverage the tagged reader derives
-    // for them instead.
-    match crate::index::append::tagged_segment_coverage(dataset, merge.segments(), staged).await? {
-        Some(coverage) => {
-            fragment_bitmap = coverage
-                .values()
-                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
-        }
-        None => fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref(),
+    let merge = SegmentMerge::new(dataset, "FMIndex", &segments)?;
+    let (fragment_bitmap, mut old_data_filters) =
+        merge.per_segment_filters(dataset, staged, true).await?;
+    // A pure merge keeps the source version. Preserve deleted rows in live
+    // fragments: restoring that version can make them visible again. Query-time
+    // deletion masks hide them until then; retired fragments can still be dropped.
+    for filter in &mut old_data_filters {
+        *filter = match filter.take() {
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep, to_remove, ..
+            }) => Some(OldIndexDataFilter::Fragments { to_keep, to_remove }),
+            other => other,
+        };
     }
-
-    if fragment_bitmap.is_empty() {
-        // All covered fragments have been retired; produce an empty index.
-        let new_uuid = Uuid::new_v4();
-        let created_index = super::build_scalar_index(
-            dataset,
-            column,
-            new_uuid,
-            &lance_index::scalar::ScalarIndexParams::for_builtin(
-                lance_index::scalar::BuiltinIndexType::Fm,
-            ),
-            false,
-            None,
-            None,
-            Arc::new(lance_index::progress::NoopIndexBuildProgress),
-        )
-        .await?;
-
-        return Ok(merge.build_metadata(
-            new_uuid,
-            dataset.manifest.version,
-            fragment_bitmap,
-            created_index,
-        ));
-    }
-
-    if !is_rebuild_required
-        && segments.len() == 1
-        && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
-    {
-        return Ok(segments[0].clone());
-    }
-
-    let fragment_ids: Vec<u32> = fragment_bitmap.iter().collect();
-    let new_uuid = Uuid::new_v4();
-
-    let created_index = super::build_scalar_index(
+    let (new_uuid, store) = merge.new_store(dataset)?;
+    let created_index = open_and_merge_segments(
         dataset,
-        column,
-        new_uuid,
-        &lance_index::scalar::ScalarIndexParams::for_builtin(
-            lance_index::scalar::BuiltinIndexType::Fm,
-        ),
-        true,
-        Some(fragment_ids),
+        merge.field_path(),
+        merge.segments(),
         None,
-        Arc::new(lance_index::progress::NoopIndexBuildProgress),
+        &store,
+        &old_data_filters,
+        staged,
     )
     .await?;
-
     Ok(merge.build_metadata(
         new_uuid,
         dataset.manifest.version,
