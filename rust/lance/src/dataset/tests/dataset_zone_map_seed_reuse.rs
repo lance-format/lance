@@ -1154,7 +1154,7 @@ async fn test_two_zone_maps_on_one_column_share_the_finer_seed() {
     }
 }
 
-/// A rebuild over a subset (two segments merged) goes through the
+/// A rebuild over a subset (two incompatible segments) goes through the
 /// metadata-aware builder: a scanned fragment keeps its configured
 /// boundaries up to its deleted tail, a fully seed-covered deleted fragment
 /// keeps its physical zones, fragments outside the request get no zones,
@@ -1171,8 +1171,8 @@ async fn test_rebuild_keeps_boundaries_past_a_deleted_tail() {
         .await
         .unwrap();
     // Three segments: fragment 0 (replace), fragment 1 (append mode), then
-    // fragment 2 appended and indexed in append mode; merging the trailing
-    // two is a rebuild over {1, 2} with fragment 0 outside the request.
+    // fragment 2 indexed with a different zone size. The incompatible trailing
+    // two require a rebuild over {1, 2}, with fragment 0 outside the request.
     create_index(
         &mut dataset,
         "val",
@@ -1185,8 +1185,16 @@ async fn test_rebuild_keeps_boundaries_past_a_deleted_tail() {
         .await
         .unwrap();
     append(&mut dataset, 2 * N..3 * N).await;
+    let params = zone_map_params(2000, true, true);
+    let segment = CreateIndexBuilder::new(&mut dataset, &["val"], IndexType::ZoneMap, &params)
+        .name(index_name("val"))
+        .replace(true)
+        .fragments(vec![2])
+        .execute_uncommitted()
+        .await
+        .unwrap();
     dataset
-        .optimize_indices(&OptimizeOptions::new().num_indices_to_merge(Some(0)))
+        .commit_existing_index_segments(&index_name("val"), "val", vec![segment])
         .await
         .unwrap();
     assert_eq!(index_metadata(&dataset, "val").await.len(), 3);
