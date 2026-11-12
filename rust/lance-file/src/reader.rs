@@ -3913,6 +3913,12 @@ mod tests {
             "expected CorruptFile, got: {error}"
         );
         assert!(
+            error
+                .to_string()
+                .contains("failed to decode column 'category' (id 0)"),
+            "expected column context, got: {error}"
+        );
+        assert!(
             error.to_string().contains("out of bounds"),
             "unexpected message: {error}"
         );

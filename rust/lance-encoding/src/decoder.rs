@@ -1747,12 +1747,24 @@ impl std::error::Error for ColumnContextError {
     }
 }
 
+/// Whether this error already carries column context from an inner field.
+fn has_column_context(err: &Error) -> bool {
+    match err {
+        Error::Wrapped { error, .. } => error.downcast_ref::<DecodeColumnError>().is_some(),
+        Error::CorruptFile { source, .. } => source.downcast_ref::<ColumnContextError>().is_some(),
+        _ => false,
+    }
+}
+
 /// Attach column context to a decode error.
 ///
 /// `CorruptFile` keeps its variant and gets the column context on its inner
 /// source, because callers match on that variant and Python maps it to
 /// `ValueError`. User-input errors are left untouched for the same reason.
 pub(crate) fn with_column_context(field_name: &str, field_id: i32, source: Error) -> Error {
+    if has_column_context(&source) {
+        return source;
+    }
     match source {
         Error::CorruptFile {
             path,
