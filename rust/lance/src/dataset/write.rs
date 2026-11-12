@@ -1754,6 +1754,11 @@ async fn build_external_base_resolver(
     .await?;
 
     let mut resolver = ExternalBaseResolver::new(candidates, store_registry);
+    resolver.unregistered_external_blob_policy = dataset
+        .map(|dataset| dataset.session.as_ref())
+        .or(params.session.as_deref())
+        .map(|session| session.unregistered_external_blob_policy())
+        .unwrap_or_default();
     resolver.registered_base_ids = dataset
         .into_iter()
         .flat_map(|dataset| dataset.manifest.base_paths.keys().copied())
