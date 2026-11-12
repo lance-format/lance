@@ -229,6 +229,54 @@ impl PostingListBuilder {
         self.overflow.get_or_insert_with(Box::default)
     }
 
+    /// Estimate scratch retained by `for_each_entry`, before decompressing
+    /// positions. A compressed block with large frequencies can expand far
+    /// beyond its encoded byte size. Include vector growth and the per-document
+    /// positions copied out of the decoded block.
+    pub(in super::super) fn merge_scratch_bytes(&self) -> Result<u64> {
+        let block_size = self.block_size();
+        let mut maximum = 0;
+        let mut account = |frequencies: &[u32]| -> Result<()> {
+            let positions: u64 = frequencies.iter().map(|&value| u64::from(value)).sum();
+            let largest = u64::from(frequencies.iter().copied().max().unwrap_or(0));
+            let bytes = positions
+                .checked_mul(3)
+                .and_then(|positions| positions.checked_add(largest))
+                .and_then(|positions| positions.checked_mul(4))
+                .ok_or_else(|| Error::invalid_input("FTS merge position scratch size overflow"))?;
+            maximum = maximum.max(bytes);
+            Ok(())
+        };
+        if self.with_positions {
+            if let Some(blocks) = self
+                .overflow
+                .as_deref()
+                .and_then(|overflow| overflow.full_blocks.as_deref())
+            {
+                let mut docs = Vec::with_capacity(block_size);
+                let mut frequencies = Vec::with_capacity(block_size);
+                for block in blocks.encoded_blocks.iter() {
+                    docs.clear();
+                    frequencies.clear();
+                    decode_full_posting_block(block, &mut docs, &mut frequencies, block_size);
+                    account(&frequencies)?;
+                }
+            }
+            let frequencies = self
+                .tail_entries()
+                .map(|(_, frequency)| frequency)
+                .collect::<Vec<_>>();
+            account(&frequencies)?;
+        }
+        maximum
+            .checked_add(
+                (block_size as u64)
+                    .checked_mul(8)
+                    .ok_or_else(|| Error::invalid_input("FTS merge block scratch size overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid_input("FTS merge scratch size overflow"))
+    }
+
     pub fn for_each_entry<E>(
         &self,
         mut visit: impl FnMut(u32, u32, Option<Vec<u32>>) -> std::result::Result<(), E>,

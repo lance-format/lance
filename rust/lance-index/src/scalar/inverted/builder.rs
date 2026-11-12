@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::{InvertedIndexParams, index::*};
+
+mod pipeline;
 use crate::scalar::RowAddrTranslatorRef;
 use crate::scalar::inverted::document_tokenizer::DocType;
 use crate::scalar::inverted::json::JsonTextStream;
@@ -212,6 +214,7 @@ pub struct InvertedIndexBuilder {
     params: InvertedIndexParams,
     pub(crate) partitions: Vec<u64>,
     new_partitions: Vec<u64>,
+    partition_ids: Arc<AtomicU64>,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
     format_version: InvertedListFormatVersion,
@@ -256,6 +259,7 @@ impl InvertedIndexBuilder {
             params,
             partitions,
             new_partitions: Vec::new(),
+            partition_ids: Arc::new(AtomicU64::new(0)),
             src_store: store,
             token_set_format,
             fragment_mask,
@@ -442,7 +446,10 @@ impl InvertedIndexBuilder {
         dest_store: &dyn IndexStore,
         mut builder: InnerBuilder,
     ) -> Result<Vec<IndexFile>> {
-        let partition_id = self.next_partition_id() | self.fragment_mask.unwrap_or(0);
+        let partition_id = self
+            .partition_id_allocator()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            | self.fragment_mask.unwrap_or(0);
         builder.set_id(partition_id);
         let files = builder
             .write_to(dest_store, self.partition_write_target())
@@ -468,12 +475,50 @@ impl InvertedIndexBuilder {
             .unwrap_or(0)
     }
 
+    fn partition_id_allocator(&self) -> Arc<AtomicU64> {
+        // A cancelled pipeline can still be draining an accepted write. Retain
+        // its reservations across retries, including retries on the ordinary
+        // path, so those writes cannot overwrite a new build's partition files.
+        self.partition_ids.fetch_max(
+            self.next_partition_id(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.partition_ids.clone()
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn update_index(
         &mut self,
         stream: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<Vec<IndexFile>> {
+        let num_workers = resolve_num_workers(&self.params);
+        let worker_limit = resolve_worker_memory_limit_bytes(&self.params, num_workers);
+        let total_budget = self
+            .params
+            .memory_limit_mb
+            .map(|mib| mib.checked_mul(1 << 20))
+            .unwrap_or_else(|| worker_limit.checked_mul(num_workers as u64))
+            .ok_or_else(|| {
+                Error::invalid_input("FTS total worker memory budget overflow".to_string())
+            })?;
+        let config = pipeline::Config::from_env(total_budget, num_workers)?;
+        self.update_index_with_pipeline(stream, dest_store, config)
+            .await
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn update_index_with_pipeline(
+        &mut self,
+        stream: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+        pipeline_config: Option<pipeline::Config>,
+    ) -> Result<Vec<IndexFile>> {
+        if let Some(config) = pipeline_config {
+            let output = pipeline::build(self, stream, dest_store, config).await?;
+            self.new_partitions.extend(output.partitions);
+            return Ok(output.files);
+        }
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -488,8 +533,7 @@ impl InvertedIndexBuilder {
             block_size: self.params.block_size,
             coordinate_rank: document_coordinate_rank(&stream.schema()),
         };
-        let next_id = self.next_partition_id();
-        let id_alloc = Arc::new(AtomicU64::new(next_id));
+        let id_alloc = self.partition_id_allocator();
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
         let dest_store = dest_store.clone_arc();
@@ -1476,12 +1520,14 @@ struct IndexWorker {
     token_ids: Vec<u32>,
     last_token_count: usize,
     coordinate_rank: usize,
+    run_sender: Option<pipeline::RunSender>,
 }
 
 struct TailPartition {
     builder: InnerBuilder,
 }
 
+#[derive(Default)]
 struct WorkerOutput {
     partitions: Vec<u64>,
     files: Vec<IndexFile>,
@@ -1577,6 +1623,7 @@ impl IndexWorker {
             token_ids: Vec::new(),
             last_token_count: 0,
             coordinate_rank: config.coordinate_rank,
+            run_sender: None,
         })
     }
 
@@ -1971,6 +2018,9 @@ impl IndexWorker {
         );
         replacement.docs = DocSet::with_coordinate_rank(self.coordinate_rank);
         let builder = std::mem::replace(&mut self.builder, replacement);
+        if let Some(sender) = &self.run_sender {
+            return sender.send(builder).await;
+        }
         let written_partition_id = builder.id();
         let mut builder = builder;
         let target = if self.fragment_mask.is_some() {
@@ -1993,6 +2043,16 @@ impl IndexWorker {
     }
 
     async fn finish(self) -> Result<WorkerOutput> {
+        if let Some(sender) = self.run_sender {
+            if !self.builder.docs.is_empty() || self.coordinate_rank > 0 {
+                sender.send(self.builder).await?;
+            }
+            return Ok(WorkerOutput {
+                partitions: self.partitions,
+                files: self.files,
+                tail_partition: None,
+            });
+        }
         let tail_partition = if self.builder.docs.is_empty() && self.coordinate_rank == 0 {
             None
         } else {
@@ -3413,12 +3473,14 @@ mod tests {
     #[derive(Debug, Default, Clone)]
     struct CountingStore {
         write_count: Arc<AtomicUsize>,
+        fault: Option<Arc<PipelineWriteFault>>,
     }
 
     impl CountingStore {
         fn new() -> Self {
             Self {
                 write_count: Arc::new(AtomicUsize::new(0)),
+                fault: None,
             }
         }
 
@@ -3681,11 +3743,72 @@ mod tests {
     struct CountingWriter {
         path: String,
         write_count: Arc<AtomicUsize>,
+        fault: Option<Arc<PipelineWriteFault>>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PipelineWriteFailure {
+        Open,
+        Batch,
+        Finish,
+        Pause,
+    }
+
+    #[derive(Debug)]
+    struct PipelineWriteFault {
+        suffix: &'static str,
+        failure: PipelineWriteFailure,
+        started: Notify,
+        release: Notify,
+        writers: AtomicUsize,
+        metadata_opens: AtomicUsize,
+        is_paused: AtomicBool,
+        paused_path: std::sync::Mutex<Option<String>>,
+    }
+
+    impl PipelineWriteFault {
+        fn new(suffix: &'static str, failure: PipelineWriteFailure) -> Self {
+            Self {
+                suffix,
+                failure,
+                started: Notify::new(),
+                release: Notify::new(),
+                writers: AtomicUsize::new(0),
+                metadata_opens: AtomicUsize::new(0),
+                is_paused: AtomicBool::new(false),
+                paused_path: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl Drop for CountingWriter {
+        fn drop(&mut self) {
+            if let Some(fault) = &self.fault {
+                fault.writers.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[async_trait]
     impl IndexWriter for CountingWriter {
         async fn write_record_batch(&mut self, _batch: RecordBatch) -> Result<u64> {
+            if let Some(fault) = &self.fault
+                && self.path.ends_with(fault.suffix)
+            {
+                fault.started.notify_one();
+                match fault.failure {
+                    PipelineWriteFailure::Batch => {
+                        return Err(Error::io("injected pipeline batch failure"));
+                    }
+                    PipelineWriteFailure::Pause
+                        if !fault.is_paused.swap(true, Ordering::SeqCst) =>
+                    {
+                        *fault.paused_path.lock().unwrap() = Some(self.path.clone());
+                        fault.release.notified().await;
+                    }
+                    _ => {}
+                }
+            }
             Ok(self.write_count.fetch_add(1, Ordering::SeqCst) as u64)
         }
 
@@ -3695,6 +3818,11 @@ mod tests {
         }
 
         async fn finish(&mut self) -> Result<IndexFile> {
+            if self.fault.as_ref().is_some_and(|fault| {
+                self.path.ends_with(fault.suffix) && fault.failure == PipelineWriteFailure::Finish
+            }) {
+                return Err(Error::io("injected pipeline finish failure"));
+            }
             Ok(IndexFile {
                 path: self.path.clone(),
                 size_bytes: 0,
@@ -3705,10 +3833,7 @@ mod tests {
             &mut self,
             _metadata: HashMap<String, String>,
         ) -> Result<IndexFile> {
-            Ok(IndexFile {
-                path: self.path.clone(),
-                size_bytes: 0,
-            })
+            self.finish().await
         }
     }
 
@@ -3741,9 +3866,19 @@ mod tests {
             name: &str,
             _schema: Arc<Schema>,
         ) -> Result<Box<dyn IndexWriter>> {
+            if let Some(fault) = &self.fault {
+                if name == METADATA_FILE {
+                    fault.metadata_opens.fetch_add(1, Ordering::SeqCst);
+                }
+                if name.ends_with(fault.suffix) && fault.failure == PipelineWriteFailure::Open {
+                    return Err(Error::io("injected pipeline open failure"));
+                }
+                fault.writers.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(Box::new(CountingWriter {
                 path: name.to_string(),
                 write_count: self.write_count.clone(),
+                fault: self.fault.clone(),
             }))
         }
 
@@ -5345,6 +5480,535 @@ mod tests {
             builder.posting_lists[token as usize].add(doc, PositionRecorder::Count(1));
         }
         TailPartition { builder }
+    }
+
+    #[rstest::rstest]
+    #[case::posting_open(INVERT_LIST_FILE, PipelineWriteFailure::Open)]
+    #[case::posting_batch(INVERT_LIST_FILE, PipelineWriteFailure::Batch)]
+    #[case::posting_finish(INVERT_LIST_FILE, PipelineWriteFailure::Finish)]
+    #[case::token_open(TOKENS_FILE, PipelineWriteFailure::Open)]
+    #[case::token_batch(TOKENS_FILE, PipelineWriteFailure::Batch)]
+    #[case::document_open(DOCS_FILE, PipelineWriteFailure::Open)]
+    #[case::document_finish(DOCS_FILE, PipelineWriteFailure::Finish)]
+    #[tokio::test]
+    async fn test_pipeline_write_failure_drains_workers(
+        #[case] suffix: &'static str,
+        #[case] failure: PipelineWriteFailure,
+    ) -> Result<()> {
+        let fault = Arc::new(PipelineWriteFault::new(suffix, failure));
+        let store = CountingStore {
+            fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let batch = make_doc_batch_from_docs(vec![Some("alpha beta alpha"); 128]);
+        // This source never finishes: a merger error must stop dispatch even
+        // when producers and both bounded queues have more work available.
+        let input = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::repeat_with(move || Ok(batch.clone())),
+        );
+        let params = consolidation_params().num_workers(2);
+        let config = pipeline::Config::new(
+            128 << 10,
+            resolve_num_workers(&params),
+            2,
+            None,
+            Some(1 << 10),
+            Some(1),
+        )?;
+        let mut builder =
+            InvertedIndexBuilder::new(params).with_format_version(InvertedListFormatVersion::V3);
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            builder.update_index_with_pipeline(
+                document_input(Box::pin(input), "doc")?,
+                &store,
+                Some(config),
+            ),
+        )
+        .await
+        .expect("a failed merger must stop producers and dispatch")
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains("injected pipeline"), "{error}");
+        assert_eq!(fault.writers.load(Ordering::SeqCst), 0);
+        assert_eq!(fault.metadata_opens.load(Ordering::SeqCst), 0);
+        assert!(builder.new_partitions.is_empty());
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::input_error(false)]
+    #[case::caller_cancellation(true)]
+    #[tokio::test]
+    async fn test_pipeline_shutdown_retains_inflight_write(#[case] cancel: bool) -> Result<()> {
+        let fault = Arc::new(PipelineWriteFault::new(
+            INVERT_LIST_FILE,
+            PipelineWriteFailure::Pause,
+        ));
+        let store = CountingStore {
+            fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let batch = make_doc_batch_from_docs(vec![Some("alpha beta alpha"); 1025]);
+        let input_fault = fault.clone();
+        let input_failed = Arc::new(Notify::new());
+        let input_failed_signal = input_failed.clone();
+        let input = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([Ok(batch)]).chain(stream::once(async move {
+                input_fault.started.notified().await;
+                if cancel {
+                    futures::future::pending().await
+                } else {
+                    input_failed_signal.notify_one();
+                    Err(datafusion_common::DataFusionError::Execution(
+                        "injected pipeline input failure".to_string(),
+                    ))
+                }
+            })),
+        );
+        let params = consolidation_params().num_workers(1);
+        let config = pipeline::Config::new(32 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
+        let progress = Arc::new(RecordingProgress::default());
+        let weak_progress = Arc::downgrade(&progress);
+        let mut builder = InvertedIndexBuilder::new(params)
+            .with_format_version(InvertedListFormatVersion::V3)
+            .with_progress(progress.clone());
+        let mut build = Box::pin(builder.update_index_with_pipeline(
+            document_input(Box::pin(input), "doc")?,
+            &store,
+            Some(config),
+        ));
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !fault.is_paused.load(Ordering::SeqCst) {
+                tokio::select! {
+                    result = &mut build => panic!("build returned before a write started: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        })
+        .await
+        .expect("a flushed run must start a write");
+        if !cancel {
+            tokio::time::timeout(Duration::from_millis(500), input_failed.notified())
+                .await
+                .expect("source error must occur while the writer is paused");
+            tokio::task::yield_now().await;
+        }
+        assert!(futures::poll!(&mut build).is_pending());
+        if cancel {
+            drop(build);
+        } else {
+            fault.release.notify_one();
+            let error = tokio::time::timeout(Duration::from_millis(500), build)
+                .await
+                .expect("input error must drain the in-flight write")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected pipeline input failure")
+            );
+            assert_eq!(fault.writers.load(Ordering::SeqCst), 0);
+        }
+        drop(builder);
+        drop(progress);
+        fault.release.notify_one();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while weak_progress.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled supervisor must release all worker/progress owners");
+        assert_eq!(fault.writers.load(Ordering::SeqCst), 0);
+        assert_eq!(fault.metadata_opens.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_cancelled_build_does_not_reuse_partition_paths() -> Result<()> {
+        let fault = Arc::new(PipelineWriteFault::new(
+            INVERT_LIST_FILE,
+            PipelineWriteFailure::Pause,
+        ));
+        let store = CountingStore {
+            fault: Some(fault.clone()),
+            ..Default::default()
+        };
+        let batch = make_doc_batch_from_docs(vec![Some("alpha beta alpha"); 1025]);
+        let input = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([Ok(batch)]).chain(stream::pending()),
+        );
+        let progress = Arc::new(RecordingProgress::default());
+        let weak_progress = Arc::downgrade(&progress);
+        let mut builder = InvertedIndexBuilder::new(consolidation_params().num_workers(1))
+            .with_format_version(InvertedListFormatVersion::V3)
+            .with_progress(progress.clone());
+        let config = pipeline::Config::new(32 << 10, 1, 1, None, Some(1 << 10), Some(1))?;
+        let mut build = Box::pin(builder.update_index_with_pipeline(
+            document_input(Box::pin(input), "doc")?,
+            &store,
+            Some(config),
+        ));
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while fault.paused_path.lock().unwrap().is_none() {
+                tokio::select! {
+                    result = &mut build => panic!("build returned before a write started: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        }).await.expect("first build must reach a write");
+        let paused_path = fault.paused_path.lock().unwrap().clone().unwrap();
+        drop(build);
+
+        // Retry immediately on the same builder and destination, including a
+        // switch back to the ordinary build path while cancellation drains.
+        let batch = make_doc_batch("gamma delta", 0);
+        let input = RecordBatchStreamAdapter::new(batch.schema(), stream::iter([Ok(batch)]));
+        let files = tokio::time::timeout(
+            Duration::from_millis(500),
+            builder.update_index_with_pipeline(
+                document_input(Box::pin(input), "doc")?,
+                &store,
+                None,
+            ),
+        )
+        .await
+        .expect("retry must finish while the cancelled write is paused")?;
+        drop(builder);
+        drop(progress);
+        fault.release.notify_one();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while weak_progress.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled build must finish cleanup");
+        assert!(
+            files.iter().all(|file| file.path != paused_path),
+            "retry reused an in-flight cancelled write: {paused_path}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_worker_failure_stops_pending_input() -> Result<()> {
+        let directory = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            directory.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch = make_doc_batch("alpha beta", 0);
+        let input = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([Ok(batch)]).chain(stream::pending()),
+        );
+        let params = consolidation_params().num_workers(2);
+        let config =
+            pipeline::Config::new(128 << 10, resolve_num_workers(&params), 1, None, None, None)?;
+        let mut builder = InvertedIndexBuilder::new(params)
+            .with_format_version(InvertedListFormatVersion::V3)
+            .with_progress(Arc::new(FailingProgress));
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            builder.update_index_with_pipeline(
+                document_input(Box::pin(input), "doc")?,
+                store.as_ref(),
+                Some(config),
+            ),
+        )
+        .await
+        .expect("a failed worker must stop a pending source")
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains("injected progress failure"));
+        assert!(store.list_files_with_sizes().await?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_budget_reserves_producers_queue_and_merge() -> Result<()> {
+        let config = pipeline::Config::new(14 << 30, 12, 1, None, None, None)?;
+        assert_eq!(config.queue_runs, 1);
+        assert_eq!(config.run_memory_limit_bytes, 256 << 20);
+        assert_eq!(config.max_run_bytes, 512 << 20);
+        assert_eq!(config.merge_memory_limit_bytes, 7 << 30);
+        assert_eq!(
+            14 * config.max_run_bytes + config.merge_memory_limit_bytes,
+            14 << 30
+        );
+        let error = pipeline::Config::new(14 << 30, 12, 1, Some(15 << 30), None, None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exceeds total budget"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_parallel_budget_includes_both_outputs() -> Result<()> {
+        let config = pipeline::Config::new(14 << 30, 12, 2, Some(5 << 30), None, None)?;
+        assert_eq!(config.queue_runs, 2);
+        assert_eq!(config.run_memory_limit_bytes, 128 << 20);
+        assert_eq!(config.max_run_bytes, 256 << 20);
+        assert_eq!(config.queue_memory_bytes, 512 << 20);
+        assert_eq!(
+            12 * config.max_run_bytes
+                + config.queue_memory_bytes
+                + 2 * config.max_run_bytes
+                + 2 * config.merge_memory_limit_bytes,
+            14 << 30
+        );
+        let error = pipeline::Config::new(14 << 30, 12, 2, Some(8 << 30), None, None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exceeds total budget"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_queue_reservation_stays_in_total_budget() -> Result<()> {
+        let config = pipeline::Config::new(4 << 30, 4, 1, Some(3 << 30), Some(64 << 20), Some(3))?;
+        assert_eq!(config.queue_runs, 3);
+        assert_eq!(config.max_run_bytes, 128 << 20);
+        assert_eq!(config.queue_memory_bytes, 384 << 20);
+        assert_eq!(
+            5 * config.max_run_bytes + config.queue_memory_bytes + config.merge_memory_limit_bytes,
+            4 << 30
+        );
+        let error = pipeline::Config::new(4 << 30, 4, 1, None, None, Some(0)).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("queue_runs=0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_queue_count_is_independent_of_consumers() -> Result<()> {
+        let first = tail_with_docs(0, 4).builder;
+        let maximum = 2 * first.memory_size().div_ceil(1024) * 1024;
+        let config = pipeline::Config {
+            merge_workers: 1,
+            queue_runs: 3,
+            queue_memory_bytes: 3 * maximum,
+            run_memory_limit_bytes: maximum / 2,
+            max_run_bytes: maximum,
+            merge_memory_limit_bytes: 4 * maximum,
+        };
+        let (sender, receiver) = pipeline::RunSender::new(config);
+        sender.send(first).await?;
+        for id in 1..3 {
+            sender.send(tail_with_docs(id, 4).builder).await?;
+        }
+        let pending = sender.send(tail_with_docs(3, 4).builder);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(receiver.recv().await.unwrap());
+        tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("receiving one run must release a queue slot")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_backpressure_unblocks_when_consumer_closes() -> Result<()> {
+        let first = tail_with_docs(0, 4).builder;
+        let maximum = first.memory_size().div_ceil(1024) * 1024;
+        let config = pipeline::Config {
+            merge_workers: 1,
+            queue_runs: 1,
+            queue_memory_bytes: maximum,
+            run_memory_limit_bytes: maximum / 2,
+            max_run_bytes: maximum,
+            merge_memory_limit_bytes: 4 * maximum,
+        };
+        let (sender, receiver) = pipeline::RunSender::new(config);
+        sender.send(first).await?;
+        let pending = sender.send(tail_with_docs(1, 4).builder);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        receiver.close();
+        let error = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("closing the consumer must wake a producer waiting for byte credit")
+            .unwrap_err();
+        assert!(matches!(error, Error::PrerequisiteFailed { .. }));
+        assert!(error.to_string().contains("consumer closed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_rejects_a_run_larger_than_queue_reservation() -> Result<()> {
+        let config = pipeline::Config::new(128 << 10, 2, 1, None, None, None)?;
+        let (sender, _receiver) = pipeline::RunSender::new(config);
+        let builder = tail_with_docs(0, 4096).builder;
+        assert!(builder.memory_size() > config.max_run_bytes);
+        let error = sender.send(builder).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exceeds its"));
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::mixed(false, 1, None, 1025)]
+    #[case::all_null(true, 1, None, 1025)]
+    #[case::parallel(false, 2, None, 1025)]
+    #[case::buffered(false, 1, Some(3), 1025)]
+    #[case::empty(false, 1, None, 0)]
+    #[case::short_wide(false, 4, None, 7)]
+    #[tokio::test]
+    async fn test_pipeline_matches_complete_build_with_nulls(
+        #[case] all_null: bool,
+        #[case] mergers: usize,
+        #[case] queue_runs: Option<usize>,
+        #[case] docs_per_fragment: u32,
+    ) -> Result<()> {
+        let mut batches = Vec::new();
+        let mut expected_rows = Vec::new();
+        for fragment in 0..3 {
+            let docs = (0..docs_per_fragment)
+                .map(|row| match (all_null, row % 4) {
+                    (true, _) | (_, 0) => None,
+                    (_, 1) => Some(""),
+                    (_, 2) => Some("alpha beta"),
+                    _ => Some("alpha beta alpha"),
+                })
+                .collect::<Vec<_>>();
+            let rows = (0..docs_per_fragment)
+                .map(|row| {
+                    u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+                        fragment, row,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            expected_rows.extend(rows.iter().zip(&docs).filter_map(|(&row, doc)| {
+                doc.is_some_and(|doc| doc.contains("alpha")).then_some(row)
+            }));
+            batches.push(arrow_array::record_batch!(
+                ("doc", Utf8, docs),
+                (ROW_ID, UInt64, rows)
+            )?);
+        }
+        let reference_dir = TempDir::default();
+        let pipeline_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let reference_store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            reference_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let pipeline_store = Arc::new(LanceIndexStore::new(
+            object_store,
+            pipeline_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = batches[0].schema();
+        let reference_stream = RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(batches.iter().cloned().map(Ok).collect::<Vec<_>>()),
+        );
+        let mut reference = InvertedIndexBuilder::new(consolidation_params().num_workers(1))
+            .with_format_version(InvertedListFormatVersion::V3);
+        reference
+            .update(Box::pin(reference_stream), reference_store.as_ref(), None)
+            .await?;
+        let params = consolidation_params().num_workers(2);
+        let config = pipeline::Config::new(
+            2 << 20,
+            resolve_num_workers(&params),
+            mergers,
+            None,
+            Some(8 << 10),
+            queue_runs,
+        )?;
+        let input =
+            RecordBatchStreamAdapter::new(schema, stream::iter(batches.into_iter().map(Ok)));
+        let mut builder =
+            InvertedIndexBuilder::new(params).with_format_version(InvertedListFormatVersion::V3);
+        builder
+            .update_index_with_pipeline(
+                document_input(Box::pin(input), "doc")?,
+                pipeline_store.as_ref(),
+                Some(config),
+            )
+            .await?;
+        builder.write(pipeline_store.as_ref()).await?;
+        let reference = InvertedIndex::load(reference_store, None, &LanceCache::no_cache()).await?;
+        let actual = InvertedIndex::load(pipeline_store, None, &LanceCache::no_cache()).await?;
+        if all_null || docs_per_fragment == 0 {
+            assert_eq!(actual.partition_count(), 0);
+        } else {
+            assert!((1..=mergers).contains(&actual.partition_count()));
+        }
+        for phrase in [false, true] {
+            let tokens = if phrase {
+                vec!["alpha", "beta"]
+            } else {
+                vec!["alpha"]
+            };
+            let operator = crate::scalar::inverted::query::Operator::And;
+            let expected = consolidation_search(&reference, &tokens, operator, phrase).await;
+            let found = consolidation_search(&actual, &tokens, operator, phrase).await;
+            let mut found_rows = found.iter().map(|hit| hit.0).collect::<Vec<_>>();
+            found_rows.sort_unstable();
+            assert_eq!(found_rows, expected_rows);
+            assert_eq!(found.len(), expected.len());
+            for ((row, score), (expected_row, expected_score)) in found.iter().zip(&expected) {
+                assert_eq!(row, expected_row);
+                assert!((score - expected_score).abs() < 1e-5);
+            }
+        }
+        Ok(())
+    }
+
+    #[rstest::rstest]
+    #[case::producer(InvertedListFormatVersion::V3, "injected progress failure")]
+    #[case::unsupported_format(InvertedListFormatVersion::V2, "requires v3")]
+    #[tokio::test]
+    async fn test_pipeline_failure_does_not_publish_metadata(
+        #[case] format: InvertedListFormatVersion,
+        #[case] expected_error: &str,
+    ) -> Result<()> {
+        let directory = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            directory.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch = make_doc_batch("alpha beta", 0);
+        let input = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let params = consolidation_params().num_workers(2);
+        let config =
+            pipeline::Config::new(128 << 10, resolve_num_workers(&params), 2, None, None, None)?;
+        let mut builder = InvertedIndexBuilder::new(params)
+            .with_format_version(format)
+            .with_progress(Arc::new(FailingProgress));
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            builder.update_index_with_pipeline(
+                document_input(Box::pin(input), "doc")?,
+                store.as_ref(),
+                Some(config),
+            ),
+        )
+        .await
+        .expect("pipeline failure must not leave background tasks waiting")
+        .unwrap_err();
+        if format == InvertedListFormatVersion::V3 {
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+        } else {
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        }
+        assert!(error.to_string().contains(expected_error), "{error}");
+        assert!(
+            !store
+                .list_files_with_sizes()
+                .await?
+                .iter()
+                .any(|file| file.path == METADATA_FILE)
+        );
+        Ok(())
     }
 
     #[tokio::test]
