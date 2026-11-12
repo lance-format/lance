@@ -1437,8 +1437,12 @@ impl BranchContents {
 
 /// Validate a branch name before constructing storage paths.
 ///
-/// Names cannot contain a `.` segment. Storage length limits apply only when
-/// creating new branches so existing names remain accessible.
+/// A literal `.` path segment is rejected because it resolves to the parent
+/// directory and would collide with the branch that owns that directory.
+///
+/// Name length is not checked here: the portable creation budget in
+/// `check_new_branch` applies only when creating a branch, so names written
+/// by older versions remain accessible.
 ///
 /// ```
 /// # use lance::dataset::refs::check_valid_branch;
@@ -1534,12 +1538,17 @@ fn is_dataset_dir(segment: &str) -> bool {
         || is_mem_wal_dir_name(segment)
 }
 
-// Local atomic creation needs room for `.json.tmp.<32-byte UUID>#1` within
-// the filesystem's 255-byte filename limit.
+// Local atomic creation appends `.json.tmp.<32-hex UUID>#1` (44 bytes) to the
+// encoded name and requires the result to fit the file's 255-byte filename
+// limit.
 const MAX_BRANCH_NAME_BYTES: usize = 211;
 
 /// Restrict storage length and reserved directories only for new branches so
 /// older branch names remain accessible.
+///
+/// The length budget is measured in bytes of the twice path-part encoded name,
+/// not in characters. It is a portable admission policy for creation, not a
+/// description of what every backend can physically store.
 pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
     check_valid_branch(branch_name)?;
 
