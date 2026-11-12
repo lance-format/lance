@@ -227,6 +227,43 @@ async fn staged_segments_merge_after_stable_partition(#[case] index_type: IndexT
     assert_queries_match_scans(&dataset, true).await;
 }
 
+/// Bloom filter segments on a tagged history are not merged by their zones,
+/// which that merge cannot translate: a bounded plan keeps the index in one
+/// task, and optimize rebuilds it over the destinations.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_segments_rebuild_on_a_tagged_table() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![s1, s2])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+
+    let bounded = OptimizeOptions::merge(2).max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &bounded)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].old_segments.len(), 2);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        dataset.load_indices_by_name("staged").await.unwrap().len(),
+        1
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
 /// One staged contributor covers only part of the partition: the merge
 /// succeeds, the merged segment claims nothing the group cannot serve (its
 /// derived coverage is empty), and the queries scan.

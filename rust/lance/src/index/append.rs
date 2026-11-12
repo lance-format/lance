@@ -1062,6 +1062,39 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
 
+    // Two or more bloom filter segments merge by their zones unless only a
+    // rebuild catches the index up (a pending compaction remap, since the
+    // merge keeps the oldest source version, or a segment without null rows)
+    // or the merge would refuse them (a tagged history, other parameters).
+    let is_bloomfilter_mergeable = if index_type == IndexType::BloomFilter
+        && selected_old_indices.len() >= 2
+        && !is_remappable
+        && tagged_coverage.is_none()
+        && selected_old_indices
+            .iter()
+            .all(|segment| segment.fragment_bitmap.is_some())
+        && !frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
+            fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
+        }) {
+        let reference = selected_old_indices[0];
+        crate::index::scalar::bloomfilter::segments_merge_by_zones(
+            dataset.as_ref(),
+            reference,
+            &selected_old_indices,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "Rebuilding index '{}' instead of merging its bloom filter segments, \
+                 whose metadata cannot be read: {error}",
+                reference.name
+            );
+            false
+        })
+    } else {
+        false
+    };
+
     // Merge new data into the existing segment(s) without rebuilding from
     // scratch, when all hold:
     //   - `effective_old_frags`: the selected segments' coverage intersected
@@ -1069,8 +1102,9 @@ async fn merge_scalar_indices<'a>(
     //   - `update_criteria` only requires the newly appended data. Indexes that
     //     need old data must rebuild over `frag_bitmap` so the scanned rows
     //     exactly match the segment coverage being committed.
-    //   - `has_segment_merge_primitive` (Indices supports N:1 segments merge) OR
-    //     `selected_old_indices.len() == 1` (any scalar type can `update` one).
+    //   - `has_segment_merge_primitive` or `is_bloomfilter_mergeable` (an N:1
+    //     segment merge applies) OR `selected_old_indices.len() == 1` (any
+    //     scalar type can `update` one).
     // Otherwise (e.g. ≥2 selected segments of a type without an N:1 merge
     // primitive) the index is rebuilt from scratch over `frag_bitmap`.
     let can_merge_segments = !effective_old_frags.is_empty()
@@ -1078,7 +1112,9 @@ async fn merge_scalar_indices<'a>(
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
         && !zonemap_requires_rebuild
-        && (has_segment_merge_primitive || selected_old_indices.len() == 1);
+        && (has_segment_merge_primitive
+            || is_bloomfilter_mergeable
+            || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
     // produced:
@@ -1177,6 +1213,22 @@ async fn merge_scalar_indices<'a>(
             };
 
             match index_type {
+                IndexType::BloomFilter if is_bloomfilter_mergeable => {
+                    let fragment_filters = crate::index::scalar::bloomfilter::effective_coverage(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                    )?;
+                    crate::index::scalar::bloomfilter::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        &fragment_filters,
+                        None,
+                    )
+                    .await?
+                }
                 IndexType::BTree => {
                     let (_, old_data_filters) = build_per_segment_filters(
                         dataset.as_ref(),
