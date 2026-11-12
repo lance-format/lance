@@ -20,7 +20,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            // An action set can modify fragments, but conflicts against it are
+            // settled by comparing footprints, which are derived from the
+            // actions rather than from collected rebase state.
+            | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());
