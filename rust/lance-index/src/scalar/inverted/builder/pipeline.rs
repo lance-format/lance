@@ -313,6 +313,9 @@ impl Config {
         // This target never depends on requested merger concurrency.
         let output_target_bytes =
             target.unwrap_or((total_budget / workers as u64).min(total_budget / 8));
+        // Before the output trigger, retained inputs cost at most target +
+        // target/4. The 4x growth estimate consumes 5x target; reserve another
+        // target for decoded-position scratch. Larger scratch uses Full safely.
         let merge_memory_limit_bytes = output_target_bytes
             .checked_mul(6)
             .filter(|bytes| *bytes > 0)
@@ -686,29 +689,30 @@ mod tests {
     use super::*;
     use crate::scalar::inverted::index::TokenSetFormat;
     use crate::scalar::lance_format::LanceIndexStore;
+    use arrow_array::cast::AsArray;
     use lance_core::cache::LanceCache;
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::oneshot;
 
+    fn small_run(id: u64) -> InnerBuilder {
+        let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
+        builder.tokens.get_or_add(&format!("token{id}"));
+        let mut posting = super::super::PostingListBuilder::new(false);
+        for row in 0..128 {
+            let doc = builder.docs.append(id * 128 + row, 1);
+            posting.add(doc, super::super::PositionRecorder::Count(1));
+        }
+        builder.posting_lists.push(posting);
+        builder
+    }
+
     #[tokio::test]
     async fn test_pipeline_output_target_is_not_the_working_set_limit() -> Result<()> {
         let target_bytes = 64 << 10;
         let config = Config::new(2 << 20, 1, 1, Some(target_bytes), None, None)?;
-        let builders = (0..8)
-            .map(|id| {
-                let mut builder = InnerBuilder::new(id, false, TokenSetFormat::default());
-                builder.tokens.get_or_add(&format!("token{id}"));
-                let mut posting = super::super::PostingListBuilder::new(false);
-                for row in 0..128 {
-                    let doc = builder.docs.append(id * 128 + row, 1);
-                    posting.add(doc, super::super::PositionRecorder::Count(1));
-                }
-                builder.posting_lists.push(posting);
-                builder
-            })
-            .collect::<Vec<_>>();
+        let builders = (0..8).map(small_run).collect::<Vec<_>>();
         let retained = builders.iter().map(InnerBuilder::memory_size).sum::<u64>();
         assert!(retained < target_bytes && 4 * retained > target_bytes);
         let (sender, receiver) = RunSender::new(config);
@@ -738,6 +742,54 @@ mod tests {
             1,
             "runs that fit one final partition must not be cut at target / 4"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_drains_all_merger_tails_together() -> Result<()> {
+        let config = Config::new(2 << 20, 1, 3, Some(64 << 10), None, None)?;
+        assert_eq!(config.merge_workers, 3);
+        let mut tasks = JoinSet::new();
+        for id in 0..3 {
+            tasks.spawn(async move {
+                Ok(WorkerOutput {
+                    tail_partition: Some(TailPartition {
+                        builder: small_run(id),
+                    }),
+                    ..Default::default()
+                })
+            });
+        }
+        let stop = Stop::default();
+        let (output, tails) = finish_workers(tasks, &stop).await?;
+        assert_eq!(tails.len(), 3);
+        assert!(output.files.is_empty() && output.partitions.is_empty());
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::memory()),
+            Path::from("index"),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let output = finish_tails(
+            output,
+            tails,
+            store.clone(),
+            PartitionWriteTarget::Final,
+            config,
+            &stop,
+        )
+        .await?;
+        assert_eq!(output.partitions.len(), 1);
+        let docs = store
+            .open_index_file(&super::super::doc_file_path(output.partitions[0]))
+            .await?;
+        assert_eq!(docs.num_rows(), 384);
+        let batch = docs.read_range(0..384, None).await?;
+        let mut rows = batch[lance_core::ROW_ID]
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .values()
+            .to_vec();
+        rows.sort_unstable();
+        assert_eq!(rows, (0..384).collect::<Vec<u64>>());
         Ok(())
     }
 
