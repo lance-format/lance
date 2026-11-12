@@ -391,6 +391,12 @@ impl LsmDataSourceCollector {
         base_count + sstable_count + in_memory_count
     }
 
+    /// The URI of `shard_id`'s generation directory `generation_dir`, where a
+    /// memtable writes its blob sidecars and later flushes.
+    pub(super) fn generation_uri(&self, shard_id: &Uuid, generation_dir: &str) -> String {
+        self.resolve_sstable_path(shard_id, generation_dir)
+    }
+
     /// Resolve an SSTable path to an absolute path.
     ///
     /// SSTables are stored at: `{base_path}/{mem_wal_dir}/{shard_id}/{folder_name}`

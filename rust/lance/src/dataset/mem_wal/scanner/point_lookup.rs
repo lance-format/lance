@@ -39,6 +39,10 @@ use super::collector::{InMemoryMemTableRef, LsmDataSourceCollector};
 use super::data_source::LsmDataSource;
 use super::exec::{BloomFilterGuardExec, CoalesceFirstExec, compute_pk_hash_from_scalars};
 use super::generation_read::{GenerationRead, memtable_matches_table};
+use super::logical_blobs::{
+    MemTableSidecars, dataset_blobs_as_logical, has_blob_descriptors, has_blobs,
+    memtable_blobs_as_logical,
+};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, force_schema, null_columns,
     project_to_canonical, validate_projection_names, wants_row_address, wants_row_id,
@@ -127,6 +131,8 @@ pub struct LsmPointLookupPlanner {
     /// fast paths read columns by the table's names, so if any memtable was
     /// created before a schema change, lookups take the slower plan path.
     in_memory_matches_table: bool,
+    /// Whether blob v2 values come back as logical bytes.
+    blobs_as_logical: bool,
     /// Source scans built so far, so tests can tell which sources a call read.
     #[cfg(test)]
     source_scans: std::sync::atomic::AtomicUsize,
@@ -169,6 +175,7 @@ impl LsmPointLookupPlanner {
             visibility: MemTableVisibility::Published,
             identity_schema: base_schema,
             in_memory_matches_table,
+            blobs_as_logical: false,
             #[cfg(test)]
             source_scans: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -185,6 +192,15 @@ impl LsmPointLookupPlanner {
     /// [`MemTableVisibility::Indexed`] for when a wider bound is sound.
     pub fn with_visibility(mut self, visibility: MemTableVisibility) -> Self {
         self.visibility = visibility;
+        self
+    }
+
+    /// Return each blob v2 value in the complete logical layout with its bytes
+    /// in `data`, as [`crate::Dataset::scan_blobs_as_logical`] does, instead of the
+    /// descriptor its source stores. A packed payload a durable put left in the
+    /// memtable's open pack is read after finishing that pack.
+    pub fn with_blobs_as_logical(mut self) -> Self {
+        self.blobs_as_logical = true;
         self
     }
 
@@ -836,7 +852,8 @@ impl LsmPointLookupPlanner {
                 if want_row_id {
                     scanner.with_row_id();
                 }
-                if want_row_addr {
+                let is_logical = self.blobs_as_logical && has_blobs(&target);
+                if want_row_addr || is_logical {
                     scanner.with_row_address();
                 }
                 scanner.filter_expr(filter.clone());
@@ -844,7 +861,15 @@ impl LsmPointLookupPlanner {
                 // rustc's depth limit up this point-lookup chain, and boxing inside
                 // `create_plan` instead triggers a `Box<Future>: Send` solver overflow
                 // (E0275 downstream). Same for the other arms below.
-                let scan = Box::pin(scanner.create_plan()).await?;
+                let mut scan = Box::pin(scanner.create_plan()).await?;
+                if is_logical {
+                    scan = dataset_blobs_as_logical(
+                        scan,
+                        dataset.clone(),
+                        want_row_addr,
+                        self.task_ctx.clone(),
+                    )?;
+                }
                 // The source schema narrows a struct in declaration order, the
                 // canonical one in selection order; cast the children by name.
                 project_to_canonical(scan, &target)?
@@ -884,7 +909,14 @@ impl LsmPointLookupPlanner {
                     &dataset.schema().project(&generation.stored_projection())?,
                 )?;
                 scanner.filter_expr(stored_filter);
-                let scan = Box::pin(scanner.create_plan()).await?;
+                let is_logical = self.blobs_as_logical && has_blobs(&target);
+                if is_logical {
+                    scanner.with_row_address();
+                }
+                let mut scan = Box::pin(scanner.create_plan()).await?;
+                if is_logical {
+                    scan = dataset_blobs_as_logical(scan, dataset, false, self.task_ctx.clone())?;
+                }
                 // `_tombstone` is carried through so the post-coalesce filter
                 // can drop a deleted key; a generation written before deletes
                 // existed lacks it and `project_to_carry` synthesizes `false`.
@@ -940,7 +972,24 @@ impl LsmPointLookupPlanner {
                 // over insert-ordered scan would return the *oldest* of
                 // multiple rows sharing the target primary key.
                 scanner.with_row_id();
-                let raw = Box::pin(scanner.create_plan()).await?;
+                let mut raw = Box::pin(scanner.create_plan()).await?;
+                if self.blobs_as_logical && has_blob_descriptors(&raw.schema()) {
+                    raw = memtable_blobs_as_logical(
+                        raw,
+                        batch_store.clone(),
+                        Arc::new(
+                            MemTableSidecars::open(
+                                &self.collector,
+                                source,
+                                batch_store,
+                                self.session.as_ref(),
+                                self.store_params.as_ref(),
+                            )
+                            .await?,
+                        ),
+                        self.task_ctx.clone(),
+                    )?;
+                }
                 // `_rowid` is not a table column; it passes through unchanged.
                 let raw = match &generation {
                     None => raw,

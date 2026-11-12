@@ -6,10 +6,22 @@
 use super::super::*;
 use crate::Dataset;
 use crate::blob::blob_v2_layout;
+use crate::dataset::mem_wal::MemTableVisibility;
+use crate::dataset::mem_wal::scanner::{
+    LsmDataSourceCollector, LsmPointLookupPlanner, ShardSnapshot,
+};
 use crate::dataset::mem_wal::test_util::failing_memory_store;
+use crate::dataset::mem_wal::util::sstable_uri;
 use crate::dataset::mem_wal::wal::WalTailer;
 use crate::dataset::mem_wal::write::test_support::*;
-use arrow_array::{Array, Float32Array, StructArray, UInt8Array, UInt32Array};
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, Float32Array, ListArray, RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
+};
+use arrow_buffer::OffsetBuffer;
+use arrow_schema::{DataType, Field};
+use datafusion::common::ScalarValue;
+use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{BlobKind, BlobV2Layout};
 use object_store::ObjectStoreExt;
 use rstest::rstest;
@@ -680,5 +692,143 @@ async fn test_blob_descriptor_filter_on_fresh_vector_scan() {
         .nearest("vector", &Float32Array::from(vec![0.0, 1.0]), 1)
         .unwrap();
     assert_eq!(vector.try_into_batch().await.unwrap().num_rows(), 1);
+    writer.close().await.unwrap();
+}
+
+/// A point lookup with blobs as logical bytes returns each kind's bytes, at
+/// the top level and in a list, from the base table, from a flushed
+/// generation, and from the active memtable while the durable put's packed
+/// payload still sits in the open pack.
+#[tokio::test]
+async fn test_point_lookup_returns_blobs_as_logical_bytes() {
+    let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+    let expected: Vec<Option<Vec<u8>>> = vec![
+        Some(b"abc".to_vec()),
+        Some(b"packed".to_vec()),
+        Some(vec![b'd'; 9]),
+        Some(Vec::new()),
+        None,
+    ];
+    let blobs = create_blob_v2_batch(
+        0,
+        &expected
+            .iter()
+            .map(|value| match value {
+                Some(bytes) if bytes.is_empty() => BlobTestValue::Empty,
+                Some(bytes) => BlobTestValue::Bytes(bytes.clone()),
+                None => BlobTestValue::Null,
+            })
+            .collect::<Vec<_>>(),
+    );
+    // The same blobs again as one-element lists.
+    let item = Arc::new(
+        blobs
+            .schema()
+            .field_with_name("blob")
+            .unwrap()
+            .clone()
+            .with_name("item"),
+    );
+    let items = ListArray::new(
+        item.clone(),
+        OffsetBuffer::from_lengths(vec![1; expected.len()]),
+        blobs["blob"].clone(),
+        None,
+    );
+    let batch = blobs
+        .try_with_column(
+            Field::new("items", DataType::List(item), true),
+            Arc::new(items),
+        )
+        .unwrap();
+    let schema = batch.schema();
+    let write = |uri: String| {
+        let batch = batch.clone();
+        async move {
+            let rows = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+            Arc::new(Dataset::write(rows, &uri, None).await.unwrap())
+        }
+    };
+    let lookup = |collector: LsmDataSourceCollector| {
+        let schema = schema.clone();
+        let expected = expected.clone();
+        async move {
+            let keys = (0..expected.len() as i32)
+                .map(|id| ScalarValue::Int32(Some(id)))
+                .collect::<Vec<_>>();
+            let rows = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema)
+                .unwrap()
+                .with_visibility(MemTableVisibility::Indexed)
+                .with_blobs_as_logical()
+                .lookup_many(&keys, None)
+                .await
+                .unwrap();
+            let ids = rows["id"].as_primitive::<arrow_array::types::Int32Type>();
+            for blobs in [&rows["blob"], rows["items"].as_list::<i32>().values()] {
+                let blobs = blobs.as_struct();
+                assert_eq!(
+                    blobs.column_by_name("uri").unwrap().null_count(),
+                    blobs.len()
+                );
+                let data = blobs.column_by_name("data").unwrap().as_binary::<i64>();
+                let mut read = vec![None; expected.len()];
+                for row in 0..rows.num_rows() {
+                    read[ids.value(row) as usize] =
+                        Some(blobs.is_valid(row).then(|| data.value(row).to_vec()));
+                }
+                assert_eq!(read, expected.iter().cloned().map(Some).collect::<Vec<_>>());
+            }
+        }
+    };
+
+    let base = write(format!("{base_uri}/base")).await;
+    lookup(LsmDataSourceCollector::new(base, vec![])).await;
+
+    let shard_id = Uuid::new_v4();
+    write(sstable_uri(&base_uri, "", &shard_id, "gen_1")).await;
+    let flushed = ShardSnapshot::new(shard_id)
+        .with_current_generation(2)
+        .with_sstable(1, "gen_1".to_string());
+    lookup(LsmDataSourceCollector::without_base_table(
+        &base_uri,
+        vec![flushed],
+    ))
+    .await;
+
+    let shard_id = Uuid::new_v4();
+    let writer = ShardWriter::open(
+        store.clone(),
+        base_path.clone(),
+        base_uri.clone(),
+        ShardWriterConfig {
+            shard_id,
+            durable_write: true,
+            max_wal_buffer_size: usize::MAX,
+            max_wal_flush_interval: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+        schema.clone(),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let (_, watcher) = writer.put_no_wait(vec![batch.clone()]).await.unwrap();
+    watcher.unwrap().wait_indexed().await.unwrap();
+    let memtables = writer.in_memory_memtable_refs().await.unwrap();
+    let data_dir = memtables
+        .active
+        .batch_store
+        .target()
+        .unwrap()
+        .generation_path(&base_path, "", &shard_id)
+        .join(DATA_DIR);
+    // The dedicated payloads are uploaded; the packed ones wait in the open pack.
+    assert_eq!(blob_sidecars(store.as_ref(), &data_dir).await.len(), 2);
+    lookup(
+        LsmDataSourceCollector::without_base_table(&base_uri, vec![])
+            .with_in_memory_memtables(shard_id, memtables),
+    )
+    .await;
+    assert_eq!(blob_sidecars(store.as_ref(), &data_dir).await.len(), 3);
     writer.close().await.unwrap();
 }
