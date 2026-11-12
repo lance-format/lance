@@ -220,8 +220,8 @@ impl<'a> CreateIndexBuilder<'a> {
     /// (the latest version at the time), renews it with a [`LeaseKeeper`]
     /// while building, and publishes the index for the lease. If the build
     /// fails, the lease is released and the dataset is left at its original
-    /// version. Only applies when the builder is awaited, not to
-    /// [`Self::execute_uncommitted`].
+    /// version. [`Self::execute_uncommitted`] refuses it, since only a build
+    /// that commits can publish for the lease.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -244,6 +244,14 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        if self.retention_lease.is_some() {
+            return Err(Error::invalid_input(
+                "CreateIndex: retention_lease only applies to a build that commits; for an \
+                 uncommitted build, acquire the lease yourself and publish with \
+                 commit_existing_index_segments_for_lease"
+                    .to_string(),
+            ));
+        }
         self.execute_uncommitted_impl().await
     }
 
