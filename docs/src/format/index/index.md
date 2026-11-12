@@ -260,8 +260,7 @@ files when fragment allocation changes. An empty map means no mapping. An
 entry `{17: 42}` maps fragment 17 to 42, and any unmapped fragment ID keeps
 its original ID. Each stored fragment ID is looked up once.
 
-The map applies to fragment references in the segment's files, including
-physical row addresses and references stored by BTree, ZoneMap, and BloomFilter.
+The map applies to fragment IDs referenced by the segment's files.
 Apply it once, before any later transformation, including
 [Fragment Reuse Index (FRI)](system/frag_reuse.md) remap. A physical row
 address keeps its 32-bit row offset. Stable logical row IDs and user column
