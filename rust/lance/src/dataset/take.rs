@@ -401,6 +401,8 @@ fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
 ///
+/// `batch_readahead` must be greater than zero; otherwise the stream yields an invalid-input error.
+///
 /// This is an experimental API. It may change at any time.
 pub fn take_scan(
     dataset: &Dataset,
@@ -409,6 +411,15 @@ pub fn take_scan(
     batch_readahead: usize,
 ) -> DatasetRecordBatchStream {
     let arrow_schema = Arc::new(projection.as_ref().into());
+    if batch_readahead == 0 {
+        let error = DataFusionError::from(Error::invalid_input(
+            "batch_readahead must be greater than 0, got 0",
+        ));
+        return DatasetRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            futures::stream::once(std::future::ready(Err(error))),
+        )));
+    }
     let dataset = Arc::new(dataset.clone());
     let batch_stream = row_ranges
         .map(move |res| {
@@ -636,6 +647,7 @@ mod test {
     use lance_core::utils::deletion::DeletionVector;
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_io::stream::RecordBatchStream;
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
@@ -1763,6 +1775,60 @@ mod test {
         assert_eq!(
             results[2].column(0).as_primitive::<Int32Type>().values(),
             &[1],
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_scan_readahead(
+        #[values(0, 1)] batch_readahead: usize,
+        #[values(false, true)] empty_input: bool,
+    ) {
+        let data = test_batch(0..4);
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let ranges = if empty_input { vec![] } else { vec![Ok(0..3)] };
+        let mut stream = dataset.take_scan(
+            futures::stream::iter(ranges).boxed(),
+            Arc::new(dataset.schema().clone()),
+            batch_readahead,
+        );
+        assert_eq!(
+            stream.schema().as_ref(),
+            &ArrowSchema::from(dataset.schema())
+        );
+
+        if batch_readahead == 0 {
+            let error = tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .expect("zero readahead must not hang")
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("batch_readahead must be greater than 0, got 0"),
+                "{error}"
+            );
+        } else if !empty_input {
+            assert_eq!(stream.next().await.unwrap().unwrap().num_rows(), 3);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .expect("take stream must terminate")
+                .is_none()
         );
     }
 

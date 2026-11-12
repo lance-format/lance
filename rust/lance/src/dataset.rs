@@ -2311,6 +2311,8 @@ impl Dataset {
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
     ///
+    /// `batch_readahead` must be greater than zero; otherwise the stream yields an invalid-input error.
+    ///
     /// This is an experimental API. It may change at any time.
     pub fn take_scan(
         &self,
