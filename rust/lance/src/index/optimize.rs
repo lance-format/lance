@@ -1020,11 +1020,14 @@ async fn plan_split_scalar_index(
 }
 
 /// Whether a split build can merge the bloom filter segments it would absorb
-/// by their zones. Where it cannot, the index stays one task, which rebuilds
-/// them as before: a tagged history or a shallow clone's base is beyond the
-/// split merge, only a rebuild catches up a pending compaction remap, and a
-/// segment must record its null rows and share the parameters of the newest
-/// segment, which the build tasks use.
+/// by their zones. Where it cannot, the index stays one task, as before: a
+/// tagged history or a shallow clone's base is beyond the split merge, only a
+/// rebuild catches up a pending compaction remap, and a segment must record
+/// its null rows and share the parameters of the newest segment, which the
+/// build tasks use. Nor may a segment hold zones of a fragment that a column
+/// rewrite took out of it: a task would keep them through `update`, and a
+/// segment left alone in its bin keeps answering from them once another task
+/// indexes the fragment.
 async fn bloomfilter_split_merges(
     dataset: &Dataset,
     tagged: bool,
@@ -1049,12 +1052,21 @@ async fn bloomfilter_split_merges(
     if absorbed.iter().any(|segment| segment.base_id.is_some()) {
         return Ok(false);
     }
-    if let Some(frag_reuse_index) = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?
-        && fragment_reuse_affects_segments(&frag_reuse_index, absorbed.iter().copied())
+    let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
+    if let Some(frag_reuse_index) = &frag_reuse_index
+        && fragment_reuse_affects_segments(frag_reuse_index, absorbed.iter().copied())
     {
         return Ok(false);
     }
-    scalar::bloomfilter::segments_merge_by_zones(dataset, reference, &absorbed).await
+    if !scalar::bloomfilter::segments_merge_by_zones(dataset, reference, &absorbed).await? {
+        return Ok(false);
+    }
+    Ok(!scalar::bloomfilter::segments_hold_rewritten_fragments(
+        dataset,
+        frag_reuse_index.as_deref(),
+        &absorbed,
+    )
+    .await?)
 }
 
 /// Train a fresh model over the whole table and plan every live fragment
@@ -2324,16 +2336,11 @@ mod tests {
         assert_bloom_answers(&dataset, &(0..250).collect::<Vec<_>>()).await;
     }
 
-    /// A column rewrite takes the rewritten fragment out of the segment that
-    /// covered it. The merge leaves that fragment's old zones and null rows
-    /// out and indexes the fragment anew.
-    #[tokio::test]
-    async fn test_bloom_filter_merge_after_a_column_rewrite() {
-        let test_dir = TempStrDir::default();
-        let dataset = bloom_dataset(&test_dir, 0).await;
-        // Row 52, the third of fragment 1, holds a null `value`.
-        assert!(value_is_null(52));
-        let mut fragment = dataset.get_fragment(1).unwrap();
+    /// Rewrite the `value` of row `id`, in its 50-row fragment, to `id * 100`
+    /// in place, as a `RewriteColumns` update does.
+    async fn rewrite_value(dataset: Dataset, uri: &str, id: i32) -> Dataset {
+        let (fragment_id, offset) = (id as u64 / 50, id as u64 % 50);
+        let mut fragment = dataset.get_fragment(fragment_id as usize).unwrap();
         let schema = Arc::new(Schema::new(vec![
             Field::new(ROW_ID, DataType::UInt64, false),
             Field::new("value", DataType::Int32, true),
@@ -2341,8 +2348,8 @@ mod tests {
         let rewrite = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(UInt64Array::from(vec![(1_u64 << 32) + 2])),
-                Arc::new(Int32Array::from(vec![5200])),
+                Arc::new(UInt64Array::from(vec![(fragment_id << 32) + offset])),
+                Arc::new(Int32Array::from(vec![id * 100])),
             ],
         )
         .unwrap();
@@ -2355,8 +2362,8 @@ mod tests {
             .await
             .unwrap();
         let updated_fragment_id = updated.fragment.id;
-        let mut dataset = Dataset::commit(
-            test_dir.as_str(),
+        Dataset::commit(
+            uri,
             Operation::Update {
                 removed_fragment_ids: vec![],
                 updated_fragments: vec![updated.fragment],
@@ -2379,25 +2386,148 @@ mod tests {
             true,
         )
         .await
-        .unwrap();
-        assert!(!coverage(&segments(&dataset, BLOOM_INDEX).await).contains(1));
-        let other_files = [data_files(&dataset, 0..1), data_files(&dataset, 2..4)].concat();
+        .unwrap()
+    }
 
+    /// A column rewrite takes the rewritten fragment out of the segment that
+    /// covered it. The merge leaves that fragment's old zones and null rows
+    /// out and indexes the fragment anew. A bounded optimize keeps the index
+    /// in one task for that, since a split would keep them: in the task that
+    /// folds the segment in alone, or in the segment left alone in its bin.
+    #[rstest::rstest]
+    #[case::unbounded(52, OptimizeOptions::merge(2))]
+    #[case::segment_in_the_build_bin(
+        52,
+        OptimizeOptions::merge(2)
+            .max_rows_per_task(Some(25))
+            .max_rows_per_segment(Some(100))
+    )]
+    #[case::segment_alone_in_its_bin(150, OptimizeOptions::merge(2).max_rows_per_segment(Some(50)))]
+    #[tokio::test]
+    async fn test_bloom_filter_merge_after_a_column_rewrite(
+        #[case] rewritten: i32,
+        #[case] options: OptimizeOptions,
+    ) {
+        let test_dir = TempStrDir::default();
+        let dataset = bloom_dataset(&test_dir, 0).await;
+        assert!(value_is_null(rewritten));
+        let mut dataset = rewrite_value(dataset, test_dir.as_str(), rewritten).await;
+        let fragment_id = rewritten as u64 / 50;
+        assert!(!coverage(&segments(&dataset, BLOOM_INDEX).await).contains(fragment_id as u32));
+        let other_files = [
+            data_files(&dataset, 0..fragment_id),
+            data_files(&dataset, fragment_id + 1..4),
+        ]
+        .concat();
+
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(task_groups(&plan), vec![(0, vec![fragment_id as u32])]);
+        assert_eq!(plan.tasks[0].old_segments.len(), 2);
         read_paths(&dataset);
-        dataset
-            .optimize_indices(&OptimizeOptions::merge(2))
-            .await
-            .unwrap();
+        dataset.optimize_indices(&options).await.unwrap();
         let paths = read_paths(&dataset);
+        assert!(
+            read_any(&paths, &data_files(&dataset, fragment_id..fragment_id + 1)),
+            "{paths:?}"
+        );
         assert!(!read_any(&paths, &other_files), "{paths:?}");
         let segments = segments(&dataset, BLOOM_INDEX).await;
         assert_eq!(segments.len(), 1);
         assert_eq!(coverage(&segments), *dataset.fragment_bitmap.as_ref());
-        assert_eq!(ids_where(&dataset, "value = 5200").await, vec![52]);
+        // One zone per fragment, so no old zone of the rewritten fragment is left.
+        let index = dataset
+            .open_scalar_index("value", &segments[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(index.statistics().unwrap()["num_blocks"], 4);
+        assert_eq!(
+            ids_where(&dataset, &format!("value = {}", rewritten * 100)).await,
+            vec![rewritten]
+        );
         let unchanged = (0..200)
-            .filter(|id| *id != 1 && *id != 52)
+            .filter(|id| *id != 1 && *id != rewritten)
             .collect::<Vec<_>>();
         assert_bloom_answers(&dataset, &unchanged).await;
+    }
+
+    /// A compaction that defers the index remap may move a rewritten
+    /// fragment's rows, and the fragment reuse index then translates its old
+    /// zones and null rows onto the new fragment. They keep a bounded optimize
+    /// in one task all the same.
+    #[tokio::test]
+    async fn test_bloom_filter_merge_after_a_column_rewrite_and_a_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let dataset = bloom_dataset(&test_dir, 0).await;
+        let mut dataset = rewrite_value(dataset, test_dir.as_str(), 150).await;
+        // The deletions make fragment 3 the only one to compact.
+        dataset.delete("id >= 190").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 50,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *dataset.fragment_bitmap.as_ref(),
+            RoaringBitmap::from_iter([0, 1, 2, 4])
+        );
+        let frag_reuse_index = dataset
+            .open_frag_reuse_index(&NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fragment_reuse_affects_segments(
+            &frag_reuse_index,
+            segments(&dataset, BLOOM_INDEX).await.iter()
+        ));
+
+        let options = OptimizeOptions::merge(2).max_rows_per_segment(Some(90));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(task_groups(&plan), vec![(0, vec![4])]);
+        assert_eq!(plan.tasks[0].old_segments.len(), 2);
+        dataset.optimize_indices(&options).await.unwrap();
+        assert_eq!(ids_where(&dataset, "value = 15000").await, vec![150]);
+        let unchanged = (0..190)
+            .filter(|id| *id != 1 && *id != 150)
+            .collect::<Vec<_>>();
+        assert_bloom_answers(&dataset, &unchanged).await;
+    }
+
+    /// `update` keeps the zones of a deleted fragment while the segment's
+    /// coverage drops it. A column rewrite did not leave those zones, so they
+    /// do not keep a bounded optimize in one task.
+    #[tokio::test]
+    async fn test_bloom_filter_segments_split_with_zones_of_a_deleted_fragment() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = bloom_dataset(&test_dir, 0).await;
+        dataset.delete("id >= 150").await.unwrap(); // fragment 3
+        append(&mut dataset, 50, 50).await; // fragment 4
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let updated = segments(&dataset, BLOOM_INDEX).await.pop().unwrap();
+        assert_eq!(
+            updated.fragment_bitmap,
+            Some(RoaringBitmap::from_iter([2u32, 4]))
+        );
+        // One zone per fragment, the deleted fragment 3 included.
+        let index = dataset
+            .open_scalar_index("value", &updated.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(index.statistics().unwrap()["num_blocks"], 3);
+
+        append(&mut dataset, 50, 25).await; // fragments 5 and 6
+        let options = OptimizeOptions::merge(2).max_rows_per_task(Some(25));
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(task_groups(&plan), vec![(0, vec![5]), (0, vec![6])]);
+        assert_eq!(plan.merges[0].old_segments.len(), 2);
     }
 
     /// Only a rebuild catches up a pending compaction remap, so the segments it

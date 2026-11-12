@@ -706,6 +706,52 @@ pub async fn read_bloomfilter_file_info(store: &dyn IndexStore) -> Result<BloomF
     })
 }
 
+/// Read the fragments the zones of a stored BloomFilter index belong to, from
+/// the `fragment_id` column of its zones, without loading the filters. The
+/// ids are as stored, untranslated by any fragment reuse index, so they may
+/// name fragments deleted or compacted away since the zones were trained.
+///
+/// # Examples
+///
+/// ```no_run
+/// use lance_core::Result;
+/// use lance_index::scalar::IndexStore;
+/// use lance_index::scalar::bloomfilter::read_bloomfilter_zone_fragments;
+/// use roaring::RoaringBitmap;
+///
+/// /// The live fragments the index holds zones of but does not cover.
+/// async fn uncovered_zone_fragments(
+///     store: &dyn IndexStore,
+///     live: &RoaringBitmap,
+///     covered: &RoaringBitmap,
+/// ) -> Result<RoaringBitmap> {
+///     Ok((read_bloomfilter_zone_fragments(store).await? & live) - covered)
+/// }
+/// ```
+pub async fn read_bloomfilter_zone_fragments(store: &dyn IndexStore) -> Result<RoaringBitmap> {
+    let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
+    let zones = index_file
+        .read_range(0..index_file.num_rows(), Some(&["fragment_id"]))
+        .await?;
+    let fragment_ids = zones
+        .column_by_name("fragment_id")
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| {
+            Error::invalid_input("BloomFilterIndex: missing UInt64 'fragment_id' column")
+        })?;
+    fragment_ids
+        .values()
+        .iter()
+        .map(|&fragment_id| {
+            u32::try_from(fragment_id).map_err(|_| {
+                Error::invalid_input(format!(
+                    "BloomFilterIndex: zone fragment id {fragment_id} does not fit a fragment id"
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
 ///
 /// Each source contributes the zones and null rows of the fragments its filter
@@ -1706,6 +1752,7 @@ mod tests {
             BloomFilterFileInfo, BloomFilterIndex, BloomFilterIndexBuilder,
             BloomFilterIndexBuilderParams, merge_bloomfilter_indices,
             merge_bloomfilter_indices_with_new_data, read_bloomfilter_file_info,
+            read_bloomfilter_zone_fragments,
         },
         lance_format::LanceIndexStore,
     };
@@ -3181,7 +3228,15 @@ mod tests {
         use crate::scalar::bloomfilter::BLOOMFILTER_ITEM_META_KEY;
 
         let params = BloomFilterIndexBuilderParams::new(500, 0.01);
-        let (_trained_dir, trained_store, _) = train_segment(&params, &[(0, vec![Some(1)])]).await;
+        let (_trained_dir, trained_store, _) = train_segment(
+            &params,
+            &[
+                (0, vec![Some(1), None]),
+                (3, vec![None]),
+                (7, vec![Some(2)]),
+            ],
+        )
+        .await;
         assert_eq!(
             read_bloomfilter_file_info(trained_store.as_ref())
                 .await
@@ -3190,6 +3245,12 @@ mod tests {
                 params,
                 has_null_rows: true,
             }
+        );
+        assert_eq!(
+            read_bloomfilter_zone_fragments(trained_store.as_ref())
+                .await
+                .unwrap(),
+            RoaringBitmap::from_iter([0, 3, 7])
         );
 
         let (_legacy_dir, legacy_store) = index_store();
@@ -3202,6 +3263,12 @@ mod tests {
                 params: BloomFilterIndexBuilderParams::new(1000, 0.01),
                 has_null_rows: false,
             }
+        );
+        assert_eq!(
+            read_bloomfilter_zone_fragments(legacy_store.as_ref())
+                .await
+                .unwrap(),
+            RoaringBitmap::from_iter([0])
         );
 
         // A parameter the metadata lacks, or cannot parse, reads as its default.
