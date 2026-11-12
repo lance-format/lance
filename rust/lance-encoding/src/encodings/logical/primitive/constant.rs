@@ -21,7 +21,7 @@ use crate::{
     decoder::PageEncoding,
     encoder::EncodedPage,
     encodings::logical::primitive::{
-        CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
+        CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask, PageValues,
     },
     format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
@@ -319,6 +319,17 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
             decoder_fut: std::future::ready(Ok(decoder)).boxed(),
             num_rows,
         }])
+    }
+
+    fn known_values(&self, _data_type: &DataType) -> Result<PageValues> {
+        match &self.repdef {
+            None => Ok(PageValues::NotLoaded),
+            Some(state) if state.scalar.null_count() == 0 => Ok(PageValues::AnyOf {
+                values: state.scalar.clone(),
+                may_have_nulls: !self.def_meaning.iter().all(|def| def.is_all_valid()),
+            }),
+            Some(_) => Ok(PageValues::Unknown),
+        }
     }
 }
 
