@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
+use lance_index::frag_reuse::CompactFragReuseIndex;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::bloomfilter::{
     BloomFilterIndex, merge_bloomfilter_indices, merge_bloomfilter_indices_with_new_data,
-    read_bloomfilter_file_info,
+    read_bloomfilter_file_info, read_bloomfilter_zone_fragments,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, index_files_to_table};
@@ -167,4 +168,39 @@ pub(in crate::index) async fn segments_merge_by_zones(
         }
     }
     Ok(true)
+}
+
+/// Whether any of `segments` holds zones of a fragment outside its coverage
+/// that still answer queries: an in-place column rewrite takes the fragment
+/// out of the segment and leaves its zones and null rows in the file. Such
+/// zones answer while the fragment is live, and after a compaction moves its
+/// rows too, since `frag_reuse_index` translates them onto the new fragment.
+pub(in crate::index) async fn segments_hold_rewritten_fragments(
+    dataset: &Dataset,
+    frag_reuse_index: Option<&CompactFragReuseIndex>,
+    segments: &[&IndexMetadata],
+) -> Result<bool> {
+    let mut answering = dataset.fragment_bitmap.as_ref().clone();
+    if let Some(frag_reuse_index) = frag_reuse_index {
+        answering.extend(
+            frag_reuse_index
+                .details
+                .versions
+                .iter()
+                .flat_map(|version| version.old_frag_ids())
+                .map(|fragment_id| fragment_id as u32),
+        );
+    }
+    for segment in segments {
+        let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+        let mut outside = read_bloomfilter_zone_fragments(&store).await?;
+        outside &= &answering;
+        if let Some(covered) = &segment.fragment_bitmap {
+            outside -= covered;
+        }
+        if !outside.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
