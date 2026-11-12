@@ -197,7 +197,7 @@ impl DecodeMiniBlockTask {
             let group_rows = group.iter().fold(0_u64, |acc, (inst, _)| {
                 acc.saturating_add(inst.rows_to_take)
             });
-            let use_full_unpack = group_rows > InlineBitpacking::SPARSE_UNPACK_THRESHOLD;
+            let cache_chunk = InlineBitpacking::should_cache_chunk(group.len(), group_rows);
 
             for (instruction, inst_chunk) in group {
                 let start = instruction
@@ -231,7 +231,7 @@ impl DecodeMiniBlockTask {
                     inst_chunk.items_in_chunk,
                     start..end,
                     inst_chunk.chunk_idx,
-                    use_full_unpack,
+                    cache_chunk,
                     &mut output,
                     &mut scratch,
                     &mut cached_chunk_idx,

@@ -331,6 +331,16 @@ impl InlineBitpacking {
     /// before falling back to a full 1024-element SIMD unpack.
     pub(crate) const SPARSE_UNPACK_THRESHOLD: u64 = 32;
 
+    /// Returns true when multiple instructions target the same chunk and their
+    /// combined row count exceeds [`Self::SPARSE_UNPACK_THRESHOLD`], making it
+    /// cheaper to unpack the chunk once into `scratch` and slice across the group.
+    /// Singleton groups always return `false` so full-chunk scans unpack directly
+    /// into `output` without allocating `scratch`.
+    #[inline]
+    pub(crate) const fn should_cache_chunk(group_len: usize, group_rows: u64) -> bool {
+        group_len > 1 && group_rows > Self::SPARSE_UNPACK_THRESHOLD
+    }
+
     fn unchunk_range<T: ArrowNativeType + BitPackingUninit + Pod>(
         data: LanceBuffer,
         num_values: u64,
@@ -408,7 +418,7 @@ impl InlineBitpacking {
         num_values: u64,
         selection: Range<u64>,
         chunk_idx: usize,
-        use_full_unpack: bool,
+        cache_chunk: bool,
         output: &mut Vec<T>,
         scratch: &mut Vec<T>,
         cached_chunk_idx: &mut Option<usize>,
@@ -430,7 +440,7 @@ impl InlineBitpacking {
             return Ok(());
         }
 
-        if num_values == ELEMS_PER_CHUNK && selection == (0..ELEMS_PER_CHUNK) && !use_full_unpack {
+        if num_values == ELEMS_PER_CHUNK && selection == (0..ELEMS_PER_CHUNK) && !cache_chunk {
             let previous_len = output.len();
             let next_len = previous_len
                 .checked_add(ELEMS_PER_CHUNK as usize)
@@ -456,7 +466,7 @@ impl InlineBitpacking {
         }
 
         if *cached_chunk_idx != Some(chunk_idx)
-            && !use_full_unpack
+            && !cache_chunk
             && (selection.end - selection.start) <= Self::SPARSE_UNPACK_THRESHOLD
         {
             let packed = &words[1..];
@@ -1156,12 +1166,13 @@ mod test {
         let mut output = Vec::<T>::with_capacity(num_values + 50);
         let mut scratch = Vec::<T>::new();
         let mut cached_chunk_idx = None;
+        let singleton_cache = InlineBitpacking::should_cache_chunk(1, num_values as u64);
         InlineBitpacking::append_selected(
             &data,
             num_values as u64,
             0..num_values as u64,
             7,
-            false,
+            singleton_cache,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
@@ -1169,36 +1180,60 @@ mod test {
         .unwrap();
         assert_eq!(output, values[..num_values]);
         if num_values == ELEMS_PER_CHUNK as usize {
-            assert!(scratch.is_empty());
+            assert!(
+                scratch.is_empty() && scratch.capacity() == 0,
+                "singleton full-chunk decode must write directly to output without allocating scratch"
+            );
+            assert_eq!(cached_chunk_idx, None);
         } else {
             assert_eq!(scratch.len(), ELEMS_PER_CHUNK as usize);
         }
 
-        // Sparse O(1) extraction avoids allocating or populating scratch.
-        let mut sparse_out = Vec::<T>::with_capacity(10);
+        // Sparse O(1) extraction avoids allocating or populating scratch, including
+        // when multiple sparse instructions stay within SPARSE_UNPACK_THRESHOLD.
+        let mut sparse_out = Vec::<T>::with_capacity(20);
         let mut sparse_scratch = Vec::<T>::new();
         let mut sparse_cached = None;
+        let sparse_group_cache = InlineBitpacking::should_cache_chunk(2, 20);
+        assert!(!sparse_group_cache);
         InlineBitpacking::append_selected(
             &data,
             num_values as u64,
             10..20,
             7,
-            false,
+            sparse_group_cache,
             &mut sparse_out,
             &mut sparse_scratch,
             &mut sparse_cached,
         )
         .unwrap();
-        assert_eq!(sparse_out, values[10..20]);
-        assert!(sparse_scratch.is_empty());
-        assert_eq!(sparse_cached, None);
-
         InlineBitpacking::append_selected(
             &data,
             num_values as u64,
-            10..20,
+            25..35,
             7,
-            true,
+            sparse_group_cache,
+            &mut sparse_out,
+            &mut sparse_scratch,
+            &mut sparse_cached,
+        )
+        .unwrap();
+        assert_eq!(sparse_out, [&values[10..20], &values[25..35]].concat());
+        assert!(sparse_scratch.is_empty() && sparse_scratch.capacity() == 0);
+        assert_eq!(sparse_cached, None);
+
+        // Multi-instruction groups exceeding SPARSE_UNPACK_THRESHOLD unpack once into
+        // scratch even when each individual range is <= SPARSE_UNPACK_THRESHOLD.
+        let dense_group_cache = InlineBitpacking::should_cache_chunk(2, 40);
+        assert!(dense_group_cache);
+        let prev_len = output.len();
+        output.reserve(40);
+        InlineBitpacking::append_selected(
+            &data,
+            num_values as u64,
+            10..30,
+            7,
+            dense_group_cache,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
@@ -1207,19 +1242,20 @@ mod test {
         InlineBitpacking::append_selected(
             &data,
             num_values as u64,
-            15..25,
+            15..35,
             7,
-            true,
+            dense_group_cache,
             &mut output,
             &mut scratch,
             &mut cached_chunk_idx,
         )
         .unwrap();
         assert_eq!(
-            &output[num_values..],
-            [&values[10..20], &values[15..25]].concat()
+            &output[prev_len..],
+            [&values[10..30], &values[15..35]].concat()
         );
         assert_eq!(scratch.len(), ELEMS_PER_CHUNK as usize);
+        assert_eq!(cached_chunk_idx, Some(7));
     }
 
     #[rstest]
