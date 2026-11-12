@@ -493,9 +493,9 @@ impl TryFrom<pb::IndexMetadata> for IndexMetadata {
             .transpose()?;
 
         // An empty map means the segment uses its stored fragment IDs.
-        if !proto.fragment_id_map.is_empty() {
+        if !proto.local_fragment_aliases.is_empty() {
             return Err(Error::not_supported(
-                "index segment has a fragment ID map, which this build does not support yet",
+                "index segment has local fragment aliases, which this build does not support yet",
             ));
         }
 
@@ -582,7 +582,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
-            fragment_id_map: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -742,26 +742,29 @@ mod tests {
     }
 
     #[test]
-    fn test_index_metadata_empty_fragment_id_map_round_trips() {
+    fn test_index_metadata_empty_local_fragment_aliases_round_trip() {
         let metadata = index_metadata_with(vec![0], vec![]);
         let proto = pb::IndexMetadata::from(&metadata);
-        assert!(proto.fragment_id_map.is_empty());
+        assert!(proto.local_fragment_aliases.is_empty());
 
         let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert!(decoded.fragment_id_map.is_empty());
+        assert!(decoded.local_fragment_aliases.is_empty());
         assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
     }
 
     #[test]
-    fn test_index_metadata_rejects_fragment_id_map() {
+    fn test_index_metadata_rejects_local_fragment_aliases() {
         let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
-        proto.fragment_id_map.insert(17, 42);
+        proto.local_fragment_aliases.insert(17, 42);
         let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded.fragment_id_map.get(&17), Some(&42));
+        assert_eq!(decoded.local_fragment_aliases.get(&17), Some(&42));
 
         let err = IndexMetadata::try_from(decoded).unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
-        assert!(err.to_string().contains("fragment ID map"), "got: {err}");
+        assert!(
+            err.to_string().contains("local fragment aliases"),
+            "got: {err}"
+        );
     }
 
     #[test]

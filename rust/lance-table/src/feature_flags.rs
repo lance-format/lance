@@ -136,9 +136,10 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
-/// Reserved for local fragment aliases (`IndexMetadata.fragment_id_map`).
-/// Readers and writers reject it until readers and index maintenance support aliases.
-/// This takes the next free bit.
+/// Reserved for local fragment aliases (`IndexMetadata.local_fragment_aliases`).
+/// Both reader and writer bits are required while any retained index segment
+/// has aliases. The flag is non-sticky and unsupported until reader and
+/// index maintenance support lands.
 pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 21;
@@ -609,6 +610,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
+        (FLAG_LOCAL_FRAGMENT_ALIASES, "local fragment aliases"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -916,10 +918,59 @@ mod tests {
     }
 
     #[test]
-    fn test_local_fragment_aliases_flag_is_reserved() {
+    fn test_local_fragment_aliases_are_paired_and_not_sticky() {
         assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
         assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
         assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(STICKY_PAIRED_FLAGS & FLAG_LOCAL_FRAGMENT_ALIASES, 0);
+
+        for (reader, writer) in [
+            (FLAG_LOCAL_FRAGMENT_ALIASES, 0),
+            (0, FLAG_LOCAL_FRAGMENT_ALIASES),
+        ] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("local fragment aliases"),
+                "{error}"
+            );
+        }
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        manifest.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        validate_paired_feature_flags(&manifest).unwrap();
+        let error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+
+        let mut source = empty_manifest();
+        source.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        source.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        assert_eq!(
+            destination.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            destination.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
     }
 
     #[test]
