@@ -269,6 +269,7 @@ impl Schema {
         columns: &[T],
         err_on_missing: bool,
         preserve_system_columns: bool,
+        err_on_missing_nested: bool,
     ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         // A linear scan of the fields per requested column is quadratic when
@@ -294,6 +295,10 @@ impl Schema {
             };
             if let Some(field_idx) = field_idx {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+                if err_on_missing_nested && self.fields[field_idx].sub_field(&split_refs).is_none()
+                {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 let projected_field = self.fields[field_idx].project(&split_refs)?;
                 if let Some(&pos) = candidate_pos.get(&field_idx) {
                     candidates[pos].merge(&projected_field)?;
@@ -339,12 +344,12 @@ impl Schema {
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
     pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true, false)
+        self.do_project(columns, true, false, false)
     }
 
     /// Project the columns over the schema, dropping unrecognized columns
     pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, false, false)
+        self.do_project(columns, false, false, false)
     }
 
     /// Project the columns over the schema, preserving system columns.
@@ -353,14 +358,7 @@ impl Schema {
     /// is an error rather than a parent struct with no children, because the
     /// columns usually come from a user.
     pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        let projected = self.do_project(columns, true, true)?;
-        for column in columns {
-            let column = column.as_ref();
-            if column.contains('.') && projected.field(column).is_none() {
-                return Err(Error::field_not_found(column, self.field_paths()));
-            }
-        }
-        Ok(projected)
+        self.do_project(columns, true, true, true)
     }
 
     /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
@@ -2550,13 +2548,30 @@ mod tests {
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
-        // A missing nested field is an error, wherever the path stops resolving.
+        // A missing nested field is an error, wherever the path stops resolving
+        // and whether or not another path under the same column comes first.
         for missing in ["b.nope", "c.nope", "b.f1.nope", "nope"] {
-            let err = schema
-                .project_preserve_system_columns(&["a", missing])
+            for columns in [["a", missing], ["b.f1", missing]] {
+                let err = schema
+                    .project_preserve_system_columns(&columns)
+                    .unwrap_err();
+                assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+                assert!(err.to_string().contains(missing), "{err}");
+            }
+        }
+
+        // A list whose projection would have no item is not merged.
+        let list_schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            true,
+        )]))
+        .unwrap();
+        for columns in [["l.item", "l.nope"], ["l.nope", "l.item"]] {
+            let err = list_schema
+                .project_preserve_system_columns(&columns)
                 .unwrap_err();
             assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
-            assert!(err.to_string().contains(missing), "{err}");
         }
     }
 
