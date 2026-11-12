@@ -2272,21 +2272,17 @@ async fn test_ann_with_deletion(
             .filter(|entry| {
                 matches!(
                     entry.type_name.as_str(),
-                    "CachedRowIdIndex" | "LatestRowIdIndex" | "RowIdIndexPart"
+                    "RowIdIndex" | "PreparedRowIdFragment"
                 )
             })
             .map(|entry| (entry.type_name.as_str(), entry.num_entries))
             .collect();
-        // The snapshot directory and reuse hint do not own the prepared graph;
-        // that allocation is cached and charged separately.
+        // Explicit complete-index loading and demand fragment lookups each
+        // own the allocations charged under their cache type.
         assert_eq!(
             row_id_entries,
             if stable_row_ids {
-                vec![
-                    ("CachedRowIdIndex", 1),
-                    ("LatestRowIdIndex", 1),
-                    ("RowIdIndexPart", 1),
-                ]
+                vec![("RowIdIndex", 1)]
             } else {
                 vec![]
             }

@@ -3,7 +3,6 @@
 
 //! Resolve requested IDs while preserving complete-index lookup semantics.
 
-use std::collections::HashMap;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -12,18 +11,13 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::{Fragment, RowIdMeta};
-use lance_table::rowids::{FragmentRowIdIndex, RowIdIndex, RowIdIndexPart, RowIdIndexView};
+use lance_table::rowids::RowIdIndex;
 
-use crate::session::index_caches::{
-    LatestRowIdIndexKey, PreparedRowIdFragmentKey, PreparedRowIdPartKey, RowIdFragmentSpanKey,
-};
+use crate::session::index_caches::{PreparedRowIdFragmentKey, RowIdFragmentSpanKey};
 use crate::{Dataset, Error, Result};
 
-use super::cache::{
-    CachedFragment, RowIdIndexSize, RowIdIndexSizeKey, deletion_identity, load_source,
-    sequence_identity,
-};
-use super::{get_row_id_index_with, overlapping_id_spans, read_row_id_sequence};
+use super::cache::{deletion_identity, load_source, sequence_identity};
+use super::{get_row_id_index_with, read_row_id_sequence};
 
 /// Small encoded inline sources need no CPU-pool dispatch to prepare a lookup.
 const INLINE_PREPARE_BYTES: usize = 16 * 1024;
@@ -41,47 +35,17 @@ impl DeepSizeOf for FragmentSpan {
     }
 }
 
+/// One cache-owned fragment lookup. Active callers keep the same allocation
+/// alive through eviction; preparation registries retain only weak references.
 #[derive(Debug)]
-pub(super) struct PreparedFragment {
+pub struct PreparedFragment {
     index: Option<Arc<RowIdIndex>>,
     span: Option<RangeInclusive<u64>>,
-    pub(super) parts: Vec<Arc<RowIdIndexPart>>,
-    part_keys: Vec<PreparedRowIdPartKey>,
 }
 
-/// A fragment directory owns no lookup graph; part entries own and charge it.
-#[derive(Debug)]
-pub struct CachedPreparedFragment {
-    index: Option<RowIdIndexView>,
-    span: Option<RangeInclusive<u64>>,
-    part_keys: Vec<PreparedRowIdPartKey>,
-}
-
-impl DeepSizeOf for CachedPreparedFragment {
+impl DeepSizeOf for PreparedFragment {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.index.deep_size_of_children(context) + self.part_keys.deep_size_of_children(context)
-    }
-}
-
-impl PreparedFragment {
-    fn downgrade(&self) -> CachedPreparedFragment {
-        CachedPreparedFragment {
-            index: self.index.as_ref().map(|index| index.downgrade()),
-            span: self.span.clone(),
-            part_keys: self.part_keys.clone(),
-        }
-    }
-}
-
-impl CachedPreparedFragment {
-    async fn upgrade(&self, dataset: &Dataset) -> Option<Arc<PreparedFragment>> {
-        let parts = super::parts::acquire(dataset, &self.part_keys).await;
-        Some(Arc::new(PreparedFragment {
-            index: Some(Arc::new(self.index.as_ref()?.upgrade()?)),
-            span: self.span.clone(),
-            parts,
-            part_keys: self.part_keys.clone(),
-        }))
+        self.index.deep_size_of_children(context)
     }
 }
 
@@ -109,32 +73,6 @@ pub async fn resolve_row_ids(
             .map(|index| index.get_many(row_ids))
             .transpose();
     }
-    let key = super::cache::view_key(dataset, true)?;
-    if let Some(cached) = dataset.index_cache.get_with_key(&key).await
-        && let Some(result) = cached.resolve(dataset, row_ids).await?
-    {
-        return Ok(Some(result));
-    }
-    // Reuse an earlier complete view without serializing resident fragment
-    // lookups behind a dataset lock. Full construction coordinates separately.
-    for mode in [true, false] {
-        if let Some(last) = dataset
-            .index_cache
-            .get_with_key(&LatestRowIdIndexKey {
-                with_deletions: mode,
-            })
-            .await
-            && (last.version != key.version
-                || last.e_tag != key.e_tag
-                || mode != key.with_deletions)
-        {
-            return get_row_id_index_with(dataset, true)
-                .await?
-                .map(|index| index.get_many(row_ids))
-                .transpose();
-        }
-    }
-
     // Sort once for fragment-bound slicing, but retain every original position.
     // Only the exclusive allocation bound can discard IDs without inspecting
     // candidate sources; a match never ends the search for another live copy.
@@ -153,8 +91,6 @@ pub async fn resolve_row_ids(
     let mut cached_fragments = 0;
     let mut excluded_fragments = 0;
     let mut resident = Vec::new();
-    let mut resident_bytes = 0;
-    let mut sizing = Context::default();
     // Consume every hit before admitting misses: a scan under cache pressure
     // must not evict a useful resident entry before this request has queried it.
     for fragment in dataset.manifest.fragments.iter() {
@@ -169,12 +105,9 @@ pub async fn resolve_row_ids(
                 excluded_fragments += 1;
                 continue;
             }
-            if let Some(prepared) = cached.upgrade(dataset).await {
-                resident_bytes += prepared.parts.deep_size_of_children(&mut sizing);
-                resident.push((prepared, range));
-                cached_fragments += 1;
-                continue;
-            }
+            resident.push((cached, range));
+            cached_fragments += 1;
+            continue;
         }
         let span_key = RowIdFragmentSpanKey { source: key.source };
         if let Some(span) = dataset.metadata_cache.get_with_key(&span_key).await {
@@ -185,53 +118,6 @@ pub async fn resolve_row_ids(
             }
         }
         misses.push((fragment, key, range));
-    }
-    // A batch that reaches every resident fragment should use the core's
-    // global routing/cost model when that working set fits one cache entry.
-    // Partial requests and pressured working sets keep demand resolution.
-    // Cold sources are still inspected before their bounds can prune a batch.
-    let complete_fits = if let Some(limit) = dataset.index_cache.max_entry_bytes() {
-        resident_bytes as u64 <= limit
-            && dataset
-                .metadata_cache
-                .get_with_key(&RowIdIndexSizeKey {
-                    with_deletions: true,
-                })
-                .await
-                .is_none_or(|size| !size.exceeds(dataset, limit))
-    } else {
-        false
-    };
-    if unique_ids.len() > 1
-        && resident.len() > 1
-        && misses.is_empty()
-        && excluded_fragments == 0
-        && complete_fits
-    {
-        tracing::debug!(
-            event = "row_id_fragment_batch_promotion",
-            candidate_fragments = resident.len(),
-            resident_bytes,
-            requested_ids = row_ids.len(),
-            "use complete routing for a fully resident batch"
-        );
-        drop(resident);
-        let cached = super::cache::get(dataset, true).await?;
-        if let Some(limit) = dataset.index_cache.max_entry_bytes() {
-            let size = RowIdIndexSize::new(&cached);
-            if size.exceeds(dataset, limit) {
-                dataset
-                    .metadata_cache
-                    .insert_with_key(
-                        &RowIdIndexSizeKey {
-                            with_deletions: true,
-                        },
-                        Arc::new(size),
-                    )
-                    .await;
-            }
-        }
-        return cached.index.get_many(row_ids).map(Some);
     }
     // Consume every resident hit before admitting any source miss.
     for (prepared, range) in resident {
@@ -263,21 +149,17 @@ pub async fn resolve_row_ids(
                 .map(|index| index.get_many(&ids[range.clone()]))
                 .transpose()?
                 .unwrap_or_default();
-            Ok::<_, Error>((key, prepared, range, addresses))
+            Ok::<_, Error>((prepared, range, addresses))
         });
     }
     let mut loads = futures::stream::iter(loads).buffer_unordered(parallelism);
     let mut loaded_fragments = 0;
     let mut prepared_fragments = 0;
-    while let Some((key, prepared, range, addresses)) = loads.try_next().await? {
+    while let Some((prepared, range, addresses)) = loads.try_next().await? {
         loaded_fragments += 1;
         if prepared.index.is_some() {
             record_matches(&unique_ids[range.clone()], &mut found[range], addresses)?;
             prepared_fragments += 1;
-            dataset
-                .index_cache
-                .insert_with_key(&key, Arc::new(prepared.downgrade()))
-                .await;
         }
     }
     tracing::debug!(
@@ -291,7 +173,7 @@ pub async fn resolve_row_ids(
         requested_ids = row_ids.len(),
         unique_requested_ids = unique_ids.len(),
         fragment_batch_calls = cached_fragments + prepared_fragments,
-        "resolved row ids from prepared fragments"
+        "resolved row ids with fragment-only cache"
     );
     let mut result = vec![None; row_ids.len()];
     let mut unique_position = 0;
@@ -342,17 +224,15 @@ async fn prepare_shared(
     {
         return Ok(active.clone());
     }
-    if let Some(cached) = dataset.index_cache.get_with_key(key).await
-        && let Some(active) = cached.upgrade(dataset).await
-    {
-        *slot = Some(active.clone());
-        return Ok(active);
+    if let Some(cached) = dataset.index_cache.get_with_key(key).await {
+        *slot = Some(cached.clone());
+        return Ok(cached);
     }
     let active = Arc::new(prepare_fragment(dataset, fragment, key, row_ids).await?);
     if active.index.is_some() {
         dataset
             .index_cache
-            .insert_with_key(key, Arc::new(active.downgrade()))
+            .insert_with_key(key, active.clone())
             .await;
     }
     dataset
@@ -379,12 +259,7 @@ async fn prepare_fragment(
         )
         .await;
     if candidate_range(&span, row_ids).is_empty() {
-        return Ok(PreparedFragment {
-            index: None,
-            span,
-            parts: Vec::new(),
-            part_keys: Vec::new(),
-        });
+        return Ok(PreparedFragment { index: None, span });
     }
     let source = load_source(dataset, fragment, sequence, true).await?;
     let prepare = move || RowIdIndex::new(&[source]);
@@ -395,19 +270,9 @@ async fn prepare_fragment(
     } else {
         spawn_cpu(prepare).await?
     };
-    let fragments = [CachedFragment {
-        fragment_id: fragment.id as u32,
-        identity: key.source,
-        span: span.clone(),
-        deletion_identity: key.deletion,
-    }];
-    let (part_keys, parts) = super::parts::prepare(dataset, &index, &fragments, &[]).await?;
-    super::parts::admit(dataset, &part_keys, &parts).await;
     Ok(PreparedFragment {
         index: Some(Arc::new(index)),
         span,
-        parts,
-        part_keys,
     })
 }
 
@@ -432,224 +297,6 @@ fn record_matches(
         }
     }
     Ok(())
-}
-
-/// Compose cached prepared fragments and missing raw sources into one charged
-/// view. Snapshot and fragment directories share separately charged parts;
-/// active construction retains leases without cached parent ownership chains.
-pub(super) struct FragmentPromotion {
-    pub index: RowIdIndex,
-    pub fragments: Vec<CachedFragment>,
-    pub units: Vec<(PreparedRowIdFragmentKey, Arc<PreparedFragment>)>,
-    pub loaded_fragments: usize,
-}
-
-pub(super) async fn promote_fragments(
-    dataset: &Dataset,
-    with_deletions: bool,
-    prepared_sources: &[FragmentRowIdIndex],
-) -> Result<Option<FragmentPromotion>> {
-    // A previous complete-view reuse attempt may already have loaded changed
-    // sources using this snapshot's effective deletion policy.
-    let prepared_sources: HashMap<_, _> = prepared_sources
-        .iter()
-        .map(|source| (source.fragment_id, source))
-        .collect();
-    let mut candidates = Vec::with_capacity(dataset.manifest.fragments.len());
-    let mut spans = Vec::with_capacity(dataset.manifest.fragments.len());
-    let mut spans_known = true;
-    for fragment in dataset.manifest.fragments.iter() {
-        let source = sequence_identity(dataset, fragment)?;
-        let deletion = deletion_identity(dataset, fragment, true)?;
-        let live_key = PreparedRowIdFragmentKey { source, deletion };
-        let live = if let Some(cached) = dataset.index_cache.get_with_key(&live_key).await {
-            cached.upgrade(dataset).await
-        } else {
-            None
-        };
-        let raw = if deletion.is_some() {
-            let raw_key = PreparedRowIdFragmentKey {
-                source,
-                deletion: None,
-            };
-            if let Some(cached) = dataset.index_cache.get_with_key(&raw_key).await {
-                cached.upgrade(dataset).await
-            } else {
-                None
-            }
-        } else {
-            live.clone()
-        };
-        let span = if let Some(cached) = live.as_ref().or(raw.as_ref()) {
-            Some(cached.span.clone())
-        } else {
-            dataset
-                .metadata_cache
-                .get_with_key(&RowIdFragmentSpanKey { source })
-                .await
-                .map(|span| span.0.clone())
-        };
-        spans_known &= span.is_some();
-        spans.push(span.flatten());
-        candidates.push((source, deletion, live, raw));
-    }
-    // Ignore-deletions mode still filters overlapping sources. Unknown spans
-    // cannot establish that policy; the normal full loader resolves them.
-    let can_select = spans_known
-        || with_deletions
-        || dataset
-            .manifest
-            .fragments
-            .iter()
-            .all(|fragment| fragment.deletion_file.is_none());
-    let promoted = if can_select {
-        let needs_deletions = if with_deletions {
-            vec![true; candidates.len()]
-        } else {
-            overlapping_id_spans(&spans)
-        };
-        let mut units = Vec::with_capacity(candidates.len());
-        let mut retained = Vec::with_capacity(candidates.len());
-        let mut missing = Vec::with_capacity(candidates.len());
-        let mut fragments = Vec::with_capacity(candidates.len());
-        for (i, (((source, deletion, live, raw), span), needs_deletions)) in candidates
-            .into_iter()
-            .zip(spans)
-            .zip(needs_deletions)
-            .enumerate()
-        {
-            let cached = if needs_deletions { live } else { raw };
-            let deletion = if needs_deletions { deletion } else { None };
-            if let Some(cached) = cached.filter(|cached| cached.index.is_some()) {
-                units.push((PreparedRowIdFragmentKey { source, deletion }, cached));
-                retained.push(dataset.manifest.fragments[i].id as u32);
-            } else {
-                missing.push((i, needs_deletions));
-            }
-            fragments.push(CachedFragment {
-                fragment_id: dataset.manifest.fragments[i].id as u32,
-                identity: source,
-                span,
-                deletion_identity: deletion,
-            });
-        }
-        let inputs: Vec<_> = units
-            .iter()
-            .filter_map(|(_, unit)| unit.index.clone())
-            .collect();
-        // Compose prepared inputs before loading misses so a native append
-        // does not force rereading previously prepared fragments. Even two
-        // merged inputs can require substantial CPU work on their sorted rows.
-        let combined = if inputs.is_empty() {
-            None
-        } else if inputs.len() > 1 {
-            spawn_cpu(move || {
-                let refs: Vec<_> = inputs.iter().map(Arc::as_ref).collect();
-                RowIdIndex::try_combine(&refs)
-            })
-            .await?
-        } else {
-            let refs: Vec<_> = inputs.iter().map(Arc::as_ref).collect();
-            RowIdIndex::try_combine(&refs)?
-        };
-        if let Some(combined) = combined {
-            let loaded_fragments = missing.len();
-            let parallelism = preparation_parallelism(
-                dataset,
-                missing
-                    .iter()
-                    .map(|(i, _)| dataset.manifest.fragments[*i].physical_rows),
-            );
-            let mut loads = Vec::with_capacity(missing.len());
-            for (i, needs_deletions) in missing {
-                let prepared = prepared_sources
-                    .get(&(dataset.manifest.fragments[i].id as u32))
-                    .copied();
-                loads.push(async move {
-                    let fragment = &dataset.manifest.fragments[i];
-                    if let Some(source) = prepared {
-                        return Ok::<_, Error>((
-                            i,
-                            source.row_id_sequence.row_id_range(),
-                            FragmentRowIdIndex {
-                                fragment_id: source.fragment_id,
-                                row_id_sequence: source.row_id_sequence.clone(),
-                                deletion_vector: source.deletion_vector.clone(),
-                            },
-                        ));
-                    }
-                    let sequence = Arc::new(read_row_id_sequence(dataset, fragment).await?);
-                    let span = sequence.row_id_range();
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(
-                            &RowIdFragmentSpanKey {
-                                source: sequence_identity(dataset, fragment)?,
-                            },
-                            Arc::new(FragmentSpan(span.clone())),
-                        )
-                        .await;
-                    let source = load_source(dataset, fragment, sequence, needs_deletions).await?;
-                    Ok::<_, Error>((i, span, source))
-                });
-            }
-            let loaded: Vec<_> = futures::stream::iter(loads)
-                .buffered(parallelism)
-                .try_collect()
-                .await?;
-            let mut sources = Vec::with_capacity(loaded.len());
-            for (i, span, source) in loaded {
-                fragments[i].span = span;
-                sources.push(source);
-            }
-            let index = if sources.is_empty() {
-                Some(combined)
-            } else {
-                let resident: Vec<_> = units
-                    .iter()
-                    .filter_map(|(_, unit)| unit.index.clone())
-                    .collect();
-                spawn_cpu(move || {
-                    if let Some(index) = combined.try_reuse_fragments(&retained, &sources)? {
-                        return Ok(Some(index));
-                    }
-                    // Changed deletions cannot be appended to an existing
-                    // merged source group. Prepare only the changed sources,
-                    // then use the bounded prepared-index composition path.
-                    // Release the tentative combined output before allocating
-                    // another union; the original resident parts remain alive.
-                    drop(combined);
-                    let prepared = sources
-                        .iter()
-                        .map(|source| RowIdIndex::new(std::slice::from_ref(source)))
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut inputs = Vec::with_capacity(resident.len() + prepared.len());
-                    inputs.extend(resident.iter().map(Arc::as_ref));
-                    inputs.extend(prepared.iter());
-                    RowIdIndex::try_combine(&inputs)
-                })
-                .await?
-            };
-            if index.is_none() {
-                tracing::debug!(
-                    event = "row_id_fragment_promotion_fallback",
-                    loaded_fragments,
-                    "global cost model requires full reconstruction"
-                );
-            }
-            index.map(|index| FragmentPromotion {
-                index,
-                fragments,
-                units,
-                loaded_fragments,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    Ok(promoted)
 }
 
 #[cfg(test)]
@@ -745,7 +392,7 @@ mod tests {
     #[case::inline(false)]
     #[case::spilled(true)]
     #[tokio::test]
-    async fn distinct_ids_reuse_fragments_and_bulk_keeps_global_lookup(#[case] spilled: bool) {
+    async fn distinct_ids_and_batches_reuse_fragment_lookups(#[case] spilled: bool) {
         let dataset = cold_dataset(shuffled_dataset(spilled, false).await, 1 << 20, 1 << 20);
         let expected_7 = scan_address(&dataset, 9).await;
         let expected_31 = scan_address(&dataset, 37).await;
@@ -794,7 +441,11 @@ mod tests {
         assert!(
             dataset
                 .index_cache
-                .get_with_key(&super::super::cache::view_key(&dataset, true).unwrap())
+                .get_with_key(&crate::session::index_caches::RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions: true,
+                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                })
                 .await
                 .is_none()
         );
@@ -812,7 +463,11 @@ mod tests {
         assert!(
             dataset
                 .index_cache
-                .get_with_key(&super::super::cache::view_key(&dataset, true).unwrap())
+                .get_with_key(&crate::session::index_caches::RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions: true,
+                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                })
                 .await
                 .is_none(),
             "a batch must reuse fragment lookups without forcing a complete map"
@@ -870,7 +525,7 @@ mod tests {
                 .unwrap(),
             expected
         );
-        // A complete candidate working set may promote on this first repeat.
+        // Repeated batches reuse the prepared fragment working set.
         // Subsequent requests must reuse either that view or fragment state.
         let before = dataset.object_store.io_stats_snapshot();
         assert_eq!(
@@ -906,7 +561,7 @@ mod tests {
     #[case::between_representations(false)]
     #[case::admission_boundary(true)]
     #[tokio::test]
-    async fn rejected_complete_view_keeps_repeated_batches_on_resident_fragments(
+    async fn fragment_working_set_serves_batches_below_complete_index_capacity(
         #[case] admission_boundary: bool,
     ) {
         const ROWS: usize = 1024;
@@ -965,7 +620,7 @@ mod tests {
             ))
         });
         let whole = cold_dataset(dataset.clone(), 1 << 20, 1 << 20);
-        let complete = super::super::cache::get(&whole, true).await.unwrap();
+        let complete = get_row_id_index(&whole).await.unwrap().unwrap();
         let full_bytes = whole.index_cache.size_bytes().await;
         assert!(full_bytes > 0);
         drop(complete);
@@ -1018,7 +673,7 @@ mod tests {
     #[case::inline(false)]
     #[case::spilled(true)]
     #[tokio::test]
-    async fn repeated_overlapping_batch_promotes_a_resident_working_set(#[case] spilled: bool) {
+    async fn repeated_overlapping_batch_keeps_fragment_only_working_set(#[case] spilled: bool) {
         let dataset = cold_dataset(shuffled_dataset(spilled, true).await, 1 << 20, 1 << 20);
         let ids = [7, 17, 31, 7, u64::MAX];
         let expected = ids.map(|id| {
@@ -1042,9 +697,13 @@ mod tests {
         assert!(
             dataset
                 .index_cache
-                .get_with_key(&super::super::cache::view_key(&dataset, true).unwrap())
+                .get_with_key(&crate::session::index_caches::RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions: true,
+                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                })
                 .await
-                .is_some()
+                .is_none()
         );
         let before = dataset.object_store.io_stats_snapshot();
         let results =
@@ -1088,7 +747,11 @@ mod tests {
         assert!(
             dataset
                 .index_cache
-                .get_with_key(&super::super::cache::view_key(&dataset, true).unwrap())
+                .get_with_key(&crate::session::index_caches::RowIdIndexKey {
+                    version: dataset.manifest.version,
+                    with_deletions: true,
+                    e_tag: dataset.manifest_location.e_tag.as_deref(),
+                })
                 .await
                 .is_none()
         );
@@ -1122,8 +785,9 @@ mod tests {
             deletion: None,
         };
         let cached = dataset.index_cache.get_with_key(&key).await.unwrap();
-        let view = cached.index.as_ref().unwrap();
+        let view = Arc::downgrade(cached.index.as_ref().unwrap());
         assert!(view.upgrade().is_some());
+        drop(cached);
         let mut spans = Vec::new();
         for fragment in dataset.manifest.fragments.iter() {
             let span_key = RowIdFragmentSpanKey {
@@ -1184,28 +848,12 @@ mod tests {
             .await
             .unwrap();
         let index = RowIdIndex::new(&[source]).unwrap();
-        let parts = index.prepared_parts();
-        let sizing = CachedPreparedFragment {
-            index: Some(index.downgrade()),
+        let index = Arc::new(index);
+        let sizing = PreparedFragment {
+            index: Some(index.clone()),
             span: span.clone(),
-            part_keys: parts
-                .iter()
-                .map(|part| {
-                    let (merged, allocation) = part.allocation_identity();
-                    PreparedRowIdPartKey {
-                        sources: sequence_identity(&dataset, fragment).unwrap(),
-                        merged,
-                        allocation,
-                    }
-                })
-                .collect(),
         };
-        let weight = super::super::cache::entry_bytes(&sizing)
-            + parts
-                .iter()
-                .map(super::super::cache::entry_bytes)
-                .sum::<usize>();
-        drop(parts);
+        let weight = super::super::cache::entry_bytes(&sizing);
         drop(sizing);
         // QuickCache also limits entry admission to about 97% of a shard.
         // This budget admits either unit while still excluding both together.
@@ -1226,27 +874,14 @@ mod tests {
             source: sequence_identity(&dataset, fragment).unwrap(),
             deletion: deletion_identity(&dataset, fragment, true).unwrap(),
         };
-        let metadata = [CachedFragment {
-            fragment_id: fragment.id as u32,
-            identity: key.source,
-            span: span.clone(),
-            deletion_identity: key.deletion,
-        }];
-        let (part_keys, parts) = super::super::parts::prepare(&dataset, &index, &metadata, &[])
-            .await
-            .unwrap();
-        super::super::parts::admit(&dataset, &part_keys, &parts).await;
         let prepared = PreparedFragment {
-            index: Some(Arc::new(index)),
+            index: Some(index),
             span,
-            parts,
-            part_keys,
         };
         dataset
             .index_cache
-            .insert_with_key(&key, Arc::new(prepared.downgrade()))
+            .insert_with_key(&key, Arc::new(prepared))
             .await;
-        drop(prepared);
         assert!(dataset.index_cache.get_with_key(&key).await.is_some());
         let before = dataset.object_store.io_stats_snapshot();
         assert_eq!(
@@ -1272,7 +907,7 @@ mod tests {
         let graph_entries = occupancy
             .types
             .iter()
-            .find(|entry| entry.type_name == PreparedRowIdPartKey::stable_type_id())
+            .find(|entry| entry.type_name == PreparedRowIdFragmentKey::stable_type_id())
             .map_or(0, |entry| entry.num_entries);
         assert!(graph_entries < dataset.manifest.fragments.len() as u64);
         // A later request must rebuild only what is absent, while preserving
@@ -1296,7 +931,7 @@ mod tests {
         let graph_entries = occupancy
             .types
             .iter()
-            .find(|entry| entry.type_name == PreparedRowIdPartKey::stable_type_id())
+            .find(|entry| entry.type_name == PreparedRowIdFragmentKey::stable_type_id())
             .map_or(0, |entry| entry.num_entries);
         assert!(graph_entries < dataset.manifest.fragments.len() as u64);
     }
@@ -1414,7 +1049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_distinct_requests_and_complete_view_ownership() {
+    async fn concurrent_distinct_requests_share_preparation_and_release_evicted_graphs() {
         let dataset = cold_dataset(shuffled_dataset(true, true).await, 1 << 20, 1 << 20);
         let expected_7 = scan_address(&dataset, 1).await;
         let expected_31 = scan_address(&dataset, 33).await;
@@ -1445,8 +1080,8 @@ mod tests {
             deletion: deletion_identity(&dataset, fragment, true).unwrap(),
         };
         let cached = dataset.index_cache.get_with_key(&key).await.unwrap();
-        let held = cached.upgrade(&dataset).await.unwrap();
-        let weak = Arc::downgrade(&held);
+        let held = cached.clone();
+        let weak = Arc::downgrade(held.index.as_ref().unwrap());
         let complete = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert_eq!(
             complete.get_many(&[7, 31]).unwrap(),
@@ -1456,13 +1091,16 @@ mod tests {
             held.index.as_ref().unwrap().get(7).unwrap(),
             Some(expected_7)
         );
-        // Fragment directories can coexist with complete directories; neither
-        // retains the active wrapper or owns an uncharged graph.
-        assert!(cached.index.is_some());
+        dataset.index_cache.clear().await;
+        drop(cached);
+        assert!(
+            weak.upgrade().is_some(),
+            "active readers survive cache eviction"
+        );
         drop(held);
         assert!(
             weak.upgrade().is_none(),
-            "cache directories must not retain active reader wrappers"
+            "the preparation registry must not retain an evicted graph"
         );
         assert!(dataset.index_cache.size_bytes().await <= 1 << 20);
     }
@@ -1479,8 +1117,6 @@ mod tests {
             vec![Some(expected)]
         );
         let builds = &dataset.session.row_id_index_builds;
-        let complete = builds.for_dataset(&dataset.uri).unwrap();
-        let _complete_guard = complete.lock().await;
         let fragment = &dataset.manifest.fragments[3];
         let key = PreparedRowIdFragmentKey {
             source: sequence_identity(&dataset, fragment).unwrap(),
@@ -1634,6 +1270,107 @@ mod tests {
         assert_eq!(
             batch["i"].as_primitive::<Int32Type>().values().as_ref(),
             &[7, 7]
+        );
+    }
+
+    #[rstest]
+    #[case::inline(false)]
+    #[case::spilled(true)]
+    #[tokio::test]
+    async fn shuffled_fragments_reuse_unchanged_sources_after_append_and_delete(
+        #[case] spilled: bool,
+    ) {
+        let mut current = cold_dataset(shuffled_dataset(spilled, true).await, 1 << 20, 1 << 20);
+        let old = current.clone();
+        let ids = [9, 23, 9, u64::MAX];
+        let expected = [
+            Some(RowAddress::new_from_parts(0, 7)),
+            Some(RowAddress::new_from_parts(0, 9)),
+            Some(RowAddress::new_from_parts(0, 7)),
+            None,
+        ];
+        assert_eq!(
+            resolve_row_ids(&old, &ids, true).await.unwrap().unwrap(),
+            expected
+        );
+        let batch = arrow_array::record_batch!(("i", Int32, [40, 41])).unwrap();
+        current
+            .append(
+                arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let before = current.object_store.io_stats_snapshot();
+        assert_eq!(
+            resolve_row_ids(&current, &ids, true)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            current.object_store.io_stats_snapshot().read_bytes,
+            before.read_bytes,
+            "append must preserve prepared shuffled fragment lookups"
+        );
+        let batch = current
+            .take_rows(
+                &[9, 23, 9, 40],
+                ProjectionRequest::from_columns(["i"], current.schema()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["i"].as_primitive::<Int32Type>().values().as_ref(),
+            &[7, 9, 7, 40]
+        );
+        current.delete("i = 7").await.unwrap();
+        let changed = current
+            .manifest
+            .fragments
+            .iter()
+            .find(|f| f.deletion_file.is_some())
+            .unwrap();
+        let before = current.object_store.io_stats_snapshot();
+        let sequence = Arc::new(read_row_id_sequence(&current, changed).await.unwrap());
+        drop(
+            load_source(&current, changed, sequence, true)
+                .await
+                .unwrap(),
+        );
+        let changed_bytes = current.object_store.io_stats_snapshot().read_bytes - before.read_bytes;
+        let before = current.object_store.io_stats_snapshot();
+        let deleted = [None, expected[1], None, None];
+        assert_eq!(
+            resolve_row_ids(&current, &ids, true)
+                .await
+                .unwrap()
+                .unwrap(),
+            deleted
+        );
+        assert!(
+            current.object_store.io_stats_snapshot().read_bytes - before.read_bytes
+                <= changed_bytes,
+            "only the fragment with changed deletion visibility may need its source read"
+        );
+        let before = current.object_store.io_stats_snapshot();
+        for _ in 0..3 {
+            assert_eq!(
+                resolve_row_ids(&old, &ids, true).await.unwrap().unwrap(),
+                expected
+            );
+            assert_eq!(
+                resolve_row_ids(&current, &ids, true)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                deleted
+            );
+        }
+        assert_eq!(
+            current.object_store.io_stats_snapshot().read_bytes,
+            before.read_bytes
         );
     }
 }

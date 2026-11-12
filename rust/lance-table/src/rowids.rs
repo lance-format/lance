@@ -27,7 +27,6 @@ use lance_core::deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::FragmentRowIdIndex;
 pub use index::RowIdIndex;
-pub use index::{RowIdIndexPart, RowIdIndexView};
 use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
 use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};

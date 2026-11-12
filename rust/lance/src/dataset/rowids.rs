@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub(crate) mod cache;
-mod parts;
 pub(crate) mod resolve;
 mod spill;
 mod validate;
@@ -10,6 +9,7 @@ mod validate;
 use super::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
+use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
@@ -236,14 +236,21 @@ pub(crate) async fn get_row_id_index_with(
     // and recreated there restarts at version 1. Without a token for this
     // manifest generation a cached index could be the old generation's, so
     // build a private one instead of sharing.
-    if dataset.manifest_location.e_tag.is_none() {
+    let Some(e_tag) = dataset.manifest_location.e_tag.as_deref() else {
         return Ok(Some(Arc::new(
             load_row_id_index(dataset, with_deletions).await?,
         )));
-    }
-    cache::get(dataset, with_deletions)
-        .await
-        .map(|cached| Some(cached.index.clone()))
+    };
+    let key = RowIdIndexKey {
+        version: dataset.manifest.version,
+        with_deletions,
+        e_tag: Some(e_tag),
+    };
+    let index = dataset
+        .index_cache
+        .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
+        .await?;
+    Ok(Some(index))
 }
 
 /// Map a set of physical row addresses to their stable row ids
@@ -457,12 +464,7 @@ pub(crate) async fn load_row_id_index_for_fragments(
     let needs_deletions = if with_deletions {
         vec![true; fragments.len()]
     } else {
-        overlapping_id_spans(
-            &sequences
-                .iter()
-                .map(|sequence| sequence.row_id_range())
-                .collect::<Vec<_>>(),
-        )
+        overlapping_id_spans(&sequences)
     };
 
     let mut loads = Vec::with_capacity(fragments.len());
@@ -492,17 +494,17 @@ pub(crate) async fn load_row_id_index_for_fragments(
 
 /// For each sequence, whether its span of ids (lowest to highest) intersects
 /// another sequence's span. An empty sequence overlaps nothing.
-fn overlapping_id_spans(ranges: &[Option<std::ops::RangeInclusive<u64>>]) -> Vec<bool> {
-    let mut spans: Vec<(u64, u64, usize)> = ranges
+fn overlapping_id_spans(sequences: &[Arc<RowIdSequence>]) -> Vec<bool> {
+    let mut spans: Vec<(u64, u64, usize)> = sequences
         .iter()
         .enumerate()
-        .filter_map(|(index, range)| {
-            let span = range.as_ref()?;
+        .filter_map(|(index, sequence)| {
+            let span = sequence.row_id_range()?;
             Some((*span.start(), *span.end(), index))
         })
         .collect();
     spans.sort_unstable();
-    let mut overlapping = vec![false; ranges.len()];
+    let mut overlapping = vec![false; sequences.len()];
     let mut reach: Option<(u64, usize)> = None;
     for &(start, end, index) in &spans {
         if let Some((reach_end, reach_index)) = reach
@@ -526,7 +528,7 @@ mod test {
     /// sequence; the sweep must mark exactly the spans that touch another.
     #[test]
     fn test_overlapping_id_spans() {
-        let seq = |ids: Vec<u64>| RowIdSequence::try_from_iter(ids).unwrap().row_id_range();
+        let seq = |ids: Vec<u64>| Arc::new(RowIdSequence::try_from_iter(ids).unwrap());
         let contained = vec![
             seq((0..=100).collect()),
             seq(vec![1, 2]),
@@ -684,7 +686,7 @@ mod test {
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert_eq!(
             session.index_cache_stats().await.num_entries,
-            index_before.num_entries + 3
+            index_before.num_entries + 1
         );
         assert!(
             session.index_cache_stats().await.size_bytes - index_before.size_bytes
@@ -745,12 +747,12 @@ mod test {
             index.get(21).unwrap(),
             Some(RowAddress::new_from_parts(2, 1))
         );
-        let weak = index.downgrade();
+        let weak = Arc::downgrade(&index);
         drop(index);
         assert_eq!(weak.upgrade().is_some(), is_cached);
         assert_eq!(
             session.index_cache_stats().await.num_entries,
-            entries_before + 3 * usize::from(is_cached)
+            entries_before + usize::from(is_cached)
         );
         assert_eq!(
             session.metadata_cache_stats().await.size_bytes,
@@ -784,21 +786,26 @@ mod test {
         .unwrap();
         let metadata_before = session.metadata_cache_stats().await;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
-        let weak = index.downgrade();
+        let weak = Arc::downgrade(&index);
         drop(index);
         assert!(weak.upgrade().is_some());
 
         // QuickCache resists scans of small cold entries. Compete with other
         // loaded indices of the same size, without touching this one's recency.
         for version in 100..132 {
-            let mut competing = dataset.clone();
-            competing.index_cache = Arc::new(
-                dataset
-                    .session
-                    .index_cache
-                    .for_dataset(&format!("{}#pressure-{version}", dataset.uri)),
-            );
-            cache::get(&competing, true).await.unwrap();
+            let key = RowIdIndexKey {
+                version,
+                with_deletions: true,
+                e_tag: Some("pressure"),
+            };
+            dataset
+                .index_cache
+                .insert_with_key(
+                    &key,
+                    Arc::new(load_row_id_index(&dataset, true).await.unwrap()),
+                )
+                .await;
+            assert!(dataset.index_cache.get_with_key(&key).await.is_some());
         }
         assert!(weak.upgrade().is_none());
         let reloaded = get_row_id_index(&dataset).await.unwrap().unwrap();
