@@ -655,6 +655,14 @@ impl Dataset {
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
     /// A segment after the first cannot be a reserved dataset directory.
+    /// A literal `.` path segment is rejected.
+    ///
+    /// New branch names are limited to a portable budget of 211 bytes, measured
+    /// after the name is path-part encoded twice: once for the branch metadata
+    /// filename and once for the local atomic staging filename. The check runs
+    /// before any branch metadata or dataset files are written. Longer names
+    /// that already exist remain available for lookup, checkout, metadata
+    /// updates, and deletion.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
