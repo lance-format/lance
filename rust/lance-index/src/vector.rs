@@ -587,6 +587,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         unimplemented!("only for IVF")
     }
 
+    /// A partition's stored rows, read without caching the partition.
+    async fn partition_storage_batches(&self, _partition_id: usize) -> Result<Vec<RecordBatch>> {
+        Err(Error::not_supported(
+            "partition_storage_batches is only supported by IVF indices",
+        ))
+    }
+
     /// Whether bounded native code-to-code scoring is available (current format).
     fn supports_pairwise_vectors(&self) -> bool {
         false
