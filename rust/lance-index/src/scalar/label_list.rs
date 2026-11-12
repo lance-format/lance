@@ -241,7 +241,16 @@ impl LabelListIndex {
         if single_set {
             return Ok(intersect_bitmap);
         }
-        while let Some(next) = sets.try_next().await? {
+        // An empty intersection can never recover, so stop pulling the stream
+        // once the accumulator is empty: every remaining pull is a per-label
+        // bitmap search (a disk round trip on a cold cache) for a result that
+        // is already decided. This is exact here because `search_exact`
+        // clears nulls on every element, so `is_empty` (which tests only the
+        // selected set) cannot miss rows hiding in `nulls`, and `&=` cannot
+        // make an empty selected set non-empty again.
+        while !intersect_bitmap.is_empty()
+            && let Some(next) = sets.try_next().await?
+        {
             intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
@@ -1235,6 +1244,8 @@ mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
+    use std::sync::atomic::Ordering;
+
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -1243,6 +1254,7 @@ mod tests {
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
+    use crate::metrics::LocalMetricsCollector;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
 
@@ -1705,6 +1717,56 @@ mod tests {
             err.to_string()
                 .contains("do not recalculate fragment coverage from their files"),
             "label list coverage recovery must be not_supported, got: {err}"
+        );
+    }
+
+    /// `set_intersection` must stop pulling the per-label search stream once
+    /// the accumulator is empty: each remaining pull is a bitmap load (a disk
+    /// round trip on a cold cache) whose result cannot revive an empty
+    /// intersection. Counted through the metrics collector, so the assertion
+    /// is deterministic rather than a timing claim.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_has_all_labels_stops_searching_once_intersection_is_empty() {
+        // 'a' covers rows 0, 1 and 12 and 'b' covers rows 2-3 -- disjoint, so
+        // the accumulator empties after the second label and none of
+        // 'c'..='j', each present in the index, can change the answer. Row 12
+        // (a null element) must not leak into the null rows; row 13 (a null
+        // list) must stay NULL after the early stop.
+        let mut rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".to_string())])),
+            (1, Some(vec![Some("a".to_string())])),
+            (2, Some(vec![Some("b".to_string())])),
+            (3, Some(vec![Some("b".to_string())])),
+        ];
+        for (offset, label) in ('c'..='j').enumerate() {
+            rows.push((4 + offset as u64, Some(vec![Some(label.to_string())])));
+        }
+        rows.push((12, Some(vec![Some("a".to_string()), None])));
+        rows.push((13, None));
+        let (_dir, index) = build_label_list_segment(&rows).await;
+
+        let labels: Vec<ScalarValue> = ('a'..='j')
+            .map(|label| ScalarValue::Utf8(Some(label.to_string())))
+            .collect();
+        let query = LabelListQuery::HasAllLabels(labels);
+        // The segment loads through a no-op cache, so every label search that
+        // runs records exactly one part load.
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(found) = result else {
+            panic!("label list search must be exact");
+        };
+        assert!(
+            found.true_rows().is_empty(),
+            "disjoint 'a' and 'b' must select no rows"
+        );
+        assert_eq!(row_addrs(found.null_rows()), vec![13]);
+        assert_eq!(
+            metrics.parts_loaded.load(Ordering::Relaxed),
+            2,
+            "the search must stop after the label that empties the intersection"
         );
     }
 

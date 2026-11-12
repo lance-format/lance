@@ -1014,28 +1014,16 @@ async fn carry_under_workload(seed: u64) -> u64 {
     let (first, mut indexed) = table.stage(&first);
     let len = table.next(4);
     table.run(len);
-    // A fragment reached through a recorded rewrite of the first segment's
-    // coverage is checked only against that rewrite's commit, not against the
-    // second segment's later build, which a restore can tell apart.
-    let mut reached = first.fragment_bitmap.clone().unwrap();
-    for group in table.current().reuse.iter().flat_map(|reuse| &reuse.groups) {
-        if group
-            .old_frags
-            .iter()
-            .any(|old| reached.contains(old.id as u32))
-        {
-            reached.extend(group.new_frags.iter().map(|new| new.id as u32));
-        }
-    }
+    // Include outputs reached from the first segment through compaction. Keep
+    // the indexed row sets disjoint so the oracle preserves each build's values.
     let second = table
         .current()
         .fragments
         .iter()
         .filter(|fragment| {
-            !reached.contains(fragment.id as u32)
-                && fragment
-                    .live_rows()
-                    .all(|row| !indexed.contains_key(&row.token))
+            fragment
+                .live_rows()
+                .all(|row| !indexed.contains_key(&row.token))
         })
         .map(|fragment| fragment.id as u32)
         .collect::<RoaringBitmap>();
