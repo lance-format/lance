@@ -61,7 +61,7 @@ use super::apply_deletions;
 
 /// Consumers own the producer task so cancelling a merge also stops polling
 /// its source, including when the producer is waiting on a full output queue.
-struct SplitterTask(tokio::task::JoinHandle<()>);
+struct SplitterTask(lance_core::utils::tokio::JoinHandle<()>);
 
 impl Drop for SplitterTask {
     fn drop(&mut self) {
@@ -906,7 +906,7 @@ impl FullSchemaMergeInsertExec {
         // `AssertUnwindSafe` bound is fine.
         let panic_update_tx = update_tx.clone();
         let panic_insert_tx = insert_tx.clone();
-        let splitter = Arc::new(SplitterTask(tokio::spawn(async move {
+        let splitter = Arc::new(SplitterTask(lance_core::utils::tokio::spawn(async move {
             let result =
                 futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
                     let mut input_stream = input_stream;

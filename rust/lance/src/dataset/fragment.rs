@@ -212,7 +212,7 @@ fn ranges_to_tasks(
             let num_rows = range.end - range.start;
             let reader = reader.clone();
             let projection = projection.clone();
-            let task = tokio::task::spawn(async move {
+            let task = lance_core::utils::tokio::spawn(async move {
                 v1_read_batch(
                     &reader,
                     &ReadBatchParams::Range(range.clone()),
