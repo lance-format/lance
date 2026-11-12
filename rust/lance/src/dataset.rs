@@ -2754,11 +2754,19 @@ impl Dataset {
                 return Ok(());
             }
 
-            // Reads decode a replacement file's columns as the dataset field
-            // types, so a column stored as another type reads back wrong or
-            // not at all. Blob columns are skipped: their file layout can
-            // legitimately differ from the dataset's logical type.
-            if dataset_field.logical_type != file_field.logical_type
+            // Reads decode a replacement file's values as the dataset field
+            // types, so values stored as another type read back as other
+            // values or fail to decode. List offset widths and timestamp time
+            // zones do not change the stored values, and list items are
+            // compared as children below. Blob columns are skipped: their
+            // file layout can legitimately differ from the dataset's type.
+            use arrow_schema::DataType::{LargeList, List, Timestamp};
+            let same_values = match (dataset_field.data_type(), file_field.data_type()) {
+                (List(_) | LargeList(_), List(_) | LargeList(_)) => true,
+                (Timestamp(dataset_unit, _), Timestamp(file_unit, _)) => dataset_unit == file_unit,
+                _ => dataset_field.logical_type == file_field.logical_type,
+            };
+            if !same_values
                 && !field_contains_blob(dataset_field)
                 && !field_contains_blob(file_field)
             {
