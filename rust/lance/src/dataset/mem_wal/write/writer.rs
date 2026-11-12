@@ -386,6 +386,9 @@ impl SharedWriterState {
         let Some(target) = memtable.target() else {
             return Ok((batches, None, false));
         };
+        // Reject capacity overflow before preparing Blob sidecars: a shared
+        // open pack may already contain payloads from accepted writes.
+        memtable.reserve_dictionary_values(&batches)?;
         let logical_schema = Schema::try_from(schema.storage.as_ref())?;
         let data_dir = target
             .generation_path(&self.base_path, &self.config.dir_id, &self.shard_id)
@@ -1450,6 +1453,12 @@ impl ShardWriter {
     /// All batches are inserted atomically with a single lock acquisition.
     /// This is more efficient than calling put() multiple times for Arrow IPC
     /// streams that contain multiple batches.
+    ///
+    /// In memtable mode, each narrow-key dictionary must fit its declared key
+    /// capacity across the active generation's encoded values (including values
+    /// stored under null keys). An overflowing write is rejected atomically.
+    /// Call [`Self::force_freeze_active`] and retry; if the write alone exceeds
+    /// capacity, split it into smaller writes with a freeze between them.
     ///
     /// # Arguments
     ///
