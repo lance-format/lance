@@ -245,6 +245,39 @@ fn rle_payload_lower_bound(data: &FixedWidthDataBlock) -> u128 {
     rle_encoded_size_from_entries(run_count, data.bits_per_value, RunLengthWidth::U8)
 }
 
+/// Upper bound on the `U8` RLE payload derived purely from `(num_values, RunCount)`.
+///
+/// Across `R` runs summing to `N` values (`N - R` intra-run steps), at most
+/// `(N - R) / M` steps cross a segment boundary of size `M`, and at most
+/// `(N - R) / 255` steps cross a `u8::MAX` run-length split (segment resets can
+/// only delay a 255-step rollover). When even this worst-case entry count beats
+/// raw and bitpacking, we can select `U8` RLE without scanning the page again.
+fn rle_u8_payload_upper_bound(
+    data: &FixedWidthDataBlock,
+    max_segment_values: Option<u64>,
+) -> Option<u128> {
+    let type_size = (data.bits_per_value / 8) as usize;
+    let expected_bytes = usize::try_from(data.num_values)
+        .ok()?
+        .checked_mul(type_size)?;
+    if data.data.len() != expected_bytes {
+        return None;
+    }
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    if run_count == 0 || data.num_values < run_count {
+        return None;
+    }
+    let extra_values = data.num_values - run_count;
+    let max_entries = run_count
+        .saturating_add(extra_values / (u8::MAX as u64))
+        .saturating_add(max_segment_values.map_or(0, |seg| extra_values / seg.max(1)));
+    Some(rle_encoded_size_from_entries(
+        max_entries,
+        data.bits_per_value,
+        RunLengthWidth::U8,
+    ))
+}
+
 fn rle_beats_raw_and_bitpacking(
     data: &FixedWidthDataBlock,
     encoded_bytes: u128,
@@ -273,6 +306,13 @@ fn try_fixed_u8_rle_for_mini_block(
     // Skip the value scan when even the lower bound cannot win.
     if !rle_beats_raw_and_bitpacking(data, rle_payload_lower_bound(data), raw_bytes) {
         return None;
+    }
+    if let Some(upper_bound) = rle_u8_payload_upper_bound(data, Some(*MAX_MINIBLOCK_VALUES))
+        && rle_beats_raw_and_bitpacking(data, upper_bound, raw_bytes)
+    {
+        return Some(Box::new(RleEncoder::with_run_length_width(
+            RunLengthWidth::U8,
+        )));
     }
     let rle_bytes = estimate_rle_size_for_width_from_data(
         data,
@@ -1173,6 +1213,15 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Whether every buffer returned by `decompress` is newly allocated, never a
+    /// view of the input, on all paths.
+    ///
+    /// Full-zip decoding copies a batch's input out of the page buffer unless this
+    /// is true, so that output batches never keep the whole page alive.
+    fn allocates_output(&self) -> bool {
+        false
+    }
 
     /// Returns an exact count or conservative upper bound on the total decompressed
     /// size for a slice of `num_values` compressed values.

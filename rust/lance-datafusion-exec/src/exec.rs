@@ -52,6 +52,9 @@ use crate::{
     },
 };
 
+mod record_batch;
+pub use record_batch::RecordBatchExec;
+
 /// An source execution node created from an existing stream
 ///
 /// It can only be used once, and will return the stream.  After that the node

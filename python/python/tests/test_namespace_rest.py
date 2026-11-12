@@ -14,6 +14,7 @@ DirectoryNamespace and RestNamespace implementations.
 import json
 import tempfile
 import threading
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import lance.namespace
@@ -27,6 +28,8 @@ from lance_namespace import (
     DeregisterTableRequest,
     DescribeNamespaceRequest,
     DescribeTableRequest,
+    DescribeTableVersionRequest,
+    DescribeTableVersionResponse,
     DropNamespaceRequest,
     DropTableRequest,
     ListNamespacesRequest,
@@ -35,6 +38,7 @@ from lance_namespace import (
     RefreshMaterializedViewRequest,
     RegisterTableRequest,
     TableExistsRequest,
+    ThrottlingError,
     connect,
 )
 from pydantic import ConfigDict
@@ -220,6 +224,26 @@ class TestDescribeTable:
 
         error_msg = str(exc_info.value).lower()
         assert "not found" in error_msg or "does not exist" in error_msg
+
+    @pytest.mark.parametrize("use_request_model", [False, True], ids=["dict", "model"])
+    def test_describe_table_version(self, rest_namespace, use_request_model):
+        """Describe version responses match the request representation."""
+        rest_namespace.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+        table_id = ["workspace", "test_table"]
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        rest_namespace.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        request = DescribeTableVersionRequest(id=table_id, version=1)
+        response = rest_namespace.describe_table_version(
+            request if use_request_model else {"id": table_id, "version": 1}
+        )
+
+        if use_request_model:
+            assert isinstance(response, DescribeTableVersionResponse)
+            assert response.version.version == 1
+        else:
+            assert isinstance(response, dict)
+            assert response.get("version")["version"] == 1
 
 
 class TestTableOperations:
@@ -921,3 +945,55 @@ class TestBackfillAndRefreshExtraOptions:
         no_extras_set_body = capturing_server.captured_bodies[-1]
 
         assert no_extras_set_body == plain_body
+
+
+class _ThrottlingHandler(BaseHTTPRequestHandler):
+    """Answers every GET with a spec-shaped throttling error."""
+
+    retry_after: str | None = "2"
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's naming
+        body = json.dumps({"code": 21, "error": "Too many requests"}).encode()
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        if self.retry_after is not None:
+            self.send_header("Retry-After", self.retry_after)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+        pass
+
+
+@pytest.fixture
+def throttling_server(request):
+    handler = type(
+        "_ConfiguredThrottlingHandler",
+        (_ThrottlingHandler,),
+        {"retry_after": request.param},
+    )
+    server = HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+@pytest.mark.parametrize(
+    ("throttling_server", "expected_retry_after"),
+    [("2", timedelta(seconds=2)), (None, None)],
+    indirect=["throttling_server"],
+)
+def test_throttling_error_exposes_retry_after(throttling_server, expected_retry_after):
+    client = connect(
+        "rest", {"uri": f"http://127.0.0.1:{throttling_server.server_port}"}
+    )
+
+    with pytest.raises(ThrottlingError) as exc_info:
+        client.list_namespaces(ListNamespacesRequest(id=["parent"]))
+
+    assert exc_info.value.retry_after == expected_retry_after
