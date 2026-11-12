@@ -258,6 +258,8 @@ impl CacheKey for SegmentOwnershipMaskKey<'_> {
 pub struct IndexMetadataKey<'a> {
     pub version: u64,
     pub store_identity: &'a str,
+    /// Manifest generation token. Callers without one must bypass this cache:
+    /// a recreated table can reuse the same URI and version.
     pub e_tag: Option<&'a str>,
 }
 

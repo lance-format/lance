@@ -593,6 +593,7 @@ impl<'a> CommitBuilder<'a> {
                     Default::default()
                 };
                 Ok(Dataset {
+                    snapshot_digest: Default::default(),
                     manifest: Arc::new(manifest),
                     manifest_location,
                     session,
@@ -623,6 +624,7 @@ impl<'a> CommitBuilder<'a> {
                 };
 
                 Ok(Dataset {
+                    snapshot_digest: Default::default(),
                     object_store,
                     base: base_path,
                     uri: uri.to_string(),

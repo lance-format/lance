@@ -1197,6 +1197,9 @@ impl DictionaryDataBlock {
         let num_indices = indices.len();
         let mut out_offsets = Vec::<T>::with_capacity(num_indices + 1);
         let mut out_bytes = Vec::<u8>::with_capacity(total_bytes);
+        // SAFETY: Pass 1 validated every index and byte range and checked the total size.
+        // The fresh output buffers have capacity for all bytes and offsets and cannot overlap
+        // the dictionary. Every output element is initialized before its length is set.
         unsafe {
             let out_off_ptr = out_offsets.as_mut_ptr();
             let out_byte_ptr = out_bytes.as_mut_ptr();
