@@ -2583,8 +2583,8 @@ mod tests {
     /// `index_version`; pin that mapping for both versions so a query never
     /// misreads a row-id-domain segment as row addresses (or vice versa).
     #[rstest]
-    #[case::row_id_domain(super::NGRAM_ROW_ID_DOMAIN_VERSION, false)]
-    #[case::row_addr_domain(super::NGRAM_ROW_ADDR_DOMAIN_VERSION, true)]
+    #[case::row_id_domain(crate::scalar::ngram::NGRAM_ROW_ID_DOMAIN_VERSION, false)]
+    #[case::row_addr_domain(crate::scalar::ngram::NGRAM_ROW_ADDR_DOMAIN_VERSION, true)]
     #[tokio::test]
     async fn test_plugin_load_index_domain(
         #[case] index_version: u32,
@@ -2618,7 +2618,7 @@ mod tests {
 
         let details =
             prost_types::Any::from_msg(&crate::pbold::NGramIndexDetails::default()).unwrap();
-        let index = super::NGramIndexPlugin
+        let index = crate::scalar::ngram::NGramIndexPlugin
             .load_index(
                 store,
                 &details,
