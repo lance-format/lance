@@ -348,7 +348,17 @@ impl Schema {
     }
 
     /// Project the columns over the schema, preserving system columns.
+    ///
+    /// Unlike [`Self::project`], a nested path whose last field does not exist
+    /// is an error rather than a parent struct with no children, because the
+    /// columns usually come from a user.
     pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        for column in columns {
+            let column = column.as_ref();
+            if column.contains('.') && self.field(column).is_none() {
+                return Err(Error::field_not_found(column, self.field_paths()));
+            }
+        }
         self.do_project(columns, true, true)
     }
 
@@ -2538,6 +2548,15 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        // A missing nested field is an error, wherever the path stops resolving.
+        for missing in ["b.nope", "c.nope", "b.f1.nope", "nope"] {
+            let err = schema
+                .project_preserve_system_columns(&["a", missing])
+                .unwrap_err();
+            assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+            assert!(err.to_string().contains(missing), "{err}");
+        }
     }
 
     #[test]

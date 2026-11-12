@@ -514,16 +514,6 @@ impl ProjectionRequest {
             .into_iter()
             .map(|s| s.as_ref().to_string())
             .collect::<Vec<_>>();
-        // Projection keeps a struct whose named child is missing, without
-        // that child, so check nested paths here.
-        for column in &columns {
-            if column.contains('.') && dataset_schema.field(column).is_none() {
-                return Err(Error::field_not_found(
-                    column.as_str(),
-                    dataset_schema.field_paths(),
-                ));
-            }
-        }
         let schema = dataset_schema.project_preserve_system_columns(&columns)?;
         Ok(Self::Schema(Arc::new(schema)))
     }
