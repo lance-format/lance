@@ -347,20 +347,27 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
         store_identity: &dataset.object_store.store_prefix,
         e_tag: dataset.manifest_location.e_tag.as_deref(),
     };
-    let mut indices = dataset
-        .index_cache
-        .get_or_insert_with_key(metadata_key, || async {
-            let loaded = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
-                &dataset.manifest,
-            )
-            .await?;
-            warn_about_unsupported_indices(&loaded);
-            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
-            Ok(loaded)
-        })
+    let load = || async {
+        let loaded = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
         .await?;
+        warn_about_unsupported_indices(&loaded);
+        warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
+        Ok(loaded)
+    };
+    // A recreated table can reuse this URI and version. Without a generation
+    // token, shared metadata could belong to the previous table incarnation.
+    let mut indices = if metadata_key.e_tag.is_some() {
+        dataset
+            .index_cache
+            .get_or_insert_with_key(metadata_key, load)
+            .await?
+    } else {
+        Arc::new(load().await?)
+    };
 
     // Infer details for legacy vector indices (once per index name, concurrently).
     // This may run on indices that were opportunistically cached during Dataset::open
@@ -375,10 +382,12 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
             infer_missing_vector_details(dataset, &mut updated).await;
             if updated != *indices {
                 indices = Arc::new(updated);
-                dataset
-                    .index_cache
-                    .insert_with_key(&metadata_key, indices.clone())
-                    .await;
+                if metadata_key.e_tag.is_some() {
+                    dataset
+                        .index_cache
+                        .insert_with_key(&metadata_key, indices.clone())
+                        .await;
+                }
             }
         }
     }

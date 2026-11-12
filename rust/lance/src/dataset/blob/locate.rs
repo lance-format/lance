@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, uri_to_url};
 use object_store::path::Path;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
@@ -263,8 +263,8 @@ struct BlobReadLocation {
 /// relative to. Fragment locations, base roots, object stores, and blob
 /// sources are cached, so a locator should be reused across the rows of a
 /// batch.
-pub(super) struct BlobLocator<'a> {
-    dataset: &'a Dataset,
+pub(super) struct BlobLocator {
+    dataset: Dataset,
     field_id: u32,
     fragments: HashMap<u32, BlobReadLocation>,
     base_roots: HashMap<u32, Path>,
@@ -272,10 +272,10 @@ pub(super) struct BlobLocator<'a> {
     sources: HashMap<BlobSourceKey, Arc<BlobSource>>,
 }
 
-impl<'a> BlobLocator<'a> {
-    pub(super) fn new(dataset: &'a Dataset, field_id: u32) -> Self {
+impl BlobLocator {
+    pub(super) fn new(dataset: &Dataset, field_id: u32) -> Self {
         Self {
-            dataset,
+            dataset: dataset.clone(),
             field_id,
             fragments: HashMap::new(),
             base_roots: HashMap::new(),
@@ -349,6 +349,121 @@ impl<'a> BlobLocator<'a> {
                 Ok(self.file(store, &path, position, size, BlobKind::Managed, Some(uri)))
             }
         }
+    }
+
+    /// Capture a locator without opening storage clients or reading payloads.
+    pub(super) fn capture_reference(
+        &mut self,
+        blob: &StoredBlob<'_>,
+        row_addr: u64,
+        context: &crate::blob::reference::BlobSourceContext,
+    ) -> Result<crate::blob::reference::BlobRef> {
+        let (base_id, path, position, size, kind) = match *blob {
+            StoredBlob::Empty | StoredBlob::Inline { .. } => {
+                let location = self.data_file(row_addr)?.clone();
+                let (position, size) = match *blob {
+                    StoredBlob::Inline { position, size } => (position, size),
+                    _ => (0, 0),
+                };
+                (
+                    location.base_id,
+                    location.data_file_path,
+                    position,
+                    Some(size),
+                    BlobKind::Inline,
+                )
+            }
+            StoredBlob::Packed {
+                blob_id,
+                position,
+                size,
+            } => {
+                let location = self.data_file(row_addr)?.clone();
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                (
+                    location.base_id,
+                    path,
+                    position,
+                    Some(size),
+                    BlobKind::Packed,
+                )
+            }
+            StoredBlob::Dedicated { blob_id, size } => {
+                let location = self.data_file(row_addr)?.clone();
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                (location.base_id, path, 0, Some(size), BlobKind::Dedicated)
+            }
+            StoredBlob::External {
+                base_id: 0,
+                uri,
+                position,
+                size,
+            } => {
+                return context.reference(
+                    uri.to_string(),
+                    position,
+                    (size > 0).then_some(size),
+                    BlobKind::External,
+                    None,
+                );
+            }
+            StoredBlob::External {
+                base_id,
+                uri,
+                position,
+                size,
+            } => {
+                let root = self.base_root(Some(base_id))?;
+                let path = join_base_and_relative_path(&root, uri)?;
+                (
+                    Some(base_id),
+                    path,
+                    position,
+                    (size > 0).then_some(size),
+                    BlobKind::External,
+                )
+            }
+            StoredBlob::Managed {
+                base_id,
+                uri,
+                position,
+                size,
+            } => {
+                let base_id = self.managed_base(base_id, row_addr)?;
+                let root = self.base_root(base_id)?;
+                let path = join_base_and_relative_path(&root, uri)?;
+                (base_id, path, position, Some(size), BlobKind::Managed)
+            }
+        };
+        let root = match base_id {
+            Some(id) => self
+                .dataset
+                .manifest()
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
+                })?
+                .path
+                .clone(),
+            None => self.dataset.refs.root()?.uri,
+        };
+        let root_path =
+            ObjectStore::extract_path_from_uri(self.dataset.session.store_registry(), &root)?;
+        let relative = path.prefix_match(&root_path).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Resolved blob path {path} is outside source root {root}"
+            ))
+        })?;
+        let mut url = uri_to_url(&root)?;
+        // Keep provider-specific authorities while extending the physical path.
+        url.path_segments_mut()
+            .map_err(|_| {
+                Error::invalid_input(format!("Blob source URI cannot contain paths: {root}"))
+            })?
+            .pop_if_empty()
+            .extend(relative.map(|part| part.as_ref().to_string()));
+        context.reference(url.into(), position, size, kind, base_id)
     }
 
     /// The base that a Managed blob's `uri` is relative to: the descriptor's

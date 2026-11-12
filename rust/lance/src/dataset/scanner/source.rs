@@ -285,7 +285,7 @@ impl Scanner {
 
             let scan = self.scan_fragments(
                 projection.with_row_id,
-                self.projection_plan.physical_projection.with_row_addr,
+                projection.with_row_addr || self.projection_plan.physical_projection.with_row_addr,
                 self.projection_plan
                     .physical_projection
                     .with_row_last_updated_at_version,
@@ -735,6 +735,17 @@ impl Scanner {
             // If the user is not requesting any columns then we will scan the row address which
             // is cheap
             projection.with_row_addr = true;
+        }
+
+        if let Some(ordering) = &self.ordering {
+            let projected = projection.to_schema();
+            let sort_column_missing = ordering
+                .iter()
+                .any(|column| projected.field(&column.column_name).is_none());
+            if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
+                // Fetching an unselected sort column later needs a physical row identity.
+                projection.with_row_addr = true;
+            }
         }
 
         // An external mask is applied as the row source inside new_filtered_read, so

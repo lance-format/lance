@@ -24,6 +24,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
@@ -451,6 +452,25 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if let Some(ordering) = &self.ordering {
+            for column in ordering {
+                let mut fields = self
+                    .dataset
+                    .schema()
+                    .field(&column.column_name)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(field) = fields.pop() {
+                    if field.is_blob_v2() && self.blob_handling.returns_description(field) {
+                        return Err(Error::invalid_input(format!(
+                            "Ordering by Blob V2 contents in '{}' requires binary blob handling; order by an explicit descriptor subfield for metadata ordering",
+                            column.column_name
+                        )));
+                    }
+                    fields.extend(&field.children);
+                }
+            }
+        }
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
@@ -924,7 +944,10 @@ impl Scanner {
         };
 
         // Load columns needed for filter and ordering
-        let mut pre_filter_projection = self.dataset.empty_projection();
+        let mut pre_filter_projection = self
+            .dataset
+            .empty_projection()
+            .with_blob_handling(self.blob_handling.clone());
 
         // We may need to take filter columns if we are going to refine
         // an indexed scan.
@@ -979,15 +1002,8 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Sort
+        // Ordering columns were loaded with the filter projection above.
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -1032,6 +1048,11 @@ impl Scanner {
             .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+
+        // Avoid zero-capacity Top-K sorting and payload reads while preserving the output schema.
+        if self.limit == Some(0) {
+            return Ok(Arc::new(EmptyExec::new(plan.schema())));
+        }
 
         // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {

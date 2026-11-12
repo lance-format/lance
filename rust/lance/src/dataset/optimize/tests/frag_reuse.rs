@@ -3078,14 +3078,14 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             assert!(committed_index.is_some());
             let listed = uncached_listed_manifest(&dataset, index_key.version).await;
             if is_in_memory {
-                let listed_key = ManifestKey {
-                    version: listed.version,
-                    e_tag: listed.e_tag.as_deref(),
-                };
-                dataset
-                    .metadata_cache
-                    .insert_with_key(&listed_key, other.manifest.clone())
-                    .await;
+                cache_manifest(
+                    &dataset.metadata_cache,
+                    &other.object_store,
+                    &listed,
+                    other.manifest.clone(),
+                    other.snapshot_digest.clone(),
+                )
+                .await;
             }
         }
         let result = commit_compaction(
@@ -3153,14 +3153,14 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             ));
             let listed = uncached_listed_manifest(&other, rewrite_key.version).await;
             if is_in_memory {
-                let listed_key = ManifestKey {
-                    version: listed.version,
-                    e_tag: listed.e_tag.as_deref(),
-                };
-                other
-                    .metadata_cache
-                    .insert_with_key(&listed_key, dataset.manifest.clone())
-                    .await;
+                cache_manifest(
+                    &other.metadata_cache,
+                    &dataset.object_store,
+                    &listed,
+                    dataset.manifest.clone(),
+                    dataset.snapshot_digest.clone(),
+                )
+                .await;
             }
         }
         let result = create_index(&mut other).await;

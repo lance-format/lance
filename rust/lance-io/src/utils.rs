@@ -53,7 +53,7 @@ pub fn read_range_in_chunks(
 /// (measured at ~0.5 s and ~1 GiB of peak memory for a 945 MiB manifest).
 /// `copy_to_bytes` hands out a slice of the underlying chunk when the request
 /// lies within one, so `bytes`-typed fields decode zero-copy as well.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ChunkedBuf {
     chunks: VecDeque<Bytes>,
     remaining: usize,
