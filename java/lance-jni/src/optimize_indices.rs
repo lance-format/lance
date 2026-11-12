@@ -16,7 +16,6 @@ use lance::index::optimize::{
     IndexSegmentResult, OptimizeIndexMerge, OptimizeIndexTask, OptimizeIndicesPlan,
     commit_optimize_indices, plan_optimize_indices,
 };
-use lance_index::optimize::OptimizeOptions;
 
 use crate::{
     block_on,
@@ -85,21 +84,28 @@ pub extern "system" fn Java_org_lance_index_optimize_OptimizeIndices_nativeCommi
     _class: JClass,
     java_dataset: JObject, // Dataset
     java_results: JObject, // List<String>
+    java_options: JObject, // OptimizeOptions
 ) {
-    ok_or_throw_without_return!(env, inner_commit(&mut env, java_dataset, java_results));
+    ok_or_throw_without_return!(
+        env,
+        inner_commit(&mut env, java_dataset, java_results, java_options)
+    );
 }
 
-fn inner_commit(env: &mut JNIEnv, java_dataset: JObject, java_results: JObject) -> Result<()> {
+fn inner_commit(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_results: JObject,
+    java_options: JObject,
+) -> Result<()> {
+    let options = optimize_options_from_java(env, &java_options)?;
     let results = results_from_java(env, &java_results)?;
     let mut dataset =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    // Java does not expose commit options. Defaults leave transaction_properties
-    // unset and max_rows_to_consolidate disabled. If max_rows_to_consolidate is
-    // exposed later, the plan and commit paths must use the same value.
     block_on(commit_optimize_indices(
         &mut dataset.inner,
         results,
-        &OptimizeOptions::default(),
+        &options,
     ))?;
     Ok(())
 }

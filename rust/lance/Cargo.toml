@@ -26,6 +26,7 @@ lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
+lance-geo = { workspace = true, optional = true }
 lance-io = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
@@ -139,6 +140,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
+parquet-variant-compute = "59.2.0"
 reqwest = { workspace = true, features = ["rustls"] }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
@@ -175,7 +177,7 @@ tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 # Publish object store and memory metrics via the `metrics` crate.
 metrics = ["lance-core/metrics", "lance-io/metrics"]
-geo = ["lance-datafusion/geo", "lance-index/geo"]
+geo = ["dep:lance-geo", "lance-datafusion/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
 # Expose internal update-join controls to the dedicated benchmark target.
@@ -198,6 +200,10 @@ required-features = ["cli"]
 
 [[bench]]
 name = "scalar_index"
+harness = false
+
+[[bench]]
+name = "index_visibility"
 harness = false
 
 [[bench]]
@@ -227,6 +233,10 @@ harness = false
 
 [[bench]]
 name = "count_pushdown"
+harness = false
+
+[[bench]]
+name = "list_structure"
 harness = false
 
 [[bench]]
@@ -263,6 +273,10 @@ harness = false
 
 [[bench]]
 name = "fts_search"
+harness = false
+
+[[bench]]
+name = "scalar_prefilter"
 harness = false
 
 [[bench]]
@@ -364,6 +378,10 @@ harness = false
 
 [[bench]]
 name = "hamming_ivf_training"
+harness = false
+
+[[bench]]
+name = "cleanup"
 harness = false
 
 [lints]

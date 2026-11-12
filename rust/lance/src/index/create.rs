@@ -91,6 +91,9 @@ pub struct CreateIndexBuilder<'a> {
     memory_operation: Option<ObservedOperation>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// The parameters come from an existing index, so settings refused for a new
+    /// index (see [`InvertedIndexParams::validate_for_creation`]) are accepted.
+    is_copy_of_existing: bool,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -114,7 +117,15 @@ impl<'a> CreateIndexBuilder<'a> {
             progress: Arc::new(NoopIndexBuildProgress),
             memory_operation: Some(ObservedOperation::CreateIndex),
             transaction_properties: None,
+            is_copy_of_existing: false,
         }
+    }
+
+    /// Mark the parameters as copied from an existing index, skipping the checks
+    /// only new indexes must pass.
+    pub(crate) fn copy_of_existing(mut self) -> Self {
+        self.is_copy_of_existing = true;
+        self
     }
 
     pub fn name(mut self, name: String) -> Self {
@@ -266,6 +277,11 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             None
         };
+        if let Some(params) = &inverted_params
+            && !self.is_copy_of_existing
+        {
+            params.validate_for_creation()?;
+        }
         let resolved_fts_field = if let Some(params) = &inverted_params {
             Some(crate::index::scalar::inverted::resolve_fts_field(
                 self.dataset.schema(),
@@ -563,7 +579,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq,
+                | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq,
                 LANCE_VECTOR_INDEX,
             ) => {
                 // Vector index params.
@@ -1058,6 +1075,7 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq
         )
         && params.as_any().is::<VectorIndexParams>()
 }
@@ -1194,6 +1212,7 @@ mod tests {
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
         SearchResult, TextQuery, TokenQuery, inverted::tokenizer::InvertedIndexParams,
     };
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -5051,8 +5070,11 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::ivf_rq(IndexType::IvfRq)]
+    #[case::ivf_hnsw_rq(IndexType::IvfHnswRq)]
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version() {
+    async fn test_create_index_ivf_rq_preserves_index_version(#[case] index_type: IndexType) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -5068,18 +5090,26 @@ mod tests {
             );
         let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
 
-        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
+        let params = match index_type {
+            IndexType::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(4),
+                HnswBuildParams::default(),
+                RQBuildParams::new(1),
+            ),
+            _ => VectorIndexParams::ivf_rq(4, 1, DistanceType::L2),
+        };
 
         let committed = dataset
-            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+            .create_index(&["vector"], index_type, None, &params, false)
             .await
             .unwrap();
 
-        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+        assert_eq!(committed.index_version, index_type.version());
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+        assert_eq!(loaded[0].index_version, index_type.version());
     }
 
     #[tokio::test]

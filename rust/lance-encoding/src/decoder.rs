@@ -699,6 +699,8 @@ pub struct CoreFieldDecoderStrategy {
     pub validate_data: bool,
     pub decompressor_strategy: Arc<dyn DecompressionStrategy>,
     pub cache_repetition_index: bool,
+    /// Structural properties requested for list field IDs.
+    pub list_structure: Arc<std::collections::BTreeMap<i32, ListReadMode>>,
 }
 
 impl Default for CoreFieldDecoderStrategy {
@@ -707,6 +709,7 @@ impl Default for CoreFieldDecoderStrategy {
             validate_data: false,
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: false,
+            list_structure: Default::default(),
         }
     }
 }
@@ -724,6 +727,7 @@ impl CoreFieldDecoderStrategy {
             validate_data: config.validate_on_decode,
             decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
             cache_repetition_index: config.cache_repetition_index,
+            list_structure: config.list_structure.clone(),
         }
     }
 
@@ -923,16 +927,33 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
+        self.create_structural_field_scheduler_with_mode(field, column_infos, None)
+    }
+
+    fn create_structural_field_scheduler_with_mode(
+        &self,
+        field: &Field,
+        column_infos: &mut ColumnInfoIter,
+        inherited_mode: Option<ListReadMode>,
+    ) -> Result<Box<dyn StructuralFieldScheduler>> {
+        let mode = self
+            .list_structure
+            .get(&field.id)
+            .copied()
+            .or(inherited_mode);
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                column_info.clone(),
-                self.decompressor_strategy.clone(),
-                self.cache_repetition_index,
-                field,
-            )?);
+            let scheduler = Box::new(
+                StructuralPrimitiveFieldScheduler::try_new_lazy(
+                    column_info.clone(),
+                    self.decompressor_strategy.clone(),
+                    self.cache_repetition_index,
+                    field,
+                )?
+                .with_optional_list_read_mode(mode),
+            );
 
             // advance to the next top level column
             column_infos.next_top_level();
@@ -941,15 +962,20 @@ impl CoreFieldDecoderStrategy {
         }
         match &data_type {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() {
+                if field.is_packed_struct()
+                    || (fields.is_empty() && !field.metadata.contains_key("__lance_decoder_root"))
+                {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                        column_info.clone(),
-                        self.decompressor_strategy.clone(),
-                        self.cache_repetition_index,
-                        field,
-                    )?);
+                    let scheduler = Box::new(
+                        StructuralPrimitiveFieldScheduler::try_new_lazy(
+                            column_info.clone(),
+                            self.decompressor_strategy.clone(),
+                            self.cache_repetition_index,
+                            field,
+                        )?
+                        .with_optional_list_read_mode(mode),
+                    );
 
                     // advance to the next top level column
                     column_infos.next_top_level();
@@ -968,12 +994,15 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                            column_info.clone(),
-                            self.decompressor_strategy.clone(),
-                            self.cache_repetition_index,
-                            field,
-                        )?);
+                        let scheduler = Box::new(
+                            StructuralPrimitiveFieldScheduler::try_new_lazy(
+                                column_info.clone(),
+                                self.decompressor_strategy.clone(),
+                                self.cache_repetition_index,
+                                field,
+                            )?
+                            .with_optional_list_read_mode(mode),
+                        );
                         column_infos.next_top_level();
                         return Ok(scheduler);
                     }
@@ -981,8 +1010,11 @@ impl CoreFieldDecoderStrategy {
 
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
-                    let field_scheduler =
-                        self.create_structural_field_scheduler(field, column_infos)?;
+                    let field_scheduler = self.create_structural_field_scheduler_with_mode(
+                        field,
+                        column_infos,
+                        mode.map(|_| ListReadMode::Length),
+                    )?;
                     child_schedulers.push(field_scheduler);
                 }
 
@@ -994,8 +1026,18 @@ impl CoreFieldDecoderStrategy {
             }
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_mode = mode.map(|mode| {
+                    if inherited_mode.is_none() {
+                        mode
+                    } else {
+                        ListReadMode::Length
+                    }
+                });
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    child,
+                    column_infos,
+                    child_mode,
+                )?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1003,8 +1045,11 @@ impl CoreFieldDecoderStrategy {
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    child,
+                    column_infos,
+                    mode.map(|_| ListReadMode::Length),
+                )?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
                     *dimension,
@@ -1018,8 +1063,11 @@ impl CoreFieldDecoderStrategy {
                     return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                let child_scheduler = self.create_structural_field_scheduler_with_mode(
+                    entries_child,
+                    column_infos,
+                    mode.map(|_| ListReadMode::Length),
+                )?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -1771,10 +1819,11 @@ impl BatchDecodeStream {
                 // Real decode work happens inside into_batch, which can block the current
                 // thread for a long time. By spawning it as a new task, we allow Tokio's
                 // worker threads to keep making progress.
-                let (batch, _data_size) =
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??;
+                let (batch, _data_size) = lance_core::utils::tokio::spawn(async move {
+                    next_task.into_batch(emitted_batch_size_warning)
+                })
+                .await
+                .map_err(|err| Error::wrapped(err.into()))??;
                 Ok(batch)
             };
             // This should be true since batch size is u32
@@ -2050,6 +2099,10 @@ fn has_variable_width(data_type: &DataType) -> bool {
 // be scheduled before the first decode completes.
 const INITIAL_BYTE_ESTIMATE_ROWS: u64 = 128;
 
+// Header-driven pages issue follow-up I/O only when polled. Overlap those
+// requests within the current batch without starting later batches eagerly.
+const PAGE_LOAD_CONCURRENCY: usize = 16;
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
@@ -2128,28 +2181,44 @@ impl StructuralBatchDecodeStream {
         if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
         }
+        let mut pages = Vec::new();
+        let mut scheduling_error = None;
         while self.rows_scheduled < scheduled_need {
             let next_message = self.context.source.recv().await;
             match next_message {
-                Some(scan_line) => {
-                    let scan_line = scan_line?;
+                Some(Ok(scan_line)) => {
                     self.rows_scheduled = scan_line.scheduled_so_far;
-                    for message in scan_line.decoders {
-                        let unloaded_page = message.into_structural();
-                        let loaded_page = unloaded_page.0.await?;
-                        self.root_decoder.accept_page(loaded_page)?;
-                    }
+                    pages.extend(
+                        scan_line
+                            .decoders
+                            .into_iter()
+                            .map(MessageType::into_structural),
+                    );
+                }
+                Some(Err(error)) => {
+                    scheduling_error = Some(error);
+                    break;
                 }
                 None => {
                     // Schedule ended before we got all the data we expected.  This probably
                     // means some kind of pushdown filter was applied and we didn't load as
                     // much data as we thought we would.
                     self.scheduler_exhausted = true;
-                    return Ok(self.rows_scheduled);
+                    break;
                 }
             }
         }
-        Ok(scheduled_need)
+        let mut loaded = stream::iter(pages)
+            .map(|page| page.0)
+            .buffered(PAGE_LOAD_CONCURRENCY);
+        while let Some(page) = loaded.next().await {
+            self.root_decoder.accept_page(page?)?;
+        }
+        // Preserve the earlier page-load error if scheduling also failed later.
+        if let Some(error) = scheduling_error {
+            return Err(error);
+        }
+        Ok(scheduled_need.min(self.rows_scheduled))
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2238,9 +2307,11 @@ impl StructuralBatchDecodeStream {
             let has_variable_width = slf.has_variable_width;
             let task = async move {
                 let (batch, data_size) = if spawn_batch_decode_tasks {
-                    tokio::spawn(async move { next_task.into_batch(emitted_batch_size_warning) })
-                        .await
-                        .map_err(|err| Error::wrapped(err.into()))??
+                    lance_core::utils::tokio::spawn(async move {
+                        next_task.into_batch(emitted_batch_size_warning)
+                    })
+                    .await
+                    .map_err(|err| Error::wrapped(err.into()))??
                 } else {
                     next_task.into_batch(emitted_batch_size_warning)?
                 };
@@ -2350,9 +2421,26 @@ impl RequestedRows {
     }
 }
 
+/// Which properties of a list a consumer needs, without its element payloads.
+///
+/// Structural reads return empty placeholder values. They may only feed expressions
+/// that use the requested list property; they must never be exposed as stored values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListReadMode {
+    /// Preserve the exact outer list length and validity.
+    Length,
+    /// Preserve outer validity and emptiness; nonempty lengths may become one.
+    NonEmpty,
+}
+
 /// Configuration for decoder behavior
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    /// List field IDs whose consumers need only structural properties.
+    ///
+    /// This is a query-planning contract, not a hint: callers must not consume
+    /// the placeholder element values. Unsupported encodings retain normal reads.
+    pub list_structure: Arc<std::collections::BTreeMap<i32, ListReadMode>>,
     /// Whether to cache repetition indices for better performance.
     ///
     /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
@@ -2385,6 +2473,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
+            list_structure: Default::default(),
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
             inline_scheduling: None,
@@ -2410,7 +2499,7 @@ pub struct SchedulerDecoderConfig {
 
 fn check_scheduler_on_drop(
     stream: BoxStream<'static, ReadBatchTask>,
-    scheduler_handle: tokio::task::JoinHandle<()>,
+    scheduler_handle: lance_core::utils::tokio::JoinHandle<()>,
 ) -> BoxStream<'static, ReadBatchTask> {
     // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
     // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
@@ -2625,7 +2714,7 @@ async fn create_scheduler_decoder(
         let scheduling = async move {
             decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io)
         };
-        let scheduler_handle = tokio::task::spawn(scheduling);
+        let scheduler_handle = lance_core::utils::tokio::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
     }
 }
@@ -3263,6 +3352,10 @@ impl EncodingsIo for RequestBatch {
     ) -> Option<Arc<dyn EncodingsIo>> {
         self.shared.inner.with_io_stats(stats)
     }
+
+    fn with_coalesce_gap(&self, gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        self.shared.inner.with_coalesce_gap(gap)
+    }
 }
 
 pub struct SchedulerContext {
@@ -3693,9 +3786,41 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use crate::repdef::DefinitionInterpretation;
+    use arrow_array::{StringArray, UInt32Array, types::UInt32Type};
     use futures::TryStreamExt;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
+    use tokio::sync::Barrier;
+
+    #[derive(Debug)]
+    struct LiteralPage(u32);
+
+    #[derive(Debug)]
+    struct LiteralPageTask(u32);
+
+    impl StructuralPageDecoder for LiteralPage {
+        fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            assert_eq!(num_rows, 1);
+            Ok(Box::new(LiteralPageTask(self.0)))
+        }
+        fn num_rows(&self) -> u64 {
+            1
+        }
+    }
+
+    impl DecodePageTask for LiteralPageTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            Ok(DecodedPage {
+                data: DataBlock::from_decoded_array(Arc::new(UInt32Array::from(vec![self.0]))),
+                repdef: RepDefUnraveler::new(
+                    None,
+                    None,
+                    Arc::new([DefinitionInterpretation::AllValidItem]),
+                    1,
+                ),
+            })
+        }
+    }
 
     struct StaticArrayDecodeTask(ArrayRef);
 
@@ -4198,9 +4323,14 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::load_only(1, false)]
+    #[case::load_before_scheduler(2, true)]
     #[tokio::test]
-    async fn test_structural_stream_stops_on_load_error() {
-        let rows_per_batch = 1;
+    async fn test_structural_stream_stops_on_load_error(
+        #[case] rows_per_batch: u32,
+        #[case] later_error: bool,
+    ) {
         let total_rows = 2;
         let scheduled_rows = 1;
         let batch_readahead = 2;
@@ -4218,6 +4348,9 @@ mod tests {
             decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(failed_page))],
         }))
         .unwrap();
+        if later_error {
+            tx.send(Err(Error::io("later scheduling failure"))).unwrap();
+        }
         drop(tx);
 
         let stream = StructuralBatchDecodeStream::new(
@@ -4245,6 +4378,72 @@ mod tests {
             batches.next().await.is_none(),
             "stream should stop after the page-load error"
         );
+    }
+
+    #[tokio::test]
+    async fn test_structural_stream_overlaps_pages_within_batch() {
+        let count = PAGE_LOAD_CONCURRENCY;
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::UInt32, false)]);
+        let root = StructuralStructDecoder::new(fields, true, true, false).unwrap();
+        let (tx, rx) = unbounded_channel();
+        let barrier = Arc::new(Barrier::new(count));
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        for value in 0..count * 2 {
+            let (barrier, started, active, peak) = (
+                barrier.clone(),
+                started.clone(),
+                active.clone(),
+                peak.clone(),
+            );
+            let page = async move {
+                started.fetch_add(1, Ordering::Relaxed);
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(current, Ordering::Relaxed);
+                barrier.wait().await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok(LoadedPageShard {
+                    decoder: Box::new(LiteralPage(value as u32)),
+                    path: VecDeque::from([0]),
+                })
+            }
+            .boxed();
+            tx.send(Ok(DecoderMessage {
+                scheduled_so_far: value as u64 + 1,
+                decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(page))],
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            count as u32,
+            (count * 2) as u64,
+            root,
+            false,
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for batch_index in 0..2 {
+                let task = stream.next_batch_task().await.unwrap().unwrap();
+                let (batch, _) = task.into_batch(Arc::new(Once::new())).unwrap();
+                assert_eq!(
+                    batch
+                        .column(0)
+                        .as_primitive::<UInt32Type>()
+                        .values()
+                        .as_ref(),
+                    &(batch_index * count..(batch_index + 1) * count)
+                        .map(|v| v as u32)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(started.load(Ordering::Relaxed), (batch_index + 1) * count);
+            }
+        })
+        .await
+        .expect("page loads must overlap to release the barrier");
+        assert_eq!(peak.load(Ordering::Relaxed), count);
     }
 
     #[tokio::test]

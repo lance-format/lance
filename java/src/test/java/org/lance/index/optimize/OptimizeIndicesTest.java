@@ -43,6 +43,8 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.commons.lang3.SerializationUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.Serializable;
 import java.nio.file.Path;
@@ -51,10 +53,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class OptimizeIndicesTest {
@@ -131,7 +135,7 @@ public class OptimizeIndicesTest {
         }
 
         long version = driver.version();
-        OptimizeIndices.commit(driver, merged);
+        OptimizeIndices.commit(driver, merged, options);
         assertEquals(version + 1, driver.version());
         List<Index> segments =
             driver.getIndexes().stream()
@@ -144,6 +148,58 @@ public class OptimizeIndicesTest {
                 .flatMap(segment -> segment.fragments().get().stream())
                 .collect(Collectors.toSet()));
         assertEquals(250, nearestId(driver, vector(250)));
+      }
+    }
+  }
+
+  @ParameterizedTest(name = "distributed={0}")
+  @ValueSource(booleans = {false, true})
+  void testBoundedVectorConsolidation(boolean distributed, @TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("dataset").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      Dataset.create(allocator, path, SCHEMA, new WriteParams.Builder().build()).close();
+      appendFragments(allocator, path, 1, 0, 1, 100);
+      try (Dataset dataset = Dataset.open(path)) {
+        dataset.createIndex(
+            List.of(VECTOR_COLUMN),
+            IndexType.IVF_FLAT,
+            Optional.of(INDEX_NAME),
+            IndexParams.builder()
+                .setVectorIndexParams(VectorIndexParams.ivfFlat(2, DistanceType.L2))
+                .build(),
+            true);
+        OptimizeOptions append = OptimizeOptions.builder().numIndicesToMerge(0).build();
+        for (int firstId : new int[] {100, 150}) {
+          appendFragments(allocator, path, dataset.version(), firstId, 1, 50);
+          dataset.checkoutLatest();
+          dataset.optimizeIndices(append);
+        }
+        appendFragments(allocator, path, dataset.version(), 200, 1, 50);
+        dataset.checkoutLatest();
+
+        OptimizeOptions options = OptimizeOptions.builder().maxRowsToConsolidate(100).build();
+        if (distributed) {
+          OptimizeIndicesPlan plan = OptimizeIndices.plan(dataset, options);
+          assertEquals(1, plan.getMerges().size());
+          IndexSegmentResult merged = plan.getMerges().get(0).execute(dataset, List.of()).get();
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> OptimizeIndices.commit(dataset, List.of(merged, merged), options));
+          assertTrue(error.getMessage().contains("consolidation results replace a source twice"));
+          OptimizeIndices.commit(dataset, List.of(merged), options);
+        } else {
+          dataset.optimizeIndices(options);
+        }
+
+        List<Index> segments = dataset.getIndexes();
+        assertEquals(2, segments.size());
+        assertEquals(
+            Set.of(List.of(0), List.of(1, 2)),
+            segments.stream()
+                .map(segment -> segment.fragments().get())
+                .collect(Collectors.toSet()));
+        assertEquals(175, nearestId(dataset, vector(175)));
       }
     }
   }
