@@ -157,8 +157,8 @@ impl<'a> UpdateFieldMetadataBuilder<'a> {
     ) -> Result<Self> {
         let field_id = field.into().into_id(self.dataset.schema())?;
         let entries = values.into_iter().map(Into::into).collect();
-        // Calls for the same field apply in order, as if committed one after
-        // the other. A replace() discards whatever came before it.
+        // Calls for the same field combine in order into their net effect on
+        // the field's metadata. A replace() discards whatever came before it.
         let update = match self.field_metadata_updates.remove(&field_id) {
             Some(earlier) if !replace => chain_update(earlier, entries),
             _ => UpdateMap {
