@@ -40,7 +40,7 @@ use lance_core::{
     ROW_LAST_UPDATED_AT_VERSION_FIELD,
 };
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_encoding::decoder::DecoderPlugins;
+use lance_encoding::decoder::{DecoderPlugins, ValuePredicate};
 use lance_file::reader::{
     CachedFileMetadata, FileMetadataIndex, FileReaderOptions, ProjectedFileReader,
 };
@@ -195,6 +195,17 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Get storage statistics for this file (ignored by v1 reader)
     fn storage_stats(&self) -> Result<Vec<(u32, u64)>>;
+
+    /// See [`FragmentReader::rows_that_may_match`]. Returns `None` if the file can't check the
+    /// field.
+    fn rows_that_may_match<'a>(
+        &'a self,
+        _field_id: i32,
+        _ranges: &'a [Range<u64>],
+        _predicate: &'a dyn ValuePredicate,
+    ) -> BoxFuture<'a, Result<Option<Vec<Range<u64>>>>> {
+        futures::future::ready(Ok(None)).boxed()
+    }
 
     // Clone the reader, this is needed because Box<dyn Foo: Clone> doesn't
     // implement Clone
@@ -753,6 +764,25 @@ mod v2_adapter {
                 stats.push((current_field_id, col_stats.size_bytes));
             }
             Ok(stats)
+        }
+
+        fn rows_that_may_match<'a>(
+            &'a self,
+            field_id: i32,
+            ranges: &'a [Range<u64>],
+            predicate: &'a dyn ValuePredicate,
+        ) -> BoxFuture<'a, Result<Option<Vec<Range<u64>>>>> {
+            async move {
+                let projection = file_versions::reader_projection_from_field_ids(
+                    self.reader.version(),
+                    &self.projection.project_by_ids(&[field_id], true),
+                    self.field_id_to_column_idx.as_ref(),
+                )?;
+                self.reader
+                    .rows_that_may_match(&projection, ranges, predicate)
+                    .await
+            }
+            .boxed()
         }
 
         fn projection(&self) -> &Arc<Schema> {
@@ -4179,6 +4209,36 @@ impl FragmentReader {
             reader.read_all_tasks(batch_size, reader.projection().clone())
         })
         .await
+    }
+
+    /// Returns the row ranges of the pages overlapping `ranges` that may contain a value of
+    /// field `field_id` matching `predicate`. See [`ProjectedFileReader::rows_that_may_match`].
+    pub async fn rows_that_may_match(
+        &self,
+        field_id: i32,
+        ranges: &[Range<u64>],
+        predicate: &dyn ValuePredicate,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        // Page values don't include values replaced by overlays.
+        if self
+            .fragment
+            .metadata
+            .overlays
+            .iter()
+            .any(|overlay| overlay.data_file.fields.contains(&field_id))
+        {
+            return Ok(None);
+        }
+        let Some(reader) = self
+            .readers
+            .iter()
+            .find(|reader| reader.projection().field_by_id(field_id).is_some())
+        else {
+            return Ok(None);
+        };
+        reader
+            .rows_that_may_match(field_id, ranges, predicate)
+            .await
     }
 
     // This method is a clone of new_read_impl but returns tasks instead of batches
