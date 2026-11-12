@@ -1197,6 +1197,15 @@ impl DictionaryDataBlock {
         let num_indices = indices.len();
         let mut out_offsets = Vec::<T>::with_capacity(num_indices + 1);
         let mut out_bytes = Vec::<u8>::with_capacity(total_bytes);
+        // SAFETY: `validate_offsets_for_append(0..dict_len)` proved `dict_offsets.len()` exceeds
+        // `dict_len` and that offsets in `0..=dict_len` are non-negative, non-decreasing, and at
+        // most `dict_data.len()`. Pass 1 proved every index converts to `usize`, so `as_usize`
+        // agrees, and that `idx < dict_len`: the unchecked reads stay within `0..=dict_len` and
+        // every `start..end` payload range is in bounds. `total_bytes` is their exact sum and fits
+        // both `usize` and `T`, so every rebased offset fits `T`. Both outputs are fresh
+        // allocations disjoint from `dict_data`, with capacity `num_indices + 1` and
+        // `total_bytes`, and the loop writes all `num_indices + 1` offsets and fills
+        // `0..total_bytes` contiguously before the two `set_len` calls.
         unsafe {
             let out_off_ptr = out_offsets.as_mut_ptr();
             let out_byte_ptr = out_bytes.as_mut_ptr();
@@ -1204,9 +1213,6 @@ impl DictionaryDataBlock {
             *out_off_ptr = T::usize_as(0);
             let mut running = 0usize;
             for (pos, &raw_idx) in indices.iter().enumerate() {
-                // SAFETY: Pass 1 verified `raw_idx.to_usize() == Some(idx)` with `idx < dict_len`,
-                // `0 <= start <= end <= dict_data.len()`, and `sum(end - start) == total_bytes`
-                // which fits in both `usize` and `T`.
                 let idx = raw_idx.as_usize();
                 let start = (*dict_offsets.get_unchecked(idx)).as_usize();
                 let end = (*dict_offsets.get_unchecked(idx + 1)).as_usize();
