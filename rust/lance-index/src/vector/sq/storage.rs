@@ -140,6 +140,99 @@ impl SQStorageChunk {
     }
 }
 
+/// Zero-copy row IDs in chunk order, including underlying values at null slots.
+///
+/// The exact remaining count comes from the storage's checked row-offset
+/// prefix. Construction is O(1); values still borrow the original Arrow slices.
+struct SQRowIds<'a> {
+    chunks: std::slice::Iter<'a, SQStorageChunk>,
+    current: std::slice::Iter<'a, u64>,
+    remaining: usize,
+}
+
+impl<'a> SQRowIds<'a> {
+    fn new(chunks: &'a [SQStorageChunk], remaining: usize) -> Self {
+        Self {
+            chunks: chunks.iter(),
+            current: [].iter(),
+            remaining,
+        }
+    }
+}
+
+impl<'a> Iterator for SQRowIds<'a> {
+    type Item = &'a u64;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row_id) = self.current.next() {
+                self.remaining -= 1;
+                return Some(row_id);
+            }
+            let Some(chunk) = self.chunks.next() else {
+                debug_assert_eq!(
+                    self.remaining, 0,
+                    "SQ row-ID slices must match their length sum"
+                );
+                return None;
+            };
+            self.current = chunk.row_ids.values().iter();
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+
+    fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
+        loop {
+            let current_len = self.current.len();
+            if n < current_len {
+                let row_id = self.current.nth(n);
+                self.remaining -= current_len - self.current.len();
+                return row_id;
+            }
+            self.remaining -= current_len;
+            n -= current_len;
+            // Exhaust this slice even when n runs beyond every remaining chunk.
+            self.current = [].iter();
+            let Some(chunk) = self.chunks.next() else {
+                debug_assert_eq!(self.remaining, 0, "SQ nth must drain all skipped slices");
+                return None;
+            };
+            self.current = chunk.row_ids.values().iter();
+        }
+    }
+
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let init = self.current.fold(init, &mut f);
+        self.chunks.fold(init, |acc, chunk| {
+            chunk.row_ids.values().iter().fold(acc, &mut f)
+        })
+    }
+
+    fn count(self) -> usize {
+        self.remaining
+    }
+
+    fn last(mut self) -> Option<Self::Item> {
+        for chunk in self.chunks.rev() {
+            if let Some(row_id) = chunk.row_ids.values().last() {
+                return Some(row_id);
+            }
+        }
+        self.current.next_back()
+    }
+}
+
+impl ExactSizeIterator for SQRowIds<'_> {}
+impl std::iter::FusedIterator for SQRowIds<'_> {}
+
 impl DeepSizeOf for SQStorageChunk {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.batch.deep_size_of_children(context)
@@ -168,6 +261,21 @@ impl DeepSizeOf for ScalarQuantizationStorage {
 
 const SQ_CHUNK_CAPACITY: usize = 1024;
 
+// Every SQ row-position API uses u32. Validate the existing offsets prefix
+// at each write, so its final value is an authoritative O(1) iterator length.
+fn checked_sq_end_offset(previous: u32, rows: usize) -> Result<u32> {
+    let count = u32::try_from(rows).map_err(|_| {
+        Error::invalid_input(format!(
+            "SQ chunk has {rows} rows, exceeding u32 row-position capacity"
+        ))
+    })?;
+    previous.checked_add(count).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "SQ row total exceeds u32 capacity: previous={previous}, chunk_rows={rows}"
+        ))
+    })
+}
+
 impl ScalarQuantizationStorage {
     pub fn try_new(
         num_bits: u16,
@@ -191,11 +299,13 @@ impl ScalarQuantizationStorage {
         let mut chunks = Vec::with_capacity(SQ_CHUNK_CAPACITY);
         let mut offsets = Vec::with_capacity(SQ_CHUNK_CAPACITY + 1);
         offsets.push(0);
+        let mut end_offset = 0_u32;
         for mut batch in batches.into_iter() {
             if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
                 batch = frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
             }
-            offsets.push(offsets.last().unwrap() + batch.num_rows() as u32);
+            end_offset = checked_sq_end_offset(end_offset, batch.num_rows())?;
+            offsets.push(end_offset);
             let chunk = SQStorageChunk::new(batch)?;
             chunks.push(chunk);
         }
@@ -263,7 +373,7 @@ impl ScalarQuantizationStorage {
                 self.chunks[0].schema(),
                 self.chunks.iter().map(|c| &c.batch),
             )?;
-            new.offsets = vec![0, batch.num_rows() as u32];
+            new.offsets = vec![0, checked_sq_end_offset(0, batch.num_rows())?];
             new.chunks = vec![SQStorageChunk::new(batch)?];
             Ok(new)
         }
@@ -358,9 +468,11 @@ impl VectorStore for ScalarQuantizationStorage {
 
         // self.quantizer.transform(data)
         let mut storage = self.clone();
-        let offset = self.len() as u32;
+        let offset = checked_sq_end_offset(0, self.len())?;
         let new_chunk = SQStorageChunk::new(new_batch)?;
-        storage.offsets.push(offset + new_chunk.len() as u32);
+        storage
+            .offsets
+            .push(checked_sq_end_offset(offset, new_chunk.len())?);
         storage.chunks.push(new_chunk);
 
         storage.optimize()
@@ -389,7 +501,7 @@ impl VectorStore for ScalarQuantizationStorage {
     }
 
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.chunks.iter().flat_map(|c| c.row_ids.values())
+        SQRowIds::new(&self.chunks, self.len())
     }
 
     /// Create a [DistCalculator] to compute the distance between the query.
@@ -884,5 +996,340 @@ mod tests {
 
         let stored_query_calculator = storage.dist_calculator_from_id(0);
         assert!((stored_query_calculator.distance(1) - 1.5019608).abs() < 1e-6);
+    }
+    fn sq_row_id_iterator_storage(rows: &[Vec<u64>]) -> ScalarQuantizationStorage {
+        ScalarQuantizationStorage::try_new(
+            8,
+            DistanceType::L2,
+            -1.0..1.0,
+            rows.iter().map(|ids| {
+                create_record_batch_with_sq_codes(ids.clone(), vec![0; ids.len() * 2], 2)
+            }),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::one_empty(vec![vec![]])]
+    #[case::empty_chunks(vec![vec![], vec![], vec![]])]
+    #[case::one_chunk(vec![vec![9, 1, 1, u64::MAX]])]
+    #[case::multiple_chunks(vec![vec![9, 1, 1], vec![u64::MAX, 4], vec![2, 9]])]
+    #[case::interspersed_empty(vec![vec![], vec![9, 1, 1], vec![], vec![u64::MAX, 4], vec![], vec![2, 9], vec![]])]
+    fn sq_row_ids_exact_hint_and_zero_copy(#[case] rows: Vec<Vec<u64>>) {
+        let storage = sq_row_id_iterator_storage(&rows);
+        let expected = storage
+            .chunks
+            .iter()
+            .flat_map(|c| c.row_ids.values())
+            .collect::<Vec<_>>();
+        let mut actual = storage.row_ids();
+        for (position, expected_row) in expected.iter().enumerate() {
+            assert_eq!(
+                actual.size_hint(),
+                (expected.len() - position, Some(expected.len() - position))
+            );
+            let row = actual.next().unwrap();
+            assert_eq!(row, *expected_row);
+            assert!(
+                std::ptr::eq(row, *expected_row),
+                "A row ID must borrow the existing Arrow buffer"
+            );
+        }
+        assert_eq!(actual.size_hint(), (0, Some(0)));
+        assert_eq!(actual.next(), None);
+        assert_eq!(actual.next(), None);
+        assert_eq!(actual.size_hint(), (0, Some(0)));
+    }
+
+    #[rstest::rstest]
+    #[case::first(0)]
+    #[case::last_in_first_chunk(2)]
+    #[case::first_in_second_chunk(3)]
+    #[case::later_chunk(5)]
+    #[case::last(6)]
+    #[case::exact_end(7)]
+    #[case::past_end(8)]
+    #[case::max_skip(usize::MAX)]
+    fn sq_row_ids_nth_matches_slice_and_updates_hint(
+        #[case] skip: usize,
+        #[values(0, 1, 4)] already_taken: usize,
+    ) {
+        let storage = sq_row_id_iterator_storage(&[
+            vec![],
+            vec![9, 1, 1],
+            vec![],
+            vec![u64::MAX, 4],
+            vec![],
+            vec![2, 9],
+            vec![],
+        ]);
+        let expected = storage
+            .chunks
+            .iter()
+            .flat_map(|c| c.row_ids.values())
+            .collect::<Vec<_>>();
+        let mut reference = expected.iter().copied();
+        let mut actual = storage.row_ids();
+        for _ in 0..already_taken {
+            assert_eq!(actual.next(), reference.next());
+        }
+        let got = actual.nth(skip);
+        let want = reference.nth(skip);
+        assert_eq!(got, want);
+        if let (Some(got), Some(want)) = (got, want) {
+            assert!(std::ptr::eq(got, want));
+        }
+        assert_eq!(actual.size_hint(), (reference.len(), Some(reference.len())));
+        assert_eq!(actual.collect::<Vec<_>>(), reference.collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sq_row_ids_private_exact_and_fused_empty_iterator() {
+        fn exact_fused<I: ExactSizeIterator + std::iter::FusedIterator>(_: &I) {}
+        let mut iterator = SQRowIds::new(&[], 0);
+        exact_fused(&iterator);
+        assert_eq!(iterator.len(), 0);
+        assert_eq!(iterator.size_hint(), (0, Some(0)));
+        assert_eq!(iterator.nth(usize::MAX), None);
+        assert_eq!(iterator.next(), None);
+    }
+
+    #[test]
+    fn sq_row_ids_count_and_last_after_partial_consumption() {
+        let storage =
+            sq_row_id_iterator_storage(&[vec![], vec![11, 7], vec![], vec![4, 9], vec![]]);
+        let mut count = SQRowIds::new(&storage.chunks, storage.len());
+        assert_eq!(count.next(), Some(&11));
+        assert_eq!(count.next(), Some(&7));
+        assert_eq!(count.len(), 2);
+        assert_eq!(count.count(), 2);
+        let mut last = storage.row_ids();
+        assert_eq!(last.next(), Some(&11));
+        assert_eq!(last.last(), Some(&9));
+    }
+
+    #[test]
+    fn sq_row_ids_keep_nullable_values_and_arrow_slice_offsets() {
+        let array = UInt64Array::new(
+            vec![123, 17, 700, 3, 456].into(),
+            Some(arrow::buffer::NullBuffer::from(vec![
+                true, true, false, true, true,
+            ])),
+        )
+        .slice(1, 3);
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0; 6]), 2).unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (ROW_ID, Arc::new(array) as ArrayRef),
+            (SQ_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+        ])
+        .unwrap();
+        let storage =
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, [batch], None)
+                .unwrap();
+        assert_eq!(
+            arrow_array::Array::null_count(&storage.chunks[0].row_ids),
+            1
+        );
+        let expected = storage
+            .chunks
+            .iter()
+            .flat_map(|c| c.row_ids.values())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected.iter().map(|&&v| v).collect::<Vec<_>>(),
+            vec![17, 700, 3]
+        );
+        let mut actual = storage.row_ids();
+        assert_eq!(actual.size_hint(), (3, Some(3)));
+        for want in expected {
+            let got = actual.next().unwrap();
+            assert!(std::ptr::eq(got, want));
+        }
+        assert_eq!(actual.size_hint(), (0, Some(0)));
+    }
+    #[rstest::rstest]
+    #[case::empty(vec![vec![]], 0, None)]
+    #[case::all_empty(vec![vec![], vec![]], 0, Some(usize::MAX))]
+    #[case::full(vec![vec![], vec![9, 1, 1], vec![], vec![u64::MAX, 4], vec![2, 9], vec![]], 0, None)]
+    #[case::partial_current(vec![vec![9, 1, 1], vec![4, 2]], 1, None)]
+    #[case::at_chunk_end(vec![vec![9, 1, 1], vec![], vec![4, 2]], 3, None)]
+    #[case::nth_current(vec![vec![9, 1, 1], vec![4, 2]], 0, Some(1))]
+    #[case::next_then_nth(vec![vec![9, 1, 1], vec![], vec![4, 2]], 1, Some(1))]
+    #[case::nth_cross_chunk(vec![vec![9, 1, 1], vec![], vec![4, 2]], 1, Some(2))]
+    #[case::nth_past_end(vec![vec![9, 1, 1], vec![4, 2]], 1, Some(usize::MAX))]
+    fn sq_row_ids_owned_fold_preserves_order_and_state(
+        #[case] chunks: Vec<Vec<u64>>,
+        #[case] next_count: usize,
+        #[case] skip: Option<usize>,
+    ) {
+        let storage = sq_row_id_iterator_storage(&chunks);
+        let original = storage
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.row_ids.values())
+            .collect::<Vec<_>>();
+        let mut expected = original.iter().copied();
+        let mut actual = SQRowIds::new(&storage.chunks, storage.len());
+        for _ in 0..next_count {
+            assert_eq!(actual.next(), expected.next());
+        }
+        if let Some(skip) = skip {
+            assert_eq!(actual.nth(skip), expected.nth(skip));
+        }
+        assert_eq!(actual.len(), expected.len());
+        let expected = expected.collect::<Vec<_>>();
+        let mut calls = 0_usize;
+        let mut state = 19_u64;
+        let actual = actual.fold(Vec::new(), |mut output, row| {
+            assert!(std::ptr::eq(row, expected[calls]));
+            calls += 1;
+            state = state.wrapping_mul(131).wrapping_add(*row);
+            output.push(row);
+            output
+        });
+        assert_eq!(actual, expected);
+        assert_eq!(calls, expected.len());
+        assert_eq!(
+            state,
+            expected
+                .iter()
+                .fold(19_u64, |acc, &&row| acc.wrapping_mul(131).wrapping_add(row))
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::none(0)]
+    #[case::current_slice(1)]
+    #[case::across_chunks(3)]
+    #[case::all(100)]
+    fn sq_row_ids_borrowed_fold_keeps_remaining(#[case] prefix: usize) {
+        let storage =
+            sq_row_id_iterator_storage(&[vec![], vec![11, 7, 3], vec![], vec![4, 9], vec![]]);
+        let original = storage
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.row_ids.values())
+            .collect::<Vec<_>>();
+        let mut expected = original.iter().copied();
+        let mut actual = SQRowIds::new(&storage.chunks, storage.len());
+        assert_eq!(actual.next(), expected.next());
+        let take = |mut values: Vec<u64>, row: &u64| {
+            values.push(*row);
+            values
+        };
+        assert_eq!(
+            actual.by_ref().take(prefix).fold(Vec::new(), take),
+            expected.by_ref().take(prefix).copied().collect::<Vec<_>>()
+        );
+        assert_eq!(actual.size_hint(), (expected.len(), Some(expected.len())));
+        let tail = actual.by_ref().fold(Vec::new(), take);
+        assert_eq!(tail, expected.copied().collect::<Vec<_>>());
+        assert_eq!(actual.len(), 0);
+        assert_eq!(actual.size_hint(), (0, Some(0)));
+        assert_eq!(actual.next(), None);
+    }
+
+    #[test]
+    fn sq_row_ids_fold_preserves_nullable_slice_values() {
+        let ids = UInt64Array::new(
+            vec![123, 17, 700, 3, 456].into(),
+            Some(arrow::buffer::NullBuffer::from(vec![
+                true, true, false, true, true,
+            ])),
+        )
+        .slice(1, 3);
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0; 6]), 2).unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (ROW_ID, Arc::new(ids) as ArrayRef),
+            (SQ_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+        ])
+        .unwrap();
+        let storage =
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, -1.0..1.0, [batch], None)
+                .unwrap();
+        let expected = storage
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.row_ids.values())
+            .collect::<Vec<_>>();
+        let actual =
+            SQRowIds::new(&storage.chunks, storage.len()).fold(Vec::new(), |mut output, row| {
+                output.push(row);
+                output
+            });
+        assert_eq!(
+            actual.iter().map(|&&row| row).collect::<Vec<_>>(),
+            [17, 700, 3]
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(&a, b)| std::ptr::eq(a, b))
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty(0, 0, Some(0))]
+    #[case::normal(17, 5, Some(22))]
+    #[case::max_total(u32::MAX-1, 1, Some(u32::MAX))]
+    #[case::overflow(u32::MAX, 1, None)]
+    fn p0_sq_checked_row_total(
+        #[case] previous: u32,
+        #[case] rows: usize,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(checked_sq_end_offset(previous, rows).ok(), expected);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn p0_sq_rejects_unrepresentable_chunk_without_allocating_it() {
+        assert!(checked_sq_end_offset(0, u32::MAX as usize + 1).is_err());
+        assert!(checked_sq_end_offset(0, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn p0_sq_offsets_remain_exact_through_append_and_optimize() {
+        let storage = sq_row_id_iterator_storage(&[vec![0, 1, 2], vec![], vec![3, 4, 5, 6]]);
+        let check = |storage: &ScalarQuantizationStorage| {
+            let actual = storage
+                .chunks
+                .iter()
+                .map(SQStorageChunk::len)
+                .sum::<usize>();
+            assert_eq!(storage.len(), actual);
+            assert_eq!(storage.row_ids().size_hint(), (actual, Some(actual)));
+        };
+        check(&storage);
+        let values =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 6]), 2).unwrap();
+        let append = RecordBatch::try_from_iter([
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from(vec![7, 8, 9])) as ArrayRef,
+            ),
+            ("vector", Arc::new(values) as ArrayRef),
+        ])
+        .unwrap();
+        let appended = storage.append_batch(append, "vector").unwrap();
+        check(&appended);
+        assert_eq!(
+            appended.row_ids().copied().collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        let before =
+            sq_row_id_iterator_storage(&[(0..512).collect(), vec![], (512..1025).collect()]);
+        check(&before);
+        let optimized = before.optimize().unwrap();
+        check(&optimized);
+        assert_eq!(optimized.to_batches().unwrap().count(), 1);
+        assert_eq!(
+            optimized.row_ids().copied().collect::<Vec<_>>(),
+            (0..1025).collect::<Vec<_>>()
+        );
     }
 }
