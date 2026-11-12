@@ -1652,6 +1652,12 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
     let legacy_field = schema.field_with_name("blob").unwrap();
     let old_values = [Some(b"legacy bytes".as_slice()), None, Some(b"".as_slice())];
     let old_snapshot = dataset.version_id();
+    let default_file_version = dataset.manifest.data_storage_format.clone();
+    let legacy_descriptors = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        legacy_descriptors["blob"].as_struct().fields(),
+        &*lance_core::datatypes::BLOB_DESC_FIELDS
+    );
     let field_id = dataset.schema().field("blob").unwrap().id;
     let old_fragment = dataset.manifest.fragments[0].clone();
     let old_path = std::path::Path::new(dir.as_str())
@@ -1741,6 +1747,28 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
         .chain([legacy_again])
         .collect::<Vec<_>>();
 
+    // Compaction must not silently upgrade the table's default file version.
+    let mixed_snapshot = dataset.version_id();
+    let error = crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions {
+            target_rows_per_fragment: 100,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("Blob v2 requires file version >= 2.2")
+    );
+    dataset = Dataset::open(&dir).await.unwrap();
+    assert_eq!(dataset.version_id(), mixed_snapshot);
+    assert_eq!(dataset.manifest.fragments.len(), 3);
+
     for compact in [false, true] {
         if compact {
             crate::dataset::optimize::compact_files(
@@ -1757,6 +1785,7 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
             assert_eq!(dataset.manifest.fragments.len(), 1);
             dataset = Dataset::open(&dir).await.unwrap();
         }
+        assert_eq!(dataset.manifest.data_storage_format, default_file_version);
         let dataset = Arc::new(dataset.clone());
         let descriptors = dataset.scan().try_into_batch().await.unwrap();
         assert_eq!(
@@ -1809,6 +1838,10 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
     }
     let historical = Arc::new(dataset.checkout_version(old_snapshot).await.unwrap());
     assert!(!historical.schema().field("blob").unwrap().is_blob_v2());
+    assert_eq!(
+        historical.scan().try_into_batch().await.unwrap(),
+        legacy_descriptors
+    );
     let handles = historical
         .take_blobs_by_indices(&[0, 1, 2], "blob")
         .await

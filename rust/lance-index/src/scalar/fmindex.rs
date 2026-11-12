@@ -1817,7 +1817,7 @@ async fn write_partitioned_fmindex_stream_with_config(
     for _ in 0..config.num_workers {
         let receiver = receiver.clone();
         let store = store.clone();
-        worker_tasks.push(tokio::task::spawn(async move {
+        worker_tasks.push(lance_core::utils::tokio::spawn(async move {
             let mut files = Vec::new();
             while let Ok(job) = receiver.recv().await {
                 files.push(

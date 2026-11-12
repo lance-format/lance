@@ -329,6 +329,61 @@ message JsonIndexDetails {
    */
   optional uint32 target_index_version = 4;
 }
+/* How a list-element index encodes the key tuple of one element into the
+ * bytes its B-tree orders.
+ */
+enum ListElementKeyEncoding {
+  /* Not recorded. A reader must not use the index, because the bytes in its
+   * B-tree have no known meaning.
+   */
+  LIST_ELEMENT_KEY_ENCODING_UNSPECIFIED = 0;
+  /* The Arrow row format with every key ascending and nulls first, as
+   * specified in the list-element index documentation.
+   */
+  LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1 = 1;
+}
+
+/* Details of a list-element index: a B-tree over the elements of a
+ * `list<struct>` column, keyed by a tuple of fields of the element struct.
+ *
+ * EXPERIMENTAL: this index is an experimental format feature. This message
+ * and the index files may change incompatibly without a separate vote, in
+ * which case the index must be rebuilt (the data is never rewritten), and
+ * the feature is removed if its stabilization vote does not pass. Datasets
+ * that do not use the index are not affected either way.
+ *
+ * Every segment of one logical index carries the same `key_field_ids`,
+ * `key_types` and `key_encoding`.
+ */
+message ListElementIndexDetails {
+  /* The key fields, in key order, as Lance field IDs (`file.Field.id`). Each
+   * is a direct child of the element struct of the indexed column, and no ID
+   * appears twice. There is at least one.
+   *
+   * A reader resolves each ID against the current schema and refers to the
+   * field by its current name, so the index follows a rename. A reader must
+   * not use the index when an ID is no longer a direct child of the element
+   * struct, or when its field no longer has the type in `key_types`.
+   */
+  repeated int32 key_field_ids = 1;
+  /* The names of the key fields when this segment was written, parallel to
+   * `key_field_ids`. They are informational: a rename does not update them,
+   * and a reader must not use them to find the key fields.
+   */
+  repeated string keys = 2;
+  /* The Lance logical type of each key field when the index was trained,
+   * parallel to `key_field_ids` (for example "string" or "float").
+   */
+  repeated string key_types = 3;
+  ListElementKeyEncoding key_encoding = 4;
+  // Details of the B-tree that stores the encoded keys.
+  google.protobuf.Any target_details = 5;
+  /* The B-tree's own format version, the `index_version` it would have in
+   * `IndexMetadata` as a standalone index.
+   */
+  uint32 target_index_version = 6;
+}
+
 message BloomFilterIndexDetails {}
 
 message RTreeIndexDetails {}
