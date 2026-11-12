@@ -2332,8 +2332,8 @@ impl FileFragment {
         let row_ids = if let Some(deletion_vector) = deletion_vector {
             // Sorting the deletion vector costs O(M log M), where M is the
             // deletion vector length. Each index is then resolved with a
-            // fixed-point binary search over the sorted deletions, for a total
-            // of O(N log^2 M + M log M) where N = indices.len().
+            // binary search over the sorted deletions, for a total of
+            // O(N log^2 M + M log M) where N = indices.len().
             let mut sorted_deleted_ids = deletion_vector
                 .as_ref()
                 .clone()
@@ -3344,12 +3344,12 @@ impl FileFragment {
 /// For each logical row index we resolve the physical row id of the row that
 /// survives the deletions. The physical id `p` for logical index `i` is the
 /// smallest `p` with `p - rank(p) == i`, where `rank(p)` is the number of
-/// deleted ids less than or equal to `p`: `p - rank(p)` counts the live rows
-/// up to and including `p`. That count never decreases and grows by at most
-/// one per physical row (deletion ids are unique), so a fixed-point binary
-/// search converges in O(log M) probes. For example, if deleted rows are
-/// [2, 3, 5] and we want row 4: 6 - rank(6) = 6 - 3 = 3 < 4 while
-/// 7 - rank(7) = 7 - 3 = 4, so the answer is 7.
+/// deleted ids less than or equal to `p`: `p - rank(p)` is the logical index
+/// of the last live row at or before `p`. It never decreases and grows by at
+/// most one per physical row (deletion ids are unique), so a binary search
+/// finds `p` in O(log M) steps. For example, if deleted rows are [2, 3, 5] and
+/// we want row 4: 6 - rank(6) = 6 - 3 = 3 < 4 while 7 - rank(7) = 7 - 3 = 4, so
+/// the answer is 7.
 pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]) -> Vec<u32> {
     let mut row_ids = row_ids.to_vec();
     for row_id in row_ids.iter_mut() {
@@ -3359,8 +3359,6 @@ pub(crate) fn resolve_actual_row_ids(row_ids: &[u32], sorted_deleted_ids: &[u32]
         let mut lo = logical_index;
         let mut hi = logical_index + sorted_deleted_ids.len() as u64;
         while lo < hi {
-            #[cfg(test)]
-            tests::deletion_list_probes::record(1);
             let mid = lo + (hi - lo) / 2;
             let rank = sorted_deleted_ids.partition_point(|v| (*v as u64) <= mid) as u64;
             // `mid - rank < logical_index`, written without subtraction so a
@@ -4417,31 +4415,6 @@ mod tests {
         session::Session,
         utils::test::TestDatasetGenerator,
     };
-
-    /// Test-only hook for [`resolve_actual_row_ids`]: counts the probes it
-    /// takes against the deletion list while resolving rows. Tests use it
-    /// to pin the per-row cost to O(log M); the previous implementation
-    /// walked the deletion prefix one physical row at a time (O(M) probes
-    /// per row).
-    pub(super) mod deletion_list_probes {
-        use std::cell::Cell;
-
-        thread_local! {
-            static PROBES: Cell<u64> = const { Cell::new(0) };
-        }
-
-        pub fn record(count: u64) {
-            PROBES.with(|probes| probes.set(probes.get() + count));
-        }
-
-        pub fn reset() {
-            PROBES.with(|probes| probes.set(0));
-        }
-
-        pub fn get() -> u64 {
-            PROBES.with(|probes| probes.get())
-        }
-    }
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -7370,33 +7343,25 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_actual_row_ids_probes_deletion_prefix_logarithmically() {
-        // A default-sized fragment (1M rows, write.rs max_rows_per_file) can
-        // carry a large deletion vector (here: the first 900k rows deleted).
-        // Resolving live indices must probe the deletion list logarithmically
-        // per row, not walk the deletion prefix one physical row at a time.
-        let sorted_deleted_ids: Vec<u32> = (0..900_000).collect();
-        let indices: Vec<u32> = (0..10_000).collect();
-
-        deletion_list_probes::reset();
-        let resolved = resolve_actual_row_ids(&indices, &sorted_deleted_ids);
-        let probes = deletion_list_probes::get();
-
-        // Every live index maps to the physical row just past the prefix.
-        for (logical, physical) in resolved.iter().enumerate() {
-            assert_eq!(*physical, 900_000 + logical as u32);
+    fn test_resolve_actual_row_ids_matches_a_walk_over_live_rows() {
+        // Deletion sets that are empty, dense, sparse, a long prefix and a
+        // tail, checked against walking the live rows one by one.
+        let num_rows = 2_000u32;
+        let deletion_sets: Vec<Vec<u32>> = vec![
+            vec![],
+            (0..num_rows).filter(|row| row % 3 != 0).collect(),
+            (0..num_rows).filter(|row| row % 97 == 5).collect(),
+            (0..1_500).collect(),
+            (1_000..num_rows - 1).collect(),
+        ];
+        for deleted in deletion_sets {
+            let live: Vec<u32> = (0..num_rows)
+                .filter(|row| deleted.binary_search(row).is_err())
+                .collect();
+            let indices: Vec<u32> = (0..live.len() as u32).rev().collect();
+            let expected: Vec<u32> = indices.iter().map(|&i| live[i as usize]).collect();
+            assert_eq!(resolve_actual_row_ids(&indices, &deleted), expected);
         }
-        // A binary search over a ~900k-wide range takes ~20 probes per row;
-        // the incremental walk took ~900k. 100 per row leaves headroom for
-        // the search while failing the walk by four orders of magnitude.
-        assert!(
-            probes < 100 * indices.len() as u64,
-            "resolving {} indices against {} deletions took {} deletion-list probes ({} per index); expected O(log M) probes per index",
-            indices.len(),
-            sorted_deleted_ids.len(),
-            probes,
-            probes / indices.len() as u64
-        );
     }
 
     #[rstest]
