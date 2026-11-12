@@ -24,7 +24,7 @@ use self::plan::{
     BlobReadBatch, BlobReadPlan, ResolvedBlobSelection, plan_blob_read_batches,
     plan_blob_read_plans, plan_disjoint_blob_reads,
 };
-use super::file::{BlobFile, BlobSource, BlobSourceKey};
+use super::file::{BlobFile, BlobSource};
 use super::locate::{
     blob_version_from_descriptions, collect_blob_files_v1, collect_blob_v2_descriptor_files,
 };
@@ -662,12 +662,13 @@ impl ReadBlobFilesBuilder {
 
 /// Operation-scoped scheduler cache for one [`ReadBlobsBuilder`] execution.
 ///
-/// We reuse one [`ScanScheduler`] per store instance and path during one
-/// operation, keeping different credentials and endpoints isolated.
+/// We reuse one [`ScanScheduler`] per store instance, keeping different
+/// credentials and endpoints isolated without retaining a scheduler for every
+/// object visited by a streaming scan. Payload grouping remains per source.
 #[derive(Debug)]
 pub(super) struct ReadBlobsExecution {
     io_buffer_size_bytes: Option<u64>,
-    schedulers: std::sync::Mutex<HashMap<BlobSourceKey, Arc<ScanScheduler>>>,
+    schedulers: std::sync::Mutex<HashMap<usize, Arc<ScanScheduler>>>,
 }
 
 impl ReadBlobsExecution {
@@ -685,8 +686,10 @@ impl ReadBlobsExecution {
 
     fn scheduler_for(&self, source: &BlobSource) -> Arc<ScanScheduler> {
         let mut schedulers = self.schedulers.lock().unwrap();
+        // Each cached scheduler retains its store Arc, so its address cannot be
+        // reused for another store while this execution holds the entry.
         schedulers
-            .entry(BlobSourceKey::new(source))
+            .entry(Arc::as_ptr(&source.object_store) as usize)
             .or_insert_with(|| {
                 let config = self
                     .io_buffer_size_bytes
@@ -1452,6 +1455,27 @@ mod tests {
                 b"sharedunused"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_blob_execution_shares_scheduler_across_paths() {
+        let store = Arc::new(ObjectStore::memory());
+        let other_store = Arc::new(ObjectStore::memory());
+        assert_eq!(store.store_prefix, other_store.store_prefix);
+        let execution = ReadBlobsExecution::new(Some(1024));
+        let first = execution.scheduler_for(&BlobSource::new(
+            store.clone(),
+            Path::from("blobs/first.bin"),
+        ));
+        for index in 0..4 {
+            let source = BlobSource::new(store.clone(), Path::from(format!("blobs/{index}.bin")));
+            assert!(Arc::ptr_eq(&first, &execution.scheduler_for(&source)));
+        }
+        assert_eq!(execution.num_schedulers(), 1);
+        let other =
+            execution.scheduler_for(&BlobSource::new(other_store, Path::from("blobs/first.bin")));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(execution.num_schedulers(), 2);
     }
 
     #[rstest]
