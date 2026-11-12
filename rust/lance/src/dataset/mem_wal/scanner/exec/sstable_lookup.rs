@@ -69,7 +69,12 @@ impl SsTablePointLookupExec {
 
 impl DisplayAs for SsTablePointLookupExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SsTablePointLookupExec: key={}", self.key)
+        write!(
+            f,
+            "SsTablePointLookupExec: uri={}, key={}",
+            self.dataset.uri(),
+            self.key
+        )
     }
 }
 
