@@ -1929,7 +1929,14 @@ mod test {
         use crate::testing::TestEncoding;
         use arrow_array::Decimal128Array;
 
+        // The ranges and indices start, end, or cross the 1024-value chunk boundary.
         let test_cases = TestCases::default()
+            .with_range(0..500)
+            .with_range(1000..1100)
+            .with_range(1500..2048)
+            .with_indices(vec![0])
+            .with_indices(vec![1023, 1024])
+            .with_indices(vec![5, 1500, 2047])
             .with_expected_encoding("inline_bitpacking")
             .with_encodings([TestEncoding::StructuralSparse]);
 
