@@ -24,18 +24,38 @@ use lance_core::{Error, Result};
 /// [`AddIndexSegment`](super::AddIndexSegment) could express as a delta.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct UpdateCompactedSsTables {
-    /// The generation each shard has been compacted through. A shard's
-    /// generation must not go backwards.
-    pub compacted_sstables: Vec<CompactedSsTable>,
+    compacted_sstables: Vec<CompactedSsTable>,
 }
 
 impl UpdateCompactedSsTables {
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        if self.compacted_sstables.is_empty() {
+    /// Record the generation each shard has been compacted through. Apply
+    /// rejects a shard whose generation goes backwards.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that every row of
+    /// each named SSTable, through its generation, is in the base table as of
+    /// this commit. Readers stop merging those SSTables in, so a row that is
+    /// not there disappears.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `compacted_sstables`.
+    pub fn try_new_unchecked(compacted_sstables: Vec<CompactedSsTable>) -> Result<Self> {
+        if compacted_sstables.is_empty() {
             return Err(Error::invalid_input(
                 "UpdateCompactedSsTables names no SSTable, so there is no progress to record",
             ));
         }
+        Ok(Self { compacted_sstables })
+    }
+
+    /// The generation each shard has been compacted through.
+    pub fn compacted_sstables(&self) -> &[CompactedSsTable] {
+        &self.compacted_sstables
+    }
+
+    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         state.update_compacted_sstables(self.compacted_sstables.clone())
     }
 
@@ -68,13 +88,15 @@ impl TryFrom<pb_actions::UpdateCompactedSsTables> for UpdateCompactedSsTables {
     type Error = Error;
 
     fn try_from(message: pb_actions::UpdateCompactedSsTables) -> Result<Self> {
-        Ok(Self {
-            compacted_sstables: message
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(
+            message
                 .compacted_sstables
                 .into_iter()
                 .map(CompactedSsTable::try_from)
                 .collect::<Result<Vec<_>>>()?,
-        })
+        )
     }
 }
 
@@ -87,19 +109,24 @@ mod tests {
     use crate::transaction::action::test_support::{
         apply_with_indices, backed_manifest, footprint,
     };
-    use crate::transaction::action::{Action, AddIndexSegment, FieldRef, Ref};
+    use crate::transaction::action::{
+        Action, AddIndexSegment, AddIndexSegmentParts, FieldRef, Ref,
+    };
     use crate::transaction::test_support::sample_index_metadata;
     use uuid::Uuid;
 
     fn update(sstables: Vec<(u128, u64)>) -> Action {
-        Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
-            compacted_sstables: sstables
-                .into_iter()
-                .map(|(shard, generation)| {
-                    CompactedSsTable::new(Uuid::from_u128(shard), generation)
-                })
-                .collect(),
-        })
+        Action::UpdateCompactedSsTables(
+            UpdateCompactedSsTables::try_new_unchecked(
+                sstables
+                    .into_iter()
+                    .map(|(shard, generation)| {
+                        CompactedSsTable::new(Uuid::from_u128(shard), generation)
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        )
     }
 
     /// The compaction progress the MemWAL index records, as (shard, generation)
@@ -186,12 +213,7 @@ mod tests {
 
     #[test]
     fn test_recording_no_sstables_is_rejected() {
-        let error = apply_with_indices(
-            &backed_manifest(),
-            vec![update(vec![])],
-            vec![empty_mem_wal_index()],
-        )
-        .unwrap_err();
+        let error = UpdateCompactedSsTables::try_new_unchecked(vec![]).unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
         assert!(
@@ -227,20 +249,23 @@ mod tests {
         // with a concurrent writer replacing that entry -- unlike a regular
         // index, where two writers may hold disjoint segments.
         let progress = footprint(vec![update(vec![(1, 3)])]);
-        let rebuild = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::from_u128(20),
-            name: MEM_WAL_INDEX_NAME.into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: None,
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: true,
-        })]);
+        let rebuild = footprint(vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::from_u128(20),
+                name: MEM_WAL_INDEX_NAME.into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: None,
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: true,
+            })
+            .unwrap(),
+        )]);
 
         assert!(progress.conflicts_with(&rebuild));
         assert!(rebuild.conflicts_with(&progress));
@@ -249,20 +274,23 @@ mod tests {
     #[test]
     fn test_recording_progress_does_not_conflict_with_an_ordinary_index() {
         let progress = footprint(vec![update(vec![(1, 3)])]);
-        let segment = footprint(vec![Action::AddIndexSegment(AddIndexSegment {
-            uuid: Uuid::from_u128(21),
-            name: "by_a".into(),
-            fields: vec![FieldRef::Committed(0)],
-            covering_fields: Vec::new(),
-            index_details: None,
-            index_version: 1,
-            covered_fragments: Some(vec![Ref::Committed(0)]),
-            files: Vec::new(),
-            base: None,
-            created_at: None,
-            dataset_version: None,
-            data_change: false,
-        })]);
+        let segment = footprint(vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                uuid: Uuid::from_u128(21),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change: false,
+            })
+            .unwrap(),
+        )]);
 
         assert!(!progress.conflicts_with(&segment));
         assert!(!segment.conflicts_with(&progress));

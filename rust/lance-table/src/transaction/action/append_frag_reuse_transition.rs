@@ -36,14 +36,60 @@ pub type FragReuseMapping = pb_fri::transition::Mapping;
 /// rows without one is legal, and the indices lose that coverage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendFragReuseTransition {
-    /// The fragments the rows were read from, in scan order.
-    pub sources: Vec<Ref>,
-    /// The fragments the rows were written to, in output (or label) order.
-    pub destinations: Vec<Ref>,
-    pub mapping: FragReuseMapping,
+    sources: Vec<Ref>,
+    destinations: Vec<Ref>,
+    mapping: FragReuseMapping,
 }
 
 impl AppendFragReuseTransition {
+    /// Record that rows moved from `sources`, in scan order, to
+    /// `destinations`, in output (or label) order, laid out as `mapping`
+    /// says.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that each
+    /// destination row holds the values of the source row `mapping` sends to
+    /// it. Apply checks the mapping conserves rows, not where they went. An
+    /// index segment that translates through a wrong mapping serves the wrong
+    /// rows.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `sources` or `destinations`.
+    pub fn try_new_unchecked(
+        sources: Vec<Ref>,
+        destinations: Vec<Ref>,
+        mapping: FragReuseMapping,
+    ) -> Result<Self> {
+        if sources.is_empty() || destinations.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "AppendFragReuseTransition needs at least one source and one destination, got \
+                 sources {sources:?} and destinations {destinations:?}"
+            )));
+        }
+        Ok(Self {
+            sources,
+            destinations,
+            mapping,
+        })
+    }
+
+    /// The fragments the rows were read from, in scan order.
+    pub fn sources(&self) -> &[Ref] {
+        &self.sources
+    }
+
+    /// The fragments the rows were written to, in output (or label) order.
+    pub fn destinations(&self) -> &[Ref] {
+        &self.destinations
+    }
+
+    /// How the surviving source rows are laid out across the destinations.
+    pub fn mapping(&self) -> &FragReuseMapping {
+        &self.mapping
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let resolve = |refs: &[Ref]| {
             refs.iter()
@@ -52,12 +98,6 @@ impl AppendFragReuseTransition {
         };
         let sources = resolve(&self.sources)?;
         let destinations = resolve(&self.destinations)?;
-        if sources.is_empty() || destinations.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "AppendFragReuseTransition needs at least one source and one destination, got \
-                 sources {sources:?} and destinations {destinations:?}"
-            )));
-        }
         state.stage_frag_reuse_transition(sources, destinations, self.mapping.clone());
         Ok(())
     }
@@ -114,14 +154,16 @@ impl TryFrom<pb_actions::AppendFragReuseTransition> for AppendFragReuseTransitio
                 .map(Ref::try_from)
                 .collect::<Result<Vec<_>>>()
         };
-        Ok(Self {
-            sources: refs(message.sources)?,
-            destinations: refs(message.destinations)?,
-            mapping: match required(message.mapping, "AppendFragReuseTransition.mapping")? {
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(
+            refs(message.sources)?,
+            refs(message.destinations)?,
+            match required(message.mapping, "AppendFragReuseTransition.mapping")? {
                 Mapping::OrderedCompaction(ordered) => FragReuseMapping::OrderedCompaction(ordered),
                 Mapping::StablePartition(partition) => FragReuseMapping::StablePartition(partition),
             },
-        })
+        )
     }
 }
 
@@ -136,7 +178,9 @@ mod tests {
         survivors, table, transition,
     };
     use crate::transaction::action::test_support::{apply_with_indices, footprint};
-    use crate::transaction::action::{Action, RemoveFragment, SetDeletionFile};
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, AddFragmentParts, RemoveFragment, SetDeletionFile,
+    };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
     use std::sync::Arc;
@@ -251,7 +295,10 @@ mod tests {
         });
         let mut actions = compaction(&[0], 0, false, Some(ordered(survivors(&[0], &[(0, 3)]))));
         if let Action::AddFragment(add) = &mut actions[1] {
-            add.physical_rows = ROWS - 1;
+            *add = AddFragment::new_unchecked(AddFragmentParts {
+                physical_rows: ROWS - 1,
+                ..add.parts().clone()
+            });
         }
 
         let (_, indices) = commit(&manifest, actions, Vec::new()).unwrap();
@@ -281,10 +328,7 @@ mod tests {
     )]
     #[case::source_removed_as_a_data_change(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
-            actions[1] = Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(1),
-                data_change: true,
-            });
+            actions[1] = Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1)));
         },
         "data_change true"
     )]
@@ -302,34 +346,45 @@ mod tests {
         |manifest: &mut Manifest, actions: &mut Vec<Action>| {
             let reserved = reserved_destination(manifest);
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.id = Ref::Committed(reserved);
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    id: Ref::Committed(reserved),
+                    ..add.parts().clone()
+                });
             }
             if let Action::AddDataFile(file) = &mut actions[3] {
-                file.fragment = Ref::Committed(reserved);
+                *file = AddDataFile::try_new_unchecked(
+                    Ref::Committed(reserved),
+                    file.file().clone(),
+                    file.field_ids().to_vec(),
+                    file.base(),
+                    file.is_data_change(),
+                )
+                .unwrap();
             }
             if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
                 t.destinations = vec![Ref::Committed(reserved)];
             }
-            actions.push(Action::SetDeletionFile(SetDeletionFile {
-                fragment: reserved,
-                deletion_file: Some(DeletionFile {
-                    read_version: 1,
-                    id: 1,
-                    file_type: DeletionFileType::Array,
-                    num_deleted_rows: Some(1),
-                    base_id: None,
-                    inline: None,
-                }),
-                data_change: true,
-                base: None,
-            }));
+            let deletion_file = DeletionFile {
+                read_version: 1,
+                id: 1,
+                file_type: DeletionFileType::Array,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                inline: None,
+            };
+            actions.push(Action::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(reserved, deletion_file, None, true).unwrap(),
+            ));
         },
         "carries a deletion file"
     )]
     #[case::destination_added_as_a_data_change(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.data_change = true;
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    data_change: true,
+                    ..add.parts().clone()
+                });
             }
         },
         "adds with data_change true"
@@ -353,7 +408,10 @@ mod tests {
     #[case::rows_not_conserved(
         |_: &mut Manifest, actions: &mut Vec<Action>| {
             if let Action::AddFragment(add) = &mut actions[2] {
-                add.physical_rows = 2 * ROWS - 1;
+                *add = AddFragment::new_unchecked(AddFragmentParts {
+                    physical_rows: 2 * ROWS - 1,
+                    ..add.parts().clone()
+                });
             }
         },
         "does not conserve rows"
@@ -369,15 +427,6 @@ mod tests {
             manifest.version = 7;
         },
         "already consumes"
-    )]
-    #[case::stable_partition_without_a_destination(
-        |_: &mut Manifest, actions: &mut Vec<Action>| {
-            if let Action::AppendFragReuseTransition(t) = &mut actions[4] {
-                t.mapping = stable_partition();
-                t.destinations.clear();
-            }
-        },
-        "at least one source and one destination"
     )]
     #[case::stable_partition_with_too_many_destinations(
         |manifest: &mut Manifest, actions: &mut Vec<Action>| {
@@ -427,6 +476,24 @@ mod tests {
             "{error:?}"
         );
         assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    #[test]
+    fn test_a_transition_without_a_destination_is_rejected() {
+        let error = AppendFragReuseTransition::try_new_unchecked(
+            vec![Ref::Committed(0)],
+            vec![],
+            stable_partition(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("at least one source and one destination"),
+            "{error}"
+        );
     }
 
     /// The history translates row addresses, so it cannot record moves on a
@@ -487,11 +554,12 @@ mod tests {
     #[test]
     fn test_round_trips_through_the_wire() {
         for mapping in [ordered(survivors(&[0], &[])), stable_partition()] {
-            let action = AppendFragReuseTransition {
-                sources: vec![Ref::Committed(0)],
-                destinations: vec![Ref::Local(0)],
+            let action = AppendFragReuseTransition::try_new_unchecked(
+                vec![Ref::Committed(0)],
+                vec![Ref::Local(0)],
                 mapping,
-            };
+            )
+            .unwrap();
             let decoded = AppendFragReuseTransition::try_from(
                 pb_actions::AppendFragReuseTransition::from(&action),
             )

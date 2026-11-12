@@ -16,24 +16,10 @@ use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Add an index segment.
-///
-/// The format has no first-class "index" apart from its segments: a logical
-/// index is the set of segments sharing a `name`, and a brand-new index is
-/// written as its first segment. So this one action covers both creating an
-/// index and extending an existing one -- the difference is only whether any
-/// segment already carries the name.
-///
-/// The segment's `uuid` is chosen by the writer rather than minted from a
-/// counter, so unlike a fragment or a field it needs no [`Ref`]: two writers
-/// cannot pick the same one, and replaying the action onto another version
-/// leaves it untouched.
-///
-/// The fragment reuse history (`__lance_frag_reuse`) is not an index here,
-/// and `apply` rejects a segment carrying its name, as it does for the other
-/// index actions.
+/// The contents of an [`AddIndexSegment`], before its caller certifies them with
+/// [`AddIndexSegment::try_new_unchecked`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct AddIndexSegment {
+pub struct AddIndexSegmentParts {
     /// Identifies the segment, and names the directory its files live in.
     pub uuid: Uuid,
     /// The logical index this segment belongs to.
@@ -64,7 +50,8 @@ pub struct AddIndexSegment {
     ///
     /// `None` says no coverage is recorded, which only the MemWAL system index
     /// (`__lance_mem_wal`) may say: it is not served per fragment. A user index
-    /// segment must state its coverage, and `apply` rejects one that does not.
+    /// segment must state its coverage, and the constructor rejects one that
+    /// does not.
     pub covered_fragments: Option<Vec<Ref>>,
     /// The segment's files and their sizes, empty when the writer did not
     /// record them.
@@ -87,51 +74,121 @@ pub struct AddIndexSegment {
     /// read version, so that accepting a segment built from an older snapshot
     /// later needs no format change -- see the TODO on `reflected_version`.
     pub dataset_version: Option<u64>,
-    /// See [`AddFragment::data_change`](super::AddFragment::data_change).
+    /// See [`AddFragmentParts::data_change`](super::AddFragmentParts::data_change).
     pub data_change: bool,
 }
 
+/// Add an index segment.
+///
+/// The format has no first-class "index" apart from its segments: a logical
+/// index is the set of segments sharing a `name`, and a brand-new index is
+/// written as its first segment. So this one action covers both creating an
+/// index and extending an existing one -- the difference is only whether any
+/// segment already carries the name.
+///
+/// The segment's `uuid` is chosen by the writer rather than minted from a
+/// counter, so unlike a fragment or a field it needs no [`Ref`]: two writers
+/// cannot pick the same one, and replaying the action onto another version
+/// leaves it untouched.
+///
+/// The fragment reuse history (`__lance_frag_reuse`) is not an index here,
+/// and `apply` rejects a segment carrying its name, as it does for the other
+/// index actions.
+///
+/// What the segment covers is a claim about its files, so it can only be
+/// built with [`try_new_unchecked`](Self::try_new_unchecked).
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct AddIndexSegment {
+    parts: AddIndexSegmentParts,
+}
+
 impl AddIndexSegment {
+    /// Add the segment `parts` describes.
+    ///
+    /// # Contract
+    ///
+    /// The caller certifies, and nothing downstream checks, that:
+    ///
+    /// * `files` exist in the segment's directory under `base`, readable as
+    ///   the index type `index_details` names, at `index_version`.
+    /// * The segment indexes every row of `covered_fragments` as the version it
+    ///   reflects holds them, keyed on `fields` and carrying the values of
+    ///   `covering_fields`, and no other rows.
+    /// * If `data_change` is `false`, the segment holds no rows a reader can
+    ///   see. That is true of an ordinary index, which is derived state, and
+    ///   not of the MemWAL index.
+    ///
+    /// Breaking the contract is not undefined behavior, but queries the index
+    /// serves miss rows or return the wrong ones.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty `name`, and unset `covered_fragments` on any index but
+    /// the MemWAL system index.
+    pub fn try_new_unchecked(mut parts: AddIndexSegmentParts) -> Result<Self> {
+        parts.name = non_empty(parts.name, "AddIndexSegment.name")?;
+        if parts.covered_fragments.is_none() && parts.name != MEM_WAL_INDEX_NAME {
+            return Err(Error::invalid_input(format!(
+                "AddIndexSegment for index '{}' leaves covered_fragments unset; only the system \
+                 index '{MEM_WAL_INDEX_NAME}' may omit its coverage",
+                parts.name
+            )));
+        }
+        Ok(Self { parts })
+    }
+
+    /// What the segment was built from.
+    pub fn parts(&self) -> &AddIndexSegmentParts {
+        &self.parts
+    }
+
+    /// Take the parts back, e.g. to change one and certify the result again
+    /// with [`try_new_unchecked`](Self::try_new_unchecked).
+    pub fn into_parts(self) -> AddIndexSegmentParts {
+        self.parts
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        reject_frag_reuse_history("AddIndexSegment", &self.name)?;
+        reject_frag_reuse_history("AddIndexSegment", &self.parts.name)?;
         let fields = self
+            .parts
             .fields
             .iter()
             .map(|field| state.resolve_schema_field(*field, "AddIndexSegment"))
             .collect::<Result<Vec<_>>>()?;
-        if self.covered_fragments.is_none() && self.name != MEM_WAL_INDEX_NAME {
-            return Err(Error::invalid_input(format!(
-                "AddIndexSegment for index '{}' leaves covered_fragments unset; only the system \
-                 index '{MEM_WAL_INDEX_NAME}' may omit its coverage",
-                self.name
-            )));
-        }
         let fragment_bitmap = self
+            .parts
             .covered_fragments
             .as_ref()
             .map(|fragments| self.resolve_coverage(fragments, state))
             .transpose()?;
-        let base_id = self.base.map(|base| state.resolve_base(base)).transpose()?;
+        let base_id = self
+            .parts
+            .base
+            .map(|base| state.resolve_base(base))
+            .transpose()?;
 
         let covering_fields = self
+            .parts
             .covering_fields
             .iter()
             .map(|field| state.resolve_schema_field(*field, "AddIndexSegment"))
             .collect::<Result<Vec<_>>>()?;
-        let (fields, covering_fields) = Self::lower_covering(&self.name, fields, covering_fields)?;
+        let (fields, covering_fields) =
+            Self::lower_covering(&self.parts.name, fields, covering_fields)?;
 
         let metadata = IndexMetadata {
-            uuid: self.uuid,
-            name: self.name.clone(),
+            uuid: self.parts.uuid,
+            name: self.parts.name.clone(),
             fields,
             covering_fields,
             dataset_version: self.reflected_version(state.read_version())?,
             fragment_bitmap,
-            index_details: self.index_details.clone(),
-            index_version: self.index_version,
-            created_at: self.created_at,
+            index_details: self.parts.index_details.clone(),
+            index_version: self.parts.index_version,
+            created_at: self.parts.created_at,
             base_id,
-            files: (!self.files.is_empty()).then(|| self.files.clone()),
+            files: (!self.parts.files.is_empty()).then(|| self.parts.files.clone()),
             clustering_id: None,
             metadata: Default::default(),
         };
@@ -197,7 +254,7 @@ impl AddIndexSegment {
     /// `prune_stale_segment_coverage`, replaying the fragment reuse index. The
     /// `dataset_version` field is kept on the wire for this.
     fn reflected_version(&self, read_version: u64) -> Result<u64> {
-        let Some(version) = self.dataset_version else {
+        let Some(version) = self.parts.dataset_version else {
             return Ok(read_version);
         };
         if version > read_version {
@@ -205,7 +262,7 @@ impl AddIndexSegment {
                 "AddIndexSegment for index '{}' reflects dataset version {version}, which is \
                  newer than the version {read_version} this operation reads; a segment cannot \
                  reflect data it could not have seen",
-                self.name
+                self.parts.name
             )));
         }
         if version < read_version {
@@ -213,7 +270,7 @@ impl AddIndexSegment {
                 "AddIndexSegment for index '{}' reflects dataset version {version}, but this \
                  operation reads version {read_version}; compose the transaction against the \
                  segment's build snapshot so that nothing rewritten since is indexed as it was",
-                self.name
+                self.parts.name
             )));
         }
         Ok(version)
@@ -228,7 +285,7 @@ impl AddIndexSegment {
                     Error::invalid_input(format!(
                         "AddIndexSegment for index '{}' covers fragment {id}, which is beyond the \
                          largest fragment id an index can record ({})",
-                        self.name,
+                        self.parts.name,
                         u32::MAX
                     ))
                 })
@@ -239,8 +296,8 @@ impl AddIndexSegment {
     /// Left to the writer. An index is derived state, so building one normally
     /// changes nothing a reader sees -- but the MemWAL index holds real
     /// unflushed rows, so the answer is not the same for every segment.
-    pub(super) fn is_data_change(&self) -> bool {
-        self.data_change
+    pub fn is_data_change(&self) -> bool {
+        self.parts.data_change
     }
 
     /// A claim on the logical index -- this is what the index is, and these are
@@ -266,22 +323,23 @@ impl AddIndexSegment {
     /// coverage.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.claim_index_segment(
-            self.name.clone(),
+            self.parts.name.clone(),
             IndexIdentity {
-                fields: self.fields.clone(),
-                covering_fields: self.covering_fields.clone(),
-                index_details: self.index_details.clone(),
+                fields: self.parts.fields.clone(),
+                covering_fields: self.parts.covering_fields.clone(),
+                index_details: self.parts.index_details.clone(),
             },
-            self.covered_fragments.clone(),
+            self.parts.covered_fragments.clone(),
         );
 
         // Keyed and carried columns alike: a carried column can be rewritten
         // while the keyed one is untouched, and the segment would then answer
         // from an obsolete carried value.
         let dependencies: Vec<FieldRef> = self
+            .parts
             .fields
             .iter()
-            .chain(self.covering_fields.iter())
+            .chain(self.parts.covering_fields.iter())
             .copied()
             .collect();
         // A drop landing first would leave the segment over a field the
@@ -290,7 +348,7 @@ impl AddIndexSegment {
         for field in dependencies.iter().copied() {
             footprint.require_field_definition(field);
         }
-        let Some(covered) = &self.covered_fragments else {
+        let Some(covered) = &self.parts.covered_fragments else {
             // Unstated reach. The claim already collides with every other claim
             // on the index; there is no fragment list to require.
             return;
@@ -301,7 +359,7 @@ impl AddIndexSegment {
     }
 }
 
-impl DeepSizeOf for AddIndexSegment {
+impl DeepSizeOf for AddIndexSegmentParts {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         // `prost_types::Any` does not implement DeepSizeOf, but it is only a
         // type url and a byte string, so both are measured directly.
@@ -323,25 +381,33 @@ impl DeepSizeOf for AddIndexSegment {
 impl From<&AddIndexSegment> for pb_actions::AddIndexSegment {
     fn from(value: &AddIndexSegment) -> Self {
         Self {
-            uuid: Some((&value.uuid).into()),
-            name: value.name.clone(),
-            fields: value.fields.iter().map(|field| (*field).into()).collect(),
+            uuid: Some((&value.parts.uuid).into()),
+            name: value.parts.name.clone(),
+            fields: value
+                .parts
+                .fields
+                .iter()
+                .map(|field| (*field).into())
+                .collect(),
             covering_fields: value
+                .parts
                 .covering_fields
                 .iter()
                 .map(|field| (*field).into())
                 .collect(),
             index_details: value
+                .parts
                 .index_details
                 .as_ref()
                 .map(|details| details.as_ref().clone()),
-            index_version: Some(value.index_version),
-            covered_fragments: value.covered_fragments.as_ref().map(|fragments| {
+            index_version: Some(value.parts.index_version),
+            covered_fragments: value.parts.covered_fragments.as_ref().map(|fragments| {
                 pb_actions::FragmentCoverage {
                     fragments: fragments.iter().map(|id| (*id).into()).collect(),
                 }
             }),
             files: value
+                .parts
                 .files
                 .iter()
                 .map(|file| pb::IndexFile {
@@ -350,12 +416,13 @@ impl From<&AddIndexSegment> for pb_actions::AddIndexSegment {
                     file_metadata_size_bytes: file.file_metadata_size_bytes.map_or(0, NonZero::get),
                 })
                 .collect(),
-            data_unchanged: !value.data_change,
-            base: value.base.map(pb_actions::Ref::from),
+            data_unchanged: !value.parts.data_change,
+            base: value.parts.base.map(pb_actions::Ref::from),
             created_at: value
+                .parts
                 .created_at
                 .map(|created_at| created_at.timestamp_millis() as u64),
-            dataset_version: value.dataset_version,
+            dataset_version: value.parts.dataset_version,
         }
     }
 }
@@ -379,9 +446,11 @@ impl TryFrom<pb_actions::AddIndexSegment> for AddIndexSegment {
             })
             .transpose()?;
 
-        Ok(Self {
+        // A committed transaction file carries the certification of the
+        // writer that staged it.
+        Self::try_new_unchecked(AddIndexSegmentParts {
             uuid: Uuid::try_from(&required(message.uuid, "AddIndexSegment.uuid")?)?,
-            name: non_empty(message.name, "AddIndexSegment.name")?,
+            name: message.name,
             fields: message
                 .fields
                 .into_iter()
@@ -430,9 +499,9 @@ mod tests {
         replace_field_data,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AdjustIndexCoverage,
-        CompositeOperation, DropField, Footprint, RemoveFragment, RemoveIndexSegment, ResetTable,
-        TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AdjustIndexCoverage,
+        AdjustIndexCoverageParts, CompositeOperation, DropField, Footprint, RemoveFragment,
+        RemoveIndexSegment, ResetTable, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -441,7 +510,7 @@ mod tests {
     use rstest::rstest;
 
     fn segment(name: &str, fields: Vec<FieldRef>) -> AddIndexSegment {
-        AddIndexSegment {
+        AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             uuid: Uuid::new_v4(),
             name: name.into(),
             fields,
@@ -454,20 +523,22 @@ mod tests {
             created_at: None,
             dataset_version: None,
             data_change: false,
-        }
+        })
+        .unwrap()
     }
 
     #[test]
     fn test_add_index_segment_records_coverage_and_the_version_it_describes() {
         let manifest = backed_manifest();
-        let action = AddIndexSegment {
+        let action = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             files: vec![IndexFile {
                 path: "index.idx".into(),
                 size_bytes: 1024,
                 file_metadata_size_bytes: None,
             }],
-            ..segment("by_a", vec![FieldRef::Committed(0)])
-        };
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
 
         let (next, indices) = apply_with_indices(
             &manifest,
@@ -478,11 +549,11 @@ mod tests {
 
         assert_eq!(indices.len(), 1);
         let index = &indices[0];
-        assert_eq!(index.uuid, action.uuid);
+        assert_eq!(index.uuid, action.parts().uuid);
         assert_eq!(index.name, "by_a");
         assert_eq!(index.fields, vec![0]);
         assert_eq!(index.fragment_bitmap, Some([0].into_iter().collect()));
-        assert_eq!(index.files, Some(action.files));
+        assert_eq!(index.files, Some(action.parts().files.clone()));
         // A segment that does not say what it reflects reflects the version the
         // operation read, so replaying it elsewhere restamps it.
         assert_eq!(index.dataset_version, manifest.version);
@@ -543,10 +614,13 @@ mod tests {
             read_version,
             Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "step",
-                vec![Action::AddIndexSegment(AddIndexSegment {
-                    dataset_version: Some(read_version + 1),
-                    ..segment("by_a", vec![FieldRef::Committed(0)])
-                })],
+                vec![Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        dataset_version: Some(read_version + 1),
+                        ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                )],
             )])),
             None,
         );
@@ -574,10 +648,10 @@ mod tests {
     /// data file, which no index can be keyed on or carry.
     #[rstest]
     #[case::keyed(segment("idx", vec![FieldRef::Committed(ROW_ID_FIELD_ID)]))]
-    #[case::carried(AddIndexSegment {
+    #[case::carried(AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
         covering_fields: vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
-        ..segment("idx", vec![FieldRef::Committed(0)])
-    })]
+        ..segment("idx", vec![FieldRef::Committed(0)]).into_parts()
+    }).unwrap())]
     fn test_a_segment_over_a_reserved_field_id_is_rejected(#[case] action: AddIndexSegment) {
         let error = apply_with_indices(
             &backed_manifest(),
@@ -598,10 +672,13 @@ mod tests {
         let manifest = backed_manifest();
         let error = apply_with_indices(
             &manifest,
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                dataset_version: Some(manifest.version - 1),
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    dataset_version: Some(manifest.version - 1),
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -618,10 +695,13 @@ mod tests {
         let manifest = backed_manifest();
         let (_, indices) = apply_with_indices(
             &manifest,
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                dataset_version: Some(manifest.version),
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    dataset_version: Some(manifest.version),
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap();
@@ -634,10 +714,13 @@ mod tests {
         let manifest = backed_manifest();
         let error = apply_with_indices(
             &manifest,
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                dataset_version: Some(manifest.version + 1),
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    dataset_version: Some(manifest.version + 1),
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -658,15 +741,14 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("carried"),
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    covering_fields: vec![FieldRef::Local(0)],
-                    ..segment("by_a", vec![FieldRef::Committed(0)])
-                }),
+                Action::AddField(AddField::new(0, added_field("carried"))),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        covering_fields: vec![FieldRef::Local(0)],
+                        ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
             ],
             Vec::new(),
         )
@@ -685,10 +767,13 @@ mod tests {
     fn test_a_covering_field_that_is_also_a_key_is_rejected_for_now() {
         let error = apply_with_indices(
             &backed_manifest(),
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                covering_fields: vec![FieldRef::Committed(0)],
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    covering_fields: vec![FieldRef::Committed(0)],
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -706,10 +791,11 @@ mod tests {
     fn test_a_second_segment_extends_the_same_index() {
         let manifest = two_fragment_manifest();
         let existing = sample_index_metadata("by_a");
-        let added = AddIndexSegment {
+        let added = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("by_a", vec![FieldRef::Committed(0)])
-        };
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
 
         let (_, indices) = apply_with_indices(
             &manifest,
@@ -723,7 +809,7 @@ mod tests {
         assert_eq!(indices.len(), 2);
         let uuids = indices.iter().map(|index| index.uuid).collect::<Vec<_>>();
         assert!(uuids.contains(&existing.uuid));
-        assert!(uuids.contains(&added.uuid));
+        assert!(uuids.contains(&added.parts().uuid));
     }
 
     fn two_fragment_manifest() -> crate::format::Manifest {
@@ -752,34 +838,34 @@ mod tests {
     /// on what the index is and not describe a fragment twice.
     #[rstest]
     #[case::different_keyed_field(
-        |added: &mut AddIndexSegment| added.fields = vec![FieldRef::Committed(1)],
+        |added: &mut AddIndexSegmentParts| added.fields = vec![FieldRef::Committed(1)],
         Some("fields")
     )]
     #[case::different_carried_field(
-        |added: &mut AddIndexSegment| added.covering_fields = vec![FieldRef::Committed(1)],
+        |added: &mut AddIndexSegmentParts| added.covering_fields = vec![FieldRef::Committed(1)],
         Some("fields")
     )]
     #[case::different_index_type(
-        |added: &mut AddIndexSegment| added.index_details = type_url("other.Type"),
+        |added: &mut AddIndexSegmentParts| added.index_details = type_url("other.Type"),
         Some("type")
     )]
     #[case::overlapping_coverage(
-        |added: &mut AddIndexSegment| added.covered_fragments = Some(vec![Ref::Committed(0)]),
+        |added: &mut AddIndexSegmentParts| added.covered_fragments = Some(vec![Ref::Committed(0)]),
         Some("fragment 0")
     )]
     #[case::compatible_and_disjoint(
-        |_: &mut AddIndexSegment| {},
+        |_: &mut AddIndexSegmentParts| {},
         None
     )]
     // Rejections here are permanent, and segments of one index legitimately
     // differ in details: a per-build training knob, say, or a different metric
     // that only the query path can judge.
     #[case::different_details_payload(
-        |added: &mut AddIndexSegment| added.index_details = details("btree.Details", vec![1, 2]),
+        |added: &mut AddIndexSegmentParts| added.index_details = details("btree.Details", vec![1, 2]),
         None
     )]
     fn test_a_segment_must_be_compatible_with_the_rest_of_its_index(
-        #[case] change: fn(&mut AddIndexSegment),
+        #[case] change: fn(&mut AddIndexSegmentParts),
         #[case] rejected_for: Option<&str>,
     ) {
         let mut manifest = two_fragment_manifest();
@@ -793,12 +879,13 @@ mod tests {
             index_details: type_url("btree.Details"),
             ..sample_index_metadata("shared")
         };
-        let mut added = AddIndexSegment {
+        let mut added = AddIndexSegmentParts {
             index_details: type_url("btree.Details"),
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![FieldRef::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)]).into_parts()
         };
         change(&mut added);
+        let added = AddIndexSegment::try_new_unchecked(added).unwrap();
 
         let result = apply_with_indices(
             &manifest,
@@ -824,27 +911,31 @@ mod tests {
     /// as a segment is checked against one already committed.
     #[rstest]
     #[case::overlapping_coverage(
-        |second: &mut AddIndexSegment| second.covered_fragments = Some(vec![Ref::Committed(0)]),
+        |second: &mut AddIndexSegmentParts| {
+            second.covered_fragments = Some(vec![Ref::Committed(0)])
+        },
         "fragment 0"
     )]
     #[case::different_index_type(
-        |second: &mut AddIndexSegment| second.index_details = type_url("bitmap.Details"),
+        |second: &mut AddIndexSegmentParts| second.index_details = type_url("bitmap.Details"),
         "type"
     )]
     fn test_two_segments_added_by_one_operation_must_agree(
-        #[case] change: fn(&mut AddIndexSegment),
+        #[case] change: fn(&mut AddIndexSegmentParts),
         #[case] rejected_for: &str,
     ) {
-        let first = AddIndexSegment {
+        let first = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             index_details: type_url("btree.Details"),
-            ..segment("shared", vec![FieldRef::Committed(0)])
-        };
-        let mut second = AddIndexSegment {
+            ..segment("shared", vec![FieldRef::Committed(0)]).into_parts()
+        })
+        .unwrap();
+        let mut second = AddIndexSegmentParts {
             index_details: type_url("btree.Details"),
             covered_fragments: Some(vec![Ref::Committed(1)]),
-            ..segment("shared", vec![FieldRef::Committed(0)])
+            ..segment("shared", vec![FieldRef::Committed(0)]).into_parts()
         };
         change(&mut second);
+        let second = AddIndexSegment::try_new_unchecked(second).unwrap();
 
         let error = apply_with_indices(
             &two_fragment_manifest(),
@@ -887,11 +978,9 @@ mod tests {
             &manifest,
             vec![
                 Action::AddIndexSegment(segment("other", vec![FieldRef::Committed(0)])),
-                Action::RemoveIndexSegment(RemoveIndexSegment {
-                    uuid: removed,
-                    name: "mixed".into(),
-                    data_change: false,
-                }),
+                Action::RemoveIndexSegment(
+                    RemoveIndexSegment::try_new_unchecked(removed, "mixed", false).unwrap(),
+                ),
             ],
             existing.clone(),
         )
@@ -900,14 +989,17 @@ mod tests {
 
         let error = apply_with_indices(
             &manifest,
-            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
-                uuid: adjusted,
-                name: "mixed".into(),
-                add_fragments: Vec::new(),
-                remove_fragments: Vec::new(),
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: Vec::new(),
-            })],
+            vec![Action::AdjustIndexCoverage(
+                AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                    uuid: adjusted,
+                    name: "mixed".into(),
+                    add_fragments: Vec::new(),
+                    remove_fragments: Vec::new(),
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: Vec::new(),
+                })
+                .unwrap(),
+            )],
             existing,
         )
         .unwrap_err();
@@ -924,30 +1016,32 @@ mod tests {
             vec![
                 Action::AddIndexSegment(segment("early", vec![FieldRef::Committed(0)])),
                 Action::ResetTable(ResetTable),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
-                Action::AddFragment(AddFragment {
+                Action::AddField(AddField::new(0, added_field("fresh"))),
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    covered_fragments: Some(vec![Ref::Local(0)]),
-                    ..segment("fresh", vec![FieldRef::Local(0)])
-                }),
+                })),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V2_0),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        covered_fragments: Some(vec![Ref::Local(0)]),
+                        ..segment("fresh", vec![FieldRef::Local(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
             ],
             vec![sample_index_metadata("old")],
         )
@@ -969,10 +1063,13 @@ mod tests {
         let beyond = u64::from(u32::MAX) + 1;
         let error = apply_with_indices(
             &backed_manifest(),
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                covered_fragments: Some(vec![Ref::Committed(beyond)]),
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    covered_fragments: Some(vec![Ref::Committed(beyond)]),
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -1005,26 +1102,21 @@ mod tests {
     fn test_local_tokens_from_separate_operations_are_different_fields() {
         let mint_and_index = |fragment: u64| {
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("c"),
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    covered_fragments: Some(vec![Ref::Committed(fragment)]),
-                    ..segment("shared", vec![FieldRef::Local(0)])
-                }),
+                Action::AddField(AddField::new(0, added_field("c"))),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        covered_fragments: Some(vec![Ref::Committed(fragment)]),
+                        ..segment("shared", vec![FieldRef::Local(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
             ]
         };
         let manifest = two_fragment_manifest();
         let (next, indices) = apply_with_indices(&manifest, mint_and_index(0), Vec::new()).unwrap();
 
         let mut second = mint_and_index(1);
-        second[0] = Action::AddField(AddField {
-            local: 0,
-            parent: None,
-            def: added_field("d"),
-        });
+        second[0] = Action::AddField(AddField::new(0, added_field("d")));
         let error = apply_with_indices(&next, second, indices).unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
@@ -1043,18 +1135,24 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::AddBase(AddBase {
-                    local: 0,
-                    base: BasePath::new(0, "s3://bucket/minted".into(), None, false),
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    base: Some(Ref::Committed(3)),
-                    ..segment("committed", vec![FieldRef::Committed(0)])
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    base: Some(Ref::Local(0)),
-                    ..segment("minted", vec![FieldRef::Committed(0)])
-                }),
+                Action::AddBase(AddBase::new(
+                    0,
+                    BasePath::new(0, "s3://bucket/minted".into(), None, false),
+                )),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        base: Some(Ref::Committed(3)),
+                        ..segment("committed", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        base: Some(Ref::Local(0)),
+                        ..segment("minted", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
             ],
             Vec::new(),
         )
@@ -1083,10 +1181,13 @@ mod tests {
     fn test_a_segment_base_must_exist(#[case] base: Ref, #[case] expected: &str) {
         let error = apply_with_indices(
             &backed_manifest(),
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                base: Some(base),
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    base: Some(base),
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             Vec::new(),
         )
         .unwrap_err();
@@ -1100,10 +1201,13 @@ mod tests {
         let existing = sample_index_metadata("by_a");
         let error = apply_with_indices(
             &backed_manifest(),
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                uuid: existing.uuid,
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
+            vec![Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    uuid: existing.uuid,
+                    ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                })
+                .unwrap(),
+            )],
             vec![existing],
         )
         .unwrap_err();
@@ -1117,14 +1221,16 @@ mod tests {
 
     #[test]
     fn test_unrecorded_coverage_is_not_the_same_as_covering_nothing() {
-        let unknown = AddIndexSegment {
+        let unknown = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             covered_fragments: None,
-            ..segment(MEM_WAL_INDEX_NAME, vec![])
-        };
-        let empty = AddIndexSegment {
+            ..segment(MEM_WAL_INDEX_NAME, vec![]).into_parts()
+        })
+        .unwrap();
+        let empty = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
             covered_fragments: Some(Vec::new()),
-            ..segment("empty", vec![])
-        };
+            ..segment("empty", vec![]).into_parts()
+        })
+        .unwrap();
 
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
@@ -1153,14 +1259,10 @@ mod tests {
     /// for every fragment, including ones it has no entries for.
     #[test]
     fn test_a_user_index_segment_must_record_its_coverage() {
-        let error = apply_with_indices(
-            &backed_manifest(),
-            vec![Action::AddIndexSegment(AddIndexSegment {
-                covered_fragments: None,
-                ..segment("by_a", vec![FieldRef::Committed(0)])
-            })],
-            Vec::new(),
-        )
+        let error = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: None,
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+        })
         .unwrap_err();
 
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
@@ -1176,18 +1278,21 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddFragment(AddFragment {
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 10,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
-                Action::AddIndexSegment(AddIndexSegment {
-                    covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
-                    ..segment("by_a", vec![FieldRef::Committed(0)])
-                }),
+                })),
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                        covered_fragments: Some(vec![Ref::Committed(0), Ref::Local(0)]),
+                        ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
+                    })
+                    .unwrap(),
+                ),
             ],
             Vec::new(),
         )
@@ -1204,11 +1309,7 @@ mod tests {
         let (next, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("added"),
-                }),
+                Action::AddField(AddField::new(0, added_field("added"))),
                 Action::AddIndexSegment(segment("by_added", vec![FieldRef::Local(0)])),
             ],
             Vec::new(),
@@ -1234,18 +1335,21 @@ mod tests {
         #[case] expected_bitmap: Option<RoaringBitmap>,
     ) {
         let rewrite = vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
                 data_change,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change,
-                base: None,
-            }),
+            )),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    data_change,
+                )
+                .unwrap(),
+            ),
         ];
         let build = Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)]));
         let actions = if segment_after_rewrite {
@@ -1266,9 +1370,7 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(0),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(0))),
                 Action::AddIndexSegment(segment("by_a", vec![FieldRef::Committed(0)])),
             ],
             Vec::new(),
@@ -1299,11 +1401,10 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-        })]);
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(0)],
+        ))]);
 
         assert!(
             build.conflicts_with(&rewrite),
@@ -1322,18 +1423,21 @@ mod tests {
     fn test_a_build_does_not_conflict_with_a_reencode() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let reencode = footprint(vec![
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Committed(0),
-                file: DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-                base: None,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+                false,
+            )),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Committed(0),
+                    DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
         ]);
 
         assert!(!build.conflicts_with(&reencode));
@@ -1350,11 +1454,10 @@ mod tests {
         segment.covering_fields = vec![FieldRef::Committed(1)];
         let build = index_footprint(segment);
 
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(1)],
-            data_change: true,
-        })]);
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(1)],
+        ))]);
 
         assert!(build.conflicts_with(&rewrite));
     }
@@ -1366,15 +1469,15 @@ mod tests {
     #[test]
     fn test_a_build_loses_to_a_committed_drop_but_not_the_reverse() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let drop = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })]);
+        let drop = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(0),
+        ))]);
 
         assert!(build.conflicts_with(&drop));
         assert!(!drop.conflicts_with(&build));
 
         // A segment of unstated reach depends on the definition just the same.
-        assert!(index_footprint(covering("by_a", None)).conflicts_with(&drop));
+        assert!(index_footprint(covering(MEM_WAL_INDEX_NAME, None)).conflicts_with(&drop));
     }
 
     /// A struct is dropped children first, so a build over a child loses to
@@ -1382,18 +1485,14 @@ mod tests {
     /// second, the drop discards the segment as it applies.
     #[test]
     fn test_a_build_over_a_child_loses_to_a_committed_struct_drop() {
-        let build = index_footprint(AddIndexSegment {
+        let build = index_footprint(AddIndexSegmentParts {
             fields: vec![FieldRef::Committed(2)],
             ..covering("by_a", Some(vec![0]))
         });
         let drop = footprint(
             [2, 1]
                 .into_iter()
-                .map(|field| {
-                    Action::DropField(DropField {
-                        field: FieldRef::Committed(field),
-                    })
-                })
+                .map(|field| Action::DropField(DropField::new(FieldRef::Committed(field))))
                 .collect(),
         );
 
@@ -1425,12 +1524,8 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(2),
-                }),
-                Action::DropField(DropField {
-                    field: FieldRef::Committed(1),
-                }),
+                Action::DropField(DropField::new(FieldRef::Committed(2))),
+                Action::DropField(DropField::new(FieldRef::Committed(1))),
             ],
             vec![committed_segment],
         )
@@ -1448,10 +1543,10 @@ mod tests {
     #[case::whole_fragment_deletion(true)]
     fn test_a_build_does_not_conflict_with_removing_a_covered_fragment(#[case] data_change: bool) {
         let build = index_footprint(covering("by_a", Some(vec![0])));
-        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
+        let removal = footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
+            Ref::Committed(0),
             data_change,
-        })]);
+        ))]);
 
         assert!(!build.conflicts_with(&removal));
         assert!(!removal.conflicts_with(&build));
@@ -1464,15 +1559,11 @@ mod tests {
     fn test_a_build_still_conflicts_with_an_in_place_write_beside_a_removal() {
         let build = index_footprint(covering("by_a", Some(vec![0])));
         let write = footprint(vec![
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(1),
-                data_change: true,
-            }),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
         ]);
 
         assert!(build.conflicts_with(&write));
@@ -1499,7 +1590,7 @@ mod tests {
         #[case] expected: bool,
     ) {
         let schema = nested_schema();
-        let build = index_footprint(AddIndexSegment {
+        let build = index_footprint(AddIndexSegmentParts {
             fields: fields.into_iter().map(FieldRef::Committed).collect(),
             covering_fields: covering_fields
                 .into_iter()
@@ -1521,15 +1612,12 @@ mod tests {
     /// fragment is visible in the metadata.
     #[rstest]
     #[case::reencode_of_the_parent(replace_field_data(0, 1, false))]
-    #[case::removal_of_the_fragment(vec![Action::RemoveFragment(RemoveFragment {
-        fragment: Ref::Committed(0),
-        data_change: true,
-    })])]
+    #[case::removal_of_the_fragment(vec![Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))])]
     fn test_a_build_over_a_child_tolerates_moving_its_parent_or_removing_the_fragment(
         #[case] other: Vec<Action>,
     ) {
         let schema = nested_schema();
-        let build = index_footprint(AddIndexSegment {
+        let build = index_footprint(AddIndexSegmentParts {
             fields: vec![FieldRef::Committed(2)],
             ..covering("by_a", Some(vec![0]))
         })
@@ -1540,15 +1628,17 @@ mod tests {
         assert!(!other.conflicts_with(&build));
     }
 
-    fn index_footprint(action: AddIndexSegment) -> Footprint {
-        footprint(vec![Action::AddIndexSegment(action)])
+    fn index_footprint(parts: AddIndexSegmentParts) -> Footprint {
+        footprint(vec![Action::AddIndexSegment(
+            AddIndexSegment::try_new_unchecked(parts).unwrap(),
+        )])
     }
 
-    fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegment {
-        AddIndexSegment {
+    fn covering(name: &str, fragments: Option<Vec<u64>>) -> AddIndexSegmentParts {
+        AddIndexSegmentParts {
             covered_fragments: fragments
                 .map(|ids| ids.into_iter().map(Ref::Committed).collect::<Vec<_>>()),
-            ..segment(name, vec![FieldRef::Committed(0)])
+            ..segment(name, vec![FieldRef::Committed(0)]).into_parts()
         }
     }
 
@@ -1569,41 +1659,63 @@ mod tests {
         false,
     )]
     #[case::unstated_coverage_reaches_everywhere(
-        covering("by_a", None),
-        covering("by_a", Some(vec![7])),
+        covering(MEM_WAL_INDEX_NAME, None),
+        covering(MEM_WAL_INDEX_NAME, Some(vec![7])),
         true,
     )]
-    #[case::two_segments_of_unstated_coverage(covering("by_a", None), covering("by_a", None), true)]
+    #[case::two_segments_of_unstated_coverage(
+        covering(MEM_WAL_INDEX_NAME, None),
+        covering(MEM_WAL_INDEX_NAME, None),
+        true
+    )]
     #[case::disagreeing_about_which_fields_the_index_is_over(
-        AddIndexSegment { fields: vec![FieldRef::Committed(1)], ..covering("by_a", Some(vec![0])) },
+        AddIndexSegmentParts {
+            fields: vec![FieldRef::Committed(1)],
+            ..covering("by_a", Some(vec![0]))
+        },
         covering("by_a", Some(vec![2])),
         true,
     )]
     #[case::disagreeing_about_the_index_type(
-        AddIndexSegment { index_details: type_url("btree.Details"), ..covering("by_a", Some(vec![0])) },
-        AddIndexSegment { index_details: type_url("bitmap.Details"), ..covering("by_a", Some(vec![2])) },
+        AddIndexSegmentParts {
+            index_details: type_url("btree.Details"),
+            ..covering("by_a", Some(vec![0]))
+        },
+        AddIndexSegmentParts {
+            index_details: type_url("bitmap.Details"),
+            ..covering("by_a", Some(vec![2]))
+        },
         true,
     )]
     // Only the bytes are compared: a training knob is as much a disagreement
     // as the metric, since `lance-table` cannot tell which details matter.
     #[case::details_differing_in_any_byte(
-        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]), ..covering("by_a", Some(vec![0])) },
-        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 2]), ..covering("by_a", Some(vec![2])) },
+        AddIndexSegmentParts {
+            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
+            ..covering("by_a", Some(vec![0]))
+        },
+        AddIndexSegmentParts {
+            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 2]),
+            ..covering("by_a", Some(vec![2]))
+        },
         true,
     )]
     // A newer library may write segments of the same index.
     #[case::differing_only_in_index_version(
-        AddIndexSegment {
+        AddIndexSegmentParts {
             index_version: 2,
             index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
             ..covering("by_a", Some(vec![0]))
         },
-        AddIndexSegment { index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]), ..covering("by_a", Some(vec![2])) },
+        AddIndexSegmentParts {
+            index_details: details(VECTOR_DETAILS, vec![8, 0, 16, 1]),
+            ..covering("by_a", Some(vec![2]))
+        },
         false,
     )]
     fn test_two_writers_extending_one_index(
-        #[case] ours: AddIndexSegment,
-        #[case] theirs: AddIndexSegment,
+        #[case] ours: AddIndexSegmentParts,
+        #[case] theirs: AddIndexSegmentParts,
         #[case] expected: bool,
     ) {
         let ours = index_footprint(ours);
@@ -1616,9 +1728,9 @@ mod tests {
     fn test_two_writers_indexing_what_they_each_just_wrote_do_not_conflict() {
         // Neither segment names a committed fragment, and the fragments they do
         // name get distinct ids once both commits are ordered.
-        let local = AddIndexSegment {
+        let local = AddIndexSegmentParts {
             covered_fragments: Some(vec![Ref::Local(0)]),
-            ..segment("by_a", vec![FieldRef::Committed(0)])
+            ..segment("by_a", vec![FieldRef::Committed(0)]).into_parts()
         };
 
         let ours = index_footprint(local.clone());

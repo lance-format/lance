@@ -175,11 +175,12 @@ mod tests {
     use crate::system_index::mem_wal::CompactedSsTable;
     use crate::transaction::UpdateMap;
     use crate::transaction::action::{
-        AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
-        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate,
-        DropField, DropIndex, FieldMetadataUpdate, RefreshRowVersionMetadata, RemoveFragment,
-        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, RowSelection,
-        SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
+        AddIndexSegmentParts, AddOverlays, AdjustIndexCoverage, AdjustIndexCoverageParts,
+        AlterField, AssertCellsUnchanged, AssertUniqueKeys, ConfigUpdate, DropField, DropIndex,
+        RefreshRowVersionMetadata, RemoveFragment, RemoveIndexSegment, ReserveFragmentIds,
+        ReserveRowIds, ResetTable, RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData,
+        UpdateCompactedSsTables,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use chrono::DateTime;
@@ -196,7 +197,7 @@ mod tests {
 
     fn all_actions() -> Vec<Action> {
         vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: Some(RowIdMeta::Inline(vec![1, 2, 3].into())),
@@ -205,58 +206,61 @@ mod tests {
                 ))),
                 created_at_version_meta: None,
                 data_change: true,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: sample_data_file(),
-                field_ids: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                data_change: false,
-                base: Some(Ref::Local(1)),
-            }),
-            Action::AddField(AddField {
-                local: 3,
-                parent: Some(FieldRef::Committed(1)),
-                def: Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
-            }),
-            Action::AddBase(AddBase {
-                local: 1,
-                base: BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
-            }),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(4),
-                field_ids: vec![FieldRef::Committed(7), FieldRef::Committed(8)],
-                data_change: true,
-            }),
-            Action::RemoveFragment(RemoveFragment {
-                fragment: Ref::Committed(5),
-                data_change: true,
-            }),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 6,
-                deletion_file: Some(DeletionFile {
-                    read_version: 3,
-                    id: 9,
-                    file_type: DeletionFileType::Bitmap,
-                    num_deleted_rows: Some(4),
-                    base_id: None,
-                    inline: None,
-                }),
-                data_change: true,
-                base: Some(Ref::Committed(2)),
-            }),
-            Action::AddOverlays(AddOverlays {
-                fragment: Ref::Committed(6),
-                overlays: vec![DataOverlayFile {
+            })),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    sample_data_file(),
+                    vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    Some(Ref::Local(1)),
+                    false,
+                )
+                .unwrap(),
+            ),
+            Action::AddField(
+                AddField::new(
+                    3,
+                    Field::try_from(ArrowField::new("added", DataType::Int32, true)).unwrap(),
+                )
+                .with_parent(FieldRef::Committed(1)),
+            ),
+            Action::AddBase(AddBase::new(
+                1,
+                BasePath::new(0, "s3://bucket/x".into(), Some("other".into()), false),
+            )),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(4),
+                vec![FieldRef::Committed(7), FieldRef::Committed(8)],
+            )),
+            Action::RemoveFragment(RemoveFragment::new(Ref::Committed(5))),
+            Action::SetDeletionFile(
+                SetDeletionFile::try_new_unchecked(
+                    6,
+                    DeletionFile {
+                        read_version: 3,
+                        id: 9,
+                        file_type: DeletionFileType::Bitmap,
+                        num_deleted_rows: Some(4),
+                        base_id: None,
+                        inline: None,
+                    },
+                    Some(Ref::Committed(2)),
+                    true,
+                )
+                .unwrap(),
+            ),
+            Action::AddOverlays(AddOverlays::new_unchecked(
+                Ref::Committed(6),
+                vec![DataOverlayFile {
                     data_file: sample_data_file(),
                     coverage: OverlayCoverage::PerField(vec![Arc::new(
                         [1u32, 4].into_iter().collect::<RoaringBitmap>(),
                     )]),
                     committed_version: 11,
                 }],
-                data_change: true,
-            }),
-            Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-                rows: vec![
+            )),
+            Action::RefreshRowVersionMetadata(
+                RefreshRowVersionMetadata::try_new(vec![
                     RowSelection {
                         fragment_id: 4,
                         rows: SelectedRows::Full,
@@ -265,100 +269,108 @@ mod tests {
                         fragment_id: 6,
                         rows: SelectedRows::Offsets(RoaringBitmap::from_iter([0u32, 2])),
                     },
-                ],
-            }),
-            Action::AlterField(AlterField {
-                field: FieldRef::Committed(2),
-                name: Some("renamed".into()),
-                nullable: Some(false),
-            }),
-            Action::DropField(DropField {
-                field: FieldRef::Committed(3),
-            }),
-            Action::AddIndexSegment(AddIndexSegment {
-                uuid: Uuid::from_u128(7),
-                name: "by_a".into(),
-                fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                covering_fields: vec![FieldRef::Local(3)],
-                index_details: Some(Arc::new(prost_types::Any {
-                    type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
-                    value: vec![1, 2, 3],
-                })),
-                index_version: 2,
-                covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
-                files: vec![IndexFile {
-                    path: "index.idx".into(),
-                    size_bytes: 512,
-                    file_metadata_size_bytes: std::num::NonZero::new(128),
-                }],
-                base: Some(Ref::Local(1)),
-                created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
-                dataset_version: Some(3),
-                data_change: false,
-            }),
-            Action::RemoveIndexSegment(RemoveIndexSegment {
-                uuid: Uuid::from_u128(8),
-                name: "by_a".into(),
-                data_change: true,
-            }),
-            Action::DropIndex(DropIndex {
-                name: "by_c".into(),
-            }),
-            Action::AdjustIndexCoverage(AdjustIndexCoverage {
-                uuid: Uuid::from_u128(9),
-                name: "by_b".into(),
-                add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
-                remove_fragments: vec![2, 3],
-                fields: vec![FieldRef::Committed(0)],
-                covering_fields: vec![FieldRef::Committed(1)],
-            }),
-            Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
-                compacted_sstables: vec![
+                ])
+                .unwrap(),
+            ),
+            Action::AlterField(
+                AlterField::new(FieldRef::Committed(2))
+                    .with_name("renamed")
+                    .with_nullable(false),
+            ),
+            Action::DropField(DropField::new(FieldRef::Committed(3))),
+            Action::AddIndexSegment(
+                AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+                    uuid: Uuid::from_u128(7),
+                    name: "by_a".into(),
+                    fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    covering_fields: vec![FieldRef::Local(3)],
+                    index_details: Some(Arc::new(prost_types::Any {
+                        type_url: "type.googleapis.com/lance.table.MemWalIndexDetails".into(),
+                        value: vec![1, 2, 3],
+                    })),
+                    index_version: 2,
+                    covered_fragments: Some(vec![Ref::Committed(4), Ref::Local(0)]),
+                    files: vec![IndexFile {
+                        path: "index.idx".into(),
+                        size_bytes: 512,
+                        file_metadata_size_bytes: std::num::NonZero::new(128),
+                    }],
+                    base: Some(Ref::Local(1)),
+                    created_at: DateTime::from_timestamp_millis(1_700_000_000_000),
+                    dataset_version: Some(3),
+                    data_change: false,
+                })
+                .unwrap(),
+            ),
+            Action::RemoveIndexSegment(
+                RemoveIndexSegment::try_new(Uuid::from_u128(8), "by_a").unwrap(),
+            ),
+            Action::DropIndex(DropIndex::try_new("by_c").unwrap()),
+            Action::AdjustIndexCoverage(
+                AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+                    uuid: Uuid::from_u128(9),
+                    name: "by_b".into(),
+                    add_fragments: vec![Ref::Committed(1), Ref::Local(0)],
+                    remove_fragments: vec![2, 3],
+                    fields: vec![FieldRef::Committed(0)],
+                    covering_fields: vec![FieldRef::Committed(1)],
+                })
+                .unwrap(),
+            ),
+            Action::UpdateCompactedSsTables(
+                UpdateCompactedSsTables::try_new_unchecked(vec![
                     CompactedSsTable::new(Uuid::from_u128(10), 2),
                     CompactedSsTable::new(Uuid::from_u128(11), 5),
-                ],
-            }),
-            Action::AssertUniqueKeys(AssertUniqueKeys {
-                key_fields: vec![FieldRef::Committed(1), FieldRef::Local(3)],
-                filter: KeyExistenceFilter {
-                    field_ids: Vec::new(),
-                    filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
-                },
-            }),
-            Action::AssertCellsUnchanged(AssertCellsUnchanged {
-                fields: vec![FieldRef::Committed(1)],
-                rows: vec![
-                    RowSelection {
-                        fragment_id: 4,
-                        rows: SelectedRows::Full,
+                ])
+                .unwrap(),
+            ),
+            Action::AssertUniqueKeys(
+                AssertUniqueKeys::try_new_unchecked(
+                    vec![FieldRef::Committed(1), FieldRef::Local(3)],
+                    KeyExistenceFilter {
+                        field_ids: Vec::new(),
+                        filter: FilterType::ExactSet([7u64, 9].into_iter().collect()),
                     },
-                    RowSelection {
-                        fragment_id: 5,
-                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
-                    },
-                ],
-            }),
-            Action::ReserveFragmentIds(ReserveFragmentIds { count: 4 }),
-            Action::ReserveRowIds(ReserveRowIds { count: 40 }),
+                )
+                .unwrap(),
+            ),
+            Action::AssertCellsUnchanged(
+                AssertCellsUnchanged::try_new(
+                    vec![FieldRef::Committed(1)],
+                    vec![
+                        RowSelection {
+                            fragment_id: 4,
+                            rows: SelectedRows::Full,
+                        },
+                        RowSelection {
+                            fragment_id: 5,
+                            rows: SelectedRows::Offsets(RoaringBitmap::from_iter([1u32, 3])),
+                        },
+                    ],
+                )
+                .unwrap(),
+            ),
+            Action::ReserveFragmentIds(ReserveFragmentIds::new(4)),
+            Action::ReserveRowIds(ReserveRowIds::new(40)),
             Action::ResetTable(ResetTable),
-            Action::ConfigUpdate(ConfigUpdate {
-                config: Some(UpdateMap {
-                    update_entries: vec![("a", "1").into(), ("b", None).into()],
-                    replace: false,
-                }),
-                table_metadata: None,
-                schema_metadata: Some(UpdateMap {
-                    update_entries: vec![("c", "2").into()],
-                    replace: true,
-                }),
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Local(3),
-                    updates: UpdateMap {
-                        update_entries: vec![("d", "3").into()],
+            Action::ConfigUpdate(
+                ConfigUpdate::default()
+                    .with_config(UpdateMap {
+                        update_entries: vec![("a", "1").into(), ("b", None).into()],
                         replace: false,
-                    },
-                }],
-            }),
+                    })
+                    .with_schema_metadata(UpdateMap {
+                        update_entries: vec![("c", "2").into()],
+                        replace: true,
+                    })
+                    .with_field_metadata(
+                        FieldRef::Local(3),
+                        UpdateMap {
+                            update_entries: vec![("d", "3").into()],
+                            replace: false,
+                        },
+                    ),
+            ),
         ]
     }
 
@@ -379,19 +391,20 @@ mod tests {
     fn test_omitted_data_unchanged_reads_as_a_data_change() {
         // The wire default is the conservative reading: a writer that omits the
         // flag claims a data change, and the common case costs no bytes.
-        let message = pb_actions::RemoveFragment::from(&RemoveFragment {
-            fragment: Ref::Committed(1),
-            data_change: true,
-        });
+        let message = pb_actions::RemoveFragment::from(&RemoveFragment::new(Ref::Committed(1)));
         assert!(!message.data_unchanged);
-        assert!(RemoveFragment::try_from(message).unwrap().data_change);
+        assert!(RemoveFragment::try_from(message).unwrap().is_data_change());
 
-        let rearrangement = pb_actions::RemoveFragment::from(&RemoveFragment {
-            fragment: Ref::Committed(1),
-            data_change: false,
-        });
+        let rearrangement = pb_actions::RemoveFragment::from(&RemoveFragment::new_unchecked(
+            Ref::Committed(1),
+            false,
+        ));
         assert!(rearrangement.data_unchanged);
-        assert!(!RemoveFragment::try_from(rearrangement).unwrap().data_change);
+        assert!(
+            !RemoveFragment::try_from(rearrangement)
+                .unwrap()
+                .is_data_change()
+        );
     }
 
     #[test]

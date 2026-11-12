@@ -1462,10 +1462,10 @@ mod tests {
         manifest_with_base, mint_base, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
-        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
-        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AddIndexSegment,
+        AddIndexSegmentParts, AdjustIndexCoverage, AdjustIndexCoverageParts, AlterField,
+        CompositeOperation, ConfigUpdate, DropField, DropIndex, RemoveFragment, RemoveIndexSegment,
+        ReserveFragmentIds, ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -1531,21 +1531,23 @@ mod tests {
             Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
                 "replace field 0",
                 vec![
-                    Action::TombstoneFieldData(TombstoneFieldData {
-                        fragment: Ref::Committed(0),
-                        field_ids: vec![FieldRef::Committed(0)],
-                        data_change: true,
-                    }),
-                    Action::AddDataFile(AddDataFile {
-                        fragment: Ref::Committed(0),
-                        file: DataFile {
-                            fields: Arc::from([]),
-                            ..replacement
-                        },
-                        field_ids: vec![FieldRef::Committed(0)],
-                        data_change: true,
-                        base: None,
-                    }),
+                    Action::TombstoneFieldData(TombstoneFieldData::new(
+                        Ref::Committed(0),
+                        vec![FieldRef::Committed(0)],
+                    )),
+                    Action::AddDataFile(
+                        AddDataFile::try_new_unchecked(
+                            Ref::Committed(0),
+                            DataFile {
+                                fields: Arc::from([]),
+                                ..replacement
+                            },
+                            vec![FieldRef::Committed(0)],
+                            None,
+                            true,
+                        )
+                        .unwrap(),
+                    ),
                 ],
             )]))
         } else {
@@ -1593,26 +1595,25 @@ mod tests {
     #[test]
     fn test_an_action_set_relocates_onto_a_newer_version() {
         let actions = vec![
-            Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("added"),
-            }),
-            Action::AddFragment(AddFragment {
+            Action::AddField(AddField::new(0, added_field("added"))),
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 10,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: one_column_file("data/new.lance"),
-                field_ids: vec![FieldRef::Local(0)],
-                data_change: true,
-                base: None,
-            }),
+            })),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    one_column_file("data/new.lance"),
+                    vec![FieldRef::Local(0)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            ),
         ];
 
         // Replaying the same actions against the manifest the first run
@@ -1623,7 +1624,9 @@ mod tests {
         let Action::AddField(add_field) = &mut replayed[0] else {
             unreachable!("the first action is the AddField built above");
         };
-        add_field.def.name = "added_again".into();
+        let mut def = add_field.def().clone();
+        def.name = "added_again".into();
+        *add_field = AddField::new(add_field.local(), def);
         let second = apply(&first, replayed).unwrap();
 
         assert_eq!(
@@ -1690,25 +1693,27 @@ mod tests {
         let (_, indices) = apply_with_indices(
             &manifest,
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(rewritten)],
-                    data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new(
-                        "data/0-new.lance",
-                        Vec::<i32>::new(),
-                        vec![0],
-                        ConcreteFileVersion::V2_0,
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(rewritten)],
+                )),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new(
+                            "data/0-new.lance",
+                            Vec::<i32>::new(),
+                            vec![0],
+                            ConcreteFileVersion::V2_0,
+                            None,
+                            None,
+                        ),
+                        vec![FieldRef::Committed(rewritten)],
                         None,
-                        None,
-                    ),
-                    field_ids: vec![FieldRef::Committed(rewritten)],
-                    data_change: true,
-                    base: None,
-                }),
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
             vec![IndexMetadata {
                 fields: vec![indexed],
@@ -1740,25 +1745,27 @@ mod tests {
         let result = apply_with_indices(
             &backed_manifest(),
             vec![
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new(
-                        "data/0-new.lance",
-                        vec![],
-                        vec![0],
-                        ConcreteFileVersion::V2_0,
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Committed(0)],
+                )),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new(
+                            "data/0-new.lance",
+                            vec![],
+                            vec![0],
+                            ConcreteFileVersion::V2_0,
+                            None,
+                            None,
+                        ),
+                        vec![FieldRef::Committed(0)],
                         None,
-                        None,
-                    ),
-                    field_ids: vec![FieldRef::Committed(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
             vec![index],
         );
@@ -1798,45 +1805,43 @@ mod tests {
     }
 
     fn mint_fragment(token: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(token),
             physical_rows: 10,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn write_data(fragment: Ref, field: FieldRef) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: one_column_file("data/new.lance"),
-            field_ids: vec![field],
-            data_change: true,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                one_column_file("data/new.lance"),
+                vec![field],
+                None,
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     fn mint_field(token: u32, name: &str, parent: Option<FieldRef>) -> Action {
-        Action::AddField(AddField {
-            local: token,
-            parent,
-            def: added_field(name),
+        let field = AddField::new(token, added_field(name));
+        Action::AddField(match parent {
+            Some(parent) => field.with_parent(parent),
+            None => field,
         })
     }
 
     fn remove_fragment_zero() -> Action {
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
-            data_change: true,
-        })
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(0)))
     }
 
     fn drop_field_zero() -> Action {
-        Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })
+        Action::DropField(DropField::new(FieldRef::Committed(0)))
     }
 
     /// Actions apply in order, across steps as within one, so a reference is
@@ -1858,34 +1863,24 @@ mod tests {
     #[case::deletion_file_after_remove(
         vec![vec![
             remove_fragment_zero(),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            }),
+            Action::SetDeletionFile(SetDeletionFile::clear(0)),
         ]],
         Some("SetDeletionFile targets fragment 0, which does not exist"),
     )]
     #[case::tombstone_after_remove(
         vec![vec![
             remove_fragment_zero(),
-            Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: true,
-            }),
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
         ]],
         Some("TombstoneFieldData targets fragment 0, which does not exist"),
     )]
     #[case::alter_after_drop(
         vec![vec![
             drop_field_zero(),
-            Action::AlterField(AlterField {
-                field: FieldRef::Committed(0),
-                name: Some("renamed".into()),
-                nullable: None,
-            }),
+            Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed")),
         ]],
         Some("AlterField names field 0, which does not exist"),
     )]
@@ -1964,30 +1959,22 @@ mod tests {
     /// A reserved id names a column of one data file, never a field of the
     /// schema, so only the action that binds a file's columns accepts one.
     #[rstest]
-    #[case::tombstone(Action::TombstoneFieldData(TombstoneFieldData {
-        fragment: Ref::Committed(0),
-        field_ids: vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
-        data_change: true,
-    }))]
-    #[case::drop(Action::DropField(DropField {
-        field: FieldRef::Committed(ROW_ID_FIELD_ID),
-    }))]
-    #[case::alter(Action::AlterField(AlterField {
-        field: FieldRef::Committed(ROW_ID_FIELD_ID),
-        name: Some("renamed".into()),
-        nullable: None,
-    }))]
+    #[case::tombstone(Action::TombstoneFieldData(TombstoneFieldData::new(
+        Ref::Committed(0),
+        vec![FieldRef::Committed(ROW_ID_FIELD_ID)],
+    )))]
+    #[case::drop(Action::DropField(DropField::new(FieldRef::Committed(ROW_ID_FIELD_ID))))]
+    #[case::alter(Action::AlterField(
+        AlterField::new(FieldRef::Committed(ROW_ID_FIELD_ID)).with_name("renamed")
+    ))]
     #[case::parent(mint_field(0, "child", Some(FieldRef::Committed(ROW_ID_FIELD_ID))))]
-    #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate {
-        field_metadata: vec![FieldMetadataUpdate {
-            field: FieldRef::Committed(ROW_ID_FIELD_ID),
-            updates: UpdateMap {
-                update_entries: vec![],
-                replace: false,
-            },
-        }],
-        ..Default::default()
-    }))]
+    #[case::field_metadata(Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
+        FieldRef::Committed(ROW_ID_FIELD_ID),
+        UpdateMap {
+            update_entries: vec![],
+            replace: false,
+        },
+    )))]
     fn test_a_reserved_field_id_names_no_schema_field(#[case] action: Action) {
         let error = apply(&backed_manifest(), vec![action]).unwrap_err();
 
@@ -2017,28 +2004,20 @@ mod tests {
     )]
     #[case::add_nested(
         vec![
-            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            Action::AddField(AddField::new(0, struct_field("s"))),
             mint_field(1, ROW_ID, Some(FieldRef::Local(0))),
         ],
         false
     )]
     #[case::rename_top_level(
-        vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some(ROW_ADDR.into()),
-            nullable: None,
-        })],
+        vec![Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name(ROW_ADDR))],
         true
     )]
     #[case::rename_nested(
         vec![
-            Action::AddField(AddField { local: 0, parent: None, def: struct_field("s") }),
+            Action::AddField(AddField::new(0, struct_field("s"))),
             mint_field(1, "child", Some(FieldRef::Local(0))),
-            Action::AlterField(AlterField {
-                field: FieldRef::Local(1),
-                name: Some(ROW_ADDR.into()),
-                nullable: None,
-            }),
+            Action::AlterField(AlterField::new(FieldRef::Local(1)).with_name(ROW_ADDR)),
         ],
         false
     )]
@@ -2062,13 +2041,10 @@ mod tests {
     }
 
     fn config_update() -> Action {
-        Action::ConfigUpdate(ConfigUpdate {
-            config: Some(UpdateMap {
-                update_entries: vec![("k", "v").into()],
-                replace: false,
-            }),
-            ..Default::default()
-        })
+        Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+            update_entries: vec![("k", "v").into()],
+            replace: false,
+        }))
     }
 
     fn fragment_counter_at_max() -> Manifest {
@@ -2108,16 +2084,13 @@ mod tests {
     #[case::fragment(fragment_counter_at_max(), mint_fragment(0), "fragment id")]
     #[case::fragment_reservation(
         fragment_counter_at_max(),
-        Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+        Action::ReserveFragmentIds(ReserveFragmentIds::new(1)),
         "fragment id"
     )]
     #[case::field(field_counter_at_max(), mint_field(0, "added", None), "field id")]
     #[case::base(
         base_counter_at_max(),
-        Action::AddBase(AddBase {
-            local: 0,
-            base: BasePath::new(0, "s3://bucket/new".into(), None, false),
-        }),
+        Action::AddBase(AddBase::new(0, BasePath::new(0, "s3://bucket/new".into(), None, false))),
         "base id"
     )]
     #[case::row_id(row_id_counter_at_max(), mint_fragment(0), "row id")]
@@ -2139,11 +2112,7 @@ mod tests {
     }
 
     fn rename_field_zero() -> Action {
-        Action::AlterField(AlterField {
-            field: FieldRef::Committed(0),
-            name: Some("renamed".into()),
-            nullable: None,
-        })
+        Action::AlterField(AlterField::new(FieldRef::Committed(0)).with_name("renamed"))
     }
 
     #[test]
@@ -2210,13 +2179,16 @@ mod tests {
     }
 
     fn data_file_under_base(fragment: Ref, base: Ref) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment,
-            file: one_column_file("data/new.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change: true,
-            base: Some(base),
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                fragment,
+                one_column_file("data/new.lance"),
+                vec![FieldRef::Committed(0)],
+                Some(base),
+                true,
+            )
+            .unwrap(),
+        )
     }
 
     /// A committed id above the read version's mark names nothing the writer
@@ -2228,12 +2200,7 @@ mod tests {
     #[case::deletion_file_on_a_minted_fragment(
         vec![
             mint_fragment(0),
-            Action::SetDeletionFile(SetDeletionFile {
-                fragment: 5,
-                deletion_file: None,
-                data_change: true,
-                base: None,
-            }),
+            Action::SetDeletionFile(SetDeletionFile::clear(5)),
         ],
         "fragment 5",
     )]
@@ -2268,21 +2235,10 @@ mod tests {
     /// operation applies, but a concurrent commit minted it for its own
     /// object.
     #[rstest]
-    #[case::deletion_file(
-        Action::SetDeletionFile(SetDeletionFile {
-            fragment: 1,
-            deletion_file: None,
-            data_change: true,
-            base: None,
-        }),
-        "fragment 1",
-    )]
+    #[case::deletion_file(Action::SetDeletionFile(SetDeletionFile::clear(1)), "fragment 1")]
     #[case::remove_fragment(
-        Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(1),
-            data_change: true,
-        }),
-        "fragment 1",
+        Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
+        "fragment 1"
     )]
     #[case::data_file_for_a_field(write_data(Ref::Committed(0), FieldRef::Committed(1)), "field 1")]
     #[case::data_file_under_a_base(
@@ -2325,21 +2281,23 @@ mod tests {
         read.max_fragment_id = Some(4);
         let current = apply(
             &read,
-            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 2 })],
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(2))],
         )
         .unwrap();
 
         let result = apply_after_reading(
             &read,
             &current,
-            vec![Action::AddFragment(AddFragment {
-                id: Ref::Committed(id),
-                physical_rows: 10,
-                row_id_meta: None,
-                last_updated_at_version_meta: None,
-                created_at_version_meta: None,
-                data_change: true,
-            })],
+            vec![Action::AddFragment(AddFragment::new_unchecked(
+                AddFragmentParts {
+                    id: Ref::Committed(id),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                },
+            ))],
         );
 
         match expected_error {
@@ -2391,11 +2349,7 @@ mod tests {
         manifest.schema.field_by_id_mut(0).unwrap().nullable = false;
         apply(
             &manifest,
-            vec![Action::AddField(AddField {
-                local: 0,
-                parent: None,
-                def: added_field("loose"),
-            })],
+            vec![Action::AddField(AddField::new(0, added_field("loose")))],
         )
         .unwrap()
     }
@@ -2406,17 +2360,14 @@ mod tests {
     /// claim about every row, so it checks every fragment.
     #[rstest]
     #[case::minted_fragment_without_its_data(vec![mint_fragment(0)])]
-    #[case::required_field_without_data(vec![Action::AddField(AddField {
-        local: 0,
-        parent: None,
-        def: lance_core::datatypes::Field::try_from(ArrowField::new("strict", DataType::Int32, false))
+    #[case::required_field_without_data(vec![Action::AddField(AddField::new(
+        0,
+        lance_core::datatypes::Field::try_from(ArrowField::new("strict", DataType::Int32, false))
             .unwrap(),
-    })])]
-    #[case::tightened_field_without_data(vec![Action::AlterField(AlterField {
-        field: FieldRef::Committed(1),
-        name: None,
-        nullable: Some(false),
-    })])]
+    ))])]
+    #[case::tightened_field_without_data(vec![Action::AlterField(
+        AlterField::new(FieldRef::Committed(1)).with_nullable(false)
+    )])]
     fn test_a_fragment_must_store_every_required_field(#[case] actions: Vec<Action>) {
         let error = apply(&manifest_with_an_unstored_nullable_field(), actions).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
@@ -2465,36 +2416,38 @@ mod tests {
     /// The fragment reuse history is not an index on the action path: no
     /// index action may name it, so it changes only through its own actions.
     #[rstest]
-    #[case::add_segment(|uuid: Uuid| Action::AddIndexSegment(AddIndexSegment {
-        uuid: Uuid::from_u128(uuid.as_u128() + 1),
-        name: FRAG_REUSE_INDEX_NAME.into(),
-        fields: Vec::new(),
-        covering_fields: Vec::new(),
-        index_details: None,
-        index_version: 1,
-        covered_fragments: None,
-        files: Vec::new(),
-        base: None,
-        created_at: None,
-        dataset_version: None,
-        data_change: false,
-    }))]
-    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
-        uuid,
-        name: FRAG_REUSE_INDEX_NAME.into(),
-        data_change: false,
-    }))]
-    #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(AdjustIndexCoverage {
-        uuid,
-        name: FRAG_REUSE_INDEX_NAME.into(),
-        add_fragments: Vec::new(),
-        remove_fragments: vec![0],
-        fields: Vec::new(),
-        covering_fields: Vec::new(),
-    }))]
-    #[case::drop_index(|_| Action::DropIndex(DropIndex {
-        name: FRAG_REUSE_INDEX_NAME.into(),
-    }))]
+    #[case::add_segment(|uuid: Uuid| Action::AddIndexSegment(
+        AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            uuid: Uuid::from_u128(uuid.as_u128() + 1),
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(Vec::new()),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        })
+        .unwrap(),
+    ))]
+    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(
+        RemoveIndexSegment::try_new_unchecked(uuid, FRAG_REUSE_INDEX_NAME, false).unwrap(),
+    ))]
+    #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(
+        AdjustIndexCoverage::try_new_unchecked(AdjustIndexCoverageParts {
+            uuid,
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            add_fragments: Vec::new(),
+            remove_fragments: vec![0],
+            fields: Vec::new(),
+            covering_fields: Vec::new(),
+        })
+        .unwrap(),
+    ))]
+    #[case::drop_index(|_| Action::DropIndex(DropIndex::try_new(FRAG_REUSE_INDEX_NAME).unwrap()))]
     fn test_an_index_action_may_not_name_the_fragment_reuse_history(
         #[case] action: fn(Uuid) -> Action,
     ) {
