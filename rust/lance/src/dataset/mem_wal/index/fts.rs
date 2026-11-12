@@ -704,8 +704,9 @@ const FUZZY_AUTOMATON_MAX_TERM_BYTES: usize = 64;
 
 /// Prefixed partition terms per automaton state that fuzzy expansion may
 /// build. Building a state costs about as much as an edit distance or two, so
-/// a build that reaches this limit and falls back costs at most about as much
-/// as the edit distances the fallback then computes.
+/// with more than a few hundred such terms, a build that reaches this limit
+/// and falls back costs at most about as much as the edit distances the
+/// fallback then computes.
 const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
 
 /// Most automaton states fuzzy expansion builds, `fst`'s default limit for
@@ -713,8 +714,8 @@ const FUZZY_AUTOMATON_TERMS_PER_STATE: usize = 4;
 const FUZZY_AUTOMATON_MAX_STATES: usize = 10_000;
 
 /// The Levenshtein automaton that expands `term` over partitions holding
-/// `prefixed_terms` terms with the required prefix, or `None` to scan their
-/// dictionaries instead. `fst`'s automaton can miss matches for a non-ASCII
+/// `prefixed_terms` terms with the required prefix, or `None` to check those
+/// terms one by one instead. `fst`'s automaton can miss matches for a non-ASCII
 /// term (lance-index keeps its own Unicode automaton for those), and building
 /// one for a long term or for few terms with the prefix can cost far more
 /// than the scan it replaces.
