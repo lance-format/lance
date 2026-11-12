@@ -4356,14 +4356,15 @@ dependencies = [
 
 [[package]]
 name = "jieba-rs"
-version = "0.10.4"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6a8bbb0f77ee810f0689a30b7cec56b875751ef4ec2e74fd995613dc52b3ae1"
+checksum = "bb5bdea4dc241d589e179f39d2a778f31490f3370aa2f626223dbd930ebc5c9d"
 dependencies = [
  "bytecount",
  "cedarwood",
  "jieba-macros",
  "phf 0.13.1",
+ "regex",
  "rustc-hash",
 ]
 
