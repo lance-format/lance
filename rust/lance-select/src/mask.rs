@@ -476,14 +476,14 @@ impl RowAddrTreeMap {
                         RowAddrSelection::Partial(set.clone())
                     }
                     (RowAddrSelection::Partial(lhs), RowAddrSelection::Partial(rhs)) => {
-                        let set = lhs & rhs;
-                        if set.is_empty() {
-                            return None;
-                        }
-                        RowAddrSelection::Partial(set)
+                        RowAddrSelection::Partial(lhs & rhs)
                     }
                 };
-                Some((*fragment, selection))
+                // Like `BitAndAssign`, keep no fragment without rows, whichever
+                // side the empty set came from.
+                let is_empty =
+                    matches!(&selection, RowAddrSelection::Partial(set) if set.is_empty());
+                (!is_empty).then_some((*fragment, selection))
             })
             .collect();
         Self { inner }
@@ -1484,31 +1484,79 @@ mod tests {
         range.filter(|val| mask.selected(*val)).collect()
     }
 
-    /// `intersect_ref` builds the same mask as the consuming `intersect`.
+    /// `intersect_ref` builds the same mask as the consuming `intersect`, for
+    /// every pairing of whole, partial, empty and absent fragments.
     #[test]
     fn test_intersect_ref_matches_intersect() {
-        let allow = RowAddrMask::from_allowed(rows(&[1, 2, 3, 1 << 32 | 5, 1 << 32 | 6, 2 << 32]));
-        let mut full = RowAddrTreeMap::new();
-        full.insert_fragment(0);
-        full.insert(1 << 32 | 6);
-        let other_allow = RowAddrMask::from_allowed(full);
-        let block = RowAddrMask::from_block(rows(&[2, 1 << 32 | 5, 3 << 32 | 1]));
-        let other_block = RowAddrMask::from_block(rows(&[3, 4 << 32 | 9]));
-        // Fragment 2 ends up empty and fragment 1 meets a whole fragment.
-        let mut disjoint = RowAddrTreeMap::new();
-        disjoint.insert_fragment(1);
-        disjoint.insert(2 << 32 | 1);
-        let disjoint = RowAddrMask::from_allowed(disjoint);
+        let whole = || RowAddrSelection::Full;
+        let partial =
+            |offsets: &[u32]| RowAddrSelection::Partial(offsets.iter().copied().collect());
+        let tree = |fragments: Vec<(u32, RowAddrSelection)>| RowAddrTreeMap {
+            inner: fragments.into_iter().collect(),
+        };
+        // What the comment after each fragment names is its pairing with the
+        // same fragment of `lhs`, as `intersection` and then `difference` see it.
+        let lhs = tree(vec![
+            (0, whole()),
+            (1, partial(&[5, 6])),
+            (2, partial(&[0])),
+            (3, whole()),
+            (4, whole()),
+            (5, partial(&[1])),
+            (7, whole()),
+            (9, partial(&[3])),
+        ]);
+        let rhs = tree(vec![
+            (0, whole()),          // whole and whole; whole minus whole
+            (1, whole()),          // partial and whole; partial minus whole
+            (2, partial(&[1])),    // partial and partial, no rows left; rows left
+            (3, partial(&[7])),    // whole and partial; whole minus partial
+            (5, partial(&[1, 2])), // partial and partial, rows left; no rows left
+            (7, partial(&[])),     // whole and an empty partial
+            (8, whole()),          // absent from `lhs`
+                                   // 4 and 9: whole and partial absent from `rhs`
+        ]);
+        let other_block = tree(vec![(1, partial(&[6])), (6, whole())]);
+
+        let allow = RowAddrMask::from_allowed(lhs);
+        let other_allow = RowAddrMask::from_allowed(rhs.clone());
+        let block = RowAddrMask::from_block(rhs);
+        let other_block = RowAddrMask::from_block(other_block);
         for (a, b) in [
             (&allow, &other_allow),
-            (&allow, &disjoint),
-            (&disjoint, &allow),
+            (&other_allow, &allow),
             (&allow, &block),
             (&block, &allow),
             (&block, &other_block),
         ] {
             assert_eq!(a.intersect_ref(b), a.clone().intersect(b.clone()));
         }
+
+        // The expected masks spelled out, so that the two implementations
+        // cannot agree on a wrong answer.
+        assert_eq!(
+            allow.intersect_ref(&other_allow),
+            RowAddrMask::from_allowed(tree(vec![
+                (0, whole()),
+                (1, partial(&[5, 6])),
+                (3, partial(&[7])),
+                (5, partial(&[1])),
+            ]))
+        );
+        let mut all_but_seven = RoaringBitmap::full();
+        all_but_seven.remove(7);
+        assert_eq!(
+            allow.intersect_ref(&block),
+            RowAddrMask::from_allowed(tree(vec![
+                (2, partial(&[0])),
+                (3, RowAddrSelection::Partial(all_but_seven)),
+                (4, whole()),
+                // As in `SubAssign`: nothing was removed, yet the fragment is
+                // now spelled as every offset.
+                (7, RowAddrSelection::Partial(RoaringBitmap::full())),
+                (9, partial(&[3])),
+            ]))
+        );
     }
 
     #[test]

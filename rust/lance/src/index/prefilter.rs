@@ -68,7 +68,7 @@ pub struct DatasetPreFilter {
     // Row addresses whose index entries are stale due to a newer data overlay committed after
     // the index was built. Computed synchronously at plan time and ANDead into the final mask
     // so the index never returns those rows.
-    pub(super) overlay_block: Option<RowAddrMask>,
+    pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -79,11 +79,8 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
-        let filter = filter.map(|filter| {
-            async move { filter.load_shared().await }
-                .in_current_span()
-                .boxed()
-        });
+        let filter =
+            filter.map(|filter| async move { filter.load().await }.in_current_span().boxed());
         Self::new_with_filter_future(dataset, indices, filter)
     }
 
@@ -329,7 +326,7 @@ impl DatasetPreFilter {
     /// Block specific row addresses from index results because their index entries are stale
     /// due to a data overlay committed after the index was built.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
-        self.overlay_block = Some(block);
+        self.overlay_block = Some(Arc::new(block));
         self
     }
 
@@ -521,43 +518,33 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            // The filter and deletion masks are shared with their caches, so
+            // Every mask is shared (with its cache or with this prefilter), so
             // they are intersected by reference and only the result is
-            // allocated; a lone mask is shared as is.
-            let filtered = self.filtered_ids.as_ref().map(|ids| ids.get_ready());
-            let deleted = self.deleted_ids.as_ref().map(|ids| ids.get_ready());
+            // allocated; a lone mask is handed out as is.
             let deleted_fragments = self.deleted_fragments.as_ref().map(|deleted| {
                 let mut block_list = RowAddrTreeMap::new();
                 for frag_id in deleted.iter() {
                     block_list.insert_fragment(frag_id);
                 }
-                RowAddrMask::from_block(block_list)
+                Arc::new(RowAddrMask::from_block(block_list))
             });
-            let count = filtered.is_some() as usize
-                + deleted.is_some() as usize
-                + deleted_fragments.is_some() as usize
-                + self.overlay_block.is_some() as usize;
-            if count <= 1 {
-                return filtered
-                    .or(deleted)
-                    .or_else(|| deleted_fragments.map(Arc::new))
-                    .or_else(|| self.overlay_block.clone().map(Arc::new))
-                    .unwrap_or_else(|| Arc::new(RowAddrMask::default()));
-            }
-            let mut parts = [
-                filtered.as_deref(),
-                deleted.as_deref(),
-                deleted_fragments.as_ref(),
-                self.overlay_block.as_ref(),
+            let mut masks = [
+                self.filtered_ids.as_ref().map(|ids| ids.get_ready()),
+                self.deleted_ids.as_ref().map(|ids| ids.get_ready()),
+                deleted_fragments,
+                self.overlay_block.clone(),
             ]
             .into_iter()
             .flatten();
-            let first = parts.next().expect("at least two masks");
-            let second = parts.next().expect("at least two masks");
-            let mut combined = first.intersect_ref(second);
-            for part in parts {
-                combined = combined.intersect_ref(part);
-            }
+            let Some(first) = masks.next() else {
+                return Arc::new(RowAddrMask::default());
+            };
+            let Some(second) = masks.next() else {
+                return first;
+            };
+            let combined = masks.fold(first.intersect_ref(&second), |combined, mask| {
+                combined.intersect_ref(&mask)
+            });
             Arc::new(combined)
         });
 

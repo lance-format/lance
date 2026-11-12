@@ -51,18 +51,9 @@ impl MaskAndLoader {
 
 #[async_trait]
 impl FilterLoader for MaskAndLoader {
-    async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         match self.inner {
-            Some(inner) => Ok(self.mask.intersect_ref(&*inner.load_shared().await?)),
-            None => Ok(Arc::unwrap_or_clone(self.mask)),
-        }
-    }
-
-    async fn load_shared(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
-        match self.inner {
-            Some(inner) => Ok(Arc::new(
-                self.mask.intersect_ref(&*inner.load_shared().await?),
-            )),
+            Some(inner) => Ok(Arc::new(self.mask.intersect_ref(&*inner.load().await?))),
             None => Ok(self.mask),
         }
     }
@@ -273,8 +264,8 @@ mod tests {
 
     #[async_trait]
     impl FilterLoader for FixedLoader {
-        async fn load(self: Box<Self>) -> Result<RowAddrMask> {
-            Ok(self.0)
+        async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+            Ok(Arc::new(self.0))
         }
     }
 

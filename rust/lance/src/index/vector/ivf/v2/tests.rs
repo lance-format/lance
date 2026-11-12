@@ -459,6 +459,9 @@ async fn test_state_entry_carries_quantizer_before_admission() {
         .downcast::<IvfStateEntryBox>()
         .unwrap();
     for entry in [Arc::new(exported), decoded] {
+        // Without this the size check below would also hold for an entry that
+        // never got a quantizer.
+        assert!(entry.0.has_quantizer());
         let charged = entry.deep_size_of();
         entry
             .0
