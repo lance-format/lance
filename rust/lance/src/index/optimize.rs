@@ -1636,6 +1636,150 @@ mod tests {
 
     use crate::dataset::WriteParams;
 
+    #[rstest::rstest]
+    #[case::worker_merge(8)]
+    #[case::coordinator_merge(4)]
+    #[tokio::test]
+    async fn test_fmindex_split_optimize(
+        #[case] task_rows: u64,
+        #[values(false, true)] stable_row_ids: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("alpha needle"),
+                    Some("deleted needle"),
+                    Some(""),
+                    None,
+                    Some("beta needle"),
+                    Some("other"),
+                    None,
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let index_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm)
+            .with_params(&serde_json::json!({"num_segments": 2}));
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Fm,
+                Some("text_idx".into()),
+                &index_params,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(segments(&dataset, "text_idx").await.len(), 2);
+        dataset.delete("id = 1").await.unwrap();
+        // Two more fragments, including one containing only nulls.
+        let appended = arrow_array::record_batch!(
+            ("id", Int32, [8, 9, 10, 11, 12, 13, 14, 15]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("gamma needle"),
+                    Some(""),
+                    None,
+                    Some("delta needle"),
+                    None,
+                    None,
+                    None,
+                    None
+                ]
+            )
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                Some(params(4)),
+            )
+            .await
+            .unwrap();
+        let mut options = OptimizeOptions::default();
+        options.num_indices_to_merge = Some(2);
+        options.max_rows_per_task = Some(task_rows);
+        options.max_rows_per_segment = Some(16);
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks.len(), (8 / task_rows) as usize);
+        assert_eq!(plan.merges.len(), 1);
+        assert_round_trip(&plan);
+        let indexed_files = dataset
+            .get_fragments()
+            .iter()
+            .take(2)
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>();
+        dataset.object_store.io_stats_incremental();
+        let results = execute_plan(&dataset, &plan).await;
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| {
+                    !indexed_files
+                        .iter()
+                        .any(|file| request.path.as_ref().ends_with(file))
+                }),
+            "existing text must not be rescanned"
+        );
+        commit_optimize_indices(&mut dataset, results, &options)
+            .await
+            .unwrap();
+        let committed = segments(&dataset, "text_idx").await;
+        assert_eq!(committed.len(), 1);
+        assert_eq!(coverage(&committed), RoaringBitmap::from_iter(0..4));
+        for pattern in ["needle", "deleted", "alpha", "beta", "gamma", "missing"] {
+            let filter = format!("contains(text, '{pattern}')");
+            let mut indexed = dataset.scan();
+            indexed.filter(&filter).unwrap();
+            assert!(
+                indexed
+                    .explain_plan(false)
+                    .await
+                    .unwrap()
+                    .contains("ScalarIndexQuery")
+            );
+            let actual = indexed.try_into_batch().await.unwrap();
+            let mut scan = dataset.scan();
+            scan.filter(&filter).unwrap().use_scalar_index(false);
+            let expected = scan.try_into_batch().await.unwrap();
+            assert_eq!(actual, expected, "pattern={pattern}");
+        }
+        assert!(
+            plan_optimize_indices(&dataset, &options)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+    }
+
     const DIM: usize = 64;
     const VECTOR_INDEX: &str = "vector_idx";
     const SCALAR_INDEX: &str = "id_idx";

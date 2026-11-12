@@ -2286,98 +2286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fmindex_merge_single_segment_passthrough() {
-        let test_dir = TempStrDir::default();
-
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "text",
-            arrow_schema::DataType::Utf8,
-            false,
-        )]));
-        let write_params = crate::dataset::write::WriteParams {
-            max_rows_per_file: 4,
-            ..Default::default()
-        };
-        let batches = vec![
-            arrow_array::RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(arrow_array::StringArray::from(vec![
-                    "alpha beta gamma delta",
-                    "beta gamma delta epsilon",
-                    "gamma delta epsilon zeta",
-                    "delta epsilon zeta eta",
-                    "epsilon zeta eta theta",
-                    "zeta eta theta iota",
-                    "eta theta iota kappa",
-                    "theta iota kappa lambda",
-                ]))],
-            )
-            .unwrap(),
-        ];
-        let reader =
-            arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(reader, test_dir.as_str(), Some(write_params))
-            .await
-            .unwrap();
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
-        let segment = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Fm, &params)
-            .name("text_fmindex_single".to_string())
-            .fragments(fragment_ids.clone())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        let source_uuid = segment.uuid;
-
-        // A single segment whose coverage is fully live is reused, not rebuilt.
-        let merged = dataset
-            .merge_existing_index_segments(vec![segment])
-            .await
-            .unwrap();
-        assert_eq!(
-            merged.uuid, source_uuid,
-            "single-segment merge with unchanged coverage should reuse the segment"
-        );
-        assert_eq!(
-            merged
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            fragment_ids
-        );
-
-        dataset
-            .commit_existing_index_segments("text_fmindex_single", "text", vec![merged])
-            .await
-            .unwrap();
-
-        let logical = open_named_scalar_index(
-            &dataset,
-            "text",
-            "text_fmindex_single",
-            &NoOpMetricsCollector,
-        )
-        .await
-        .unwrap();
-        assert_eq!(logical.index_type(), IndexType::Fm);
-
-        let query = lance_index::scalar::TextQuery::StringContains("delta".to_string());
-        let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
-        let row_addrs = match result {
-            SearchResult::Exact(row_addrs) => row_addrs,
-            other => panic!("expected exact result from fmindex, got {:?}", other),
-        };
-        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 4);
-    }
-
-    #[tokio::test]
-    async fn test_fmindex_merge_single_segment_rebuilds_when_coverage_shrinks() {
+    async fn test_fmindex_merge_filters_retired_fragment_addresses() {
         let test_dir = TempStrDir::default();
 
         let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -2449,14 +2358,14 @@ mod tests {
         );
         assert!(live_frags.contains(1), "fragment 1 should stay live");
 
-        // Coverage shrank, so even a single segment must be rebuilt.
+        // Filter the retired fragment without rebuilding its BWT.
         let merged = dataset
             .merge_existing_index_segments(vec![segment])
             .await
             .unwrap();
         assert_ne!(
             merged.uuid, source_uuid,
-            "shrunk coverage must trigger a rebuild"
+            "filtered partitions must be written to a new segment"
         );
         assert_eq!(
             merged

@@ -1007,14 +1007,9 @@ async fn merge_scalar_indices<'a>(
             tagged_coverage.as_ref(),
             &effective_old_frags,
             unindexed,
-            // The domain each `build_per_segment_filters` call below asks for.
-            // `legacy_domain_mismatch` above already forces a rebuild instead of
-            // reaching here for a row-id-domain segment of a migrated type
-            // under stable row ids, so every such segment that can still be
-            // merged here is address-domain (or the dataset lacks stable row
-            // ids and the two domains coincide). NGram has no such domain and
-            // always asks for row ids.
-            migrated_to_row_addrs(reference_idx),
+            // Filters and overlay rescans must use the index's persisted domain;
+            // FMIndex stores addresses even on datasets with stable row IDs.
+            reference_index.results_are_row_addresses(),
         )
         .await?
     } else {
@@ -1034,7 +1029,7 @@ async fn merge_scalar_indices<'a>(
     // rescanning the dataset
     let has_segment_merge_primitive = matches!(
         index_type,
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::Fm
     );
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
     let ngram_requires_rebuild = index_type == IndexType::NGram
@@ -1211,6 +1206,26 @@ async fn merge_scalar_indices<'a>(
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::Fm => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    crate::index::scalar::fmindex::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
                         &new_store,
                         &old_data_filters,
                         None,
@@ -4417,7 +4432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimize_fmindex_default_rebuilds_old_and_new_rows() {
+    async fn test_optimize_fmindex_default_merges_old_and_new_rows() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
@@ -4474,10 +4489,12 @@ mod tests {
                 .is_empty()
         );
 
+        let indexed_files = indexed_data_files(&dataset, "text_fmindex").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "text_fmindex", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert!(
