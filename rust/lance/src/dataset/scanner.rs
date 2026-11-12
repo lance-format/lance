@@ -566,6 +566,8 @@ pub struct Scanner {
     ordering: Option<Vec<ColumnOrdering>>,
 
     nearest: Option<Query>,
+    /// When set, score coarse candidates in this separate vector space.
+    nearest_refine: Option<vector::VectorRefinement>,
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,

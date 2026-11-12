@@ -54,6 +54,7 @@
 //! When used in the block compression path, the encoded output is a single buffer:
 //! `[8-byte header: values buffer size][values buffer][run_lengths buffer]`.
 
+use arrow_array::{Array, cast::AsArray, types::UInt64Type};
 use arrow_buffer::{ArrowNativeType, ScalarBuffer};
 use log::trace;
 
@@ -70,6 +71,7 @@ use crate::encodings::logical::primitive::miniblock::{
 use crate::encodings::physical::block::{CompressionConfig, GeneralBufferCompressor};
 use crate::format::EncodingUtils;
 use crate::format::metadata::CompressiveEncoding;
+use crate::statistics::Stat;
 
 use lance_core::{Error, Result};
 
@@ -115,14 +117,6 @@ impl RunLengthWidth {
             Self::U8 => u8::MAX as u64,
             Self::U16 => u16::MAX as u64,
             Self::U32 => u32::MAX as u64,
-        }
-    }
-
-    fn write_length(self, length: u64, dst: &mut Vec<u8>) {
-        match self {
-            Self::U8 => dst.push(length as u8),
-            Self::U16 => dst.extend_from_slice(&(length as u16).to_le_bytes()),
-            Self::U32 => dst.extend_from_slice(&(length as u32).to_le_bytes()),
         }
     }
 
@@ -216,7 +210,17 @@ pub(crate) fn select_miniblock_run_length_width(
     ) -> ([u64; 3], [u64; 3]) {
         let mut full = [0; 3];
         let mut composite = [0; 3];
+        let fast_limit = full_limit.min(composite_limit).max(1).min(u8::MAX as u64);
         let mut add_run = |length| {
+            if length <= fast_limit {
+                full[0] += 1;
+                full[1] += 1;
+                full[2] += 1;
+                composite[0] += 1;
+                composite[1] += 1;
+                composite[2] += 1;
+                return;
+            }
             let mut entries = [0; 3];
             accumulate_run_length_entries(length, Some(full_limit), &mut entries);
             for (total, count) in full.iter_mut().zip(entries) {
@@ -394,6 +398,14 @@ pub(crate) fn accumulate_run_length_entries(
     max_segment_values: Option<u64>,
     entries: &mut [u64; 3],
 ) {
+    if run_length <= u8::MAX as u64
+        && max_segment_values.is_none_or(|limit| run_length <= limit.max(1))
+    {
+        entries[0] = entries[0].saturating_add(1);
+        entries[1] = entries[1].saturating_add(1);
+        entries[2] = entries[2].saturating_add(1);
+        return;
+    }
     let max_segment_values = max_segment_values.unwrap_or(run_length).max(1);
     let mut remaining = run_length;
     while remaining > 0 {
@@ -403,6 +415,51 @@ pub(crate) fn accumulate_run_length_entries(
             entries[idx] = entries[idx].saturating_add(entry_count);
         }
         remaining -= segment;
+    }
+}
+
+trait RunLengthSpec: Copy {
+    const BYTES: usize;
+    const MAX_RUN_LENGTH: u64;
+    fn write_length(length: u64, dst: &mut Vec<u8>);
+}
+
+#[derive(Clone, Copy)]
+struct WidthU8;
+
+impl RunLengthSpec for WidthU8 {
+    const BYTES: usize = 1;
+    const MAX_RUN_LENGTH: u64 = u8::MAX as u64;
+
+    #[inline(always)]
+    fn write_length(length: u64, dst: &mut Vec<u8>) {
+        dst.push(length as u8);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WidthU16;
+
+impl RunLengthSpec for WidthU16 {
+    const BYTES: usize = 2;
+    const MAX_RUN_LENGTH: u64 = u16::MAX as u64;
+
+    #[inline(always)]
+    fn write_length(length: u64, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&(length as u16).to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WidthU32;
+
+impl RunLengthSpec for WidthU32 {
+    const BYTES: usize = 4;
+    const MAX_RUN_LENGTH: u64 = u32::MAX as u64;
+
+    #[inline(always)]
+    fn write_length(length: u64, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&(length as u32).to_le_bytes());
     }
 }
 
@@ -478,6 +535,16 @@ impl RleEncoder {
         num_values: u64,
         bits_per_value: u64,
     ) -> Result<(Vec<LanceBuffer>, Vec<MiniBlockChunk>)> {
+        self.encode_data_with_hint(data, num_values, bits_per_value, None)
+    }
+
+    fn encode_data_with_hint(
+        &self,
+        data: &LanceBuffer,
+        num_values: u64,
+        bits_per_value: u64,
+        run_count_hint: Option<usize>,
+    ) -> Result<(Vec<LanceBuffer>, Vec<MiniBlockChunk>)> {
         if num_values == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -487,15 +554,80 @@ impl RleEncoder {
                 format!("RLE num_values does not fit in usize: {num_values}").into(),
             )
         })?;
-        let bytes_per_value = (bits_per_value / 8) as usize;
-        let bytes_per_length = self.run_length_width.bytes_per_value();
 
-        // Pre-allocate global buffers with estimated capacity
-        // Assume average compression ratio of ~10:1 (10 values per run)
-        let estimated_runs = num_values / 10;
+        match bits_per_value {
+            8 => self.encode_data_typed::<u8>(data, num_values, bits_per_value, run_count_hint),
+            16 => self.encode_data_typed::<u16>(data, num_values, bits_per_value, run_count_hint),
+            32 => self.encode_data_typed::<u32>(data, num_values, bits_per_value, run_count_hint),
+            64 => self.encode_data_typed::<u64>(data, num_values, bits_per_value, run_count_hint),
+            _ => Err(Error::invalid_input_source(
+                format!(
+                    "RLE encoding bits_per_value must be 8, 16, 32, or 64, got {bits_per_value}"
+                )
+                .into(),
+            )),
+        }
+    }
+
+    fn encode_data_typed<T>(
+        &self,
+        data: &LanceBuffer,
+        num_values: usize,
+        bits_per_value: u64,
+        run_count_hint: Option<usize>,
+    ) -> Result<(Vec<LanceBuffer>, Vec<MiniBlockChunk>)>
+    where
+        T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug + ArrowNativeType,
+    {
+        match self.run_length_width {
+            RunLengthWidth::U8 => self.encode_data_typed_spec::<T, WidthU8>(
+                data,
+                num_values,
+                bits_per_value,
+                run_count_hint,
+            ),
+            RunLengthWidth::U16 => self.encode_data_typed_spec::<T, WidthU16>(
+                data,
+                num_values,
+                bits_per_value,
+                run_count_hint,
+            ),
+            RunLengthWidth::U32 => self.encode_data_typed_spec::<T, WidthU32>(
+                data,
+                num_values,
+                bits_per_value,
+                run_count_hint,
+            ),
+        }
+    }
+
+    fn encode_data_typed_spec<T, W>(
+        &self,
+        data: &LanceBuffer,
+        num_values: usize,
+        bits_per_value: u64,
+        run_count_hint: Option<usize>,
+    ) -> Result<(Vec<LanceBuffer>, Vec<MiniBlockChunk>)>
+    where
+        T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug + ArrowNativeType,
+        W: RunLengthSpec,
+    {
+        let bytes_per_value = std::mem::size_of::<T>();
+
+        let estimated_runs = run_count_hint
+            .map(|runs| runs.saturating_add(num_values / 256 + 16))
+            .unwrap_or(num_values / 10);
         let mut all_values = Vec::with_capacity(estimated_runs * bytes_per_value);
-        let mut all_lengths = Vec::with_capacity(estimated_runs * bytes_per_length);
-        let mut chunks = Vec::new();
+        let mut all_lengths = Vec::with_capacity(estimated_runs * W::BYTES);
+        let mut chunks = Vec::with_capacity(num_values.div_ceil(self.max_miniblock_values.max(1)));
+
+        let typed_view = if data.len().is_multiple_of(bytes_per_value) {
+            data.borrow_to_typed_view::<T>()
+        } else {
+            let aligned_len = data.len() - (data.len() % bytes_per_value);
+            std::borrow::Cow::Owned(bytemuck::pod_collect_to_vec(&data[..aligned_len]))
+        };
+        let typed_all: &[T] = typed_view.as_ref();
 
         let mut offset = 0usize;
         let mut values_remaining = num_values;
@@ -504,44 +636,13 @@ impl RleEncoder {
             let values_start = all_values.len();
             let lengths_start = all_lengths.len();
 
-            let (_num_runs, values_processed, is_last_chunk) = match bits_per_value {
-                8 => self.encode_chunk_rolling::<u8>(
-                    data,
-                    offset,
+            let (_num_runs, values_processed, is_last_chunk) = self
+                .encode_chunk_rolling_slice::<T, W>(
+                    typed_all.get(offset..).unwrap_or(&[]),
                     values_remaining,
                     &mut all_values,
                     &mut all_lengths,
-                ),
-                16 => self.encode_chunk_rolling::<u16>(
-                    data,
-                    offset,
-                    values_remaining,
-                    &mut all_values,
-                    &mut all_lengths,
-                ),
-                32 => self.encode_chunk_rolling::<u32>(
-                    data,
-                    offset,
-                    values_remaining,
-                    &mut all_values,
-                    &mut all_lengths,
-                ),
-                64 => self.encode_chunk_rolling::<u64>(
-                    data,
-                    offset,
-                    values_remaining,
-                    &mut all_values,
-                    &mut all_lengths,
-                ),
-                _ => {
-                    return Err(Error::invalid_input_source(
-                        format!(
-                            "RLE encoding bits_per_value must be 8, 16, 32, or 64, got {bits_per_value}"
-                        )
-                        .into(),
-                    ));
-                }
-            };
+                );
 
             if values_processed == 0 {
                 // A non-final chunk needs at least two values because log_num_values == 0
@@ -568,12 +669,10 @@ impl RleEncoder {
             let values_size = all_values.len() - values_start;
             let lengths_size = all_lengths.len() - lengths_start;
 
-            let chunk = MiniBlockChunk {
+            chunks.push(MiniBlockChunk {
                 buffer_sizes: vec![values_size as u32, lengths_size as u32],
                 log_num_values,
-            };
-
-            chunks.push(chunk);
+            });
 
             offset += values_processed;
             values_remaining -= values_processed;
@@ -650,116 +749,177 @@ impl RleEncoder {
         let mut all_values = Vec::with_capacity(estimated_runs * type_size);
         let mut all_lengths =
             Vec::with_capacity(estimated_runs * self.run_length_width.bytes_per_value());
-        self.encode_values(values, &mut all_values, &mut all_lengths);
+        match self.run_length_width {
+            RunLengthWidth::U8 => {
+                Self::encode_values_spec::<T, WidthU8>(values, &mut all_values, &mut all_lengths)
+            }
+            RunLengthWidth::U16 => {
+                Self::encode_values_spec::<T, WidthU16>(values, &mut all_values, &mut all_lengths)
+            }
+            RunLengthWidth::U32 => {
+                Self::encode_values_spec::<T, WidthU32>(values, &mut all_values, &mut all_lengths)
+            }
+        }
         Ok(vec![
             LanceBuffer::from(all_values),
             LanceBuffer::from(all_lengths),
         ])
     }
 
-    /// Encodes the largest valid mini-block prefix from `offset`.
-    fn encode_chunk_rolling<T>(
+    /// Encodes the largest valid mini-block prefix in a single division-free pass.
+    ///
+    /// Because RLE byte size is monotonically non-decreasing with prefix length, we
+    /// walk power-of-two segments (`1..2`, `2..4`, `4..8`, ...), track active run
+    /// bytes incrementally without per-element division or checkpoint checks, and
+    /// roll back to the latest power-of-two checkpoint if `MAX_MINIBLOCK_BYTES` is
+    /// exceeded.
+    fn encode_chunk_rolling_slice<T, W>(
         &self,
-        data: &LanceBuffer,
-        offset: usize,
+        available: &[T],
         values_remaining: usize,
         all_values: &mut Vec<u8>,
         all_lengths: &mut Vec<u8>,
     ) -> (usize, usize, bool)
     where
         T: bytemuck::Pod + PartialEq + Copy + std::fmt::Debug + ArrowNativeType,
+        W: RunLengthSpec,
     {
         let type_size = std::mem::size_of::<T>();
-        let chunk_start = offset * type_size;
+        let entry_bytes = type_size + W::BYTES;
         let max_by_count = self.max_miniblock_values;
-        let max_values = values_remaining.min(max_by_count);
-        let chunk_end = chunk_start + max_values * type_size;
-
-        if chunk_start >= data.len() {
+        let max_values = values_remaining.min(max_by_count).min(available.len());
+        if max_values == 0 {
             return (0, 0, false);
         }
 
-        let chunk_len = chunk_end.min(data.len()) - chunk_start;
-        let chunk_buffer = data.slice_with_length(chunk_start, chunk_len);
-        let typed_data_ref = chunk_buffer.borrow_to_typed_slice::<T>();
-        let typed_data: &[T] = typed_data_ref.as_ref();
-        let max_values = max_values.min(typed_data.len());
-
-        if typed_data.is_empty() {
-            return (0, 0, false);
-        }
-
-        let values_start = all_values.len();
         let all_remaining_values_fit = values_remaining <= max_by_count;
-        // Size the whole remainder only when it could become the last chunk
-        let (values_to_encode, is_last_chunk) = if all_remaining_values_fit
-            && self.encoded_size(&typed_data[..max_values]) <= MAX_MINIBLOCK_BYTES as usize
-        {
-            (max_values, true)
-        } else if let Some(values_to_encode) = self.largest_power_of_two_prefix::<T>(typed_data) {
-            (values_to_encode, false)
+        let scan_limit = if all_remaining_values_fit {
+            max_values
+        } else if max_values >= 2 {
+            1usize << max_values.ilog2()
         } else {
             return (0, 0, false);
         };
 
-        self.encode_values(&typed_data[..values_to_encode], all_values, all_lengths);
+        let slice = &available[..scan_limit];
+        let values_start = all_values.len();
+        let lengths_start = all_lengths.len();
 
-        let num_runs = (all_values.len() - values_start) / type_size;
-        (num_runs, values_to_encode, is_last_chunk)
-    }
-
-    fn largest_power_of_two_prefix<T>(&self, values: &[T]) -> Option<usize>
-    where
-        T: bytemuck::Pod + PartialEq + Copy,
-    {
-        let max_prefix = values.len().min(self.max_miniblock_values);
-        let mut prefix = 1usize << max_prefix.ilog2();
-        while prefix > 1 {
-            if self.encoded_size(&values[..prefix]) <= MAX_MINIBLOCK_BYTES as usize {
-                return Some(prefix);
-            }
-            prefix >>= 1;
-        }
-        None
-    }
-
-    fn encoded_size<T>(&self, values: &[T]) -> usize
-    where
-        T: bytemuck::Pod + PartialEq + Copy,
-    {
-        if values.is_empty() {
-            return 0;
+        if entry_bytes > MAX_MINIBLOCK_BYTES as usize {
+            return (0, 0, false);
         }
 
-        let mut current_value = values[0];
+        let mut current_value = slice[0];
         let mut current_length = 1u64;
-        let mut encoded_size = 0usize;
+        let mut current_run_bytes = entry_bytes;
+        let mut next_split_len = W::MAX_RUN_LENGTH;
+        let mut committed_bytes = 0usize;
+        let mut best_pow2: Option<(usize, usize, usize, T, u64)> = None;
+        let mut all_fit = true;
 
-        for &value in values.iter().skip(1) {
-            if value == current_value {
-                current_length += 1;
-            } else {
-                encoded_size += self.run_size::<T>(current_length);
-                current_value = value;
-                current_length = 1;
+        let mut seg_start = 1usize;
+        let mut seg_end = 2usize;
+        'segments: while seg_end <= scan_limit {
+            for &val in &slice[seg_start..seg_end] {
+                if val == current_value {
+                    current_length += 1;
+                    if current_length > next_split_len {
+                        current_run_bytes += entry_bytes;
+                        next_split_len += W::MAX_RUN_LENGTH;
+                        if committed_bytes + current_run_bytes > MAX_MINIBLOCK_BYTES as usize {
+                            all_fit = false;
+                            break 'segments;
+                        }
+                    }
+                } else {
+                    if committed_bytes + current_run_bytes + entry_bytes
+                        > MAX_MINIBLOCK_BYTES as usize
+                    {
+                        all_fit = false;
+                        break 'segments;
+                    }
+                    committed_bytes += Self::add_run_spec::<T, W>(
+                        &current_value,
+                        current_length,
+                        all_values,
+                        all_lengths,
+                    );
+                    current_value = val;
+                    current_length = 1;
+                    current_run_bytes = entry_bytes;
+                    next_split_len = W::MAX_RUN_LENGTH;
+                }
+            }
+            best_pow2 = Some((
+                seg_end,
+                all_values.len(),
+                all_lengths.len(),
+                current_value,
+                current_length,
+            ));
+            seg_start = seg_end;
+            let Some(next_end) = seg_end.checked_mul(2) else {
+                break;
+            };
+            seg_end = next_end;
+        }
+
+        if all_fit && seg_start < scan_limit {
+            for &val in &slice[seg_start..scan_limit] {
+                if val == current_value {
+                    current_length += 1;
+                    if current_length > next_split_len {
+                        current_run_bytes += entry_bytes;
+                        next_split_len += W::MAX_RUN_LENGTH;
+                        if committed_bytes + current_run_bytes > MAX_MINIBLOCK_BYTES as usize {
+                            all_fit = false;
+                            break;
+                        }
+                    }
+                } else {
+                    if committed_bytes + current_run_bytes + entry_bytes
+                        > MAX_MINIBLOCK_BYTES as usize
+                    {
+                        all_fit = false;
+                        break;
+                    }
+                    committed_bytes += Self::add_run_spec::<T, W>(
+                        &current_value,
+                        current_length,
+                        all_values,
+                        all_lengths,
+                    );
+                    current_value = val;
+                    current_length = 1;
+                    current_run_bytes = entry_bytes;
+                    next_split_len = W::MAX_RUN_LENGTH;
+                }
             }
         }
-        encoded_size += self.run_size::<T>(current_length);
-        encoded_size
+
+        if all_fit && all_remaining_values_fit {
+            Self::add_run_spec::<T, W>(&current_value, current_length, all_values, all_lengths);
+            let num_runs = (all_values.len() - values_start) / type_size;
+            return (num_runs, scan_limit, true);
+        }
+
+        if let Some((prefix, vals_len, lens_len, tail_val, tail_len)) = best_pow2 {
+            all_values.truncate(vals_len);
+            all_lengths.truncate(lens_len);
+            Self::add_run_spec::<T, W>(&tail_val, tail_len, all_values, all_lengths);
+            let num_runs = (all_values.len() - values_start) / type_size;
+            (num_runs, prefix, false)
+        } else {
+            all_values.truncate(values_start);
+            all_lengths.truncate(lengths_start);
+            (0, 0, false)
+        }
     }
 
-    fn run_size<T>(&self, length: u64) -> usize
-    where
-        T: bytemuck::Pod,
-    {
-        let type_size = std::mem::size_of::<T>();
-        let run_chunks = length.div_ceil(self.run_length_width.max_run_length()) as usize;
-        run_chunks * (type_size + self.run_length_width.bytes_per_value())
-    }
-
-    fn encode_values<T>(&self, values: &[T], all_values: &mut Vec<u8>, all_lengths: &mut Vec<u8>)
+    fn encode_values_spec<T, W>(values: &[T], all_values: &mut Vec<u8>, all_lengths: &mut Vec<u8>)
     where
         T: bytemuck::Pod + PartialEq + Copy,
+        W: RunLengthSpec,
     {
         if values.is_empty() {
             return;
@@ -768,20 +928,20 @@ impl RleEncoder {
         let mut current_value = values[0];
         let mut current_length = 1u64;
 
-        for &value in values.iter().skip(1) {
+        for &value in &values[1..] {
             if value == current_value {
                 current_length += 1;
             } else {
-                self.add_run(&current_value, current_length, all_values, all_lengths);
+                Self::add_run_spec::<T, W>(&current_value, current_length, all_values, all_lengths);
                 current_value = value;
                 current_length = 1;
             }
         }
-        self.add_run(&current_value, current_length, all_values, all_lengths);
+        Self::add_run_spec::<T, W>(&current_value, current_length, all_values, all_lengths);
     }
 
-    fn add_run<T>(
-        &self,
+    #[inline(always)]
+    fn add_run_spec<T, W>(
         value: &T,
         length: u64,
         all_values: &mut Vec<u8>,
@@ -789,29 +949,34 @@ impl RleEncoder {
     ) -> usize
     where
         T: bytemuck::Pod,
+        W: RunLengthSpec,
     {
         let value_bytes = bytemuck::bytes_of(value);
         let type_size = std::mem::size_of::<T>();
-        let max_run_length = self.run_length_width.max_run_length();
-        let num_full_chunks = (length / max_run_length) as usize;
-        let remainder = length % max_run_length;
+        let entry_bytes = type_size + W::BYTES;
+        if length <= W::MAX_RUN_LENGTH {
+            all_values.extend_from_slice(value_bytes);
+            W::write_length(length, all_lengths);
+            return entry_bytes;
+        }
 
-        let total_chunks = num_full_chunks + if remainder > 0 { 1 } else { 0 };
+        let num_full_chunks = (length / W::MAX_RUN_LENGTH) as usize;
+        let remainder = length % W::MAX_RUN_LENGTH;
+        let total_chunks = num_full_chunks + usize::from(remainder > 0);
         all_values.reserve(total_chunks * type_size);
-        all_lengths.reserve(total_chunks * self.run_length_width.bytes_per_value());
+        all_lengths.reserve(total_chunks * W::BYTES);
 
         for _ in 0..num_full_chunks {
             all_values.extend_from_slice(value_bytes);
-            self.run_length_width
-                .write_length(max_run_length, all_lengths);
+            W::write_length(W::MAX_RUN_LENGTH, all_lengths);
         }
 
         if remainder > 0 {
             all_values.extend_from_slice(value_bytes);
-            self.run_length_width.write_length(remainder, all_lengths);
+            W::write_length(remainder, all_lengths);
         }
 
-        total_chunks * (type_size + self.run_length_width.bytes_per_value())
+        total_chunks * entry_bytes
     }
 
     fn flat_child_candidate(
@@ -1171,10 +1336,28 @@ impl MiniBlockCompressor for RleEncoder {
             DataBlock::FixedWidth(fixed_width) => {
                 let num_values = fixed_width.num_values;
                 let bits_per_value = fixed_width.bits_per_value;
+                let run_count_hint = fixed_width
+                    .block_info
+                    .0
+                    .read()
+                    .unwrap()
+                    .get(&Stat::RunCount)
+                    .and_then(|arr| {
+                        arr.as_primitive_opt::<UInt64Type>()
+                            .filter(|p| p.len() == 1)
+                            .map(|p| p.value(0) as usize)
+                    });
 
-                let (all_buffers, chunks) =
-                    self.encode_data(&fixed_width.data, num_values, bits_per_value)?;
-                if all_buffers.is_empty() {
+                let (all_buffers, chunks) = self.encode_data_with_hint(
+                    &fixed_width.data,
+                    num_values,
+                    bits_per_value,
+                    run_count_hint,
+                )?;
+                let has_child_candidates = self.values_compression.is_some()
+                    || self.run_lengths_compression.is_some()
+                    || (cfg!(feature = "bitpacking") && self.use_child_bitpacking);
+                if all_buffers.is_empty() || !has_child_candidates {
                     let compressed = MiniBlockCompressed {
                         data: all_buffers,
                         chunks,
@@ -1659,7 +1842,7 @@ impl RleDecompressor {
 
         if values_buffer.is_empty() || lengths_buffer.is_empty() {
             if num_values == 0 {
-                return Ok(LanceBuffer::empty());
+                return Ok(LanceBuffer::reinterpret_vec(Vec::<T>::new()));
             } else {
                 return Err(Error::invalid_input_source(
                     format!("Empty buffers but expected {} values", num_values).into(),
@@ -1753,13 +1936,203 @@ impl RleDecompressor {
     }
 }
 
+impl RleDecompressor {
+    fn decode_data_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "rle",
+                format!(
+                    "RLE mini-block selection {:?} exceeds {} values in chunk",
+                    range, num_values
+                ),
+            ));
+        }
+        if num_values == 0 {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: self.bits_per_value,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+                block_info: BlockInfo::default(),
+            }));
+        }
+        if data.len() != 2 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE decompressor expects exactly 2 buffers, got {}",
+                    data.len()
+                )
+                .into(),
+            ));
+        }
+
+        let mut data_iter = data.into_iter();
+        let values_buffer = data_iter.next().unwrap();
+        let lengths_buffer = data_iter.next().unwrap();
+        let (values_buffer, lengths_buffer) =
+            self.decode_child_buffers(values_buffer, lengths_buffer)?;
+
+        let decoded_data = match self.bits_per_value {
+            8 => self.decode_generic_range::<u8>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            16 => self.decode_generic_range::<u16>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            32 => self.decode_generic_range::<u32>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            64 => self.decode_generic_range::<u64>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding bits_per_value must be 8, 16, 32, or 64, got {}",
+                        self.bits_per_value
+                    )
+                    .into(),
+                ));
+            }
+        };
+
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bits_per_value,
+            data: decoded_data,
+            num_values: range.end - range.start,
+            block_info: BlockInfo::default(),
+        }))
+    }
+
+    fn decode_generic_range<T>(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<LanceBuffer>
+    where
+        T: bytemuck::Pod + Copy + std::fmt::Debug + ArrowNativeType,
+    {
+        let type_size = std::mem::size_of::<T>();
+
+        if values_buffer.is_empty() || lengths_buffer.is_empty() {
+            if num_values == 0 {
+                return Ok(LanceBuffer::reinterpret_vec(Vec::<T>::new()));
+            }
+            return Err(Error::invalid_input_source(
+                format!("Empty buffers but expected {} values", num_values).into(),
+            ));
+        }
+
+        let length_size = self.validate_buffer_sizes(
+            values_buffer,
+            lengths_buffer,
+            type_size,
+            std::any::type_name::<T>(),
+        )?;
+
+        let values_ref = values_buffer.borrow_to_typed_slice::<T>();
+        let values: &[T] = values_ref.as_ref();
+        let lengths = lengths_buffer.as_ref();
+
+        let expected_value_count = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE num_values does not fit in usize: {num_values}").into(),
+            )
+        })?;
+        let sel_start = range.start as usize;
+        let sel_end = range.end as usize;
+        let selected_count = sel_end - sel_start;
+
+        let mut decoded: Vec<T> = Vec::new();
+        decoded.try_reserve_exact(selected_count).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE decoding cannot allocate {selected_count} values").into(),
+            )
+        })?;
+
+        let mut logical_pos = 0usize;
+        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
+            let length = self.run_length_width.read_length(length_bytes);
+            if length == 0 {
+                return Err(Error::invalid_input_source(
+                    "RLE decoding encountered a zero run length".into(),
+                ));
+            }
+            let length = usize::try_from(length).map_err(|_| {
+                Error::invalid_input_source(
+                    format!("RLE run length does not fit in usize: {length}").into(),
+                )
+            })?;
+            let remaining = expected_value_count - logical_pos;
+            let count = length.min(remaining);
+            let run_start = logical_pos;
+            let run_end = logical_pos + count;
+            if run_end > sel_start && run_start < sel_end {
+                let copy_count = run_end.min(sel_end) - run_start.max(sel_start);
+                let initialized = decoded.len() + copy_count;
+                decoded.spare_capacity_mut()[..copy_count].fill(std::mem::MaybeUninit::new(*value));
+                // SAFETY: capacity was reserved for selected_count above, copy_count is bounded
+                // by the remaining intersection with [sel_start, sel_end), and every slot was filled.
+                unsafe { decoded.set_len(initialized) };
+            }
+            logical_pos = run_end;
+            if length > remaining {
+                break;
+            }
+        }
+
+        if logical_pos != expected_value_count {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE decoding produced {} values, expected {}",
+                    logical_pos, expected_value_count
+                )
+                .into(),
+            ));
+        }
+
+        Ok(LanceBuffer::reinterpret_vec(decoded))
+    }
+}
+
 impl MiniBlockDecompressor for RleDecompressor {
     fn num_buffers(&self) -> usize {
         2
     }
 
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
+    }
+
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        self.decode_data_range(data, num_values, range)
     }
 
     fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
@@ -3983,5 +4356,55 @@ mod tests {
             }
             _ => panic!("Expected FixedWidth block"),
         }
+    }
+
+    #[test]
+    fn test_rolling_chunk_straddling_power_of_two_boundary() {
+        // Each unique u64 value run of length 1 costs 9 bytes (8B value + 1B length).
+        // MAX_MINIBLOCK_BYTES = 8186 fits at most 909 single-value runs (< 1024),
+        // so 2000 values with mostly length-1 runs plus a run straddling 512 must
+        // truncate cleanly at prefix = 512 and split the straddling run across chunks.
+        let mut data: Vec<u64> = (0..2000).map(|i| i as u64 * 17).collect();
+        for slot in &mut data[508..518] {
+            *slot = 0xDEAD_BEEF_CAFE_BABE;
+        }
+
+        let encoder = RleEncoder::new();
+        let buf = LanceBuffer::reinterpret_vec(data.clone());
+        let (buffers, chunks) = encoder.encode_data(&buf, data.len() as u64, 64).unwrap();
+        assert_eq!(chunks[0].log_num_values, 9); // 2^9 = 512
+
+        // Reconstruct and verify every chunk decodes to the exact input slice.
+        let decompressor = RleDecompressor::new(64);
+        let mut val_off = 0usize;
+        let mut len_off = 0usize;
+        let mut out = Vec::with_capacity(data.len());
+        let mut remaining = data.len();
+        for chunk in &chunks {
+            let chunk_rows = if chunk.log_num_values == 0 {
+                remaining
+            } else {
+                1usize << chunk.log_num_values
+            };
+            let v_sz = chunk.buffer_sizes[0] as usize;
+            let l_sz = chunk.buffer_sizes[1] as usize;
+            let decoded = MiniBlockDecompressor::decompress(
+                &decompressor,
+                vec![
+                    buffers[0].slice_with_length(val_off, v_sz),
+                    buffers[1].slice_with_length(len_off, l_sz),
+                ],
+                chunk_rows as u64,
+            )
+            .unwrap();
+            let DataBlock::FixedWidth(fw) = decoded else {
+                panic!("Expected FixedWidth")
+            };
+            out.extend_from_slice(bytemuck::cast_slice::<u8, u64>(fw.data.as_ref()));
+            val_off += v_sz;
+            len_off += l_sz;
+            remaining -= chunk_rows;
+        }
+        assert_eq!(out, data);
     }
 }

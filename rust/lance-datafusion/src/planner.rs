@@ -31,8 +31,8 @@ use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, ExprSchemable, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
+    ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
@@ -338,6 +338,16 @@ impl Planner {
         Self {
             schema,
             context_provider: LanceContextProvider::default(),
+            enable_relations: false,
+        }
+    }
+
+    /// Like [`Self::new`], but resolves functions against `session` instead of
+    /// Lance's default session, so functions registered on it can be planned.
+    pub fn new_with_session(schema: SchemaRef, session: SessionContext) -> Self {
+        Self {
+            schema,
+            context_provider: LanceContextProvider::new(session),
             enable_relations: false,
         }
     }
@@ -1159,7 +1169,8 @@ impl Planner {
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
-        let ast_expr = parse_sql_filter(filter)?;
+        let mut ast_expr = parse_sql_filter(filter)?;
+        self.rewrite_filter_lambdas(&mut ast_expr)?;
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema).map_err(|e| {
@@ -1167,6 +1178,16 @@ impl Planner {
         })?;
 
         Ok(coerce_filter_type_to_boolean(resolved))
+    }
+
+    /// Rewrite each `array_any_match(list, x -> predicate)` in a parsed filter
+    /// to `any_element(list, 'predicate')`, and reject any other lambda.
+    pub(crate) fn rewrite_filter_lambdas(&self, filter: &mut SQLExpr) -> Result<()> {
+        crate::udf::rewrite_element_lambdas(filter, |list| {
+            let expr = self.parse_sql_expr(list)?;
+            let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+            Ok(expr.get_type(&schema)?)
+        })
     }
 
     /// Create Logical [Expr] from a SQL expression.
@@ -2749,6 +2770,30 @@ mod tests {
                 .udf_names()
                 .contains(&"registered_later".to_string())
         );
+    }
+
+    #[test]
+    fn test_planner_with_session_plans_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "echo",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        let batch = arrow_array::record_batch!(("s", Utf8, ["a", "b"])).unwrap();
+
+        let err = Planner::new(batch.schema())
+            .parse_expr("echo(s)")
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid function 'echo'"), "{err}");
+
+        let planner = Planner::new_with_session(batch.schema(), session);
+        let expr = planner.parse_expr("echo(s)").unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        assert_eq!(result.as_ref(), batch.column(0).as_ref());
     }
 
     #[test]

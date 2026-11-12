@@ -55,6 +55,7 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceBytes;
   private List<Long> excludedFragmentIds;
   private Optional<DataStorageVersion> dataStorageVersion;
+  private Optional<SourceBudgetMode> sourceBudgetMode;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -72,7 +73,8 @@ public class CompactionOptions implements Serializable {
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
       List<Long> excludedFragmentIds,
-      Optional<String> dataStorageVersion) {
+      Optional<String> dataStorageVersion,
+      Optional<SourceBudgetMode> sourceBudgetMode) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -89,6 +91,7 @@ public class CompactionOptions implements Serializable {
     this.maxSourceBytes = maxSourceBytes;
     this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
     this.dataStorageVersion = dataStorageVersion.map(DataStorageVersion::fromRustString);
+    this.sourceBudgetMode = sourceBudgetMode;
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -118,6 +121,11 @@ public class CompactionOptions implements Serializable {
 
   public List<Long> getExcludedFragmentIds() {
     return excludedFragmentIds;
+  }
+
+  /** Returns the source budget mode as its string value for the native layer. */
+  public Optional<String> getSourceBudgetMode() {
+    return sourceBudgetMode.map(SourceBudgetMode::getValue);
   }
 
   /** Returns the version selector as its string value for the native layer. */
@@ -181,6 +189,7 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
         .add("excludedFragmentIds", excludedFragmentIds)
         .add("dataStorageVersion", dataStorageVersion.orElse(null))
+        .add("sourceBudgetMode", sourceBudgetMode.orElse(null))
         .toString();
   }
 
@@ -201,6 +210,7 @@ public class CompactionOptions implements Serializable {
     output.writeObject(excludedFragmentIds);
     output.writeObject(getDataStorageVersion().orElse(null));
     output.writeObject(minBytesPerFile.orElse(null));
+    output.writeObject(sourceBudgetMode.map(SourceBudgetMode::getValue).orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -229,6 +239,7 @@ public class CompactionOptions implements Serializable {
     this.excludedFragmentIds = readTrailingLongList(input);
     this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
     this.minBytesPerFile = readTrailingLong(input);
+    this.sourceBudgetMode = readTrailingSourceBudgetMode(input);
   }
 
   /**
@@ -274,6 +285,20 @@ public class CompactionOptions implements Serializable {
     }
   }
 
+  private static Optional<SourceBudgetMode> readTrailingSourceBudgetMode(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    Optional<String> value = readTrailingString(input);
+    if (value.isEmpty()) {
+      return Optional.empty();
+    }
+    for (SourceBudgetMode mode : SourceBudgetMode.values()) {
+      if (mode.getValue().equals(value.get())) {
+        return Optional.of(mode);
+      }
+    }
+    return Optional.empty();
+  }
+
   /** Builder for CompactionOptions. */
   public static class Builder {
     private Optional<Long> targetRowsPerFragment = Optional.empty();
@@ -292,6 +317,7 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceBytes = Optional.empty();
     private List<Long> excludedFragmentIds = Collections.emptyList();
     private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
+    private Optional<SourceBudgetMode> sourceBudgetMode = Optional.empty();
 
     private Builder() {}
 
@@ -413,6 +439,20 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Sets how planning applies all configured max-source budgets to cumulative totals across the
+     * tasks selected for one plan. {@link SourceBudgetMode#HARD} rejects a task when adding it
+     * would exceed a cumulative budget. {@link SourceBudgetMode#SOFT} always admits the first task;
+     * if it exceeds a budget the plan stops there, otherwise later tasks use the same cumulative
+     * checks as hard mode. If a byte budget is configured but the first task has a source file
+     * without a recorded size, soft mode admits that task and stops; hard mode reports an error.
+     */
+    public Builder withSourceBudgetMode(SourceBudgetMode sourceBudgetMode) {
+      this.sourceBudgetMode =
+          Optional.of(Objects.requireNonNull(sourceBudgetMode, "sourceBudgetMode"));
+      return this;
+    }
+
+    /**
      * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
      * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
      * and unknown IDs are ignored.
@@ -462,7 +502,8 @@ public class CompactionOptions implements Serializable {
           maxSourceRows,
           maxSourceBytes,
           excludedFragmentIds,
-          dataStorageVersion.map(DataStorageVersion::toRustString));
+          dataStorageVersion.map(DataStorageVersion::toRustString),
+          sourceBudgetMode);
     }
   }
 }
