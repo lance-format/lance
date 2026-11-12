@@ -14,6 +14,7 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::dataset::RetentionLease;
 use crate::{Error, Result};
 
 /// Statistics for one physical index segment, collected at a dataset read version.
@@ -528,6 +529,37 @@ pub trait DatasetIndexExt {
         index_name: &str,
         column: &str,
         segments: Vec<impl IntoIndexSegment + Send>,
+    ) -> Result<()>;
+
+    /// Commit staged segments as [`Self::commit_existing_index_segments`]
+    /// does, publishing the result of `lease` (see
+    /// [`Dataset::acquire_retention_lease`](crate::Dataset::acquire_retention_lease)).
+    ///
+    /// The segments must have been built on the leased version. They are
+    /// validated against it and rebased over every commit since, such as
+    /// compactions the lease let run during the build, and the commit releases
+    /// the lease. Fails if any segment's files are missing.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::RetentionLease, index::{DatasetIndexExt, IndexSegment}};
+    /// # async fn commit(
+    /// #     dataset: &mut Dataset,
+    /// #     lease: &RetentionLease,
+    /// #     segments: Vec<IndexSegment>,
+    /// # ) -> Result<()> {
+    /// // Workers built `segments` on `dataset.checkout_lease(lease)`.
+    /// dataset
+    ///     .commit_existing_index_segments_for_lease("value_idx", "value", segments, lease)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn commit_existing_index_segments_for_lease(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        segments: Vec<impl IntoIndexSegment + Send>,
+        lease: &RetentionLease,
     ) -> Result<()>;
 
     async fn read_index_partition(

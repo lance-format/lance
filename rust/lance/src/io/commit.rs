@@ -45,7 +45,7 @@ use lance_table::io::commit::{
 };
 use lance_table::io::manifest::read_manifest;
 use lance_table::transaction::{
-    FragReuseUpdate, PreparedIndices, canonicalize_non_reusable_field_ids,
+    FragReuseUpdate, ManifestBuild, PreparedIndices, canonicalize_non_reusable_field_ids,
     has_writer_placed_lineage, validate_detached_non_reusable_field_ids,
     validate_non_reusable_field_id_transition, validate_operation,
 };
@@ -474,13 +474,16 @@ async fn do_commit_new_dataset(
         let source_manifest_location = commit_handler
             .resolve_version_location(&source_base_path, *ref_version, &source_store.inner)
             .await?;
-        let source_manifest = Dataset::load_manifest(
+        let mut source_manifest = Dataset::load_manifest(
             source_store,
             &source_manifest_location,
             ref_path.as_str(),
             &session,
         )
         .await?;
+        // A clone starts with no leases, so the source's neither carry over
+        // nor gate the clone.
+        source_manifest.set_retention_leases(Vec::new());
         ensure_can_write_manifest(&source_manifest)?;
 
         // Prepare the cloned index metadata now: an uncloneable tagged FRI
@@ -1346,6 +1349,18 @@ pub(crate) async fn do_commit_detached_transaction(
              fragment reuse entry; commit the rewrite on the main version chain",
         ));
     }
+    if matches!(
+        transaction.operation,
+        Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. }
+    ) {
+        return Err(Error::invalid_input(format!(
+            "{} cannot be committed detached: retention leases live only on the main \
+             version chain",
+            transaction.operation.name()
+        )));
+    }
     let pb_transaction = pb::Transaction::try_from(transaction)?;
     let inline_transaction = pb_transaction.encoded_len() <= MAX_INLINE_TRANSACTION_BYTES;
     // Classified from the operation itself. Reading it back off the inline
@@ -1393,20 +1408,28 @@ pub(crate) async fn do_commit_detached_transaction(
                 let prepared =
                     prepare_attempt(dataset, transaction, &build_config, FragReuseUpdate::None)
                         .await?;
-                let (mut manifest, indices) = transaction.build_manifest_prepared(
-                    Some(dataset.manifest.as_ref()),
-                    prepared,
-                    &transaction_file,
-                    &build_config,
-                    None,
-                )?;
+                let ManifestBuild::Write(mut manifest, indices) = transaction
+                    .build_manifest_prepared(
+                        Some(dataset.manifest.as_ref()),
+                        prepared,
+                        &transaction_file,
+                        &build_config,
+                        None,
+                    )?
+                else {
+                    return Err(Error::internal(format!(
+                        "detached {} built no manifest; only lease operations, which are \
+                         refused above, can leave the manifest unchanged",
+                        transaction.operation.name()
+                    )));
+                };
                 crate::dataset::write::seeds::apply_seed_feature_flags(
                     &mut manifest,
                     &indices,
                     dataset,
                 )
                 .await?;
-                (manifest, indices)
+                (*manifest, indices)
             }
         };
 
@@ -1427,6 +1450,9 @@ pub(crate) async fn do_commit_detached_transaction(
         .await?;
 
         manifest.version = random_version;
+        // Detached manifests are outside the retention window, so they
+        // neither carry leases nor fence writers with the lease flag.
+        manifest.set_retention_leases(Vec::new());
 
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
@@ -1615,7 +1641,8 @@ pub(crate) async fn commit_detached_transaction(
 /// An operation that carries rows' lineage over from existing fragments needs
 /// their sequences at build time, and the build cannot read the ones spilled to
 /// data files; they are read here, per attempt, so a rebase onto a newer
-/// manifest sees that manifest's fragments.
+/// manifest sees that manifest's fragments. The lease clock
+/// ([`ManifestBuildConfig::now`]) is likewise read per attempt.
 async fn build_config_for_attempt(
     dataset: &Dataset,
     transaction: &Transaction,
@@ -1767,6 +1794,11 @@ async fn record_successful_commit(
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
+///
+/// Returns the manifest that is current once the commit is done: the one
+/// written, or, for a retention lease request that changes nothing against
+/// the latest manifest (see [`ManifestBuild::Unchanged`]), that manifest,
+/// with no version written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -1936,6 +1968,13 @@ pub(crate) async fn commit_transaction(
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+        Box::pin(
+            crate::dataset::index::frag_reuse::ensure_rewrite_records_lease_transitions(
+                &dataset,
+                &transaction,
+            ),
+        )
+        .await?;
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);
 
@@ -2003,20 +2042,32 @@ pub(crate) async fn commit_transaction(
                 let prepared =
                     prepare_attempt(&dataset, &attempt_transaction, &build_config, frag_reuse)
                         .await?;
-                let (mut manifest, indices) = attempt_transaction.build_manifest_prepared(
+                let build = attempt_transaction.build_manifest_prepared(
                     Some(dataset.manifest.as_ref()),
                     prepared,
                     transaction_file,
                     &build_config,
                     read_version_state,
                 )?;
+                let ManifestBuild::Write(mut manifest, indices) = build else {
+                    cleanup_transaction_file(
+                        object_store,
+                        &dataset.base,
+                        &current_transaction_file,
+                    )
+                    .await;
+                    return Ok((
+                        dataset.manifest.as_ref().clone(),
+                        dataset.manifest_location.clone(),
+                    ));
+                };
                 crate::dataset::write::seeds::apply_seed_feature_flags(
                     &mut manifest,
                     &indices,
                     &dataset,
                 )
                 .await?;
-                (manifest, indices)
+                (*manifest, indices)
             }
         };
 

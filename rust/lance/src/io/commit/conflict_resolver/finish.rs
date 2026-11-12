@@ -44,7 +44,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => Ok(self.transaction),
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",

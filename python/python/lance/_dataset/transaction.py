@@ -19,7 +19,12 @@ from ..fragment import DataFile, FragmentMetadata
 if TYPE_CHECKING:
     from .. import mem_wal
     from ..dataset import LanceDataset
-    from ..lance import DatasetBasePath, InsertedRowsFilter, LanceSchema
+    from ..lance import (
+        DatasetBasePath,
+        InsertedRowsFilter,
+        LanceSchema,
+        RetentionLease,
+    )
     from .index import Index
 
 
@@ -46,6 +51,33 @@ class Transaction:
         default_factory=dict
     )
     tag: Optional[str] = None
+
+    @classmethod
+    def for_lease(
+        cls, lease: RetentionLease, operation: LanceOperation.BaseOperation
+    ) -> Transaction:
+        """A transaction that publishes the result of work done under ``lease``.
+
+        The transaction reads the leased version and carries the lease's id as
+        its UUID, so committing it releases the lease. The commit succeeds
+        even if the lease has already ended.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease the work was done under.
+        operation: LanceOperation.BaseOperation
+            The change to commit.
+
+        Returns
+        -------
+        Transaction
+
+        Examples
+        --------
+        See :meth:`lance.LanceDataset.acquire_retention_lease`.
+        """
+        return cls(read_version=lease.version, operation=operation, uuid=lease.id)
 
 
 class UpdateResult(TypedDict):

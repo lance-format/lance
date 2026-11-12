@@ -24,10 +24,14 @@
 
 use std::collections::HashSet;
 
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_table::feature_flags::FLAG_RETENTION_LEASES;
 use lance_table::format::Fragment;
+use lance_table::system_index::frag_reuse::leases::{LeaseRequirement, RecordLineage};
 
 use super::scenarios::{Scenario, row_counts};
 use crate::Dataset;
+use crate::dataset::index::frag_reuse::leases::{leased_fragments, record_lineages};
 
 /// Check every invariant against a landing, panicking with `context` on the
 /// first failure.
@@ -45,6 +49,9 @@ pub(super) async fn check_all(before: &Dataset, after: &Dataset, ours: Scenario,
     }
     manifest_round_trips(after, context);
     dataset_scans(after, context).await;
+    lease_flag_matches_list(after, context);
+    leases_carry_over(before, after, ours, context);
+    lease_transitions_recorded(before, after, ours, context).await;
 }
 
 /// Delegate to [`Dataset::validate`], the production integrity check.
@@ -238,4 +245,150 @@ async fn dataset_scans(after: &Dataset, context: &str) {
         "{context}: scan returned {} rows but the manifest accounts for {expected}",
         batch.num_rows(),
     );
+}
+
+/// `FLAG_RETENTION_LEASES` must be set exactly when the lease list is nonempty, so
+/// writers without lease support are fenced only while leases exist.
+fn lease_flag_matches_list(after: &Dataset, context: &str) {
+    let flagged = after.manifest.writer_feature_flags & FLAG_RETENTION_LEASES != 0;
+    assert_eq!(
+        flagged,
+        !after.retention_leases().is_empty(),
+        "{context}: FLAG_RETENTION_LEASES is {flagged} but the manifest lists {} leases",
+        after.retention_leases().len(),
+    );
+}
+
+/// The lease list a commit writes is its predecessor's with only its own lease
+/// change applied. The matrix never moves the clock, so nothing expires.
+///
+/// Restore and overwrite remove every lease. Otherwise a listed lease survives
+/// unless `ours` released it, keeping its version and creation time, and only
+/// a renewal may push its expiry later. A lease absent from the predecessor can
+/// only be one `ours` acquired, on the version its commit created.
+fn leases_carry_over(before: &Dataset, after: &Dataset, ours: Scenario, context: &str) {
+    let leases = after.retention_leases();
+    let ids = leases
+        .iter()
+        .map(|lease| lease.id())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        ids.len(),
+        leases.len(),
+        "{context}: duplicate lease IDs in {leases:?}"
+    );
+    if ours.replaces_state() {
+        assert!(
+            leases.is_empty(),
+            "{context}: {} kept leases {leases:?}",
+            ours.name()
+        );
+        return;
+    }
+    for previous in before.retention_leases() {
+        let Some(lease) = leases.iter().find(|lease| lease.id() == previous.id()) else {
+            assert_eq!(
+                ours,
+                Scenario::ReleaseLease,
+                "{context}: lease {} was dropped by {}",
+                previous.id(),
+                ours.name(),
+            );
+            continue;
+        };
+        assert_eq!(lease.version(), previous.version(), "{context}");
+        assert_eq!(lease.created_at(), previous.created_at(), "{context}");
+        if ours == Scenario::RenewLease {
+            assert!(
+                lease.expires_at() >= previous.expires_at(),
+                "{context}: renewing lease {} moved its expiry earlier",
+                lease.id(),
+            );
+        } else {
+            assert_eq!(lease.expires_at(), previous.expires_at(), "{context}");
+        }
+    }
+    let previous_ids = before
+        .retention_leases()
+        .iter()
+        .map(|lease| lease.id())
+        .collect::<HashSet<_>>();
+    for lease in leases.iter().filter(|l| !previous_ids.contains(&l.id())) {
+        assert_eq!(
+            ours,
+            Scenario::AcquireLease,
+            "{context}: lease {} appeared under {}",
+            lease.id(),
+            ours.name(),
+        );
+        assert_eq!(
+            lease.version(),
+            after.manifest.version,
+            "{context}: an acquired lease must retain the version its commit created",
+        );
+    }
+}
+
+/// Every fragment reuse transition a lease listed after the commit requires
+/// is still recorded, and a rewrite recorded a transition for every fragment
+/// it replaced that such a lease requires.
+async fn lease_transitions_recorded(
+    before: &Dataset,
+    after: &Dataset,
+    ours: Scenario,
+    context: &str,
+) {
+    if after.retention_leases().is_empty() {
+        return;
+    }
+    let leased = leased_fragments(after).await;
+    let before_records = fri_records(before).await;
+    let required = LeaseRequirement::compute(&leased, &before_records);
+    let recorded = fri_records(after)
+        .await
+        .iter()
+        .flat_map(|record| record.sources().collect::<Vec<_>>())
+        .collect::<HashSet<_>>();
+    for (position, record) in before_records.iter().enumerate() {
+        if required.requires_record(position) {
+            for source in record.sources() {
+                assert!(
+                    recorded.contains(&source),
+                    "{context}: {} dropped the lease-required transition from fragment {source}",
+                    ours.name(),
+                );
+            }
+        }
+    }
+    if ours != Scenario::Rewrite {
+        return;
+    }
+    let live = after
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<HashSet<_>>();
+    for fragment in before.fragments().iter() {
+        if !live.contains(&fragment.id) && required.requires_sources([fragment.id]) {
+            assert!(
+                recorded.contains(&fragment.id),
+                "{context}: the rewrite replaced lease-required fragment {} without recording \
+                 a transition",
+                fragment.id,
+            );
+        }
+    }
+}
+
+async fn fri_records(dataset: &Dataset) -> Vec<RecordLineage> {
+    let indices = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
+    match indices
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+    {
+        Some(entry) => record_lineages(dataset, entry).await.unwrap(),
+        None => Vec::new(),
+    }
 }

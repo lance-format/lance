@@ -4689,6 +4689,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "chrono",
  "criterion",
  "datafusion-common",
  "datafusion-sql",
@@ -4719,6 +4720,7 @@ dependencies = [
  "tracing",
  "twox-hash",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -5381,6 +5383,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

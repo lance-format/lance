@@ -20,7 +20,10 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            | Operation::AcquireLease { .. }
+            | Operation::RenewLease { .. }
+            | Operation::ReleaseLease { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());

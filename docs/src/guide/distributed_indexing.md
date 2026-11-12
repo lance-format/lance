@@ -127,6 +127,10 @@ or merged into larger segments:
 
 Within a single commit, built segments must have disjoint fragment coverage.
 
+A distributed build can take long enough for compaction or cleanup to run
+before it commits. Hold a [retention lease](retention_leases.md#distributed-index-builds)
+during the build and commit with it so the segments still publish.
+
 `merge_existing_index_segments(...)` currently supports vector, inverted,
 bitmap, BTree, and zone map segments. Other scalar index families can still
 commit multiple compatible segments directly when their build path supports

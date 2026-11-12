@@ -24,6 +24,7 @@
 //! index_maintenance  how that narrows or drops index metadata
 //! row_version        how it assigns row ids and per-row version metadata
 //! conflicts          whether two operations collide, for the commit retry path
+//! retention_leases   deriving the lease list a commit writes
 //! proto              the persisted protobuf encoding of all of the above
 //! ```
 
@@ -34,6 +35,7 @@ mod manifest_build;
 mod operation;
 mod prepare;
 mod proto;
+mod retention_leases;
 mod row_version;
 mod update_map;
 mod validate;
@@ -42,7 +44,7 @@ mod validate;
 pub(crate) mod test_support;
 
 pub use builder::{Transaction, TransactionBuilder};
-pub use manifest_build::RANGE_SEGMENTS_CONFIG_KEY;
+pub use manifest_build::{ManifestBuild, RANGE_SEGMENTS_CONFIG_KEY};
 pub use operation::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex,
     TaggedRewriteAssembly, UpdateMode, UpdatedFragmentOffsets, reordered_sources,

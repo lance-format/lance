@@ -12,12 +12,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Int32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::ROW_ADDR;
 use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
+use lance_index::frag_reuse::{FragDigest, FragReuseGroup};
 use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
@@ -28,10 +30,11 @@ use crate::dataset::transaction::{
     DataReplacementGroup, Operation, RewriteGroup, Transaction, UpdateMode,
 };
 use crate::dataset::{
-    CommitBuilder, Dataset, DeleteBuilder, InsertBuilder, MergeInsertBuilder, NewColumnTransform,
-    WriteMode, WriteParams,
+    CommitBuilder, Dataset, DeleteBuilder, InsertBuilder, LeaseOptions, MergeInsertBuilder,
+    NewColumnTransform, RetentionLease, WriteMode, WriteParams,
 };
 use crate::index::CreateIndexBuilder;
+use crate::utils::temporal::utc_now;
 
 /// A transaction staged against a dataset version but not yet committed.
 pub(super) struct Staged {
@@ -96,6 +99,13 @@ pub(super) enum Scenario {
     /// A schema-metadata update. `updates_schema_or_field_metadata` keys on
     /// schema or field metadata specifically, not on config entries.
     UpdateConfig,
+    /// Acquire a new retention lease alongside the fixture's.
+    AcquireLease,
+    /// Extend the fixture's retention lease by a fixed amount, so two
+    /// renewals request the same time.
+    RenewLease,
+    /// Release the fixture's retention lease.
+    ReleaseLease,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -155,7 +165,7 @@ impl Footprint {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -172,6 +182,9 @@ impl Scenario {
         Self::Overwrite,
         Self::Restore,
         Self::UpdateConfig,
+        Self::AcquireLease,
+        Self::RenewLease,
+        Self::ReleaseLease,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -193,6 +206,9 @@ impl Scenario {
             Self::Overwrite => "ow",
             Self::Restore => "rs",
             Self::UpdateConfig => "cf",
+            Self::AcquireLease => "aq",
+            Self::RenewLease => "rn",
+            Self::ReleaseLease => "rl",
         }
     }
 
@@ -214,6 +230,9 @@ impl Scenario {
             Self::Overwrite => "overwrite",
             Self::Restore => "restore",
             Self::UpdateConfig => "update_config",
+            Self::AcquireLease => "acquire_lease",
+            Self::RenewLease => "renew_lease",
+            Self::ReleaseLease => "release_lease",
         }
     }
 
@@ -299,6 +318,9 @@ impl Scenario {
             Self::Overwrite => stage_overwrite(dataset).await,
             Self::Restore => stage_restore(dataset).await,
             Self::UpdateConfig => stage_update_config(dataset).await,
+            Self::AcquireLease => stage_acquire_lease(dataset),
+            Self::RenewLease => stage_renew_lease(dataset),
+            Self::ReleaseLease => stage_release_lease(dataset),
         }
     }
 }
@@ -652,6 +674,46 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
         )
         .await?;
     }
+    // The fixture's lease retains every fragment, so the rewrite records its
+    // move as compaction does under a lease. Compaction reserves the output
+    // ids in a commit of its own first; ids well above any a concurrent
+    // scenario allocates stand in for that reservation.
+    let first_id = u64::from(dataset.manifest.max_fragment_id.unwrap_or(0)) + 100;
+    for (fragment, id) in fragments.iter_mut().zip(first_id..) {
+        fragment.id = id;
+    }
+    let changed_row_addrs = crate::dataset::optimize::execution::live_source_row_addrs(
+        dataset.as_ref(),
+        std::slice::from_ref(&old),
+    )
+    .await?;
+    let mut serialized = Vec::with_capacity(changed_row_addrs.serialized_size());
+    changed_row_addrs.serialize_into(&mut serialized)?;
+    let digest = |fragment: &Fragment| FragDigest {
+        id: fragment.id,
+        physical_rows: fragment.physical_rows.unwrap_or(0),
+        num_deleted_rows: fragment
+            .deletion_file
+            .as_ref()
+            .and_then(|deletion| deletion.num_deleted_rows)
+            .unwrap_or(0),
+    };
+    let group = FragReuseGroup {
+        changed_row_addrs: serialized,
+        old_frags: vec![digest(&old)],
+        new_frags: fragments.iter().map(digest).collect(),
+    };
+    let new_bitmap = fragments
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect();
+    let frag_reuse_index = crate::index::frag_reuse::build_new_frag_reuse_index(
+        &mut dataset.as_ref().clone(),
+        vec![group],
+        new_bitmap,
+        dataset.manifest.version,
+    )
+    .await?;
     Ok(Staged::new(Transaction::new_from_version(
         dataset.manifest.version,
         Operation::Rewrite {
@@ -660,7 +722,7 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
                 new_fragments: fragments,
             }],
             rewritten_indices: vec![],
-            frag_reuse_index: None,
+            frag_reuse_index: Some(frag_reuse_index),
         },
     )))
 }
@@ -670,6 +732,55 @@ async fn stage_restore(dataset: &Arc<Dataset>) -> Result<Staged> {
         dataset.manifest.version,
         // The fixture's first version, before the column `c` was added.
         Operation::Restore { version: 1 },
+    )))
+}
+
+/// How long the fixture's lease and an acquired one last. The matrix never
+/// moves the clock, so no lease expires during a case.
+const LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn stage_acquire_lease(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let created_at = utc_now();
+    Ok(Staged::new(Transaction::new_from_version(
+        dataset.manifest.version,
+        Operation::AcquireLease {
+            lease_id: uuid::Uuid::new_v4(),
+            created_at,
+            expires_at: created_at + LEASE_TTL,
+            label: Some("matrix".to_string()),
+        },
+    )))
+}
+
+/// The lease the fixture acquired. Staging a renewal or release against a
+/// version without it fails, which the oracle reads as "cannot run serially".
+fn fixture_lease(dataset: &Dataset) -> Result<&RetentionLease> {
+    dataset.retention_leases().first().ok_or_else(|| {
+        crate::Error::invalid_input(format!(
+            "version {} lists no retention lease to renew or release",
+            dataset.manifest.version
+        ))
+    })
+}
+
+fn stage_renew_lease(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let lease = fixture_lease(dataset)?;
+    Ok(Staged::new(Transaction::new_from_version(
+        dataset.manifest.version,
+        Operation::RenewLease {
+            lease_id: lease.id(),
+            expires_at: lease.expires_at() + LEASE_TTL,
+        },
+    )))
+}
+
+fn stage_release_lease(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let lease = fixture_lease(dataset)?;
+    Ok(Staged::new(Transaction::new_from_version(
+        dataset.manifest.version,
+        Operation::ReleaseLease {
+            lease_id: lease.id(),
+        },
     )))
 }
 
@@ -733,8 +844,11 @@ async fn write_value_file(
 /// - **`a` and `b` sharing the file written first**, which is why no scenario
 ///   targets them: replacing that file to reach one orphans the other.
 ///
-/// Version 1 holds `a`/`b`; versions 2 and 3 add `c` and `d`. Cases stage
-/// against the last, which gives `restore` a version to fall back to.
+/// Version 1 holds `a`/`b`; versions 2 and 3 add `c` and `d`. Version 4
+/// acquires a retention lease, so every case runs with a listed lease and
+/// `FLAG_RETENTION_LEASES`, and the lease scenarios have one to renew and release.
+/// Cases stage against the last, which gives `restore` a version to fall back
+/// to.
 pub(super) async fn fixture() -> Arc<Dataset> {
     let data = RecordBatch::try_new(
         Arc::new(ArrowSchema::new(vec![
@@ -774,7 +888,12 @@ pub(super) async fn fixture() -> Arc<Dataset> {
             .await
             .unwrap();
     }
-    Arc::new(dataset)
+    let options = LeaseOptions {
+        ttl: LEASE_TTL,
+        label: Some("fixture".to_string()),
+    };
+    let (_, leased) = dataset.acquire_retention_lease(options).await.unwrap();
+    Arc::new(leased)
 }
 
 /// Fragment ids and their logical row counts, for the row-count invariant.

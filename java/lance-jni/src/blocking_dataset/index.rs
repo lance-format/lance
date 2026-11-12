@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::retention_lease::lease_options_from_java;
 use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::blocking_scanner::build_full_text_search_query;
 use crate::error::{Error, Result};
@@ -15,7 +16,7 @@ use arrow::ffi_stream::FFI_ArrowArrayStream;
 use jni::JNIEnv;
 use jni::objects::{JObject, JString, JValue};
 use jni::sys::{jboolean, jbyteArray, jint, jlong};
-use lance::dataset::Dataset;
+use lance::dataset::{Dataset, LeaseOptions, RetentionLease};
 use lance::index::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use lance::table::format::IndexMetadata;
 use lance_index::IndexCriteria as RustIndexCriteria;
@@ -83,6 +84,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
     fragments_jobj: JObject<'local>,         // List<Integer>
     index_uuid_jobj: JObject<'local>,        // String
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    retention_lease_jobj: JObject<'local>,   // LeaseOptions, nullable
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -98,6 +100,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndex<'local>(
             fragments_jobj,
             index_uuid_jobj,
             arrow_stream_addr_jobj,
+            retention_lease_jobj,
             None,
         )
     )
@@ -116,6 +119,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndexWithProgress<'loc
     fragments_jobj: JObject<'local>,         // List<Integer>
     index_uuid_jobj: JObject<'local>,        // String
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    retention_lease_jobj: JObject<'local>,   // LeaseOptions, nullable
     progress_jobj: JObject<'local>,          // IndexBuildProgress
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -132,6 +136,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCreateIndexWithProgress<'loc
             fragments_jobj,
             index_uuid_jobj,
             arrow_stream_addr_jobj,
+            retention_lease_jobj,
             progress_jobj,
         )
     )
@@ -150,6 +155,7 @@ fn inner_create_index_with_progress<'local>(
     fragments_jobj: JObject<'local>,
     index_uuid_jobj: JObject<'local>,
     arrow_stream_addr_jobj: JObject<'local>,
+    retention_lease_jobj: JObject<'local>,
     progress_jobj: JObject<'local>,
 ) -> Result<JObject<'local>> {
     let progress = Arc::new(JavaIndexBuildProgress::new(env, &progress_jobj)?);
@@ -165,6 +171,7 @@ fn inner_create_index_with_progress<'local>(
         fragments_jobj,
         index_uuid_jobj,
         arrow_stream_addr_jobj,
+        retention_lease_jobj,
         Some(progress),
     )
 }
@@ -182,6 +189,7 @@ fn inner_create_index<'local>(
     fragments_jobj: JObject<'local>,         // Optional<List<String>>
     index_uuid_jobj: JObject<'local>,        // Optional<String>
     arrow_stream_addr_jobj: JObject<'local>, // Optional<Long>
+    retention_lease_jobj: JObject<'local>,   // LeaseOptions, nullable
     progress: Option<Arc<dyn IndexBuildProgress>>,
 ) -> Result<JObject<'local>> {
     let columns = env.get_strings(&columns_jobj)?;
@@ -200,6 +208,7 @@ fn inner_create_index<'local>(
                 .map_err(|e| Error::input_error(format!("Invalid UUID string for index_uuid: {e}")))
         })
         .transpose()?;
+    let retention_lease = lease_options_from_java(env, &retention_lease_jobj)?;
     let arrow_stream_addr_opt = env.get_long_opt(&arrow_stream_addr_jobj)?;
     let batch_reader = if let Some(arrow_stream_addr) = arrow_stream_addr_opt {
         let stream_ptr = arrow_stream_addr as *mut FFI_ArrowArrayStream;
@@ -256,6 +265,13 @@ fn inner_create_index<'local>(
     };
 
     let params = params_result?;
+    if retention_lease.is_some() && skip_commit {
+        return Err(Error::input_error(
+            "a retention lease applies only to index builds that commit, not to builds with \
+             fragment ids or preprocessed data"
+                .to_string(),
+        ));
+    }
 
     let index_metadata = if progress.is_some() || skip_commit {
         // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
@@ -280,6 +296,7 @@ fn inner_create_index<'local>(
             fragment_ids,
             index_uuid,
             batch_reader,
+            retention_lease,
             progress,
             skip_commit,
         )
@@ -331,6 +348,7 @@ fn inner_create_index<'local>(
             fragment_ids,
             index_uuid,
             batch_reader,
+            retention_lease,
             None,
             skip_commit,
         )?
@@ -359,6 +377,7 @@ fn execute_create_index(
     fragment_ids: Option<Vec<u32>>,
     index_uuid: Option<Uuid>,
     batch_reader: Option<ArrowArrayStreamReader>,
+    retention_lease: Option<LeaseOptions>,
     progress: Option<Arc<dyn IndexBuildProgress>>,
     skip_commit: bool,
 ) -> Result<IndexMetadata> {
@@ -385,6 +404,10 @@ fn execute_create_index(
 
     if let Some(progress) = progress {
         index_builder = index_builder.progress(progress);
+    }
+
+    if let Some(retention_lease) = retention_lease {
+        index_builder = index_builder.retention_lease(retention_lease);
     }
 
     if skip_commit {
@@ -567,6 +590,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitExistingIndexSegments<
     index_name: JString,
     column: JString,
     java_segments: JObject,
+    lease: JObject, // RetentionLease, nullable
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -575,7 +599,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCommitExistingIndexSegments<
             java_dataset,
             index_name,
             column,
-            java_segments
+            java_segments,
+            lease
         )
     )
 }
@@ -586,6 +611,7 @@ fn inner_commit_existing_index_segments<'local>(
     index_name: JString,
     column: JString,
     java_segments: JObject,
+    lease: JObject,
 ) -> Result<JObject<'local>> {
     let index_name = index_name.extract(env)?;
     let column = column.extract(env)?;
@@ -595,15 +621,32 @@ fn inner_commit_existing_index_segments<'local>(
         .iter()
         .map(index_metadata_to_segment)
         .collect::<Result<Vec<_>>>()?;
+    let lease: Option<RetentionLease> = if lease.is_null() {
+        None
+    } else {
+        Some(lease.extract_object(env)?)
+    };
 
     let committed = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.commit_existing_index_segments(
-            &index_name,
-            &column,
-            segments,
-        ))?;
+        match &lease {
+            Some(lease) => block_on(
+                dataset_guard
+                    .inner
+                    .commit_existing_index_segments_for_lease(
+                        &index_name,
+                        &column,
+                        segments,
+                        lease,
+                    ),
+            )?,
+            None => block_on(dataset_guard.inner.commit_existing_index_segments(
+                &index_name,
+                &column,
+                segments,
+            ))?,
+        }
         block_on(dataset_guard.inner.load_indices_by_name(&index_name))?
     };
 

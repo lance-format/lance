@@ -157,6 +157,23 @@ public class Transaction implements AutoCloseable {
       return this;
     }
 
+    /**
+     * Publish the result of work done under {@code lease}: read the leased version and carry the
+     * lease's id as the transaction UUID, so committing the transaction releases the lease. The
+     * commit succeeds even if the lease has already ended.
+     *
+     * <p>This sets both {@link #readVersion(long)} and {@link #uuid(String)}.
+     *
+     * @param lease the lease the work was done under
+     * @return this builder instance
+     */
+    public Builder forLease(RetentionLease lease) {
+      Preconditions.checkNotNull(lease, "lease cannot be null");
+      this.readVersion = lease.getVersion();
+      this.uuid = lease.getId().toString();
+      return this;
+    }
+
     public Builder operation(Operation operation) {
       if (this.operation != null) {
         throw new IllegalStateException(

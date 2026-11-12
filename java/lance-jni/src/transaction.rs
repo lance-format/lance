@@ -5,6 +5,7 @@ use crate::Error;
 use crate::JNIEnvExt;
 use crate::block_on;
 use crate::blocking_dataset::conversions::extract_namespace_info;
+use crate::blocking_dataset::retention_lease::instant_to_java;
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{
@@ -20,7 +21,7 @@ use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::CommitBuilder;
 use lance::dataset::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
-    TransactionBuilder, UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
+    UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets,
 };
 use lance::io::ObjectStoreParams;
 use lance::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
@@ -1240,6 +1241,50 @@ fn convert_to_java_operation_inner<'local>(
                 &[JValue::Object(&new_bases)],
             )?)
         }
+        Operation::AcquireLease {
+            lease_id,
+            created_at,
+            expires_at,
+            label,
+        } => {
+            let lease_id = lease_id.into_java(env)?;
+            let created_at = instant_to_java(env, created_at)?;
+            let expires_at = instant_to_java(env, expires_at)?;
+            let label = match label {
+                Some(label) => JObject::from(env.new_string(label)?),
+                None => JObject::null(),
+            };
+            Ok(env.new_object(
+                "org/lance/operation/AcquireLease",
+                "(Ljava/util/UUID;Ljava/time/Instant;Ljava/time/Instant;Ljava/lang/String;)V",
+                &[
+                    JValue::Object(&lease_id),
+                    JValue::Object(&created_at),
+                    JValue::Object(&expires_at),
+                    JValue::Object(&label),
+                ],
+            )?)
+        }
+        Operation::RenewLease {
+            lease_id,
+            expires_at,
+        } => {
+            let lease_id = lease_id.into_java(env)?;
+            let expires_at = instant_to_java(env, expires_at)?;
+            Ok(env.new_object(
+                "org/lance/operation/RenewLease",
+                "(Ljava/util/UUID;Ljava/time/Instant;)V",
+                &[JValue::Object(&lease_id), JValue::Object(&expires_at)],
+            )?)
+        }
+        Operation::ReleaseLease { lease_id } => {
+            let lease_id = lease_id.into_java(env)?;
+            Ok(env.new_object(
+                "org/lance/operation/ReleaseLease",
+                "(Ljava/util/UUID;)V",
+                &[JValue::Object(&lease_id)],
+            )?)
+        }
         Operation::Unknown { .. } => Err(Error::input_error(
             "Cannot convert an operation written by a newer version of Lance".to_string(),
         )),
@@ -1530,11 +1575,13 @@ fn convert_to_rust_transaction(
             to_rust_map(env, &transaction_properties)
         },
     )?;
-    Ok(TransactionBuilder::new(read_ver, op)
-        .uuid(uuid)
-        .tag(tag)
-        .transaction_properties(transaction_properties.map(Arc::new))
-        .build())
+    Ok(Transaction {
+        read_version: read_ver,
+        uuid,
+        operation: op,
+        tag,
+        transaction_properties: transaction_properties.map(Arc::new),
+    })
 }
 
 struct ConvertedSchema {
@@ -2201,6 +2248,12 @@ fn convert_to_rust_operation(
                     base.extract_object(env)
                 })?;
             Operation::UpdateBases { new_bases }
+        }
+        "AcquireLease" | "RenewLease" | "ReleaseLease" => {
+            return Err(Error::input_error(format!(
+                "{op_name} cannot be committed through a Java transaction; use the \
+                 Dataset retention lease methods"
+            )));
         }
         _ => {
             return Err(Error::input_error(format!(

@@ -867,6 +867,39 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (
+                Self::AcquireLease {
+                    lease_id: a_id,
+                    created_at: a_created_at,
+                    expires_at: a_expires_at,
+                    label: a_label,
+                },
+                Self::AcquireLease {
+                    lease_id: b_id,
+                    created_at: b_created_at,
+                    expires_at: b_expires_at,
+                    label: b_label,
+                },
+            ) => {
+                a_id == b_id
+                    && a_created_at == b_created_at
+                    && a_expires_at == b_expires_at
+                    && a_label == b_label
+            }
+            (Self::AcquireLease { .. }, _) | (_, Self::AcquireLease { .. }) => false,
+            (
+                Self::RenewLease {
+                    lease_id: a_id,
+                    expires_at: a_expires_at,
+                },
+                Self::RenewLease {
+                    lease_id: b_id,
+                    expires_at: b_expires_at,
+                },
+            ) => a_id == b_id && a_expires_at == b_expires_at,
+            (Self::RenewLease { .. }, _) | (_, Self::RenewLease { .. }) => false,
+            (Self::ReleaseLease { lease_id: a }, Self::ReleaseLease { lease_id: b }) => a == b,
+            (Self::ReleaseLease { .. }, _) | (_, Self::ReleaseLease { .. }) => false,
             (Self::Unknown {}, Self::Unknown {}) => true,
             (Self::Unknown {}, _) | (_, Self::Unknown {}) => false,
         }

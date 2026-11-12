@@ -31,6 +31,7 @@ from .blob import (
 )
 from .dataset import (
     LanceDataset,
+    LeaseOptions,
     Session,
     __version__,
     batch_udf,
@@ -47,6 +48,8 @@ from .lance import (
     FragmentAddColumnsCleanup,
     FtsToken,
     InsertedRowsFilter,
+    LeaseKeeper,
+    RetentionLease,
     ScanStatistics,
     bytes_read_counter,
     iops_counter,
@@ -111,7 +114,10 @@ __all__ = [
     "LanceFragment",
     "LanceOperation",
     "LanceScanner",
+    "LeaseKeeper",
+    "LeaseOptions",
     "MergeInsertBuilder",
+    "RetentionLease",
     "ScanStatistics",
     "Transaction",
     "__version__",

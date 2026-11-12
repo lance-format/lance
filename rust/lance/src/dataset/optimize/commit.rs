@@ -22,6 +22,7 @@ use super::planning::{
 use super::remapping::{self, IndexRemapperOptions};
 use crate::Dataset;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::index::frag_reuse::lease_requirement;
 use crate::dataset::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -115,6 +116,30 @@ async fn records_stable_row_id_moves(
     Ok(true)
 }
 
+/// `options` with `defer_index_remap` set, when listed retention leases need
+/// this compaction to record its transitions and the tasks allow it.
+///
+/// This covers plans made before a lease was acquired; see
+/// `DefaultCompactionPlanner::deferring_under_leases` for the other layers. Tasks
+/// that recorded no row addresses cannot be deferred; the commit then refuses the
+/// rewrite if a lease requires its fragments, and the caller replans. Boxed
+/// because the options are large and held across every await of the commit.
+fn deferred_by_leases(
+    leases_listed: bool,
+    completed_tasks: &[RewriteResult],
+    options: &CompactionOptions,
+) -> Option<Box<CompactionOptions>> {
+    (!options.defer_index_remap
+        && leases_listed
+        && completed_tasks.iter().all(|task| task.row_addrs.is_some()))
+    .then(|| {
+        Box::new(CompactionOptions {
+            defer_index_remap: true,
+            ..options.clone()
+        })
+    })
+}
+
 /// Commit the results of file compaction.
 ///
 /// It is not required that all tasks are passed to this method. If some failed,
@@ -136,6 +161,13 @@ pub async fn commit_compaction(
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
+
+    let deferred_by_leases = deferred_by_leases(
+        !dataset.manifest.retention_leases().is_empty(),
+        &completed_tasks,
+        options,
+    );
+    let options = deferred_by_leases.as_deref().unwrap_or(options);
 
     // A tagged FRI history stores row translation in the manifest entry and
     // depends on index bitmaps keeping their retired provenance, so a
@@ -262,6 +294,12 @@ pub async fn commit_compaction(
     // past this rewrite (a bare rewrite of a covered fragment preempts it).
     // Trim reclaims such records once every index is disjoint from the chain
     // or postdates the rewrite.
+    let lease_requirement = if records_row_addrs {
+        Box::pin(lease_requirement(dataset)).await?
+    } else {
+        None
+    };
+    let mut any_group_lease_required = false;
 
     for task in completed_tasks {
         metrics += task.metrics;
@@ -339,6 +377,11 @@ pub async fn commit_compaction(
                 }
             }
         } else if records_row_addrs {
+            if lease_requirement.as_ref().is_some_and(|required| {
+                required.requires_sources(old_fragments.iter().map(|fragment| fragment.id))
+            }) {
+                any_group_lease_required = true;
+            }
             let changed_row_addrs = task.row_addrs.ok_or_else(|| {
                 Error::internal(
                     "defer_index_remap requires row_addrs but none were provided".to_string(),
@@ -467,11 +510,17 @@ pub async fn commit_compaction(
         // extending it in place. A table that never was tagged has neither
         // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
+        //
+        // A table with no entry at all starts a tagged history when a lease
+        // requires the record (the retention lease specification's rule),
+        // except with stable row ids, which never carry one.
         let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-            &dataset.manifest,
-            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
-        );
+        let existing_entry = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
+        let tagged_at_commit =
+            lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
+                &dataset.manifest,
+                existing_entry,
+            ) || (any_group_lease_required && existing_entry.is_none() && !uses_stable_row_ids);
         if tagged_at_commit {
             // Materializing a data overlay breaks the reuse premise that a
             // rewrite moves addresses, never values; on a tagged table the
@@ -620,4 +669,43 @@ pub async fn normalize_source_fragments(
         normalized.push(fragment);
     }
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn task(recorded_row_addrs: bool) -> RewriteResult {
+        RewriteResult {
+            metrics: CompactionMetrics::default(),
+            new_fragments: vec![],
+            read_version: 1,
+            original_fragments: vec![],
+            row_addrs: recorded_row_addrs.then(Vec::new),
+        }
+    }
+
+    #[rstest]
+    #[case::no_leases(false, false, vec![true], false)]
+    #[case::already_deferred(true, true, vec![true], false)]
+    #[case::all_tasks_recorded(true, false, vec![true, true], true)]
+    #[case::some_task_unrecorded(true, false, vec![true, false], false)]
+    #[case::no_task_recorded(true, false, vec![false], false)]
+    fn deferred_by_leases_only_when_every_task_recorded(
+        #[case] leases_listed: bool,
+        #[case] defer_index_remap: bool,
+        #[case] recorded: Vec<bool>,
+        #[case] expected: bool,
+    ) {
+        let tasks: Vec<_> = recorded.into_iter().map(task).collect();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
+        let deferred = deferred_by_leases(leases_listed, &tasks, &options);
+        assert_eq!(deferred.is_some(), expected);
+        assert!(deferred.is_none_or(|options| options.defer_index_remap));
+    }
 }

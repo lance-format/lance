@@ -4,7 +4,7 @@
 use crate::{
     Error, Result,
     dataset::{
-        Dataset,
+        Dataset, LeaseKeeper, LeaseOptions, LeaseStatus,
         transaction::{Operation, TransactionBuilder},
     },
     index::{
@@ -13,7 +13,7 @@ use crate::{
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        lifecycle::build_index_metadata_from_segments,
+        lifecycle::{build_index_metadata_from_segments, ensure_index_files_exist},
         loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
         memory_progress::{ObservedBuild, ObservedOperation, index_type_label},
         scalar::{build_bitmap_index_segment, build_scalar_index},
@@ -94,6 +94,9 @@ pub struct CreateIndexBuilder<'a> {
     /// The parameters come from an existing index, so settings refused for a new
     /// index (see [`InvertedIndexParams::validate_for_creation`]) are accepted.
     is_copy_of_existing: bool,
+    retention_lease: Option<LeaseOptions>,
+    /// Keeps the lease of a build started with [`Self::retention_lease`].
+    lease_keeper: Option<LeaseKeeper>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -118,6 +121,8 @@ impl<'a> CreateIndexBuilder<'a> {
             memory_operation: Some(ObservedOperation::CreateIndex),
             transaction_properties: None,
             is_copy_of_existing: false,
+            retention_lease: None,
+            lease_keeper: None,
         }
     }
 
@@ -208,8 +213,45 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
+    /// Build under a retention lease, so that compaction and cleanup can run
+    /// while a long build is in progress.
+    ///
+    /// The build acquires the lease first, builds on the version it leases
+    /// (the latest version at the time), renews it with a [`LeaseKeeper`]
+    /// while building, and publishes the index for the lease. If the build
+    /// fails, the lease is released and the dataset is left at its original
+    /// version. [`Self::execute_uncommitted`] refuses it, since only a build
+    /// that commits can publish for the lease.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::LeaseOptions;
+    /// # use lance::index::DatasetIndexExt;
+    /// # use lance_index::{IndexType, scalar::ScalarIndexParams};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let params = ScalarIndexParams::default();
+    /// dataset
+    ///     .create_index_builder(&["category"], IndexType::BTree, &params)
+    ///     .retention_lease(LeaseOptions::default())
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn retention_lease(mut self, options: LeaseOptions) -> Self {
+        self.retention_lease = Some(options);
+        self
+    }
+
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
+        if self.retention_lease.is_some() {
+            return Err(Error::invalid_input(
+                "CreateIndex: retention_lease only applies to a build that commits; for an \
+                 uncommitted build, acquire the lease yourself and publish with \
+                 commit_existing_index_segments_for_lease"
+                    .to_string(),
+            ));
+        }
         self.execute_uncommitted_impl().await
     }
 
@@ -744,6 +786,28 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     async fn execute(mut self) -> Result<IndexMetadata> {
+        let Some(options) = self.retention_lease.take() else {
+            return self.build_and_commit().await;
+        };
+        let (lease, leased) = self.dataset.acquire_retention_lease(options).await?;
+        self.lease_keeper = Some(LeaseKeeper::start(&leased, lease));
+        let original = std::mem::replace(self.dataset, leased);
+        let result = self.build_and_commit().await;
+        if result.is_err() {
+            *self.dataset = original;
+            if let Some(keeper) = self.lease_keeper.take() {
+                let lease_id = keeper.lease().id();
+                if let Err(error) = keeper.release().await {
+                    warn!(
+                        "Failed to release retention lease {lease_id} of a failed index build: {error}"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    async fn build_and_commit(&mut self) -> Result<IndexMetadata> {
         // Multi-segment FM-Index path: split whole-table builds into fragment groups.
         // Explicit fragment selections stay on the single-segment path.
         if self.fragments.is_none()
@@ -765,19 +829,7 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             vec![]
         };
-        let transaction = TransactionBuilder::new(
-            new_idx.dataset_version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices,
-            },
-        )
-        .transaction_properties(self.transaction_properties.clone())
-        .build();
-
-        self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+        self.commit_index(vec![new_idx], removed_indices).await?;
 
         // Rebasing may withdraw all query coverage while keeping the committed
         // segment's definition for rebuilding. Include that stored metadata.
@@ -791,6 +843,46 @@ impl<'a> CreateIndexBuilder<'a> {
                 ))
             })
     }
+    async fn commit_index(
+        &mut self,
+        new_indices: Vec<IndexMetadata>,
+        removed_indices: Vec<IndexMetadata>,
+    ) -> Result<()> {
+        let transaction = match &self.lease_keeper {
+            Some(keeper) => {
+                let lease = keeper.lease();
+                if let LeaseStatus::Lost { reason } = keeper.status() {
+                    warn!(
+                        "Publishing an index for retention lease {} on version {}, which was lost \
+                         during the build ({reason}); the commit fails if what it retained is gone",
+                        lease.id(),
+                        lease.version()
+                    );
+                }
+                ensure_index_files_exist(self.dataset, &new_indices).await?;
+                TransactionBuilder::for_lease(
+                    &lease,
+                    Operation::CreateIndex {
+                        new_indices,
+                        removed_indices,
+                    },
+                )
+            }
+            None => TransactionBuilder::new(
+                self.dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices,
+                    removed_indices,
+                },
+            ),
+        }
+        .transaction_properties(self.transaction_properties.clone())
+        .build();
+        self.dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+    }
+
     /// Extract `num_segments` from FM-Index params if this is an FM-Index build.
     fn fmindex_num_segments(&self) -> Option<u32> {
         let scalar_params = self.params.as_any().downcast_ref::<ScalarIndexParams>()?;
@@ -920,19 +1012,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 vec![]
             };
 
-            let transaction = TransactionBuilder::new(
-                self.dataset.manifest.version,
-                Operation::CreateIndex {
-                    new_indices,
-                    removed_indices,
-                },
-            )
-            .transaction_properties(self.transaction_properties.clone())
-            .build();
-
-            self.dataset
-                .apply_commit(transaction, &Default::default(), &Default::default())
-                .await?;
+            self.commit_index(new_indices, removed_indices).await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
             if let Some(index) = indices.into_iter().next() {
@@ -1008,19 +1088,7 @@ impl<'a> CreateIndexBuilder<'a> {
             vec![]
         };
 
-        let transaction = TransactionBuilder::new(
-            self.dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            },
-        )
-        .transaction_properties(self.transaction_properties.clone())
-        .build();
-
-        self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+        self.commit_index(new_indices, removed_indices).await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
         if let Some(index) = indices.into_iter().next() {
@@ -1188,6 +1256,7 @@ impl<'a> IntoFuture for CreateIndexBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    mod retention_lease;
     mod staged_tagged;
 
     use super::*;

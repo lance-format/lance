@@ -309,7 +309,10 @@ pub fn classify(
         | Operation::Project { .. }
         | Operation::Merge { .. }
         | Operation::DataReplacement { .. }
-        | Operation::UpdateBases { .. } => Ok(Admission::MovesNoRows),
+        | Operation::UpdateBases { .. }
+        | Operation::AcquireLease { .. }
+        | Operation::RenewLease { .. }
+        | Operation::ReleaseLease { .. } => Ok(Admission::MovesNoRows),
         Operation::Restore { .. } => Ok(Admission::RestoresManifest),
         // Replaces only the MemWAL entry; fragments, user segments and the
         // history are carried through unchanged.

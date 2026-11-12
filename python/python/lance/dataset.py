@@ -10,6 +10,7 @@ import random
 import re
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import (
@@ -87,6 +88,7 @@ from .lance import (
     ExpireVersionsStats,
     IOStats,
     LanceSchema,
+    RetentionLease,
     ScanStatistics,
     _Dataset,
     _write_dataset,
@@ -122,6 +124,35 @@ if TYPE_CHECKING:
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
 _DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
+# Mirrors Rust's `LeaseOptions::default().ttl`; keep the two in sync.
+_DEFAULT_RETENTION_LEASE_TTL = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class LeaseOptions:
+    """How to acquire a retention lease for an index build.
+
+    Pass to :meth:`LanceDataset.create_index` or
+    :meth:`LanceDataset.create_scalar_index` as ``retention_lease``.
+
+    Parameters
+    ----------
+    ttl: timedelta, default 30 minutes
+        How long the lease lasts unless renewed, from the time of acquisition.
+        Must be positive.
+    label: str, optional
+        Human-readable context stored with the lease.
+
+    Examples
+    --------
+    >>> from datetime import timedelta
+    >>> import lance
+    >>> lance.LeaseOptions(ttl=timedelta(hours=1), label="nightly reindex")
+    LeaseOptions(ttl=datetime.timedelta(seconds=3600), label='nightly reindex')
+    """
+
+    ttl: timedelta = _DEFAULT_RETENTION_LEASE_TTL
+    label: Optional[str] = None
 
 
 def _resolve_blob_selection(
@@ -2771,6 +2802,153 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.restore()
 
+    def acquire_retention_lease(
+        self,
+        ttl: timedelta = _DEFAULT_RETENTION_LEASE_TTL,
+        label: Optional[str] = None,
+    ) -> Tuple[RetentionLease, "LanceDataset"]:
+        """Acquire a retention lease on a new version of this dataset.
+
+        While the lease is listed, cleanup keeps the leased version and every
+        later one, so the holder can build on the leased version for as long
+        as it keeps the lease. The lease ends when the holder commits a
+        transaction for it (see :meth:`Transaction.for_lease`), releases it
+        with :meth:`release_retention_lease`, or lets it expire without
+        :meth:`renew_retention_lease`.
+
+        The acquisition commits a new version on the latest version of this
+        dataset's branch; that version is the leased one. This dataset stays
+        at its current version.
+
+        Parameters
+        ----------
+        ttl: timedelta, default 30 minutes
+            How long the lease lasts unless renewed. Must be positive.
+        label: str, optional
+            Human-readable context stored with the lease.
+
+        Returns
+        -------
+        Tuple[RetentionLease, LanceDataset]
+            The lease and the dataset checked out at the leased version.
+
+        Raises
+        ------
+        NotImplementedError
+            If this build of Lance cannot honor leases on this dataset, for
+            example on a dataset with stable row IDs.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, leased = dataset.acquire_retention_lease(label="backfill")
+        >>> leased.version == lease.version
+        True
+        >>> fragment = lance.LanceFragment.create("example", pa.table({"a": [3]}))
+        >>> transaction = lance.Transaction.for_lease(
+        ...     lease, lance.LanceOperation.Append([fragment])
+        ... )
+        >>> dataset = lance.LanceDataset.commit("example", transaction)
+        >>> dataset.retention_leases()
+        []
+        """
+        lease, leased_ds = self._ds.acquire_retention_lease(ttl, label)
+        leased = copy.copy(self)
+        leased._ds = leased_ds
+        return lease, leased
+
+    def checkout_lease(self, lease: RetentionLease) -> "LanceDataset":
+        """Check out the version ``lease`` retains.
+
+        Use this on a worker that received the lease from its holder.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease whose version to check out.
+
+        Returns
+        -------
+        LanceDataset
+        """
+        leased = copy.copy(self)
+        leased._ds = self._ds.checkout_lease(lease)
+        return leased
+
+    def renew_retention_lease(
+        self, lease: RetentionLease, ttl: timedelta
+    ) -> RetentionLease:
+        """Extend ``lease`` to expire ``ttl`` from now.
+
+        A time not later than the current expiry changes nothing and commits
+        no version.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease to renew.
+        ttl: timedelta
+            How long from now the lease should last. Must be positive.
+
+        Returns
+        -------
+        RetentionLease
+            The lease as listed after the renewal.
+
+        Raises
+        ------
+        ValueError
+            If the lease is no longer listed or has already expired.
+
+        Examples
+        --------
+        >>> from datetime import timedelta
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, _ = dataset.acquire_retention_lease(ttl=timedelta(minutes=5))
+        >>> renewed = dataset.renew_retention_lease(lease, timedelta(hours=1))
+        >>> renewed.expires_at > lease.expires_at
+        True
+        """
+        return self._ds.renew_retention_lease(lease, ttl)
+
+    def release_retention_lease(self, lease: RetentionLease) -> None:
+        """Release ``lease``, ending its retention without publishing a result.
+
+        Releasing a lease that is no longer listed changes nothing.
+
+        Parameters
+        ----------
+        lease: RetentionLease
+            The lease to release.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, _ = dataset.acquire_retention_lease()
+        >>> dataset.release_retention_lease(lease)
+        >>> lance.dataset("example").retention_leases()
+        []
+        """
+        self._ds.release_retention_lease(lease)
+
+    def retention_leases(self) -> List[RetentionLease]:
+        """The retention leases listed in this version of the dataset.
+
+        Expired leases stay listed until a later commit removes them. Only the
+        latest version's list is authoritative.
+
+        Returns
+        -------
+        List[RetentionLease]
+        """
+        return self._ds.retention_leases()
+
     def base_paths(self) -> Dict[int, DatasetBasePath]:
         """Return the base paths registered in the current dataset snapshot.
 
@@ -3335,6 +3513,7 @@ class LanceDataset(pa.dataset.Dataset):
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         format_version: Optional[Union[int, str]] = None,
         document_granularity: DocumentGranularity = DocumentGranularity.ROW,
+        retention_lease: Optional[LeaseOptions] = None,
         **kwargs: Any,
     ) -> None:
         """Create a scalar index on a column.
@@ -3474,6 +3653,14 @@ class LanceDataset(pa.dataset.Dataset):
             selected text in one dataset row as one document. ``LIST_ELEMENT``
             treats each element of the deepest list on ``column`` as one document.
 
+        retention_lease: LeaseOptions, optional
+            Build under a retention lease, so that compaction and cleanup can run
+            while a long build is in progress. The build acquires the lease
+            first, builds on the version it leases (the latest version at the
+            time), renews it while building, and publishes the index for the
+            lease. If the build fails, the lease is released and the dataset is
+            left at its original version. Not supported with ``fragment_ids``.
+
         with_position: bool, default False
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
@@ -3583,6 +3770,15 @@ class LanceDataset(pa.dataset.Dataset):
                 "BTREE",
             )
 
+        To let compaction and cleanup run during a long build, build under a
+        retention lease:
+
+        .. code-block:: python
+
+            dataset.create_scalar_index(
+                "category", "BTREE", retention_lease=lance.LeaseOptions()
+            )
+
         Scalar indices can only speed up scans for basic filters using
         equality, comparison, range (e.g. ``my_col BETWEEN 0 AND 100``), and set
         membership (e.g. `my_col IN (0, 1, 2)`)
@@ -3629,7 +3825,9 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["progress_callback"] = progress_callback
         if format_version is not None:
             kwargs["format_version"] = format_version
-        self._ds.create_index([column], index_type, name, replace, train, None, kwargs)
+        self._ds.create_index(
+            [column], index_type, name, replace, train, None, kwargs, retention_lease
+        )
 
     def _create_index_impl(
         self,
@@ -3665,6 +3863,7 @@ class LanceDataset(pa.dataset.Dataset):
         skip_transpose: bool = False,
         rabitq_model: Optional[str] = None,
         require_commit: bool = True,
+        retention_lease: Optional[LeaseOptions] = None,
         **kwargs,
     ) -> Index:
         if not require_commit and fragment_ids is None:
@@ -3807,6 +4006,11 @@ class LanceDataset(pa.dataset.Dataset):
                         "enforce single-node indexing (distributed is CPU-only)."
                     )
                 index_uuid = None
+
+        if accelerator is not None and retention_lease is not None:
+            # Accelerated training reads this version before Rust acquires the
+            # lease, so the precomputed partitions may not match the leased one.
+            raise ValueError("retention_lease is not supported with an accelerator")
 
         if accelerator is not None:
             from .vector import (
@@ -4023,7 +4227,14 @@ class LanceDataset(pa.dataset.Dataset):
 
         timers["final_create_index:start"] = time.time()
         index = self._ds.create_index(
-            column, index_type, name, replace, train, storage_options, kwargs
+            column,
+            index_type,
+            name,
+            replace,
+            train,
+            storage_options,
+            kwargs,
+            retention_lease,
         )
         timers["final_create_index:end"] = time.time()
         final_create_index_time = (
@@ -4075,6 +4286,7 @@ class LanceDataset(pa.dataset.Dataset):
         streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
+        retention_lease: Optional[LeaseOptions] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -4192,6 +4404,14 @@ class LanceDataset(pa.dataset.Dataset):
             Number of extra streaming Lloyd refinement passes to run after streaming
             coreset training. Each pass loads at most
             ``num_partitions * streaming_sample_rate`` raw vectors at a time.
+        retention_lease : LeaseOptions, optional
+            Build under a retention lease, so that compaction and cleanup can run
+            while a long build is in progress. The build acquires the lease
+            first, builds on the version it leases (the latest version at the
+            time), renews it while building, and publishes the index for the
+            lease. If the build fails, the lease is released and the dataset is
+            left at its original version. Not supported with ``fragment_ids`` or
+            ``accelerator``.
         kwargs :
             Parameters passed to the index building process.
 
@@ -4318,6 +4538,7 @@ class LanceDataset(pa.dataset.Dataset):
             streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             require_commit=True,
+            retention_lease=retention_lease,
             **kwargs,
         )
         return self
@@ -4574,12 +4795,49 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.merge_existing_index_segments(segments)
 
     def commit_existing_index_segments(
-        self, index_name: str, column: str, segments: List[Union[IndexSegment, Index]]
+        self,
+        index_name: str,
+        column: str,
+        segments: List[Union[IndexSegment, Index]],
+        *,
+        lease: Optional[RetentionLease] = None,
     ) -> LanceDataset:
         """
         Commit built index segments as one logical index.
+
+        Parameters
+        ----------
+        index_name: str
+            The name of the logical index.
+        column: str
+            The indexed column.
+        segments: List[Union[IndexSegment, Index]]
+            The segments to commit.
+        lease: RetentionLease, optional
+            Publish the result of a build done under ``lease`` (see
+            :meth:`acquire_retention_lease`). The segments must have been built
+            on the leased version. They are validated against it and rebased
+            over every commit since, such as compactions the lease let run
+            during the build, and the commit releases the lease. Fails if any
+            segment's files are missing.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> dataset = lance.write_dataset(pa.table({"a": [1, 2]}), "example")
+        >>> lease, leased = dataset.acquire_retention_lease()
+        >>> fragment_ids = [f.fragment_id for f in leased.get_fragments()]
+        >>> segment = leased.create_index_uncommitted(
+        ...     "a", "BTREE", fragment_ids=fragment_ids
+        ... )
+        >>> dataset = dataset.commit_existing_index_segments(
+        ...     "a_idx", "a", [segment], lease=lease
+        ... )
+        >>> dataset.retention_leases()
+        []
         """
-        self._ds.commit_existing_index_segments(index_name, column, segments)
+        self._ds.commit_existing_index_segments(index_name, column, segments, lease)
         return self
 
     def session(self) -> Session:

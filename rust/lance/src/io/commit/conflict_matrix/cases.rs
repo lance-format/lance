@@ -21,8 +21,18 @@ use crate::{Dataset, Error};
 ///
 /// Rows are `ours` — the transaction that has to rebase. Columns are `theirs`,
 /// the one that landed underneath it, keyed by [`Scenario::code`]. Cells are
-/// `L` lands, `R` retryable, `X` incompatible, and `!` excluded because what
-/// the code does today is wrong (see [`KNOWN_BUGS`]).
+/// `L` lands, `R` retryable, `X` incompatible, `N` a lease request that writes
+/// no version, `E` a lease request the new head makes invalid, and `!`
+/// excluded because what the code does today is wrong (see [`KNOWN_BUGS`]).
+///
+/// The lease rows and columns are the directional table in the transaction
+/// specification's "Retention Lease Transactions": a lease operation never
+/// conflicts in either direction, and the retry re-derives the lease list
+/// from the new head.
+///
+/// The fixture's lease retains every fragment, so the rewrite records its move
+/// in the fragment reuse index, as compaction does under a lease. That defers
+/// index remapping, so a rewrite and an index build do not conflict.
 ///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
@@ -33,23 +43,26 @@ use crate::{Dataset, Error};
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf
-append                    | L  L  L  L  L  L  L  L  R  R  R  L  L  X  X  L
-delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L
-delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
-update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L
-data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L
-data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R
-merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
-merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
-overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X
-update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X
+                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf aq rn rl
+append                    | L  L  L  L  L  L  L  L  R  R  R  L  L  X  X  L  L  L  L
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L
+data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L  L  L  L
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  L  L
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  L  L
+merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  L  L  L
+merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  L  L  L
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  L  X  X  L  L  L  L
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  L  R  X  X  L  L  L  L
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  L  L
+update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X  L  L  L
+acquire_lease             | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  L
+renew_lease               | L  L  L  L  L  L  L  L  L  L  L  L  L  E  E  L  L  N  E
+release_lease             | L  L  L  L  L  L  L  L  L  L  L  L  L  N  N  L  L  L  N
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -201,8 +214,11 @@ pub(super) fn run(
         );
 
         let result = staged.commit(&base).await;
-        let outcome = Outcome::of(&result);
-        let landed = result.ok().map(|dataset| (after_theirs, dataset));
+        let outcome = Outcome::of(&result, after_theirs.manifest.version);
+        let landed = result
+            .ok()
+            .filter(|_| outcome == Outcome::Lands)
+            .map(|dataset| (after_theirs, dataset));
         (outcome, landed)
     })
 }
@@ -230,6 +246,9 @@ pub(super) fn run(
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
 #[case::update_config(Scenario::UpdateConfig)]
+#[case::acquire_lease(Scenario::AcquireLease)]
+#[case::renew_lease(Scenario::RenewLease)]
+#[case::release_lease(Scenario::ReleaseLease)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -288,6 +307,9 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[case::overwrite(Scenario::Overwrite)]
 #[case::restore(Scenario::Restore)]
 #[case::update_config(Scenario::UpdateConfig)]
+#[case::acquire_lease(Scenario::AcquireLease)]
+#[case::renew_lease(Scenario::RenewLease)]
+#[case::release_lease(Scenario::ReleaseLease)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;
