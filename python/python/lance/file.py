@@ -99,10 +99,13 @@ class LanceFileReader:
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
         session : optional, lance.Session
-            A session whose metadata cache is used to cache page metadata and file
-            metadata for this reader. When omitted, no metadata cache is used.
-            Cache entries are scoped to this reader and are not reused across
-            readers.
+            A session whose metadata cache stores the pages read through this
+            reader, so reading the same page again in this reader reuses the
+            cached page data instead of reading it again. The footer and column
+            metadata are read when the reader is opened, before any page is
+            read, so they are not cached. When omitted, no metadata cache is
+            used. Entries are scoped to this reader and are not reused by
+            another reader.
         """
         if _inner_reader is not None:
             self._reader = _inner_reader
@@ -274,10 +277,13 @@ class LanceFileSession:
             The table identifier within the namespace.
             Must be provided together with namespace_client.
         session : optional, lance.Session
-            A session whose metadata cache is used by every reader opened from
-            this file session. Each reader's entries are scoped to that reader,
-            so they are not reused across readers. When omitted, readers use no
-            metadata cache.
+            A session whose metadata cache stores the pages read through every
+            reader opened from this file session, so reading the same page again
+            in one reader reuses the cached page data instead of reading it
+            again. Footer and column metadata are read when each reader is
+            opened and are not cached. When omitted, readers use no metadata
+            cache. Each reader's entries are scoped to that reader and are not
+            reused by another reader.
         """
         if isinstance(base_path, Path):
             base_path = str(base_path)
