@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import inspect
 import json
 import logging
 import os
@@ -3731,6 +3732,17 @@ def test_nearest_preserves_existing_positional_arguments(dataset):
         .to_table()
     )
     assert actual == expected
+
+    # New options are appended, so positional refinement arguments keep binding.
+    parameters = list(inspect.signature(ScannerBuilder.nearest).parameters)
+    assert parameters[parameters.index("quantized_refine_factor") :] == [
+        "quantized_refine_factor",
+        "refine_column",
+        "refine_q",
+        "refine_metric",
+        "multivector_algorithm",
+        "warp_imputation_rank",
+    ]
 
 
 def test_knn_deleted_rows(tmp_path):

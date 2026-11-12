@@ -39,12 +39,13 @@ use lance_index::vector::warp::{
     Stride, centroid_similarities, merge_strides, merge_top_k, missing_similarity,
     probe_partitions, split_row_ids, top_k_documents,
 };
-use lance_index::vector::{PreparedPartitionRows, Query, VectorIndex};
+use lance_index::vector::{ApproxMode, PreparedPartitionRows, Query, VectorIndex};
 use lance_linalg::distance::{DistanceType, dot_f32};
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
+use super::adaptive_probe::interpolate_budget;
 use super::{AnnIndexMetrics, KNN_INDEX_SCHEMA, prefilter_for_segment};
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
@@ -80,16 +81,73 @@ pub struct WarpSelection {
     /// `m_i`: the similarity imputed for documents query token `i` never
     /// observes, estimated over the partitions of every segment.
     pub missing_similarities: Vec<f32>,
+    /// How the probed partitions' tokens are scored.
+    pub approx_mode: ApproxMode,
 }
 
 /// Per-query WARP search parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct WarpParams {
-    /// Partitions each query token probes per index segment (`n_probe`).
+    /// Partitions each query token probes per index segment (`n_probe`) at
+    /// the default search effort, before the probe bounds apply.
     pub nprobe: usize,
+    /// The fewest partitions each query token probes per segment, as in
+    /// [`Query::minimum_nprobes`].
+    pub minimum_nprobes: usize,
+    /// The most partitions each query token probes per segment, as in
+    /// [`Query::maximum_nprobes`]; unset allows all partitions.
+    pub maximum_nprobes: Option<usize>,
+    /// The search effort in [0, 1], as in [`Query::search_effort`].
+    pub search_effort: f64,
     /// The rank `t'` whose estimated similarity is imputed for unobserved
     /// documents.
     pub imputation_rank: usize,
+    /// How the partitions' quantized tokens are scored, as in
+    /// [`Query::approx_mode`].
+    pub approx_mode: ApproxMode,
+}
+
+impl WarpParams {
+    /// Probe `nprobe` partitions per query token and segment at the default
+    /// effort, with no other bounds, and impute the `imputation_rank`-th
+    /// similarity.
+    #[cfg(test)]
+    pub fn new(nprobe: usize, imputation_rank: usize) -> Self {
+        Self {
+            nprobe,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            imputation_rank,
+            approx_mode: ApproxMode::default(),
+        }
+    }
+
+    /// The partitions each query token probes in a segment of
+    /// `num_partitions`.
+    ///
+    /// As in IVF search, effort 0.5 keeps the default budget (`nprobe`), 0
+    /// probes the minimum and 1 every partition up to the maximum, with
+    /// geometric interpolation in between. The minimum and maximum always
+    /// bound the result.
+    fn segment_nprobe(&self, num_partitions: usize) -> usize {
+        let upper = self
+            .maximum_nprobes
+            .map_or(num_partitions, |maximum| maximum.min(num_partitions));
+        if upper == 0 {
+            return 0;
+        }
+        let lower = self.minimum_nprobes.clamp(1, upper);
+        let default = self.nprobe.clamp(lower, upper);
+        let effort = self.search_effort;
+        if effort == 0.5 {
+            default
+        } else if effort < 0.5 {
+            interpolate_budget(effort, (0.0, lower), (0.5, default))
+        } else {
+            interpolate_budget(effort, (0.5, default), (1.0, upper))
+        }
+    }
 }
 
 /// Run WARPselect for a flattened multivector query against index segments.
@@ -114,11 +172,19 @@ pub async fn warp_select(
     let WarpParams {
         nprobe,
         imputation_rank,
+        search_effort,
+        approx_mode,
+        ..
     } = params;
-    if nprobe == 0 {
+    if nprobe == 0 || params.maximum_nprobes == Some(0) {
         return Err(Error::invalid_input(
             "WARP nprobes must be at least 1, got 0",
         ));
+    }
+    if !search_effort.is_finite() || !(0.0..=1.0).contains(&search_effort) {
+        return Err(Error::invalid_input(format!(
+            "search_effort must be finite and in [0, 1], got {search_effort}"
+        )));
     }
     if imputation_rank == 0 {
         return Err(Error::invalid_input(
@@ -204,6 +270,10 @@ pub async fn warp_select(
             (0..index.total_partitions()).map(|partition| index.partition_size(partition) as u32)
         })
         .collect::<Arc<[u32]>>();
+    let nprobes = indices
+        .iter()
+        .map(|index| params.segment_nprobe(index.total_partitions()))
+        .collect::<Arc<[usize]>>();
 
     // Each query token is selected independently, so tokens run in parallel.
     let shared_centroids = Arc::new(
@@ -215,6 +285,7 @@ pub async fn warp_select(
     let per_token = try_join_all(query_tokens.iter().cloned().map(|token| {
         let centroids = shared_centroids.clone();
         let partition_sizes = partition_sizes.clone();
+        let nprobes = nprobes.clone();
         spawn_cpu(move || {
             let similarities = centroids
                 .iter()
@@ -222,7 +293,8 @@ pub async fn warp_select(
                 .collect::<Result<Vec<_>>>()?;
             let probed = similarities
                 .iter()
-                .map(|similarities| probe_partitions(similarities, nprobe))
+                .zip(nprobes.iter())
+                .map(|(similarities, &nprobe)| probe_partitions(similarities, nprobe))
                 .collect::<Vec<_>>();
             let missing =
                 missing_similarity(&similarities.concat(), &partition_sizes, imputation_rank)?;
@@ -260,6 +332,7 @@ pub async fn warp_select(
         query_keys,
         segments,
         missing_similarities,
+        approx_mode,
     })
 }
 
@@ -534,7 +607,7 @@ fn partition_query(
         use_index: true,
         query_parallelism: 0,
         dist_q_c,
-        approx_mode: Default::default(),
+        approx_mode: selection.approx_mode,
     }
 }
 
@@ -718,18 +791,23 @@ impl DisplayAs for WarpExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let WarpParams {
             nprobe,
+            minimum_nprobes,
+            search_effort,
             imputation_rank,
+            ..
         } = self.params;
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
                 f,
-                "Warp: k={}, nprobes={nprobe}, imputation_rank={imputation_rank}, deltas={}",
+                "Warp: k={}, nprobes={nprobe}, imputation_rank={imputation_rank}, deltas={}, \
+                 minimum_nprobes={minimum_nprobes}, search_effort={search_effort}",
                 self.query.k,
                 self.indices.len()
             ),
             DisplayFormatType::TreeRender => write!(
                 f,
-                "Warp\nk={}\nnprobes={nprobe}\nimputation_rank={imputation_rank}\ndeltas={}",
+                "Warp\nk={}\nnprobes={nprobe}\nimputation_rank={imputation_rank}\ndeltas={}\n\
+                 minimum_nprobes={minimum_nprobes}\nsearch_effort={search_effort}",
                 self.query.k,
                 self.indices.len()
             ),
@@ -1001,10 +1079,7 @@ mod tests {
             &segments,
             &query,
             DIM,
-            WarpParams {
-                nprobe: 2,
-                imputation_rank,
-            },
+            WarpParams::new(2, imputation_rank),
             &NoOpMetricsCollector,
         )
         .await
@@ -1082,10 +1157,7 @@ mod tests {
             &[],
             &query,
             dim,
-            WarpParams {
-                nprobe,
-                imputation_rank,
-            },
+            WarpParams::new(nprobe, imputation_rank),
             &NoOpMetricsCollector,
         )
         .await
@@ -1135,10 +1207,7 @@ mod tests {
             &segments,
             &query,
             DIM,
-            WarpParams {
-                nprobe,
-                imputation_rank: 100,
-            },
+            WarpParams::new(nprobe, 100),
             &NoOpMetricsCollector,
         )
         .await
@@ -1259,10 +1328,7 @@ mod tests {
             &segments,
             &query,
             DIM,
-            WarpParams {
-                nprobe: 1,
-                imputation_rank: 1,
-            },
+            WarpParams::new(1, 1),
             &NoOpMetricsCollector,
         )
         .await
@@ -1346,15 +1412,14 @@ mod tests {
                 }
             }
         }
-        let missing_total = missing.iter().sum::<f32>();
         let mut scored = best
             .into_iter()
             .map(|(row_id, per_token)| {
                 let score = per_token
                     .iter()
                     .zip(missing)
-                    .filter_map(|(best, &missing)| best.map(|best| best - missing))
-                    .fold(missing_total, |score, gain| score + gain);
+                    .map(|(best, &missing)| best.unwrap_or(missing))
+                    .fold(0.0, |score, similarity| score + similarity);
                 (row_id, score)
             })
             .collect::<Vec<_>>();
@@ -1366,17 +1431,42 @@ mod tests {
     /// Scanning each probed partition once for all its query tokens, and the
     /// parallel reduction, return the same top k as scoring every probe with a
     /// partition search and reducing by the definition.
+    ///
+    /// The query's approximation mode reaches the scoring of RQ partitions.
     #[rstest]
-    #[case::ivf_flat(VectorIndexParams::ivf_flat(4, DistanceType::Cosine))]
-    #[case::ivf_pq(VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::Cosine, 50))]
-    #[case::ivf_sq(VectorIndexParams::with_ivf_sq_params(
-        DistanceType::Cosine,
-        ivf(4),
-        SQBuildParams::default()
-    ))]
-    #[case::ivf_rq(VectorIndexParams::ivf_rq(4, 4, DistanceType::Cosine))]
+    #[case::ivf_flat(
+        VectorIndexParams::ivf_flat(4, DistanceType::Cosine),
+        ApproxMode::Normal
+    )]
+    #[case::ivf_pq(
+        VectorIndexParams::ivf_pq(4, 8, 4, DistanceType::Cosine, 50),
+        ApproxMode::Normal
+    )]
+    #[case::ivf_sq(
+        VectorIndexParams::with_ivf_sq_params(
+            DistanceType::Cosine,
+            ivf(4),
+            SQBuildParams::default()
+        ),
+        ApproxMode::Normal
+    )]
+    #[case::ivf_rq(
+        VectorIndexParams::ivf_rq(4, 4, DistanceType::Cosine),
+        ApproxMode::Normal
+    )]
+    #[case::ivf_rq_fast(
+        VectorIndexParams::ivf_rq(4, 4, DistanceType::Cosine),
+        ApproxMode::Fast
+    )]
+    #[case::ivf_rq_accurate(
+        VectorIndexParams::ivf_rq(4, 4, DistanceType::Cosine),
+        ApproxMode::Accurate
+    )]
     #[tokio::test]
-    async fn test_warp_matches_partition_search_reference(#[case] params: VectorIndexParams) {
+    async fn test_warp_matches_partition_search_reference(
+        #[case] params: VectorIndexParams,
+        #[case] approx_mode: ApproxMode,
+    ) {
         let mut rng = StdRng::seed_from_u64(7);
         let (mut dataset, segments) = two_segment_dataset(&params, &mut rng).await;
         dataset.delete("id % 10 = 0").await.unwrap();
@@ -1391,8 +1481,8 @@ mod tests {
             &query,
             DIM,
             WarpParams {
-                nprobe: 2,
-                imputation_rank: 100,
+                approx_mode,
+                ..WarpParams::new(2, 100)
             },
             &NoOpMetricsCollector,
         )
@@ -1409,7 +1499,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let reference = reference_strides(&dataset, &selection, pre_filter).await;
+        let reference = reference_strides(&dataset, &selection, pre_filter.clone()).await;
         for (token, (actual, expected)) in strides.iter().zip(&reference).enumerate() {
             assert_eq!(
                 merge_strides(actual).unwrap(),
@@ -1421,7 +1511,7 @@ mod tests {
         let expected = reference_top_k(&reference, &selection.missing_similarities, k);
         assert_eq!(expected.len(), k);
         let top = warp_top_k(
-            strides,
+            strides.clone(),
             selection.missing_similarities.clone(),
             DistanceRange::default(),
             k,
@@ -1429,6 +1519,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(top, expected);
+
+        if approx_mode != ApproxMode::Normal {
+            let mut normal = selection;
+            normal.approx_mode = ApproxMode::Normal;
+            let normal_strides = warp_score(&dataset, &normal, pre_filter, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert_ne!(strides, normal_strides, "{approx_mode:?} scored as Normal");
+        }
+    }
+
+    #[rstest]
+    #[case::default(32, 1, None, 0.5, 100, 32)]
+    #[case::minimum_raises(32, 64, None, 0.5, 100, 64)]
+    #[case::minimum_capped_by_partitions(32, 64, None, 0.5, 40, 40)]
+    #[case::fixed(4, 4, Some(4), 0.5, 100, 4)]
+    #[case::fewer_partitions(32, 1, None, 0.5, 10, 10)]
+    #[case::no_partitions(32, 1, None, 0.5, 0, 0)]
+    #[case::least_effort(32, 1, None, 0.0, 100, 1)]
+    #[case::least_effort_keeps_minimum(32, 8, None, 0.0, 100, 8)]
+    #[case::full_effort(32, 1, None, 1.0, 100, 100)]
+    #[case::full_effort_keeps_maximum(50, 1, Some(50), 1.0, 100, 50)]
+    // 32 * (100 / 32)^0.5 = 56.6, rounded up.
+    #[case::interpolated_effort(32, 1, None, 0.75, 100, 57)]
+    fn test_segment_nprobe(
+        #[case] nprobe: usize,
+        #[case] minimum_nprobes: usize,
+        #[case] maximum_nprobes: Option<usize>,
+        #[case] search_effort: f64,
+        #[case] num_partitions: usize,
+        #[case] expected: usize,
+    ) {
+        let params = WarpParams {
+            minimum_nprobes,
+            maximum_nprobes,
+            search_effort,
+            ..WarpParams::new(nprobe, 1)
+        };
+        assert_eq!(params.segment_nprobe(num_partitions), expected);
+    }
+
+    /// The scanner's probe controls reach WARP, which multivector search uses
+    /// by default.
+    #[rstest]
+    #[case::default(None, None, None, 32)]
+    #[case::nprobes(Some(4), None, None, 4)]
+    #[case::minimum_nprobes(None, Some(36), None, 36)]
+    #[case::full_effort(None, None, Some(1.0), 40)]
+    #[case::least_effort(None, None, Some(0.0), 1)]
+    #[tokio::test]
+    async fn test_warp_probe_controls(
+        #[case] nprobes: Option<usize>,
+        #[case] minimum_nprobes: Option<usize>,
+        #[case] search_effort: Option<f64>,
+        #[case] expected: usize,
+    ) {
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut dataset = write(None, multivector_batch(0, 700, &mut rng))
+            .await
+            .unwrap();
+        let num_partitions = 40;
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::ivf_flat(num_partitions, DistanceType::Cosine),
+                true,
+            )
+            .await
+            .unwrap();
+        // One query token, so each probed partition is searched once.
+        let query = Float32Array::from(vec![0.5; DIM]);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vector", &query, 10).unwrap();
+        if let Some(nprobes) = nprobes {
+            scanner.nprobes(nprobes);
+        }
+        if let Some(minimum_nprobes) = minimum_nprobes {
+            scanner.minimum_nprobes(minimum_nprobes);
+        }
+        if let Some(search_effort) = search_effort {
+            scanner.search_effort(search_effort).unwrap();
+        }
+        let plan = scanner.analyze_plan().await.unwrap();
+        let warp = plan
+            .lines()
+            .find(|line| line.contains("Warp:"))
+            .unwrap_or_else(|| panic!("{plan}"));
+        assert!(
+            warp.contains(&format!("partitions_searched={expected},")),
+            "{warp}"
+        );
     }
 
     /// Counts the items alive, like the storage prepared partitions pin.
@@ -1517,10 +1700,7 @@ mod tests {
             &segments,
             &query,
             DIM,
-            WarpParams {
-                nprobe: 4,
-                imputation_rank: 1,
-            },
+            WarpParams::new(4, 1),
             &NoOpMetricsCollector,
         )
         .await

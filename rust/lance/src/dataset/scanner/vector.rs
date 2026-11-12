@@ -1451,11 +1451,15 @@ impl Scanner {
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
         let params = WarpParams {
             // WARP probes a fixed count rather than expanding until k results
-            // are found, so it takes the probing ceiling.
+            // are found, so an explicit ceiling is its default budget.
             nprobe: q.maximum_nprobes.unwrap_or(DEFAULT_WARP_NPROBE),
+            minimum_nprobes: q.minimum_nprobes,
+            maximum_nprobes: q.maximum_nprobes,
+            search_effort: q.search_effort,
             imputation_rank: self
                 .warp_imputation_rank
                 .unwrap_or(q.k * *DEFAULT_XTR_OVERFETCH as usize),
+            approx_mode: q.approx_mode,
         };
         let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
         Ok(Arc::new(WarpExec::new(

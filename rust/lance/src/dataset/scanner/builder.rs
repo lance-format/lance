@@ -1279,9 +1279,13 @@ impl Scanner {
 
     /// Choose the algorithm for indexed multivector search.
     ///
-    /// Unset, WARP is used when every index segment supports it and XTR
-    /// otherwise. Choosing WARP for an index it does not support fails the
-    /// query; see [`MultivectorAlgorithm::Warp`].
+    /// Leave it unset: WARP is used when every index segment supports it and
+    /// XTR otherwise. Prefer WARP, which delivers much higher recall than XTR
+    /// at similar or lower latency. On BEIR SciFact at the defaults, its
+    /// recall@10 against exact search is 0.79-0.86 versus XTR's 0.53-0.56, and
+    /// XTR stays below 0.56 at any [`Self::nprobes`]. Choose XTR only to
+    /// reproduce earlier results. Choosing WARP for an index it does not
+    /// support fails the query; see [`MultivectorAlgorithm::Warp`].
     ///
     /// ```
     /// # use arrow_array::Float32Array;
@@ -1303,14 +1307,27 @@ impl Scanner {
         self
     }
 
-    /// Set WARP's imputation rank `t'` (must be at least 1).
+    /// Set WARP's imputation rank `t'` (must be at least 1); most callers
+    /// should leave it unset.
     ///
-    /// A query token imputes, for documents it never observes, an estimate of
-    /// the similarity of its `t'`-th most similar indexed token. Defaults to the
-    /// number of tokens XTR retrieves per query token, `k * LANCE_XTR_OVERFETCH`.
-    /// WARP probes a fixed number of partitions per query token and segment:
-    /// the maximum set by [`Self::nprobes`] or [`Self::maximum_nprobes`],
-    /// defaulting to [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`].
+    /// When none of a document's tokens is in the partitions a query token
+    /// probed, WARP cannot compute that token's similarity to the document,
+    /// so it imputes the similarity of roughly the `t'`-th most similar token
+    /// in the whole index, estimated from the centroids and partition sizes.
+    /// Defaults to `k * LANCE_XTR_OVERFETCH`, i.e. `k * 10` unless that
+    /// environment variable is set. It is not a latency knob: it reads no
+    /// extra data. Larger values impute lower similarities, so documents that
+    /// only some query tokens observe rank lower. Its effect on recall is
+    /// small: on SciFact (1.9 million tokens), recall@10 varied by at most
+    /// 0.02 between 10 and 100000, and was best between 1000 and 10000.
+    /// Prefer more partitions to raise recall.
+    ///
+    /// WARP probes a fixed number of partitions per query token and segment,
+    /// [`lance_index::vector::warp::DEFAULT_WARP_NPROBE`] by default. As for
+    /// IVF search, [`Self::nprobes`], [`Self::minimum_nprobes`],
+    /// [`Self::maximum_nprobes`] and [`Self::search_effort`] change it, except
+    /// that a maximum set alone is the count WARP probes, since it never
+    /// expands its search.
     ///
     /// ```
     /// # use arrow_array::Float32Array;

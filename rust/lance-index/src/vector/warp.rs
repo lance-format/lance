@@ -356,10 +356,12 @@ impl Eq for Candidate {}
 /// `token_scores[i]` is query token `i`'s merged scores `f_i` (see
 /// [`merge_strides`]) and `missing_similarities[i]` its `m_i`. A document `D`
 /// some token observes scores `Σ_i f_i(D)`, with `f_i(D) = m_i` when token `i`
-/// does not observe it. Following Section 5.3, this is computed as
-/// `Σ_i m_i + Σ_{i observes D} (f_i(D) - m_i)`, adding tokens in ascending
-/// order, by merging the token lists by row id, so no candidate × token score
-/// matrix is built. Documents no token observes are never candidates, and
+/// does not observe it. The token lists are merged by row id, so no
+/// candidate × token score matrix is built, and each score adds its terms in
+/// ascending token order. Section 5.3's `Σ_i m_i + Σ_{i observes D} (f_i(D) - m_i)`
+/// would cancel in floating point: a document every token observes would not
+/// score exactly the sum of its similarities, and a zero lower distance bound
+/// could reject an exact match. Documents no token observes are never candidates, and
 /// neither are documents whose score fails `is_eligible`: a distance range
 /// must be applied here, before selection, or the top k can crowd out every
 /// document in range.
@@ -397,7 +399,6 @@ pub fn top_k_documents(
         return Ok(Vec::new());
     }
 
-    let missing_total = missing_similarities.iter().sum::<f32>();
     let positions = token_scores
         .iter()
         .map(|scores| scores.positions(&rows))
@@ -417,13 +418,20 @@ pub fn top_k_documents(
     let mut top = BinaryHeap::with_capacity(k + 1);
 
     while let Some(&Reverse((row_id, _))) = frontier.peek() {
-        let mut score = missing_total;
+        // Tokens pop in ascending order, so the tokens skipped since the last
+        // observed one are those that do not observe this row.
+        let mut score = 0.0_f32;
+        let mut next_token = 0;
         while let Some(&Reverse((next_row_id, token))) = frontier.peek() {
             if next_row_id != row_id {
                 break;
             }
             frontier.pop();
-            score += token_scores[token].similarities[cursors[token]] - missing_similarities[token];
+            score = missing_similarities[next_token..token]
+                .iter()
+                .fold(score, |score, missing| score + missing);
+            score += token_scores[token].similarities[cursors[token]];
+            next_token = token + 1;
             cursors[token] += 1;
             if cursors[token] < positions[token].end {
                 frontier.push(Reverse((
@@ -432,6 +440,9 @@ pub fn top_k_documents(
                 )));
             }
         }
+        score = missing_similarities[next_token..]
+            .iter()
+            .fold(score, |score, missing| score + missing);
         if !is_eligible(score) {
             continue;
         }
@@ -720,6 +731,27 @@ mod tests {
         // them out of a top 2.
         let top = top_k_documents(&token_scores, &[0.0], .., |score| score <= 0.5, 2).unwrap();
         assert_eq!(top, vec![(3, 0.3), (4, 0.2)]);
+    }
+
+    #[test]
+    fn test_top_k_documents_scores_without_cancellation() {
+        // Row 7 is observed by every token, row 8 by every token but the last.
+        let num_tokens = 32;
+        let token_scores = (0..num_tokens)
+            .map(|token| {
+                if token + 1 < num_tokens {
+                    stride(vec![7, 8], vec![1.0, 0.9])
+                } else {
+                    stride(vec![7], vec![1.0])
+                }
+            })
+            .collect::<Vec<_>>();
+        let missing = vec![0.3; num_tokens];
+        let top = top_k_documents(&token_scores, &missing, .., |_| true, 2).unwrap();
+        // An exact match scores exactly one per token, i.e. distance zero.
+        assert_eq!(top[0], (7, num_tokens as f32));
+        let expected = (0..num_tokens - 1).fold(0.0_f32, |score, _| score + 0.9) + 0.3;
+        assert_eq!(top[1], (8, expected));
     }
 
     #[test]
