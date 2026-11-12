@@ -383,7 +383,7 @@ impl Footprint {
     /// claims cannot be widened instead, or two writes of sibling children
     /// would collide through their shared parent.
     ///
-    /// Only the dependency widens, in the same [`Mode::RequiresUnlessRemoved`],
+    /// Only the dependency widens, in the same unless-removed mode,
     /// so a re-encode of a related field or a removal of the fragment still
     /// leaves the segment alone. Call it once per schema the ids may be
     /// resolved in; a field missing from `schema` keeps only its own id.
