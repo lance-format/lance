@@ -108,6 +108,14 @@ impl SetDeletionFile {
         self.base
     }
 
+    /// Replace the deletion file with `merged`, written to the dataset's own
+    /// directory by the rebase, holding this action's deletions and every one
+    /// committed to the fragment since it read.
+    pub(super) fn install_merged(&mut self, merged: DeletionFile) {
+        self.deletion_file = Some(merged);
+        self.base = None;
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let deletion_file = self
             .deletion_file
@@ -133,8 +141,18 @@ impl SetDeletionFile {
 
     /// The fragment's deletions, which is a distinct coordinate from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
+    ///
+    /// A new deletion file is taken to add deletions, which merge with another
+    /// set's row by row (see [`Overlap::Deletions`](super::Overlap::Deletions));
+    /// the rebase reads both files and refuses one that dropped a deletion.
+    /// Clearing the file removes deletions, and collides with any other change
+    /// to them.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        if self.deletion_file.is_some() {
+            footprint.add_deletions(self.fragment);
+        } else {
+            footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        }
     }
 }
 

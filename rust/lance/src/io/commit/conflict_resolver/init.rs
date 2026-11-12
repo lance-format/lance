@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use lance_table::transaction::action::Action;
 
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
