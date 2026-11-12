@@ -1096,7 +1096,7 @@ mod tests {
             .sum::<usize>();
         assert_eq!(total_tokens, 500 * TOKENS_PER_ROW);
 
-        for (token, query_token) in query.values().chunks_exact(DIM).enumerate() {
+        for (token, query_token) in query.values().as_chunks::<DIM>().0.iter().enumerate() {
             let norm = dot_f32(query_token, query_token).sqrt();
             let unit = query_token.iter().map(|v| v / norm).collect::<Vec<_>>();
 
@@ -1233,8 +1233,10 @@ mod tests {
                     row_id,
                     values
                         .values()
-                        .chunks_exact(DIM)
-                        .map(<[f32]>::to_vec)
+                        .as_chunks::<DIM>()
+                        .0
+                        .iter()
+                        .map(|token| token.to_vec())
                         .collect(),
                 )
             })
@@ -1520,13 +1522,26 @@ mod tests {
         .unwrap();
         assert_eq!(top, expected);
 
-        if approx_mode != ApproxMode::Normal {
+        assert_eq!(
+            partition_query(&selection, &selection.segments[0], 0, 0).approx_mode,
+            approx_mode
+        );
+        // The deletions route IVF_RQ through per-row scoring, where only Fast
+        // changes distances; Accurate only affects unfiltered batch scoring.
+        if approx_mode == ApproxMode::Fast {
             let mut normal = selection;
             normal.approx_mode = ApproxMode::Normal;
             let normal_strides = warp_score(&dataset, &normal, pre_filter, &NoOpMetricsCollector)
                 .await
                 .unwrap();
-            assert_ne!(strides, normal_strides, "{approx_mode:?} scored as Normal");
+            // Strides arrive in completion order, so compare them merged.
+            let merged = |strides: &[Vec<Stride>]| {
+                strides
+                    .iter()
+                    .map(|token_strides| merge_strides(token_strides).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert_ne!(merged(&strides), merged(&normal_strides));
         }
     }
 
