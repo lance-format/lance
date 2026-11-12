@@ -211,6 +211,9 @@ jobs:
     strategy:
       matrix:
         python-minor-version: ${{ fromJSON(needs.changes.outputs.bindings == 'true' && '["10", "13", "14"]' || '["14"]') }}
+        include:
+          - python-minor-version: "14"
+            doctest: true
     name: "Python Linux 3.${{ matrix.python-minor-version }} x86_64"
     runs-on: "ubuntu-24.04-4x"
     defaults:
@@ -239,13 +242,9 @@ jobs:
       - uses: ./.github/workflows/run_tests
         with:
           memtest: true
-      # Reuse the wheel's compiled module so the doctests run from the source
-      # tree, where their fixture paths resolve.
       - name: Run doctests
-        if: ${{ !cancelled() && matrix.python-minor-version == '14' }}
-        run: |
-          ln -s "$(python -c 'import lance.lance as m; print(m.__file__)')" python/lance/
-          pytest --doctest-modules python/lance
+        if: ${{ !cancelled() && matrix.doctest }}
+        run: pytest --doctest-modules --pyargs lance
 
   compat:
     needs: linux-wheel
