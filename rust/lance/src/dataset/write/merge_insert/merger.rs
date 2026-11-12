@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::inserted_rows::{KeyExistenceFilterBuilder, extract_key_value_from_batch};
 use super::{
     InsertedKeyTracker, MergeInsertParams, MergeStats, SourceDedupeBehavior, WhenMatched,
     WhenNotMatchedBySource, create_duplicate_row_error, format_key_values_on_columns,
@@ -120,6 +121,8 @@ pub(super) struct Merger {
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
+    /// Inserted keys for declared primary-key conflict detection; absent otherwise.
+    pub(super) inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilterBuilder>>>,
 }
 
 impl Merger {
@@ -130,6 +133,7 @@ impl Merger {
         joined_schema: &Schema,
         with_row_addr: bool,
         enable_stable_row_ids: bool,
+        inserted_rows_filter: Option<KeyExistenceFilterBuilder>,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -202,6 +206,7 @@ impl Merger {
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
             processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
+            inserted_rows_filter: Arc::new(Mutex::new(inserted_rows_filter)),
         })
     }
 
@@ -446,6 +451,21 @@ impl Merger {
                 if keep_indices.len() != not_matched.num_rows() {
                     not_matched =
                         take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
+                }
+            }
+            // Track only rows that will actually be inserted, after source deduplication.
+            if let Some(filter) = self
+                .inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_mut()
+            {
+                for row_idx in 0..not_matched.num_rows() {
+                    if let Some(key) =
+                        extract_key_value_from_batch(&not_matched, row_idx, &self.params.on)
+                    {
+                        filter.insert(key)?;
+                    }
                 }
             }
             let not_matched = not_matched.project(&output_cols)?;

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_datagen::ArrayGeneratorExt;
 
 // For some reason, Windows isn't able to handle the timeout test. Possibly
 // a performance bug in their timer implementation?
@@ -679,58 +680,101 @@ async fn test_skip_auto_cleanup() {
     );
 }
 
+#[rstest::rstest]
+#[case::scan(false, false, true, "id")]
+#[case::indexed(false, true, true, "id")]
+#[case::indexed_partial(true, true, true, "id")]
+#[case::undeclared(false, true, false, "id")]
+#[case::undeclared_partial(true, true, false, "id")]
+#[case::other_key(false, true, true, "value")]
 #[tokio::test]
-async fn test_transaction_inserted_rows_filter_roundtrip() {
-    // Create dataset with unenforced primary key on "id" column
+async fn test_transaction_inserted_rows_filter_roundtrip(
+    #[case] is_partial: bool,
+    #[case] use_index: bool,
+    #[case] has_primary_key: bool,
+    #[case] on: &str,
+) {
+    let mut id_field = Field::new("id", DataType::UInt32, false);
+    if has_primary_key {
+        id_field = id_field.with_metadata(HashMap::from([(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        )]));
+    }
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::UInt32, false).with_metadata(
-            vec![(
-                "lance-schema:unenforced-primary-key".to_string(),
-                "true".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        ),
+        id_field,
         Field::new("value", DataType::UInt32, false),
+        Field::new("extra", DataType::UInt32, true),
     ]));
     let initial = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(UInt32Array::from(vec![0, 1, 2])),
             Arc::new(UInt32Array::from(vec![0, 0, 0])),
+            Arc::new(UInt32Array::from(vec![Some(10), None, Some(30)])),
         ],
     )
     .unwrap();
-    let dataset = InsertBuilder::new("memory://")
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        })
         .execute(vec![initial])
         .await
         .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    if use_index {
+        dataset
+            .create_index(
+                &[on],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
     let dataset = Arc::new(dataset);
 
-    // Source with overlapping key 1
+    // Only key 3 is inserted; key 1 is updated and must not enter the filter.
     let new_batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
             Arc::new(UInt32Array::from(vec![1, 3])),
             Arc::new(UInt32Array::from(vec![2, 2])),
+            Arc::new(UInt32Array::from(vec![None, Some(40)])),
         ],
     )
     .unwrap();
-    let stream =
-        RecordBatchStreamAdapter::new(schema.clone(), futures::stream::iter(vec![Ok(new_batch)]));
+    let new_batch = if is_partial {
+        // Omit the nullable payload and put the key after the value.
+        new_batch.project(&[1, 0]).unwrap()
+    } else {
+        new_batch
+    };
+    let mut expected = KeyExistenceFilterBuilder::new(vec![dataset.schema().field(on).unwrap().id]);
+    expected
+        .insert(extract_key_value_from_batch(&new_batch, 1, &[on.to_string()]).unwrap())
+        .unwrap();
+    let expected = (has_primary_key && on == "id").then(|| expected.build());
 
-    let UncommittedMergeInsert { transaction, .. } =
-        MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .try_build()
-            .unwrap()
-            .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
-            .await
-            .unwrap();
+    let UncommittedMergeInsert {
+        transaction,
+        inserted_rows_filter,
+        ..
+    } = MergeInsertBuilder::try_new(dataset.clone(), vec![on.to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_uncommitted_batches(vec![new_batch])
+        .await
+        .unwrap();
+    assert_eq!(inserted_rows_filter, expected);
 
-    // Commit and read back transaction file
     let committed = CommitBuilder::new(dataset.clone())
         .execute(transaction)
         .await
@@ -739,19 +783,14 @@ async fn test_transaction_inserted_rows_filter_roundtrip() {
     let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
         .await
         .unwrap();
-    // Check that inserted_rows_filter is present in the Operation::Update
-    if let Operation::Update {
+    let Operation::Update {
         inserted_rows_filter,
         ..
     } = &tx_read.operation
-    {
-        assert!(inserted_rows_filter.is_some());
-        let filter = inserted_rows_filter.as_ref().unwrap();
-        // Field IDs are assigned by Lance schema; check that we tracked exactly 1 key field
-        assert_eq!(filter.field_ids.len(), 1);
-    } else {
+    else {
         panic!("Expected Operation::Update");
-    }
+    };
+    assert_eq!(inserted_rows_filter, &expected);
 }
 
 /// Test that two merge insert operations on the same existing key conflict.
@@ -842,95 +881,6 @@ async fn test_inserted_rows_filter_bloom_conflict_detection_concurrent() {
     );
 }
 
-/// Test that two merge insert operations inserting the same NEW key conflict.
-/// First merge insert commits successfully (inserts id=100), second one fails
-/// with conflict error because both inserted the same new key (detected via bloom filter).
-#[tokio::test]
-async fn test_concurrent_insert_same_new_key() {
-    // Create schema with unenforced primary key on "id" column
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::UInt32, false).with_metadata(
-            vec![(
-                "lance-schema:unenforced-primary-key".to_string(),
-                "true".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        ),
-        Field::new("value", DataType::UInt32, false),
-    ]));
-    // Initial dataset with ids 0, 1, 2, 3 - NOT containing id=100
-    let initial = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
-            Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
-        ],
-    )
-    .unwrap();
-
-    let dataset = InsertBuilder::new("memory://")
-        .execute(vec![initial])
-        .await
-        .unwrap();
-    let dataset = Arc::new(dataset);
-
-    // Both jobs try to INSERT the same NEW key id=100 (doesn't exist in initial data)
-    let batch1 = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![100])), // NEW key id=100
-            Arc::new(UInt32Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let batch2 = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![100])), // Same NEW key id=100
-            Arc::new(UInt32Array::from(vec![2])),
-        ],
-    )
-    .unwrap();
-
-    // Create second merge insert job based on version 1 with 0 retries
-    let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .conflict_retries(0)
-        .try_build()
-        .unwrap();
-
-    // First merge insert commits (creates version 2, inserts id=100)
-    let s1 = RecordBatchStreamAdapter::new(
-        schema.clone(),
-        futures::stream::iter(vec![Ok(batch1.clone())]),
-    );
-    let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-        .unwrap()
-        .when_matched(WhenMatched::UpdateAll)
-        .when_not_matched(WhenNotMatched::InsertAll)
-        .try_build()
-        .unwrap();
-    let result1 = b1.execute(Box::pin(s1) as SendableRecordBatchStream).await;
-    assert!(result1.is_ok(), "First merge insert should succeed");
-
-    // Second merge insert tries to commit based on version 1, needs to rebase against version 2
-    let s2 = RecordBatchStreamAdapter::new(
-        schema.clone(),
-        futures::stream::iter(vec![Ok(batch2.clone())]),
-    );
-    let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
-
-    // Second merge insert should fail because bloom filters show both inserted key 100
-    assert!(
-        matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
-        "Expected TooMuchWriteContention (retryable conflict exhausted), got: {:?}",
-        result2
-    );
-}
-
 /// Concurrency regression for lance-format/lance#6441: two concurrent
 /// find-or-create jobs (`WhenMatched::DoNothing` + `WhenNotMatched::InsertAll`)
 /// both try to insert the same fresh key. The second must fail with
@@ -939,56 +889,61 @@ async fn test_concurrent_insert_same_new_key() {
 /// routing find-or-create through v2 this did not work at all: the v1
 /// path returned `inserted_rows_filter=None`, so there was nothing to
 /// intersect against during conflict resolution.
+#[rstest::rstest]
+#[case::uint32(DataType::UInt32)]
+#[case::binary(DataType::Binary)]
+#[case::large_binary(DataType::LargeBinary)]
+#[case::fixed_size_binary(DataType::FixedSizeBinary(32))]
 #[tokio::test]
-async fn test_concurrent_find_or_create_same_new_key() {
-    // Schema with an unenforced primary key on "id" — that is what
-    // activates bloom-filter conflict detection.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::UInt32, false).with_metadata(
-            vec![(
+async fn test_concurrent_find_or_create_same_new_key(
+    #[case] key_type: DataType,
+    #[values(false, true)] use_index: bool,
+) {
+    let data = lance_datagen::gen_batch()
+        .col(
+            "id",
+            array::rand_type(&key_type).with_metadata(HashMap::from([(
                 "lance-schema:unenforced-primary-key".to_string(),
                 "true".to_string(),
-            )]
-            .into_iter()
-            .collect(),
-        ),
-        Field::new("value", DataType::UInt32, false),
+            )])),
+        )
+        .col("value", array::step::<UInt32Type>())
+        .into_batch_rows(RowCount::from(5))
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        data.schema().field(0).clone().with_nullable(false),
+        data.schema().field(1).clone(),
     ]));
-    // Initial dataset with ids 0..=3 — id=100 is not present.
-    let initial = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
-            Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
-        ],
-    )
-    .unwrap();
+    let data = RecordBatch::try_new(schema.clone(), data.columns().to_vec()).unwrap();
 
-    let dataset = InsertBuilder::new("memory://")
-        .execute(vec![initial])
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        })
+        .execute(vec![data.slice(0, 4)])
         .await
         .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    if use_index {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
     let dataset = Arc::new(dataset);
 
-    // Both jobs try to find-or-create the same new id=100.
-    let batch1 = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![100])),
-            Arc::new(UInt32Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let batch2 = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(UInt32Array::from(vec![100])),
-            Arc::new(UInt32Array::from(vec![2])),
-        ],
-    )
-    .unwrap();
+    // Both jobs try to find-or-create the same key absent from both fragments.
+    let batch1 = data.slice(4, 1);
+    let batch2 = batch1.clone();
 
-    // b2 is built against version 1 with zero retries, so when it needs
+    // b2 is built against the same version with zero retries, so when it needs
     // to rebase against b1's commit the bloom-filter intersection decides
     // the outcome directly.
     let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
@@ -999,7 +954,7 @@ async fn test_concurrent_find_or_create_same_new_key() {
         .try_build()
         .unwrap();
 
-    // First job commits successfully, producing version 2 with id=100.
+    // First job commits successfully, inserting the new key.
     let s1 = RecordBatchStreamAdapter::new(
         schema.clone(),
         futures::stream::iter(vec![Ok(batch1.clone())]),
@@ -1021,9 +976,17 @@ async fn test_concurrent_find_or_create_same_new_key() {
     let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
 
     assert!(
-        matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
+        matches!(&result2, Err(crate::Error::TooMuchWriteContention { message, .. })
+            if message.contains("Attempted 0 retries.")),
         "Expected TooMuchWriteContention (bloom-filter conflict) for find-or-create, got: {:?}",
         result2
+    );
+    let mut latest = (*dataset).clone();
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.count_rows(None).await.unwrap(), 5);
+    assert_eq!(
+        latest.count_rows(Some("value = 4".into())).await.unwrap(),
+        1
     );
 }
 

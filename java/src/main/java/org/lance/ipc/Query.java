@@ -374,11 +374,14 @@ public class Query {
      *
      * <p>Absent effort resolves to 0.5 and preserves Auto. Zero starts at the caller minimum (at
      * least one available partition); one starts at all available partitions, subject to the caller
-     * maximum. Intermediate values interpolate geometrically. Later expansion to find enough
-     * candidates is unchanged. This is independent of approximation mode, HNSW ef and refinement,
-     * and is not a recall guarantee. Any explicit effort, including 0.5, ignores fixed nprobes
-     * regardless of setter order. Explicit minimum and maximum bounds remain effective. Effort
-     * validation occurs in the Rust core when the query is executed.
+     * maximum. For L2, cosine and dot with k up to 100000, efforts 0.1, 0.25 and 0.5 target 80%,
+     * 90% and 95% mean partition-routing recall, respectively. These are empirical targets, not
+     * guaranteed end-to-end Recall@k. Intermediate budgets interpolate geometrically between these
+     * anchors. Hamming and larger k retain uncalibrated interpolation. Later expansion to find
+     * enough candidates is unchanged. This is independent of approximation mode, HNSW ef and
+     * refinement, and is not a recall guarantee. Any explicit effort, including 0.5, ignores fixed
+     * nprobes regardless of setter order. Explicit minimum and maximum bounds remain effective.
+     * Effort validation occurs in the Rust core when the query is executed.
      *
      * <p>Example: {@code new
      * Query.Builder().setColumn("vector").setKey(vector).setSearchEffort(0.75).build()}.
@@ -478,8 +481,9 @@ public class Query {
     /**
      * Sets the speed / accuracy tradeoff for approximate vector search.
      *
-     * <p>This setting currently only affects RQ-quantized vector indexes, such as IVF_RQ. Other
-     * index types ignore this setting.
+     * <p>This setting currently affects RQ-quantized vector indexes (such as IVF_RQ) and HNSW
+     * sub-index searches that exclude rows (for example through a prefilter or deletions), where
+     * {@code FAST} enables the ACORN traversal. Other index types ignore this setting.
      *
      * @param approxMode The approximate search mode to use for the query.
      * @return The Builder instance for method chaining.

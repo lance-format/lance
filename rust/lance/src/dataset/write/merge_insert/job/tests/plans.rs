@@ -190,6 +190,173 @@ async fn test_plan_join_build_side_follows_source_statistics() {
     );
 }
 
+/// The same build-side choice, now driven by a width measured from the target's
+/// string column instead of the decoder's cold seed. The target is small enough
+/// to be collected under the seed, while its decoded values are larger than the
+/// materialized source and the collection threshold.
+#[tokio::test]
+async fn test_plan_join_build_side_uses_measured_widths() {
+    use crate::dataset::builder::DatasetBuilder;
+
+    fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
+        if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+            return Some(join);
+        }
+        for child in plan.children() {
+            if let Some(join) = find_hash_join(child.as_ref()) {
+                return Some(join);
+            }
+        }
+        None
+    }
+
+    fn sides(join: &HashJoinExec) -> (String, String) {
+        let render = |plan: &Arc<dyn ExecutionPlan>| {
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            )
+        };
+        (render(join.left()), render(join.right()))
+    }
+
+    let wide: &'static str = Box::leak("x".repeat(4_096).into_boxed_str());
+    let tmp = TempStrDir::default();
+    let target = lance_datagen::gen_batch()
+        .with_seed(Seed::from(1))
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("payload", array::cycle_utf8_literals(&[wide]))
+        .into_reader_rows(RowCount::from(1_024), BatchCount::from(1));
+    let written = Dataset::write(target, tmp.as_str(), None).await.unwrap();
+    let ds = Arc::new(
+        DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap(),
+    );
+
+    // Larger than the target's cold seed estimate (1,024 rows x ~72 B) but
+    // smaller than its measured payload (1,024 x 4 KB).
+    let source = lance_datagen::gen_batch()
+        .with_seed(Seed::from(2))
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .into_batch_rows(RowCount::from(20_000))
+        .unwrap();
+    let new_job = || {
+        crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(crate::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+    };
+    let materialized = || {
+        Arc::new(MemTable::try_new(source.schema(), vec![vec![source.clone()]]).unwrap())
+            as Arc<dyn TableProvider>
+    };
+
+    let cold_plan = new_job().create_plan(materialized()).await.unwrap();
+    let cold_join = find_hash_join(cold_plan.as_ref()).expect("cold plan must have a hash join");
+    let (cold_build, _) = sides(cold_join);
+    assert_eq!(
+        (*cold_join.partition_mode(), *cold_join.join_type()),
+        (PartitionMode::CollectLeft, JoinType::Right),
+        "the seed makes the target look smaller than the source:\n{cold_build}"
+    );
+    assert!(cold_build.contains("LanceRead"), "{cold_build}");
+
+    ds.scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let warm_plan = new_job().create_plan(materialized()).await.unwrap();
+    let warm_join = find_hash_join(warm_plan.as_ref()).expect("warm plan must have a hash join");
+    let (warm_build, warm_probe) = sides(warm_join);
+    assert_eq!(
+        (*warm_join.partition_mode(), *warm_join.join_type()),
+        (PartitionMode::CollectLeft, JoinType::Left),
+        "the measured width must make the source the smaller, collected side:\n{warm_build}"
+    );
+    assert!(
+        warm_build.contains("DataSourceExec") && !warm_build.contains("LanceRead"),
+        "the materialized source must be the build side:\n{warm_build}"
+    );
+    assert!(
+        warm_probe.contains("LanceRead"),
+        "the wide target must be the probe side:\n{warm_probe}"
+    );
+}
+
+#[tokio::test]
+async fn test_first_seen_native_source_matches_ordered_scanner() {
+    let source_batch = record_batch!(
+        ("key", UInt32, [2, 2, 3, 3, 5]),
+        ("value", UInt32, [100, 200, 400, 500, 600])
+    )
+    .unwrap();
+    let source = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new([Ok(source_batch.clone())], source_batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    let initial =
+        record_batch!(("key", UInt32, [1, 2, 3]), ("value", UInt32, [10, 20, 30])).unwrap();
+    let mut results = Vec::new();
+    for native in [true, false] {
+        let target = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+                "memory://",
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let job = crate::dataset::MergeInsertBuilder::try_new(target, vec!["key".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen)
+            .try_build()
+            .unwrap();
+        let (result, stats) = if native {
+            job.execute_dataset(source.clone()).await.unwrap()
+        } else {
+            job.execute(source.scan().try_into_stream().await.unwrap().into())
+                .await
+                .unwrap()
+        };
+        assert_eq!(stats.num_skipped_duplicates, 2);
+        let batch = result.scan().try_into_batch().await.unwrap();
+        let keys = batch.column(0).as_primitive::<UInt32Type>();
+        let values = batch.column(1).as_primitive::<UInt32Type>();
+        let mut rows = keys
+            .values()
+            .iter()
+            .zip(values.values())
+            .map(|(&k, &v)| (k, v))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        results.push(rows);
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0], vec![(1, 10), (2, 100), (3, 400), (5, 600)]);
+}
+
 /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
 /// was handed would actually run. The batches entry point must therefore not
 /// fall back to the streaming plan: with the row counts used below the join

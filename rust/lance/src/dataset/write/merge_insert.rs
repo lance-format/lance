@@ -485,6 +485,21 @@ struct MergeInsertParams {
 }
 
 impl MergeInsertParams {
+    /// Return ON field IDs only when they match the declared primary key.
+    fn primary_key_field_ids(&self, schema: &lance_core::datatypes::Schema) -> Option<Vec<i32>> {
+        let field_ids: Vec<i32> = self
+            .on
+            .iter()
+            .filter_map(|name| schema.field(name).map(|field| field.id))
+            .collect();
+        let pk_field_ids: Vec<i32> = schema
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.id)
+            .collect();
+        (!pk_field_ids.is_empty() && field_ids == pk_field_ids).then_some(field_ids)
+    }
+
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
         self.data_storage_version
             .map(|version| version.0)

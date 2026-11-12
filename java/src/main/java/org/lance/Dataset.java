@@ -18,6 +18,9 @@ import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.expire.ExpireVersionsPlan;
+import org.lance.expire.ExpireVersionsPolicy;
+import org.lance.expire.ExpireVersionsStats;
 import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexBuildProgress;
@@ -25,6 +28,7 @@ import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
@@ -917,6 +921,39 @@ public class Dataset implements Closeable {
   private native byte[] nativeTakeRows(List<Long> rowIds, List<String> columns);
 
   /**
+   * Resolve row IDs (from the {@code _rowid} column) to their current row addresses.
+   *
+   * <p>A row address is {@code (fragmentId << 32) | rowOffset}, so callers can tell which fragment
+   * holds each row without scanning. With stable row IDs, a row keeps its ID when compaction or an
+   * update moves it, so its address can differ between versions. Without stable row IDs, a row ID
+   * is its row address, and each input is returned unchanged without checking that the row exists.
+   *
+   * <p>Reading stable row IDs may access row-id metadata and deletion files; I/O failures surface
+   * as {@link IOException}.
+   *
+   * @param rowIds the row IDs to resolve
+   * @return one entry per input ID, in input order, including duplicates; {@code null} where the ID
+   *     is unknown or its row was deleted
+   * @throws RuntimeException if a row ID is live in more than one fragment, which means the stable
+   *     row IDs are corrupt
+   */
+  public List<Long> getRowAddresses(List<Long> rowIds) {
+    Preconditions.checkArgument(rowIds != null, "rowIds cannot be null");
+    long[] addresses;
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      addresses = nativeGetRowAddresses(rowIds);
+    }
+    List<Long> result = new ArrayList<>(addresses.length);
+    for (long address : addresses) {
+      result.add(address == -1L ? null : address);
+    }
+    return result;
+  }
+
+  private native long[] nativeGetRowAddresses(List<Long> rowIds);
+
+  /**
    * Randomly sample n rows from the dataset.
    *
    * <p>The returned rows are in row-id order (not random order), which allows the underlying take
@@ -1645,6 +1682,24 @@ public class Dataset implements Closeable {
   private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
+   * Get per-fragment column-layout statistics for this dataset version: how many data files hold a
+   * column of the schema, each file's size and schema field count, the share of dead field slots,
+   * and how many overlay files each fragment carries. Only manifest metadata is read.
+   *
+   * <p>This is an experimental API. It may change at any time.
+   *
+   * @return column-layout statistics as parallel arrays, in manifest order
+   */
+  public ColumnLayoutStatistics getColumnLayoutStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetColumnLayoutStatistics();
+    }
+  }
+
+  private native ColumnLayoutStatistics nativeGetColumnLayoutStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
@@ -1749,6 +1804,64 @@ public class Dataset implements Closeable {
   }
 
   private native String nativeGetIndexStatistics(String indexName);
+
+  /**
+   * Returns results in UUID request order at this dataset's read version.
+   *
+   * <p>UUIDs must be nonempty, unique, non-null, and belong to {@code indexName}. System indices
+   * are unsupported.
+   *
+   * <pre>{@code
+   * List<IndexSegmentStatistics> segments =
+   *     dataset.getIndexSegmentStatistics("vector_idx", segmentUuids);
+   * Map<String, Object> statistics =
+   *     dataset.getIndexStatisticsFromSegments("vector_idx", segments);
+   * }</pre>
+   */
+  public List<IndexSegmentStatistics> getIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids != null && !indexUuids.isEmpty(), "indexUuids cannot be null or empty");
+    Preconditions.checkArgument(
+        indexUuids.stream().allMatch(indexUuid -> indexUuid != null),
+        "indexUuids cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetIndexSegmentStatistics(indexName, indexUuids);
+    }
+  }
+
+  private native List<IndexSegmentStatistics> nativeGetIndexSegmentStatistics(
+      String indexName, List<UUID> indexUuids);
+
+  /**
+   * Requires exactly one result per segment from this dataset and read version.
+   *
+   * <p>Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
+   * Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+   *
+   * <p>See {@link #getIndexSegmentStatistics} for a collection example.
+   */
+  public Map<String, Object> getIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics) {
+    Preconditions.checkArgument(
+        indexName != null && !indexName.isEmpty(), "indexName cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics != null && !segmentStatistics.isEmpty(),
+        "segmentStatistics cannot be null or empty");
+    Preconditions.checkArgument(
+        segmentStatistics.stream().allMatch(statistics -> statistics != null),
+        "segmentStatistics cannot contain null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return JsonUtils.fromJson(nativeGetIndexStatisticsFromSegments(indexName, segmentStatistics));
+    }
+  }
+
+  private native String nativeGetIndexStatisticsFromSegments(
+      String indexName, List<IndexSegmentStatistics> segmentStatistics);
 
   /**
    * Build global BM25 statistics for a full-text query across every committed segment of its
@@ -2444,7 +2557,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
+      update(tag, Ref.ofMain(versionNumber));
     }
 
     /**
@@ -2805,6 +2918,49 @@ public class Dataset implements Closeable {
       Optional<Long> deleteConcurrency,
       Optional<Long> deleteRateLimit,
       Optional<String> retentionPolicyJson);
+
+  /**
+   * Remove version history without deleting any data files.
+   *
+   * <p>Unlike {@link #cleanupWithPolicy}, this does not compute the set of live data files, so it
+   * does not read the manifests it expires. Data files that only an expired version referenced are
+   * left behind as unreferenced; the next cleanup reclaims them, and is cheaper for having fewer
+   * manifests to read. The intended order is expire, then clean up.
+   *
+   * <p>The newest version, tags on the current branch, and versions a branch is rooted at are never
+   * removed.
+   *
+   * @param policy expiry policy
+   * @return expiry stats; a non-zero {@code failedDeletes} means the run completed without removing
+   *     everything it selected
+   */
+  public ExpireVersionsStats expireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsStats nativeExpireVersions(ExpireVersionsPolicy policy);
+
+  /**
+   * Report what {@link #expireVersions} would remove, without removing it.
+   *
+   * <p>A dry run: no manifest is deleted to produce this.
+   *
+   * @param policy expiry policy, the same one you would pass to {@link #expireVersions}
+   * @return the versions that would be removed and the stats that would result
+   */
+  public ExpireVersionsPlan explainExpireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsPlan nativeExplainExpireVersions(ExpireVersionsPolicy policy);
 
   CleanupExplanation explainCleanup(
       CleanupPolicy policy,
