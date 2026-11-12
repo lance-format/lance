@@ -148,6 +148,14 @@ impl AddIndexSegment {
         self.parts
     }
 
+    /// Stop covering committed fragment `fragment`, whose rows a reader then
+    /// scans, as a column rewrite landing after the segment prunes it.
+    pub(super) fn forget_covered_fragment(&mut self, fragment: u64) {
+        if let Some(covered) = &mut self.parts.covered_fragments {
+            covered.retain(|covered| *covered != Ref::Committed(fragment));
+        }
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         reject_frag_reuse_history("AddIndexSegment", &self.parts.name)?;
         let fields = self
@@ -301,8 +309,8 @@ impl AddIndexSegment {
     }
 
     /// A claim on the logical index -- this is what the index is, and these are
-    /// the fragments the new segment describes -- plus a requirement on the
-    /// data the segment was built from.
+    /// the fragments the new segment describes -- plus a record of the data
+    /// the segment was built from.
     ///
     /// An index is derived state whose segments the query path unions, so two
     /// writers may extend the same index at once. What they may not do is
@@ -315,12 +323,14 @@ impl AddIndexSegment {
     /// arriving *after* the rewrite prunes nothing, and the format gives a
     /// reader no way to catch it -- an in-place column rewrite "cannot be
     /// detected just by examining metadata", so a reader trusts
-    /// `fragment_bitmap` as it finds it. Requiring the data keeps that trust
-    /// earned. Deletions, overlays and the removal of a whole fragment are
-    /// excluded on purpose: each leaves a trace a reader can act on, so each
-    /// may still run alongside a build. A segment naming a removed fragment
-    /// reaches its rows through the fragment reuse history or loses that
-    /// coverage.
+    /// `fragment_bitmap` as it finds it. So the build records the data it read,
+    /// and a segment landing after a rewrite of it is rebased to give up the
+    /// rewritten fragments (see [`Overlap`](super::Overlap)). Deletions,
+    /// overlays and the removal of a whole fragment are excluded on purpose:
+    /// each leaves a trace a reader can act on, so each may still run
+    /// alongside a build. A compaction under the segment is an overlap too,
+    /// which the resolver settles by whether the fragment reuse history
+    /// recorded the move.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         footprint.claim_index_segment(
             self.parts.name.clone(),
@@ -354,9 +364,7 @@ impl AddIndexSegment {
             // on the index; there is no fragment list to require.
             return;
         };
-        for fragment in covered.iter().filter_map(|fragment| fragment.committed()) {
-            footprint.require_field_data_unless_removed(fragment, dependencies.iter().copied());
-        }
+        footprint.build_index_from(self.parts.uuid, dependencies, covered.iter().copied());
     }
 }
 
@@ -501,8 +509,8 @@ mod tests {
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AddFragmentParts, AdjustIndexCoverage,
-        AdjustIndexCoverageParts, CompositeOperation, DropField, Footprint, RemoveFragment,
-        RemoveIndexSegment, ResetTable, TombstoneFieldData, UserStep,
+        AdjustIndexCoverageParts, CompositeOperation, DropField, Footprint, Overlap,
+        RemoveFragment, RemoveIndexSegment, ResetTable, TombstoneFieldData, UserStep, Verdict,
     };
     use crate::transaction::test_support::{default_build_config, sample_index_metadata};
     use crate::transaction::{Operation, ReadVersionState, Transaction};
@@ -1392,29 +1400,43 @@ mod tests {
         assert!(!theirs.conflicts_with(&ours));
     }
 
+    fn rewrite(fragment: u64, field: i32) -> Footprint {
+        footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+            Ref::Committed(fragment),
+            vec![FieldRef::Committed(field)],
+        ))])
+    }
+
+    fn overlaps(verdict: Verdict) -> Vec<Overlap> {
+        match verdict {
+            Verdict::Rebase(overlaps) => overlaps,
+            other => panic!("expected a rebase, got {other:?}"),
+        }
+    }
+
     /// The direction is the whole point, so it gets its own test.
     ///
-    /// A segment requires the data it describes; a rewrite of that data writes
-    /// it. Arriving after the rewrite, the segment would publish coverage of
-    /// values it never saw and a reader has no way to detect that, so it must
-    /// be rejected. Arriving before, the rewrite prunes the segment's coverage
-    /// as it applies, so rejecting it would be a conflict over nothing.
+    /// Arriving after a rewrite of data it covers, the segment would publish
+    /// coverage of values it never saw and a reader has no way to detect that,
+    /// so it is rebased to give up the rewritten fragment. Arriving before, the
+    /// rewrite prunes the segment's coverage as it applies, so there is nothing
+    /// to rebase.
     #[test]
-    fn test_a_build_loses_to_a_committed_rewrite_but_not_the_reverse() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-            Ref::Committed(0),
-            vec![FieldRef::Committed(0)],
-        ))]);
+    fn test_a_build_gives_up_what_a_committed_rewrite_replaced() {
+        let segment = covering("by_a", Some(vec![0, 1]));
+        let uuid = segment.uuid;
+        let build = index_footprint(segment);
 
-        assert!(
-            build.conflicts_with(&rewrite),
-            "a segment cannot describe values a committed rewrite replaced"
+        assert_eq!(
+            overlaps(build.compare(&rewrite(0, 0))),
+            vec![Overlap::UpdatedUnderIndex {
+                segment: uuid,
+                fragment: 0
+            }]
         );
-        assert!(
-            !rewrite.conflicts_with(&build),
-            "the rewrite prunes the committed segment's coverage as it applies"
-        );
+        assert!(matches!(rewrite(0, 0).compare(&build), Verdict::Compatible));
+        assert!(matches!(build.compare(&rewrite(0, 7)), Verdict::Compatible));
+        assert!(matches!(build.compare(&rewrite(2, 0)), Verdict::Compatible));
     }
 
     /// A re-encode with `data_change` false moves the values the segment
@@ -1447,20 +1469,22 @@ mod tests {
 
     /// A rewrite of a column the segment merely carries invalidates it just as
     /// a keyed one does -- the segment would answer from an obsolete carried
-    /// value. `covering_fields` is independent of `fields`, so the requirement
-    /// is over the union.
+    /// value. `covering_fields` is independent of `fields`, so the build is
+    /// over the union.
     #[test]
-    fn test_a_build_requires_the_columns_it_carries_too() {
+    fn test_a_build_gives_up_what_a_rewrite_of_a_carried_column_replaced() {
         let mut segment = covering("by_a", Some(vec![0]));
         segment.covering_fields = vec![FieldRef::Committed(1)];
+        let uuid = segment.uuid;
         let build = index_footprint(segment);
 
-        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData::new(
-            Ref::Committed(0),
-            vec![FieldRef::Committed(1)],
-        ))]);
-
-        assert!(build.conflicts_with(&rewrite));
+        assert_eq!(
+            overlaps(build.compare(&rewrite(0, 1))),
+            vec![Overlap::UpdatedUnderIndex {
+                segment: uuid,
+                fragment: 0
+            }]
+        );
     }
 
     /// A drop landing first leaves the segment over a field the manifest no
@@ -1554,11 +1578,13 @@ mod tests {
     }
 
     /// The exemption is for removal only: replacing the covered values in
-    /// place still conflicts, even in the set that also removes another
+    /// place still overlaps, even in the set that also removes another
     /// fragment.
     #[test]
-    fn test_a_build_still_conflicts_with_an_in_place_write_beside_a_removal() {
-        let build = index_footprint(covering("by_a", Some(vec![0])));
+    fn test_a_build_still_overlaps_an_in_place_write_beside_a_removal() {
+        let segment = covering("by_a", Some(vec![0]));
+        let uuid = segment.uuid;
+        let build = index_footprint(segment);
         let write = footprint(vec![
             Action::RemoveFragment(RemoveFragment::new(Ref::Committed(1))),
             Action::TombstoneFieldData(TombstoneFieldData::new(
@@ -1567,7 +1593,127 @@ mod tests {
             )),
         ]);
 
-        assert!(build.conflicts_with(&write));
+        assert_eq!(
+            overlaps(build.compare(&write)),
+            vec![Overlap::UpdatedUnderIndex {
+                segment: uuid,
+                fragment: 0
+            }]
+        );
+    }
+
+    /// A compaction landing first leaves the segment describing rows under
+    /// addresses they no longer have, which only a fragment reuse index can
+    /// translate; the overlap names the move for the caller to settle. A
+    /// deletion of the fragment leaves nothing to translate: its rows are gone.
+    /// Landing second, the compaction is the one answerable for the index, and
+    /// the footprint has nothing to say.
+    #[test]
+    fn test_a_build_overlaps_a_committed_compaction_of_a_covered_fragment() {
+        let segment = covering("by_a", Some(vec![0]));
+        let uuid = segment.uuid;
+        let build = index_footprint(segment);
+        let removal = |fragment: u64, data_change: bool| {
+            footprint(vec![Action::RemoveFragment(RemoveFragment::new_unchecked(
+                Ref::Committed(fragment),
+                data_change,
+            ))])
+        };
+
+        assert_eq!(
+            overlaps(build.compare(&removal(0, false))),
+            vec![Overlap::CompactedUnderIndex {
+                segment: uuid,
+                fragment: 0
+            }]
+        );
+        assert!(matches!(
+            build.compare(&removal(0, true)),
+            Verdict::Compatible
+        ));
+        assert!(matches!(
+            removal(0, false).compare(&build),
+            Verdict::Compatible
+        ));
+        assert!(matches!(
+            build.compare(&removal(1, false)),
+            Verdict::Compatible
+        ));
+    }
+
+    /// An overlap is still a conflict when the sets also collide outright:
+    /// a drop landing first leaves the segment over a field the schema no
+    /// longer has, and no coverage rewrite fixes that.
+    #[test]
+    fn test_a_collision_outranks_an_overlap() {
+        let build = index_footprint(covering("by_a", Some(vec![0])));
+        let drop_and_rewrite = vec![
+            Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(0)],
+            )),
+            Action::DropField(DropField::new(FieldRef::Committed(0))),
+        ];
+
+        assert!(matches!(
+            build.compare(&footprint(drop_and_rewrite)),
+            Verdict::Conflict
+        ));
+    }
+
+    /// Rebasing past a rewrite drops the rewritten fragment from the segment's
+    /// coverage and leaves the rest of the set as it was; rebasing past a
+    /// recorded compaction leaves the coverage for the fragment reuse index to
+    /// translate.
+    #[test]
+    fn test_rebasing_a_build_rewrites_only_its_coverage() {
+        let segment = covering("by_a", Some(vec![0, 1]));
+        let uuid = segment.uuid;
+        let other = AddIndexSegment::try_new_unchecked(covering("by_b", Some(vec![0, 1]))).unwrap();
+        let mut operation = CompositeOperation::new(vec![UserStep::new(
+            "build",
+            vec![
+                Action::AddIndexSegment(
+                    AddIndexSegment::try_new_unchecked(segment.clone()).unwrap(),
+                ),
+                Action::AddIndexSegment(other.clone()),
+            ],
+        )]);
+
+        operation
+            .rebase(&[
+                Overlap::UpdatedUnderIndex {
+                    segment: uuid,
+                    fragment: 0,
+                },
+                Overlap::CompactedUnderIndex {
+                    segment: uuid,
+                    fragment: 1,
+                },
+            ])
+            .unwrap();
+
+        let expected = AddIndexSegment::try_new_unchecked(AddIndexSegmentParts {
+            covered_fragments: Some(vec![Ref::Committed(1)]),
+            ..segment
+        })
+        .unwrap();
+        assert_eq!(
+            operation.iter_actions().cloned().collect::<Vec<_>>(),
+            vec![
+                Action::AddIndexSegment(expected),
+                Action::AddIndexSegment(other)
+            ]
+        );
+        assert!(
+            operation
+                .rebase(&[Overlap::UpdatedUnderIndex {
+                    segment: Uuid::new_v4(),
+                    fragment: 0,
+                }])
+                .is_err(),
+            "an overlap names a segment the set does not add"
+        );
     }
 
     /// A packed struct is stored, and rewritten, under the parent's id while an
@@ -1576,7 +1722,7 @@ mod tests {
     /// `nested_schema`, `s` is 1 and holds `x` (2) and `y` (3); `id` is 0.
     ///
     /// Landing second, the rewrite prunes the segment's coverage as it applies,
-    /// walking the same nesting, so that order needs no conflict.
+    /// walking the same nesting, so that order needs no rebase.
     #[rstest]
     #[case::keyed_child_under_a_rewritten_parent(vec![2], vec![], 1, true)]
     #[case::keyed_parent_over_a_rewritten_child(vec![1], vec![], 2, true)]
@@ -1584,27 +1730,38 @@ mod tests {
     #[case::carried_parent_over_a_rewritten_child(vec![0], vec![1], 3, true)]
     #[case::keyed_child_beside_a_rewritten_sibling(vec![2], vec![], 3, false)]
     #[case::keyed_child_beside_an_unrelated_rewrite(vec![2], vec![], 0, false)]
-    fn test_a_build_loses_to_a_committed_rewrite_of_a_containing_or_nested_field(
+    fn test_a_build_gives_up_what_a_rewrite_of_a_containing_or_nested_field_replaced(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,
         #[case] rewritten: i32,
-        #[case] expected: bool,
+        #[case] gives_up: bool,
     ) {
         let schema = nested_schema();
-        let build = index_footprint(AddIndexSegmentParts {
+        let segment = AddIndexSegmentParts {
             fields: fields.into_iter().map(FieldRef::Committed).collect(),
             covering_fields: covering_fields
                 .into_iter()
                 .map(FieldRef::Committed)
                 .collect(),
             ..covering("by_a", Some(vec![0]))
-        })
-        .with_field_ancestry(&schema);
+        };
+        let uuid = segment.uuid;
+        let build = index_footprint(segment).with_field_ancestry(&schema);
         let rewrite =
             footprint(replace_field_data(0, rewritten, true)).with_field_ancestry(&schema);
 
-        assert_eq!(build.conflicts_with(&rewrite), expected);
-        assert!(!rewrite.conflicts_with(&build));
+        if gives_up {
+            assert_eq!(
+                overlaps(build.compare(&rewrite)),
+                vec![Overlap::UpdatedUnderIndex {
+                    segment: uuid,
+                    fragment: 0
+                }]
+            );
+        } else {
+            assert!(matches!(build.compare(&rewrite), Verdict::Compatible));
+        }
+        assert!(matches!(rewrite.compare(&build), Verdict::Compatible));
     }
 
     /// Relating a build to the parent of its field does not make it collide
@@ -1625,8 +1782,8 @@ mod tests {
         .with_field_ancestry(&schema);
         let other = footprint(other).with_field_ancestry(&schema);
 
-        assert!(!build.conflicts_with(&other));
-        assert!(!other.conflicts_with(&build));
+        assert!(matches!(build.compare(&other), Verdict::Compatible));
+        assert!(matches!(other.compare(&build), Verdict::Compatible));
     }
 
     fn index_footprint(parts: AddIndexSegmentParts) -> Footprint {

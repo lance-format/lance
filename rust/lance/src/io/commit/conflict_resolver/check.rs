@@ -5,7 +5,7 @@ mod create_index;
 mod rewrite;
 
 use super::*;
-use lance_table::transaction::action::{Footprint, Verdict};
+use lance_table::transaction::action::{Action, Footprint, Overlap, Verdict};
 
 impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -143,18 +143,79 @@ impl<'a> TransactionRebase<'a> {
         };
         let ours = with_ancestry(Footprint::pending(&self.transaction, read));
         let theirs = with_ancestry(Footprint::committed(other_transaction, before, after));
-        match ours.compare(&theirs) {
-            Verdict::Compatible => Ok(()),
-            Verdict::Rebase(overlaps) => match &mut self.transaction.operation {
-                // Rebased as each committed set is checked, so the next one is
-                // compared against what this set has become.
-                Operation::CompositeOperation(composite_operation) => {
-                    composite_operation.rebase(&overlaps)
-                }
-                _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
-            },
-            Verdict::Conflict => Err(self.retryable_conflict_err(other_transaction, other_version)),
+        let overlaps = match ours.compare(&theirs) {
+            Verdict::Compatible => return Ok(()),
+            Verdict::Rebase(overlaps) => overlaps,
+            Verdict::Conflict => {
+                return Err(self.retryable_conflict_err(other_transaction, other_version));
+            }
+        };
+        if !overlaps
+            .iter()
+            .all(|overlap| self.can_rebase_past(overlap, before))
+        {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
+        // Rebased as each committed set is checked, so the next one is
+        // compared against what this transaction has become.
+        match &mut self.transaction.operation {
+            Operation::CompositeOperation(composite_operation) => {
+                composite_operation.rebase(&overlaps)
+            }
+            Operation::CreateIndex { new_indices, .. } => {
+                rebase_index_build(new_indices, &overlaps, self.untagged_reuse.as_deref());
+                Ok(())
+            }
+            _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
+        }
+    }
+
+    /// Whether the rebase can resolve `overlap`, given the manifest `before`
+    /// the commit it overlaps.
+    ///
+    /// A compaction under a legacy `CreateIndex`'s segment is resolvable only
+    /// as legacy resolves it: the move deferred its index remap and the latest
+    /// untagged fragment reuse index still records it, so a reader translates
+    /// the segment's coverage. An action set's segment follows the reuse
+    /// history's own rule instead, that removal isn't staleness: its coverage
+    /// of the moved rows translates through a recorded transition, or is lost
+    /// and the rows are scanned. Either way, an NGram segment refuses retired
+    /// coverage at query time, and an overlay newer than the segment that the
+    /// compaction folded into base data would no longer be masked out of it;
+    /// legacy withdraws the latter from coverage, and this conflicts instead.
+    fn can_rebase_past(&self, overlap: &Overlap, before: &Manifest) -> bool {
+        let Overlap::CompactedUnderIndex { segment, fragment } = overlap else {
+            return true;
+        };
+        let Some(built) = added_segment(&self.transaction, *segment) else {
+            return false;
+        };
+        let recorded = matches!(self.transaction.operation, Operation::CompositeOperation(_))
+            || self.untagged_reuse.as_deref().is_some_and(|reuse| {
+                reuse
+                    .groups
+                    .iter()
+                    .any(|sources| sources.contains(fragment))
+            });
+        let is_ngram = built
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.ends_with("NGramIndexDetails"));
+        let folds_newer_overlay = before
+            .fragments
+            .iter()
+            .find(|candidate| candidate.id == *fragment)
+            .is_some_and(|compacted| {
+                compacted.overlays.iter().any(|overlay| {
+                    overlay_affects_index(
+                        overlay,
+                        &built.fields,
+                        built.dataset_version,
+                        &before.schema,
+                    )
+                })
+            });
+        recorded && !is_ngram && !folds_newer_overlay
     }
 
     fn check_delete_txn(
@@ -1349,5 +1410,70 @@ impl<'a> TransactionRebase<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// What a rebase needs to know about a segment a transaction adds.
+struct AddedSegment {
+    fields: Vec<i32>,
+    dataset_version: u64,
+    index_details: Option<Arc<prost_types::Any>>,
+}
+
+fn added_segment(transaction: &Transaction, uuid: uuid::Uuid) -> Option<AddedSegment> {
+    match &transaction.operation {
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .find(|index| index.uuid == uuid)
+            .map(|index| AddedSegment {
+                fields: index.fields.clone(),
+                dataset_version: index.dataset_version,
+                index_details: index.index_details.clone(),
+            }),
+        Operation::CompositeOperation(composite_operation) => composite_operation
+            .iter_actions()
+            .find_map(|action| match action {
+                Action::AddIndexSegment(segment) if segment.parts().uuid == uuid => {
+                    Some(segment.parts())
+                }
+                _ => None,
+            })
+            .map(|segment| AddedSegment {
+                fields: segment
+                    .fields
+                    .iter()
+                    .chain(&segment.covering_fields)
+                    .filter_map(|field| field.committed())
+                    .collect(),
+                dataset_version: transaction.read_version,
+                index_details: segment.index_details.clone(),
+            }),
+        _ => None,
+    }
+}
+
+/// Rebase a legacy `CreateIndex`'s segments past `overlaps`, as its own arms
+/// of `check_create_index_txn` would: a rewritten fragment leaves the bitmap,
+/// together with the fragments a recorded compaction made it from, and a
+/// compacted one stays for the fragment reuse index to translate.
+fn rebase_index_build(
+    new_indices: &mut [IndexMetadata],
+    overlaps: &[Overlap],
+    reuse: Option<&UntaggedReuse>,
+) {
+    for overlap in overlaps {
+        let Overlap::UpdatedUnderIndex { segment, fragment } = overlap else {
+            continue;
+        };
+        let Ok(fragment) = u32::try_from(*fragment) else {
+            continue;
+        };
+        if let Some(bitmap) = new_indices
+            .iter_mut()
+            .find(|index| index.uuid == *segment)
+            .and_then(|index| index.fragment_bitmap.as_mut())
+        {
+            *bitmap -= compacted_from(reuse, fragment);
+        }
     }
 }

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_table::transaction::action::Action;
 
 impl<'a> TransactionRebase<'a> {
     pub async fn try_new(
@@ -279,12 +280,23 @@ impl<'a> TransactionRebase<'a> {
     }
 
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
-        if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
-            self.current_schema = Some(dataset.schema().clone());
-            return Ok(());
-        }
-        if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
-            return Ok(());
+        match &self.transaction.operation {
+            Operation::CreateIndex { .. } => {}
+            Operation::CompositeOperation(composite_operation) => {
+                self.current_schema = Some(dataset.schema().clone());
+                // An action set gets the untagged history only: a segment it
+                // adds over fragments a tagged history retired conflicts
+                // instead.
+                if composite_operation
+                    .iter_actions()
+                    .any(|action| matches!(action, Action::AddIndexSegment(_)))
+                {
+                    let indices = crate::index::loading::load_all_indices(dataset).await?;
+                    return self.load_untagged_reuse(dataset, &indices).await;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
         let indices = crate::index::loading::load_all_indices(dataset).await?;
         let Some(entry) = indices
@@ -302,7 +314,7 @@ impl<'a> TransactionRebase<'a> {
     }
 
     /// The untagged counterpart of the tagged lineage. Skipped when the
-    /// CreateIndex writes the fragment reuse index itself, which
+    /// transaction writes the fragment reuse index itself, which
     /// `finish_create_index` checks, or the MemWAL index, which covers no
     /// fragments.
     async fn load_untagged_reuse(
@@ -310,12 +322,23 @@ impl<'a> TransactionRebase<'a> {
         dataset: &Dataset,
         indices: &[IndexMetadata],
     ) -> Result<()> {
-        let Operation::CreateIndex { new_indices, .. } = &self.transaction.operation else {
-            return Ok(());
+        let names: Vec<&str> = match &self.transaction.operation {
+            Operation::CreateIndex { new_indices, .. } => new_indices
+                .iter()
+                .map(|index| index.name.as_str())
+                .collect(),
+            Operation::CompositeOperation(composite_operation) => composite_operation
+                .iter_actions()
+                .filter_map(|action| match action {
+                    Action::AddIndexSegment(segment) => Some(segment.parts().name.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => return Ok(()),
         };
-        if new_indices
+        if names
             .iter()
-            .any(|index| index.name == FRAG_REUSE_INDEX_NAME || index.name == MEM_WAL_INDEX_NAME)
+            .any(|name| *name == FRAG_REUSE_INDEX_NAME || *name == MEM_WAL_INDEX_NAME)
         {
             return Ok(());
         }
