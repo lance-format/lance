@@ -27,7 +27,9 @@ use crate::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
         RLE_THRESHOLD_META_KEY,
     },
-    data::{DataBlock, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{
+        DataBlock, DataBlockBuilder, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock,
+    },
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
@@ -81,7 +83,7 @@ use arrow_array::{cast::AsArray, types::UInt64Type};
 use arrow_schema::DataType;
 use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 use lance_core::{Error, Result, datatypes::Field, error::LanceOptionExt};
-use std::{str::FromStr, sync::Arc};
+use std::{ops::Range, str::FromStr, sync::Arc};
 
 /// Default threshold for RLE compression selection when the user explicitly provides a threshold.
 ///
@@ -1137,10 +1139,48 @@ pub fn try_fixed_size_list_block(
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 
+    /// Decompress only `range` (`0 <= range.start <= range.end <= num_values`) from a mini-block
+    /// chunk containing `num_values` items.
+    ///
+    /// Codecs that support random or prefix/sub-range extraction override this to avoid
+    /// materializing unselected items during point `take` and sub-chunk reads.
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "mini-block",
+                format!(
+                    "mini-block selection {:?} exceeds {} values in chunk",
+                    range, num_values
+                ),
+            ));
+        }
+        let block = self.decompress(data, num_values)?;
+        if range == (0..num_values) {
+            return Ok(block);
+        }
+        let estimated_bytes = self
+            .decoded_size_bytes(range.end - range.start)
+            .unwrap_or(64);
+        let mut builder = DataBlockBuilder::with_capacity_estimate(estimated_bytes);
+        builder.append(&block, range)?;
+        Ok(builder.finish())
+    }
+
     /// Number of payload buffers consumed by each independently decoded chunk.
     /// Decoders with multiple buffers must override the single-buffer default.
     fn num_buffers(&self) -> usize {
         1
+    }
+
+    /// Whether every buffer returned by `decompress_range` is newly allocated with exact
+    /// capacity (never a `slice_with_length` view pinning the raw mini-block/page buffer).
+    fn allocates_output(&self) -> bool {
+        false
     }
 
     /// Returns the output bit width when this is the single-buffer inline
@@ -1154,7 +1194,7 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
@@ -1202,7 +1242,7 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Returns the exact aggregate decoded size when it is determined solely by the value count.
     ///
     /// Implementations should only return `Some` when this aggregate estimate can be used by
-    /// [`DataBlockBuilder`](crate::data::DataBlockBuilder) to preallocate the decoded output
+    /// [`DataBlockBuilder`] to preallocate the decoded output
     /// exactly. Outputs with multiple buffers or whose layout-dependent allocation cannot be
     /// represented by one aggregate estimate should return `None`.
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
