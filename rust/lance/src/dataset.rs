@@ -2743,6 +2743,8 @@ impl Dataset {
             file_field: &lance_core::datatypes::Field,
             path: &str,
         ) -> Result<()> {
+            use arrow_schema::DataType::{LargeList, List, Timestamp};
+
             if dataset_field.name != file_field.name {
                 return Err(Error::invalid_input(format!(
                     "Schema mismatch: expected field '{}' but file has '{}'",
@@ -2757,13 +2759,16 @@ impl Dataset {
             // Reads decode a replacement file's values as the dataset field
             // types, so values stored as another type read back as other
             // values or fail to decode. List offset widths and timestamp time
-            // zones do not change the stored values, and list items are
+            // zone names do not change the stored values, and list items are
             // compared as children below. Blob columns are skipped: their
             // file layout can legitimately differ from the dataset's type.
-            use arrow_schema::DataType::{LargeList, List, Timestamp};
             let same_values = match (dataset_field.data_type(), file_field.data_type()) {
                 (List(_) | LargeList(_), List(_) | LargeList(_)) => true,
-                (Timestamp(dataset_unit, _), Timestamp(file_unit, _)) => dataset_unit == file_unit,
+                // A naive timestamp is a wall-clock time and one with a time
+                // zone is an instant, so only the zone's name may differ.
+                (Timestamp(dataset_unit, dataset_tz), Timestamp(file_unit, file_tz)) => {
+                    dataset_unit == file_unit && dataset_tz.is_some() == file_tz.is_some()
+                }
                 _ => dataset_field.logical_type == file_field.logical_type,
             };
             if !same_values

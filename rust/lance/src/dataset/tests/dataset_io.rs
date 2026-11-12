@@ -625,8 +625,8 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
 
 /// A replacement file must store each column's values as the dataset field's
 /// type: reads decode it as the dataset type, so `x: double` under `x: int64`
-/// returns the doubles' bit patterns. Nullability, list offset width and
-/// timestamp time zone may differ.
+/// returns the doubles' bit patterns. Nullability, list offset width and the
+/// name of a timestamp's time zone may differ.
 #[rstest::rstest]
 #[case::same_width(DataType::Int64, DataType::Float64, false)]
 #[case::narrower(DataType::Int64, DataType::Int32, false)]
@@ -639,6 +639,11 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
 #[case::list_item(
     DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
     DataType::List(Arc::new(ArrowField::new("item", DataType::Float64, true))),
+    false
+)]
+#[case::timestamp_gains_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, None),
     false
 )]
 #[case::same_type(DataType::Int64, DataType::Int64, true)]
