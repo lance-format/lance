@@ -122,6 +122,39 @@ pub struct IndexMetadata {
     pub metadata: HashMap<String, String>,
 }
 
+/// True when an index segment with these details, persisted at `index_version`,
+/// reports matches as physical row addresses rather than row ids.
+///
+/// See [`IndexMetadata::results_are_row_addrs`]. Exposed separately so a wrapper
+/// index (e.g. JSON) can classify the target index it holds, which has details and
+/// a version but no [`IndexMetadata`] of its own.
+pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i32) -> bool {
+    let is_fm = details
+        .type_url
+        .rsplit_once('/')
+        .is_some_and(|(_, details_type_name)| {
+            details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+        });
+    let is_btree_addr_domain = IndexMetadata::is_btree_addr_domain(details, index_version);
+    let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
+    let is_label_list_addr_domain =
+        IndexMetadata::is_label_list_addr_domain(details, index_version);
+    // A JSON index takes its domain from the target index it wraps. It is
+    // stamped with format version 1
+    // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
+    // when that target stores row addresses, so the wrapper's own version
+    // answers this without decoding the nested target details.
+    let is_json_addr_domain = details.type_url.ends_with("JsonIndexDetails") && index_version >= 1;
+    details.type_url.ends_with("ZoneMapIndexDetails")
+        || details.type_url.ends_with("BloomFilterIndexDetails")
+        || is_fm
+        || IndexMetadata::is_list_element(details)
+        || is_btree_addr_domain
+        || is_bitmap_addr_domain
+        || is_label_list_addr_domain
+        || is_json_addr_domain
+}
+
 impl IndexMetadata {
     /// Returns the run-optimized serialized size of this fragment bitmap.
     ///
@@ -190,20 +223,9 @@ impl IndexMetadata {
     /// likely turn from an allow-list into a block-list.
     /// A false result does not prove that an unrecognized plugin stores stable row IDs.
     pub fn results_are_row_addrs(&self) -> bool {
-        self.index_details.as_ref().is_some_and(|details| {
-            let is_fm = details
-                .type_url
-                .rsplit_once('/')
-                .is_some_and(|(_, details_type_name)| {
-                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-                });
-            details.type_url.ends_with("ZoneMapIndexDetails")
-                || details.type_url.ends_with("BloomFilterIndexDetails")
-                || is_fm
-                || Self::is_btree_addr_domain(details, self.index_version)
-                || Self::is_bitmap_addr_domain(details, self.index_version)
-                || Self::is_label_list_addr_domain(details, self.index_version)
-        })
+        self.index_details
+            .as_ref()
+            .is_some_and(|details| index_details_are_row_addrs(details, self.index_version))
     }
 
     /// Whether the metadata proves that stored identifiers survive a physical
@@ -263,19 +285,31 @@ impl IndexMetadata {
         details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2
     }
 
+    // A list-element segment wraps a B-tree that always stores row addresses
+    // (`lance_index::scalar::list_element`), at every format version.
+    fn is_list_element(details: &prost_types::Any) -> bool {
+        details
+            .type_url
+            .rsplit_once('/')
+            .is_some_and(|(_, details_type_name)| {
+                details_type_name.eq_ignore_ascii_case("lance.index.pb.ListElementIndexDetails")
+            })
+    }
+
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap and LabelList's indexes support
-    /// this today (`ScalarIndexPlugin::can_remap`); ZoneMap, BloomFilter and FM
-    /// cannot remap. This gate recognizes the supported built-in address-domain
-    /// formats without opening index files.
+    /// Of the address-domain types, BTree, Bitmap, LabelList and ListElement's
+    /// indexes support this today (`ScalarIndexPlugin::can_remap`); ZoneMap,
+    /// BloomFilter and FM cannot remap. This gate recognizes the supported
+    /// built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             Self::is_btree_addr_domain(details, self.index_version)
                 || Self::is_bitmap_addr_domain(details, self.index_version)
                 || Self::is_label_list_addr_domain(details, self.index_version)
+                || Self::is_list_element(details)
         })
     }
 
@@ -995,6 +1029,16 @@ mod tests {
     #[case::fm("type.googleapis.com/lance.index.pb.FMIndexDetails", true, false)]
     #[case::fm_case_insensitive("type.googleapis.com/LANCE.INDEX.PB.FMINDEXDETAILS", true, false)]
     #[case::foreign_fm_terminal_name("type.googleapis.com/example.FMIndexDetails", false, false)]
+    #[case::list_element(
+        "type.googleapis.com/lance.index.pb.ListElementIndexDetails",
+        true,
+        false
+    )]
+    #[case::foreign_list_element_terminal_name(
+        "type.googleapis.com/example.ListElementIndexDetails",
+        false,
+        false
+    )]
     #[case::custom("type.googleapis.com/example.ExampleIndexDetails", false, false)]
     #[case::foreign_bitmap("type.googleapis.com/example.BitmapIndexDetails", false, false)]
     #[case::btree_legacy("type.googleapis.com/lance.table.BTreeIndexDetails", false, true)]
@@ -1087,6 +1131,43 @@ mod tests {
         assert!(
             metadata.supports_eager_remap(),
             "BitmapIndex and LabelListIndex both support remapping, same as BTree"
+        );
+    }
+
+    /// A list-element index stores row addresses at every version, and remaps
+    /// its B-tree during compaction, so it keeps covering rewritten fragments on
+    /// a stable-row-ID table.
+    #[rstest]
+    fn test_list_element_is_remappable_addr_domain(#[values(0, 1)] index_version: i32) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.ListElementIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+        metadata.index_version = index_version;
+        assert!(metadata.results_are_row_addrs());
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(metadata.supports_eager_remap());
+    }
+
+    #[test]
+    fn test_results_are_row_addrs_json_is_version_gated() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+
+        metadata.index_version = 0;
+        assert!(
+            !metadata.results_are_row_addrs(),
+            "a version 0 JSON segment wraps a target that stores row ids"
+        );
+
+        metadata.index_version = 1;
+        assert!(
+            metadata.results_are_row_addrs(),
+            "a version 1 JSON segment wraps a target that stores row addresses"
         );
     }
 

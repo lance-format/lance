@@ -53,7 +53,7 @@ use crate::index::api::DatasetIndexExt;
 use crate::index::frag_reuse::{self, load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_frag_reuse;
 use crate::index::mem_wal::open_mem_wal_index;
-use crate::index::scalar::{self, IndexDetails, fetch_index_details};
+use crate::index::scalar::{self, IndexDetails, fetch_index_details, list_element};
 use crate::index::segment::{
     index_is_usable, index_type_is_known, segment_has_vector_details, unsupported_index_version,
 };
@@ -64,7 +64,9 @@ use crate::index::vector::{
     ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key},
     utils::get_vector_type,
 };
-use crate::session::index_caches::{FragReuseIndexKey, IndexMetadataKey, write_index_identity};
+use crate::session::index_caches::{
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+};
 use crate::{Dataset, Error, Result};
 
 // Cache keys for different index types
@@ -318,6 +320,12 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
+        } else if !index_is_usable(idx) {
+            log::warn!(
+                "Index {} has unsupported field dependencies {:?}, ignoring it",
+                idx.name,
+                idx.dependency_fields(),
+            );
         }
     }
 }
@@ -400,6 +408,16 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
+        // Query planning loads the listing several times per scan, and each
+        // remap walks the whole reuse history.
+        let remapped_key = DerivedIndexListingKey {
+            version: metadata_key.version,
+            store_identity: metadata_key.store_identity,
+            e_tag: metadata_key.e_tag,
+        };
+        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
+            return Ok(remapped);
+        }
         let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
         let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
@@ -410,13 +428,24 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
                 open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
             })
             .await?;
-        let mut indices = indices.as_ref().clone();
-        for idx in indices.iter_mut() {
+        let mut remapped = indices.as_ref().clone();
+        for idx in remapped.iter_mut() {
             if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                 frag_reuse_index.remap_fragment_bitmap(bitmap)?;
             }
         }
-        Ok(Arc::new(indices))
+        let remapped = Arc::new(remapped);
+        // A later call may still infer the missing details; don't pin this list.
+        if !indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
+        {
+            dataset
+                .index_cache
+                .insert_with_key(&remapped_key, remapped.clone())
+                .await;
+        }
+        Ok(remapped)
     } else {
         Ok(indices)
     }
@@ -666,9 +695,36 @@ impl Dataset {
                 field.name.clone()
             };
 
-            let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
+            let mut index_details =
+                IndexDetails(fetch_index_details(self, &field_path, index).await?);
             if index_details.is_vector() {
                 continue;
+            }
+            // A list-element index finds its key fields by ID; plan with the
+            // names they have now, or not at all if one is gone or changed.
+            if list_element::is_list_element(&index_details.0) {
+                match list_element::bind_key_fields(field, &index_details.0) {
+                    Ok(Some(bound)) => index_details = IndexDetails(Arc::new(bound)),
+                    Ok(None) => {
+                        log::warn!(
+                            "Skipping index '{}' on column '{}': a key field was dropped or \
+                             changed type since it was built. Queries on this column will \
+                             fall back to a full scan; drop and recreate the index.",
+                            index.name,
+                            field_path,
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Skipping index '{}' on column '{}': {err}. Queries on this column \
+                             will fall back to a full scan.",
+                            index.name,
+                            field_path,
+                        );
+                        continue;
+                    }
+                }
             }
 
             let plugin = match index_details.get_plugin() {
@@ -1049,7 +1105,7 @@ impl Dataset {
                 let idx = vector::open_vector_index_v2(
                     Arc::new(self.clone()),
                     column,
-                    uuid,
+                    index_meta,
                     reader,
                     frag_reuse_index,
                 )
@@ -1058,30 +1114,9 @@ impl Dataset {
             }
 
             (0, 3) | (2, _) => {
-                let scheduler = ScanScheduler::new(
-                    object_store.clone(),
-                    SchedulerConfig::max_bandwidth(&object_store),
-                );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
-                let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &self.metadata_cache.file_metadata_cache(&index_file),
-                    FileReaderOptions::default(),
-                )
-                .await?;
-                let index_metadata = reader
-                    .schema()
-                    .metadata
-                    .get(INDEX_METADATA_SCHEMA_KEY)
-                    .ok_or(Error::index("Index Metadata not found".to_owned()))?;
-                let index_metadata: lance_index::IndexMetadata =
-                    serde_json::from_str(index_metadata)?;
+                let index_metadata = self
+                    .read_vector_index_metadata(&object_store, &index_file, &file_sizes)
+                    .await?;
 
                 // Resolve the column name and field
                 let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
@@ -1279,6 +1314,40 @@ impl Dataset {
                 .await;
         }
         Ok(index)
+    }
+
+    /// The index metadata in the schema of a vector index file of the
+    /// current format, `(0, 3)` or `(2, _)`: the type the file opens as and
+    /// its distance type, both read before any centroid or quantizer.
+    pub(crate) async fn read_vector_index_metadata(
+        &self,
+        object_store: &Arc<lance_io::object_store::ObjectStore>,
+        index_file: &object_store::path::Path,
+        file_sizes: &HashMap<String, u64>,
+    ) -> Result<lance_index::IndexMetadata> {
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(object_store),
+        );
+        let cached_size = file_sizes
+            .get(INDEX_FILE_NAME)
+            .map(|&size| CachedFileSize::new(size))
+            .unwrap_or_else(CachedFileSize::unknown);
+        let file = scheduler.open_file(index_file, &cached_size).await?;
+        let reader = lance_file::reader::FileReader::try_open(
+            file,
+            None,
+            Default::default(),
+            &self.metadata_cache.file_metadata_cache(index_file),
+            FileReaderOptions::default(),
+        )
+        .await?;
+        let index_metadata = reader
+            .schema()
+            .metadata
+            .get(INDEX_METADATA_SCHEMA_KEY)
+            .ok_or(Error::index("Index Metadata not found".to_owned()))?;
+        Ok(serde_json::from_str(index_metadata)?)
     }
 }
 

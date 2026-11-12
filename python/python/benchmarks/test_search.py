@@ -213,8 +213,22 @@ def test_ann_with_refine(test_dataset, benchmark):
 N_BATCH_QUERIES = 32
 
 
+# `None` keeps the default adaptive probe bounds.
+BATCH_NPROBES = pytest.mark.parametrize(
+    "nprobes", (10, None), ids=("fixed", "adaptive")
+)
+
+
+def batch_nearest(q, nprobes):
+    nearest = dict(column="vector", q=q, k=100)
+    if nprobes is not None:
+        nearest["nprobes"] = nprobes
+    return nearest
+
+
 @pytest.mark.benchmark(group="query_ann_batch")
-def test_batch_ann_search(test_dataset, benchmark):
+@BATCH_NPROBES
+def test_batch_ann_search(test_dataset, benchmark, nprobes):
     # One request carrying all query vectors: the index shares each partition's
     # scan across the batch (issue #6822).
     queries = np.random.randn(N_BATCH_QUERIES, N_DIMS).astype(np.float32)
@@ -222,18 +236,14 @@ def test_batch_ann_search(test_dataset, benchmark):
         test_dataset.to_table,
         columns=[],
         with_row_id=True,
-        nearest=dict(
-            column="vector",
-            q=queries,
-            k=100,
-            nprobes=10,
-        ),
+        nearest=batch_nearest(queries, nprobes),
     )
     assert result.num_rows > 0
 
 
 @pytest.mark.benchmark(group="query_ann_batch")
-def test_repeated_single_ann_search(test_dataset, benchmark):
+@BATCH_NPROBES
+def test_repeated_single_ann_search(test_dataset, benchmark, nprobes):
     # Baseline: the same query vectors issued one indexed search at a time.
     queries = np.random.randn(N_BATCH_QUERIES, N_DIMS).astype(np.float32)
 
@@ -242,12 +252,7 @@ def test_repeated_single_ann_search(test_dataset, benchmark):
             test_dataset.to_table(
                 columns=[],
                 with_row_id=True,
-                nearest=dict(
-                    column="vector",
-                    q=q,
-                    k=100,
-                    nprobes=10,
-                ),
+                nearest=batch_nearest(q, nprobes),
             )
 
     benchmark(run)
