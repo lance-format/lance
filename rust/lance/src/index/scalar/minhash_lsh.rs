@@ -56,8 +56,8 @@ pub(in crate::index) async fn merge_segments(
         )));
     }
     let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
-    // Every segment here stores row addresses, or (without stable row ids)
-    // row ids that equal them, so the filters are built in the address domain.
+    // Every segment here stores row addresses so the filters are built
+    // in the address domain.
     let (fragment_bitmap, filters) =
         build_per_segment_filters(dataset, &segment_refs, staged, true).await?;
 
