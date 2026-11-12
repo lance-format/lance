@@ -22,6 +22,7 @@ use lance_index::{
         inverted::InvertedIndex,
         json,
         lance_format::LanceIndexStore,
+        list_element::ListElementIndex,
         seed::{FragmentSeed, SEED_META_KEY_PREFIX},
         table_files_to_index,
         zonemap::ZoneMapIndexVersion,
@@ -46,8 +47,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, load_fts_training_data,
-    load_training_data, scan_training_data,
+    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, list_element,
+    load_fts_training_data, load_training_data, scan_training_data,
 };
 use crate::index::vector::details::vector_index_details_default;
 
@@ -504,6 +505,26 @@ async fn overlay_rescan(
     Ok((stale_rows, TrainingRows::Rows(selection)))
 }
 
+/// Whether a merge's old-data filters, and so the stale rows subtracted from them, key rows by
+/// physical address rather than by stable row id (see [`build_old_data_filter`] and
+/// [`overlay_rescan`]). This is the domain the merged index stores, not whether its type
+/// migrated from row ids: BTree and Bitmap merge as address-domain segments (a row-id-domain
+/// one under stable row ids is rebuilt instead), NGram stores row ids, a LabelList segment
+/// reports its own domain, and of the other types a JSON index over an address-domain target
+/// and a list-element index store addresses.
+fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIndex) -> bool {
+    match index_type {
+        IndexType::BTree | IndexType::Bitmap => true,
+        IndexType::NGram => false,
+        IndexType::LabelList => reference_index.results_are_row_addresses(),
+        _ => {
+            let index = reference_index.as_any();
+            reference_index.results_are_row_addresses()
+                && (index.is::<json::JsonIndex>() || index.is::<ListElementIndex>())
+        }
+    }
+}
+
 /// Remove `stale_rows` from a segment's old-data filter ([`OldIndexDataFilter`]): the rows
 /// an overlay replaced after the segment was built, keyed like the filter (see
 /// [`overlay_rescan`]). The merge re-reads them.
@@ -958,6 +979,23 @@ async fn merge_scalar_indices<'a>(
         .first()
         .copied()
         .unwrap_or(old_indices[old_indices.len() - 1]);
+
+    // A list-element index whose key fields were dropped or changed type is no
+    // longer queried. Leave it as it is rather than index new rows under keys
+    // the column no longer has.
+    if reference_idx
+        .index_details
+        .as_deref()
+        .is_some_and(list_element::is_list_element)
+        && !list_element::key_fields_resolve(dataset.schema(), reference_idx)?
+    {
+        log::warn!(
+            "Not optimizing index '{}' on column '{field_path}': a key field was dropped or \
+             changed type since it was built. Drop and recreate the index.",
+            reference_idx.name
+        );
+        return Ok(None);
+    }
     let reference_index = dataset
         .open_scalar_index_for_maintenance(field_path, &reference_idx.uuid, &NoOpMetricsCollector)
         .await?;
@@ -1000,6 +1038,13 @@ async fn merge_scalar_indices<'a>(
     // predate, and overlay masking will trust it for every overlay up to that manifest.
     // Entries carried over from a source never incorporate overlays committed after it was
     // built, so those rows are dropped from the carried-over data and re-read instead.
+    // The domain every old-data filter below keys rows by, which the stale rows
+    // subtracted from them must share. `legacy_domain_mismatch` below forces a
+    // rebuild instead of a merge for a row-id-domain segment of a migrated type
+    // under stable row ids, so a merged BTree or Bitmap segment is
+    // address-domain (or the dataset lacks stable row ids and the two domains
+    // coincide).
+    let address_domain = old_data_address_domain(index_type, reference_index.as_ref());
     let (stale_rows, scan_selection) = if is_remappable {
         overlay_rescan(
             dataset.as_ref(),
@@ -1007,14 +1052,7 @@ async fn merge_scalar_indices<'a>(
             tagged_coverage.as_ref(),
             &effective_old_frags,
             unindexed,
-            // The domain each `build_per_segment_filters` call below asks for.
-            // `legacy_domain_mismatch` above already forces a rebuild instead of
-            // reaching here for a row-id-domain segment of a migrated type
-            // under stable row ids, so every such segment that can still be
-            // merged here is address-domain (or the dataset lacks stable row
-            // ids and the two domains coincide). NGram has no such domain and
-            // always asks for row ids.
-            migrated_to_row_addrs(reference_idx),
+            address_domain,
         )
         .await?
     } else {
@@ -1251,7 +1289,7 @@ async fn merge_scalar_indices<'a>(
                         dataset.as_ref(),
                         &effective_old_frags,
                         &deleted_old_frags,
-                        reference_index.results_are_row_addresses(),
+                        address_domain,
                     )
                     .await?;
                     let old_data_filter =
@@ -1261,12 +1299,9 @@ async fn merge_scalar_indices<'a>(
                         .await?
                 }
                 _ => {
-                    // A JSON index over an address-domain target stores row
-                    // addresses, which a row-id filter would wrongly prune.
-                    let address_domain = reference_index
-                        .as_any()
-                        .downcast_ref::<json::JsonIndex>()
-                        .is_some_and(|index| index.results_are_row_addresses());
+                    // A JSON index over an address-domain target, and a
+                    // list-element index, store row addresses, which a row-id
+                    // filter would wrongly prune.
                     let old_data_filter = build_old_data_filter(
                         dataset.as_ref(),
                         &effective_old_frags,
