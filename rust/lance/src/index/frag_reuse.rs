@@ -532,6 +532,11 @@ pub(crate) async fn segment_coverage_reason(
     let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
     Ok(match plan.segments.get(&index.uuid) {
         Some(SegmentRemappingPlan::MissingCoverage(reason)) => Some(*reason),
+        // FTS retains empty query coverage for tokenizer settings. Maintenance
+        // must still skip remapping a segment that contributes no rows.
+        Some(SegmentRemappingPlan::Translate { coverage, .. }) if coverage.is_empty() => {
+            Some(MissingCoverageReason::NoDerivedCoverage)
+        }
         Some(_) => None,
         None => Some(MissingCoverageReason::NoDerivedCoverage),
     })

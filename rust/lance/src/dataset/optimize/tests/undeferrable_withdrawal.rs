@@ -3341,8 +3341,9 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
         "the logical index still covers every destination through the delta"
     );
 
-    // And the remap the fault refused succeeds, publishing the sibling it
-    // could not verify before.
+    // The remap the fault refused now succeeds, but must leave the superseded
+    // segment untouched. Rewriting it with empty coverage would make it newer
+    // than the delta, preventing the newest-first prune from removing it.
     crate::dataset::optimize::remapping::remap_column_index(
         &mut dataset,
         &["doc"],
@@ -3350,6 +3351,11 @@ async fn a_read_failure_refuses_to_prune_a_superseded_segment() {
     )
     .await
     .expect("the remap must succeed once the marker is readable");
+    assert_eq!(
+        stored_segments(&dataset).await,
+        before,
+        "remapping must preserve a superseded segment's provenance and age"
+    );
 
     // The same prune, once reads recover, removes the superseded segment.
     crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
