@@ -920,11 +920,10 @@ fn compress_bulk<T: OffsetSizeTrait>(
             }
         }
 
+        let encoded_off = encode_offset(out_curr)?;
         // SAFETY: `i + 1 < offsets.len() <= out_offsets.capacity()`.
         unsafe {
-            out_offsets_ptr
-                .add(i + 1)
-                .write(T::from_usize(out_curr).unwrap());
+            out_offsets_ptr.add(i + 1).write(encoded_off);
         }
     }
 
@@ -1456,6 +1455,13 @@ pub fn compress_into<T: OffsetSizeTrait>(
         ));
     }
 
+    validate_offsets(in_offsets_buf, in_buf.len())?;
+
+    if in_offsets_buf.len() <= 1 {
+        export_symbol_table(None, false, symbol_table);
+        return Ok((Vec::new(), vec![T::zero(); in_offsets_buf.len()]));
+    }
+
     if in_buf.len() < FSST_LEAST_INPUT_SIZE {
         export_symbol_table(None, false, symbol_table);
         return Ok((in_buf.to_vec(), in_offsets_buf.to_vec()));
@@ -1507,6 +1513,26 @@ pub fn compress<T: OffsetSizeTrait>(
                 FSST_SYMBOL_TABLE_SIZE
             ),
         ));
+    }
+
+    validate_offsets(in_offsets_buf, in_buf.len())?;
+
+    if in_offsets_buf.len() <= 1 {
+        if in_offsets_buf.len() > out_offsets_buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output offsets buffer ({}) too small for FSST encoder (need at least {})",
+                    out_offsets_buf.len(),
+                    in_offsets_buf.len()
+                ),
+            ));
+        }
+        export_symbol_table(None, false, symbol_table);
+        out_buf.clear();
+        out_offsets_buf.clear();
+        out_offsets_buf.resize(in_offsets_buf.len(), T::zero());
+        return Ok(());
     }
 
     if in_buf.len() < FSST_LEAST_INPUT_SIZE {
@@ -2417,5 +2443,47 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         // Dangling escape at lane 7 of an 8-byte window must error cleanly
         let dangling8 = [0u8, 0, 0, 0, 0, 0, 0, FSST_ESC];
         assert_missing_escape_payload(&table, &dangling8, &[0, 8]);
+    }
+
+    #[test]
+    fn test_compress_rejects_invalid_offsets_and_handles_zero_values() {
+        let input = vec![b'a'; FSST_LEAST_INPUT_SIZE + 64];
+        let mut symbol_table = [0u8; FSST_SYMBOL_TABLE_SIZE];
+
+        // Out-of-range offset beyond `input.len()` (including after >16 KiB sampled prefix)
+        let mut oob_offsets: Vec<i32> = (0..=512).map(|i| i * 64).collect();
+        *oob_offsets.last_mut().unwrap() = (input.len() + 8) as i32;
+        let err = compress_into(&mut symbol_table, &input, &oob_offsets).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Decreasing offsets (would otherwise compress overlapping windows past `2 * input.len()`)
+        let decreasing_offsets = [0_i32, input.len() as i32, 0, input.len() as i32];
+        let mut out = vec![0u8; input.len()];
+        let mut out_offsets = vec![0i32; decreasing_offsets.len()];
+        let err = compress(
+            &mut symbol_table,
+            &input,
+            &decreasing_offsets,
+            &mut out,
+            &mut out_offsets,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Negative offset
+        let neg_offsets = [-1_i32, 16];
+        let err = compress_into(&mut symbol_table, &input, &neg_offsets).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Zero strings on a large shared backing buffer must not underflow/divide-by-zero in sampling
+        for empty_offsets in [&[][..], &[0_i32][..], &[128_i32][..]] {
+            let (comp, comp_off) = compress_into(&mut symbol_table, &input, empty_offsets).unwrap();
+            assert!(comp.is_empty());
+            assert_eq!(comp_off, vec![0_i32; empty_offsets.len()]);
+            let dec = FsstDecompressor::try_new(&symbol_table).unwrap();
+            let (rt, rt_off) = dec.decompress_into(&comp, &comp_off).unwrap();
+            assert!(rt.is_empty());
+            assert_eq!(rt_off, comp_off);
+        }
     }
 }
