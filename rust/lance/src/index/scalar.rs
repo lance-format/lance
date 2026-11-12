@@ -681,6 +681,18 @@ pub(super) async fn build_scalar_index(
             // plugin would, so the same relabeling applies to a wrapped BTree,
             // Bitmap, or LabelList.
             lance_index::scalar::json::relabel_as_row_id_domain(&mut created_index)?;
+        } else if params
+            .index_type
+            .eq_ignore_ascii_case(BuiltinIndexType::Inverted.as_str())
+            || params.index_type.eq_ignore_ascii_case("fts")
+        {
+            // Inverted always trains on physical row addresses too, but its
+            // pre-migration version varies with the chosen posting format
+            // (and document granularity), unlike the single fixed constant
+            // `row_id_domain_version` returns for the other types above.
+            lance_index::scalar::inverted::InvertedIndexPlugin::relabel_as_row_id_domain(
+                &mut created_index,
+            )?;
         }
     }
 

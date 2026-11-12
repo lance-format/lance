@@ -2,6 +2,23 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::ROW_ADDR;
+
+/// Training always scans row addresses now; relabel a hand-built `_rowid`
+/// fixture (shared with the flat/brute-force reference search below, whose
+/// own contract is an arbitrary caller-supplied batch literally named
+/// `_rowid`) before feeding it to the real indexed builder.
+fn as_row_addr_training_input(batch: &RecordBatch) -> RecordBatch {
+    let schema = batch.schema();
+    let row_id_idx = schema.index_of(ROW_ID).unwrap();
+    let mut fields = schema.fields().to_vec();
+    fields[row_id_idx] = Arc::new(Field::new(
+        ROW_ADDR,
+        DataType::UInt64,
+        fields[row_id_idx].is_nullable(),
+    ));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec()).unwrap()
+}
 
 #[rstest::rstest]
 #[case::or(Operator::Or, None, vec![0, 1, 2])]
@@ -184,18 +201,19 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
+    let training_batch = as_row_addr_training_input(&batch);
     InvertedIndexBuilder::new(params.clone())
         .update(
             Box::pin(RecordBatchStreamAdapter::new(
-                batch.schema(),
-                stream::iter(vec![Ok(batch.clone())]),
+                training_batch.schema(),
+                stream::iter(vec![Ok(training_batch.clone())]),
             )),
             store.as_ref(),
             None,
         )
         .await
         .unwrap();
-    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache(), true)
         .await
         .unwrap();
     let tokens = try_collect_query_tokens("abcd", &mut params.build().unwrap()).unwrap();
@@ -318,18 +336,19 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
+    let training_batch = as_row_addr_training_input(&batch);
     InvertedIndexBuilder::new(params.clone())
         .update(
             Box::pin(RecordBatchStreamAdapter::new(
-                batch.schema(),
-                stream::iter(vec![Ok(batch.clone())]),
+                training_batch.schema(),
+                stream::iter(vec![Ok(training_batch.clone())]),
             )),
             store.as_ref(),
             None,
         )
         .await
         .unwrap();
-    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache(), true)
         .await
         .unwrap();
     for (operator, expected) in [(Operator::And, expected_and), (Operator::Or, expected_or)] {
@@ -517,18 +536,19 @@ async fn test_document_lengths_indexed_and_flat(
         ));
         let mut builder =
             InvertedIndexBuilder::new(params.clone().with_position(with_position).num_workers(1));
+        let training_batch = as_row_addr_training_input(&batch);
         builder
             .update(
                 Box::pin(RecordBatchStreamAdapter::new(
-                    batch.schema(),
-                    stream::iter(vec![Ok(batch.clone())]),
+                    training_batch.schema(),
+                    stream::iter(vec![Ok(training_batch.clone())]),
                 )),
                 store.as_ref(),
                 None,
             )
             .await
             .unwrap();
-        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let (tokens, num_docs, _) = index.bm25_stats_for_terms(&[], None).await.unwrap();

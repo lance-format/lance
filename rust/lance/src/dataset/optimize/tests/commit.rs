@@ -554,18 +554,28 @@ async fn test_commit_refuses_recording_mismatch_before_reserving_fragments(
         );
     }
     if matches!(mismatch, RecordingMismatch::IncompatibleIndexCreated) {
-        // Inverted: the other scalar index types now always create an
+        // Every scalar index type, Inverted included, now always creates an
         // address-domain segment on a stable-row-id dataset (safe alongside
-        // the recorded moves by construction), so none of them can illustrate
-        // this mismatch. Inverted still stores row ids directly here.
+        // the recorded moves by construction), so illustrating this mismatch
+        // needs a row-id-domain segment simulated by relabeling a freshly
+        // built one's `index_version` down -- the same trick
+        // `results_are_row_addrs` itself relies on to tell the two apart.
+        let segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &["cat"],
+            IndexType::Inverted,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
+        )
+        .name("i_idx".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        let legacy_segment = IndexMetadata {
+            index_version: 0,
+            ..segment
+        };
         dataset
-            .create_index(
-                &["cat"],
-                IndexType::Inverted,
-                Some("i_idx".into()),
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
-                false,
-            )
+            .commit_existing_index_segments("i_idx", "cat", vec![legacy_segment])
             .await
             .unwrap();
     }

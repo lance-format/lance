@@ -16,7 +16,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
 use lance_core::{
-    ROW_ID,
+    ROW_ADDR, ROW_ID,
     datatypes::{Field, LogicalType, Schema, format_field_path, parse_field_path},
 };
 use lance_index::metrics::NoOpMetricsCollector;
@@ -722,10 +722,15 @@ pub(crate) async fn validate_combined_fields_target_column(
     Ok(())
 }
 
-pub(crate) fn fts_document_schema(coordinate_rank: usize) -> Arc<ArrowSchema> {
+/// `row_id_col` is `ROW_ADDR` when training/updating an index (the scan
+/// behind it always yields physical row addresses now) and `ROW_ID` for the
+/// flat/residual query-time path (`FtsDocumentExec`), which must keep
+/// emitting genuine row ids. [`transform_fts_document_stream`] detects which
+/// one its input actually carries and passes it straight through.
+pub(crate) fn fts_document_schema(coordinate_rank: usize, row_id_col: &str) -> Arc<ArrowSchema> {
     let mut fields = vec![
         ArrowField::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
-        ArrowField::new(ROW_ID, DataType::UInt64, false),
+        ArrowField::new(row_id_col, DataType::UInt64, false),
     ];
     fields.extend(
         (0..coordinate_rank)
@@ -804,17 +809,30 @@ pub(crate) fn transform_fts_document_stream(
     resolved: ResolvedFtsField,
 ) -> Result<SendableRecordBatchStream> {
     let input_schema = input.schema();
-    if (input_schema
+    if input_schema
         .column_with_name(&resolved.root_column)
         .is_none()
-        && input_schema.column_with_name(VALUE_COLUMN_NAME).is_none())
-        || input_schema.column_with_name(ROW_ID).is_none()
+        && input_schema.column_with_name(VALUE_COLUMN_NAME).is_none()
     {
         return Err(Error::internal(
-            "FTS document input must contain the root source column and _rowid".to_string(),
+            "FTS document input must contain the root source column".to_string(),
         ));
     }
-    let output_schema = fts_document_schema(resolved.coordinate_rank());
+    // Index training/update scans always yield row addresses now; the
+    // flat/residual query-time path (`FtsDocumentExec`) still scans row ids.
+    // Whichever the input carries, the output keeps the same column so each
+    // consumer gets the domain it needs without this shared transform having
+    // to know which one called it.
+    let row_id_col = if input_schema.column_with_name(ROW_ADDR).is_some() {
+        ROW_ADDR
+    } else if input_schema.column_with_name(ROW_ID).is_some() {
+        ROW_ID
+    } else {
+        return Err(Error::internal(
+            "FTS document input must contain _rowid or _rowaddr".to_string(),
+        ));
+    };
+    let output_schema = fts_document_schema(resolved.coordinate_rank(), row_id_col);
     let stream_schema = output_schema.clone();
     let stream = input.map(move |batch| {
         let batch = batch?;
@@ -825,7 +843,7 @@ pub(crate) fn transform_fts_document_stream(
         let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
-        let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        let input_row_ids = batch[row_id_col].as_primitive::<arrow_array::types::UInt64Type>();
         // The row-ID validity bitmap can carry the scan's selection vector.
         if input_row_ids.null_count() > 0 {
             documents.retain(|document| input_row_ids.is_valid(document.row_index));
@@ -853,13 +871,19 @@ pub(crate) fn transform_fts_document_stream(
 
 /// Fill legacy posting-format metadata while leaving protobuf-default row
 /// document granularity untouched.
+///
+/// `index_version` 4 ([`lance_index::scalar::inverted::INVERTED_ROW_ADDR_DOMAIN_VERSION`])
+/// marks row-address-domain segments; it is independent of the posting-list
+/// format, which every such segment already carries explicitly in
+/// `details.posting_format_version` (see `InvertedIndexPlugin::train_inverted_index`),
+/// so the fallback below never needs to synthesize one for it.
 pub(crate) fn normalize_inverted_details(
     index: &IndexMetadata,
     mut details: InvertedIndexDetails,
 ) -> Result<InvertedIndexDetails> {
-    if !matches!(index.index_version, 0..=3) {
+    if !matches!(index.index_version, 0..=4) {
         return Err(Error::invalid_input(format!(
-            "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, or 3",
+            "FTS index '{}' has unsupported index_version {}; expected 0, 1, 2, 3, or 4",
             index.name, index.index_version
         )));
     }
@@ -867,7 +891,7 @@ pub(crate) fn normalize_inverted_details(
         let posting_format_version = match index.index_version {
             0 | 1 => 1,
             2 => 2,
-            3 => 3,
+            3 | 4 => 3,
             _ => unreachable!("index version was validated above"),
         };
         details.posting_format_version = Some(posting_format_version);
@@ -879,7 +903,8 @@ pub(crate) fn normalize_inverted_details(
 ///
 /// `InvertedIndex::merge_segments` is shaped as "merge old segments plus new
 /// rows", so even a pure segment merge needs a stream with the document column
-/// and `_rowid` fields. The stream intentionally contains no batches.
+/// and `_rowaddr` fields (training always scans row addresses now). The
+/// stream intentionally contains no batches.
 fn empty_inverted_update_stream(
     dataset: &Dataset,
     resolved: &ResolvedFtsField,
@@ -894,11 +919,11 @@ fn empty_inverted_update_stream(
             ))
         })?;
     let schema = if resolved.has_lists() {
-        fts_document_schema(resolved.coordinate_rank())
+        fts_document_schema(resolved.coordinate_rank(), ROW_ADDR)
     } else {
         Arc::new(ArrowSchema::new(vec![
             ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
-            ArrowField::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            ArrowField::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
         ]))
     };
     Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -1067,11 +1092,20 @@ pub(crate) async fn merge_segments(
 
     // Like the BTree merge, each source keeps only its rows still stored in the
     // fragments it covers, so a stale posting for a row that moved into another
-    // source's fragment is not carried into the merged segment.
+    // source's fragment is not carried into the merged segment. Every segment
+    // of a named index shares one domain (`append.rs`'s `legacy_domain_mismatch`
+    // forces a rebuild rather than letting them disagree), so the first
+    // segment's domain speaks for all of them -- same as BTree/Bitmap/NGram/
+    // RTree/MinHashLsh's own (always-`true`) calls below.
     let segment_refs = segments.iter().collect::<Vec<_>>();
-    let (_, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
-            .await?;
+    let address_domain = segments[0].results_are_row_addrs();
+    let (_, old_data_filters) = crate::index::append::build_per_segment_filters(
+        dataset,
+        &segment_refs,
+        staged,
+        address_domain,
+    )
+    .await?;
 
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
@@ -1382,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_unreleased_v4_metadata() {
+    fn normalize_keeps_v4_row_addr_domain_metadata() {
         let metadata = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![1],
@@ -1399,10 +1433,35 @@ mod tests {
             metadata: Default::default(),
         };
         let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
+        let posting_format_version = details.posting_format_version;
+
+        let details = normalize_inverted_details(&metadata, details).unwrap();
+
+        assert_eq!(details.posting_format_version, posting_format_version);
+    }
+
+    #[test]
+    fn normalize_rejects_unsupported_metadata() {
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![1],
+            covering_fields: vec![],
+            name: "tags_idx".to_string(),
+            dataset_version: 1,
+            fragment_bitmap: None,
+            index_details: None,
+            index_version: 5,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
 
         let err = normalize_inverted_details(&metadata, details).unwrap_err();
 
-        assert!(err.to_string().contains("unsupported index_version 4"));
+        assert!(err.to_string().contains("unsupported index_version 5"));
     }
 
     #[test]

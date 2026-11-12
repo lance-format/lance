@@ -37,7 +37,7 @@ use crate::Dataset;
 use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
 use crate::index::scalar::inverted::load_segment_details;
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::utils::{PreFilterMasks, build_prefilter};
+use crate::io::exec::utils::{PreFilterMasks, build_prefilter_in_domain};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{
@@ -62,7 +62,8 @@ use super::query_tokens::{
     tokenize_cross_column_compound_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    open_fts_segments, search_prepared_segments, segments_the_prefilter_may_match,
+    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
+    search_prepared_segments, segments_the_prefilter_may_match, translate_row_ids_and_scores,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -715,6 +716,8 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let indices =
                 open_fts_segments(&dataset, &column, segments_to_open, &metrics.index_metrics)
                     .await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, indices.first()).await?;
+            let address_domain = fts_segments_are_address_domain(&dataset, segments_to_open);
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -732,7 +735,8 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let terms = residual_seed.exact_query_terms(&query)?;
             if terms.is_empty() {
                 metrics.baseline_metrics.record_output(0);
-                return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
+                return scored_documents_batch(schema, Vec::new(), None)
+                    .map_err(DataFusionError::from);
             }
             let allowed_terms = Arc::new(terms.iter().cloned().collect::<FxHashSet<_>>());
             let query_tokens = Tokens::new(terms.clone(), doc_type);
@@ -776,7 +780,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     let stream = input.execute(0, context.clone())?;
                     return collect_bounded_fts_input(stream, limit).await;
                 }
-                let prefilter = build_prefilter(
+                let prefilter = build_prefilter_in_domain(
                     context,
                     partition,
                     &PreFilterSource::None,
@@ -787,8 +791,10 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                         external_mask: None,
                     },
                     &metrics_set,
-                )?;
-                compound_search_with_base_scorer(
+                    address_domain,
+                )
+                .await?;
+                let (row_ids, scores) = compound_search_with_base_scorer(
                     &indices,
                     &query,
                     &params,
@@ -797,7 +803,12 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     committed_scorer,
                 )
                 .await
-                .map_err(DataFusionError::from)
+                .map_err(DataFusionError::from)?;
+                DataFusionResult::Ok(translate_row_ids_and_scores(
+                    row_ids,
+                    scores,
+                    row_addr_to_row_id.as_deref(),
+                ))
             };
             let residual_query = query.clone();
             let residual_search = async move {
@@ -831,7 +842,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             });
             documents.truncate(limit);
             metrics.baseline_metrics.record_output(documents.len());
-            scored_documents_batch(schema, documents).map_err(DataFusionError::from)
+            scored_documents_batch(schema, documents, None).map_err(DataFusionError::from)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -1100,15 +1111,17 @@ impl ExecutionPlan for CompoundQueryExec {
                 true
             };
             let _details = load_segment_details(&dataset, column, &segments).await?;
-            let address_domain = !dataset.manifest.uses_stable_row_ids();
             let dataset_for_scope = dataset.clone();
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
+            let row_addr_to_row_id =
+                fts_row_addr_to_row_id(&dataset_for_scope, indices.first()).await?;
+            let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments);
             if let Some(first_index) = indices.first() {
                 let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
                 tokenized_query.get_or_init(|| snapshot);
             }
-            let mut prefilter = build_prefilter(
+            let mut prefilter = build_prefilter_in_domain(
                 context,
                 partition,
                 &prefilter_source,
@@ -1119,7 +1132,9 @@ impl ExecutionPlan for CompoundQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-            )?;
+                address_domain,
+            )
+            .await?;
             let deleted_fragments =
                 indices
                     .iter()
@@ -1408,6 +1423,8 @@ impl ExecutionPlan for CompoundQueryExec {
                     }
                 }
             };
+            let (row_ids, scores) =
+                translate_row_ids_and_scores(row_ids, scores, row_addr_to_row_id.as_deref());
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -1723,10 +1740,11 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 .iter()
                 .flat_map(|selection| selection.segments.iter().cloned())
                 .collect::<Vec<_>>();
+            let address_domain = fts_segments_are_address_domain(&dataset, &selected_segments);
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
-            let mut prefilter = build_prefilter(
+            let mut prefilter = build_prefilter_in_domain(
                 context,
                 partition,
                 &prefilter_source,
@@ -1737,7 +1755,9 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-            )?;
+                address_domain,
+            )
+            .await?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
                 let dataset = dataset.clone();
                 let metrics = metrics.clone();
@@ -1760,6 +1780,14 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     Ok::<_, DataFusionError>((selection.column, indices))
                 }
             }))
+            .await?;
+            let row_addr_to_row_id = fts_row_addr_to_row_id(
+                &dataset,
+                opened_columns
+                    .iter()
+                    .flat_map(|(_, indices)| indices.first())
+                    .next(),
+            )
             .await?;
 
             let mut tokenizer_indices = HashMap::with_capacity(opened_columns.len());
@@ -1823,6 +1851,8 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 metrics.clone(),
             )
             .await?;
+            let (row_ids, scores) =
+                translate_row_ids_and_scores(row_ids, scores, row_addr_to_row_id.as_deref());
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),

@@ -469,6 +469,7 @@ pub async fn build_global_bm25_scorer(
 }
 
 use lance_core::Error;
+use prost::Message;
 
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
@@ -507,8 +508,6 @@ impl InvertedIndexPlugin {
         });
 
         params.validate_format_version()?;
-        let format_version = params.resolved_format_version();
-        let is_element_document = params.get_document_granularity().is_list_element();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
         let mut inverted_index =
             InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
@@ -516,13 +515,50 @@ impl InvertedIndexPlugin {
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),
-            index_version: if is_element_document {
-                INVERTED_INDEX_VERSION_V3
-            } else {
-                format_version.index_version()
-            },
+            // Training always scans row addresses now (see
+            // `InvertedIndexTrainingRequest`); `build_scalar_index` relabels
+            // this back to the legacy row-id-domain version (via
+            // `relabel_as_row_id_domain`) on a dataset without stable row
+            // ids, where a row id and a row address are the same value.
+            index_version: INVERTED_ROW_ADDR_DOMAIN_VERSION,
             files,
         })
+    }
+
+    /// The format-and-granularity-appropriate version for a freshly trained
+    /// segment on a dataset without stable row ids, where a row id and a row
+    /// address are the same value.
+    ///
+    /// List-element-granularity documents require the V3 reader capability
+    /// (element-document coordinates) regardless of the configured posting
+    /// format; every other segment keeps the version implied by its posting
+    /// format.
+    fn legacy_index_version(is_element_document: bool, posting_format_version: u32) -> u32 {
+        if is_element_document {
+            INVERTED_INDEX_VERSION_V3
+        } else {
+            posting_format_version
+        }
+    }
+
+    /// Relabel a freshly trained Inverted segment in the pre-migration
+    /// row-id-domain format.
+    ///
+    /// Only valid on a dataset without stable row ids, where a row address and
+    /// a row id are the same value, so the segment's trained data is
+    /// identical in either domain. Mirrors the plain BTree/Bitmap/LabelList
+    /// relabeling in `build_scalar_index`, and keeps the segment readable by
+    /// builds that predate [`INVERTED_ROW_ADDR_DOMAIN_VERSION`].
+    pub fn relabel_as_row_id_domain(created: &mut CreatedIndex) -> Result<()> {
+        let details = pbold::InvertedIndexDetails::decode(created.index_details.value.as_slice())?;
+        let is_element_document =
+            DocumentGranularity::try_from(details.document_granularity)?.is_list_element();
+        let posting_format_version = details
+            .posting_format_version
+            .unwrap_or_else(|| default_fts_format_version().index_version());
+        created.index_version =
+            Self::legacy_index_version(is_element_document, posting_format_version);
+        Ok(())
     }
 
     /// Return true if the query can be used to speed up contains_tokens queries
@@ -543,7 +579,7 @@ impl InvertedIndexTrainingRequest {
     pub fn new(parameters: InvertedIndexParams) -> Self {
         Self {
             parameters,
-            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_id(),
+            criteria: TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
         }
     }
 }
@@ -636,7 +672,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn version(&self) -> u32 {
-        INVERTED_INDEX_VERSION_V3
+        INVERTED_ROW_ADDR_DOMAIN_VERSION
     }
 
     fn new_query_parser(
@@ -667,11 +703,18 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let results_are_row_addresses = index_version >= INVERTED_ROW_ADDR_DOMAIN_VERSION;
+        let index = InvertedIndex::load(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
@@ -691,12 +734,18 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
-        _index_version: u32,
+        index_version: u32,
         frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let index =
-            InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
+        let results_are_row_addresses = index_version >= INVERTED_ROW_ADDR_DOMAIN_VERSION;
+        let index = InvertedIndex::load_with_remapping(
+            index_store,
+            frag_reuse_index,
+            cache,
+            results_are_row_addresses,
+        )
+        .await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
@@ -876,9 +925,9 @@ mod tests {
     }
 
     #[test]
-    fn test_plugin_version_tracks_v3_capability_gate() {
+    fn test_plugin_version_tracks_row_addr_domain_gate() {
         let plugin = InvertedIndexPlugin;
-        assert_eq!(plugin.version(), INVERTED_INDEX_VERSION_V3);
+        assert_eq!(plugin.version(), INVERTED_ROW_ADDR_DOMAIN_VERSION);
     }
 
     #[test]

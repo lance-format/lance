@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead. The current implementation supports format versions 1 through 3; format version 4 is specified here but is not yet implemented.
+From format version 4 (`INVERTED_ROW_ADDR_DOMAIN_VERSION`) onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead. This version is independent of the posting-list format below (tracked separately via file metadata, not `index_version`): a row-address-domain segment can pair with any posting format.
 
 ### Token Dictionary File Schema
 
@@ -33,8 +33,7 @@ From format version 4 onward, a segment stores a physical row address (`fragment
 
 | Column        | Type   | Nullable | Description                      |
 |---------------|--------|----------|----------------------------------|
-| `_rowid`      | UInt64 | false    | Document row ID (only if format version <= 3) |
-| `_rowaddr`    | UInt64 | false    | Physical row address (`fragment_id << 32 \| offset`) of the document (only if format version >= 4) |
+| `_rowid`      | UInt64 | false    | Document row ID (format version <= 3) or row address (format version >= 4); see above |
 | `_num_tokens` | UInt32 | false    | Number of tokens in the document |
 
 Partitioned `docs.lance` files may include the optional schema metadata key
@@ -50,7 +49,7 @@ loaded, is file corruption.
 
 | Column                 | Type                    | Nullable | Description                                                      |
 |------------------------|-------------------------|----------|------------------------------------------------------------------|
-| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance._rowid` or `docs.lance._rowaddr`. |
+| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance._rowid`. |
 | `_max_score`           | Float32                 | false    | Maximum score for the token (for query optimization)             |
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |

@@ -312,10 +312,10 @@ enum IndexPresence {
 }
 
 /// `cat` is a Utf8 column alongside the numeric `i` one so a test can build
-/// a row-id-domain index (e.g. NGram) over it -- every remaining
-/// row-id-domain scalar index type requires a text column, unlike BTree,
-/// Bitmap, and LabelList, which moved to row-address domain and no longer
-/// serve as that fixture.
+/// a text-column scalar index (e.g. Inverted) over it. No scalar index type
+/// is row-id-domain anymore (Inverted's migration to
+/// `INVERTED_ROW_ADDR_DOMAIN_VERSION` was the last one), so this is purely
+/// about needing a text column, not about domain.
 async fn stable_row_id_dataset(uri: &str, num_fragments: u32) -> Dataset {
     lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -959,10 +959,10 @@ async fn assert_id_idx_answers_every_row(dataset: &Dataset, index_name: &str) {
 /// 12 rows over 3 fragments with a zone map on `value`, stable row ids on.
 ///
 /// `cat` is a Utf8 column alongside the numeric `id`/`value` ones so a test
-/// can build a row-id-domain index (e.g. NGram) over it -- every remaining
-/// row-id-domain scalar index type requires a text column, unlike BTree and
-/// Bitmap, which moved to row-address domain and no longer serve as that
-/// fixture.
+/// can build a text-column scalar index (e.g. Inverted) over it. No scalar
+/// index type is row-id-domain anymore (Inverted's migration to
+/// `INVERTED_ROW_ADDR_DOMAIN_VERSION` was the last one), so this is purely
+/// about needing a text column, not about domain.
 async fn zonemap_stable_row_id_dataset(uri: &str) -> Dataset {
     let batch = arrow_array::record_batch!(
         ("id", Int32, (0..12).collect::<Vec<_>>()),

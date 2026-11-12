@@ -2772,14 +2772,23 @@ async fn test_compact_ngram_with_stable_row_ids(#[values(false, true)] defer_ind
 #[tokio::test]
 async fn test_defer_index_remap_rejected_while_row_id_index_present() {
     let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
+    // A fresh Inverted index always trains in row-address domain, so a
+    // row-id-domain one (as every segment predating
+    // `INVERTED_ROW_ADDR_DOMAIN_VERSION` is) has to be simulated by relabeling
+    // a freshly built segment's `index_version` down -- the same trick
+    // `results_are_row_addrs` itself relies on to tell the two apart.
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
+    let segment = CreateIndexBuilder::new(&mut dataset, &["cat"], IndexType::Inverted, &params)
+        .name("id_idx".into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let legacy_segment = IndexMetadata {
+        index_version: 0,
+        ..segment
+    };
     dataset
-        .create_index(
-            &["cat"],
-            IndexType::Inverted,
-            Some("id_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
-            false,
-        )
+        .commit_existing_index_segments("id_idx", "cat", vec![legacy_segment])
         .await
         .unwrap();
 
@@ -2805,7 +2814,9 @@ async fn test_defer_index_remap_rejected_while_row_id_index_present() {
     assert_eq!(zonemap_coverage(&dataset).await.len(), 3);
 }
 /// The mirror image: once an FRI is live, a row-id-domain index cannot be
-/// added, because the FRI would be applied to it on load.
+/// added, because the FRI would be applied to it on load. Vector indices are
+/// the only kind that still is: every scalar index type, Inverted included,
+/// now trains in row-address domain.
 #[tokio::test]
 async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
     let mut dataset = zonemap_stable_row_id_dataset("memory://").await;
@@ -2828,7 +2839,9 @@ async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
             .is_some()
     );
 
-    let err = dataset
+    // Address-domain indices are allowed: the FRI repairs them. Inverted
+    // included now -- it no longer trains in row-id domain.
+    dataset
         .create_index(
             &["cat"],
             IndexType::Inverted,
@@ -2837,12 +2850,7 @@ async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
             false,
         )
         .await
-        .unwrap_err();
-    assert!(matches!(err, Error::InvalidInput { .. }));
-    let msg = err.to_string();
-    assert!(msg.contains("fragment reuse index"), "{msg}");
-
-    // Address-domain indices are still allowed: the FRI repairs them.
+        .unwrap();
     dataset
         .create_index(
             &["id"],
@@ -2865,6 +2873,72 @@ async fn test_create_row_id_domain_index_rejected_under_frag_reuse() {
         .unwrap();
     assert_zonemap_answers_match_scan(&dataset).await;
     assert_id_idx_answers_every_row(&dataset, "id_btree").await;
+}
+
+/// Vector indices still train in row-id domain, so they are still refused
+/// while an FRI is live -- the scalar-only half of the story above.
+#[tokio::test]
+async fn test_create_vector_index_rejected_under_frag_reuse() {
+    const DIM: u32 = 16;
+    let mut dataset = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vec",
+            lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(DIM)),
+        )
+        .into_dataset_with_params(
+            "memory://",
+            FragmentCount::from(3),
+            FragmentRowCount::from(4),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 512,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let centroids = FixedSizeListArray::try_new_from_values(
+        Float32Array::from_iter_values(std::iter::repeat_n(0.0, DIM as usize)),
+        DIM as i32,
+    )
+    .unwrap();
+    let params = VectorIndexParams::with_ivf_flat_params(
+        DistanceType::L2,
+        IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap(),
+    );
+    let err = dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("vec_idx".into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    let msg = err.to_string();
+    assert!(msg.contains("fragment reuse index"), "{msg}");
 }
 /// Index creation and a deferred compaction race, and each one's guard looks
 /// at a snapshot taken before the other committed.
@@ -2899,16 +2973,23 @@ async fn test_defer_index_remap_racing_row_id_index_creation() {
     let completed = execute_compaction_plan(&dataset, &options).await;
 
     // A concurrent writer adds one and commits first. No FRI exists yet, so
-    // nothing refuses it.
+    // nothing refuses it. A fresh Inverted index always trains in
+    // row-address domain, so a row-id-domain one is simulated the same way
+    // `test_defer_index_remap_rejected_while_row_id_index_present` does: relabel a
+    // freshly built segment's `index_version` down.
     let mut concurrent = Dataset::open(test_uri).await.unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
+    let segment = CreateIndexBuilder::new(&mut concurrent, &["cat"], IndexType::Inverted, &params)
+        .name("id_idx".into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let legacy_segment = IndexMetadata {
+        index_version: 0,
+        ..segment
+    };
     concurrent
-        .create_index(
-            &["cat"],
-            IndexType::Inverted,
-            Some("id_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted),
-            false,
-        )
+        .commit_existing_index_segments("id_idx", "cat", vec![legacy_segment])
         .await
         .unwrap();
     assert!(concurrent.manifest.version > dataset.manifest.version);
@@ -3075,9 +3156,10 @@ async fn test_row_id_index_creation_racing_defer_index_remap_disjoint_coverage()
 #[rstest]
 #[tokio::test]
 async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
-    // Inverted: every other scalar index type now always creates an
+    // Inverted: every scalar index type now always creates an
     // address-domain segment on a stable-row-id dataset (safe alongside an
-    // FRI by construction), so only Inverted still illustrates this race.
+    // FRI by construction) -- `create_index` below relabels a freshly built
+    // Inverted segment back to row-id domain to keep illustrating this race.
     #[values(IndexType::Inverted, IndexType::ZoneMap)] index_type: IndexType,
     #[values(false, true)] index_commits_first: bool,
     #[values(false, true)] is_disjoint: bool,
@@ -3129,11 +3211,25 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
     };
     let create_index = async |dataset: &mut Dataset| {
         let columns = [index_column];
-        let builder = dataset
+        let mut builder = dataset
             .create_index_builder(&columns, index_type, &params)
             .name("i_idx".into());
         if is_disjoint {
-            builder.fragments(vec![2]).await.map(|_| ())
+            builder = builder.fragments(vec![2]);
+        }
+        if index_type == IndexType::Inverted {
+            // A fresh Inverted index always trains in row-address domain;
+            // relabel it to simulate the pre-migration (row-id-domain)
+            // segment this race specifically exercises (same trick as
+            // `test_defer_index_remap_racing_row_id_index_creation`).
+            let segment = builder.execute_uncommitted().await?;
+            let legacy_segment = IndexMetadata {
+                index_version: 0,
+                ..segment
+            };
+            dataset
+                .commit_existing_index_segments("i_idx", index_column, vec![legacy_segment])
+                .await
         } else {
             builder.await.map(|_| ())
         }
