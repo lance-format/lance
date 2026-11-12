@@ -353,13 +353,14 @@ impl Schema {
     /// is an error rather than a parent struct with no children, because the
     /// columns usually come from a user.
     pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        let projected = self.do_project(columns, true, true)?;
         for column in columns {
             let column = column.as_ref();
-            if column.contains('.') && self.field(column).is_none() {
+            if column.contains('.') && projected.field(column).is_none() {
                 return Err(Error::field_not_found(column, self.field_paths()));
             }
         }
-        self.do_project(columns, true, true)
+        Ok(projected)
     }
 
     /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
