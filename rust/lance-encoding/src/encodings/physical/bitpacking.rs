@@ -211,8 +211,9 @@ impl InlineBitpacking {
         )
     }
 
+    #[inline]
     fn parse_chunk<T: ArrowNativeType + BitPackingUninit + Pod>(
-        data: &LanceBuffer,
+        data: &[u8],
         num_values: u64,
     ) -> Result<(usize, Cow<'_, [T]>)> {
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
@@ -248,7 +249,11 @@ impl InlineBitpacking {
             ));
         }
 
-        let chunk_words = data.borrow_to_typed_view::<T>();
+        let chunk_words = if data.as_ptr().align_offset(std::mem::align_of::<T>()) == 0 {
+            Cow::Borrowed(bytemuck::cast_slice::<u8, T>(data))
+        } else {
+            Cow::Owned(bytemuck::pod_collect_to_vec::<u8, T>(data))
+        };
         let bit_width_value = chunk_words[0].as_usize();
         if bit_width_value > uncompressed_bit_width {
             return Err(Error::corrupt_file_named(
@@ -402,9 +407,10 @@ impl InlineBitpacking {
 
     /// Append a selected range from one inline bitpacked mini-block. The caller
     /// owns `output` and keeps `scratch` across chunks in the same decode task.
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_selected<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
-        data: &LanceBuffer,
+        data: &[u8],
         num_values: u64,
         selection: Range<u64>,
         chunk_idx: usize,

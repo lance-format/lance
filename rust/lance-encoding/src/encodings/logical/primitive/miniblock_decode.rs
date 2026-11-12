@@ -118,41 +118,26 @@ impl DecodeMiniBlockTask {
         let mut scratch = Vec::<T>::new();
         let mut cached_chunk_idx = None;
         let mut defbuf: Option<LevelBuffer> = None;
-        let mut level_offset = 0usize;
 
-        let mut group_start = 0usize;
-        while group_start < self.instructions.len() {
-            let chunk = &self.instructions[group_start].1;
-            let mut group_end = group_start + 1;
-            while group_end < self.instructions.len()
-                && self.instructions[group_end].1.chunk_idx == chunk.chunk_idx
-            {
-                group_end += 1;
-            }
-            let group = &self.instructions[group_start..group_end];
-
-            let (def, payload) = if let Some(def_decompressor) = &self.def_decompressor {
-                let sections =
-                    Self::split_miniblock_chunk(&chunk.data, false, true, 1, self.has_large_chunk)?;
-                let num_levels = Self::resolve_num_levels(
-                    None,
-                    None,
-                    Some(def_decompressor.as_ref()),
-                    sections.def.as_ref(),
-                    sections.num_levels,
-                )?;
-                let def = sections
-                    .def
-                    .map(|def_bytes| {
-                        Self::decode_levels(def_decompressor.as_ref(), def_bytes, num_levels)
-                    })
-                    .transpose()?;
-                let payload = sections.value_buffers.into_iter().next().ok_or_else(|| {
-                    Error::corrupt_file_named("mini-block", "missing inline bitpacking buffer")
+        if let Some(def_decompressor) = &self.def_decompressor {
+            self.decode_inline_bitpacking_nullable::<T>(
+                def_decompressor.as_ref(),
+                &mut output,
+                &mut scratch,
+                &mut cached_chunk_idx,
+                &mut defbuf,
+            )?;
+        } else {
+            let header_size: usize = if self.has_large_chunk { 6 } else { 4 };
+            let payload_start = header_size
+                .checked_add(pad_bytes::<MINIBLOCK_ALIGNMENT>(header_size))
+                .ok_or_else(|| {
+                    Error::corrupt_file_named("mini-block", "payload offset overflow")
                 })?;
-                (def, payload)
-            } else {
-                let header_size = if self.has_large_chunk { 6 } else { 4 };
+            let instructions = &self.instructions;
+            let mut group_start = 0usize;
+            while group_start < instructions.len() {
+                let (instruction, chunk) = &instructions[group_start];
                 let header = chunk.data.get(..header_size).ok_or_else(|| {
                     Error::corrupt_file_named(
                         "mini-block",
@@ -171,74 +156,78 @@ impl DecodeMiniBlockTask {
                         Error::corrupt_file_named("mini-block", "truncated buffer size")
                     })?) as usize
                 };
-                let payload_start = header_size
-                    .checked_add(pad_bytes::<MINIBLOCK_ALIGNMENT>(header_size))
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named("mini-block", "payload offset overflow")
-                    })?;
                 let payload_end = payload_start.checked_add(payload_size).ok_or_else(|| {
                     Error::corrupt_file_named("mini-block", "payload end overflow")
                 })?;
-                if payload_end > chunk.data.len() {
-                    return Err(Error::corrupt_file_named(
+                let payload = chunk.data.get(payload_start..payload_end).ok_or_else(|| {
+                    Error::corrupt_file_named(
                         "mini-block",
                         format!(
                             "payload ends at {payload_end}, beyond chunk size {}",
                             chunk.data.len()
                         ),
-                    ));
-                }
-                (
-                    None,
-                    chunk.data.slice_with_length(payload_start, payload_size),
-                )
-            };
-
-            let group_rows = group.iter().fold(0_u64, |acc, (inst, _)| {
-                acc.saturating_add(inst.rows_to_take)
-            });
-            let cache_chunk = InlineBitpacking::should_cache_chunk(group.len(), group_rows);
-
-            for (instruction, inst_chunk) in group {
-                let start = instruction
-                    .rows_to_skip
-                    .checked_add(instruction.chunk_instructions.rows_to_skip)
-                    .ok_or_else(|| {
-                        Error::corrupt_file_named("mini-block", "selection start overflow")
-                    })?;
-                let end = start.checked_add(instruction.rows_to_take).ok_or_else(|| {
-                    Error::corrupt_file_named("mini-block", "selection end overflow")
+                    )
                 })?;
-                if self.def_decompressor.is_some() {
-                    if let Some(def_buf) = &def
-                        && (end as usize) > def_buf.len()
-                    {
-                        return Err(Error::corrupt_file_named(
-                            "miniblock_levels",
-                            format!(
-                                "level selection {}..{} exceeds {} decoded definition levels",
-                                start,
-                                end,
-                                def_buf.len()
-                            ),
-                        ));
-                    }
-                    Self::extend_levels(start..end, &mut defbuf, &def, level_offset);
-                    level_offset += (end - start) as usize;
-                }
-                InlineBitpacking::append_selected::<T>(
-                    &payload,
-                    inst_chunk.items_in_chunk,
-                    start..end,
-                    inst_chunk.chunk_idx,
-                    cache_chunk,
-                    &mut output,
-                    &mut scratch,
-                    &mut cached_chunk_idx,
-                )?;
-            }
 
-            group_start = group_end;
+                if group_start + 1 >= instructions.len()
+                    || instructions[group_start + 1].1.chunk_idx != chunk.chunk_idx
+                {
+                    let start = instruction
+                        .rows_to_skip
+                        .checked_add(instruction.chunk_instructions.rows_to_skip)
+                        .ok_or_else(|| {
+                            Error::corrupt_file_named("mini-block", "selection start overflow")
+                        })?;
+                    let end = start.checked_add(instruction.rows_to_take).ok_or_else(|| {
+                        Error::corrupt_file_named("mini-block", "selection end overflow")
+                    })?;
+                    InlineBitpacking::append_selected::<T>(
+                        payload,
+                        chunk.items_in_chunk,
+                        start..end,
+                        chunk.chunk_idx,
+                        false,
+                        &mut output,
+                        &mut scratch,
+                        &mut cached_chunk_idx,
+                    )?;
+                    group_start += 1;
+                } else {
+                    let mut group_end = group_start + 2;
+                    while group_end < instructions.len()
+                        && instructions[group_end].1.chunk_idx == chunk.chunk_idx
+                    {
+                        group_end += 1;
+                    }
+                    let group = &instructions[group_start..group_end];
+                    let group_rows = group.iter().fold(0_u64, |acc, (inst, _)| {
+                        acc.saturating_add(inst.rows_to_take)
+                    });
+                    let cache_chunk = InlineBitpacking::should_cache_chunk(group.len(), group_rows);
+                    for (inst, inst_chunk) in group {
+                        let start = inst
+                            .rows_to_skip
+                            .checked_add(inst.chunk_instructions.rows_to_skip)
+                            .ok_or_else(|| {
+                                Error::corrupt_file_named("mini-block", "selection start overflow")
+                            })?;
+                        let end = start.checked_add(inst.rows_to_take).ok_or_else(|| {
+                            Error::corrupt_file_named("mini-block", "selection end overflow")
+                        })?;
+                        InlineBitpacking::append_selected::<T>(
+                            payload,
+                            inst_chunk.items_in_chunk,
+                            start..end,
+                            inst_chunk.chunk_idx,
+                            cache_chunk,
+                            &mut output,
+                            &mut scratch,
+                            &mut cached_chunk_idx,
+                        )?;
+                    }
+                    group_start = group_end;
+                }
+            }
         }
 
         let fixed = FixedWidthDataBlock {
@@ -257,6 +246,92 @@ impl DecodeMiniBlockTask {
             DataBlock::FixedWidth(fixed)
         };
         Ok(DecodedPage { data, repdef })
+    }
+
+    fn decode_inline_bitpacking_nullable<T: ArrowNativeType + BitPackingUninit + Pod + Default>(
+        &self,
+        def_decompressor: &dyn BlockDecompressor,
+        output: &mut Vec<T>,
+        scratch: &mut Vec<T>,
+        cached_chunk_idx: &mut Option<usize>,
+        defbuf: &mut Option<LevelBuffer>,
+    ) -> Result<()> {
+        let instructions = &self.instructions;
+        let has_large_chunk = self.has_large_chunk;
+        let mut level_offset = 0usize;
+        let mut group_start = 0usize;
+        while group_start < instructions.len() {
+            let chunk = &instructions[group_start].1;
+            let mut group_end = group_start + 1;
+            while group_end < instructions.len()
+                && instructions[group_end].1.chunk_idx == chunk.chunk_idx
+            {
+                group_end += 1;
+            }
+            let group = &instructions[group_start..group_end];
+
+            let sections =
+                Self::split_miniblock_chunk(&chunk.data, false, true, 1, has_large_chunk)?;
+            let num_levels = Self::resolve_num_levels(
+                None,
+                None,
+                Some(def_decompressor),
+                sections.def.as_ref(),
+                sections.num_levels,
+            )?;
+            let def = sections
+                .def
+                .map(|def_bytes| Self::decode_levels(def_decompressor, def_bytes, num_levels))
+                .transpose()?;
+            let payload = sections.value_buffers.into_iter().next().ok_or_else(|| {
+                Error::corrupt_file_named("mini-block", "missing inline bitpacking buffer")
+            })?;
+
+            let group_rows = group.iter().fold(0_u64, |acc, (inst, _)| {
+                acc.saturating_add(inst.rows_to_take)
+            });
+            let cache_chunk = InlineBitpacking::should_cache_chunk(group.len(), group_rows);
+
+            for (instruction, inst_chunk) in group {
+                let start = instruction
+                    .rows_to_skip
+                    .checked_add(instruction.chunk_instructions.rows_to_skip)
+                    .ok_or_else(|| {
+                        Error::corrupt_file_named("mini-block", "selection start overflow")
+                    })?;
+                let end = start.checked_add(instruction.rows_to_take).ok_or_else(|| {
+                    Error::corrupt_file_named("mini-block", "selection end overflow")
+                })?;
+                if let Some(def_buf) = &def
+                    && (end as usize) > def_buf.len()
+                {
+                    return Err(Error::corrupt_file_named(
+                        "miniblock_levels",
+                        format!(
+                            "level selection {}..{} exceeds {} decoded definition levels",
+                            start,
+                            end,
+                            def_buf.len()
+                        ),
+                    ));
+                }
+                Self::extend_levels(start..end, defbuf, &def, level_offset);
+                level_offset += (end - start) as usize;
+                InlineBitpacking::append_selected::<T>(
+                    &payload,
+                    inst_chunk.items_in_chunk,
+                    start..end,
+                    inst_chunk.chunk_idx,
+                    cache_chunk,
+                    output,
+                    scratch,
+                    cached_chunk_idx,
+                )?;
+            }
+
+            group_start = group_end;
+        }
+        Ok(())
     }
 
     fn decoded_size_bytes(&self) -> Option<u64> {
