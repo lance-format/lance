@@ -27,12 +27,12 @@ pub use index::{
     list_index_files_with_sizes,
 };
 
-pub(crate) use manifest::pb_manifest_without_fragments;
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,
     SelfDescribingFileReader, WriterVersion, is_detached_version,
     populate_manifest_schema_dictionaries,
 };
+pub(crate) use manifest::{ManifestSummary, pb_manifest_without_fragments};
 pub use row_ids::{
     ExternalFile, InlineRowIds, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
     ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowIdMeta,

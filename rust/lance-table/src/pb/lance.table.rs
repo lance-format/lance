@@ -32,7 +32,7 @@ impl ::prost::Name for Clustering {
 /// rows. If column exists in the schema of a dataset, but the file for that column does
 /// not exist within a DataFragment of that dataset, that column consists entirely of
 /// nulls.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Message)]
 pub struct DataFragment {
     /// The ID of a DataFragment is unique within a dataset.
     #[prost(uint64, tag = "1")]
@@ -91,7 +91,7 @@ pub mod data_fragment {
     /// These are the row ids for the fragment, in order of the rows as they appear.
     /// That is, if a fragment has 3 rows, and the row ids are \[1, 42, 3\], then the
     /// first row is row 1, the second row is row 42, and the third row is row 3.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum RowIdSequence {
         /// Current Lance writers store row ids inline regardless of encoded size.
         #[prost(bytes, tag = "5")]
@@ -106,7 +106,7 @@ pub mod data_fragment {
         #[prost(message, tag = "12")]
         ColumnRowIds(super::RowLineageColumn),
     }
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum LastUpdatedAtVersionSequence {
         /// Current Lance writers store last-updated versions inline regardless of encoded size.
         #[prost(bytes, tag = "7")]
@@ -117,7 +117,7 @@ pub mod data_fragment {
         #[prost(message, tag = "13")]
         ColumnLastUpdatedAtVersions(super::RowLineageColumn),
     }
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum CreatedAtVersionSequence {
         /// Current Lance writers store created-at versions inline regardless of encoded size.
         #[prost(bytes, tag = "9")]
@@ -139,7 +139,7 @@ impl ::prost::Name for DataFragment {
         "/lance.table.DataFragment".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DataFile {
     /// Path to the root relative to the dataset's URI.
     #[prost(string, tag = "1")]
@@ -274,7 +274,7 @@ impl ::prost::Name for DataFile {
 /// set bits below it) of that offset within the field's coverage bitmap. Because
 /// fields may cover different offset sets, the value columns of a single overlay
 /// data file may have different lengths (which the Lance file format permits).
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DataOverlayFile {
     /// The data file storing the overlay's new cell values, one value column per
     /// field in `data_file.fields`. No row-offset key column is stored.
@@ -303,7 +303,7 @@ pub struct DataOverlayFile {
 /// Nested message and enum types in `DataOverlayFile`.
 pub mod data_overlay_file {
     /// Which (offset, field) cells this overlay provides values for.
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Coverage {
         /// A single 32-bit Roaring bitmap of physical row offsets that applies to
         /// every field in `data_file.fields` (a "dense" / rectangular overlay).
@@ -328,7 +328,7 @@ impl ::prost::Name for DataOverlayFile {
     }
 }
 /// Per-field coverage for a sparse overlay.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FieldCoverage {
     /// One entry per field in the overlay's `data_file.fields`, in the same order.
     /// Each is a 32-bit Roaring bitmap of the physical row offsets covered for that
@@ -356,7 +356,7 @@ impl ::prost::Name for FieldCoverage {
 ///
 /// When `inline` is set there is no such file: the deletion vector lives in the
 /// manifest itself.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeletionFile {
     /// Type of deletion file.
     #[prost(enumeration = "deletion_file::DeletionFileType", tag = "1")]
@@ -389,7 +389,18 @@ pub mod deletion_file {
     /// Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
     /// offsets. If there are sparsely deleted rows, then ARROW_ARRAY is the most efficient. If there
     /// are densely deleted rows, then BITMAP is the most efficient.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[derive(
+        lance_core::deepsize::DeepSizeOf,
+        Clone,
+        Copy,
+        Debug,
+        PartialEq,
+        Eq,
+        Hash,
+        PartialOrd,
+        Ord,
+        ::prost::Enumeration,
+    )]
     #[repr(i32)]
     pub enum DeletionFileType {
         /// A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
@@ -449,7 +460,7 @@ impl ::prost::Name for DeletionFile {
 /// This is a stable table-format feature. A manifest containing any column
 /// marker must set the spilled row lineage feature flag (bit 11) in both the
 /// reader and writer feature words.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RowLineageColumn {}
 impl ::prost::Name for RowLineageColumn {
     const NAME: &'static str = "RowLineageColumn";
@@ -462,7 +473,7 @@ impl ::prost::Name for RowLineageColumn {
     }
 }
 /// A byte range of a file. Used by the fragment reuse index details.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ExternalFile {
     /// Path to the file, relative to the root of the table.
     #[prost(string, tag = "1")]
@@ -509,7 +520,7 @@ impl ::prost::Name for FragmentTreeMetadata {
     }
 }
 /// Fragment state for one Version Manifest.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Message)]
 pub struct FragmentTree {
     /// Mutations not represented by the selected root.
     #[prost(message, repeated, tag = "3")]
@@ -522,7 +533,7 @@ pub struct FragmentTree {
 }
 /// Nested message and enum types in `FragmentTree`.
 pub mod fragment_tree {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Oneof)]
     pub enum Root {
         #[prost(message, tag = "1")]
         InlineRoot(super::FragmentTreeRoot),
@@ -543,7 +554,7 @@ impl ::prost::Name for FragmentTree {
     }
 }
 /// Inline or external root state.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Message)]
 pub struct FragmentTreeRoot {
     #[prost(message, repeated, tag = "1")]
     pub children: ::prost::alloc::vec::Vec<FragmentTreeChild>,
@@ -565,7 +576,7 @@ impl ::prost::Name for FragmentTreeRoot {
 }
 /// Children are ordered by min_key. A child owns [min_key, next min_key);
 /// the last child inherits its parent's upper bound.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FragmentTreeChild {
     /// Tree object path relative to its resolved dataset.
     #[prost(string, tag = "1")]
@@ -631,7 +642,7 @@ impl ::prost::Name for FragmentTreeNode {
     }
 }
 /// Validated mutation with exact after-minus-before aggregate deltas.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Message)]
 pub struct FragmentTreeMutation {
     #[prost(uint64, tag = "1")]
     pub action_sequence: u64,
@@ -656,14 +667,14 @@ impl ::prost::Name for FragmentTreeMutation {
 }
 /// upsert_fragment replaces the complete record. Use it for changes that other
 /// actions cannot express, including overlays, version sequences, and row IDs.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Message)]
 pub struct FragmentAction {
     #[prost(oneof = "fragment_action::Action", tags = "1, 2, 3, 4, 5, 6, 7")]
     pub action: ::core::option::Option<fragment_action::Action>,
 }
 /// Nested message and enum types in `FragmentAction`.
 pub mod fragment_action {
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    #[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, ::prost::Oneof)]
     pub enum Action {
         #[prost(message, tag = "1")]
         UpsertFragment(super::DataFragment),
@@ -692,7 +703,7 @@ impl ::prost::Name for FragmentAction {
     }
 }
 /// Append to the ordered file list.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddDataFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,
@@ -710,7 +721,7 @@ impl ::prost::Name for AddDataFile {
     }
 }
 /// Remove every matching path, preserving order.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RemoveDataFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,
@@ -727,7 +738,7 @@ impl ::prost::Name for RemoveDataFile {
         "/lance.table.RemoveDataFile".into()
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AddDeletionFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,
@@ -744,7 +755,7 @@ impl ::prost::Name for AddDeletionFile {
         "/lance.table.AddDeletionFile".into()
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClearDeletionFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,
@@ -761,7 +772,7 @@ impl ::prost::Name for ClearDeletionFile {
 }
 /// On the first expected_path match, replace path, file_size_bytes, and base_id.
 /// Preserve its column mapping and file version.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(lance_core::deepsize::DeepSizeOf, Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReplaceDataFile {
     #[prost(uint64, tag = "1")]
     pub frag_id: u64,

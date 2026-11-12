@@ -130,6 +130,30 @@ fn generate_table(
         ".lance.table.DataFragment.inline_row_ids",
         ".lance.table.DeletionFile.inline",
     ]);
+    for name in [
+        "FragmentTree",
+        "FragmentTreeRoot",
+        "FragmentTreeChild",
+        "FragmentTreeMutation",
+        "FragmentAction",
+        "AddDataFile",
+        "RemoveDataFile",
+        "ReplaceDataFile",
+        "AddDeletionFile",
+        "ClearDeletionFile",
+        "DataFragment",
+        "DataFile",
+        "DataOverlayFile",
+        "FieldCoverage",
+        "DeletionFile",
+        "ExternalFile",
+        "RowLineageColumn",
+    ] {
+        config.type_attribute(
+            format!(".lance.table.{name}"),
+            "#[derive(lance_core::deepsize::DeepSizeOf)]",
+        );
+    }
     config.compile_protos(
         &[
             proto_dir.join("table.proto"),

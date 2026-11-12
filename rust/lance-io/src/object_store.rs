@@ -992,6 +992,11 @@ impl ObjectStore {
         self.max_iop_size
     }
 
+    /// Retries of a download whose response body fails partway.
+    pub fn download_retry_count(&self) -> usize {
+        self.download_retry_count
+    }
+
     /// The amount of parallelism to use for I/O operations.
     ///
     /// Honors the `LANCE_IO_THREADS` override when set, otherwise the store's configured value.

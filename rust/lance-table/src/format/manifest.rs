@@ -14,13 +14,16 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
+use crate::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_TREE, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS,
+    TREE_CARRIED_PAIRED_FLAGS, TREE_CARRIED_WRITER_FLAGS,
+};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -52,9 +55,23 @@ pub struct Manifest {
 
     /// Fragments, the pieces to build the dataset.
     ///
-    /// This list is stored in order, sorted by fragment id.  However, the fragment id
-    /// sequence may have gaps.
+    /// This list is stored in order, sorted by fragment id. However, the fragment id
+    /// sequence may have gaps. For a tree table, [`Self::fragment_tree`] is
+    /// authoritative, and this list only holds the fragments this handle has
+    /// loaded, which can be all, some or none of them. A written tree manifest
+    /// leaves the list empty. A manifest with the tree feature bits but no
+    /// descriptor is a successor still waiting for its tree, so its list isn't
+    /// the table's state either.
     pub fragments: Arc<Vec<Fragment>>,
+
+    /// Experimental fragment tree descriptor. This API may change at any time.
+    /// A tree requires [`FLAG_FRAGMENT_TREE`] in both feature words. `None`
+    /// without that bit means [`Self::fragments`] is the complete state. `None`
+    /// with it marks a successor or clone of a tree. To write one, set this
+    /// field and empty the list with [`Self::set_fragments`], because
+    /// [`write_manifest`](crate::io::manifest::write_manifest) refuses records
+    /// beside a descriptor.
+    pub fragment_tree: Option<Arc<pb::FragmentTree>>,
 
     /// The file position of the version aux data.
     pub version_aux_data: usize,
@@ -147,7 +164,7 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
         .collect()
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ManifestSummary {
     pub total_fragments: u64,
     pub total_data_files: u64,
@@ -191,6 +208,26 @@ impl From<ManifestSummary> for BTreeMap<String, String> {
 }
 
 impl Manifest {
+    /// Replace resident fragments and rebuild the row offsets read by
+    /// [`Self::fragments_by_offset_range`], which assigning [`Self::fragments`]
+    /// does not do. An `Arc` is stored as given, so shared records are not copied.
+    /// `max_fragment_id` and the tree descriptor are unchanged, and this does not
+    /// establish tree inventory completeness.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_table::format::{Fragment, Manifest};
+    /// # fn example(manifest: &mut Manifest, fragments: Arc<Vec<Fragment>>) {
+    /// manifest.set_fragments(fragments.clone());
+    /// assert!(Arc::ptr_eq(&manifest.fragments, &fragments));
+    /// # }
+    /// ```
+    pub fn set_fragments(&mut self, fragments: impl Into<Arc<Vec<Fragment>>>) {
+        let fragments = fragments.into();
+        self.fragment_offsets = compute_fragment_offsets(&fragments);
+        self.fragments = fragments;
+    }
+
     /// Whether this table requires independently addressed Managed Blob support.
     pub fn has_managed_blobs(&self) -> bool {
         self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
@@ -229,15 +266,21 @@ impl Manifest {
             clustering: Vec::new(),
             max_clustering_id: 0,
             encoded_fragments: EncodedFragmentCache::default(),
+            fragment_tree: None,
         }
     }
 
+    /// The version after `previous`, over `schema` and `fragments`. A successor
+    /// of a tree has the tree bits and keeps the fragment requirements of the
+    /// predecessor's records, but no descriptor. [`Self::fragment_tree`] says
+    /// what it needs before it can be written.
     pub fn new_from_previous(
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let (tree_reader_flags, tree_writer_flags) = previous.carried_tree_flags();
 
         Self {
             schema,
@@ -249,8 +292,10 @@ impl Manifest {
             index_section: None, // Caller should update index if they want to keep them.
             timestamp_nanos: 0,  // This will be set on commit
             tag: None,
-            reader_feature_flags: previous.reader_feature_flags & STICKY_READER_FLAGS,
-            writer_feature_flags: previous.writer_feature_flags & STICKY_WRITER_FLAGS,
+            reader_feature_flags: (previous.reader_feature_flags & STICKY_READER_FLAGS)
+                | tree_reader_flags,
+            writer_feature_flags: (previous.writer_feature_flags & STICKY_WRITER_FLAGS)
+                | tree_writer_flags,
             max_fragment_id: previous.max_fragment_id,
             max_allocated_field_id: previous.max_allocated_field_id,
             transaction_file: None,
@@ -264,13 +309,15 @@ impl Manifest {
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
             encoded_fragments: EncodedFragmentCache::default(),
+            fragment_tree: None,
         }
     }
 
-    /// Performs a shallow_clone of the manifest entirely in memory without:
-    /// - Any persistent storage operations
-    /// - Modifications to the original data
-    /// - If the shallow clone is for branch, ref_name is the source branch
+    /// Clone the manifest in memory. For a branch, `ref_name` names the source.
+    /// A clone of a tree has the tree bits but no descriptor. The caller rebuilds
+    /// the tree or remaps its references to the source dataset, and
+    /// [`Self::fragment_tree`] says what else the clone needs before it can be
+    /// written.
     pub fn shallow_clone(
         &self,
         ref_name: Option<String>,
@@ -279,6 +326,7 @@ impl Manifest {
         branch_name: Option<String>,
         transaction_file: String,
     ) -> Self {
+        let (tree_reader_flags, tree_writer_flags) = self.carried_tree_flags();
         let cloned_fragments = self
             .fragments
             .as_ref()
@@ -322,15 +370,18 @@ impl Manifest {
             // they are otherwise derived from the fragments, so a clone of a table
             // whose rows were all deleted would lose them and stop assigning ids
             // from `next_row_id`.
-            reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
-            writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
+            reader_feature_flags: (self.reader_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS))
+                | tree_reader_flags,
+            writer_feature_flags: (self.writer_feature_flags
+                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS))
+                | tree_writer_flags,
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
             transaction_section: None,
             fragment_offsets: self.fragment_offsets.clone(),
+            fragment_tree: None,
             next_row_id: self.next_row_id,
             data_storage_format: self.data_storage_format.clone(),
             config: self.config.clone(),
@@ -542,6 +593,13 @@ impl Manifest {
         }
     }
 
+    /// The next fragment id an append may allocate, one above
+    /// [`Self::max_fragment_id`], or zero when that is `None`. A stored high
+    /// water mark keeps a removed id from being reused.
+    pub fn next_fragment_id(&self) -> u64 {
+        self.max_fragment_id().map_or(0, |id| id + 1)
+    }
+
     /// Get the highest field ID that may not be allocated again.
     ///
     /// This is different than [Schema::max_field_id] because it also considers
@@ -648,6 +706,53 @@ impl Manifest {
         self.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0
     }
 
+    /// Whether this version keeps its fragments in a tree. A successor of a
+    /// tree carries the tree bits before its own descriptor is attached.
+    pub(crate) fn uses_fragment_tree(&self) -> bool {
+        self.fragment_tree.is_some()
+            || (self.reader_feature_flags | self.writer_feature_flags) & FLAG_FRAGMENT_TREE != 0
+    }
+
+    /// The reader and writer bits a successor or clone keeps for its tree. Zero
+    /// for a flat manifest, which derives them from its own fragments.
+    fn carried_tree_flags(&self) -> (u64, u64) {
+        if self.uses_fragment_tree() {
+            (
+                (self.reader_feature_flags & TREE_CARRIED_PAIRED_FLAGS) | FLAG_FRAGMENT_TREE,
+                (self.writer_feature_flags & TREE_CARRIED_WRITER_FLAGS) | FLAG_FRAGMENT_TREE,
+            )
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Check the layout a manifest file must have. A stored tree manifest has a
+    /// descriptor, [`FLAG_FRAGMENT_TREE`] in both feature words and no records. A
+    /// stored flat manifest has no descriptor and neither bit. A descriptor also
+    /// needs a root the spec allows. In memory a tree
+    /// manifest may hold resident records and a successor may hold the bits
+    /// before its descriptor, so this applies only to decoded and outgoing bytes.
+    pub(crate) fn validate_stored_fragment_layout(&self) -> std::result::Result<(), String> {
+        let version = self.version;
+        let descriptor = self.fragment_tree.is_some();
+        let reader_flag = self.reader_feature_flags & FLAG_FRAGMENT_TREE != 0;
+        let writer_flag = self.writer_feature_flags & FLAG_FRAGMENT_TREE != 0;
+        let records = self.fragments.len();
+        if descriptor != reader_flag || descriptor != writer_flag || (descriptor && records > 0) {
+            return Err(format!(
+                "Manifest version {version} has inconsistent fragment metadata: \
+                 descriptor={descriptor}, reader_flag={reader_flag}, \
+                 writer_flag={writer_flag}, records={records}. A stored tree manifest has \
+                 a descriptor, FLAG_FRAGMENT_TREE in both feature words and no records. \
+                 A stored flat manifest has no descriptor and neither bit"
+            ));
+        }
+        match self.fragment_tree.as_deref() {
+            Some(descriptor) => validate_descriptor_root(version, descriptor),
+            None => Ok(()),
+        }
+    }
+
     /// Creates a serialized copy of the manifest, suitable for IPC or temp storage
     /// and can be used to create a dataset
     pub fn serialized(&self) -> Vec<u8> {
@@ -655,53 +760,82 @@ impl Manifest {
         pb_manifest.encode_to_vec()
     }
 
-    /// Get the summary information of a manifest.
+    /// Totals over the resident [`Self::fragments`].
+    ///
+    /// A tree manifest may hold only some of its fragment records, or none, so
+    /// for a tree table this is not the table's summary. Use
+    /// [`FragmentTree::summary`](crate::fragment_metadata::FragmentTree::summary)
+    /// for that.
     ///
     /// This function calculates various statistics about the manifest, including:
     /// - total_files_size: Total size of all data files in bytes
-    /// - total_fragments: Total number of fragments in the dataset
+    /// - total_fragments: Total number of resident fragments
     /// - total_data_files: Total number of data files across all fragments
     /// - total_deletion_files: Total number of external deletion files
     /// - total_data_file_rows: Total number of rows in data files
     /// - total_deletion_file_rows: Total number of deleted rows in deletion files
-    /// - total_rows: Total number of rows in the dataset
+    /// - total_rows: Total visible rows in the resident fragments
     pub fn summary(&self) -> ManifestSummary {
+        ManifestSummary::of(&self.fragments)
+    }
+}
+
+impl ManifestSummary {
+    /// The totals [`Manifest::summary`] reports for `fragments`.
+    pub(crate) fn of(fragments: &[Fragment]) -> Self {
         // Calculate total fragments
-        let mut summary =
-            self.fragments
-                .iter()
-                .fold(ManifestSummary::default(), |mut summary, f| {
-                    // Count data files in the current fragment
-                    summary.total_data_files += f.files.len() as u64;
-                    // Sum the number of rows for the current fragment (if available)
-                    if let Some(num_rows) = f.num_rows() {
-                        summary.total_rows += num_rows as u64;
-                    }
-                    // Sum file sizes for all data files in the current fragment (if available)
-                    for data_file in &f.files {
-                        if let Some(size_bytes) = data_file.file_size_bytes.get() {
-                            summary.total_files_size += size_bytes.get();
-                        }
-                    }
-                    // Inline vectors are part of the manifest, not deletion files.
-                    if f.deletion_file
-                        .as_ref()
-                        .is_some_and(|file| !file.is_inline())
-                    {
-                        summary.total_deletion_files += 1;
-                    }
-                    // Sum the number of deleted rows from the deletion file (if available)
-                    if let Some(deletion_file) = &f.deletion_file
-                        && let Some(num_deleted) = deletion_file.num_deleted_rows
-                    {
-                        summary.total_deletion_file_rows += num_deleted as u64;
-                    }
-                    summary
-                });
-        summary.total_fragments = self.fragments.len() as u64;
+        let mut summary = fragments.iter().fold(Self::default(), |mut summary, f| {
+            // Count data files in the current fragment
+            summary.total_data_files += f.files.len() as u64;
+            // Sum the number of rows for the current fragment (if available)
+            if let Some(num_rows) = f.num_rows() {
+                summary.total_rows += num_rows as u64;
+            }
+            // Sum file sizes for all data files in the current fragment (if available)
+            for data_file in &f.files {
+                if let Some(size_bytes) = data_file.file_size_bytes.get() {
+                    summary.total_files_size += size_bytes.get();
+                }
+            }
+            // Inline vectors are part of the manifest, not deletion files.
+            if f.deletion_file
+                .as_ref()
+                .is_some_and(|file| !file.is_inline())
+            {
+                summary.total_deletion_files += 1;
+            }
+            // Sum the number of deleted rows from the deletion file (if available)
+            if let Some(deletion_file) = &f.deletion_file
+                && let Some(num_deleted) = deletion_file.num_deleted_rows
+            {
+                summary.total_deletion_file_rows += num_deleted as u64;
+            }
+            summary
+        });
+        summary.total_fragments = fragments.len() as u64;
         summary.total_data_file_rows = summary.total_rows + summary.total_deletion_file_rows;
 
         summary
+    }
+
+    /// Count fragments disjoint from those this summary already counts.
+    pub(crate) fn add(&mut self, other: &Self) {
+        let Self {
+            total_fragments,
+            total_data_files,
+            total_files_size,
+            total_deletion_files,
+            total_data_file_rows,
+            total_deletion_file_rows,
+            total_rows,
+        } = other;
+        self.total_fragments += total_fragments;
+        self.total_data_files += total_data_files;
+        self.total_files_size += total_files_size;
+        self.total_deletion_files += total_deletion_files;
+        self.total_data_file_rows += total_data_file_rows;
+        self.total_deletion_file_rows += total_deletion_file_rows;
+        self.total_rows += total_rows;
     }
 }
 
@@ -1106,10 +1240,73 @@ impl From<BasePath> for pb::BasePath {
     }
 }
 
+/// Check the root rules the spec gives a descriptor, which need no tree object
+/// to verify. Without them a manifest could be written and decoded but never
+/// opened.
+fn validate_descriptor_root(
+    version: u64,
+    descriptor: &pb::FragmentTree,
+) -> std::result::Result<(), String> {
+    use pb::fragment_tree::Root;
+    match &descriptor.root {
+        None => Err(format!(
+            "Manifest version {version} has a fragment tree descriptor with no root"
+        )),
+        Some(Root::InlineRoot(_)) if !descriptor.mutations_since_root.is_empty() => Err(format!(
+            "Manifest version {version} has an inline fragment tree root with {} \
+                 mutations_since_root, but an inline root must have none",
+            descriptor.mutations_since_root.len()
+        )),
+        Some(Root::RootUuid(uuid)) if uuid.len() != 16 => Err(format!(
+            "Manifest version {version} has a fragment tree root_uuid of {} bytes, \
+             but it must be 16",
+            uuid.len()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Check the rules a decoded tree manifest adds to
+/// [`Manifest::validate_stored_fragment_layout`]. Encoding cannot break either
+/// rule, because the in-memory manifest holds the tree itself and keys base
+/// paths by id, so this runs only on decode.
+fn validate_tree_manifest(p: &pb::Manifest) -> Result<()> {
+    let Some(metadata) = &p.fragment_tree else {
+        return Ok(());
+    };
+    // prost skips an unknown oneof tag, so a layout from a newer writer is unset here too.
+    if metadata.layout.is_none() {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            format!(
+                "Manifest version {} has no recognized fragment tree layout",
+                p.version
+            ),
+        ));
+    }
+    // Child references resolve through these ids, so a repeated id is ambiguous.
+    // Flat manifests are not checked because released readers keep the last
+    // entry for an id, and a manifest that opens today must keep opening.
+    let mut ids = BTreeSet::new();
+    for base in &p.base_paths {
+        if !ids.insert(base.id) {
+            return Err(Error::corrupt_file_named(
+                "manifest",
+                format!(
+                    "Manifest version {} has duplicate base path id {}",
+                    p.version, base.id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl TryFrom<pb::Manifest> for Manifest {
     type Error = Error;
 
     fn try_from(p: pb::Manifest) -> Result<Self> {
+        validate_tree_manifest(&p)?;
         let timestamp_nanos = p.timestamp.map(|ts| {
             let sec = ts.seconds as u128 * 1e9 as u128;
             let nanos = ts.nanos as u128;
@@ -1168,7 +1365,7 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let schema = Schema::try_from(fields_with_meta)?;
 
-        Ok(Self {
+        let manifest = Self {
             schema,
             version: p.version,
             branch: p.branch,
@@ -1194,6 +1391,12 @@ impl TryFrom<pb::Manifest> for Manifest {
             encoded_fragments: EncodedFragmentCache::default(),
             fragment_offsets,
             next_row_id: p.next_row_id,
+            fragment_tree: p
+                .fragment_tree
+                .and_then(|metadata| metadata.layout)
+                .map(|layout| match layout {
+                    pb::fragment_tree_metadata::Layout::Tree(tree) => Arc::new(tree),
+                }),
             data_storage_format,
             config: p.config,
             table_metadata: p.table_metadata,
@@ -1208,14 +1411,23 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .map(ClusteringDefinition::try_from)
                 .collect::<Result<Vec<_>>>()?,
             max_clustering_id: p.max_clustering_id,
-        })
+        };
+        manifest
+            .validate_stored_fragment_layout()
+            .map_err(|message| Error::corrupt_file_named("manifest", message))?;
+        Ok(manifest)
     }
 }
 
 impl From<&Manifest> for pb::Manifest {
     fn from(m: &Manifest) -> Self {
+        let fragments = if m.uses_fragment_tree() {
+            Vec::new()
+        } else {
+            m.fragments.iter().map(pb::DataFragment::from).collect()
+        };
         Self {
-            fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
+            fragments,
             ..pb_manifest_without_fragments(m)
         }
     }
@@ -1257,7 +1469,12 @@ pub fn pb_manifest_without_fragments(m: &Manifest) -> pb::Manifest {
                 build_metadata: wv.build_metadata.clone(),
             }),
         fragments: vec![],
-        fragment_tree: None,
+        fragment_tree: m
+            .fragment_tree
+            .as_deref()
+            .map(|tree| pb::FragmentTreeMetadata {
+                layout: Some(pb::fragment_tree_metadata::Layout::Tree(tree.clone())),
+            }),
         table_metadata: m.table_metadata.clone(),
         version_aux_data: m.version_aux_data as u64,
         index_section: m.index_section.map(|i| i as u64),
@@ -1353,9 +1570,14 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{
+        FLAG_NON_REUSABLE_FIELD_IDS, FLAG_SPILLED_ROW_LINEAGE, FLAG_USE_V2_FORMAT_DEPRECATED,
+        apply_feature_flags,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
-    use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
+    use crate::format::{
+        DataFile, DeletionFile, DeletionFileType, IndexMetadata, ROW_ID_FIELD_ID, RowIdMeta,
+    };
     use std::num::NonZero;
     use uuid::Uuid;
 
@@ -1530,6 +1752,192 @@ mod tests {
             Manifest::new_from_previous(&previous, previous.schema.clone(), Arc::new(vec![]));
         assert_eq!(next.clustering, previous.clustering);
         assert_eq!(next.max_clustering_id, 4);
+    }
+
+    #[rstest::rstest]
+    #[case::flat(false, false, false, false, true)]
+    #[case::tree(true, true, true, false, true)]
+    #[case::reader_missing(true, false, true, false, false)]
+    #[case::writer_missing(true, true, false, false, false)]
+    #[case::descriptor_missing(false, true, true, false, false)]
+    #[case::two_layouts(true, true, true, true, false)]
+    fn fragment_tree_requires_paired_flags(
+        #[case] descriptor: bool,
+        #[case] reader: bool,
+        #[case] writer: bool,
+        #[case] flat_records: bool,
+        #[case] accepted: bool,
+    ) {
+        let flag = crate::feature_flags::FLAG_FRAGMENT_TREE;
+        let mut manifest = pb::Manifest::from(&Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        ));
+        manifest.fragment_tree = descriptor.then(|| pb::FragmentTreeMetadata {
+            layout: Some(pb::fragment_tree_metadata::Layout::Tree(
+                inline_root_descriptor(),
+            )),
+        });
+        manifest.reader_feature_flags = if reader { flag } else { 0 };
+        manifest.writer_feature_flags = if writer { flag } else { 0 };
+        if flat_records {
+            manifest.fragments.push(Default::default());
+        }
+        let decoded = Manifest::try_from(manifest);
+        assert_eq!(decoded.is_ok(), accepted);
+        if !accepted {
+            let error = decoded.unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains(&format!("writer_flag={writer}")));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::empty_flat(false, 0)]
+    #[case::flat(false, 2)]
+    #[case::empty_resident_tree(true, 0)]
+    #[case::resident_tree(true, 2)]
+    fn encoding_writes_records_only_for_a_flat_manifest(
+        #[case] is_tree: bool,
+        #[case] fragment_count: usize,
+    ) {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new((0..fragment_count as u64).map(Fragment::new).collect()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = is_tree.then(|| Arc::new(pb::FragmentTree::default()));
+        let encoded = pb::Manifest::from(&manifest);
+        assert_eq!(encoded.fragment_tree.is_some(), is_tree);
+        assert_eq!(
+            encoded.fragments.len(),
+            if is_tree { 0 } else { fragment_count }
+        );
+    }
+
+    fn inline_root_descriptor() -> pb::FragmentTree {
+        pb::FragmentTree {
+            root: Some(pb::fragment_tree::Root::InlineRoot(Default::default())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resident_tree_fragments_are_not_duplicated_in_the_manifest() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(inline_root_descriptor()));
+        let mut fragment = Fragment::new(0).with_file(
+            "lineage.lance".to_string(),
+            vec![ROW_ID_FIELD_ID],
+            vec![0],
+            ConcreteFileVersion::V2_2,
+            None,
+        );
+        fragment.physical_rows = Some(7);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        manifest.set_fragments(vec![fragment]);
+        apply_feature_flags(&mut manifest, true, false).unwrap();
+        assert_eq!(manifest.fragments_by_offset_range(0..7).len(), 1);
+        let encoded = pb::Manifest::from(&manifest);
+        assert!(encoded.fragments.is_empty());
+        let mut decoded = Manifest::try_from(encoded).unwrap();
+        assert_eq!(decoded.fragment_tree, manifest.fragment_tree);
+        assert!(decoded.fragments.is_empty());
+        // The records are now lazy, but still require the lineage capability.
+        apply_feature_flags(&mut decoded, true, false).unwrap();
+        assert_eq!(decoded.reader_feature_flags, manifest.reader_feature_flags);
+        assert_eq!(decoded.writer_feature_flags, manifest.writer_feature_flags);
+        assert_ne!(decoded.reader_feature_flags & FLAG_SPILLED_ROW_LINEAGE, 0);
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0)]
+    #[case::nonzero(7)]
+    fn fragment_tree_rejects_duplicate_base_ids(#[case] id: u32) {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(Default::default()));
+        manifest.reader_feature_flags = FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags = FLAG_FRAGMENT_TREE;
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.base_paths = vec![
+            pb::BasePath {
+                id,
+                path: "memory://first".into(),
+                is_dataset_root: true,
+                ..Default::default()
+            },
+            pb::BasePath {
+                id,
+                path: "memory://second".into(),
+                is_dataset_root: true,
+                ..Default::default()
+            },
+        ];
+        let error = Manifest::try_from(encoded).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        let expected = format!("Manifest version 1 has duplicate base path id {id}");
+        assert!(error.to_string().contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn fragment_tree_rejects_a_descriptor_without_a_root() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(Default::default()));
+        manifest.reader_feature_flags = FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags = FLAG_FRAGMENT_TREE;
+
+        let error = Manifest::try_from(pb::Manifest::from(&manifest)).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Manifest version 1 has a fragment tree descriptor with no root"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fragment_tree_rejects_a_descriptor_without_a_recognized_layout() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(Arc::new(Default::default()));
+        manifest.reader_feature_flags = FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags = FLAG_FRAGMENT_TREE;
+        let mut encoded = pb::Manifest::from(&manifest);
+        encoded.fragment_tree = Some(pb::FragmentTreeMetadata { layout: None });
+
+        let error = Manifest::try_from(encoded).unwrap_err();
+
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Manifest version 1 has no recognized fragment tree layout"),
+            "{error}"
+        );
     }
 
     /// A shallow clone points every local file at the parent through `base_id`.
@@ -2291,6 +2699,17 @@ mod tests {
         assert_eq!(deletion_summary.total_deletion_file_rows, 10);
         assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        // Summaries of disjoint fragments add up to the summary of them all.
+        let mut parts = real_data_summary;
+        parts.add(&deletion_summary);
+        let all: Vec<Fragment> = real_data_manifest
+            .fragments
+            .iter()
+            .chain(manifest_with_deletion.fragments.iter())
+            .cloned()
+            .collect();
+        assert_eq!(parts, ManifestSummary::of(&all));
 
         fragment_with_deletion
             .deletion_file

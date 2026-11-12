@@ -865,10 +865,7 @@ impl Transaction {
         // must never name two different sets of rows, or per-fragment state keyed
         // by id (caches, deletion files, row addresses) can be attributed to the
         // wrong rows.
-        let mut fragment_id = current_manifest
-            .and_then(|m| m.max_fragment_id())
-            .map(|id| id + 1)
-            .unwrap_or(0);
+        let mut fragment_id = current_manifest.map_or(0, Manifest::next_fragment_id);
         let mut final_fragments = Vec::new();
         let mut final_indices = prepared_indices;
         // Only the labels this operation introduces or changes; fragments and
@@ -2534,7 +2531,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FLAG_OBJECT_METADATA;
+    use crate::feature_flags::{FLAG_FRAGMENT_TREE, FLAG_OBJECT_METADATA};
     use crate::format::overlay::OverlayCoverage;
     use crate::format::pb;
     use crate::format::{
@@ -2542,6 +2539,11 @@ mod tests {
         ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
         RowIdMeta,
     };
+    use crate::fragment_metadata::support::make_fragment;
+    use crate::fragment_metadata::{
+        FragmentTree, FragmentTreeConfig, InventoryRetention, PublicationPolicy, TreeContext,
+    };
+    use crate::io::commit::write_manifest_file_to_path;
     use crate::rowids::{RowIdSequence, write_row_ids};
     use crate::transaction::test_support::{
         created_at_versions, default_build_config, last_updated_at_versions,
@@ -2552,6 +2554,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
     use lance_io::utils::CachedFileSize;
     use rstest::rstest;
     use std::cell::RefCell;
@@ -6085,6 +6088,47 @@ mod tests {
         replace_fields(fragment, vec![5], manifest_version, read_version)
     }
 
+    /// Flat keeps an overlay committed after the read and tombstones one
+    /// committed before it. The tree encoder has no read version to tell them
+    /// apart, so it refuses and the caller must derive the final fragment.
+    #[test]
+    fn tree_data_replacement_refuses_overlay_on_replaced_field() {
+        let file = |path: &str| {
+            DataFile::new(
+                path,
+                vec![5],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            )
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files = vec![file("v.lance")];
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: file("o5.lance"),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 3,
+        }];
+
+        let overlay_newer = replace_field_5(fragment.clone(), 3, 2).unwrap();
+        assert_eq!(overlay_newer.overlays, fragment.overlays);
+        let overlay_older = replace_field_5(fragment.clone(), 3, 3).unwrap();
+        assert!(overlay_older.overlays.is_empty());
+
+        let error =
+            crate::fragment_metadata::data_replacement_actions(&fragment, &file("v-new.lance"))
+                .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("an overlay covers a replaced field"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn test_data_replacement_rejects_subset_of_legacy_file() {
         // The V1 reader derives its page table offset from the first field in
@@ -8073,5 +8117,87 @@ mod tests {
         )
         .await;
         assert_eq!(next.fragments[1].files.len(), 1);
+    }
+
+    /// Encoding a tree manifest keeps its descriptor and drops its list, so a
+    /// successor holding its predecessor's descriptor would publish the old
+    /// tree in place of its own list. A successor keeps only the tree bits,
+    /// and the writer refuses them until the caller attaches the new tree and
+    /// empties the list.
+    #[rstest]
+    #[case::append(Operation::Append {
+        fragments: vec![Fragment {
+            id: 0,
+            ..make_fragment(3)
+        }],
+    })]
+    #[case::delete_every_fragment(Operation::Delete {
+        updated_fragments: vec![],
+        deleted_fragment_ids: vec![0, 1, 2],
+        predicate: "true".into(),
+    })]
+    #[tokio::test]
+    async fn successor_of_a_tree_manifest_is_not_written(#[case] operation: Operation) {
+        let store = Arc::new(ObjectStore::memory());
+        let records: Vec<Fragment> = (0..3).map(make_fragment).collect();
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]))
+        .unwrap();
+        let mut flat = Manifest::new(
+            schema,
+            Arc::new(records.clone()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        flat.update_max_fragment_id();
+        let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::default_for_testing());
+        let tree = FragmentTree::build(
+            TreeContext::new(store.clone(), Path::from("table"), scheduler),
+            FragmentTreeConfig::default(),
+            records,
+            1,
+            PublicationPolicy::default(),
+            InventoryRetention::Retain,
+        )
+        .await
+        .unwrap();
+        let mut resident = flat.clone();
+        resident.fragment_tree = Some(tree.descriptor().clone());
+        resident.reader_feature_flags = FLAG_FRAGMENT_TREE;
+        resident.writer_feature_flags = FLAG_FRAGMENT_TREE;
+        let transaction = Transaction::new(resident.version, operation, None);
+        let path = Path::from("table/_versions/2.manifest");
+
+        let (mut successor, indices) = transaction
+            .build_manifest(
+                Some(&resident),
+                vec![],
+                "successor.txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        let error = write_manifest_file_to_path(&store, &mut successor, Some(indices), &path, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Manifest version 2 "), "{error}");
+        assert!(!store.exists(&path).await.unwrap());
+
+        // The same transaction over the flat version writes its new list.
+        let (mut successor, indices) = transaction
+            .build_manifest(
+                Some(&flat),
+                vec![],
+                "successor.txn",
+                &default_build_config(),
+            )
+            .unwrap();
+        write_manifest_file_to_path(&store, &mut successor, Some(indices), &path, None)
+            .await
+            .unwrap();
+        let written = read_manifest(&store, &path, None).await.unwrap();
+        assert_eq!(written.fragments, successor.fragments);
     }
 }
