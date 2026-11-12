@@ -126,13 +126,19 @@ pub(crate) fn validate_segment_index_details(
 /// Whether optimize can fold several segments of this kind into one without
 /// rescanning the table: the kinds the single-process optimize merges rather
 /// than rebuilds, vector, BTree, Bitmap and NGram (`merge_scalar_indices`) and
-/// Inverted (`InvertedIndex::merge_segments`).
+/// Inverted (`InvertedIndex::merge_segments`), including JSON wrappers over
+/// the supported scalar targets.
 pub(crate) fn segment_has_merge_primitive(segment: &IndexMetadata) -> bool {
     segment_has_vector_details(segment)
         || segment_has_btree_details(segment)
         || segment_has_bitmap_details(segment)
         || segment_has_ngram_details(segment)
         || segment_has_inverted_details(segment)
+        || segment
+            .index_details
+            .as_deref()
+            .and_then(super::scalar::json::merge_target_type)
+            .is_some()
 }
 
 /// Detect vector segments while preserving the legacy pre-details fallback.

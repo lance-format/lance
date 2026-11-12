@@ -2062,15 +2062,33 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::plain(false)]
+    #[case::json(true)]
     #[tokio::test]
-    async fn test_ngram_segment_merge_rebuilds_after_deferred_compaction() {
+    async fn test_ngram_segment_merge_rebuilds_after_deferred_compaction(#[case] json: bool) {
         let test_dir = TempStrDir::default();
-        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "text",
-            arrow_schema::DataType::Utf8,
-            true,
-        )]));
-        let make_batch = |values| {
+        let mut field = arrow_schema::Field::new("text", arrow_schema::DataType::Utf8, true);
+        if json {
+            field = field.with_metadata(std::collections::HashMap::from([(
+                lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::ARROW_JSON_EXT_NAME.to_string(),
+            )]));
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(vec![field]));
+        let make_batch = |values: Vec<Option<&str>>| {
+            let values = values
+                .into_iter()
+                .map(|value| {
+                    value.map(|value| {
+                        if json {
+                            serde_json::json!({"x": value}).to_string()
+                        } else {
+                            value.to_string()
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
             arrow_array::RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(arrow_array::StringArray::from(values))],
@@ -2109,11 +2127,23 @@ mod tests {
         .await
         .unwrap();
 
-        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let (index_type, params) = if json {
+            (
+                IndexType::Scalar,
+                ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+                    "path": "x", "target_index_type": "ngram",
+                })),
+            )
+        } else {
+            (
+                IndexType::NGram,
+                ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
+            )
+        };
         let mut segments = Vec::new();
         for fragment in dataset.get_fragments() {
             segments.push(
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                CreateIndexBuilder::new(&mut dataset, &["text"], index_type, &params)
                     .name("text_ngram".to_string())
                     .fragments(vec![fragment.id() as u32])
                     .execute_uncommitted()
@@ -2125,7 +2155,7 @@ mod tests {
         dataset
             .create_index(
                 &["text"],
-                IndexType::NGram,
+                index_type,
                 Some("compaction_guard".to_string()),
                 &params,
                 false,
@@ -2180,11 +2210,17 @@ mod tests {
             open_named_scalar_index(&dataset, "text", "text_ngram", &NoOpMetricsCollector)
                 .await
                 .unwrap();
+        let query = lance_index::scalar::TextQuery::StringContains("needle".to_string());
+        let query: Arc<dyn lance_index::scalar::AnyQuery> = if json {
+            Arc::new(lance_index::scalar::json::JsonQuery::new(
+                Arc::new(query),
+                "x".into(),
+            ))
+        } else {
+            Arc::new(query)
+        };
         let result = logical
-            .search(
-                &lance_index::scalar::TextQuery::StringContains("needle".to_string()),
-                &NoOpMetricsCollector,
-            )
+            .search(query.as_ref(), &NoOpMetricsCollector)
             .await
             .unwrap();
         let row_addrs = match result {
