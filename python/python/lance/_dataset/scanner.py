@@ -487,6 +487,9 @@ def _build_vector_search_query(
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     search_effort: Optional[float] = None,
+    refine_column: Optional[str] = None,
+    refine_q: Optional[QueryVectorLike] = None,
+    refine_metric: Optional[str] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -550,9 +553,11 @@ def _build_vector_search_query(
         0.5. With None, an explicitly supplied nprobes remains effective.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
-        when supported by the selected index. This currently only affects
-        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-        setting. ``fast`` favors lower latency and may reduce recall,
+        when supported by the selected index. This currently affects
+        RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+        that exclude rows (for example through a prefilter or deletions),
+        where ``fast`` enables the ACORN traversal. Other index types ignore
+        this setting. ``fast`` favors lower latency and may reduce recall,
         ``normal`` uses the default balance, and ``accurate`` favors higher
         recall and may increase latency.
     distance_range: tuple[Optional[float], Optional[float]], optional
@@ -560,6 +565,14 @@ def _build_vector_search_query(
         Both bounds are optional. The lower bound is inclusive and the upper
         bound is exclusive, so (0.0, 1.0) keeps distances d where
         0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+    refine_column, refine_q, refine_metric: optional
+        Supply all three to rerank ``k * refine_factor`` coarse candidates
+        using another Float32 fixed-size vector column. ``refine_q`` must
+        match that column's dimension and the number of coarse queries.
+        Requires an explicit positive ``refine_factor``. Final ``_distance``
+        and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
+        coarse TopM still precedes refinement. Query filters are unsupported;
+        scalar filters retain their usual prefilter/postfilter behavior.
 
     Returns
     -------
@@ -567,6 +580,13 @@ def _build_vector_search_query(
         The scanner builder for method chaining.
     """
     q, q_dim = _coerce_query_vector(q)
+    refine_args = (refine_column, refine_q, refine_metric)
+    if any(value is not None for value in refine_args):
+        if not all(value is not None for value in refine_args):
+            raise ValueError(
+                "refine_column, refine_q, and refine_metric must be provided together"
+            )
+        refine_q, _ = _coerce_query_vector(cast("QueryVectorLike", refine_q))
 
     if dataset is not None:
         lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
@@ -652,6 +672,9 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
+        "refine_column": refine_column,
+        "refine_q": refine_q,
+        "refine_metric": refine_metric,
     }
 
 
@@ -1022,6 +1045,9 @@ class ScannerBuilder:
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
         quantized_refine_factor: Optional[int] = None,
+        refine_column: Optional[str] = None,
+        refine_q: Optional[QueryVectorLike] = None,
+        refine_metric: Optional[str] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1068,9 +1094,11 @@ class ScannerBuilder:
             0.5. With None, an explicitly supplied nprobes remains effective.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
-            when supported by the selected index. This currently only affects
-            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-            setting. ``fast`` favors lower latency and may reduce recall,
+            when supported by the selected index. This currently affects
+            RQ-quantized indexes (such as IVF_RQ) and HNSW sub-index searches
+            that exclude rows (for example through a prefilter or deletions),
+            where ``fast`` enables the ACORN traversal. Other index types ignore
+            this setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
         quantized_refine_factor: int, optional
@@ -1083,6 +1111,28 @@ class ScannerBuilder:
             vectors for its candidates. With ``distance_range``, selected partitions
             use Accurate RQ search directly so the range applies before top-k
             truncation.
+        refine_column, refine_q, refine_metric: optional
+            Supply all three to rerank ``k * refine_factor`` coarse candidates
+            using another Float32 fixed-size vector column. ``refine_q`` must
+            match that column's dimension and the number of coarse queries.
+            Requires an explicit positive ``refine_factor``. Final ``_distance``
+            and ``distance_range`` use ``refine_metric``. With ``use_index=False``,
+            coarse TopM still precedes refinement. Query filters are unsupported;
+            scalar filters retain their usual prefilter/postfilter behavior.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            builder.nearest(
+                "pca128",
+                q128,
+                k=10,
+                refine_factor=2,
+                refine_column="embedding",
+                refine_q=q1024,
+                refine_metric="cosine",
+            )
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -1101,6 +1151,9 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
+            refine_column=refine_column,
+            refine_q=refine_q,
+            refine_metric=refine_metric,
         )
         return self
 
