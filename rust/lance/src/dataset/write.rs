@@ -6452,6 +6452,12 @@ mod tests {
         }
 
         if is_shredded {
+            let typed_value = stored.typed_value_column().unwrap().as_struct();
+            let name = typed_value.column_by_name("name").unwrap().as_struct();
+            assert_eq!(
+                name.column_by_name("typed_value").unwrap().data_type(),
+                &DataType::Utf8
+            );
             let projected = dataset
                 .scan()
                 .project(&["event.typed_value.id.typed_value"])
