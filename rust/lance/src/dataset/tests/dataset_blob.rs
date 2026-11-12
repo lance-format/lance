@@ -46,12 +46,14 @@ use lance_core::{
 };
 use lance_datagen::{BatchCount, RowCount, array};
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
+use lance_io::object_store::WrappingObjectStore;
 use lance_io::{object_store::ObjectStoreParams, stream::RecordBatchStream};
 use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
 use lance_table::format::BasePath;
 use rstest::rstest;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
 #[rstest]
@@ -2834,6 +2836,204 @@ async fn test_blob_v2_external_outside_base_denied_by_default() {
         err.to_string()
             .contains("outside registered external bases"),
         "{err:?}"
+    );
+}
+
+/// Counts HEAD requests and the peak number in flight, and holds each one open
+/// so that concurrent lookups overlap. `ThrottledStore` cannot be used: it does
+/// not support the local file store's `GetResultPayload::File`.
+#[derive(Debug, Default)]
+struct HeadProbe {
+    heads: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    peak_in_flight: Arc<AtomicUsize>,
+}
+
+impl WrappingObjectStore for HeadProbe {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(HeadProbeStore {
+            target: original,
+            probe: Self {
+                heads: self.heads.clone(),
+                in_flight: self.in_flight.clone(),
+                peak_in_flight: self.peak_in_flight.clone(),
+            },
+        })
+    }
+
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+#[derive(Debug)]
+struct HeadProbeStore {
+    target: Arc<dyn object_store::ObjectStore>,
+    probe: HeadProbe,
+}
+
+impl std::fmt::Display for HeadProbeStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HeadProbeStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for HeadProbeStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.target.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.target.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head {
+            return self.target.get_opts(location, options).await;
+        }
+        self.probe.heads.fetch_add(1, Ordering::SeqCst);
+        let in_flight = self.probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.probe
+            .peak_in_flight
+            .fetch_max(in_flight, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let result = self.target.get_opts(location, options).await;
+        self.probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.target.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.target.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.target.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.target.copy_opts(from, to, opts).await
+    }
+
+    async fn rename_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::RenameOptions,
+    ) -> object_store::Result<()> {
+        self.target.rename_opts(from, to, opts).await
+    }
+}
+
+/// External blobs written without a range have no stored size. Reading a batch
+/// of them must look up each distinct object once, with the lookups overlapping.
+#[tokio::test]
+async fn test_external_blob_unknown_sizes_are_resolved_once_and_concurrently() {
+    const OBJECTS: usize = 16;
+    const ROWS_PER_OBJECT: usize = 2;
+
+    let dataset_dir = TempStrDir::default();
+    let external_dir = TempDir::default();
+    let payloads: Vec<Vec<u8>> = (0..OBJECTS).map(|i| vec![i as u8; i + 1]).collect();
+    let mut blobs = BlobArrayBuilder::new(OBJECTS * ROWS_PER_OBJECT);
+    for (i, payload) in payloads.iter().enumerate() {
+        let path = external_dir.std_path().join(format!("{i}.bin"));
+        std::fs::write(&path, payload).unwrap();
+        for _ in 0..ROWS_PER_OBJECT {
+            // No range, so the descriptor stores size 0.
+            blobs
+                .push_uri(format!("file://{}", path.display()))
+                .unwrap();
+        }
+    }
+    let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &dataset_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let probe = Arc::new(HeadProbe::default());
+    let dataset = DatasetBuilder::from_uri(&dataset_dir)
+        .with_store_params(ObjectStoreParams {
+            object_store_wrapper: Some(probe.clone()),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .map(Arc::new)
+        .unwrap();
+
+    probe.heads.store(0, Ordering::SeqCst);
+    let indices: Vec<u64> = (0..(OBJECTS * ROWS_PER_OBJECT) as u64).collect();
+    let files = dataset
+        .take_blobs_by_indices(&indices, "blob")
+        .await
+        .unwrap();
+
+    for (row, file) in files.iter().enumerate() {
+        let payload = &payloads[row / ROWS_PER_OBJECT];
+        let file = file.as_ref().unwrap();
+        assert_eq!(file.size(), payload.len() as u64);
+        assert_eq!(file.read().await.unwrap().as_ref(), payload.as_slice());
+    }
+    assert_eq!(
+        probe.heads.load(Ordering::SeqCst),
+        OBJECTS,
+        "expected one HEAD per distinct object"
+    );
+    assert!(
+        probe.peak_in_flight.load(Ordering::SeqCst) > 1,
+        "size lookups were issued serially"
     );
 }
 
