@@ -14,6 +14,7 @@ use crate::dataset::{
 };
 
 use crate::index::DatasetIndexExt;
+use crate::utils::test::geo;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
 use arrow_array::UInt32Array;
@@ -34,6 +35,7 @@ use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::ScalarIndexParams;
 use rstest::rstest;
 
@@ -243,6 +245,48 @@ async fn test_geo_rtree_index() {
         .unwrap();
 
     assert_intersects_sql(&mut dataset, true).await;
+}
+
+/// Any code can build a default registry before the first index operation, as a
+/// directory namespace does when it rewrites its manifest, and that freezes plugin
+/// registration. The R-tree index must not depend on coming first.
+#[tokio::test]
+async fn test_rtree_index_after_a_default_registry_froze_registration() {
+    let frozen = IndexPluginRegistry::with_default_plugins();
+    let err = frozen.get_plugin_by_name("rtree").unwrap_err();
+    assert!(matches!(err, crate::Error::InvalidInput { .. }));
+    assert_contains!(err.to_string(), "No scalar index plugin found");
+
+    let (dataset, _) = geo::dataset_with_committed_rtree_index("memory://", 10, 3).await;
+
+    // This line crosses the diagonal where the last row of the first fragment
+    // meets the first row of the second one.
+    let sql = "SELECT id FROM dataset \
+               WHERE St_Intersects(geometry, ST_GeomFromText('LINESTRING ( 11 9, 9 11 )'))";
+    let batches = dataset
+        .sql(sql)
+        .build()
+        .await
+        .unwrap()
+        .into_batch_records()
+        .await
+        .unwrap();
+    let mut ids = batches
+        .iter()
+        .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![9, 10]);
+
+    let plan = dataset
+        .sql(&format!("Explain {sql}"))
+        .build()
+        .await
+        .unwrap()
+        .into_batch_records()
+        .await
+        .unwrap();
+    assert_contains!(format!("{plan:?}"), "ScalarIndexQuery");
 }
 
 #[rstest]
