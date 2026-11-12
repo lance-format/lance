@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, Schema as ArrowSchema};
+use arrow_array::RecordBatchReader;
+use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
@@ -31,7 +31,7 @@ use object_store::path::Path;
 use prost::Message;
 
 use lance_core::{
-    ArrowResult, Error, Result,
+    Error, Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
 };
@@ -52,85 +52,6 @@ use crate::{
 };
 
 pub(crate) mod structural;
-
-/// An error wrapper that adds file path context to errors raised while reading a file.
-///
-/// The path is known when the reader is opened but is not available to the
-/// decode tasks that raise most read errors. This wrapper carries it so a
-/// failure reads like:
-///
-/// ```text
-/// failed to read file 'part-000.parquet'
-///
-/// Caused by:
-///     failed to decode column 'age' (id 7) at offset 1234
-///     number out of range
-/// ```
-#[derive(Debug)]
-pub struct ReadFileError {
-    /// The path of the file being read.
-    pub path: Path,
-    /// The underlying read or decode error.
-    pub source: Error,
-}
-
-impl std::fmt::Display for ReadFileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "failed to read file '{}'", self.path)
-    }
-}
-
-impl std::error::Error for ReadFileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl From<ReadFileError> for Error {
-    fn from(err: ReadFileError) -> Self {
-        Self::wrapped(Box::new(err))
-    }
-}
-
-/// Wrap a read task so any error raised while the task runs names the file.
-fn wrap_read_task(path: Path, task: ReadBatchTask) -> ReadBatchTask {
-    let ReadBatchTask { task, num_rows } = task;
-    let wrapped = async move {
-        task.await
-            .map_err(|source| ReadFileError { path, source }.into())
-    };
-    ReadBatchTask {
-        task: Box::pin(wrapped),
-        num_rows,
-    }
-}
-
-/// A record batch reader that names the file in any error it returns.
-struct ReadFileRecordBatchReader {
-    inner: Box<dyn RecordBatchReader + Send + 'static>,
-    path: Path,
-}
-
-impl Iterator for ReadFileRecordBatchReader {
-    type Item = ArrowResult<RecordBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|result| {
-            result.map_err(|source| {
-                ArrowError::from(Error::from(ReadFileError {
-                    path: self.path.clone(),
-                    source: source.into(),
-                }))
-            })
-        })
-    }
-}
-
-impl RecordBatchReader for ReadFileRecordBatchReader {
-    fn schema(&self) -> Arc<ArrowSchema> {
-        self.inner.schema()
-    }
-}
 
 /// Default chunk size for reading large pages (8MiB)
 /// Pages larger than this will be split into multiple chunks during read
@@ -520,8 +441,6 @@ pub(crate) struct DecodeEngine {
     pub decoder_plugins: Arc<DecoderPlugins>,
     pub cache: Arc<LanceCache>,
     pub options: FileReaderOptions,
-    /// The path of the file being read, used for error context.
-    pub path: Path,
 }
 
 /// A projection-scoped reader for a current-format Lance file.
@@ -1707,7 +1626,7 @@ impl FileReader {
                 Ok(())
             }
         };
-        let reader = match &params {
+        match &params {
             ReadBatchParams::Indices(indices) => {
                 for index in indices {
                     match index {
@@ -1751,10 +1670,6 @@ impl FileReader {
             ReadBatchParams::RangeFull => {
                 self.read_range_blocking(0..read_len, batch_size, projection, filter)
             }
-        };
-        match reader {
-            Ok(reader) => Ok(self.core.wrap_read_reader(reader)),
-            Err(source) => Err(self.core.wrap_read_error(source)),
         }
     }
 
@@ -1977,10 +1892,8 @@ impl FileMetadataProvider {
 }
 
 impl DecodeEngine {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         scheduler: Arc<dyn EncodingsIo>,
-        path: Path,
         base_projection: ReaderProjection,
         decoder_plugins: Arc<DecoderPlugins>,
         metadata_provider: FileMetadataProvider,
@@ -1996,7 +1909,6 @@ impl DecodeEngine {
             decoder_plugins,
             cache,
             options,
-            path,
         })
     }
 
@@ -2009,42 +1921,7 @@ impl DecodeEngine {
             decoder_plugins: self.decoder_plugins.clone(),
             cache: self.cache.clone(),
             options: self.options.clone(),
-            path: self.path.clone(),
         }
-    }
-
-    fn wrap_read_error(&self, source: Error) -> Error {
-        if matches!(
-            source.find_root(),
-            Error::InvalidInput { .. } | Error::NotSupported { .. }
-        ) {
-            return source;
-        }
-        ReadFileError {
-            path: self.path.clone(),
-            source,
-        }
-        .into()
-    }
-
-    fn wrap_read_tasks(
-        &self,
-        tasks: BoxStream<'static, ReadBatchTask>,
-    ) -> BoxStream<'static, ReadBatchTask> {
-        let path = self.path.clone();
-        tasks
-            .map(move |task| wrap_read_task(path.clone(), task))
-            .boxed()
-    }
-
-    fn wrap_read_reader(
-        &self,
-        reader: Box<dyn RecordBatchReader + Send + 'static>,
-    ) -> Box<dyn RecordBatchReader + Send + 'static> {
-        Box::new(ReadFileRecordBatchReader {
-            inner: reader,
-            path: self.path.clone(),
-        })
     }
 
     fn num_rows(&self) -> u64 {
@@ -2170,7 +2047,7 @@ impl DecodeEngine {
                 Ok(())
             }
         };
-        let tasks = match &params {
+        match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
                     match idx {
@@ -2218,10 +2095,6 @@ impl DecodeEngine {
                 self.read_range(0..read_len, batch_size, prepared, filter)
                     .await
             }
-        };
-        match tasks {
-            Ok(tasks) => Ok(self.wrap_read_tasks(tasks)),
-            Err(source) => Err(self.wrap_read_error(source)),
         }
     }
 }
@@ -2386,7 +2259,6 @@ impl FileReader {
         let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
         let core = DecodeEngine::try_new(
             scheduler,
-            path,
             base_projection,
             decoder_plugins,
             FileMetadataProvider::Full(metadata.clone()),
@@ -2452,10 +2324,7 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection().clone());
-        let (prepared, read_len) = self
-            .prepare(projection)
-            .await
-            .map_err(|source| self.core.wrap_read_error(source))?;
+        let (prepared, read_len) = self.prepare(projection).await?;
         self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
             .await
     }
@@ -2483,14 +2352,9 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Box<dyn RecordBatchReader + Send + 'static>> {
         let projection = projection.unwrap_or_else(|| self.base_projection().clone());
-        Self::validate_projection(&projection, self.metadata())
-            .map_err(|source| self.core.wrap_read_error(source))?;
+        Self::validate_projection(&projection, self.metadata())?;
         let prepared = self.full_projection(projection);
-        let read_len = self
-            .core
-            .read_projection
-            .read_length(&prepared)
-            .map_err(|source| self.core.wrap_read_error(source))?;
+        let read_len = self.core.read_projection.read_length(&prepared)?;
         self.read_prepared_blocking(params, batch_size, prepared, read_len, filter)
     }
 
@@ -2572,7 +2436,6 @@ impl ProjectedFileReader {
         let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
         let core = DecodeEngine::try_new(
             scheduler,
-            path,
             base_projection,
             decoder_plugins,
             FileMetadataProvider::Indexed(metadata_index),
@@ -2611,7 +2474,6 @@ impl ProjectedFileReader {
         let cache = Arc::new(cache.with_key_prefix(path.as_ref()));
         let core = DecodeEngine::try_new(
             scheduler,
-            path,
             base_projection,
             decoder_plugins,
             FileMetadataProvider::Full(metadata),
@@ -2643,8 +2505,7 @@ impl ProjectedFileReader {
                 &self.core.scheduler,
                 &self.core.cache,
             )
-            .await
-            .map_err(|source| self.core.wrap_read_error(source))?;
+            .await?;
         self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
             .await
     }
@@ -2815,11 +2676,8 @@ mod tests {
     use bytes::Bytes;
     use futures::{StreamExt, prelude::stream::TryStreamExt};
     use lance_arrow::{BLOB_META_KEY, RecordBatchExt};
-    use lance_core::{ArrowResult, Error, datatypes::Schema};
+    use lance_core::{ArrowResult, datatypes::Schema};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
-    use object_store::path::Path;
-
-    use super::{ReadFileError, wrap_read_task};
     use lance_encoding::{
         constants::{
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
@@ -6349,64 +6207,5 @@ mod tests {
             9
         );
         assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
-    }
-
-    #[test]
-    fn read_file_error_reports_path_and_source_chain() {
-        use lance_encoding::decoder::DecodeColumnError;
-
-        let decode_error: Error = DecodeColumnError {
-            field_name: "age".to_string(),
-            field_id: 7,
-            offset: Some(1234),
-            source: Error::invalid_input("number out of range"),
-        }
-        .into();
-        let err = ReadFileError {
-            path: Path::from("part-000.parquet"),
-            source: decode_error,
-        };
-
-        assert_eq!(err.to_string(), "failed to read file 'part-000.parquet'");
-        let wrapper = std::error::Error::source(&err)
-            .expect("read file error should expose the decode error");
-        assert!(
-            wrapper
-                .to_string()
-                .contains("failed to decode column 'age' (id 7) at offset 1234"),
-            "unexpected source: {wrapper}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_file_task_error_is_wrapped_with_file_path() {
-        let task = ReadBatchTask {
-            task: Box::pin(async { Err(Error::invalid_input("NumberOutOfRange")) }),
-            num_rows: 1,
-        };
-        let err = wrap_read_task(Path::from("part-000.parquet"), task)
-            .task
-            .await
-            .expect_err("read task should fail");
-
-        assert!(
-            err.to_string()
-                .contains("failed to read file 'part-000.parquet'"),
-            "unexpected error: {err}"
-        );
-        let wrapper = std::error::Error::source(&err)
-            .expect("wrapped read task error should expose the file context");
-        assert!(
-            wrapper
-                .to_string()
-                .contains("failed to read file 'part-000.parquet'"),
-            "unexpected file context: {wrapper}"
-        );
-        let inner =
-            std::error::Error::source(wrapper).expect("file context should expose the read error");
-        assert!(
-            inner.to_string().contains("NumberOutOfRange"),
-            "unexpected source: {inner}"
-        );
     }
 }

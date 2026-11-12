@@ -13,10 +13,10 @@ use super::{
 };
 use crate::{
     decoder::{
-        ColumnContext, DecodeColumnError, DecodedArray, DrainLimit, FilterExpression,
-        LoadedPageShard, NextDecodeTask, PageEncoding, ScheduledScanLine, SchedulerContext,
-        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
-        StructuralSchedulingJob,
+        ColumnContext, DecodedArray, DrainLimit, FilterExpression, LoadedPageShard, NextDecodeTask,
+        PageEncoding, ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask,
+        StructuralFieldDecoder, StructuralFieldScheduler, StructuralSchedulingJob,
+        with_column_context,
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
@@ -242,8 +242,6 @@ pub struct StructuralStructDecoder {
     nullable: bool,
     // Column context for top-level fields, if known.
     column_contexts: Option<Arc<[ColumnContext]>>,
-    // Rows drained so far, used to report the batch offset for root decodes.
-    rows_drained: u64,
 }
 
 impl StructuralStructDecoder {
@@ -265,7 +263,6 @@ impl StructuralStructDecoder {
             is_root,
             nullable: !is_root && nullable,
             column_contexts: None,
-            rows_drained: 0,
         })
     }
 
@@ -390,13 +387,10 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
             .iter_mut()
             .map(|child| child.drain(num_rows))
             .collect::<Result<Vec<_>>>()?;
-        let offset = self.is_root.then_some(self.rows_drained);
-        self.rows_drained += num_rows;
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
             column_contexts: self.column_contexts.clone(),
-            offset,
             is_root: self.is_root,
             num_rows,
         }))
@@ -430,7 +424,6 @@ struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
     column_contexts: Option<Arc<[ColumnContext]>>,
-    offset: Option<u64>,
     is_root: bool,
     num_rows: u64,
 }
@@ -446,7 +439,6 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         }
 
         let contexts = self.column_contexts;
-        let offset = self.offset;
         let arrays = self
             .children
             .into_iter()
@@ -454,13 +446,7 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             .map(|(index, task)| {
                 task.decode().map_err(|source| {
                     match contexts.as_ref().and_then(|contexts| contexts.get(index)) {
-                        Some(context) => DecodeColumnError {
-                            field_name: context.name.clone(),
-                            field_id: context.id,
-                            offset,
-                            source,
-                        }
-                        .into(),
+                        Some(context) => with_column_context(&context.name, context.id, source),
                         None => source,
                     }
                 })

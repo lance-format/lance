@@ -1671,34 +1671,30 @@ pub struct ColumnContext {
 /// An error wrapper that adds column context to decoding errors.
 ///
 /// Decode errors are often raised deep inside a page decoder where the field
-/// name, field id, and row offset are no longer available. This wrapper carries
-/// that context so a failure reads like:
+/// name and field id are no longer available. This wrapper carries that context
+/// and keeps the underlying message visible:
 ///
 /// ```text
-/// failed to decode column 'age' (id 7) at offset 1234
-///
-/// Caused by:
-///     number out of range
+/// failed to decode column 'age' (id 7): number out of range
 /// ```
+///
+/// The underlying error is also exposed through [`std::error::Error::source`].
 #[derive(Debug)]
 pub struct DecodeColumnError {
     /// The name of the column being decoded.
     pub field_name: String,
     /// The Lance field id of the column being decoded.
     pub field_id: i32,
-    /// The row offset of the batch being decoded, when it is known.
-    pub offset: Option<u64>,
     /// The underlying decode error.
     pub source: Error,
 }
 
 impl DecodeColumnError {
     /// Create a wrapper for a decode failure on `field`.
-    pub fn new(field: &Field, offset: Option<u64>, source: Error) -> Self {
+    pub fn new(field: &Field, source: Error) -> Self {
         Self {
             field_name: field.name.clone(),
             field_id: field.id,
-            offset,
             source,
         }
     }
@@ -1708,13 +1704,9 @@ impl std::fmt::Display for DecodeColumnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "failed to decode column '{}' (id {})",
-            self.field_name, self.field_id
-        )?;
-        if let Some(offset) = self.offset {
-            write!(f, " at offset {offset}")?;
-        }
-        Ok(())
+            "failed to decode column '{}' (id {}): {}",
+            self.field_name, self.field_id, self.source
+        )
     }
 }
 
@@ -1730,18 +1722,73 @@ impl From<DecodeColumnError> for Error {
     }
 }
 
-/// Attach column context to an error raised while building a field scheduler.
-///
-/// Scheduling errors happen before any rows are decoded, so there is no row
-/// offset to report.
-fn wrap_scheduler_error(field: &Field, source: Error) -> Error {
-    if matches!(
-        source.find_root(),
-        Error::InvalidInput { .. } | Error::NotSupported { .. }
-    ) {
-        return source;
+/// A display-only wrapper used to add column context to a corrupt-file error
+/// without changing the outer error variant.
+#[derive(Debug)]
+struct ColumnContextError {
+    field_name: String,
+    field_id: i32,
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl std::fmt::Display for ColumnContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to decode column '{}' (id {}): {}",
+            self.field_name, self.field_id, self.source
+        )
     }
-    DecodeColumnError::new(field, None, source).into()
+}
+
+impl std::error::Error for ColumnContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+/// Attach column context to a decode error.
+///
+/// `CorruptFile` keeps its variant and gets the column context on its inner
+/// source, because callers match on that variant and Python maps it to
+/// `ValueError`. User-input errors are left untouched for the same reason.
+pub(crate) fn with_column_context(field_name: &str, field_id: i32, source: Error) -> Error {
+    match source {
+        Error::CorruptFile {
+            path,
+            source,
+            location,
+            backtrace,
+        } => Error::CorruptFile {
+            path,
+            source: Box::new(ColumnContextError {
+                field_name: field_name.to_string(),
+                field_id,
+                source,
+            }),
+            location,
+            backtrace,
+        },
+        source
+            if matches!(
+                source.find_root(),
+                Error::InvalidInput { .. } | Error::NotSupported { .. }
+            ) =>
+        {
+            source
+        }
+        source => DecodeColumnError {
+            field_name: field_name.to_string(),
+            field_id,
+            source,
+        }
+        .into(),
+    }
+}
+
+/// Attach column context to an error raised while building a field scheduler.
+fn wrap_scheduler_error(field: &Field, source: Error) -> Error {
+    with_column_context(&field.name, field.id, source)
 }
 
 /// A stream that takes scheduled jobs and generates decode tasks from them.
@@ -4277,6 +4324,38 @@ mod tests {
         }
     }
 
+    struct CorruptFileDecodeTask;
+
+    impl DecodeArrayTask for CorruptFileDecodeTask {
+        fn decode(self: Box<Self>) -> Result<(ArrayRef, u64)> {
+            Err(Error::corrupt_file_named(
+                "some_file",
+                "malformed sparse page",
+            ))
+        }
+    }
+
+    #[test]
+    fn with_column_context_leaves_invalid_input_untouched() {
+        let err = with_column_context("age", 7, Error::invalid_input("bad value"));
+        assert!(matches!(err, Error::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn with_column_context_preserves_corrupt_file_variant() {
+        let err = with_column_context(
+            "age",
+            7,
+            Error::corrupt_file_named("some_file", "bad bytes"),
+        );
+        assert!(matches!(err, Error::CorruptFile { .. }));
+        assert!(
+            err.to_string()
+                .contains("failed to decode column 'age' (id 7)"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn next_decode_task_preserves_invalid_input_errors() {
         let err = NextDecodeTask {
@@ -4289,23 +4368,25 @@ mod tests {
     }
 
     #[test]
-    fn decode_column_error_reports_column_id_and_offset() {
+    fn decode_column_error_reports_column_id_and_source_message() {
         let err = DecodeColumnError {
             field_name: "age".to_string(),
             field_id: 7,
-            offset: Some(1234),
             source: Error::invalid_input("number out of range"),
         };
-        assert_eq!(
-            err.to_string(),
-            "failed to decode column 'age' (id 7) at offset 1234"
+        let display = err.to_string();
+        assert!(
+            display.starts_with(
+                "failed to decode column 'age' (id 7): Invalid user input: number out of range"
+            ),
+            "unexpected display: {display}"
         );
 
         let lance_err: Error = err.into();
         assert!(
             lance_err
                 .to_string()
-                .contains("failed to decode column 'age' (id 7) at offset 1234"),
+                .contains("failed to decode column 'age' (id 7)"),
             "unexpected error: {lance_err}"
         );
         let wrapper = std::error::Error::source(&lance_err)
@@ -4316,17 +4397,6 @@ mod tests {
                 .to_string()
                 .contains("number out of range")
         );
-    }
-
-    #[test]
-    fn decode_column_error_omits_unknown_offset() {
-        let err = DecodeColumnError {
-            field_name: "age".to_string(),
-            field_id: 7,
-            offset: None,
-            source: Error::invalid_input("number out of range"),
-        };
-        assert_eq!(err.to_string(), "failed to decode column 'age' (id 7)");
     }
 
     #[derive(Debug)]
@@ -4354,7 +4424,7 @@ mod tests {
 
         fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
             Ok(NextDecodeTask {
-                task: Box::new(InvalidInputDecodeTask),
+                task: Box::new(CorruptFileDecodeTask),
                 num_rows,
             })
         }
@@ -4365,7 +4435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decode_task_error_is_wrapped_with_column_and_offset() {
+    async fn decode_task_error_is_wrapped_with_column_context() {
         let fields = Fields::from(vec![ArrowField::new("age", DataType::Int32, false)]);
         let root = SimpleStructDecoder::new(fields, 1).with_column_contexts(vec![ColumnContext {
             name: "age".to_string(),
@@ -4395,17 +4465,25 @@ mod tests {
             .expect_err("decode task should fail");
 
         assert!(
-            err.to_string()
-                .contains("failed to decode column 'age' (id 7) at offset 0"),
-            "unexpected error: {err}"
+            matches!(err, Error::CorruptFile { .. }),
+            "corrupt-file variant must be preserved, got: {err}"
         );
-        let wrapper = std::error::Error::source(&err)
-            .expect("wrapped error should expose the column context");
+        let context = std::error::Error::source(&err)
+            .expect("corrupt-file error should expose the column context");
+        let inner = std::error::Error::source(context)
+            .expect("column context should expose the decode error");
+        // Evidence for the PR: a genuine decode failure before and after the context wrapper.
+        println!("decode error before context: {inner}");
+        println!("decode error with context: {context}");
         assert!(
-            std::error::Error::source(wrapper)
-                .expect("column context should expose the decode error")
+            context
                 .to_string()
-                .contains("malformed sparse page")
+                .starts_with("failed to decode column 'age' (id 7): malformed sparse page"),
+            "unexpected context: {context}"
+        );
+        assert!(
+            inner.to_string().contains("malformed sparse page"),
+            "unexpected source: {inner}"
         );
     }
 
