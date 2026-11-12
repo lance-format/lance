@@ -563,6 +563,8 @@ impl InlineBitpacking {
         }
 
         let mut decompressed = vec![0u128; ELEMS_PER_CHUNK as usize];
+        // SAFETY: the header is at most 128, `body` has exactly `bit_width * 128` bytes (both
+        // checked above), and `decompressed` is one block.
         unsafe { unpack_u128_chunk(bit_width, body, &mut decompressed) };
 
         decompressed.truncate(num_values as usize);
@@ -867,6 +869,8 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
         U128Kernel::Memcpy => {
             // bit_width == 128: every value occupies one whole u128 word in the body.
             debug_assert_eq!(dest_u128.len(), ELEMS_PER_CHUNK as usize);
+            // SAFETY: `src` and `dest_u128` both hold 1024 values at width 128, and
+            // `dest_u128` is a unique borrow, so the copy stays in bounds and cannot overlap.
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dest_u128.as_mut_ptr(), src.len());
             }
@@ -900,6 +904,8 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
                 *n = v as u32;
             }
             let dest_u32 = bytemuck::cast_slice_mut::<u128, u32>(dest_u128);
+            // SAFETY: `narrow` is 1024 values, `dest_u32` is `32 * bit_width` words, which
+            // is `1024 * bit_width / 32`, and `bit_width <= 32` here.
             unsafe { BitPacking::unchecked_pack(bit_width, &narrow, dest_u32) };
         }
         U128Kernel::NarrowU64 => {
@@ -926,6 +932,8 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
                 *n = v as u64;
             }
             let dest_u64 = bytemuck::cast_slice_mut::<u128, u64>(dest_u128);
+            // SAFETY: `narrow` is 1024 values, `dest_u64` is `16 * bit_width` words, which
+            // is `1024 * bit_width / 64`, and `bit_width <= 64` here.
             unsafe { BitPacking::unchecked_pack(bit_width, &narrow, dest_u64) };
         }
         U128Kernel::SplitU64 => {
@@ -943,6 +951,9 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
                 *l = v as u64;
                 *h = (v >> 64) as u64;
             }
+            // SAFETY: `high_halves` is 1024 values and `high` is the remaining
+            // `16 * (bit_width - 64)` words, which is `1024 * (bit_width - 64) / 64`, with
+            // `bit_width - 64 < 64`.
             unsafe { BitPacking::unchecked_pack(bit_width - 64, &high_halves, high) };
         }
     }
@@ -1011,6 +1022,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
                  got {} (header outer-assertion already covers this for bit_width=128)",
                 body_bytes.len()
             );
+            // SAFETY: `body_bytes` is `1024 * 16` bytes (asserted at entry) and `dest`
+            // holds 1024 u128 values, which have no invalid bit patterns.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     body_bytes.as_ptr(),
@@ -1027,6 +1040,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
             let words = bit_width * (ELEMS_PER_CHUNK as usize / 32);
             debug_assert!(words <= ELEMS_PER_CHUNK as usize);
             let mut packed = [0u32; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `body_bytes` is `bit_width * 128` bytes (asserted at entry), at most
+            // the 4096 bytes of `packed` for `bit_width <= 32`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     body_bytes.as_ptr(),
@@ -1035,6 +1050,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
                 );
             }
             let mut narrow = [0u32; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `packed[..words]` is `1024 * bit_width / 32` words, `narrow` is 1024
+            // values, and `bit_width <= 32`.
             unsafe { BitPacking::unchecked_unpack(bit_width, &packed[..words], &mut narrow) };
             for (d, &v) in dest.iter_mut().zip(narrow.iter()) {
                 *d = v as u128;
@@ -1045,6 +1062,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
             let words = bit_width * (ELEMS_PER_CHUNK as usize / 64);
             debug_assert!(words <= ELEMS_PER_CHUNK as usize);
             let mut packed = [0u64; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `body_bytes` is `bit_width * 128` bytes (asserted at entry), at most
+            // the 8192 bytes of `packed` for `bit_width <= 64`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     body_bytes.as_ptr(),
@@ -1053,6 +1072,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
                 );
             }
             let mut narrow = [0u64; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `packed[..words]` is `1024 * bit_width / 64` words, `narrow` is 1024
+            // values, and `bit_width <= 64`.
             unsafe { BitPacking::unchecked_unpack(bit_width, &packed[..words], &mut narrow) };
             for (d, &v) in dest.iter_mut().zip(narrow.iter()) {
                 *d = v as u128;
@@ -1066,6 +1087,9 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
             let high_words = high_width * (ELEMS_PER_CHUNK as usize / 64);
             let mut low = [0u64; ELEMS_PER_CHUNK as usize];
             let mut packed = [0u64; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `body_bytes` is `bit_width * 128` bytes (asserted at entry), so its
+            // first 8192 bytes fill `low` and the remaining `(bit_width - 64) * 128` bytes, at
+            // most 8064, fit in `packed`.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     body_bytes.as_ptr(),
@@ -1079,6 +1103,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
                 );
             }
             let mut high = [0u64; ELEMS_PER_CHUNK as usize];
+            // SAFETY: `packed[..high_words]` is `1024 * high_width / 64` words, `high` is
+            // 1024 values, and `high_width < 64`.
             unsafe { BitPacking::unchecked_unpack(high_width, &packed[..high_words], &mut high) };
             for ((d, &l), &h) in dest.iter_mut().zip(low.iter()).zip(high.iter()) {
                 *d = (u128::from(h) << 64) | u128::from(l);
@@ -1130,7 +1156,8 @@ fn bitpack_out_of_line_u128(data: FixedWidthDataBlock, compressed_bit_width: usi
 
 /// Inverse of [`bitpack_out_of_line_u128`]. The caller has checked that `data` has the
 /// raw-tail or padded-tail length for `num_values` (`out_of_line_payload_byte_lengths`).
-/// A zero-width payload is empty, so only the allocation bounds `num_values`.
+/// A zero-width payload holds at most a raw tail, so it does not bound `num_values`; a count
+/// whose output length overflows or cannot be allocated returns an error.
 fn unpack_out_of_line_u128(
     data: &LanceBuffer,
     num_values: usize,
@@ -1148,7 +1175,13 @@ fn unpack_out_of_line_u128(
     } else {
         chunk_len
     };
-    let decoded_len = num_whole_chunks * chunk_len + tail_values;
+    let decoded_len = (num_whole_chunks * chunk_len)
+        .checked_add(tail_values)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Out-of-line bitpacking output length overflows usize for {num_values} values"
+            ))
+        })?;
     let mut decoded: Vec<u128> =
         try_vec_with_capacity(decoded_len as u64, "Out-of-line bitpacking output")?;
     decoded.resize(decoded_len, 0);
@@ -2263,12 +2296,16 @@ mod test {
             1..=32 => {
                 let narrow: Vec<u32> = values.iter().map(|&v| v as u32).collect();
                 let mut packed = vec![0u32; ELEMS_PER_CHUNK as usize * bit_width / 32];
+                // SAFETY: `narrow` is 1024 values and `packed` is `1024 * bit_width / 32`
+                // words.
                 unsafe { BitPacking::unchecked_pack(bit_width, &narrow, &mut packed) };
                 bytemuck::cast_slice(&packed).to_vec()
             }
             33..=64 => {
                 let narrow: Vec<u64> = values.iter().map(|&v| v as u64).collect();
                 let mut packed = vec![0u64; ELEMS_PER_CHUNK as usize * bit_width / 64];
+                // SAFETY: `narrow` is 1024 values and `packed` is `1024 * bit_width / 64`
+                // words.
                 unsafe { BitPacking::unchecked_pack(bit_width, &narrow, &mut packed) };
                 bytemuck::cast_slice(&packed).to_vec()
             }
@@ -2276,6 +2313,8 @@ mod test {
                 // The low 64 bits of every value, then the high bits packed at `w - 64`.
                 let high: Vec<u64> = values.iter().map(|&v| (v >> 64) as u64).collect();
                 let mut packed = vec![0u64; ELEMS_PER_CHUNK as usize * (bit_width - 64) / 64];
+                // SAFETY: `high` is 1024 values and `packed` is
+                // `1024 * (bit_width - 64) / 64` words.
                 unsafe { BitPacking::unchecked_pack(bit_width - 64, &high, &mut packed) };
                 values
                     .iter()
@@ -2432,6 +2471,7 @@ mod test {
         let narrow: Vec<u32> = values.iter().map(|&v| v as u32).collect();
         let words_per_chunk = ELEMS_PER_CHUNK as usize * bit_width / 32;
         let mut packed: Vec<u32> = vec![0u32; words_per_chunk];
+        // SAFETY: `narrow` is 1024 values and `packed` is `1024 * bit_width / 32` words.
         unsafe {
             BitPacking::unchecked_pack(bit_width, &narrow, &mut packed);
         }
@@ -2881,12 +2921,16 @@ mod test {
         assert_eq!(decoded.data.borrow_to_typed_slice::<u32>().as_ref(), values);
     }
 
-    /// A zero-width 128-bit payload is empty, so a declared count too large to allocate
-    /// must be an error rather than a panic or an abort.
+    /// A zero-width 128-bit payload with a padded tail is empty, so a declared count whose
+    /// output does not fit or cannot be allocated must be an error rather than a panic or an
+    /// abort.
     #[test]
     fn test_u128_out_of_line_zero_width_rejects_unallocatable_count() {
         let decompressor = OutOfLineBitpacking::new(0, 128);
+        // The first two pad a short tail to a block, which overflows the output length.
         for num_values in [
+            u64::MAX,
+            u64::MAX - 1022,
             u64::MAX - 2048,
             isize::MAX as u64 / 16 + 1,
             (1_u64 << 60) / 16,

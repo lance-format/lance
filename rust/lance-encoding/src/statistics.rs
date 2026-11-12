@@ -90,7 +90,9 @@ impl ComputeStat for FixedWidthDataBlock {
     fn compute_stat(&mut self) {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
-        let max_bit_widths = self.max_bit_widths();
+        // Only the 2.3 bitpacking selectors read 128-bit widths, so other versions never pay
+        // for the scan.
+        let max_bit_widths = (self.bits_per_value != 128).then(|| self.max_bit_widths());
         let max_len = self.bits_per_value / 8;
         let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
 
@@ -100,7 +102,9 @@ impl ComputeStat for FixedWidthDataBlock {
         // and transcendental `log2` evaluations.
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
-        info.insert(Stat::BitWidth, max_bit_widths);
+        if let Some(max_bit_widths) = max_bit_widths {
+            info.insert(Stat::BitWidth, max_bit_widths);
+        }
         info.insert(Stat::MaxLength, max_len_array);
     }
 }
@@ -337,6 +341,7 @@ impl GetStat for FixedWidthDataBlock {
             Stat::Cardinality if self.bits_per_value == 64 || self.bits_per_value == 128 => {
                 Some(self.cardinality())
             }
+            Stat::BitWidth if self.bits_per_value == 128 => Some(self.max_bit_widths()),
             _ => None,
         }?;
 
@@ -381,7 +386,7 @@ impl FixedWidthDataBlock {
     /// dispatch falls into the memcpy branch. Do not "optimize" the OR-fold to skip the sign
     /// bit. The same property holds mechanically for narrower signed types but they currently
     /// have no narrow-dispatch consumer that would rely on it.
-    fn max_bit_widths(&mut self) -> Arc<dyn Array> {
+    fn max_bit_widths(&self) -> Arc<dyn Array> {
         if self.num_values == 0 {
             return Arc::new(UInt64Array::from(vec![0u64]));
         }
@@ -1337,7 +1342,27 @@ mod tests {
                 .with_precision_and_scale(38, 0)
                 .unwrap();
             let block = DataBlock::from_array(Arc::new(array) as ArrayRef);
+            let DataBlock::FixedWidth(fixed) = &block else {
+                panic!("expected FixedWidth");
+            };
+            // Only the 2.3 selectors read 128-bit widths, so the scan waits until one asks.
+            assert!(
+                !fixed
+                    .block_info
+                    .0
+                    .read()
+                    .unwrap()
+                    .contains_key(&Stat::BitWidth)
+            );
             let stat = block.expect_stat(Stat::BitWidth);
+            assert!(
+                fixed
+                    .block_info
+                    .0
+                    .read()
+                    .unwrap()
+                    .contains_key(&Stat::BitWidth)
+            );
             let stat_array = stat
                 .as_any()
                 .downcast_ref::<UInt64Array>()
