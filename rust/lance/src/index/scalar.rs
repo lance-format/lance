@@ -10,6 +10,7 @@ pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
 pub(crate) mod label_list;
+pub(crate) mod list_element;
 pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
@@ -587,6 +588,16 @@ pub(super) async fn build_scalar_index(
         )
         .await?;
 
+    // A list-element index names its keys; record which fields they are, so
+    // the index follows them through renames.
+    if list_element::is_list_element(&created_index.index_details) {
+        let indexed_field = dataset
+            .schema()
+            .field(column)
+            .ok_or_else(|| Error::invalid_input(format!("No column with name {column}")))?;
+        list_element::record_key_field_ids(indexed_field, &mut created_index)?;
+    }
+
     // BTree, Bitmap, and LabelList always train on physical row addresses --
     // the plugins' TrainingCriteria has no per-dataset awareness to vary
     // that -- but a row address and a row id are the same value on a
@@ -874,7 +885,10 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
-    let index_details = fetch_index_details(dataset, column, index).await?;
+    let mut index_details = fetch_index_details(dataset, column, index).await?;
+    if list_element::is_list_element(&index_details) {
+        index_details = list_element::details_for_open(dataset.schema(), index, index_details)?;
+    }
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
     let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
@@ -898,12 +912,13 @@ pub(crate) async fn open_scalar_index_with_plan(
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
     // already validated this session, saving the extra `open_index_file` IOP.
-    let load: ScalarIndexLoad = Box::pin({
+    let make_load = || -> ScalarIndexLoad<'_> {
         let index_store = index_store.clone();
         let batch_remapping = batch_remapping.clone();
         let frag_reuse_index = frag_reuse_index.clone();
         let index_cache = index_cache.clone();
-        async move {
+        let index_details = index_details.clone();
+        Box::pin(async move {
             if index_details.type_url.ends_with("LabelListIndexDetails") {
                 validate_label_list_index_compatibility(
                     dataset,
@@ -944,26 +959,37 @@ pub(crate) async fn open_scalar_index_with_plan(
             tracing::info!(target: TRACE_IO_EVENTS, index_uuid = %index_uuid, r#type = IO_TYPE_OPEN_SCALAR, index_type = index.index_type().to_string());
             metrics.record_index_load();
             Ok(index)
-        }
-    });
+        })
+    };
 
-    if batch_remapping.is_some() {
+    let opened = if let Some(batch_remapping) = batch_remapping.clone() {
         let rebind_store = index_store.clone();
         lance_index::scalar::registry::single_flight_store_bound_open_with_snapshot(
-            index_store,
+            index_store.clone(),
             &index_cache,
-            load,
+            make_load(),
             move |index| async move {
-                plugin.rebind_with_remapping(index.as_ref(), rebind_store, batch_remapping)
+                plugin.rebind_with_remapping(index.as_ref(), rebind_store, Some(batch_remapping))
             },
             |index| plugin.cache_snapshot(index),
         )
-        .await
+        .await?
     } else {
         plugin
-            .get_or_insert_in_cache(index_store, frag_reuse_index, &index_cache, load)
-            .await
+            .get_or_insert_in_cache(
+                index_store.clone(),
+                frag_reuse_index.clone(),
+                &index_cache,
+                make_load(),
+            )
+            .await?
+    };
+    // A list-element index cached before a rename reads its keys by their old
+    // names. Searching does not use them, but updating does, so load it again.
+    if list_element::has_other_key_names(opened.as_ref(), &index_details) {
+        return make_load().await;
     }
+    Ok(opened)
 }
 
 pub(crate) async fn cached_scalar_index_container(

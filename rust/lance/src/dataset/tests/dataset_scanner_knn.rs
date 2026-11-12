@@ -1379,13 +1379,10 @@ async fn test_batch_knn_indexed_refine_zero(#[case] fixed_probes: bool) {
     assert!(error.to_string().contains("Refine factor cannot be zero"));
 }
 
-/// Without pinned nprobes the shared-scan fast path is not equivalent to
-/// single-query search (the single-query path applies an adaptive
-/// `early_pruning` floor and late-search expansion that the batch path does
-/// not), so the scanner must fall back to the per-query loop, which reuses
-/// the real adaptive search and stays exact.
+/// Adaptive nprobes (no `nprobes()` call) uses the shared-scan batch node,
+/// which applies the same probe budget as the single-query path.
 #[tokio::test]
-async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
+async fn test_batch_knn_indexed_adaptive_nprobes() {
     let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
         .await
         .unwrap();
@@ -1401,20 +1398,12 @@ async fn test_batch_knn_indexed_adaptive_nprobes_falls_back() {
 
     let plan = scan.explain_plan(false).await.unwrap();
     assert!(
-        !plan.contains("ANNIvfBatch"),
-        "adaptive nprobes must not use the shared-scan batch node, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("ANNSubIndex"),
-        "adaptive nprobes batch search should fall back to the per-query loop, got:\n{}",
-        plan
+        plan.contains("ANNIvfBatch"),
+        "adaptive nprobes should use the shared-scan batch node, got:\n{plan}"
     );
 
     let batch = scan.try_into_batch().await.unwrap();
     assert_query_index_field(&batch);
-    // The fallback runs real single-query searches, so it stays exact even
-    // with adaptive nprobes.
     assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None).await;
 }
 
@@ -2662,6 +2651,7 @@ async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
 /// each segment's ownership so the stale copy is neither returned nor counted.
 #[rstest]
 #[case::fixed_nprobes(Some(2))]
+#[case::adaptive_nprobes(None)]
 #[tokio::test]
 async fn test_batch_knn_skips_rows_owned_by_newer_delta(
     #[case] nprobes: Option<usize>,
