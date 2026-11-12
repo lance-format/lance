@@ -85,6 +85,11 @@ impl HashJoiner {
             .enumerate()
             .filter_map(|(i, field)| if field.name() == on { None } else { Some(i) })
             .collect();
+        if keep_indices.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "The right side has no columns besides the join key '{on}', so there is nothing to merge"
+            )));
+        }
         let out_schema: Arc<arrow_schema::Schema> = Arc::new(schema.project(&keep_indices)?);
         let right_batches = batches
             .iter()

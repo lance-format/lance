@@ -14,7 +14,10 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::{DataReplacementGroup, Operation};
-use crate::dataset::{AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder};
+use crate::dataset::{
+    AutoCleanupParams, MergeInsertBuilder, ProjectionRequest, UpdateBuilder, UpdateJoinOptions,
+    UpdateJoinStrategy,
+};
 use crate::index::DatasetIndexExt;
 use crate::{Dataset, Error};
 use lance_core::{ROW_ADDR, ROW_LAST_UPDATED_AT_VERSION};
@@ -228,6 +231,58 @@ async fn test_merge_rejects_duplicate_right_keys(
     dataset.checkout_latest().await.unwrap();
     assert_eq!(dataset.version().version, version);
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), original);
+}
+
+/// A right side holding only the join key has nothing to merge, which every
+/// entry point that joins on it reports as an input error.
+#[rstest]
+#[case::dataset_merge("merge")]
+#[case::fragment_merge_columns("merge_columns")]
+#[case::fragment_update_columns("update_columns")]
+#[case::fragment_update_columns_sort_merge("update_columns_sort_merge")]
+#[tokio::test]
+async fn test_merge_rejects_a_key_only_right_side(#[case] entry_point: &str) {
+    let original =
+        arrow_array::record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30]))
+            .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(original.clone())], original.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let right = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(right.clone())], right.schema());
+    let error = match entry_point {
+        "merge" => dataset.merge(reader, "id", "id").await.unwrap_err(),
+        "merge_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .merge_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        "update_columns" => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            fragment
+                .update_columns(reader, "id", "id")
+                .await
+                .unwrap_err()
+        }
+        _ => {
+            let mut fragment = dataset.get_fragment(0).unwrap();
+            let options = UpdateJoinOptions::default().with_strategy(UpdateJoinStrategy::SortMerge);
+            fragment
+                .update_columns_with_options(reader, "id", "id", options)
+                .await
+                .unwrap_err()
+        }
+    };
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains("no columns besides the join key 'id'"),
+        "{error}"
+    );
+    assert_eq!(dataset.version().version, 1);
 }
 
 #[rstest]
