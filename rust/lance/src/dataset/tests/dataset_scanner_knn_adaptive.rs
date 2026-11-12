@@ -16,6 +16,7 @@ use lance_datafusion::utils::INDEX_SEGMENTS_SKIPPED_METRIC;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
@@ -606,4 +607,142 @@ async fn test_batch_knn_adaptive_skips_delta_whose_prefilter_selects_nothing() {
         rows["i"].as_primitive::<Int32Type>().values(),
         single["i"].as_primitive::<Int32Type>().values()
     );
+}
+
+/// A scoped exact scalar predicate reaches the ANN scan as a hybrid prefilter
+/// producer (`PrefilterUnionExec`): the scalar index masks the fragments it
+/// covers and a row-ID read supplies the rest. The shared adaptive batch node
+/// must consume that producer instead of falling back to per-query search, and
+/// the mask must stay exact through the shared scan.
+#[rstest]
+#[case::explicit_fragments(true)]
+#[case::partial_scalar_coverage(false)]
+#[tokio::test]
+async fn test_batch_knn_adaptive_hybrid_scalar_prefilter(#[case] explicit_fragments: bool) {
+    // The predicate spans both ends of the middle fragments so the scan scope
+    // and the predicate each exclude rows the other would admit.
+    const FILTER: &str = "i >= 250 AND i < 1750";
+    const SCOPE: std::ops::Range<i32> = 500..1500;
+    let mut dataset = adaptive_batch_dataset("IVF_FLAT", false, MetricType::L2).await;
+    let mut scalar_fragments = dataset
+        .fragments()
+        .iter()
+        .map(|fragment| fragment.id as u32)
+        .collect::<Vec<_>>();
+    if !explicit_fragments {
+        // The exact predicate then has no index coverage for the last two
+        // fragments, so the union must read their row IDs through its second
+        // child instead of dropping those fragments from the scan.
+        scalar_fragments.truncate(2);
+    }
+    let segment = dataset
+        .create_index_builder(&["i"], IndexType::BTree, &ScalarIndexParams::default())
+        .name("i_idx".to_owned())
+        .fragments(scalar_fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("i_idx", "i", vec![segment])
+        .await
+        .unwrap();
+
+    let query_values = adaptive_batch_queries(&dataset).await;
+    let queries = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(query_values.clone()),
+        ADAPTIVE_DIM as i32,
+    )
+    .unwrap();
+    let k = 10;
+    // Only the explicit case scopes the scan; a partial scalar index already
+    // produces the union through its missing-fragment child.
+    let selected = explicit_fragments.then(|| dataset.fragments()[1..3].to_vec());
+
+    let mut scan = dataset.scan();
+    configure_adaptive_scan(&mut scan, &queries, k, Some(FILTER), None, true);
+    if let Some(fragments) = &selected {
+        scan.with_fragments(fragments.clone());
+    }
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ANNIvfBatch:"), "got:\n{plan}");
+    assert!(
+        !plan.contains("ANNSubIndex"),
+        "the adaptive batch must not fall back to per-query search:\n{plan}"
+    );
+    // The union shape is what distinguishes the two producer paths: the
+    // explicit case masks only the two selected fragments, while partial
+    // coverage also evaluates the two fragments the scalar index omits.
+    let expected_union = if explicit_fragments {
+        "PrefilterUnion: scalar_fragments=2, evaluated_fragments=2"
+    } else {
+        "PrefilterUnion: scalar_fragments=2, evaluated_fragments=4"
+    };
+    assert!(
+        plan.contains(expected_union),
+        "expected `{expected_union}` in:\n{plan}"
+    );
+
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), ADAPTIVE_QUERIES * k);
+
+    let mut hits = 0;
+    let mut expected_total = 0;
+    for query_index in 0..ADAPTIVE_QUERIES {
+        let query = Float32Array::from(
+            query_values[query_index * ADAPTIVE_DIM..(query_index + 1) * ADAPTIVE_DIM].to_vec(),
+        );
+        let mut single_scan = dataset.scan();
+        configure_adaptive_scan(&mut single_scan, &query, k, Some(FILTER), None, true);
+        if let Some(fragments) = &selected {
+            single_scan.with_fragments(fragments.clone());
+        }
+        let single = single_scan.try_into_batch().await.unwrap();
+        let rows = rows_for_query(&batch, query_index);
+        assert_eq!(
+            rows["i"].as_primitive::<Int32Type>().values(),
+            single["i"].as_primitive::<Int32Type>().values(),
+            "query {query_index}: batch rows must match single-query rows"
+        );
+        assert_eq!(
+            rows[DIST_COL].as_primitive::<Float32Type>().values(),
+            single[DIST_COL].as_primitive::<Float32Type>().values(),
+            "query {query_index}: batch distances must match single-query"
+        );
+        // Eligibility comes from the mask the producer built, so validate it on
+        // the rows the shared scan returned rather than trusting the plan.
+        for id in rows["i"].as_primitive::<Int32Type>().values() {
+            assert!(
+                (250..1750).contains(id),
+                "query {query_index}: row {id} violates `{FILTER}`"
+            );
+            if explicit_fragments {
+                assert!(
+                    SCOPE.contains(id),
+                    "query {query_index}: row {id} is outside the selected fragments"
+                );
+            }
+        }
+
+        let mut flat_scan = dataset.scan();
+        configure_adaptive_scan(&mut flat_scan, &query, k, Some(FILTER), None, false);
+        if let Some(fragments) = &selected {
+            flat_scan.with_fragments(fragments.clone());
+        }
+        let flat = flat_scan.try_into_batch().await.unwrap();
+        let expected: HashSet<i32> = flat["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        expected_total += expected.len();
+        hits += rows["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+    }
+    let recall = hits as f32 / expected_total as f32;
+    assert!(recall >= 0.5, "recall {recall} below 0.5");
 }
