@@ -22,6 +22,7 @@ mod element;
 mod geo;
 
 pub(crate) use element::rewrite_element_lambdas;
+pub use element::{ANY_ELEMENT, any_element_predicate, plan_element_predicate};
 
 /// Register UDF functions to datafusion context.
 pub fn register_functions(ctx: &SessionContext) {
