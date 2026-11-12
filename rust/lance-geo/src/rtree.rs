@@ -757,11 +757,22 @@ pub async fn merge_rtree_indices(
         .unwrap_or(&source_indices[0]);
     let page_size = first_contributing.metadata.page_size;
     validate_page_size(page_size)?;
-    // Every source must already agree on this (see the doc comment above);
-    // the caller is responsible for enforcing it, same as
-    // `NGramIndex::merge_segments`'s equivalent `results_are_row_addresses`
-    // parameter.
+    // This function is public, so a direct caller -- not just the one
+    // in-repo wrapper, which already enforces this via `shared_segment_domain`
+    // before opening any segment -- could supply sources that disagree.
+    // Each source already carries its own `results_are_row_addresses`; check
+    // them here too, rather than silently combining row ids and row
+    // addresses in the same column.
     let results_are_row_addresses = source_indices[0].results_are_row_addresses;
+    if source_indices
+        .iter()
+        .any(|source| source.results_are_row_addresses != results_are_row_addresses)
+    {
+        return Err(Error::invalid_input(
+            "cannot merge RTree segments that disagree on whether they store row ids or row \
+             addresses -- rebuild them into one segment first",
+        ));
+    }
     let mut data_streams = Vec::with_capacity(source_indices.len());
     let mut null_map = RowAddrTreeMap::new();
 
@@ -2593,5 +2604,65 @@ mod tests {
             err.to_string().contains("injected page read failure"),
             "{err}"
         );
+    }
+
+    /// `results_are_row_addresses` is stamped at train/merge time from the
+    /// segment's own domain and read back at load time from the caller's
+    /// `index_version`; pin that round trip, and that merging keeps (or
+    /// rejects) the sources' shared domain, without a full dataset-level
+    /// test -- the query-time translation itself is shared with BTree/Bitmap.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_version_domain_round_trip_and_merge() {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut builder = PointBuilder::new(point_type);
+        builder.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+        let (index, store, _tmpdir) = train_index(&builder.finish(), None).await;
+
+        // A freshly trained segment is address-domain.
+        assert!(index.results_are_row_addresses());
+
+        // The same store, loaded at each index_version, must report the
+        // domain the caller passed in: this is the only thing that tells a
+        // query whether to translate a segment's results.
+        let addr_domain =
+            RTreeIndex::load_inner(store.clone(), None, None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
+        assert!(addr_domain.results_are_row_addresses());
+        let id_domain = RTreeIndex::load_inner(store, None, None, &LanceCache::no_cache(), false)
+            .await
+            .unwrap();
+        assert!(!id_domain.results_are_row_addresses());
+
+        let merge = |sources: Vec<Arc<RTreeIndex>>| async move {
+            let tmpdir = TempObjDir::default();
+            let dest_store = Arc::new(LanceIndexStore::new(
+                Arc::new(ObjectStore::local()),
+                tmpdir.clone(),
+                Arc::new(LanceCache::no_cache()),
+            ));
+            let filters = vec![None; sources.len()];
+            let result = merge_rtree_indices(&sources, dest_store.as_ref(), &filters).await;
+            (result, tmpdir)
+        };
+
+        // Merging keeps the sources' shared domain, both ways.
+        let (created, _tmpdir) = merge(vec![id_domain.clone(), id_domain.clone()]).await;
+        assert_eq!(created.unwrap().index_version, RTREE_ROW_ID_DOMAIN_VERSION);
+        let (created, _tmpdir) = merge(vec![addr_domain.clone(), addr_domain.clone()]).await;
+        assert_eq!(
+            created.unwrap().index_version,
+            RTREE_ROW_ADDR_DOMAIN_VERSION
+        );
+
+        // Mixed domains are rejected rather than silently combined: this
+        // function is public, so a direct caller (not just the one in-repo
+        // wrapper that already checks this beforehand) could supply them.
+        let (result, _tmpdir) = merge(vec![id_domain, addr_domain]).await;
+        let Err(err) = result else {
+            panic!("merging mismatched domains must be rejected");
+        };
+        assert!(err.to_string().contains("disagree"), "{err}");
     }
 }
