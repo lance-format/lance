@@ -241,7 +241,10 @@ async fn test_merge_rejects_duplicate_right_keys(
 #[case::fragment_update_columns("update_columns")]
 #[case::fragment_update_columns_sort_merge("update_columns_sort_merge")]
 #[tokio::test]
-async fn test_merge_rejects_a_key_only_right_side(#[case] entry_point: &str) {
+async fn test_merge_rejects_a_key_only_right_side(
+    #[case] entry_point: &str,
+    #[values(false, true)] empty: bool,
+) {
     let original =
         arrow_array::record_batch!(("id", Int32, [1, 2, 3]), ("value", Int32, [10, 20, 30]))
             .unwrap();
@@ -249,7 +252,12 @@ async fn test_merge_rejects_a_key_only_right_side(#[case] entry_point: &str) {
     let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 
     let right = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(right.clone())], right.schema());
+    let batches = if empty {
+        vec![]
+    } else {
+        vec![Ok(right.clone())]
+    };
+    let reader = RecordBatchIterator::new(batches, right.schema());
     let error = match entry_point {
         "merge" => dataset.merge(reader, "id", "id").await.unwrap_err(),
         "merge_columns" => {
