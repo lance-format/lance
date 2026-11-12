@@ -174,7 +174,7 @@ empty values. Historical snapshots retain their previous schema.
 
 Descriptor consumers that access fields by position or compare exact Arrow
 schemas must account for the extended structure. Interpret `position` together
-with `kind` and the object reference. See [the schema-transition discussion](https://github.com/lance-format/lance/issues/9458).
+with `kind` and the object reference.
 
 The dataset's default file version remains unchanged. Select `2.2` or newer
 explicitly when writing Blob v2 structs or compacting the mixed column into
