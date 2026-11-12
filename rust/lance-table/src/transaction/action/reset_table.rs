@@ -45,10 +45,10 @@ impl ResetTable {
     }
 
     /// Everything. A reset writes every coordinate there is, including ones a
-    /// concurrent set would only mint, so it takes the table exclusively rather
-    /// than enumerating them.
+    /// concurrent set would only mint, so it is a flag rather than a list of
+    /// coordinates, and one that wins over what landed before it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.take_exclusive();
+        footprint.reset_table();
     }
 }
 
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_conflicts_with_everything() {
+    fn test_a_committed_reset_conflicts_with_everything() {
         let reset = footprint(vec![reset()]);
         // Even a pure append, which writes no committed coordinate at all, is
         // preempted: its rows would either vanish or survive the reset
@@ -263,15 +263,13 @@ mod tests {
             },
         ))]);
 
-        assert!(reset.conflicts_with(&append));
         assert!(append.conflicts_with(&reset));
         assert!(reset.conflicts_with(&reset.clone()));
         assert!(!append.conflicts_with(&append.clone()));
 
         // Nor does a set have to write anything: one that only requires a
         // coordinate (a compaction-shaped set, which is not even an insert),
-        // or records nothing at all, still cannot land on either side of a
-        // reset.
+        // or records nothing at all, still cannot land after a reset.
         let requires_only = footprint(vec![
             Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
@@ -295,8 +293,50 @@ mod tests {
         let records_nothing =
             footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(3))]);
         for other in [requires_only, records_nothing] {
-            assert!(reset.conflicts_with(&other));
             assert!(other.conflicts_with(&reset));
         }
+    }
+
+    /// A reset landing second wins over what landed before it: the rows of a
+    /// concurrent append are discarded with the rest of the table, which is
+    /// what an overwrite means. Only what the resetting set states besides
+    /// the reset is compared.
+    #[test]
+    fn test_a_pending_reset_wins_over_what_landed_before_it() {
+        use crate::system_index::mem_wal::CompactedSsTable;
+        use crate::transaction::action::{ConfigUpdate, UpdateCompactedSsTables};
+        use crate::transaction::{UpdateMap, UpdateMapEntry};
+
+        let config = |key: &str| {
+            Action::ConfigUpdate(ConfigUpdate::default().with_config(UpdateMap {
+                update_entries: vec![UpdateMapEntry::from((key, Some("v")))],
+                replace: false,
+            }))
+        };
+        let append = footprint(vec![Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            },
+        ))]);
+        let overwrite = footprint(vec![reset(), config("a")]);
+
+        assert!(!overwrite.conflicts_with(&append));
+        assert!(!overwrite.conflicts_with(&footprint(vec![config("b")])));
+        assert!(overwrite.conflicts_with(&footprint(vec![config("a")])));
+        // The MemWAL index records compaction progress nothing else does, and
+        // a reset drops it.
+        let compaction_progress = footprint(vec![Action::UpdateCompactedSsTables(
+            UpdateCompactedSsTables::try_new_unchecked(vec![CompactedSsTable {
+                shard_id: uuid::Uuid::new_v4(),
+                generation: 1,
+            }])
+            .unwrap(),
+        )]);
+        assert!(overwrite.conflicts_with(&compaction_progress));
     }
 }

@@ -5,7 +5,7 @@ mod create_index;
 mod rewrite;
 
 use super::*;
-use lance_table::transaction::action::Footprint;
+use lance_table::transaction::action::{Footprint, Verdict};
 
 impl<'a> TransactionRebase<'a> {
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -102,24 +102,29 @@ impl<'a> TransactionRebase<'a> {
         }
     }
 
+    /// Record manifests committed since the read version, so a concurrent
+    /// transaction committed between two of them can be compared by footprint.
+    pub fn record_manifests(&mut self, manifests: impl IntoIterator<Item = Arc<Manifest>>) {
+        for manifest in manifests {
+            self.manifests.record(manifest);
+        }
+    }
+
     /// Whether an action-based transaction conflicts with `other_transaction`.
     ///
     /// Reached from both directions: when the transaction being committed is
-    /// action-based, and when a concurrent one is.
+    /// action-based, and when a concurrent one is. Either side may be a named
+    /// operation; both are compared by footprint.
     ///
-    /// Two action sets are compared by footprint. Anything else -- a named
-    /// operation on the other side -- conflicts unconditionally. The two forms
-    /// describe a change in different vocabularies, and deciding whether a
-    /// named operation's post-image overlaps an action set's coordinates would
-    /// mean specifying every named operation in terms of coordinates. Until that
-    /// exists, a mixed pair fails closed rather than guessing.
+    /// Fails closed when the manifests either side of `other_version` were not
+    /// recorded, since there is then nothing to take its footprint against.
     fn check_action_txn(
         &mut self,
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
-        let (Operation::CompositeOperation(ours), Operation::CompositeOperation(theirs)) =
-            (&self.transaction.operation, &other_transaction.operation)
+        let (Some(read), Some((before, after))) =
+            (&self.manifests.read, self.manifests.around(other_version))
         else {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         };
@@ -128,18 +133,29 @@ impl<'a> TransactionRebase<'a> {
         // read and the latest schema finds every relation either side named:
         // a child added since the read, or a field dropped since.
         let schemas = [self.read_schema.as_ref(), self.current_schema.as_ref()];
-        let footprint = |operation| {
+        let with_ancestry = |footprint: Footprint| {
             schemas
                 .iter()
                 .flatten()
-                .fold(Footprint::from(operation), |footprint, schema| {
+                .fold(footprint, |footprint, schema| {
                     footprint.with_field_ancestry(schema)
                 })
         };
-        if footprint(ours).conflicts_with(&footprint(theirs)) {
-            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        let ours = with_ancestry(Footprint::pending(&self.transaction, read));
+        let theirs = with_ancestry(Footprint::committed(other_transaction, before, after));
+        match ours.compare(&theirs) {
+            Verdict::Compatible => Ok(()),
+            Verdict::Rebase(overlaps) => match &mut self.transaction.operation {
+                // Rebased as each committed set is checked, so the next one is
+                // compared against what this set has become.
+                Operation::CompositeOperation(composite_operation) => {
+                    *composite_operation = std::mem::take(composite_operation).rebase(overlaps)?;
+                    Ok(())
+                }
+                _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
+            },
+            Verdict::Conflict => Err(self.retryable_conflict_err(other_transaction, other_version)),
         }
-        Ok(())
     }
 
     fn check_delete_txn(
