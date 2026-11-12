@@ -2560,7 +2560,13 @@ public class DatasetTest {
       assertArrayEquals(new int[] {1, 2}, BlobReferences.getSupportedCapabilities());
       assertArrayEquals(
           new String[] {
-            "capture_top_level", "read_whole", "read_range", "streaming", "cancellation"
+            "capture_top_level",
+            "capture_nested",
+            "reader_metrics_v1",
+            "read_whole",
+            "read_range",
+            "streaming",
+            "cancellation"
           },
           BlobReferences.getSupportedOperations());
       SourceContext source = SourceContext.fromDataset(original, "catalog/portable", "workers");

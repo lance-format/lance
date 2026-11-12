@@ -1,23 +1,24 @@
 # Engine blob integration
 
-Lance supplies portable locators, source validation, payload planning, and snapshot
-retention. The engine decides which expressions need bytes and where to fetch
-them. Reference identity is not SQL content equality or ordering. Preserve the
-Arrow extension field, validity, source table, and nested element mapping until
-the expression needs the payload.
+Lance supplies portable locators, source validation, and payload planning. The
+engine coordinates snapshot lifetime and decides which expressions need bytes
+and where to fetch them. Reference identity is not SQL content equality or
+ordering. Preserve the Arrow extension field, validity, source table, and nested
+element mapping until the expression needs the payload.
 
 ## Coordinator and worker handoff
 
 1. Check the worker's reference protocol and supported operations before assigning
    work. Require `capture_top_level`, `read_whole`, `read_range`, `streaming`, and
    `cancellation`. Require `capture_nested` for nested capture and
-   `reader_metrics_v1` for the metrics below. Retention and maintenance clients
-   must support `snapshot_retention_v1`.
+   `reader_metrics_v1` for the metrics below.
 2. Resolve the exact branch/version. Capture a `BlobSourceContext` with a stable
    table-incarnation identity and an access key that each worker can resolve to
    authenticated storage. Credentials are never embedded in reference rows.
-3. Acquire `SnapshotRetention` before issuing references. Persist acquisition
-   intent and the resulting token in the coordinator's recovery journal.
+3. Keep the source snapshot available before issuing references. Coordinate
+   cleanup and branch deletion through the last worker, retry, and lazy consumer.
+   Existing tags can retain versions, but creating a tag alone does not
+   synchronize concurrent cleanup.
 4. Scan descriptors with physical `_rowaddr` and capture from those arrays. Keep
    the scan's original field IDs and source association through engine operators.
    Capture performs no descriptor re-take or payload read.
@@ -31,14 +32,15 @@ the expression needs the payload.
    Use completion indices to restore engine order.
 7. Consume and release each Arrow result before requesting more work that needs
    the same budget. On cancellation/failure, close streams and stop participating
-   workers and retries. Release retention only after all readers and lazy
-   consumers have stopped. Use the durable journal for interrupted operations.
+   workers and retries. End snapshot protection only after all readers and lazy
+   consumers have stopped. Persist enough coordinator state to recover an
+   interrupted query without releasing a snapshot still in use.
 
 See the [Python/Java examples](blob_references.md#python-and-javajni-bindings)
-and the [snapshot retention deployment contract](snapshot_retention.md). Query
-tags require explicit release. Only maintenance owners expire; their configurable
-default is 120 hours. Expiration does not provide storage-enforced fencing against
-arbitrary process pauses or outstanding storage requests.
+and the [source lifetime requirements](blob_references.md#external-objects-and-lifetime).
+Capturing, transporting, or reading a reference does not acquire snapshot
+protection or activate a table. The conformance runner uses an existing tag
+and controls cleanup for its temporary datasets until the worker exits.
 
 The [Blob V2 storage specification](../format/table/blob.md) describes persisted
 descriptors and ownership. The independently versioned execution wire is

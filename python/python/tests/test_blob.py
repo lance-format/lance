@@ -3593,6 +3593,8 @@ def test_portable_blob_reference_requests(portable_blob_references):
     assert BlobSourceContext.supported_capabilities() == [1, 2]
     assert BlobSourceContext.supported_operations() == [
         "capture_top_level",
+        "capture_nested",
+        "reader_metrics_v1",
         "read_whole",
         "read_range",
         "streaming",
@@ -3751,7 +3753,7 @@ def test_portable_nested_capture(tmp_path, large_list):
 
 
 def test_portable_shared_conformance_fixture(portable_blob_references):
-    dataset, source, _, refs = portable_blob_references
+    dataset, source, refs = portable_blob_references
     fixture = json.loads(
         (
             Path(__file__).parents[3] / "test_data/blob_reference_v1/conformance.json"
@@ -3858,13 +3860,13 @@ def test_portable_nested_capture_slices(tmp_path, large_list, start, length):
     ],
 )
 def test_portable_nested_mapping_validation(portable_blob_references, array, message):
-    _, _, _, refs = portable_blob_references
+    _, _, refs = portable_blob_references
     with pytest.raises(ValueError, match=message):
         NestedBlobRefBatch.from_arrow(refs, pa.record_batch([array], names=["indices"]))
 
 
 def test_portable_nested_null_mapping_without_references(portable_blob_references):
-    _, _, _, refs = portable_blob_references
+    _, _, refs = portable_blob_references
     refs = BlobRefBatch.from_arrow(refs.contexts, refs.field, refs.array.slice(0, 0))
     indices = pa.record_batch(
         [pa.array([None, None], type=pa.uint64())], names=["indices"]
@@ -3881,7 +3883,7 @@ def test_portable_nested_null_mapping_without_references(portable_blob_reference
     [(0, 0, b""), (0, 10, b"abcdefghij"), (9, 1, b"j"), (10, 0, b"")],
 )
 def test_portable_range_boundaries(portable_blob_references, offset, length, expected):
-    dataset, source, _, refs = portable_blob_references
+    dataset, source, refs = portable_blob_references
     with BlobRefReader(
         [(source, dataset)],
         io_buffer_size_bytes=32,
@@ -3901,7 +3903,7 @@ def test_portable_range_boundaries(portable_blob_references, offset, length, exp
 def test_portable_invalid_last_demand_is_atomic(
     portable_blob_references, offset, length
 ):
-    dataset, source, _, refs = portable_blob_references
+    dataset, source, refs = portable_blob_references
     with BlobRefReader(
         [(source, dataset)],
         io_buffer_size_bytes=32,
@@ -3916,7 +3918,7 @@ def test_portable_invalid_last_demand_is_atomic(
 
 @pytest.mark.parametrize("cancel", [False, True], ids=["close", "cancel"])
 def test_portable_unpolled_stream_termination(portable_blob_references, cancel):
-    dataset, source, _, refs = portable_blob_references
+    dataset, source, refs = portable_blob_references
     with BlobRefReader(
         [(source, dataset)],
         io_buffer_size_bytes=1,
@@ -3937,7 +3939,7 @@ def test_portable_unpolled_stream_termination(portable_blob_references, cancel):
 
 
 def test_portable_factory_close_preserves_stream_and_slice(portable_blob_references):
-    dataset, source, _, refs = portable_blob_references
+    dataset, source, refs = portable_blob_references
     reader = BlobRefReader(
         [(source, dataset)],
         io_buffer_size_bytes=4,
@@ -4120,7 +4122,7 @@ def test_blob_scalar_refinement_with_unindexed_tail(tmp_path, indexed):
 
 
 def test_portable_metadata_filter_top_k_capture(portable_blob_references):
-    dataset, source, _, _ = portable_blob_references
+    dataset, source, _ = portable_blob_references
     scanned = (
         dataset.to_table(
             columns=["blob"],

@@ -13,7 +13,6 @@ import json
 import subprocess
 import sys
 import tempfile
-import uuid
 from pathlib import Path
 
 import lance
@@ -44,9 +43,9 @@ def capture_dataset(path, values):
     source = lance.BlobSourceContext.from_dataset(
         dataset, "conformance/table", "worker"
     )
-    retention = lance.SnapshotRetention.acquire(
-        dataset, source.snapshot_identity(), str(uuid.uuid4())
-    )
+    # This runner owns the temporary dataset and controls cleanup until workers exit.
+    tag_name = "conformance"
+    dataset.tags.create(tag_name, source.version)
     try:
         before_scan = dataset.io_stats_snapshot()
         scanned = (
@@ -70,9 +69,9 @@ def capture_dataset(path, values):
             "capture_bytes": after_capture.read_bytes - after_scan.read_bytes,
         }
         assert producer_io["capture_requests"] == 0
-        return dataset, retention, refs, producer_io
+        return dataset, tag_name, refs, producer_io
     except BaseException:
-        retention.release(dataset)
+        dataset.tags.delete(tag_name)
         raise
 
 
@@ -174,7 +173,7 @@ def qualify(directory):
     values = [
         value.encode() if value is not None else None for value in fixture["payloads"]
     ]
-    dataset, retention, refs, producer_io = capture_dataset(
+    dataset, tag_name, refs, producer_io = capture_dataset(
         directory / "fixture.lance", values
     )
     try:
@@ -204,12 +203,12 @@ def qualify(directory):
         assert result["conformance"]["duplicate_demands"] == 1
         return {**result["conformance"], "producer_io": producer_io}
     finally:
-        retention.release(dataset)
+        dataset.tags.delete(tag_name)
 
 
 def compare(directory, rows, payload_bytes, selected_rows):
     values = [bytes([row % 251]) * payload_bytes for row in range(rows)]
-    dataset, retention, refs, producer_io = capture_dataset(
+    dataset, tag_name, refs, producer_io = capture_dataset(
         directory / "compare.lance", values
     )
     try:
@@ -270,7 +269,7 @@ def compare(directory, rows, payload_bytes, selected_rows):
         report["producer_io"] = producer_io
         return report
     finally:
-        retention.release(dataset)
+        dataset.tags.delete(tag_name)
 
 
 def main():
