@@ -1842,7 +1842,7 @@ impl RleDecompressor {
 
         if values_buffer.is_empty() || lengths_buffer.is_empty() {
             if num_values == 0 {
-                return Ok(LanceBuffer::empty());
+                return Ok(LanceBuffer::reinterpret_vec(Vec::<T>::new()));
             } else {
                 return Err(Error::invalid_input_source(
                     format!("Empty buffers but expected {} values", num_values).into(),
@@ -1936,13 +1936,203 @@ impl RleDecompressor {
     }
 }
 
+impl RleDecompressor {
+    fn decode_data_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        if range.start > range.end || range.end > num_values {
+            return Err(Error::corrupt_file_named(
+                "rle",
+                format!(
+                    "RLE mini-block selection {:?} exceeds {} values in chunk",
+                    range, num_values
+                ),
+            ));
+        }
+        if num_values == 0 {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: self.bits_per_value,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+                block_info: BlockInfo::default(),
+            }));
+        }
+        if data.len() != 2 {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE decompressor expects exactly 2 buffers, got {}",
+                    data.len()
+                )
+                .into(),
+            ));
+        }
+
+        let mut data_iter = data.into_iter();
+        let values_buffer = data_iter.next().unwrap();
+        let lengths_buffer = data_iter.next().unwrap();
+        let (values_buffer, lengths_buffer) =
+            self.decode_child_buffers(values_buffer, lengths_buffer)?;
+
+        let decoded_data = match self.bits_per_value {
+            8 => self.decode_generic_range::<u8>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            16 => self.decode_generic_range::<u16>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            32 => self.decode_generic_range::<u32>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            64 => self.decode_generic_range::<u64>(
+                &values_buffer,
+                &lengths_buffer,
+                num_values,
+                range.clone(),
+            )?,
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "RLE decoding bits_per_value must be 8, 16, 32, or 64, got {}",
+                        self.bits_per_value
+                    )
+                    .into(),
+                ));
+            }
+        };
+
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bits_per_value,
+            data: decoded_data,
+            num_values: range.end - range.start,
+            block_info: BlockInfo::default(),
+        }))
+    }
+
+    fn decode_generic_range<T>(
+        &self,
+        values_buffer: &LanceBuffer,
+        lengths_buffer: &LanceBuffer,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<LanceBuffer>
+    where
+        T: bytemuck::Pod + Copy + std::fmt::Debug + ArrowNativeType,
+    {
+        let type_size = std::mem::size_of::<T>();
+
+        if values_buffer.is_empty() || lengths_buffer.is_empty() {
+            if num_values == 0 {
+                return Ok(LanceBuffer::reinterpret_vec(Vec::<T>::new()));
+            }
+            return Err(Error::invalid_input_source(
+                format!("Empty buffers but expected {} values", num_values).into(),
+            ));
+        }
+
+        let length_size = self.validate_buffer_sizes(
+            values_buffer,
+            lengths_buffer,
+            type_size,
+            std::any::type_name::<T>(),
+        )?;
+
+        let values_ref = values_buffer.borrow_to_typed_slice::<T>();
+        let values: &[T] = values_ref.as_ref();
+        let lengths = lengths_buffer.as_ref();
+
+        let expected_value_count = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE num_values does not fit in usize: {num_values}").into(),
+            )
+        })?;
+        let sel_start = range.start as usize;
+        let sel_end = range.end as usize;
+        let selected_count = sel_end - sel_start;
+
+        let mut decoded: Vec<T> = Vec::new();
+        decoded.try_reserve_exact(selected_count).map_err(|_| {
+            Error::invalid_input_source(
+                format!("RLE decoding cannot allocate {selected_count} values").into(),
+            )
+        })?;
+
+        let mut logical_pos = 0usize;
+        for (value, length_bytes) in values.iter().zip(lengths.chunks_exact(length_size)) {
+            let length = self.run_length_width.read_length(length_bytes);
+            if length == 0 {
+                return Err(Error::invalid_input_source(
+                    "RLE decoding encountered a zero run length".into(),
+                ));
+            }
+            let length = usize::try_from(length).map_err(|_| {
+                Error::invalid_input_source(
+                    format!("RLE run length does not fit in usize: {length}").into(),
+                )
+            })?;
+            let remaining = expected_value_count - logical_pos;
+            let count = length.min(remaining);
+            let run_start = logical_pos;
+            let run_end = logical_pos + count;
+            if run_end > sel_start && run_start < sel_end {
+                let copy_count = run_end.min(sel_end) - run_start.max(sel_start);
+                let initialized = decoded.len() + copy_count;
+                decoded.spare_capacity_mut()[..copy_count].fill(std::mem::MaybeUninit::new(*value));
+                // SAFETY: capacity was reserved for selected_count above, copy_count is bounded
+                // by the remaining intersection with [sel_start, sel_end), and every slot was filled.
+                unsafe { decoded.set_len(initialized) };
+            }
+            logical_pos = run_end;
+            if length > remaining {
+                break;
+            }
+        }
+
+        if logical_pos != expected_value_count {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "RLE decoding produced {} values, expected {}",
+                    logical_pos, expected_value_count
+                )
+                .into(),
+            ));
+        }
+
+        Ok(LanceBuffer::reinterpret_vec(decoded))
+    }
+}
+
 impl MiniBlockDecompressor for RleDecompressor {
     fn num_buffers(&self) -> usize {
         2
     }
 
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         self.decode_data(data, num_values, true)
+    }
+
+    fn decompress_range(
+        &self,
+        data: Vec<LanceBuffer>,
+        num_values: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataBlock> {
+        self.decode_data_range(data, num_values, range)
     }
 
     fn decoded_size_bytes(&self, num_values: u64) -> Option<u64> {
