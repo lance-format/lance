@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{BlockingDataset, NATIVE_DATASET};
+use super::{BlockingDataset, NATIVE_DATASET, clone_dataset};
 use crate::blocking_scanner::build_full_text_search_query;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
@@ -47,9 +47,8 @@ fn inner_list_indexes<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let index_names = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let indexes = dataset_guard.list_indexes()?;
+        let dataset = clone_dataset(env, &java_dataset)?;
+        let indexes = dataset.list_indexes()?;
         indexes
             .iter()
             .map(|index| index.name.clone())
@@ -249,7 +248,8 @@ fn inner_create_index<'local>(
         | IndexType::IvfRq
         | IndexType::IvfHnswSq
         | IndexType::IvfHnswPq
-        | IndexType::IvfHnswFlat => {
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswRq => {
             // For vector indices, use the existing parameter handling
             get_vector_index_params(env, params_jobj)
         }
@@ -626,36 +626,47 @@ pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
     );
 }
 
-fn inner_optimize_indices(
+/// `OptimizeOptions` from its Java counterpart; the defaults for `null`.
+pub(crate) fn optimize_options_from_java(
     env: &mut JNIEnv,
-    java_dataset: JObject,
-    java_options: JObject, // OptimizeOptions
-) -> Result<()> {
+    java_options: &JObject, // OptimizeOptions
+) -> Result<OptimizeOptions> {
     let mut options = OptimizeOptions::default();
 
     if !java_options.is_null() {
         options.num_indices_to_merge =
-            env.get_optional_usize_from_method(&java_options, "getNumIndicesToMerge")?;
+            env.get_optional_usize_from_method(java_options, "getNumIndicesToMerge")?;
 
         // getIndexNames(): Optional<List<String>>
         let index_names_obj = env
-            .call_method(
-                &java_options,
-                "getIndexNames",
-                "()Ljava/util/Optional;",
-                &[],
-            )?
+            .call_method(java_options, "getIndexNames", "()Ljava/util/Optional;", &[])?
             .l()?;
         let index_names = env.get_strings_opt(&index_names_obj)?;
         options.index_names = index_names;
 
         // isRetrain(): boolean
         let retrain = env
-            .call_method(&java_options, "isRetrain", "()Z", &[])?
+            .call_method(java_options, "isRetrain", "()Z", &[])?
             .z()?;
         options.retrain = retrain;
+
+        options.max_rows_per_task =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsPerTask")?;
+        options.max_rows_per_segment =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsPerSegment")?;
+        options.max_rows_to_consolidate =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsToConsolidate")?;
     }
 
+    Ok(options)
+}
+
+fn inner_optimize_indices(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_options: JObject, // OptimizeOptions
+) -> Result<()> {
+    let options = optimize_options_from_java(env, &java_options)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     block_on(dataset_guard.inner.optimize_indices(&options))?;
@@ -677,9 +688,8 @@ fn inner_get_indexes<'local>(
     java_dataset: JObject,
 ) -> Result<JObject<'local>> {
     let indexes = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.list_indexes()?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.list_indexes()?
     };
 
     let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
@@ -717,9 +727,8 @@ fn inner_get_index_statistics<'local>(
 ) -> Result<JString<'local>> {
     let index_name: String = jindex_name.extract(env)?;
     let stats_json = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.index_statistics(&index_name))?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.index_statistics(&index_name))?
     };
     let jstats = env.new_string(stats_json)?;
     Ok(jstats)
@@ -867,9 +876,8 @@ fn inner_get_fts_global_statistics(
 ) -> Result<jbyteArray> {
     let query = build_full_text_search_query(env, query_obj)?;
     let mut scanner = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        dataset_guard.inner.scan()
+        let dataset = clone_dataset(env, &java_dataset)?;
+        dataset.inner.scan()
     };
     scanner.full_text_search(FullTextSearchQuery::new_query(query))?;
     let statistics = block_on(scanner.fts_global_statistics())?;
@@ -925,9 +933,8 @@ fn inner_describe_indices<'local>(
     })?;
 
     let descriptions = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.describe_indices(index_criteria))?
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.describe_indices(index_criteria))?
     };
 
     if include_metadata {
@@ -1046,9 +1053,8 @@ fn count_indexed_rows(
     fragment_ids: Option<Vec<u32>>,
 ) -> Result<i64> {
     let count = {
-        let dataset_guard =
-            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        block_on(dataset_guard.inner.count_indexed_rows(
+        let dataset = clone_dataset(env, &java_dataset)?;
+        block_on(dataset.inner.count_indexed_rows(
             &index_name,
             &filter,
             segment_uuids.as_deref(),

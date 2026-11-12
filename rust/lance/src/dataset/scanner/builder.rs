@@ -12,8 +12,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::Array;
+use arrow_array::{Array, types::Float32Type};
 use arrow_schema::{DataType, Schema as ArrowSchema};
+use arrow_select::concat::concat;
 use chrono::Utc;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Expr, ScalarUDF, lit};
@@ -40,12 +41,13 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::dataset::fragment_slice::FragmentSlice;
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::vector::utils::{get_vector_dim, get_vector_type, validate_distance_type_for};
 use crate::io::exec::LANCE_RELATIONAL_ALGEBRA_VERSION;
 use crate::io::exec::knn::QUERY_INDEX_COL;
 use crate::{Error, Result};
 
 use super::aggregate::AggregateExpr;
+use super::vector::VectorRefinement;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
     QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
@@ -54,7 +56,7 @@ use super::{
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
-        let file_reader_options = dataset.file_reader_options.clone();
+        let file_reader_options = dataset.file_reader_options.as_deref().cloned();
         let mut scanner = Self {
             dataset,
             projection_plan,
@@ -76,6 +78,7 @@ impl Scanner {
             offset: None,
             ordering: None,
             nearest: None,
+            nearest_refine: None,
             probe_params: ProbeParams::default(),
             quantized_refine_factor: None,
             nearest_query_count: 1,
@@ -254,6 +257,22 @@ impl Scanner {
     /// Projection with transform
     ///
     /// Only select the specified columns with the given transform.
+    ///
+    /// When a list is only used by `array_length` (`list_length`), nonempty
+    /// comparisons, or NULL checks, structural-format readers omit element
+    /// payloads. This applies to nested element types and struct field paths.
+    /// Selecting the list itself or otherwise inspecting its elements keeps the
+    /// ordinary value read. Legacy array-format files keep their normal reader.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let counts = dataset.scan()
+    ///     .project_with_transform(&[("image_count", "array_length(images)")])?
+    ///     .try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn project_with_transform(
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
@@ -921,6 +940,7 @@ impl Scanner {
             approx_mode: Default::default(),
         });
         self.quantized_refine_factor = None;
+        self.nearest_refine = None;
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
         Ok(self)
@@ -966,6 +986,9 @@ impl Scanner {
     /// increase it toward all available partitions, subject to
     /// [`Self::maximum_nprobes`]. At 0, at least one available partition is
     /// searched. Later expansion to find enough candidates remains unchanged.
+    /// For L2, cosine and dot with k <= 100000, effort 0.1, 0.25 and 0.5 target
+    /// 80%, 90% and 95% mean partition-routing recall, respectively. These are
+    /// empirical calibration objectives, not guaranteed end-to-end Recall@k.
     /// This is independent of refinement, HNSW ef and approximation mode, and
     /// is not a recall guarantee. Setting any effort, including 0.5, ignores
     /// [`Self::nprobes`] regardless of setter order. Explicit minimum and maximum
@@ -976,7 +999,7 @@ impl Scanner {
     /// # use lance::{Dataset, Result};
     /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
     /// let mut scanner = dataset.scan();
-    /// scanner.nearest("vector", vector, 10)?.search_effort(0.75)?;
+    /// scanner.nearest("vector", vector, 10)?.search_effort(0.25)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1097,6 +1120,130 @@ impl Scanner {
             q.refine_factor = Some(factor)
         };
         self
+    }
+
+    /// Refine candidates using a separate Float32 fixed-size vector column.
+    ///
+    /// Call this after [`Self::nearest`] and set a positive [`Self::refine`]
+    /// factor before execution. The coarse search returns at most `k * factor`
+    /// candidates; their final `_distance` and [`Self::distance_range`] use
+    /// `metric` and `query`. This replaces same-column exact refinement,
+    /// including when a quantized index supplies the coarse candidates.
+    /// Without an index, coarse exact TopM still precedes cross-column refinement.
+    ///
+    /// Both columns must contain single Float32 vectors. Query dimensions may
+    /// differ, but batch queries must have matching counts and both queries must
+    /// be batches. Scalar prefilters apply before candidate selection, and
+    /// postfilters apply after the final TopK. Vector and full-text query filters
+    /// are not supported. Null or invalid refinement vectors can result in fewer
+    /// than `k` rows. Calling [`Self::nearest`] again clears this setting.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # use lance_linalg::distance::MetricType;
+    /// # async fn example(
+    /// #     dataset: &Dataset,
+    /// #     coarse: &Float32Array,
+    /// #     full: &Float32Array,
+    /// # ) -> Result<()> {
+    /// let mut scan = dataset.scan();
+    /// scan.nearest("short_vector", coarse, 10)?.refine(2);
+    /// scan.with_refine_column("full_vector", full, MetricType::Cosine)?;
+    /// let results = scan.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_refine_column(
+        &mut self,
+        column: impl AsRef<str>,
+        query: &dyn Array,
+        metric: MetricType,
+    ) -> Result<&mut Self> {
+        let column = column.as_ref();
+        let nearest = self.nearest.as_ref().ok_or_else(|| {
+            Error::invalid_input("nearest must be set before refine_column".to_string())
+        })?;
+        for name in [nearest.column.as_str(), column] {
+            let (vector_type, element_type) = get_vector_type(self.dataset.schema(), name)?;
+            if !matches!(vector_type, DataType::FixedSizeList(_, _))
+                || element_type != DataType::Float32
+            {
+                return Err(Error::not_supported(format!(
+                    "cross-column refinement requires Float32 fixed-size vectors; column {name} has type {vector_type}"
+                )));
+            }
+        }
+        validate_distance_type_for(metric, &DataType::Float32)?;
+        let query_element_type = match query.data_type() {
+            DataType::List(field) | DataType::FixedSizeList(field, _) => field.data_type(),
+            data_type => data_type,
+        };
+        if query_element_type != &DataType::Float32 {
+            return Err(Error::invalid_input(format!(
+                "refine_q must contain Float32 values, got {}",
+                query.data_type()
+            )));
+        }
+        if query.null_count() > 0 {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+
+        let mut validation = Self::new(self.dataset.clone());
+        validation.nearest(column, query, nearest.k)?;
+        if validation.nearest_query_count != self.nearest_query_count
+            || validation.is_batch_nearest != self.is_batch_nearest
+        {
+            return Err(Error::invalid_input(format!(
+                "refine_q batch shape must match q: expected {} queries (batch={}), got {} (batch={})",
+                self.nearest_query_count,
+                self.is_batch_nearest,
+                validation.nearest_query_count,
+                validation.is_batch_nearest
+            )));
+        }
+
+        // Respect offsets when a caller passes a slice of a batch query array.
+        let vectors = if let Some(list) = query.as_list_opt::<i32>() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else if let Some(list) = query.as_fixed_size_list_opt() {
+            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
+        } else {
+            vec![query.slice(0, query.len())]
+        };
+        let key = concat(
+            &vectors
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<_>>(),
+        )?;
+        let values = key.as_primitive::<Float32Type>();
+        if values.null_count() > 0 || values.values().iter().any(|value| !value.is_finite()) {
+            return Err(Error::invalid_input(
+                "refine_q must contain only finite, non-null values".to_string(),
+            ));
+        }
+        let dim = get_vector_dim(self.dataset.schema(), column)?;
+        if metric == MetricType::Cosine
+            && values
+                .values()
+                .chunks_exact(dim)
+                .any(|vector| vector.iter().all(|value| *value == 0.0))
+        {
+            return Err(Error::invalid_input(
+                "refine_q must have nonzero norm for cosine distance".to_string(),
+            ));
+        }
+
+        self.nearest_refine = Some(VectorRefinement {
+            column: column.to_string(),
+            key,
+            metric,
+        });
+        Ok(self)
     }
 
     /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
@@ -1255,7 +1402,7 @@ impl Scanner {
         let base = self
             .file_reader_options
             .clone()
-            .or_else(|| self.dataset.file_reader_options.clone());
+            .or_else(|| self.dataset.file_reader_options.as_deref().cloned());
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
                 opts.batch_size_bytes = Some(bsb);

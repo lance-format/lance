@@ -351,7 +351,7 @@ Array membership filters can use a label-list index:
     }
     ```
 
-Scalar indexes support common equality, comparison, range, set-membership, and null predicates. Multiple indexed predicates can be combined with `AND` or `OR`. A predicate such as `id = 1 OR unindexed_column = 2` may not be able to use the index on `id`, because the unindexed branch must also be evaluated.
+Scalar indexes support common equality, comparison, range, set-membership, and null predicates. Multiple indexed predicates can be combined with `AND` or `OR`. A predicate such as `id = 1 OR unindexed_column = 2` may not be able to use the index on `id`, because the unindexed branch must also be evaluated. An `OR` whose branches each include an indexed predicate, such as `(id = 1 AND unindexed_column = 2) OR id = 3`, still uses the index: the index finds the candidate rows and the whole filter is applied to them.
 
 Set `use_scalar_index=False` (Python), `.use_scalar_index(false)` (Rust), or `.useScalarIndex(false)` (Java) on a scanner to disable scalar-index acceleration for a specific query.
 
