@@ -509,13 +509,14 @@ async fn overlay_rescan(
 /// physical address rather than by stable row id (see [`build_old_data_filter`] and
 /// [`overlay_rescan`]). This is the domain the merged index stores, not whether its type
 /// migrated from row ids: BTree, Bitmap, NGram, RTree and MinHash LSH merge as address-domain
-/// segments (a row-id-domain one under stable row ids is rebuilt instead), BloomFilter always
-/// stored addresses, a LabelList segment reports its own domain, and of the other types a JSON
-/// index over an address-domain target and a list-element index store addresses.
+/// segments (a row-id-domain one under stable row ids is rebuilt instead). BloomFilter and
+/// FMIndex store addresses. LabelList reports its own domain. A JSON index over an
+/// address-domain target and a list-element index also store addresses.
 fn old_data_address_domain(index_type: IndexType, reference_index: &dyn ScalarIndex) -> bool {
     match index_type {
         IndexType::BTree
         | IndexType::Bitmap
+        | IndexType::Fm
         | IndexType::NGram
         | IndexType::RTree
         | IndexType::MinHashLsh
@@ -912,7 +913,11 @@ pub fn select_segments_to_merge<'a>(
 /// Whether a scalar index can merge multiple segments without rescanning their data.
 fn has_segment_merge_primitive(index_type: IndexType) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::MinHashLsh => true,
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::Fm
+        | IndexType::NGram
+        | IndexType::MinHashLsh => true,
         #[cfg(feature = "geo")]
         IndexType::RTree => true,
         _ => false,
@@ -1309,6 +1314,26 @@ async fn merge_scalar_indices<'a>(
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
+                        &new_store,
+                        &old_data_filters,
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::Fm => {
+                    let (_, old_data_filters) = build_per_segment_filters(
+                        dataset.as_ref(),
+                        &selected_old_indices,
+                        None,
+                        address_domain,
+                    )
+                    .await?;
+                    let old_data_filters = per_segment_filters(old_data_filters);
+                    crate::index::scalar::fmindex::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
                         &new_store,
                         &old_data_filters,
                         None,
@@ -4561,7 +4586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimize_fmindex_default_rebuilds_old_and_new_rows() {
+    async fn test_optimize_fmindex_default_merges_old_and_new_rows() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
 
@@ -4618,10 +4643,12 @@ mod tests {
                 .is_empty()
         );
 
+        let indexed_files = indexed_data_files(&dataset, "text_fmindex").await;
         dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
+        assert_merged_not_rebuilt(&dataset, "text_fmindex", &indexed_files).await;
 
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         assert!(
