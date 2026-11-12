@@ -1340,9 +1340,12 @@ fn probe_memtable(
 mod tests {
     use super::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
+    use lance_arrow::json::{JsonArray, is_json_field, json_field};
     use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -2127,6 +2130,114 @@ mod tests {
             })
             .collect();
         assert!(planner.lookup(&missing, None).await.unwrap().is_none());
+    }
+
+    #[rstest]
+    #[case::top_level(false)]
+    #[case::nested(true)]
+    #[tokio::test]
+    async fn test_sstable_point_lookup_preserves_json_payload(#[case] is_nested: bool) {
+        let json: ArrayRef = Arc::new(
+            JsonArray::try_from_iter([
+                Some(r#"{"name":"Alice"}"#),
+                None,
+                Some("null"),
+                Some(r#"{"name":"Bob"}"#),
+            ])
+            .unwrap()
+            .into_inner(),
+        );
+        let doc_field = json_field("doc", true);
+        let (field, payload, json_projection) = if is_nested {
+            let payload = StructArray::new(vec![doc_field].into(), vec![json], None);
+            (
+                Field::new("meta", payload.data_type().clone(), false),
+                Arc::new(payload) as ArrayRef,
+                "meta.doc",
+            )
+        } else {
+            (doc_field, json, "doc")
+        };
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2, 3, 4]))
+            .unwrap()
+            .try_with_column(field, payload)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = temp.path().to_str().unwrap();
+        let shard_id = Uuid::new_v4();
+        let uri = format!("{base_uri}/_mem_wal/{shard_id}/gen_1");
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        super::super::block_list::write_pk_sidecar(&uri, std::slice::from_ref(&batch), &["id"])
+            .await
+            .unwrap();
+        let shard = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        let collector =
+            LsmDataSourceCollector::without_base_table(base_uri.to_string(), vec![shard]);
+        let planner =
+            LsmPointLookupPlanner::new(collector, vec!["id".into()], batch.schema()).unwrap();
+        for (projection, has_json) in [
+            (None, true),
+            (Some(vec![json_projection.to_string()]), true),
+            (Some(vec!["id".to_string()]), false),
+        ] {
+            let projection = projection.as_deref();
+            let plan = planner
+                .plan_lookup(&[ScalarValue::Int32(Some(1))], projection)
+                .await
+                .unwrap();
+            let display = displayable(plan.as_ref()).indent(true).to_string();
+            assert!(display.contains("SsTablePointLookupExec"), "{display}");
+            assert!(!display.contains("LanceScan"), "{display}");
+            for id in 1..=4 {
+                let indexed = planner
+                    .lookup(&[ScalarValue::Int32(Some(id))], projection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // A wider literal exercises the retained scan/coercion path.
+                let scanned = planner
+                    .lookup(&[ScalarValue::Int64(Some(i64::from(id)))], projection)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(indexed.num_rows(), 1);
+                assert_eq!(indexed, scanned);
+                if has_json {
+                    let schema = indexed.schema();
+                    let field = if is_nested {
+                        let DataType::Struct(fields) =
+                            schema.field_with_name("meta").unwrap().data_type()
+                        else {
+                            panic!("expected struct payload");
+                        };
+                        fields[0].as_ref()
+                    } else {
+                        schema.field_with_name("doc").unwrap()
+                    };
+                    assert!(is_json_field(field));
+                    assert_eq!(field.data_type(), &DataType::LargeBinary);
+                }
+            }
+            assert!(
+                planner
+                    .lookup(&[ScalarValue::Int32(Some(99))], projection)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

@@ -18,15 +18,14 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use lance_core::datatypes::Schema;
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::{SargableQuery, SearchResult};
 
 use crate::Dataset;
+use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::mem_wal::scanner::block_list::{load_pk_index, on_disk_pk_key};
-use crate::dataset::take::TakeBuilder;
 
 /// A lazy PK-sidecar probe followed by a take of the first live matching row.
 /// Kept below the bloom guard and newest-first coalesce so skipped generations
@@ -125,7 +124,7 @@ impl ExecutionPlan for SsTablePointLookupExec {
         let projection = self.projection.clone();
         let schema = self.schema();
         // Stop stream adapters' Send proofs at a trait object rather than
-        // repeatedly traversing the dataset take's nested future types.
+        // repeatedly traversing the row read's nested future types.
         let lookup: futures::future::BoxFuture<'static, DFResult<RecordBatch>> =
             Box::pin(async move {
                 take_matching_row(dataset, key, projection)
@@ -185,16 +184,16 @@ async fn take_matching_row(
                 if deleted.as_ref().is_some_and(|d| d.contains(offset)) {
                     continue;
                 }
-                let fragment_id = u32::try_from(fragment.id())
-                    .map_err(|e| Error::internal(format!("SSTable fragment id: {e}")))?;
-                let address = RowAddress::new_from_parts(fragment_id, offset);
-                return TakeBuilder::try_new_from_addresses(
-                    dataset.clone(),
-                    vec![u64::from(address)],
-                    projection,
-                )?
-                .execute()
-                .await;
+                // Dataset-level takes convert JSONB to Arrow JSON. Keep the
+                // storage representation here for generation reconciliation.
+                let batch = fragment
+                    .take_rows(
+                        &[offset],
+                        &projection.physical_projection.to_bare_schema(),
+                        FragReadConfig::default(),
+                    )
+                    .await?;
+                return projection.project_batch(batch).await;
             }
         }
         fragment_start = fragment_end;
