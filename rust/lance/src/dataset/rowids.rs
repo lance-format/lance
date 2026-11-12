@@ -331,6 +331,9 @@ pub async fn row_addrs_to_row_ids(
 /// that are unknown or deleted yield `None`. Without stable row ids, row ids
 /// are row addresses, so each id is returned unchanged.
 ///
+/// With stable row ids, this may read row-id metadata and deletion vectors from
+/// the dataset and returns an error if either read fails.
+///
 /// ```
 /// # use lance::{Dataset, Result};
 /// # use lance::dataset::rowids::row_ids_to_row_addrs;
