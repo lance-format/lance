@@ -54,6 +54,7 @@ use crate::index::statistics::{
     index_statistics_mem_wal, index_statistics_scalar, serialize_regular_index_statistics,
 };
 use crate::index::vector;
+use crate::index::vector::details::needs_vector_details_inference;
 use crate::session::index_caches::DerivedIndexListingKey;
 use crate::{Dataset, Error, Result};
 
@@ -638,12 +639,17 @@ impl DatasetIndexExt for Dataset {
         if let Some(cached) = self.index_cache.get_with_key(&derived_key).await {
             return Ok(cached);
         }
+        // A later call may still infer the missing details; don't pin a
+        // listing derived without them.
+        let details_pending = indices
+            .iter()
+            .any(|idx| needs_vector_details_inference(idx, self.schema()));
         let listing = self.derive_index_listing(indices).await?;
         // A listing that excludes a segment only because its format marker
         // could not be read is valid for this call alone; caching it would
         // keep the segment excluded for the whole snapshot. Return it
         // uncached so the next call re-probes.
-        if listing.unverifiable.is_empty() {
+        if listing.unverifiable.is_empty() && !details_pending {
             self.index_cache
                 .insert_with_key(&derived_key, listing.indices.clone())
                 .await;

@@ -5,11 +5,18 @@
 //!
 //! Observation is off unless [`OBSERVE_ENV_VAR`] (`LANCE_MEMORY_OBSERVE`) is
 //! set to a true value such as `1`. While it is on, Lance reads the process's
-//! resident set size (RSS) during the stages of an index build and reports the
-//! peak of every stage and of the whole build. Together with gauges for the
-//! process and its cgroup, these are published through the `metrics` crate
-//! facade when Lance is built with the `metrics` feature. Readings come from
-//! `/proc` and cgroupfs, so observation is available on Linux only.
+//! resident set size (RSS) during the stages of an index build and reports
+//! every stage and the whole build in two ways:
+//!
+//! - as trace events on the [`TRACE_MEMORY`] target, one when the stage or
+//!   build starts and one with its peak when it completes, each carrying the
+//!   id of the build and the current memory of the process and of its cgroup;
+//! - through the `metrics` crate facade when Lance is built with the `metrics`
+//!   feature, as the peak of every stage and of the whole build next to gauges
+//!   for the process and its cgroup.
+//!
+//! Readings come from `/proc` and cgroupfs, so observation is available on
+//! Linux only.
 //!
 //! An application that installs its own recorder registers the metrics once
 //! and refreshes the gauges from its collection loop; the Python and Java
@@ -20,16 +27,20 @@
 //! // ... on every collection:
 //! lance_core::memory::refresh_metrics();
 //! ```
+//!
+//! [`TRACE_MEMORY`]: crate::utils::tracing::TRACE_MEMORY
 
-#[cfg(any(test, all(feature = "metrics", target_os = "linux")))]
+#[cfg(any(test, target_os = "linux"))]
 mod cgroup;
+mod events;
 mod observer;
 mod proc;
+mod report;
 mod telemetry;
 
 pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow};
+pub use report::OperationReport;
 pub use telemetry::{
     METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_OPERATION_PEAK, METRIC_RSS, METRIC_RSS_PEAK,
-    METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds, record_operation_peak,
-    record_stage_peak, refresh_metrics,
+    METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds, refresh_metrics,
 };
