@@ -27,8 +27,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
+                let is_composite =
+                    matches!(transaction.operation, Operation::CompositeOperation(_));
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());
-                let read_schema = is_create_index.then(|| dataset.schema().clone());
+                let read_schema =
+                    (is_create_index || is_composite).then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
                         if new_indices
@@ -248,18 +251,29 @@ impl<'a> TransactionRebase<'a> {
         self
     }
 
-    /// Use the transaction's read snapshot for every CreateIndex check. The
-    /// submitting handle may already be newer, hiding rewritten columns or
-    /// removed fields when compared with the latest version.
+    /// Use the transaction's read snapshot for every CreateIndex check, and for
+    /// an action set's footprints. The submitting handle may already be newer,
+    /// hiding rewritten columns or removed fields when compared with the latest
+    /// version.
     pub(crate) fn with_read_version_dataset(mut self, dataset: &Dataset) -> Self {
-        if matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
-            self.read_fragments = Some(dataset.fragments().clone());
-            self.read_schema = Some(dataset.schema().clone());
+        match self.transaction.operation {
+            Operation::CreateIndex { .. } => {
+                self.read_fragments = Some(dataset.fragments().clone());
+                self.read_schema = Some(dataset.schema().clone());
+            }
+            Operation::CompositeOperation(_) => {
+                self.read_schema = Some(dataset.schema().clone());
+            }
+            _ => {}
         }
         self
     }
 
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
+        if matches!(self.transaction.operation, Operation::CompositeOperation(_)) {
+            self.current_schema = Some(dataset.schema().clone());
+            return Ok(());
+        }
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }

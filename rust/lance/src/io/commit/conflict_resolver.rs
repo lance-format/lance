@@ -65,11 +65,13 @@ pub struct TransactionRebase<'a> {
     /// The latest manifest's schema, loaded with `current_lineage`: a
     /// rewritten field is expanded to its descendants through it (a packed
     /// struct is rewritten whole while an index on a child records the
-    /// child's id).
+    /// child's id). Also loaded for an action set, whose footprints relate
+    /// fields through it.
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// to detect in-place column rewrites even after transaction cleanup,
-    /// and fields a concurrent `Merge` removed or retyped.
+    /// and fields a concurrent `Merge` removed or retyped. The schema is also
+    /// kept for an action set, whose footprints relate fields through it.
     read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
