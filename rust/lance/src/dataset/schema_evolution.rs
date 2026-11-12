@@ -1016,7 +1016,13 @@ pub(super) async fn alter_columns(
             tightens_nullability = true;
         }
 
-        let field_dest = new_schema.mut_field_by_id(field_src.id).unwrap();
+        let field_dest = new_schema.mut_field_by_id(field_src.id).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Column \"{}\" was already modified by an earlier type change. \
+                 Combine the changes in one alteration or use separate alter_columns calls",
+                alteration.path
+            ))
+        })?;
         if let Some(rename) = &alteration.rename {
             field_dest.name.clone_from(rename);
         }
@@ -6142,6 +6148,107 @@ mod test {
         assert_eq!(data["a"].as_ref(), &Int64Array::from(vec![1, 2]));
         assert_eq!(data["b"].as_ref(), &Int64Array::from(vec![10, 20]));
 
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::rename(ColumnAlteration::new("v".into()).rename("w".into()))]
+    #[case::nullability(ColumnAlteration::new("v".into()).set_nullable(true))]
+    #[case::cast(ColumnAlteration::new("v".into()).cast_to(DataType::Utf8))]
+    #[tokio::test]
+    async fn test_cast_then_alter_same_column(
+        #[case] mut following: ColumnAlteration,
+        #[values(false, true)] is_nested: bool,
+    ) -> Result<()> {
+        let values = record_batch!(("v", Utf8, [Some("x"), None]))?;
+        let batch = if is_nested {
+            following.path = "b.v".into();
+            RecordBatch::try_from_iter(vec![(
+                "b",
+                Arc::new(StructArray::from(values)) as ArrayRef,
+            )])?
+        } else {
+            values
+        };
+        let path = following.path.clone();
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+        let original_schema = dataset.schema().clone();
+        let original_fragments = dataset.fragments().to_vec();
+        let original_version = dataset.version().version;
+
+        let error = dataset
+            .alter_columns(&[
+                ColumnAlteration::new(path.clone()).cast_to(DataType::LargeUtf8),
+                following,
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("Column \"{path}\"")));
+        assert!(error.to_string().contains("earlier type change"));
+        assert_eq!(dataset.schema(), &original_schema);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.version().version, original_version);
+
+        let dataset = Dataset::open(&test_dir).await?;
+        assert_eq!(dataset.schema(), &original_schema);
+        assert_eq!(dataset.fragments().as_ref(), &original_fragments);
+        assert_eq!(dataset.version().version, original_version);
+        assert_eq!(dataset.scan().try_into_batch().await?, batch);
+        dataset.validate().await?;
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::combined(vec![vec![
+        ColumnAlteration::new("v".into())
+            .cast_to(DataType::LargeUtf8)
+            .rename("w".into()),
+    ]])]
+    #[case::rename_then_cast(vec![vec![
+        ColumnAlteration::new("v".into()).rename("w".into()),
+        ColumnAlteration::new("v".into()).cast_to(DataType::LargeUtf8),
+    ]])]
+    #[case::separate_calls(vec![
+        vec![ColumnAlteration::new("v".into()).cast_to(DataType::LargeUtf8)],
+        vec![ColumnAlteration::new("v".into()).rename("w".into())],
+    ])]
+    #[tokio::test]
+    async fn test_cast_and_rename_same_column(
+        #[case] calls: Vec<Vec<ColumnAlteration>>,
+    ) -> Result<()> {
+        let batch = record_batch!(("v", Utf8, [Some("x"), None]))?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        for alterations in &calls {
+            dataset.alter_columns(alterations).await?;
+        }
+
+        let dataset = Dataset::open(&test_dir).await?;
+        let expected = record_batch!(("w", LargeUtf8, [Some("x"), None]))?;
+        assert_eq!(dataset.version().version, 1 + calls.len() as u64);
+        assert_eq!(dataset.scan().try_into_batch().await?, expected);
+        dataset.validate().await?;
         Ok(())
     }
 
