@@ -43,7 +43,7 @@ use tracing::instrument;
 
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::Dataset;
-use crate::dataset::rowids::load_row_id_sequences;
+use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::prefilter::DatasetPreFilter;
 
 /// An execution node that computes a `COUNT(*)`-style aggregate from an
@@ -359,14 +359,32 @@ impl CountFromMaskExec {
             None => dataset_fragments,
         };
 
-        // Under stable row ids the prefilter and deletion masks are in stable-id
-        // space, so the universe must be too (see `stable_id_universe`); the
-        // default path builds it in row-address space.
+        // Under stable row ids the deletion mask and `stable_id_universe` are in
+        // stable-id space, but `prefilter` (a `ScalarIndexExec`-produced mask) is
+        // always row-address domain on the wire, so it needs converting first.
         let count = if dataset.manifest.uses_stable_row_ids() {
             match prefilter {
                 // No prefilter: just the live row count, from metadata.
                 None => Self::count_live_rows(&dataset, &fragments_covered).await?,
                 Some(prefilter) => {
+                    // Restrict to the covered fragments' physical addresses before
+                    // the reverse (address -> id) conversion, which is a per-fragment
+                    // row-id-sequence/deletion-vector load: converting addresses
+                    // outside `fragments_covered` would do real I/O whose result
+                    // the combine step below discards anyway (scoping to `universe`,
+                    // which is already restricted to the same fragments).
+                    let fragments_allow =
+                        Self::address_fragments_allow(&dataset, &fragments_covered)?;
+                    let prefilter = match prefilter {
+                        RowAddrMask::AllowList(set) => RowAddrMask::AllowList(
+                            translate_addr_treemap_to_row_ids(&dataset, &(set & fragments_allow))
+                                .await?,
+                        ),
+                        RowAddrMask::BlockList(set) => RowAddrMask::BlockList(
+                            translate_addr_treemap_to_row_ids(&dataset, &(set & fragments_allow))
+                                .await?,
+                        ),
+                    };
                     let universe = Self::stable_id_universe(&dataset, fragments_covered).await?;
                     let combined = Self::combine_masks(universe, Some(prefilter), None);
                     Self::count_from_mask(&combined, dataset.as_ref())?

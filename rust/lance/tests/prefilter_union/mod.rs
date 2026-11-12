@@ -18,7 +18,7 @@ use lance::{
     dataset::{WriteParams, builder::DatasetBuilder},
     io::exec::PrefilterUnionExec,
 };
-use lance_core::ROW_ID;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrTreeMap, result::IndexExprResultWireFormat,
 };
@@ -159,15 +159,25 @@ async fn prefilter_union_metadata_roundtrip(
         .unwrap(),
     );
     let mut scanner = dataset.scan();
-    scanner.with_row_id().project(&[ROW_ID]).unwrap();
+    scanner
+        .with_row_id()
+        .with_row_address()
+        .project(&[ROW_ID, ROW_ADDR])
+        .unwrap();
     let rows = scanner.try_into_batch().await.unwrap();
     let ids = rows[ROW_ID].as_primitive::<UInt64Type>().values();
+    let addrs = rows[ROW_ADDR].as_primitive::<UInt64Type>().values();
     // The scalar complement includes excluded fragments and unbounded addresses.
     // Its scope must survive encoding, rather than merely its serialized coverage.
+    // `ScalarIndexExec` (which this batch stands in for) is always row-address
+    // domain on the wire, so the block-list is built from `addrs`, not `ids` —
+    // they diverge when `stable_row_ids` is true.
     let scalar_batch =
-        IndexExprResult::exact(RowAddrMask::from_block(RowAddrTreeMap::from_iter([ids[3]])))
-            .serialize(&[0, 1, 2].into_iter().collect(), format)
-            .unwrap();
+        IndexExprResult::exact(RowAddrMask::from_block(RowAddrTreeMap::from_iter([
+            addrs[3]
+        ])))
+        .serialize(&[0, 1, 2].into_iter().collect(), format)
+        .unwrap();
     let scalar_bytes = encode_batch(&scalar_batch);
     let scalar =
         MemorySourceConfig::try_new_exec(&[vec![scalar_batch]], format.schema().clone(), None)

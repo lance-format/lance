@@ -531,3 +531,51 @@ async fn count_star_over_a_limited_coalesce() {
     assert!(!plan_contains_pushdown(&optimized), "{shown}");
     assert_eq!(execute_count(optimized).await, 5, "{shown}");
 }
+
+/// A BTree-indexed equality negation (`NOT (id = 0)`) cannot be rewritten as a
+/// contiguous range, so it reaches `CountFromMaskExec` as a genuine block-list
+/// prefilter rather than an allow-list. On a stable-row-id dataset this must
+/// still produce a count, not an internal error.
+#[tokio::test]
+async fn count_pushdown_handles_block_list_prefilter_with_stable_row_ids() {
+    let batch = record_batch!(("id", Int64, (0..9).collect::<Vec<_>>())).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let indexed = dataset
+        .scan()
+        .filter("NOT (id = 0)")
+        .unwrap()
+        .count_rows()
+        .await
+        .unwrap();
+    let unindexed = dataset
+        .scan()
+        .use_scalar_index(false)
+        .filter("NOT (id = 0)")
+        .unwrap()
+        .count_rows()
+        .await
+        .unwrap();
+    assert_eq!(unindexed, 8);
+    assert_eq!(indexed, unindexed);
+}

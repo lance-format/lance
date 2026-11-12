@@ -26,7 +26,7 @@ use crate::scalar::inverted::InvertedIndexParams;
 use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
 use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
-use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use lance_select::{IndexExprResult, MaskDomain, NullableIndexExprResult, NullableRowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -1432,18 +1432,20 @@ pub trait ScalarIndexLoader: Send + Sync {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
-    /// Translate an address-domain index result into the row-id domain
+    /// Translate a row-id-domain index result into the row-address domain
     ///
-    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
-    /// report matches as physical row addresses. The default returns `result`
-    /// unchanged, which is correct when addresses and row ids coincide (no
-    /// stable row ids). A dataset with stable row ids overrides this to remap
-    /// addresses to stable row ids via its per-fragment row-id sequences.
-    async fn row_addr_result_to_row_ids(
+    /// Row-id-domain indices (see [`ScalarIndex::results_are_row_addresses`])
+    /// report matches as stable row ids rather than physical row addresses.
+    /// The default returns `result` just retagged, which is correct when
+    /// addresses and row ids coincide (no stable row ids). A dataset with
+    /// stable row ids overrides this to remap row ids to physical row
+    /// addresses via its row-id index (an id -> address lookup, cheap and
+    /// batched).
+    async fn row_id_result_to_row_addrs(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
-        Ok(result)
+        Ok(result.with_domain(MaskDomain::RowAddress))
     }
 }
 
@@ -1904,8 +1906,8 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
-    match result {
+fn search_result_to_nullable(result: SearchResult, domain: MaskDomain) -> NullableIndexExprResult {
+    let result = match result {
         SearchResult::Exact(mask) => {
             NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
         }
@@ -1915,6 +1917,29 @@ fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
         SearchResult::AtLeast(mask) => {
             NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
         }
+    };
+    result.with_domain(domain)
+}
+
+/// Reconcile mismatched mask domains before combining two results with
+/// `And`/`Or`.
+///
+/// Converts whichever side is row-id-domain into row-address domain (via
+/// [`ScalarIndexLoader::row_id_result_to_row_addrs`]). Same-domain pairs
+/// (the common case) pass through untouched.
+async fn reconcile_domains(
+    index_loader: &dyn ScalarIndexLoader,
+    lhs: NullableIndexExprResult,
+    rhs: NullableIndexExprResult,
+) -> Result<(NullableIndexExprResult, NullableIndexExprResult)> {
+    match (lhs.domain, rhs.domain) {
+        (MaskDomain::RowId, MaskDomain::RowAddress) => {
+            Ok((index_loader.row_id_result_to_row_addrs(lhs).await?, rhs))
+        }
+        (MaskDomain::RowAddress, MaskDomain::RowId) => {
+            Ok((lhs, index_loader.row_id_result_to_row_addrs(rhs).await?))
+        }
+        _ => Ok((lhs, rhs)),
     }
 }
 
@@ -1954,12 +1979,16 @@ impl ScalarIndexExpr {
                 let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                let (lhs_result, rhs_result) =
+                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
                 let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                let (lhs_result, rhs_result) =
+                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
                 Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
@@ -1973,15 +2002,16 @@ impl ScalarIndexExpr {
                         metrics,
                     )
                     .await?;
-                let result = search_result_to_nullable(search_result);
-                if index.results_are_row_addresses() {
-                    // Translate address-domain results to the row-id domain
-                    // before combining or scanning; otherwise stable-row-id
-                    // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
+                // Leave address-domain results as-is and tag row-id-domain
+                // results accordingly; domain reconciliation (if this leaf
+                // ends up combined with a mismatched-domain sibling) happens
+                // in the `And`/`Or` arms above, not here.
+                let domain = if index.results_are_row_addresses() {
+                    MaskDomain::RowAddress
                 } else {
-                    Ok(result)
-                }
+                    MaskDomain::RowId
+                };
+                Ok(search_result_to_nullable(search_result, domain))
             }
         }
     }
@@ -2854,11 +2884,15 @@ mod tests {
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_datafusion::planner::Planner;
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
     use roaring::RoaringBitmap;
     use rstest::rstest;
+
+    use crate::{Index, IndexType};
 
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
     use crate::scalar::registry::ScalarIndexPlugin;
@@ -3833,6 +3867,339 @@ mod tests {
         // !{l, u} = {!u, !l}. AllowList → BlockList.
         assert!(matches!(negated.lower, NullableRowAddrMask::BlockList(_)));
         assert!(matches!(negated.upper, NullableRowAddrMask::BlockList(_)));
+    }
+
+    // --- domain-aware evaluation (issue #10960) -----------------------
+
+    /// Minimal [`ScalarIndex`] for testing domain-aware `And`/`Or`
+    /// combination in `evaluate_with_options`, without needing a real
+    /// `Dataset`. Always answers with `matches` (ignoring the query itself)
+    /// tagged `domain`.
+    #[derive(Debug, DeepSizeOf)]
+    struct MockScalarIndex {
+        domain: MaskDomain,
+        matches: RowAddrTreeMap,
+    }
+
+    #[async_trait::async_trait]
+    impl Index for MockScalarIndex {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Scalar
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScalarIndex for MockScalarIndex {
+        async fn search(
+            &self,
+            _query: &dyn AnyQuery,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            Ok(SearchResult::exact(self.matches.clone()))
+        }
+
+        fn results_are_row_addresses(&self) -> bool {
+            matches!(self.domain, MaskDomain::RowAddress)
+        }
+
+        async fn remap(
+            &self,
+            _mapping: &lance_core::utils::row_addr_remap::RowAddrRemap,
+            _dest_store: &dyn crate::scalar::IndexStore,
+        ) -> Result<crate::scalar::CreatedIndex> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        async fn update(
+            &self,
+            _new_data: datafusion_physical_plan::SendableRecordBatchStream,
+            _dest_store: &dyn crate::scalar::IndexStore,
+            _old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        ) -> Result<crate::scalar::CreatedIndex> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        fn update_criteria(&self) -> crate::scalar::UpdateCriteria {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        fn derive_index_params(&self) -> Result<crate::scalar::ScalarIndexParams> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+    }
+
+    /// Shifts every element of `map` by `offset` — a deterministic stand-in
+    /// for a `RowIdIndex` id->address lookup, distinguishable from the input
+    /// in test assertions.
+    fn shift_treemap(map: &RowAddrTreeMap, offset: u64) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(
+            map.row_addrs()
+                .expect("test masks are always finite")
+                .map(|addr| u64::from(addr) + offset),
+        )
+    }
+
+    fn shift_mask(mask: NullableRowAddrMask, offset: u64) -> NullableRowAddrMask {
+        let (ctor, set): (fn(NullableRowAddrSet) -> NullableRowAddrMask, _) = match mask {
+            NullableRowAddrMask::AllowList(set) => {
+                (NullableRowAddrMask::AllowList as fn(_) -> _, set)
+            }
+            NullableRowAddrMask::BlockList(set) => {
+                (NullableRowAddrMask::BlockList as fn(_) -> _, set)
+            }
+        };
+        let (selected, nulls) = set.into_parts();
+        ctor(NullableRowAddrSet::new(
+            shift_treemap(&selected, offset),
+            shift_treemap(&nulls, offset),
+        ))
+    }
+
+    const TEST_ADDR_OFFSET: u64 = 1_000_000;
+
+    /// `ScalarIndexLoader` backed by [`MockScalarIndex`]es, with a
+    /// call-counting `row_id_result_to_row_addrs` so tests can assert
+    /// exactly when (and how often) domain conversion happens.
+    struct MockLoader {
+        indexes: HashMap<&'static str, Arc<MockScalarIndex>>,
+        conversions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockLoader {
+        fn new(indexes: Vec<(&'static str, MockScalarIndex)>) -> Self {
+            Self {
+                indexes: indexes
+                    .into_iter()
+                    .map(|(name, idx)| (name, Arc::new(idx)))
+                    .collect(),
+                conversions: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn conversion_count(&self) -> usize {
+            self.conversions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScalarIndexLoader for MockLoader {
+        async fn load_index(
+            &self,
+            _column: &str,
+            index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(self.indexes[index_name].clone() as Arc<dyn ScalarIndex>)
+        }
+
+        async fn row_id_result_to_row_addrs(
+            &self,
+            result: NullableIndexExprResult,
+        ) -> Result<NullableIndexExprResult> {
+            self.conversions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
+                .try_map(|mask| {
+                    std::future::ready(Ok::<_, Error>(shift_mask(mask, TEST_ADDR_OFFSET)))
+                })
+                .await
+                .map(|r| r.with_domain(MaskDomain::RowAddress))
+        }
+    }
+
+    fn mock_query(column: &str, index_name: &str) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "Mock".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(0)))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_and_of_two_address_domain_leaves_never_converts() {
+        let loader = MockLoader::new(vec![
+            (
+                "a",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+            (
+                "b",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("a", "a")),
+            Box::new(mock_query("b", "b")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        assert_eq!(
+            result.lower,
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[2, 3]),
+                RowAddrTreeMap::new(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_and_of_two_row_id_domain_leaves_never_converts() {
+        let loader = MockLoader::new(vec![
+            (
+                "a",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+            (
+                "b",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("a", "a")),
+            Box::new(mock_query("b", "b")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowId);
+    }
+
+    #[tokio::test]
+    async fn test_and_of_mixed_domain_leaves_converts_row_id_side_once() {
+        let loader = MockLoader::new(vec![
+            (
+                "addr",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+            (
+                "id",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("addr", "addr")),
+            Box::new(mock_query("id", "id")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 1);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        // The row-id side ({2,3,4}) was shifted by TEST_ADDR_OFFSET before
+        // intersecting with the address-domain side ({1,2,3}), so only
+        // `2 + OFFSET`/`3 + OFFSET` could possibly match — neither does,
+        // since the address side was never shifted. The intersection is
+        // therefore empty, which is exactly the point: this proves
+        // combination happened *after* conversion, not before.
+        assert_eq!(
+            result.lower,
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::new(),
+                RowAddrTreeMap::new(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_not_preserves_domain_through_mixed_subtree() {
+        let loader = MockLoader::new(vec![(
+            "id",
+            MockScalarIndex {
+                domain: MaskDomain::RowId,
+                matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            },
+        )]);
+        let expr = ScalarIndexExpr::Not(Box::new(mock_query("id", "id")));
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        // A lone leaf with no And/Or never triggers reconciliation.
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowId);
+    }
+
+    #[tokio::test]
+    async fn test_or_of_mixed_domain_block_list_leaf_converts_row_id_side() {
+        // NOT(AtMost) produces an AtLeast result whose upper bound is a
+        // BlockList — exercise that a row-id-domain BlockList converts
+        // correctly (forward id->address lookup of just the listed ids,
+        // not the full universe).
+        let loader = MockLoader::new(vec![
+            (
+                "addr",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[10]),
+                },
+            ),
+            (
+                "id",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::Or(
+            Box::new(mock_query("addr", "addr")),
+            Box::new(ScalarIndexExpr::Not(Box::new(mock_query("id", "id")))),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 1);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        assert!(matches!(result.upper, NullableRowAddrMask::BlockList(_)));
     }
 
     #[test]

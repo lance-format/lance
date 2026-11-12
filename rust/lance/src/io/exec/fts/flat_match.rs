@@ -32,7 +32,9 @@ use crate::index::scalar::inverted::{
 };
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
-use crate::io::exec::utils::{FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter};
+use crate::io::exec::utils::{
+    FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter, is_prefilter_union,
+};
 use lance_index::prefilter::FilterLoader;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
@@ -1122,9 +1124,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             .await?
                         }
                         PreFilterSource::ScalarIndexQuery(input) => {
-                            Box::new(SelectionVectorToPrefilter(
-                                input.execute(partition, context)?,
-                            ))
+                            let already_row_id_domain = is_prefilter_union(&input);
+                            Box::new(
+                                SelectionVectorToPrefilter::new(
+                                    input.execute(partition, context)?,
+                                    ds.clone(),
+                                )
+                                .with_already_row_id_domain(already_row_id_domain),
+                            )
                             .load()
                             .await?
                         }
