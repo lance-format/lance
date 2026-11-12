@@ -19,20 +19,52 @@ use lance_core::{Error, Result};
 /// followed by an [`AddDataFile`](super::AddDataFile) for the same field.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct TombstoneFieldData {
-    pub fragment: Ref,
-    /// The fields whose current backing is tombstoned.
-    pub field_ids: Vec<FieldRef>,
-    /// `false` marks one half of a re-encode: every tombstoned field is
-    /// re-bound in this fragment by an [`AddDataFile`](super::AddDataFile) in
-    /// the same operation that is also `false`, holding the same base values.
-    /// Such a tombstone keeps the fields' overlays and index coverage, the
-    /// way a `DataReplacement` with `data_change` false does. `true` tombstones
-    /// the fields out of the fragment's overlays and withdraws every index on
-    /// them from the fragment.
-    pub data_change: bool,
+    fragment: Ref,
+    field_ids: Vec<FieldRef>,
+    data_change: bool,
 }
 
 impl TombstoneFieldData {
+    /// Tombstone the current backing of `field_ids` in `fragment`, dropping
+    /// their values: the fields are tombstoned out of the fragment's overlays
+    /// and every index on them is withdrawn from the fragment.
+    pub fn new(fragment: Ref, field_ids: Vec<FieldRef>) -> Self {
+        Self::new_unchecked(fragment, field_ids, true)
+    }
+
+    /// Tombstone the current backing of `field_ids` in `fragment`, saying
+    /// whether their values change. `data_change = true` is the same as
+    /// [`new`](Self::new).
+    ///
+    /// `false` marks one half of a re-encode. Such a tombstone keeps the
+    /// fields' overlays and index coverage, the way a `DataReplacement` with
+    /// `data_change` false does.
+    ///
+    /// # Contract
+    ///
+    /// With `data_change = false` the caller certifies, and nothing downstream
+    /// checks, that each field is re-bound in this fragment by an
+    /// [`AddDataFile`](super::AddDataFile) in the same operation, also not a
+    /// data change, holding the same base values. Apply checks the re-binding
+    /// exists, not what it holds.
+    pub fn new_unchecked(fragment: Ref, field_ids: Vec<FieldRef>, data_change: bool) -> Self {
+        Self {
+            fragment,
+            field_ids,
+            data_change,
+        }
+    }
+
+    /// The fragment whose fields are tombstoned.
+    pub fn fragment(&self) -> Ref {
+        self.fragment
+    }
+
+    /// The fields whose current backing is tombstoned.
+    pub fn field_ids(&self) -> &[FieldRef] {
+        &self.field_ids
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if self.data_change {
@@ -82,7 +114,9 @@ impl TombstoneFieldData {
         Ok(())
     }
 
-    pub(super) fn is_data_change(&self) -> bool {
+    /// Whether the fields' values change. See
+    /// [`new_unchecked`](Self::new_unchecked).
+    pub fn is_data_change(&self) -> bool {
         self.data_change
     }
 
@@ -111,15 +145,15 @@ impl TryFrom<pb_actions::TombstoneFieldData> for TombstoneFieldData {
     type Error = Error;
 
     fn try_from(message: pb_actions::TombstoneFieldData) -> Result<Self> {
-        Ok(Self {
-            fragment: required(message.fragment, "TombstoneFieldData.fragment")?.try_into()?,
-            field_ids: message
+        Ok(Self::new_unchecked(
+            required(message.fragment, "TombstoneFieldData.fragment")?.try_into()?,
+            message
                 .field_ids
                 .into_iter()
                 .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
-            data_change: !message.data_unchanged,
-        })
+            !message.data_unchanged,
+        ))
     }
 }
 
@@ -137,21 +171,24 @@ mod tests {
     use std::sync::Arc;
 
     fn tombstone_field_zero(data_change: bool) -> Action {
-        Action::TombstoneFieldData(TombstoneFieldData {
-            fragment: Ref::Committed(0),
-            field_ids: vec![FieldRef::Committed(0)],
+        Action::TombstoneFieldData(TombstoneFieldData::new_unchecked(
+            Ref::Committed(0),
+            vec![FieldRef::Committed(0)],
             data_change,
-        })
+        ))
     }
 
     fn rebind_field_zero(data_change: bool) -> Action {
-        Action::AddDataFile(AddDataFile {
-            fragment: Ref::Committed(0),
-            file: one_column_file("data/reencoded.lance"),
-            field_ids: vec![FieldRef::Committed(0)],
-            data_change,
-            base: None,
-        })
+        Action::AddDataFile(
+            AddDataFile::try_new_unchecked(
+                Ref::Committed(0),
+                one_column_file("data/reencoded.lance"),
+                vec![FieldRef::Committed(0)],
+                None,
+                data_change,
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -255,11 +292,10 @@ mod tests {
     fn test_tombstone_field_data_rejects_a_field_no_file_backs() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(7)],
-                data_change: true,
-            })],
+            vec![Action::TombstoneFieldData(TombstoneFieldData::new(
+                Ref::Committed(0),
+                vec![FieldRef::Committed(7)],
+            ))],
         )
         .unwrap_err();
 
@@ -274,23 +310,21 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Committed(0),
-                    file: DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
-                Action::TombstoneFieldData(TombstoneFieldData {
-                    fragment: Ref::Committed(0),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Committed(0),
+                        DataFile::new_unstarted("data/fresh.lance", ConcreteFileVersion::V1),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
+                Action::TombstoneFieldData(TombstoneFieldData::new(
+                    Ref::Committed(0),
+                    vec![FieldRef::Local(0)],
+                )),
             ],
         )
         .unwrap();

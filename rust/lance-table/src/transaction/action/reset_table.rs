@@ -74,7 +74,8 @@ mod tests {
         added_field, apply, apply_with_indices, backed_manifest, footprint, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddField, AddFragment, FieldRef, Ref, ReserveFragmentIds,
+        Action, AddDataFile, AddField, AddFragment, AddFragmentParts, FieldRef, Ref,
+        ReserveFragmentIds,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
@@ -116,26 +117,25 @@ mod tests {
             &backed_manifest(),
             vec![
                 reset(),
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
-                Action::AddFragment(AddFragment {
+                Action::AddField(AddField::new(0, added_field("fresh"))),
+                Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                     id: Ref::Local(0),
                     physical_rows: 4,
                     row_id_meta: None,
                     last_updated_at_version_meta: None,
                     created_at_version_meta: None,
                     data_change: true,
-                }),
-                Action::AddDataFile(AddDataFile {
-                    fragment: Ref::Local(0),
-                    file: one_column_file("data/fresh.lance"),
-                    field_ids: vec![FieldRef::Local(0)],
-                    data_change: true,
-                    base: None,
-                }),
+                })),
+                Action::AddDataFile(
+                    AddDataFile::try_new_unchecked(
+                        Ref::Local(0),
+                        one_column_file("data/fresh.lance"),
+                        vec![FieldRef::Local(0)],
+                        None,
+                        true,
+                    )
+                    .unwrap(),
+                ),
             ],
         )
         .unwrap();
@@ -153,40 +153,35 @@ mod tests {
     #[test]
     fn test_reset_discards_what_earlier_actions_in_the_operation_did() {
         let mint_fragment = |token| {
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(token),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: true,
-            })
+            }))
         };
         let write = |token, path: &str| {
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(token),
-                file: one_column_file(path),
-                field_ids: vec![FieldRef::Local(token)],
-                data_change: true,
-                base: None,
-            })
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(token),
+                    one_column_file(path),
+                    vec![FieldRef::Local(token)],
+                    None,
+                    true,
+                )
+                .unwrap(),
+            )
         };
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("early"),
-                }),
+                Action::AddField(AddField::new(0, added_field("early"))),
                 mint_fragment(0),
                 write(0, "data/early.lance"),
                 reset(),
-                Action::AddField(AddField {
-                    local: 1,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
+                Action::AddField(AddField::new(1, added_field("fresh"))),
                 mint_fragment(1),
                 write(1, "data/fresh.lance"),
             ],
@@ -204,22 +199,18 @@ mod tests {
     }
 
     fn mint_fragment(token: u32) -> Action {
-        Action::AddFragment(AddFragment {
+        Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
             id: Ref::Local(token),
             physical_rows: 4,
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
-        })
+        }))
     }
 
     fn mint_field(token: u32, name: &str) -> Action {
-        Action::AddField(AddField {
-            local: token,
-            parent: None,
-            def: added_field(name),
-        })
+        Action::AddField(AddField::new(token, added_field(name)))
     }
 
     /// A reset discards objects but never rewinds a counter: the committed
@@ -261,14 +252,16 @@ mod tests {
         // Even a pure append, which writes no committed coordinate at all, is
         // preempted: its rows would either vanish or survive the reset
         // depending on which commit landed first.
-        let append = footprint(vec![Action::AddFragment(AddFragment {
-            id: Ref::Local(0),
-            physical_rows: 4,
-            row_id_meta: None,
-            last_updated_at_version_meta: None,
-            created_at_version_meta: None,
-            data_change: true,
-        })]);
+        let append = footprint(vec![Action::AddFragment(AddFragment::new_unchecked(
+            AddFragmentParts {
+                id: Ref::Local(0),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            },
+        ))]);
 
         assert!(reset.conflicts_with(&append));
         assert!(append.conflicts_with(&reset));
@@ -280,25 +273,27 @@ mod tests {
         // or records nothing at all, still cannot land on either side of a
         // reset.
         let requires_only = footprint(vec![
-            Action::AddFragment(AddFragment {
+            Action::AddFragment(AddFragment::new_unchecked(AddFragmentParts {
                 id: Ref::Local(0),
                 physical_rows: 4,
                 row_id_meta: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
                 data_change: false,
-            }),
-            Action::AddDataFile(AddDataFile {
-                fragment: Ref::Local(0),
-                file: one_column_file("data/compacted.lance"),
-                field_ids: vec![FieldRef::Committed(0)],
-                data_change: false,
-                base: None,
-            }),
+            })),
+            Action::AddDataFile(
+                AddDataFile::try_new_unchecked(
+                    Ref::Local(0),
+                    one_column_file("data/compacted.lance"),
+                    vec![FieldRef::Committed(0)],
+                    None,
+                    false,
+                )
+                .unwrap(),
+            ),
         ]);
-        let records_nothing = footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds {
-            count: 3,
-        })]);
+        let records_nothing =
+            footprint(vec![Action::ReserveFragmentIds(ReserveFragmentIds::new(3))]);
         for other in [requires_only, records_nothing] {
             assert!(reset.conflicts_with(&other));
             assert!(other.conflicts_with(&reset));

@@ -13,13 +13,28 @@ use lance_core::{Error, Result};
 /// Mint a new base path.
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AddBase {
-    /// Token standing in for the base id until it is allocated at apply.
-    pub local: u32,
-    /// The base path. Its `id` is ignored and stamped in at apply.
-    pub base: BasePath,
+    local: u32,
+    base: BasePath,
 }
 
 impl AddBase {
+    /// Mint `base` under the token `local`, which stands in for the base id
+    /// until it is allocated at apply. The base's `id` is ignored and stamped
+    /// in at apply.
+    pub fn new(local: u32, base: BasePath) -> Self {
+        Self { local, base }
+    }
+
+    /// The token later actions name the base by.
+    pub fn local(&self) -> u32 {
+        self.local
+    }
+
+    /// The base path, with its `id` not yet stamped.
+    pub fn base(&self) -> &BasePath {
+        &self.base
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let id = state.mint_base(self.local)?;
 
@@ -79,10 +94,10 @@ impl TryFrom<pb_actions::AddBase> for AddBase {
     type Error = Error;
 
     fn try_from(message: pb_actions::AddBase) -> Result<Self> {
-        Ok(Self {
-            local: message.local,
-            base: BasePath::from(required(message.base, "AddBase.base")?),
-        })
+        Ok(Self::new(
+            message.local,
+            BasePath::from(required(message.base, "AddBase.base")?),
+        ))
     }
 }
 
@@ -97,10 +112,10 @@ mod tests {
         let manifest = unbacked_manifest();
         let next = apply(
             &manifest,
-            vec![Action::AddBase(AddBase {
-                local: 0,
-                base: BasePath::new(0, "s3://bucket/a".into(), Some("a".into()), false),
-            })],
+            vec![Action::AddBase(AddBase::new(
+                0,
+                BasePath::new(0, "s3://bucket/a".into(), Some("a".into()), false),
+            ))],
         )
         .unwrap();
         assert_eq!(next.base_paths.len(), 1);
@@ -109,10 +124,10 @@ mod tests {
         // A fresh name, but the location is taken.
         let error = apply(
             &next,
-            vec![Action::AddBase(AddBase {
-                local: 0,
-                base: BasePath::new(0, "s3://bucket/a".into(), Some("other".into()), false),
-            })],
+            vec![Action::AddBase(AddBase::new(
+                0,
+                BasePath::new(0, "s3://bucket/a".into(), Some("other".into()), false),
+            ))],
         )
         .unwrap_err();
         assert!(
@@ -132,14 +147,14 @@ mod tests {
         let next = apply(
             &manifest,
             vec![
-                Action::AddBase(AddBase {
-                    local: 0,
-                    base: BasePath::new(0, "s3://bucket/a".into(), None, false),
-                }),
-                Action::AddBase(AddBase {
-                    local: 1,
-                    base: BasePath::new(0, "s3://bucket/b".into(), None, false),
-                }),
+                Action::AddBase(AddBase::new(
+                    0,
+                    BasePath::new(0, "s3://bucket/a".into(), None, false),
+                )),
+                Action::AddBase(AddBase::new(
+                    1,
+                    BasePath::new(0, "s3://bucket/b".into(), None, false),
+                )),
             ],
         )
         .unwrap();
@@ -155,14 +170,14 @@ mod tests {
         let error = apply(
             &manifest,
             vec![
-                Action::AddBase(AddBase {
-                    local: 0,
-                    base: BasePath::new(0, "s3://bucket/a".into(), Some("a".into()), false),
-                }),
-                Action::AddBase(AddBase {
-                    local: 1,
-                    base: BasePath::new(0, "s3://bucket/b".into(), Some("a".into()), false),
-                }),
+                Action::AddBase(AddBase::new(
+                    0,
+                    BasePath::new(0, "s3://bucket/a".into(), Some("a".into()), false),
+                )),
+                Action::AddBase(AddBase::new(
+                    1,
+                    BasePath::new(0, "s3://bucket/b".into(), Some("a".into()), false),
+                )),
             ],
         )
         .unwrap_err();

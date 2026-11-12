@@ -626,11 +626,12 @@ fn action_txn(actions: Vec<TxnAction>) -> Transaction {
 }
 
 fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
-    action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
-        fragment: ActionRef::Committed(fragment),
-        field_ids: vec![FieldRef::Committed(field)],
-        data_change: true,
-    })])
+    action_txn(vec![TxnAction::TombstoneFieldData(
+        TombstoneFieldData::new(
+            ActionRef::Committed(fragment),
+            vec![FieldRef::Committed(field)],
+        ),
+    )])
 }
 
 /// Assert the verdict holds whichever transaction is the one rebasing.

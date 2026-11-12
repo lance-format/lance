@@ -25,27 +25,101 @@ use lance_core::{Error, Result};
 ///
 /// This is reference-stable rather than a delta -- config keys and field ids are
 /// stable coordinates -- so two operations editing different keys commute.
+///
+/// Every update is safe to build: apply checks it against the table it lands
+/// on, including the reserved key rules. Start from
+/// [`ConfigUpdate::default`], which changes nothing, and add the maps to edit.
+///
+/// ```
+/// # use lance_table::transaction::UpdateMap;
+/// # use lance_table::transaction::action::{ConfigUpdate, FieldRef};
+/// let set_interval = UpdateMap {
+///     update_entries: vec![("lance.auto_cleanup.interval", "20").into()],
+///     replace: false,
+/// };
+/// let drop_comment = UpdateMap {
+///     update_entries: vec![("comment", None).into()],
+///     replace: false,
+/// };
+/// let update = ConfigUpdate::default()
+///     .with_config(set_interval)
+///     .with_field_metadata(FieldRef::Committed(0), drop_comment);
+/// assert!(update.table_metadata().is_none());
+/// ```
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct ConfigUpdate {
-    /// Dataset config.
-    pub config: Option<UpdateMap>,
-    /// Table metadata.
-    pub table_metadata: Option<UpdateMap>,
-    /// Schema-level metadata.
-    pub schema_metadata: Option<UpdateMap>,
-    /// Per-field metadata, in application order. Keyed by [`FieldRef`] so a field
-    /// minted earlier in the same operation can be given metadata.
-    pub field_metadata: Vec<FieldMetadataUpdate>,
+    config: Option<UpdateMap>,
+    table_metadata: Option<UpdateMap>,
+    schema_metadata: Option<UpdateMap>,
+    field_metadata: Vec<FieldMetadataUpdate>,
 }
 
 /// One field's metadata within a [`ConfigUpdate`].
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct FieldMetadataUpdate {
-    pub field: FieldRef,
-    pub updates: UpdateMap,
+    field: FieldRef,
+    updates: UpdateMap,
+}
+
+impl FieldMetadataUpdate {
+    /// The field whose metadata is edited.
+    pub fn field(&self) -> FieldRef {
+        self.field
+    }
+
+    /// The edit to the field's metadata.
+    pub fn updates(&self) -> &UpdateMap {
+        &self.updates
+    }
 }
 
 impl ConfigUpdate {
+    /// Edit the dataset config, replacing any edit set before.
+    pub fn with_config(mut self, updates: UpdateMap) -> Self {
+        self.config = Some(updates);
+        self
+    }
+
+    /// Edit the table metadata, replacing any edit set before.
+    pub fn with_table_metadata(mut self, updates: UpdateMap) -> Self {
+        self.table_metadata = Some(updates);
+        self
+    }
+
+    /// Edit the schema-level metadata, replacing any edit set before.
+    pub fn with_schema_metadata(mut self, updates: UpdateMap) -> Self {
+        self.schema_metadata = Some(updates);
+        self
+    }
+
+    /// Edit one field's metadata, after any field edits added before. `field`
+    /// may be minted earlier in the same operation.
+    pub fn with_field_metadata(mut self, field: FieldRef, updates: UpdateMap) -> Self {
+        self.field_metadata
+            .push(FieldMetadataUpdate { field, updates });
+        self
+    }
+
+    /// The edit to the dataset config, or `None` to leave it alone.
+    pub fn config(&self) -> Option<&UpdateMap> {
+        self.config.as_ref()
+    }
+
+    /// The edit to the table metadata, or `None` to leave it alone.
+    pub fn table_metadata(&self) -> Option<&UpdateMap> {
+        self.table_metadata.as_ref()
+    }
+
+    /// The edit to the schema-level metadata, or `None` to leave it alone.
+    pub fn schema_metadata(&self) -> Option<&UpdateMap> {
+        self.schema_metadata.as_ref()
+    }
+
+    /// The per-field metadata edits, in application order.
+    pub fn field_metadata(&self) -> &[FieldMetadataUpdate] {
+        &self.field_metadata
+    }
+
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         if let Some(updates) = &self.config {
             apply_update_map(state.config_mut(), updates);
@@ -243,25 +317,26 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
     type Error = Error;
 
     fn try_from(message: pb_actions::ConfigUpdate) -> Result<Self> {
-        Ok(Self {
-            config: message.config.as_ref().map(UpdateMap::from),
-            table_metadata: message.table_metadata.as_ref().map(UpdateMap::from),
-            schema_metadata: message.schema_metadata.as_ref().map(UpdateMap::from),
-            field_metadata: message
-                .field_metadata
-                .into_iter()
-                .map(|update| {
-                    Ok(FieldMetadataUpdate {
-                        field: required(update.field, "ConfigUpdate.field_metadata.field")?
-                            .try_into()?,
-                        updates: UpdateMap::from(&required(
-                            update.updates,
-                            "ConfigUpdate.field_metadata.updates",
-                        )?),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?,
-        })
+        let mut update = Self::default();
+        if let Some(updates) = &message.config {
+            update = update.with_config(updates.into());
+        }
+        if let Some(updates) = &message.table_metadata {
+            update = update.with_table_metadata(updates.into());
+        }
+        if let Some(updates) = &message.schema_metadata {
+            update = update.with_schema_metadata(updates.into());
+        }
+        for field_update in message.field_metadata {
+            update = update.with_field_metadata(
+                required(field_update.field, "ConfigUpdate.field_metadata.field")?.try_into()?,
+                UpdateMap::from(&required(
+                    field_update.updates,
+                    "ConfigUpdate.field_metadata.updates",
+                )?),
+            );
+        }
+        Ok(update)
     }
 }
 
@@ -306,10 +381,9 @@ mod tests {
 
         let next = apply(
             &manifest,
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                config: Some(merge(&[("drop", None), ("added", Some("1"))])),
-                ..Default::default()
-            })],
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_config(merge(&[("drop", None), ("added", Some("1"))])),
+            )],
         )
         .unwrap();
 
@@ -325,10 +399,9 @@ mod tests {
 
         let next = apply(
             &manifest,
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                table_metadata: Some(replace(&[("new", "1")])),
-                ..Default::default()
-            })],
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_table_metadata(replace(&[("new", "1")])),
+            )],
         )
         .unwrap();
 
@@ -340,14 +413,14 @@ mod tests {
     fn test_config_update_edits_schema_and_field_metadata() {
         let next = apply(
             &backed_manifest(),
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                schema_metadata: Some(merge(&[("schema", Some("yes"))])),
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(0),
-                    updates: merge(&[("comment", Some("the id"))]),
-                }],
-                ..Default::default()
-            })],
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default()
+                    .with_schema_metadata(merge(&[("schema", Some("yes"))]))
+                    .with_field_metadata(
+                        FieldRef::Committed(0),
+                        merge(&[("comment", Some("the id"))]),
+                    ),
+            )],
         )
         .unwrap();
 
@@ -361,18 +434,11 @@ mod tests {
         let next = apply(
             &backed_manifest(),
             vec![
-                Action::AddField(AddField {
-                    local: 0,
-                    parent: None,
-                    def: added_field("fresh"),
-                }),
-                Action::ConfigUpdate(ConfigUpdate {
-                    field_metadata: vec![FieldMetadataUpdate {
-                        field: FieldRef::Local(0),
-                        updates: merge(&[("comment", Some("brand new"))]),
-                    }],
-                    ..Default::default()
-                }),
+                Action::AddField(AddField::new(0, added_field("fresh"))),
+                Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
+                    FieldRef::Local(0),
+                    merge(&[("comment", Some("brand new"))]),
+                )),
             ],
         )
         .unwrap();
@@ -459,13 +525,12 @@ mod tests {
     fn test_config_update_rejects_a_missing_field() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(7),
-                    updates: merge(&[("comment", Some("nope"))]),
-                }],
-                ..Default::default()
-            })],
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_field_metadata(
+                    FieldRef::Committed(7),
+                    merge(&[("comment", Some("nope"))]),
+                ),
+            )],
         )
         .unwrap_err();
 
@@ -476,13 +541,10 @@ mod tests {
     #[test]
     fn test_config_update_sets_then_refuses_to_change_the_primary_key() {
         let set_key = |field: i32| {
-            Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(field),
-                    updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
-                }],
-                ..Default::default()
-            })
+            Action::ConfigUpdate(ConfigUpdate::default().with_field_metadata(
+                FieldRef::Committed(field),
+                merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
+            ))
         };
 
         let next = apply(&backed_manifest(), vec![set_key(0)]).unwrap();
@@ -506,16 +568,12 @@ mod tests {
     fn test_config_update_rejects_an_invalid_primary_key() {
         let error = apply(
             &backed_manifest(),
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(0),
-                    updates: merge(&[(
-                        LANCE_UNENFORCED_PRIMARY_KEY_POSITION,
-                        Some("not a number"),
-                    )]),
-                }],
-                ..Default::default()
-            })],
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_field_metadata(
+                    FieldRef::Committed(0),
+                    merge(&[(LANCE_UNENFORCED_PRIMARY_KEY_POSITION, Some("not a number"))]),
+                ),
+            )],
         )
         .unwrap_err();
 
@@ -530,10 +588,9 @@ mod tests {
     #[test]
     fn test_edits_to_different_keys_commute() {
         let update = |key: &str| {
-            vec![Action::ConfigUpdate(ConfigUpdate {
-                config: Some(merge(&[(key, Some("1"))])),
-                ..Default::default()
-            })]
+            vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_config(merge(&[(key, Some("1"))])),
+            )]
         };
 
         assert!(!footprint(update("a")).conflicts_with(&footprint(update("b"))));
@@ -542,18 +599,15 @@ mod tests {
 
     #[test]
     fn test_a_replacement_collides_with_any_edit_to_the_same_map() {
-        let replaced = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            config: Some(replace(&[("a", "1")])),
-            ..Default::default()
-        })]);
-        let merged = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            config: Some(merge(&[("untouched-by-name", Some("1"))])),
-            ..Default::default()
-        })]);
-        let other_map = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            table_metadata: Some(merge(&[("a", Some("1"))])),
-            ..Default::default()
-        })]);
+        let replaced = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default().with_config(replace(&[("a", "1")])),
+        )]);
+        let merged = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default().with_config(merge(&[("untouched-by-name", Some("1"))])),
+        )]);
+        let other_map = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default().with_table_metadata(merge(&[("a", Some("1"))])),
+        )]);
 
         assert!(replaced.conflicts_with(&merged));
         // Two clears of the same map name no key at all, and still collide.
@@ -564,19 +618,16 @@ mod tests {
 
     #[test]
     fn test_dropping_a_field_collides_with_updating_its_metadata() {
-        let metadata = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            field_metadata: vec![FieldMetadataUpdate {
-                field: FieldRef::Committed(1),
-                updates: merge(&[("comment", Some("x"))]),
-            }],
-            ..Default::default()
-        })]);
-        let dropped = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(1),
-        })]);
-        let other = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(2),
-        })]);
+        let metadata = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default()
+                .with_field_metadata(FieldRef::Committed(1), merge(&[("comment", Some("x"))])),
+        )]);
+        let dropped = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(1),
+        ))]);
+        let other = footprint(vec![Action::DropField(DropField::new(
+            FieldRef::Committed(2),
+        ))]);
 
         // Metadata landing after the drop names a field that is gone; the
         // drop landing after the metadata takes the metadata with the field.
@@ -589,28 +640,23 @@ mod tests {
     #[test]
     fn test_declaring_the_primary_key_on_different_fields_collides() {
         let primary_key = |field: i32| {
-            footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-                field_metadata: vec![FieldMetadataUpdate {
-                    field: FieldRef::Committed(field),
-                    updates: merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
-                }],
-                ..Default::default()
-            })])
+            footprint(vec![Action::ConfigUpdate(
+                ConfigUpdate::default().with_field_metadata(
+                    FieldRef::Committed(field),
+                    merge(&[(LANCE_UNENFORCED_PRIMARY_KEY, Some("true"))]),
+                ),
+            )])
         };
-        let clustering_key = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            field_metadata: vec![FieldMetadataUpdate {
-                field: FieldRef::Committed(3),
-                updates: merge(&[(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, Some("0"))]),
-            }],
-            ..Default::default()
-        })]);
-        let comment = footprint(vec![Action::ConfigUpdate(ConfigUpdate {
-            field_metadata: vec![FieldMetadataUpdate {
-                field: FieldRef::Committed(3),
-                updates: merge(&[("comment", Some("x"))]),
-            }],
-            ..Default::default()
-        })]);
+        let clustering_key = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default().with_field_metadata(
+                FieldRef::Committed(3),
+                merge(&[(LANCE_UNENFORCED_CLUSTERING_KEY_POSITION, Some("0"))]),
+            ),
+        )]);
+        let comment = footprint(vec![Action::ConfigUpdate(
+            ConfigUpdate::default()
+                .with_field_metadata(FieldRef::Committed(3), merge(&[("comment", Some("x"))])),
+        )]);
 
         // The key is one per table, so the fields being different is no help.
         assert!(primary_key(1).conflicts_with(&primary_key(2)));
