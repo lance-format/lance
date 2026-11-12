@@ -58,9 +58,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
         ));
     }
     if type_name.eq_ignore_ascii_case(&lance_index::pb::JsonIndexDetails::full_name()) {
-        return Some(
-            "a JSON index, which does not record the identifiers its target index stores".into(),
-        );
+        return Some("a JSON index, which does not apply the fragment reuse index".into());
     }
     if let Some(max_supported_version) = unsupported_index_version(index) {
         return Some(format!(
@@ -413,6 +411,11 @@ mod tests {
         false
     )]
     #[case::json_over_btree(json_over(details(&pbold::BTreeIndexDetails::default())), 0, false)]
+    #[case::json_over_address_domain_btree(
+        json_over(details(&pbold::BTreeIndexDetails::default())),
+        1,
+        false
+    )]
     #[case::undecodable_json(undecodable_json(), 0, false)]
     #[case::legacy_without_details(None, 0, false)]
     #[case::unknown_type(foreign("example.ForeignIndexDetails"), 0, false)]

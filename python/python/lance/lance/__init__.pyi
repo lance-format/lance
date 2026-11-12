@@ -81,6 +81,21 @@ from .optimize import (
     CompactionTask as CompactionTask,
 )
 from .optimize import (
+    IndexSegmentResult as IndexSegmentResult,
+)
+from .optimize import (
+    OptimizeIndexMerge as OptimizeIndexMerge,
+)
+from .optimize import (
+    OptimizeIndexTask as OptimizeIndexTask,
+)
+from .optimize import (
+    OptimizeIndices as OptimizeIndices,
+)
+from .optimize import (
+    OptimizeIndicesPlan as OptimizeIndicesPlan,
+)
+from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
@@ -150,7 +165,9 @@ def tokenize(
 ) -> List[FtsToken]:
     """Tokenize an FTS query without an index.
 
-    ``max_token_length`` defaults to 40; pass ``None`` to disable the limit.
+    ``max_token_length`` is an exclusive limit in UTF-8 bytes, not characters.
+    Tokens of this length or longer are removed. It defaults to 40; pass
+    ``None`` to disable the limit.
     """
     ...
 
