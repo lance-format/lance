@@ -232,13 +232,33 @@ impl ScalarIndexExec {
     /// Address-domain results are restricted before translation to stable row ids. Native
     /// row-id results can still cover other fragments, so the consumer remains responsible
     /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// Codecs can inspect this setting with [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -256,6 +276,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading and address-to-row-ID translation.
+    /// `None` searches every selected segment. Native row-ID results are not bounded by this scope.
+    /// See [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]
@@ -887,7 +921,16 @@ impl MapIndexExec {
         }
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_addr_mask = row_addr_mask & deletion_mask.as_ref().clone();
+            // The deletion mask is shared by every batch of the stream, so apply
+            // it to an allow-list probe in place instead of copying it per batch.
+            // Other probes keep the by-value intersection.
+            row_addr_mask = match row_addr_mask {
+                RowAddrMask::AllowList(mut rows) => {
+                    rows.mask(deletion_mask);
+                    RowAddrMask::AllowList(rows)
+                }
+                probe => probe & deletion_mask.as_ref().clone(),
+            };
         }
 
         let row_id_iter = row_addr_mask
@@ -1322,6 +1365,7 @@ mod tests {
         ArrayRef, Int32Array, RecordBatch, UInt64Array, cast::AsArray, record_batch,
     };
     use arrow_schema::Schema;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::{
         error::DataFusionError,
         execution::{
@@ -1334,9 +1378,11 @@ mod tests {
     };
     use futures::TryStreamExt;
     use lance_core::{
+        ROW_ID,
         deepsize::DeepSizeOf,
         utils::{address::RowAddress, tempfile::TempStrDir},
     };
+    use lance_datafusion::exec::OneShotExec;
     use lance_datafusion::utils::{
         MetricsExt, SCALAR_INDEX_MAX_ALLOWED_METRIC, SCALAR_INDEX_MAX_BLOCKED_METRIC,
         SCALAR_INDEX_MIN_ALLOWED_METRIC, SCALAR_INDEX_MIN_BLOCKED_METRIC,
@@ -1880,6 +1926,54 @@ mod tests {
         // Negating it turns both bounds into block lists of the same rows
         let bounds = run(ScalarIndexExpr::Not(Box::new(less_than_47))).await;
         assert_eq!(bounds, [None, Some(47), None, Some(47)]);
+    }
+
+    /// Every batch of the stream applies the shared deletion mask: deleted
+    /// keys in any batch produce no candidates.
+    #[tokio::test]
+    async fn test_map_index_exec_drops_deleted_rows_in_every_batch() {
+        let mut dataset = gen_batch()
+            .col("key", lance_datagen::array::step::<UInt64Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset.delete("key % 2 = 0").await.unwrap();
+
+        let batches = [vec![0_u64, 1, 2, 3], vec![10, 11, 12, 13]]
+            .map(|keys| Ok(record_batch!(("key", UInt64, keys)).unwrap()));
+        let schema = batches[0].as_ref().unwrap().schema();
+        let input = Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches),
+        ))));
+        let plan = MapIndexExec::new(
+            Arc::new(dataset),
+            "key".to_string(),
+            "key_idx".to_string(),
+            input,
+        );
+        let batches = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let mut row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, vec![1, 3, 11, 13]);
     }
 
     #[test]

@@ -42,7 +42,6 @@ Maintainers with GitHub write access are additionally encouraged to:
 
 | Name                   | GitHub Handle        | Affiliation       | GitHub Write Access | Ecosystem Roles                                    |
 |------------------------|----------------------|-------------------|---------------------|----------------------------------------------------|
-| Wyatt Alt              | wkalt                | LanceDB           | ✓                   |                                                    |
 | Matt Basta             | mattbasta            | Runway AI         |                     |                                                    |
 | Giuseppe Battista      | giusedroid           | AWS               |                     |                                                    |
 | Timothy Carambat       | timothycarambat      | Anything LLM      |                     |                                                    |
@@ -56,9 +55,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Sangwu Lee             | RE-N-Y               | Krea.ai           |                     |                                                    |
 | Jeremy Leibs           | jleibs               | Genesis AI        |                     |                                                    |
 | Haocheng Liu           | HaochengLIU          | Seven Research    | ✓                   |                                                    |
-| Nathan Ma              | majin1102            | ByteDance         | ✓                   | Apache Amoro (incubating) PPMC Member              |
 | ChanChan Mao           | ccmao1130            | LanceDB           |                     |                                                    |
-| Lu Qiu                 | LuQQiu               | LanceDB           | ✓                   | Alluxio PMC Member                                 |
 | Dan Rammer             | hamersaw             | LanceDB           | ✓                   |                                                    |
 | Rong Rong              | walterddr            | Google DeepMind   |                     | Apache Pinot PMC Member, Apache Flink Committer    |
 | Nat Roth               | nrothGIT             | Meta AI           |                     |                                                    |
@@ -68,9 +65,7 @@ Maintainers with GitHub write access are additionally encouraged to:
 | Ankit Vij              | ankitvij-db          | Databricks        |                     |                                                    |
 | Beinan Wang            | beinan               | Microsoft AI      |                     | Alluxio PMC Member, Presto TSC Member              |
 | Jiacheng Yang          | jiachengdb           | Google AI         |                     |                                                    |
-| Yang Jie               | LuciferYang          | Baidu Inc.        |                     | Apache Spark PMC Member, Apache Uniffle PMC Member | 
 | Jianjian Xie           | jja725               | Uber              |                     |                                                    |
-| Zhang Yue              | zhangyue19921010     | ByteDance         |                     | Apache Hudi PMC, Apache Druid Committer, Kafka Contributor |
 | Jinglun                | wojiaodoubao         | ByteDance         |                     | Apache Hadoop Committer                            |
 
 ## Becoming a Maintainer

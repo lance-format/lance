@@ -914,3 +914,86 @@ async fn test_add_nested_child_reads_null_then_round_trips(
         arrow_select::concat::concat_batches(&expected.schema(), &[source, kept]).unwrap();
     assert_reads(&dataset, &expected, new_leaf, old_leaf).await;
 }
+
+/// Filtering on a child added to a struct reads it from new fragments and as
+/// null from old ones, whatever else the scan projects.
+#[rstest]
+#[tokio::test]
+async fn test_filter_on_added_struct_child(
+    #[values(vec!["id"], vec!["id", "payload"])] columns: Vec<&str>,
+    #[values(
+        crate::dataset::scanner::MaterializationStyle::Heuristic,
+        crate::dataset::scanner::MaterializationStyle::AllEarly,
+        crate::dataset::scanner::MaterializationStyle::AllLate
+    )]
+    style: crate::dataset::scanner::MaterializationStyle,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, true),
+        ArrowField::new("payload", st(vec![("existing", DataType::Utf8)]), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0])) as ArrayRef,
+            fill(&st(vec![("existing", DataType::Utf8)]), 1, 0, false),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let added = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "payload",
+        st(vec![("added", DataType::Utf8)]),
+        true,
+    )]));
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(added), None, None)
+        .await
+        .unwrap();
+
+    let full = st(vec![
+        ("existing", DataType::Utf8),
+        ("added", DataType::Utf8),
+    ]);
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            fill(&full, 1, 0, false),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let predicate = "payload.added = 'v0'";
+    let mut scan = dataset.scan();
+    scan.project(&columns).unwrap();
+    scan.filter(predicate).unwrap();
+    scan.materialization_style(style);
+    let batch = scan.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(ids.values().as_ref(), &[1]);
+
+    assert_eq!(
+        dataset
+            .count_rows(Some(predicate.to_string()))
+            .await
+            .unwrap(),
+        1
+    );
+}

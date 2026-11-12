@@ -788,9 +788,10 @@ mod tests {
         #[values(TestEncoding::StructuralU32, TestEncoding::StructuralSparse)]
         encoding: TestEncoding,
         #[values(4096, 1024 * 1024)] page_size: u64,
-        #[values(false, true)] use_slicing: bool,
-        #[values(1, 5, 10)] ingest_batch_count: u32,
+        // Slicing a single ingest batch is a no-op, so that pair is omitted.
+        #[values((false, 1), (false, 5), (false, 10), (true, 5), (true, 10))] ingest: (bool, u32),
     ) {
+        let (use_slicing, ingest_batch_count) = ingest;
         let data_type = make_fsl_struct_type(struct_fields, dimension);
         let mut field_metadata = HashMap::new();
         field_metadata.insert(

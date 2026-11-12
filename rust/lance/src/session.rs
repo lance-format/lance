@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::execution::context::SessionContext;
+
 use lance_core::cache::{
     CacheBackend, CacheDiagnostics, CacheMetricsKind, CacheSnapshotMode, LanceCache,
     QuickCacheBackend, QuickCacheShardPolicy,
@@ -60,6 +62,20 @@ pub struct SessionCacheDiagnostics {
     pub metadata: CacheDiagnostics,
 }
 
+/// Access policy for external blob descriptors that do not name a registered base.
+///
+/// This policy also prevents dataset writers from accepting unregistered URI
+/// references and gives controlled services an error without local opt-in advice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnregisteredExternalBlobPolicy {
+    /// Resolve absolute URIs using this session's providers and credentials.
+    #[default]
+    Allow,
+    /// Reject `base_id == 0` before parsing its URI or accessing storage.
+    /// Registered bases remain available under their configured credentials.
+    Deny,
+}
+
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
 /// A session will be created automatically when a Dataset is opened.  However, you
@@ -94,6 +110,8 @@ pub struct Session {
 
     store_registry: Arc<ObjectStoreRegistry>,
 
+    unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
+
     spill_store: Arc<dyn SpillStore>,
 
     /// The origin latency class the process declares for the IVF_RQ indexes
@@ -107,6 +125,9 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+    /// See [`Self::with_datafusion_session`].
+    datafusion_session: Option<SessionContext>,
 }
 
 impl DeepSizeOf for Session {
@@ -137,9 +158,14 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "unregistered_external_blob_policy",
+                &self.unregistered_external_blob_policy,
+            )
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
             .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
+            .field("has_datafusion_session", &self.datafusion_session.is_some())
             .finish()
     }
 }
@@ -175,10 +201,12 @@ impl Session {
             )),
             index_extensions: HashMap::new(),
             store_registry,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -207,7 +235,39 @@ impl Session {
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
         }
+    }
+
+    /// Set the policy for external blobs without a registered storage base.
+    ///
+    /// The default is [`UnregisteredExternalBlobPolicy::Allow`] for embedded use.
+    /// Servers should use [`UnregisteredExternalBlobPolicy::Deny`] before opening
+    /// datasets, including datasets written by other clients. This does not
+    /// restrict registered bases or remove file providers from the registry.
+    ///
+    /// ```
+    /// use lance::session::{Session, UnregisteredExternalBlobPolicy};
+    /// let session = Session::default()
+    ///     .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
+    /// assert_eq!(session.unregistered_external_blob_policy(), UnregisteredExternalBlobPolicy::Deny);
+    /// ```
+    pub fn with_unregistered_external_blob_policy(
+        mut self,
+        policy: UnregisteredExternalBlobPolicy,
+    ) -> Self {
+        self.unregistered_external_blob_policy = policy;
+        self
+    }
+
+    /// The policy applied before resolving an unregistered external blob URI.
+    ///
+    /// When rebuilding a session with different caches, pass this value to
+    /// [`Self::with_unregistered_external_blob_policy`] on the replacement.
+    /// New sessions default to allowing unregistered references.
+    pub fn unregistered_external_blob_policy(&self) -> UnregisteredExternalBlobPolicy {
+        self.unregistered_external_blob_policy
     }
 
     /// Replace the spill store used by this session.
@@ -323,6 +383,19 @@ impl Session {
         self.rabit_scan_factory.clone()
     }
 
+    /// Attach a DataFusion session for planning expressions over this
+    /// session's datasets, e.g. with
+    /// [`lance_datafusion::planner::Planner::new_with_session`].
+    pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
+        self.datafusion_session = Some(session);
+        self
+    }
+
+    /// The session set by [`Self::with_datafusion_session`], if any.
+    pub fn datafusion_session(&self) -> Option<&SessionContext> {
+        self.datafusion_session.as_ref()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -383,10 +456,12 @@ impl Session {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
             store_registry,
+            unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -985,5 +1060,19 @@ mod tests {
             ),
             "expected DiskCapExceeded, got {err}"
         );
+    }
+
+    #[test]
+    fn test_datafusion_session_is_shared_with_clones() {
+        assert!(Session::default().datafusion_session().is_none());
+
+        let datafusion_session = SessionContext::new();
+        let session = Session::default().with_datafusion_session(datafusion_session.clone());
+        for session in [&session, &session.clone()] {
+            assert_eq!(
+                session.datafusion_session().unwrap().session_id(),
+                datafusion_session.session_id()
+            );
+        }
     }
 }

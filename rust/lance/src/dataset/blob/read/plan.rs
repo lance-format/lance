@@ -271,8 +271,8 @@ fn group_blob_read_plans(planned_reads: Vec<SourcePlannedBlobRead>) -> Vec<BlobR
 
     plans.sort_by(|left, right| {
         left.source_key
-            .store_prefix
-            .cmp(&right.source_key.store_prefix)
+            .store_id
+            .cmp(&right.source_key.store_id)
             .then_with(|| left.source_key.path.cmp(&right.source_key.path))
     });
 

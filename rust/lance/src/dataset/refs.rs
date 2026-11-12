@@ -9,7 +9,10 @@ use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::{Error as ObjectStoreError, path::Path};
+use object_store::{
+    Error as ObjectStoreError,
+    path::{Path, PathPart},
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -1432,6 +1435,21 @@ impl BranchContents {
     }
 }
 
+/// Validate a branch name before constructing storage paths.
+///
+/// A literal `.` path segment is rejected because it resolves to the parent
+/// directory and would collide with the branch that owns that directory.
+///
+/// Name length is not checked here: the portable creation budget in
+/// `check_new_branch` applies only when creating a branch, so names written
+/// by older versions remain accessible.
+///
+/// ```
+/// # use lance::dataset::refs::check_valid_branch;
+/// check_valid_branch("feature/new-model")?;
+/// assert!(check_valid_branch("feature/.").is_err());
+/// # Ok::<(), lance::Error>(())
+/// ```
 pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
         return Err(Error::InvalidRef {
@@ -1466,6 +1484,11 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
                 message: "Branch name cannot have empty segments between '/'".to_string(),
             });
         }
+        if segment == "." {
+            return Err(Error::InvalidRef {
+                message: format!("Branch name '{}' cannot contain a '.' segment", branch_name),
+            });
+        }
         if !segment
             .chars()
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
@@ -1494,7 +1517,7 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
-const REFS_DIR: &str = "_refs";
+pub(crate) const REFS_DIR: &str = "_refs";
 
 // Nested branches cannot use these names because they overlap
 // directories owned by their ancestors.
@@ -1515,9 +1538,33 @@ fn is_dataset_dir(segment: &str) -> bool {
         || is_mem_wal_dir_name(segment)
 }
 
-/// Only restrict new branches so older branch names remain accessible.
+// Local atomic creation appends `.json.tmp.<32-hex UUID>#1` (44 bytes) to the
+// encoded name and requires the result to fit the file's 255-byte filename
+// limit.
+const MAX_BRANCH_NAME_BYTES: usize = 211;
+
+/// Restrict storage length and reserved directories only for new branches so
+/// older branch names remain accessible.
+///
+/// The length budget is measured in bytes of the twice path-part encoded name,
+/// not in characters. It is a portable admission policy for creation, not a
+/// description of what every backend can physically store.
 pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
     check_valid_branch(branch_name)?;
+
+    // Metadata encodes the whole name as one path part. The local atomic
+    // writer encodes it again when constructing its staging path.
+    let encoded_name = PathPart::from(branch_name);
+    let storage_name_length = PathPart::from(encoded_name.as_ref()).as_ref().len();
+    if storage_name_length > MAX_BRANCH_NAME_BYTES {
+        return Err(Error::InvalidRef {
+            message: format!(
+                "Branch name '{}' uses {} bytes after storage path encoding; maximum is {} bytes",
+                branch_name, storage_name_length, MAX_BRANCH_NAME_BYTES
+            ),
+        });
+    }
+
     if let Some(segment) = branch_name
         .split('/')
         .skip(1)
@@ -1639,6 +1686,8 @@ mod tests {
             "with-dash",
             "with_underscore",
             "with.dot",
+            ".hidden",
+            "trailing.",
             "data",
             "_versions/child"
         )]
@@ -1699,6 +1748,37 @@ mod tests {
             "Branch name '{}' should be invalid",
             branch_name
         );
+    }
+
+    #[rstest]
+    #[case::dot(".")]
+    #[case::leading_dot_segment("./feature")]
+    #[case::trailing_dot_segment("feature/.")]
+    #[case::middle_dot_segment("feature/./child")]
+    fn test_branch_dot_segments(#[case] branch_name: &str) {
+        let error = check_valid_branch(branch_name).unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert_contains!(error.to_string(), "'.' segment");
+    }
+
+    #[rstest]
+    #[case::ascii_boundary("x".repeat(211), true)]
+    #[case::ascii_too_long("x".repeat(212), false)]
+    #[case::reported_name("x".repeat(300), false)]
+    #[case::nested_boundary(format!("{}/{}", "x".repeat(101), "y".repeat(105)), true)]
+    #[case::nested_too_long(format!("{}/{}", "x".repeat(102), "y".repeat(105)), false)]
+    #[case::unicode_boundary(format!("{}x", "é".repeat(21)), true)]
+    #[case::unicode_too_long("é".repeat(22), false)]
+    fn test_branch_name_storage_limits(#[case] branch_name: String, #[case] is_valid: bool) {
+        check_valid_branch(&branch_name).unwrap();
+        let result = check_new_branch(&branch_name);
+        if is_valid {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+            assert_contains!(error.to_string(), "maximum is 211 bytes");
+        }
     }
 
     #[test]
